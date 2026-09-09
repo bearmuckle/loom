@@ -4,6 +4,14 @@ use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, LoomError, ProjectId,
     Result, SessionEvent, SessionEventRecord, Timestamp,
 };
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionManagerState {
+    pub sessions: BTreeMap<AgentSessionId, AgentSessionSnapshot>,
+    pub events: Vec<SessionEventRecord>,
+    pub next_sequence: EventSequence,
+}
 
 #[derive(Debug, Default)]
 pub struct SessionManager {
@@ -13,6 +21,123 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+    pub fn from_state(state: SessionManagerState) -> Result<Self> {
+        if state
+            .sessions
+            .iter()
+            .any(|(id, snapshot)| *id != snapshot.id)
+        {
+            return Err(LoomError::new(
+                loom_core::ErrorCode::MalformedPayload,
+                "persisted session map key does not match its snapshot id",
+                false,
+            ));
+        }
+
+        let mut previous = EventSequence::default();
+        for record in &state.events {
+            if record.sequence <= previous || record.sequence > state.next_sequence {
+                return Err(LoomError::new(
+                    loom_core::ErrorCode::MalformedPayload,
+                    "session journal sequences are not strictly increasing",
+                    false,
+                ));
+            }
+            if !state.sessions.contains_key(&record.session_id) {
+                return Err(LoomError::new(
+                    loom_core::ErrorCode::MalformedPayload,
+                    "session journal references an unknown session",
+                    false,
+                ));
+            }
+            match &record.event {
+                SessionEvent::AgentSessionCreated { snapshot } => {
+                    if snapshot.id != record.session_id {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session creation event id does not match its record",
+                            false,
+                        ));
+                    }
+                    let Some(current) = state.sessions.get(&snapshot.id) else {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session creation event references a missing session",
+                            false,
+                        ));
+                    };
+                    if current.project_id != snapshot.project_id
+                        || current.name != snapshot.name
+                        || current.created_at != snapshot.created_at
+                    {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session creation event snapshot does not match the session map",
+                            false,
+                        ));
+                    }
+                }
+                SessionEvent::AgentSessionStateChanged { session_id, .. } => {
+                    if *session_id != record.session_id {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session state event id does not match its record",
+                            false,
+                        ));
+                    }
+                }
+                SessionEvent::AgentSessionForked {
+                    source_session_id,
+                    snapshot,
+                } => {
+                    if snapshot.id != record.session_id {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session fork event id does not match its record",
+                            false,
+                        ));
+                    }
+                    if !state.sessions.contains_key(source_session_id) {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session fork event references an unknown source session",
+                            false,
+                        ));
+                    }
+                }
+            }
+            previous = record.sequence;
+        }
+        if previous != state.next_sequence && !state.events.is_empty() {
+            return Err(LoomError::new(
+                loom_core::ErrorCode::MalformedPayload,
+                "session journal sequence does not match its stored cursor",
+                false,
+            ));
+        }
+        Ok(Self {
+            sessions: state.sessions,
+            events: state.events,
+            next_sequence: state.next_sequence,
+        })
+    }
+
+    pub fn restore(state: SessionManagerState) -> Result<Self> {
+        Self::from_state(state)
+    }
+
+    pub fn export_state(&self) -> SessionManagerState {
+        SessionManagerState {
+            sessions: self.sessions.clone(),
+            events: self.events.clone(),
+            next_sequence: self.next_sequence,
+        }
+    }
+
+    pub fn state(&self) -> SessionManagerState {
+        self.export_state()
+    }
+
     pub fn create(
         &mut self,
         project_id: ProjectId,
@@ -78,6 +203,39 @@ impl SessionManager {
                 session_id,
                 previous,
                 current: state,
+            },
+        );
+        Ok((snapshot, record))
+    }
+
+    pub fn fork(
+        &mut self,
+        source_session_id: AgentSessionId,
+        name: impl Into<String>,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        let source = self.get(source_session_id)?;
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "forked agent session name must not be empty",
+            ));
+        }
+        let now = Timestamp::now();
+        let snapshot = AgentSessionSnapshot {
+            id: AgentSessionId::new(),
+            project_id: source.project_id,
+            name,
+            state: AgentSessionState::Idle,
+            created_at: now,
+            updated_at: now,
+        };
+        self.sessions.insert(snapshot.id, snapshot.clone());
+        let record = self.record(
+            snapshot.id,
+            now,
+            SessionEvent::AgentSessionForked {
+                source_session_id,
+                snapshot: snapshot.clone(),
             },
         );
         Ok((snapshot, record))
@@ -157,5 +315,22 @@ mod tests {
         assert_eq!(updated.state, AgentSessionState::Planning);
         assert_eq!(event.sequence, EventSequence::new(2));
         assert_eq!(manager.events_since(Some(snapshot.id), None).count(), 2);
+    }
+
+    #[test]
+    fn state_round_trips_and_forks_with_an_explicit_event() {
+        let mut manager = SessionManager::default();
+        let (source, _) = manager.create(ProjectId::new(), "Source").unwrap();
+        let (fork, event) = manager.fork(source.id, "Fork").unwrap();
+        let restored = SessionManager::from_state(manager.export_state()).unwrap();
+
+        assert_eq!(restored.get(fork.id).unwrap().name, "Fork");
+        assert!(matches!(
+            event.event,
+            SessionEvent::AgentSessionForked {
+                source_session_id,
+                ..
+            } if source_session_id == source.id
+        ));
     }
 }

@@ -115,6 +115,25 @@ pub struct UndoResult {
     pub revision: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceEditHistory {
+    pub path: String,
+    pub before: Option<String>,
+    pub after_revision: String,
+    pub source: WorkspaceControl,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceStateSnapshot {
+    pub project_id: ProjectId,
+    pub root: String,
+    pub control: WorkspaceControl,
+    pub checkpoints: Vec<Checkpoint>,
+    pub edits: Vec<WorkspaceEditHistory>,
+    pub next_sequence: EventSequence,
+    pub changes: Vec<WorkspaceChange>,
+}
+
 #[derive(Debug)]
 struct WorkspaceState {
     control: WorkspaceControl,
@@ -225,6 +244,126 @@ impl Workspace {
         let previous = state.control;
         state.control = control;
         Ok(previous)
+    }
+
+    pub fn export_state(&self) -> Result<WorkspaceStateSnapshot> {
+        let state = self.lock_state()?;
+        Ok(WorkspaceStateSnapshot {
+            project_id: self.inner.project_id,
+            root: self.inner.root.display().to_string(),
+            control: state.control,
+            checkpoints: state.checkpoints.values().cloned().collect(),
+            edits: state
+                .edits
+                .iter()
+                .map(|edit| WorkspaceEditHistory {
+                    path: edit.path.clone(),
+                    before: edit.before.clone(),
+                    after_revision: edit.after_revision.clone(),
+                    source: edit.source,
+                })
+                .collect(),
+            next_sequence: state.next_sequence,
+            changes: state.changes.clone(),
+        })
+    }
+
+    pub fn state(&self) -> Result<WorkspaceStateSnapshot> {
+        self.export_state()
+    }
+
+    pub fn restore_state(&self, persisted: WorkspaceStateSnapshot) -> Result<()> {
+        if persisted.project_id != self.inner.project_id
+            || Path::new(&persisted.root) != self.inner.root
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted workspace identity does not match the opened workspace",
+                false,
+            ));
+        }
+
+        if persisted
+            .changes
+            .iter()
+            .any(|change| change.project_id != self.inner.project_id)
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted workspace change belongs to another project",
+                false,
+            ));
+        }
+        if persisted
+            .checkpoints
+            .iter()
+            .any(|checkpoint| checkpoint.project_id != self.inner.project_id)
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted checkpoint belongs to another project",
+                false,
+            ));
+        }
+        for checkpoint in &persisted.checkpoints {
+            for (path, file) in &checkpoint.files {
+                self.resolve_relative(path, true)?;
+                if file.revision != revision(&file.content) {
+                    return Err(LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted checkpoint revision for '{path}' is invalid"),
+                        false,
+                    ));
+                }
+            }
+        }
+        for edit in &persisted.edits {
+            self.resolve_relative(&edit.path, true)?;
+        }
+        if persisted
+            .changes
+            .windows(2)
+            .any(|changes| changes[0].sequence >= changes[1].sequence)
+            || persisted
+                .changes
+                .last()
+                .is_some_and(|change| change.sequence != persisted.next_sequence)
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted workspace change sequences are invalid",
+                false,
+            ));
+        }
+        let mut state = self.lock_state()?;
+        state.control = persisted.control;
+        state.checkpoints = persisted
+            .checkpoints
+            .into_iter()
+            .map(|checkpoint| (checkpoint.id, checkpoint))
+            .collect();
+        state.edits = persisted
+            .edits
+            .into_iter()
+            .map(|edit| EditRecord {
+                path: edit.path,
+                before: edit.before,
+                after_revision: edit.after_revision,
+                source: edit.source,
+            })
+            .collect();
+        state.next_sequence = persisted.next_sequence;
+        state.changes = persisted.changes;
+        state.watcher_snapshot = Some(self.snapshot()?);
+        Ok(())
+    }
+
+    pub fn restore(&self, persisted: WorkspaceStateSnapshot) -> Result<()> {
+        self.restore_state(persisted)
+    }
+
+    pub fn checkpoints(&self) -> Result<Vec<Checkpoint>> {
+        Ok(self.lock_state()?.checkpoints.values().cloned().collect())
     }
 
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot> {
@@ -946,6 +1085,22 @@ mod tests {
             .unwrap();
         workspace.undo_last_agent_edit().unwrap();
         assert_eq!(workspace.read_file("README.md").unwrap().content, "hello\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_state_restores_checkpoints_and_user_control() {
+        let (workspace, root) = workspace();
+        let checkpoint = workspace
+            .create_checkpoint(None, "durable checkpoint")
+            .unwrap();
+        workspace.take_control(WorkspaceControl::User).unwrap();
+        let state = workspace.export_state().unwrap();
+        let restored = Workspace::open(workspace.project_id(), &root).unwrap();
+        restored.restore_state(state).unwrap();
+
+        assert_eq!(restored.control().unwrap(), WorkspaceControl::User);
+        assert_eq!(restored.checkpoint(checkpoint.id).unwrap(), checkpoint);
         fs::remove_dir_all(root).unwrap();
     }
 

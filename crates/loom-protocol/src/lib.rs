@@ -1,12 +1,15 @@
 use loom_agent::{AgentEvent, AgentRunSnapshot};
+use loom_context::ContextAssemblyOptions;
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, Capability, CapabilitySet, EventSequence, LoomError,
-    ProjectId, ProtocolVersion, RequestId, RunId, SessionEvent, SessionEventRecord, ToolCallId,
+    ProjectId, ProtocolVersion, RequestId, RunId, SessionEvent, SessionEventRecord, SessionLimits,
+    ToolCallId, UsageSnapshot,
 };
-use loom_model::{ModelDescriptor, ModelId};
+use loom_model::{ModelDescriptor, ModelId, ProviderId};
 use loom_process::{
     TaskEventRecord, TaskSnapshot, TaskSpec, TerminalEventRecord, TerminalSnapshot,
 };
+use loom_providers::{ProviderHealth, ProviderSummary, ProviderUsageSummary};
 use loom_workspace::{
     Checkpoint, RevertResult, UndoResult, WorkspaceChange, WorkspaceControl, WorkspaceEdit,
     WorkspaceEditResult, WorkspaceFile, WorkspaceSnapshot,
@@ -67,7 +70,20 @@ pub enum ClientRequest {
         system_instructions: Option<String>,
         repository_instructions: Option<String>,
     },
+    StartAgentRunWithOptions {
+        session_id: AgentSessionId,
+        task: String,
+        model: ModelId,
+        workspace_root: String,
+        system_instructions: Option<String>,
+        repository_instructions: Option<String>,
+        limits: SessionLimits,
+        context: ContextAssemblyOptions,
+    },
     GetAgentRun {
+        run_id: RunId,
+    },
+    GetRunCheckpoint {
         run_id: RunId,
     },
     ApproveAgentAction {
@@ -85,7 +101,37 @@ pub enum ClientRequest {
     RetryAgentStep {
         run_id: RunId,
     },
+    PauseAgentRun {
+        run_id: RunId,
+    },
+    ResumeAgentRun {
+        run_id: RunId,
+    },
+    RetryAgentFromCheckpoint {
+        run_id: RunId,
+        checkpoint_id: loom_core::CheckpointId,
+    },
+    ForkAgentSession {
+        session_id: AgentSessionId,
+        name: String,
+    },
     ListModels,
+    ListProviders,
+    DiscoverProviderModels {
+        provider_id: ProviderId,
+    },
+    GetProviderHealth {
+        provider_id: ProviderId,
+    },
+    GetRunUsage {
+        run_id: RunId,
+    },
+    GetSessionUsage {
+        session_id: AgentSessionId,
+    },
+    InspectAgentContext {
+        run_id: RunId,
+    },
     OpenWorkspace {
         project_id: ProjectId,
         root: String,
@@ -178,14 +224,26 @@ impl ClientRequest {
             Self::GetAgentSession { .. } => Some(Capability::ReadAgentSession),
             Self::GetSessionEvents { .. } => Some(Capability::SubscribeSessionEvents),
             Self::StartAgentRun { .. } => Some(Capability::StartAgentRun),
+            Self::StartAgentRunWithOptions { .. } => Some(Capability::StartAgentRun),
             Self::GetAgentRun { .. } => Some(Capability::ReadAgentRun),
+            Self::GetRunCheckpoint { .. } => Some(Capability::ReadAgentRun),
             Self::ApproveAgentAction { .. } | Self::RejectAgentAction { .. } => {
                 Some(Capability::ApproveAgentAction)
             }
             Self::InterruptAgentRun { .. } | Self::RetryAgentStep { .. } => {
                 Some(Capability::ControlAgentRun)
             }
+            Self::PauseAgentRun { .. } => Some(Capability::PauseAgentRun),
+            Self::ResumeAgentRun { .. } => Some(Capability::ResumeAgentRun),
+            Self::RetryAgentFromCheckpoint { .. } => Some(Capability::RetryFromCheckpoint),
+            Self::ForkAgentSession { .. } => Some(Capability::ForkAgentSession),
             Self::ListModels => None,
+            Self::ListProviders => Some(Capability::ListProviders),
+            Self::DiscoverProviderModels { .. } => Some(Capability::ListProviders),
+            Self::GetProviderHealth { .. } => Some(Capability::ReadProviderHealth),
+            Self::GetRunUsage { .. } => Some(Capability::ReadUsage),
+            Self::GetSessionUsage { .. } => Some(Capability::ReadUsage),
+            Self::InspectAgentContext { .. } => Some(Capability::InspectContext),
             Self::OpenWorkspace { .. } => Some(Capability::OpenWorkspace),
             Self::GetWorkspaceSnapshot { .. } | Self::ReadWorkspaceFile { .. } => {
                 Some(Capability::ReadWorkspace)
@@ -239,14 +297,35 @@ impl ResponseEnvelope {
 pub enum ServerResponse {
     Negotiated(NegotiationResult),
     AgentSessionCreated(AgentSessionSnapshot),
+    AgentSessionForked(AgentSessionSnapshot),
     AgentSession(AgentSessionSnapshot),
     AgentRunStarted(AgentRunSnapshot),
     AgentRun(AgentRunSnapshot),
-    SessionEvents { events: Vec<ServerEventEnvelope> },
-    Models { models: Vec<ModelDescriptor> },
+    RunCheckpoint(loom_workspace::Checkpoint),
+    SessionEvents {
+        events: Vec<ServerEventEnvelope>,
+    },
+    Models {
+        models: Vec<ModelDescriptor>,
+    },
+    Providers {
+        providers: Vec<ProviderSummary>,
+    },
+    ProviderHealth(ProviderHealth),
+    RunUsage {
+        usage: UsageSnapshot,
+        provider: ProviderUsageSummary,
+    },
+    SessionUsage {
+        usage: UsageSnapshot,
+        provider: ProviderUsageSummary,
+    },
+    ContextInspection(loom_context::ContextInspection),
     WorkspaceOpened(WorkspaceSnapshot),
     WorkspaceSnapshot(WorkspaceSnapshot),
-    WorkspaceEvents { events: Vec<WorkspaceChange> },
+    WorkspaceEvents {
+        events: Vec<WorkspaceChange>,
+    },
     WorkspaceFile(WorkspaceFile),
     WorkspaceEditApplied(WorkspaceEditResult),
     WorkspaceControl(WorkspaceControl),
@@ -256,10 +335,14 @@ pub enum ServerResponse {
     ApprovalPolicy(loom_core::ApprovalPolicy),
     TerminalOpened(TerminalSnapshot),
     Terminal(TerminalSnapshot),
-    TerminalEvents { events: Vec<TerminalEventRecord> },
+    TerminalEvents {
+        events: Vec<TerminalEventRecord>,
+    },
     TaskStarted(TaskSnapshot),
     Task(TaskSnapshot),
-    TaskEvents { events: Vec<TaskEventRecord> },
+    TaskEvents {
+        events: Vec<TaskEventRecord>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -286,6 +369,10 @@ pub enum ServerEvent {
         previous: loom_core::AgentSessionState,
         current: loom_core::AgentSessionState,
     },
+    AgentSessionForked {
+        source_session_id: AgentSessionId,
+        snapshot: AgentSessionSnapshot,
+    },
     Agent {
         event: AgentEvent,
     },
@@ -297,6 +384,10 @@ pub enum ServerEvent {
     },
     Task {
         event: TaskEventRecord,
+    },
+    ProviderHealthChanged {
+        provider_id: ProviderId,
+        health: ProviderHealth,
     },
 }
 
@@ -319,6 +410,13 @@ impl ServerEventEnvelope {
             SessionEvent::AgentSessionStateChanged {
                 previous, current, ..
             } => ServerEvent::AgentSessionStateChanged { previous, current },
+            SessionEvent::AgentSessionForked {
+                source_session_id,
+                snapshot,
+            } => ServerEvent::AgentSessionForked {
+                source_session_id,
+                snapshot,
+            },
         };
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,

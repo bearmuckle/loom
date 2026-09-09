@@ -9,6 +9,7 @@ pub enum AgentSessionState {
     Queued,
     Planning,
     AwaitingApproval,
+    Paused,
     Executing,
     Evaluating,
     NeedsInput,
@@ -37,6 +38,10 @@ pub enum SessionEvent {
         session_id: AgentSessionId,
         previous: AgentSessionState,
         current: AgentSessionState,
+    },
+    AgentSessionForked {
+        source_session_id: AgentSessionId,
+        snapshot: AgentSessionSnapshot,
     },
 }
 

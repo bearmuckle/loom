@@ -59,9 +59,24 @@ patches, tests, and a terminal while the user can stop or reject any action.
   time/tool/cost limits.
 - Add session fork, retry from checkpoint, pause/resume, and background work.
 
-**Exit condition:** the same task can be run with two hosted providers or a
-local model, and a disconnected/restarted backend resumes the session without
-losing the transcript or workspace state.
+Implementation notes for the first vertical slice:
+
+- `loom-providers` supplies deterministic, OpenAI-compatible, and Ollama
+  configurations with normalized discovery, capability intersection,
+  credential references, usage records, rate-limit/error normalization, and
+  health state.
+- `loom-persistence` stores a versioned JSON snapshot atomically. The
+  snapshot covers the session/event journal, serializable runtime state,
+  checkpoints, policies, provider health, and usage. Recovery pauses
+  unfinished runs for explicit resume.
+- `loom-context` reports assembly decisions, compaction summaries, omissions,
+  and budgets. Runtime limits are represented by typed usage/limit events.
+
+**Exit condition:** the same task can be run with deterministic and
+OpenAI-compatible/local configurations, and a disconnected/restarted backend
+resumes the session without losing the transcript or workspace state. The
+CLI `--m3-demo` exercises provider discovery and a persistent restart fixture;
+the GPUI shell exposes provider count and pause/resume controls.
 
 ### M4 - Remote backend control
 

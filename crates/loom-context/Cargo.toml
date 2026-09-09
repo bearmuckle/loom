@@ -1,6 +1,6 @@
 [package]
-name = "loom-session"
-description = "Agent session lifecycle, event journal, and durable state for Loom."
+name = "loom-context"
+description = "Provider-neutral context inspection, assembly, and compaction for Loom."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,6 @@ rust-version.workspace = true
 
 [dependencies]
 loom-core.workspace = true
+loom-model.workspace = true
 serde.workspace = true
 
-[dev-dependencies]
-loom-core.workspace = true

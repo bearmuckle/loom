@@ -17,7 +17,14 @@ pub enum ErrorCode {
     ProcessCancelled,
     UnsupportedProtocol,
     ProviderUnavailable,
+    ProviderAuthentication,
+    ProviderRateLimited,
+    ProviderInvalidResponse,
     ToolExecution,
+    Persistence,
+    ContextLimitExceeded,
+    SessionLimitExceeded,
+    RecoveryRequired,
     Internal,
 }
 
@@ -35,7 +42,14 @@ impl fmt::Display for ErrorCode {
             Self::ProcessCancelled => "process_cancelled",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::ProviderUnavailable => "provider_unavailable",
+            Self::ProviderAuthentication => "provider_authentication",
+            Self::ProviderRateLimited => "provider_rate_limited",
+            Self::ProviderInvalidResponse => "provider_invalid_response",
             Self::ToolExecution => "tool_execution",
+            Self::Persistence => "persistence",
+            Self::ContextLimitExceeded => "context_limit_exceeded",
+            Self::SessionLimitExceeded => "session_limit_exceeded",
+            Self::RecoveryRequired => "recovery_required",
             Self::Internal => "internal",
         };
         formatter.write_str(value)

@@ -95,3 +95,41 @@ reject, interrupt, and retry controls. See
 [ADR 0003](docs/decisions/0003-m2-workspace-and-human-control.md) for the
 implementation tradeoffs and deferred PTY, persistence, and remote-watch
 work.
+
+## M3 providers and durable orchestration
+
+M3 keeps the M2 protocol and workspace boundaries while adding a provider
+registry and restart-safe orchestration:
+
+- deterministic fixtures, arbitrary OpenAI-compatible HTTP configurations, and
+  an Ollama-compatible local runtime share normalized model descriptors,
+  capability negotiation, usage ledgers, health state, and rate-limit/error
+  codes;
+- provider configuration stores only opaque credential references in
+  descriptors, events, and durable state. Secret material is resolved by the
+  backend credential store and is never returned by `ListProviders`;
+- sessions, event envelopes, prompts/messages, run state, steps, tool and
+  approval events, policies, workspace checkpoints, and model usage are saved
+  in an atomic, versioned JSON state file when the backend is opened with
+  `InProcessBackend::new_persistent`;
+- context inspection reports instruction/conversation items, token budgets,
+  summaries, compaction, and explicit omissions. Session limits cover elapsed
+  time, input/output tokens, tool calls, and cost without silently switching
+  providers or truncating required context;
+- pause/resume, fork, retry-from-checkpoint, and recovery after restart are
+  typed protocol operations. A disconnected client does not own the runtime;
+  another connection can resume the same backend state.
+
+Run the deterministic provider, list the deterministic and local provider
+configurations, then close and reopen the backend from the persisted transcript:
+
+```sh
+cargo run -p loom-cli -- --m3-demo
+```
+
+The local-compatible fixture uses `http://127.0.0.1:11434/v1/chat/completions`
+and model `llama3.2`; pass `--model llama3.2` when an Ollama server is
+available. The persistence file can be selected explicitly with
+`--persistence <path>`. See
+[ADR 0004](docs/decisions/0004-m3-providers-and-durable-orchestration.md) for
+the persistence, provider, context, and recovery tradeoffs.

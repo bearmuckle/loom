@@ -23,14 +23,26 @@ fn main() -> Result<(), LoomError> {
         return Ok(());
     };
     let workspace_root = prepare_workspace(options.root.clone())?;
-    let backend = InProcessBackend::new();
+    let temporary_persistence = options.m3_demo && options.persistence.is_none();
+    let persistence_path = options.persistence.clone().or_else(|| {
+        options
+            .m3_demo
+            .then(|| env::temp_dir().join(format!("loom-m3-demo-{}.json", ProjectId::new())))
+    });
+    let backend = match persistence_path.as_deref() {
+        Some(path) => InProcessBackend::new_persistent(path)?,
+        None => InProcessBackend::new(),
+    };
     let connection = backend.connect();
 
     negotiate(&connection)?;
     let session = create_session(&connection, &options.name)?;
     let run_id = start_run(&connection, session.id, &options, &workspace_root)?;
 
-    println!("Loom native M2 shell");
+    println!(
+        "Loom native {} shell",
+        if options.m3_demo { "M3 durable" } else { "M2" }
+    );
     println!(
         "Connected in-process using protocol {}.{}",
         CURRENT_PROTOCOL_VERSION.major, CURRENT_PROTOCOL_VERSION.minor
@@ -42,6 +54,17 @@ fn main() -> Result<(), LoomError> {
     if options.m2_demo {
         demonstrate_m2_services(&connection, session.project_id, &workspace_root)?;
     }
+    if options.m3_demo {
+        demonstrate_m3_recovery(
+            backend,
+            connection,
+            persistence_path.as_deref().expect("M3 persistence path"),
+            temporary_persistence,
+            session.project_id,
+            session.id,
+            run_id,
+        )?;
+    }
     Ok(())
 }
 
@@ -52,6 +75,8 @@ struct CliOptions {
     root: Option<PathBuf>,
     manual_approval: bool,
     m2_demo: bool,
+    m3_demo: bool,
+    persistence: Option<PathBuf>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOptions>, LoomError> {
@@ -62,6 +87,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
         root: None,
         manual_approval: false,
         m2_demo: false,
+        m3_demo: false,
+        persistence: None,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -71,12 +98,22 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--root" => options.root = Some(PathBuf::from(required_value(&mut args, "--root")?)),
             "--manual-approval" => options.manual_approval = true,
             "--m2-demo" => options.m2_demo = true,
+            "--m3-demo" => options.m3_demo = true,
+            "--persistence" => {
+                options.persistence =
+                    Some(PathBuf::from(required_value(&mut args, "--persistence")?));
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: loom [--name <name>] [--task <task>] [--model <id>] \
-                     [--root <path>] [--manual-approval]"
+                     [--root <path>] [--manual-approval] [--m3-demo] \
+                     [--persistence <path>]"
                 );
                 println!("Add --m2-demo to exercise workspace, terminal, and task APIs.");
+                println!(
+                    "Add --m3-demo to persist the run, list deterministic/Ollama providers, \
+                     and reopen the backend."
+                );
                 println!(
                     "The default workspace is an isolated directory in the system temp folder."
                 );
@@ -93,6 +130,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             }
             value if value.starts_with("--root=") => {
                 options.root = Some(PathBuf::from(value["--root=".len()..].to_owned()));
+            }
+            value if value.starts_with("--persistence=") => {
+                options.persistence =
+                    Some(PathBuf::from(value["--persistence=".len()..].to_owned()));
             }
             _ => {
                 return Err(LoomError::invalid_request(format!(
@@ -247,6 +288,85 @@ fn demonstrate_m2_services(
     Ok(())
 }
 
+fn demonstrate_m3_recovery(
+    backend: std::sync::Arc<InProcessBackend>,
+    connection: InProcessConnection,
+    persistence_path: &Path,
+    temporary_persistence: bool,
+    project_id: ProjectId,
+    session_id: AgentSessionId,
+    run_id: RunId,
+) -> Result<(), LoomError> {
+    let providers = connection.request(RequestEnvelope::new(ClientRequest::ListProviders));
+    if let ServerResponse::Providers { providers } = providers.result? {
+        println!("M3 providers:");
+        for provider in providers {
+            println!(
+                "  {} ({:?}) - {} model(s), health {:?}",
+                provider.id.as_str(),
+                provider.kind,
+                provider.models.len(),
+                provider.health.state
+            );
+        }
+    }
+    backend.flush()?;
+    drop(connection);
+    drop(backend);
+
+    let recovered_backend = InProcessBackend::open_persistent(persistence_path)?;
+    let recovered = recovered_backend.connect();
+    negotiate(&recovered)?;
+    let session = recovered.request(RequestEnvelope::new(ClientRequest::GetAgentSession {
+        session_id,
+    }));
+    let session = match session.result? {
+        ServerResponse::AgentSession(snapshot) => snapshot,
+        response => return Err(unexpected_response("recovered session", response)),
+    };
+    let run = recovered.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+    let run = match run.result? {
+        ServerResponse::AgentRun(snapshot) => snapshot,
+        response => return Err(unexpected_response("recovered run", response)),
+    };
+    let events = recovered.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+        session_id: Some(session_id),
+        after_sequence: None,
+    }));
+    let event_count = match events.result? {
+        ServerResponse::SessionEvents { events } => events.len(),
+        response => return Err(unexpected_response("recovered events", response)),
+    };
+    let workspace = recovered.request(RequestEnvelope::new(ClientRequest::GetWorkspaceSnapshot {
+        project_id,
+    }));
+    let entries = match workspace.result? {
+        ServerResponse::WorkspaceSnapshot(snapshot) => snapshot.entries.len(),
+        response => return Err(unexpected_response("recovered workspace", response)),
+    };
+    println!(
+        "M3 recovered session {} [{}], run [{}], {} events, {} workspace entries",
+        session.id,
+        session_state_name(session.state),
+        run_state_name(run.state),
+        event_count,
+        entries
+    );
+    if temporary_persistence {
+        fs::remove_file(persistence_path).map_err(|error| {
+            LoomError::new(
+                ErrorCode::ToolExecution,
+                format!(
+                    "could not remove temporary M3 persistence file '{}': {error}",
+                    persistence_path.display()
+                ),
+                false,
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn prepare_workspace(root: Option<PathBuf>) -> Result<PathBuf, LoomError> {
     let default_root = env::temp_dir().join("loom-m1-demo");
     let root = root.unwrap_or_else(|| default_root.clone());
@@ -298,7 +418,15 @@ fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
             Capability::StartAgentRun,
             Capability::ReadAgentRun,
             Capability::ControlAgentRun,
+            Capability::PauseAgentRun,
+            Capability::ResumeAgentRun,
+            Capability::ForkAgentSession,
+            Capability::RetryFromCheckpoint,
             Capability::ApproveAgentAction,
+            Capability::ListProviders,
+            Capability::ReadProviderHealth,
+            Capability::ReadUsage,
+            Capability::InspectContext,
             Capability::OpenWorkspace,
             Capability::ReadWorkspace,
             Capability::WriteWorkspace,
@@ -481,6 +609,17 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
         ServerEvent::AgentSessionStateChanged { current, .. } => {
             println!("      session state -> {}", session_state_name(*current));
         }
+        ServerEvent::AgentSessionForked {
+            source_session_id,
+            snapshot,
+        } => {
+            println!(
+                "session forked from {}: {} [{}]",
+                source_session_id,
+                snapshot.id,
+                session_state_name(snapshot.state)
+            );
+        }
         ServerEvent::Agent { event } => match event {
             AgentEvent::RunStarted { snapshot } => {
                 println!("Run {} [{}]", snapshot.id, run_state_name(snapshot.state));
@@ -490,6 +629,24 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
                 for (index, step) in plan.steps.iter().enumerate() {
                     println!("  {}. {}", index + 1, step.description);
                 }
+            }
+            AgentEvent::StepStarted { index, .. } => {
+                println!("Step {} started", index + 1);
+            }
+            AgentEvent::StepCompleted { index, .. } => {
+                println!("Step {} completed", index + 1);
+            }
+            AgentEvent::ContextInspected { inspection, .. } => {
+                println!(
+                    "Context: {} input tokens ({} omitted, compacted: {})",
+                    inspection.included_tokens, inspection.omitted_tokens, inspection.compacted
+                );
+            }
+            AgentEvent::ProviderError { error, .. } => {
+                println!("Provider error [{}]: {}", error.code, error.message);
+            }
+            AgentEvent::ContextError { error, .. } => {
+                println!("Context error [{}]: {}", error.code, error.message);
             }
             AgentEvent::AssistantMessageDelta { text, .. } => {
                 println!("Assistant: {}", text.trim_end());
@@ -527,6 +684,16 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
                 "Usage: {} input / {} output tokens",
                 usage.input_tokens, usage.output_tokens
             ),
+            AgentEvent::RunUsageUpdated { usage, .. } => println!(
+                "Total usage: {} input / {} output tokens / {} tool calls / {} cost micros",
+                usage.input_tokens, usage.output_tokens, usage.tool_calls, usage.cost_micros
+            ),
+            AgentEvent::RunLimitReached { status, .. } => {
+                println!("Session limit reached: {:?}", status.exceeded);
+            }
+            AgentEvent::RecoveryRequired { reason, .. } => {
+                println!("Recovery requires attention: {reason}");
+            }
             AgentEvent::RunStateChanged { state, .. } => {
                 println!("Run state -> {}", run_state_name(*state));
             }
@@ -542,6 +709,16 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
         }
         ServerEvent::Task { event } => {
             println!("Task event: {:?}", event.event);
+        }
+        ServerEvent::ProviderHealthChanged {
+            provider_id,
+            health,
+        } => {
+            println!(
+                "Provider {} health: {:?}",
+                provider_id.as_str(),
+                health.state
+            );
         }
     }
 }
@@ -560,6 +737,7 @@ const fn session_state_name(state: AgentSessionState) -> &'static str {
         AgentSessionState::Queued => "queued",
         AgentSessionState::Planning => "planning",
         AgentSessionState::AwaitingApproval => "awaiting_approval",
+        AgentSessionState::Paused => "paused",
         AgentSessionState::Executing => "executing",
         AgentSessionState::Evaluating => "evaluating",
         AgentSessionState::NeedsInput => "needs_input",
@@ -574,6 +752,7 @@ const fn run_state_name(state: AgentRunState) -> &'static str {
         AgentRunState::Planning => "planning",
         AgentRunState::Executing => "executing",
         AgentRunState::AwaitingApproval => "awaiting_approval",
+        AgentRunState::Paused => "paused",
         AgentRunState::Evaluating => "evaluating",
         AgentRunState::Completed => "completed",
         AgentRunState::Failed => "failed",
