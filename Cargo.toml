@@ -1,11 +1,15 @@
 [workspace]
 members = [
     "crates/loom-core",
+    "crates/loom-tools",
     "crates/loom-model",
     "crates/loom-protocol",
+    "crates/loom-providers",
+    "crates/loom-agent",
     "crates/loom-session",
     "crates/loom-server",
     "crates/loom-cli",
+    "crates/loom-ui",
 ]
 resolver = "2"
 
@@ -17,11 +21,16 @@ version = "0.1.0"
 
 [workspace.dependencies]
 loom-core = { path = "crates/loom-core" }
+loom-tools = { path = "crates/loom-tools" }
 loom-model = { path = "crates/loom-model" }
 loom-protocol = { path = "crates/loom-protocol" }
+loom-providers = { path = "crates/loom-providers" }
+loom-agent = { path = "crates/loom-agent" }
 loom-session = { path = "crates/loom-session" }
 loom-server = { path = "crates/loom-server" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
+gpui = "=0.2.2"
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
 uuid = { version = "1.16", features = ["serde", "v4"] }

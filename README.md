@@ -36,7 +36,7 @@ should produce a demonstrable vertical slice, and architecture decisions
 should be recorded as implementation settles details such as the GPUI
 variant, schema format, persistence engine, and supported deployment targets.
 
-## Foundation implementation
+## M0 foundation and M1 vertical slice
 
 The M0 foundation is a Rust workspace with shared domain types, provider-
 neutral model types, a versioned JSON protocol, an in-process backend, and a
@@ -47,6 +47,21 @@ cargo run -p loom-cli -- --name "Foundation demo"
 ```
 
 The shell negotiates protocol capabilities, creates an empty agent session,
-and renders the authoritative session event stream. See
-[ADR 0001](docs/decisions/0001-foundation.md) for the initial implementation
-decisions and deferred frontend choices.
+and renders the authoritative session event stream.
+
+M1 adds the deterministic provider, an OpenAI-compatible adapter, the
+workspace tools, approvals, interruption, retry, streamed agent events, and
+the GPUI three-pane native client:
+
+```sh
+# Text event-stream client with automatic approvals
+cargo run -p loom-cli -- --task "make a small repository change"
+
+# GPUI client against the isolated M1 demo workspace
+cargo run -p loom-ui
+```
+
+The GPUI client starts against an isolated temporary workspace and pauses on
+write/command approvals. See [ADR 0001](docs/decisions/0001-foundation.md) and
+[ADR 0002](docs/decisions/0002-m1-agent-vertical-slice.md) for the
+implementation decisions.

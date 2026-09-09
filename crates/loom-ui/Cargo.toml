@@ -1,15 +1,20 @@
 [package]
-name = "loom-protocol"
-description = "Versioned request, response, and event contracts for Loom clients and backends."
+name = "loom-ui"
+description = "GPUI native client for the Loom M1 single-agent vertical slice."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "loom-ui"
+path = "src/main.rs"
+
 [dependencies]
+gpui.workspace = true
 loom-agent.workspace = true
 loom-core.workspace = true
 loom-model.workspace = true
-serde.workspace = true
+loom-protocol.workspace = true
+loom-server.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true

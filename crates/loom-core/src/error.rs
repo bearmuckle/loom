@@ -7,11 +7,14 @@ use thiserror::Error;
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     InvalidRequest,
+    InvalidState,
     MalformedPayload,
     NotFound,
     Conflict,
     CapabilityDenied,
     UnsupportedProtocol,
+    ProviderUnavailable,
+    ToolExecution,
     Internal,
 }
 
@@ -19,11 +22,14 @@ impl fmt::Display for ErrorCode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
             Self::InvalidRequest => "invalid_request",
+            Self::InvalidState => "invalid_state",
             Self::MalformedPayload => "malformed_payload",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::CapabilityDenied => "capability_denied",
             Self::UnsupportedProtocol => "unsupported_protocol",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::ToolExecution => "tool_execution",
             Self::Internal => "internal",
         };
         formatter.write_str(value)

@@ -8,6 +8,10 @@ pub enum Capability {
     CreateAgentSession,
     ReadAgentSession,
     SubscribeSessionEvents,
+    StartAgentRun,
+    ReadAgentRun,
+    ControlAgentRun,
+    ApproveAgentAction,
     JsonProtocol,
 }
 

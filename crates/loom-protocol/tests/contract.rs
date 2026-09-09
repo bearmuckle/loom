@@ -1,7 +1,9 @@
+use loom_agent::{AgentEvent, AgentRunSnapshot, AgentRunState};
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet,
-    EventSequence, ProjectId, ProtocolVersion, Timestamp,
+    EventSequence, ProjectId, ProtocolVersion, RunId, Timestamp,
 };
+use loom_model::ModelId;
 use loom_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ResponseEnvelope, ServerEvent,
     ServerEventEnvelope, ServerResponse, decode_event, decode_request, decode_response,
@@ -72,4 +74,35 @@ fn response_can_carry_model_list_without_provider_specific_types() {
     let decoded = decode_response(&encoded).unwrap();
 
     assert_eq!(decoded, response);
+}
+
+#[test]
+fn agent_event_json_round_trip_preserves_run_identity() {
+    let run = AgentRunSnapshot {
+        id: RunId::new(),
+        session_id: AgentSessionId::new(),
+        task: "inspect the workspace".to_owned(),
+        model: ModelId::new("deterministic/demo"),
+        state: AgentRunState::Executing,
+        started_at: Timestamp::from_unix_millis(2),
+        updated_at: Timestamp::from_unix_millis(3),
+        completed_at: None,
+        summary: None,
+    };
+    let event = ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(8),
+        session_id: run.session_id,
+        event: ServerEvent::Agent {
+            event: AgentEvent::RunStarted {
+                snapshot: run.clone(),
+            },
+        },
+    };
+
+    let encoded = encode_event(&event).unwrap();
+    let decoded = decode_event(&encoded).unwrap();
+
+    assert_eq!(decoded, event);
+    assert_eq!(run.state, AgentRunState::Executing);
 }

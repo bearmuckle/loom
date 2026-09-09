@@ -1,6 +1,7 @@
+use loom_agent::{AgentEvent, AgentRunSnapshot};
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, Capability, CapabilitySet, EventSequence, LoomError,
-    ProjectId, ProtocolVersion, RequestId, SessionEvent, SessionEventRecord,
+    ProjectId, ProtocolVersion, RequestId, RunId, SessionEvent, SessionEventRecord, ToolCallId,
 };
 use loom_model::{ModelDescriptor, ModelId};
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,32 @@ pub enum ClientRequest {
         session_id: Option<AgentSessionId>,
         after_sequence: Option<EventSequence>,
     },
+    StartAgentRun {
+        session_id: AgentSessionId,
+        task: String,
+        model: ModelId,
+        workspace_root: String,
+        system_instructions: Option<String>,
+        repository_instructions: Option<String>,
+    },
+    GetAgentRun {
+        run_id: RunId,
+    },
+    ApproveAgentAction {
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+    },
+    RejectAgentAction {
+        run_id: RunId,
+        tool_call_id: ToolCallId,
+        reason: Option<String>,
+    },
+    InterruptAgentRun {
+        run_id: RunId,
+    },
+    RetryAgentStep {
+        run_id: RunId,
+    },
     ListModels,
 }
 
@@ -61,6 +88,14 @@ impl ClientRequest {
             Self::CreateAgentSession { .. } => Some(Capability::CreateAgentSession),
             Self::GetAgentSession { .. } => Some(Capability::ReadAgentSession),
             Self::GetSessionEvents { .. } => Some(Capability::SubscribeSessionEvents),
+            Self::StartAgentRun { .. } => Some(Capability::StartAgentRun),
+            Self::GetAgentRun { .. } => Some(Capability::ReadAgentRun),
+            Self::ApproveAgentAction { .. } | Self::RejectAgentAction { .. } => {
+                Some(Capability::ApproveAgentAction)
+            }
+            Self::InterruptAgentRun { .. } | Self::RetryAgentStep { .. } => {
+                Some(Capability::ControlAgentRun)
+            }
             Self::ListModels => None,
         }
     }
@@ -97,6 +132,8 @@ pub enum ServerResponse {
     Negotiated(NegotiationResult),
     AgentSessionCreated(AgentSessionSnapshot),
     AgentSession(AgentSessionSnapshot),
+    AgentRunStarted(AgentRunSnapshot),
+    AgentRun(AgentRunSnapshot),
     SessionEvents { events: Vec<ServerEventEnvelope> },
     Models { models: Vec<ModelDescriptor> },
 }
@@ -125,11 +162,24 @@ pub enum ServerEvent {
         previous: loom_core::AgentSessionState,
         current: loom_core::AgentSessionState,
     },
+    Agent {
+        event: AgentEvent,
+    },
 }
 
 impl From<SessionEventRecord> for ServerEventEnvelope {
     fn from(record: SessionEventRecord) -> Self {
-        let event = match record.event {
+        Self::from_session_event(record.sequence, record.session_id, record.event)
+    }
+}
+
+impl ServerEventEnvelope {
+    pub fn from_session_event(
+        sequence: EventSequence,
+        session_id: AgentSessionId,
+        event: SessionEvent,
+    ) -> Self {
+        let event = match event {
             SessionEvent::AgentSessionCreated { snapshot } => {
                 ServerEvent::AgentSessionCreated { snapshot }
             }
@@ -139,9 +189,22 @@ impl From<SessionEventRecord> for ServerEventEnvelope {
         };
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence: record.sequence,
-            session_id: record.session_id,
+            sequence,
+            session_id,
             event,
+        }
+    }
+
+    pub fn from_agent_event(
+        sequence: EventSequence,
+        session_id: AgentSessionId,
+        event: AgentEvent,
+    ) -> Self {
+        Self {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence,
+            session_id,
+            event: ServerEvent::Agent { event },
         }
     }
 }
@@ -184,8 +247,4 @@ pub fn unsupported_version_error(requested: ProtocolVersion) -> LoomError {
         CURRENT_PROTOCOL_VERSION.major,
         CURRENT_PROTOCOL_VERSION.minor
     ))
-}
-
-pub fn model_id(value: &str) -> ModelId {
-    ModelId::new(value)
 }

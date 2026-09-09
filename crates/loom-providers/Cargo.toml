@@ -1,15 +1,13 @@
 [package]
-name = "loom-protocol"
-description = "Versioned request, response, and event contracts for Loom clients and backends."
+name = "loom-providers"
+description = "Deterministic and OpenAI-compatible model providers for Loom."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-loom-agent.workspace = true
 loom-core.workspace = true
 loom-model.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
+ureq.workspace = true

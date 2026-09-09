@@ -1,15 +1,13 @@
 [package]
-name = "loom-protocol"
-description = "Versioned request, response, and event contracts for Loom clients and backends."
+name = "loom-tools"
+description = "Workspace-scoped tools used by Loom agent runs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-loom-agent.workspace = true
 loom-core.workspace = true
 loom-model.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
