@@ -1,7 +1,7 @@
 use loom_context::{ContextAssembler, ContextAssemblyOptions, ContextInput, ContextInspection};
 use loom_core::{
-    AgentSessionId, ApprovalPolicy, ErrorCode, LimitKind, LimitStatus, LoomError, PolicyEvaluation,
-    Result, RunId, SessionLimits, StepId, Timestamp, UsageSnapshot,
+    AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink, LimitKind, LimitStatus, LoomError,
+    PolicyEvaluation, Result, RunId, SessionLimits, StepId, Timestamp, UsageSnapshot,
 };
 use loom_model::{
     CompletionOptions, MessageRole, ModelId, ModelMessage, ModelRequest, ModelStreamEvent,
@@ -35,6 +35,8 @@ pub struct AgentRunSnapshot {
     pub updated_at: Timestamp,
     pub completed_at: Option<Timestamp>,
     pub summary: Option<String>,
+    #[serde(default)]
+    pub evidence: Vec<EvidenceLink>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -264,6 +266,7 @@ impl AgentRuntime {
             updated_at: now,
             completed_at: None,
             summary: None,
+            evidence: Vec::new(),
         };
         let plan = AgentPlan {
             steps: vec![
@@ -370,6 +373,10 @@ impl AgentRuntime {
 
     pub fn checkpoint_id(&self) -> Option<loom_core::CheckpointId> {
         self.options.checkpoint_id
+    }
+
+    pub fn add_evidence(&mut self, links: impl IntoIterator<Item = EvidenceLink>) {
+        self.run.evidence.extend(links);
     }
 
     pub fn export_state(&self) -> AgentRuntimeState {

@@ -9,8 +9,9 @@ use loom_agent::{
 };
 use loom_core::{
     AgentSessionId, AgentSessionState, ApprovalPolicy, Capability, CapabilitySet, ErrorCode,
-    EventSequence, LoomError, ProjectId, ProtocolVersion, Result, SessionEventRecord,
+    EventSequence, LoomError, ProjectId, ProtocolVersion, Result, SessionEventRecord, Timestamp,
 };
+use loom_language::LanguageServiceManager;
 use loom_model::{ModelDescriptor, ModelId, ProviderId};
 use loom_persistence::{CURRENT_SCHEMA_VERSION, FilePersistence};
 use loom_process::{TaskSupervisor, TerminalManager};
@@ -24,7 +25,8 @@ use loom_providers::{
 };
 use loom_session::SessionManager;
 use loom_tools::ToolExecutor;
-use loom_workspace::Workspace;
+use loom_vcs::GitService;
+use loom_workspace::{EditorWorkspace, Workspace};
 use serde::{Deserialize, Serialize};
 
 mod auth;
@@ -154,6 +156,9 @@ pub struct InProcessBackend {
     runs: Mutex<BTreeMap<loom_core::RunId, AgentRuntime>>,
     journal: Mutex<EventJournal>,
     workspaces: Mutex<BTreeMap<ProjectId, Workspace>>,
+    editors: Mutex<BTreeMap<ProjectId, EditorWorkspace>>,
+    language_services: Mutex<BTreeMap<ProjectId, LanguageServiceManager>>,
+    vcs: Mutex<BTreeMap<ProjectId, GitService>>,
     task_supervisors: Mutex<BTreeMap<ProjectId, TaskSupervisor>>,
     policies: Mutex<BTreeMap<ProjectId, ApprovalPolicy>>,
     terminal_projects: Mutex<BTreeMap<loom_core::TerminalId, ProjectId>>,
@@ -299,6 +304,9 @@ impl InProcessBackend {
             runs: Mutex::new(BTreeMap::new()),
             journal: Mutex::new(EventJournal::default()),
             workspaces: Mutex::new(BTreeMap::new()),
+            editors: Mutex::new(BTreeMap::new()),
+            language_services: Mutex::new(BTreeMap::new()),
+            vcs: Mutex::new(BTreeMap::new()),
             task_supervisors: Mutex::new(BTreeMap::new()),
             policies: Mutex::new(BTreeMap::new()),
             terminal_projects: Mutex::new(BTreeMap::new()),
@@ -331,6 +339,19 @@ impl InProcessBackend {
                 Capability::ConfigureApprovalPolicy,
                 Capability::ManageCheckpoints,
                 Capability::TakeoverWorkspace,
+                Capability::WorkspaceNavigation,
+                Capability::SearchWorkspace,
+                Capability::ReadWorkspaceInstructions,
+                Capability::ReadDiagnostics,
+                Capability::ReadSymbols,
+                Capability::GoToDefinition,
+                Capability::FindReferences,
+                Capability::LanguageServiceLifecycle,
+                Capability::ReadVcsStatus,
+                Capability::ReadVcsDiff,
+                Capability::MutateVcsIndex,
+                Capability::CreateVcsCommit,
+                Capability::ReadTaskEvidence,
                 Capability::JsonProtocol,
             ]),
             models,
@@ -398,6 +419,38 @@ impl InProcessBackend {
             LoomError::new(
                 ErrorCode::Internal,
                 "workspace manager lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn editors(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, EditorWorkspace>>> {
+        self.editors.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "editor workspace manager lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn language_services(
+        &self,
+    ) -> Result<MutexGuard<'_, BTreeMap<ProjectId, LanguageServiceManager>>> {
+        self.language_services.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "language service manager lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn vcs(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, GitService>>> {
+        self.vcs.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "Git service manager lock was poisoned",
                 true,
             )
         })
@@ -713,6 +766,37 @@ impl InProcessConnection {
             .get(&project_id)
             .cloned()
             .ok_or_else(|| LoomError::not_found("workspace", project_id))
+    }
+
+    fn editor(&self, project_id: ProjectId) -> Result<EditorWorkspace> {
+        let workspace = self.workspace(project_id)?;
+        let mut editors = self.backend.editors()?;
+        let editor = editors
+            .entry(project_id)
+            .or_insert_with(|| EditorWorkspace::new(workspace))
+            .clone();
+        drop(editors);
+        editor.autosave_due(Timestamp::now())?;
+        Ok(editor)
+    }
+
+    fn language_services(&self, project_id: ProjectId) -> Result<LanguageServiceManager> {
+        self.workspace(project_id)?;
+        let mut services = self.backend.language_services()?;
+        Ok(services
+            .entry(project_id)
+            .or_insert_with(LanguageServiceManager::basic)
+            .clone())
+    }
+
+    fn vcs(&self, project_id: ProjectId) -> Result<GitService> {
+        if let Some(service) = self.backend.vcs()?.get(&project_id).cloned() {
+            return Ok(service);
+        }
+        let workspace = self.workspace(project_id)?;
+        let service = GitService::open(workspace.root())?;
+        self.backend.vcs()?.insert(project_id, service.clone());
+        Ok(service)
     }
 
     fn policy(&self, project_id: ProjectId) -> Result<ApprovalPolicy> {
@@ -1221,6 +1305,218 @@ impl InProcessConnection {
             } => Ok(ServerResponse::Task(
                 self.task_supervisor(project_id)?.cancel(task_id)?,
             )),
+            ClientRequest::GetTaskEvidence {
+                project_id,
+                task_id,
+            } => Ok(ServerResponse::TaskEvidence {
+                evidence: self.task_supervisor(project_id)?.get(task_id)?.evidence,
+            }),
+            ClientRequest::OpenEditorBuffer { project_id, path } => Ok(
+                ServerResponse::EditorBuffer(self.editor(project_id)?.open_buffer(&path)?),
+            ),
+            ClientRequest::GetEditorBuffer {
+                project_id,
+                buffer_id,
+            } => Ok(ServerResponse::EditorBuffer(
+                self.editor(project_id)?.buffer(buffer_id)?,
+            )),
+            ClientRequest::EditEditorBuffer {
+                project_id,
+                buffer_id,
+                edit,
+            } => Ok(ServerResponse::EditorBuffer(
+                self.editor(project_id)?.edit_buffer(buffer_id, edit)?,
+            )),
+            ClientRequest::UndoEditorBuffer {
+                project_id,
+                buffer_id,
+            } => Ok(ServerResponse::EditorBuffer(
+                self.editor(project_id)?.undo(buffer_id)?,
+            )),
+            ClientRequest::RedoEditorBuffer {
+                project_id,
+                buffer_id,
+            } => Ok(ServerResponse::EditorBuffer(
+                self.editor(project_id)?.redo(buffer_id)?,
+            )),
+            ClientRequest::SaveEditorBuffer {
+                project_id,
+                buffer_id,
+            } => Ok(ServerResponse::EditorBuffer(
+                self.editor(project_id)?.save_buffer(buffer_id)?,
+            )),
+            ClientRequest::ReloadEditorBuffer {
+                project_id,
+                buffer_id,
+                discard_dirty,
+            } => Ok(ServerResponse::EditorBuffer(
+                self.editor(project_id)?
+                    .reload_buffer(buffer_id, discard_dirty)?,
+            )),
+            ClientRequest::MarkExternalEditorChanges { project_id } => {
+                let editor = self.editor(project_id)?;
+                editor.mark_external_changes()?;
+                Ok(ServerResponse::EditorBuffers {
+                    buffers: editor.buffers()?,
+                })
+            }
+            ClientRequest::SetAutosavePolicy { project_id, policy } => {
+                let editor = self.editor(project_id)?;
+                editor.set_autosave_policy(policy)?;
+                Ok(ServerResponse::AutosavePolicy(policy))
+            }
+            ClientRequest::GetEditorLayout { project_id } => Ok(ServerResponse::EditorLayout(
+                self.editor(project_id)?.layout()?,
+            )),
+            ClientRequest::SplitEditor {
+                project_id,
+                direction,
+            } => Ok(ServerResponse::EditorLayout(
+                self.editor(project_id)?.split(direction)?,
+            )),
+            ClientRequest::FocusEditorPane {
+                project_id,
+                pane_id,
+            } => Ok(ServerResponse::EditorLayout(
+                self.editor(project_id)?.focus_pane(pane_id)?,
+            )),
+            ClientRequest::FocusEditorTab {
+                project_id,
+                pane_id,
+                buffer_id,
+            } => Ok(ServerResponse::EditorLayout(
+                self.editor(project_id)?.focus_tab(pane_id, buffer_id)?,
+            )),
+            ClientRequest::CloseEditorBuffer {
+                project_id,
+                buffer_id,
+                force,
+            } => {
+                let editor = self.editor(project_id)?;
+                editor.close_buffer(buffer_id, force)?;
+                Ok(ServerResponse::EditorLayout(editor.layout()?))
+            }
+            ClientRequest::GetFileTree { project_id } => Ok(ServerResponse::FileTree {
+                entries: self.editor(project_id)?.file_tree()?,
+            }),
+            ClientRequest::FuzzyFindFiles {
+                project_id,
+                query,
+                limit,
+            } => Ok(ServerResponse::FuzzyFiles {
+                paths: self.editor(project_id)?.fuzzy_find_files(&query, limit)?,
+            }),
+            ClientRequest::SearchWorkspace { project_id, query } => {
+                Ok(ServerResponse::SearchMatches {
+                    matches: self.editor(project_id)?.search(query)?,
+                })
+            }
+            ClientRequest::GetContextFiles { project_id } => Ok(ServerResponse::ContextFiles {
+                files: self.editor(project_id)?.context_files()?,
+            }),
+            ClientRequest::RecordAgentChange {
+                project_id,
+                buffer_id,
+                marker,
+            } => Ok(ServerResponse::EditorBuffer(
+                self.editor(project_id)?
+                    .record_agent_change(buffer_id, marker)?,
+            )),
+            ClientRequest::ClearAgentMarkers {
+                project_id,
+                buffer_id,
+            } => Ok(ServerResponse::EditorBuffer(
+                self.editor(project_id)?.clear_agent_markers(buffer_id)?,
+            )),
+            ClientRequest::DiscoverLanguageServices { project_id } => {
+                Ok(ServerResponse::LanguageServices {
+                    services: self.language_services(project_id)?.descriptors(),
+                })
+            }
+            ClientRequest::StartLanguageService { project_id, path } => {
+                let manager = self.language_services(project_id)?;
+                let descriptor = manager.start_for_path(&path)?;
+                Ok(ServerResponse::LanguageServices {
+                    services: vec![descriptor],
+                })
+            }
+            ClientRequest::StopLanguageService { project_id, path } => {
+                let manager = self.language_services(project_id)?;
+                let descriptor = manager.stop_for_path(&path)?;
+                Ok(ServerResponse::LanguageServices {
+                    services: vec![descriptor],
+                })
+            }
+            ClientRequest::GetDiagnostics { project_id, path } => Ok(ServerResponse::Diagnostics {
+                diagnostics: self
+                    .language_services(project_id)?
+                    .diagnostics(&self.workspace(project_id)?, &path)?,
+                path,
+            }),
+            ClientRequest::GetSymbols { project_id, path } => Ok(ServerResponse::Symbols {
+                symbols: self
+                    .language_services(project_id)?
+                    .symbols(&self.workspace(project_id)?, &path)?,
+                path,
+            }),
+            ClientRequest::GoToDefinition {
+                project_id,
+                path,
+                position,
+            } => Ok(ServerResponse::Locations {
+                locations: self
+                    .language_services(project_id)?
+                    .go_to_definition(&self.workspace(project_id)?, &path, position)?
+                    .into_iter()
+                    .collect(),
+            }),
+            ClientRequest::FindReferences {
+                project_id,
+                path,
+                position,
+            } => Ok(ServerResponse::Locations {
+                locations: self.language_services(project_id)?.references(
+                    &self.workspace(project_id)?,
+                    &path,
+                    position,
+                )?,
+            }),
+            ClientRequest::GetVcsStatus { project_id } => {
+                Ok(ServerResponse::VcsStatus(self.vcs(project_id)?.status()?))
+            }
+            ClientRequest::GetVcsDiff {
+                project_id,
+                path,
+                staged,
+            } => Ok(ServerResponse::VcsDiff(
+                self.vcs(project_id)?.diff(path.as_deref(), staged)?,
+            )),
+            ClientRequest::StageVcsPaths { project_id, paths } => Ok(ServerResponse::VcsStatus(
+                self.vcs(project_id)?.stage(&paths)?,
+            )),
+            ClientRequest::UnstageVcsPaths { project_id, paths } => Ok(ServerResponse::VcsStatus(
+                self.vcs(project_id)?.unstage(&paths)?,
+            )),
+            ClientRequest::CreateVcsCommit {
+                project_id,
+                message,
+            } => Ok(ServerResponse::VcsCommit(
+                self.vcs(project_id)?.commit(&message)?,
+            )),
+            ClientRequest::GetVcsBranches { project_id } => Ok(ServerResponse::VcsBranches {
+                branches: self.vcs(project_id)?.branches()?,
+            }),
+            ClientRequest::GetVcsConflicts { project_id } => Ok(ServerResponse::VcsConflicts {
+                paths: self.vcs(project_id)?.conflicts()?,
+            }),
+            ClientRequest::AttachRunEvidence { run_id, evidence } => {
+                let mut runs = self.backend.runs()?;
+                let runtime = runs
+                    .get_mut(&run_id)
+                    .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
+                runtime.add_evidence(evidence);
+                Ok(ServerResponse::AgentRun(runtime.snapshot()))
+            }
         }
     }
 
@@ -1328,6 +1624,138 @@ impl InProcessConnection {
                 project_id: requested_project,
                 ..
             } => project_id = Some(*requested_project),
+            ClientRequest::OpenEditorBuffer {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetEditorBuffer {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::EditEditorBuffer {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::UndoEditorBuffer {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::RedoEditorBuffer {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::SaveEditorBuffer {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::ReloadEditorBuffer {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::MarkExternalEditorChanges {
+                project_id: requested_project,
+            }
+            | ClientRequest::SetAutosavePolicy {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetEditorLayout {
+                project_id: requested_project,
+            }
+            | ClientRequest::SplitEditor {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::FocusEditorPane {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::FocusEditorTab {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::CloseEditorBuffer {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetFileTree {
+                project_id: requested_project,
+            }
+            | ClientRequest::FuzzyFindFiles {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::SearchWorkspace {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetContextFiles {
+                project_id: requested_project,
+            }
+            | ClientRequest::RecordAgentChange {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::ClearAgentMarkers {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::DiscoverLanguageServices {
+                project_id: requested_project,
+            }
+            | ClientRequest::StartLanguageService {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::StopLanguageService {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetDiagnostics {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetSymbols {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GoToDefinition {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::FindReferences {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetVcsStatus {
+                project_id: requested_project,
+            }
+            | ClientRequest::GetVcsDiff {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::StageVcsPaths {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::UnstageVcsPaths {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::CreateVcsCommit {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetVcsBranches {
+                project_id: requested_project,
+            }
+            | ClientRequest::GetVcsConflicts {
+                project_id: requested_project,
+            }
+            | ClientRequest::GetTaskEvidence {
+                project_id: requested_project,
+                ..
+            } => project_id = Some(*requested_project),
             ClientRequest::GetAgentSession {
                 session_id: requested_session,
             }
@@ -1385,6 +1813,10 @@ impl InProcessConnection {
             }
             | ClientRequest::InspectAgentContext {
                 run_id: requested_run,
+            } => run_id = Some(*requested_run),
+            ClientRequest::AttachRunEvidence {
+                run_id: requested_run,
+                ..
             } => run_id = Some(*requested_run),
             ClientRequest::CreateCheckpoint {
                 project_id: requested_project,
@@ -1492,6 +1924,12 @@ impl InProcessConnection {
         input.options.input_cost_micros_per_1k = input_cost_micros_per_1k;
         input.options.output_cost_micros_per_1k = output_cost_micros_per_1k;
         let workspace = self.open_workspace(session.project_id, input.workspace_root)?;
+        if input.repository_instructions.is_none() {
+            let instructions = self.editor(session.project_id)?.instruction_text()?;
+            if !instructions.trim().is_empty() {
+                input.repository_instructions = Some(instructions);
+            }
+        }
         let checkpoint = workspace.create_checkpoint(Some(input.session_id), "before agent run")?;
         input.options.checkpoint_id = Some(checkpoint.id);
         let tools = ToolExecutor::new_with_workspace(workspace);
@@ -1666,13 +2104,15 @@ impl InProcessConnection {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, thread, time::Duration};
+    use std::{fs, path::PathBuf, process::Command, thread, time::Duration};
 
     use loom_context::ContextAssemblyOptions;
     use loom_core::{CapabilitySet, PolicyDecision, ProjectId, ToolCallId};
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
     use loom_protocol::{ClientRequest, RequestEnvelope, ServerEvent, ServerResponse};
-    use loom_workspace::{WorkspaceControl, WorkspaceEdit};
+    use loom_workspace::{
+        AutosavePolicy, BufferEdit, SearchQuery, TextRange, WorkspaceControl, WorkspaceEdit,
+    };
 
     use super::*;
 
@@ -1744,6 +2184,40 @@ mod tests {
                 Capability::WriteWorkspace,
                 Capability::SubscribeWorkspaceEvents,
                 Capability::ManageCheckpoints,
+            ]),
+        }));
+        assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
+    }
+
+    fn negotiate_m5(connection: &InProcessConnection) {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities: CapabilitySet::new([
+                Capability::CreateAgentSession,
+                Capability::ReadAgentSession,
+                Capability::SubscribeSessionEvents,
+                Capability::StartAgentRun,
+                Capability::ReadAgentRun,
+                Capability::ControlAgentRun,
+                Capability::ApproveAgentAction,
+                Capability::OpenWorkspace,
+                Capability::ReadWorkspace,
+                Capability::WriteWorkspace,
+                Capability::WorkspaceNavigation,
+                Capability::SearchWorkspace,
+                Capability::ReadWorkspaceInstructions,
+                Capability::ReadDiagnostics,
+                Capability::ReadSymbols,
+                Capability::GoToDefinition,
+                Capability::FindReferences,
+                Capability::LanguageServiceLifecycle,
+                Capability::ReadVcsStatus,
+                Capability::ReadVcsDiff,
+                Capability::MutateVcsIndex,
+                Capability::CreateVcsCommit,
+                Capability::ReadTask,
+                Capability::StartTask,
+                Capability::ReadTaskEvidence,
             ]),
         }));
         assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
@@ -2446,6 +2920,151 @@ mod tests {
         };
         assert_eq!(error.code, ErrorCode::MalformedPayload);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn m5_workspace_navigation_language_vcs_and_task_evidence_are_authoritative() {
+        let root = workspace();
+        fs::write(root.join("README.md"), "fn answer() {\n TODO\n}\n").unwrap();
+        let git = |arguments: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(arguments)
+                    .current_dir(&root)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "loom@example.test"]);
+        git(&["config", "user.name", "Loom Test"]);
+        git(&["add", "--", "README.md"]);
+        git(&["commit", "-qm", "initial"]);
+
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        negotiate_m5(&connection);
+        let project_id = ProjectId::new();
+        let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+            project_id,
+            root: root.display().to_string(),
+        }));
+        assert!(matches!(
+            opened.result,
+            Ok(ServerResponse::WorkspaceOpened(_))
+        ));
+
+        let buffer = connection.request(RequestEnvelope::new(ClientRequest::OpenEditorBuffer {
+            project_id,
+            path: "README.md".to_owned(),
+        }));
+        let buffer_id = match buffer.result.unwrap() {
+            ServerResponse::EditorBuffer(buffer) => buffer.id,
+            response => panic!("unexpected buffer response: {response:?}"),
+        };
+        let edited = connection.request(RequestEnvelope::new(ClientRequest::EditEditorBuffer {
+            project_id,
+            buffer_id,
+            edit: BufferEdit {
+                range: TextRange::new(0, 2),
+                replacement: "pub".to_owned(),
+            },
+        }));
+        assert!(matches!(edited.result, Ok(ServerResponse::EditorBuffer(_))));
+        let policy = connection.request(RequestEnvelope::new(ClientRequest::SetAutosavePolicy {
+            project_id,
+            policy: AutosavePolicy::AfterIdle { delay_ms: 1 },
+        }));
+        assert!(matches!(
+            policy.result,
+            Ok(ServerResponse::AutosavePolicy(_))
+        ));
+        let tree = connection.request(RequestEnvelope::new(ClientRequest::GetFileTree {
+            project_id,
+        }));
+        assert!(matches!(tree.result, Ok(ServerResponse::FileTree { .. })));
+        let search = connection.request(RequestEnvelope::new(ClientRequest::SearchWorkspace {
+            project_id,
+            query: SearchQuery::literal("TODO"),
+        }));
+        assert!(matches!(
+            search.result,
+            Ok(ServerResponse::SearchMatches { .. })
+        ));
+
+        let language =
+            connection.request(RequestEnvelope::new(ClientRequest::StartLanguageService {
+                project_id,
+                path: "README.md".to_owned(),
+            }));
+        assert!(matches!(
+            language.result,
+            Ok(ServerResponse::LanguageServices { .. })
+        ));
+        let diagnostics = connection.request(RequestEnvelope::new(ClientRequest::GetDiagnostics {
+            project_id,
+            path: "README.md".to_owned(),
+        }));
+        assert!(matches!(
+            diagnostics.result,
+            Ok(ServerResponse::Diagnostics { .. })
+        ));
+        let vcs = connection.request(RequestEnvelope::new(ClientRequest::GetVcsStatus {
+            project_id,
+        }));
+        assert!(matches!(vcs.result, Ok(ServerResponse::VcsStatus(_))));
+
+        let task = connection.request(RequestEnvelope::new(ClientRequest::StartTask {
+            project_id,
+            spec: TaskSpec {
+                kind: TaskKind::Test,
+                label: "evidence fixture".to_owned(),
+                command: if cfg!(windows) {
+                    "cmd".to_owned()
+                } else {
+                    "printf".to_owned()
+                },
+                args: if cfg!(windows) {
+                    vec!["/C".to_owned(), "ok".to_owned()]
+                } else {
+                    vec!["ok".to_owned()]
+                },
+                cwd: None,
+                output_limit_bytes: Some(128),
+                artifact_paths: Vec::new(),
+            },
+        }));
+        let task_id = match task.result.unwrap() {
+            ServerResponse::TaskStarted(task) => task.id,
+            response => panic!("unexpected task response: {response:?}"),
+        };
+        for _ in 0..100 {
+            let current = connection.request(RequestEnvelope::new(ClientRequest::GetTask {
+                project_id,
+                task_id,
+            }));
+            if let Ok(ServerResponse::Task(snapshot)) = current.result {
+                if matches!(
+                    snapshot.status,
+                    TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+                ) {
+                    let evidence =
+                        connection.request(RequestEnvelope::new(ClientRequest::GetTaskEvidence {
+                            project_id,
+                            task_id,
+                        }));
+                    assert!(matches!(
+                        evidence.result,
+                        Ok(ServerResponse::TaskEvidence { .. })
+                    ));
+                    fs::remove_dir_all(root).unwrap();
+                    return;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("task evidence fixture did not finish");
     }
 
     #[test]

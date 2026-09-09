@@ -170,3 +170,31 @@ cargo run -p loom-cli -- --m4-demo
 
 See [ADR 0005](docs/decisions/0005-m4-remote-backend-control.md) for the
 transport/authentication/reconnect choices and their current limitations.
+
+## M5 coding workspace
+
+M5 turns the GPUI shell into a coding workspace while keeping the M4
+backend-owned workspace and remote protocol boundaries:
+
+- `loom-workspace::EditorWorkspace` provides multi-file buffers, tabs,
+  splits, undo/redo, manual/focus-loss/idle autosave, newline and UTF-8/UTF-16
+  preservation, large-file limits, external-edit conflicts, agent markers,
+  file-tree navigation, fuzzy open, literal project search, and repository
+  instruction/context references.
+- `loom-language` provides explicit lifecycle and capability descriptors plus
+  a deterministic basic service for diagnostics, symbols, definitions, and
+  references. Unsupported languages return structured capability errors.
+- `loom-vcs` runs scoped Git commands with argument vectors (never shell
+  concatenation) for status, diffs, staging, unstaging, commits, branches,
+  and conflict visibility.
+- `loom-process` task snapshots include bounded build/test/lint output and
+  stable `loom://task/...` evidence links. Agent run snapshots can attach
+  evidence links to final summaries.
+- The GPUI layout now has activity/file navigation, an editor center with
+  tabs and unsaved/conflict indicators, an agent timeline/approval panel,
+  diagnostics/outline and task-result areas, and a Git/status footer.
+
+M5 protocol requests are additive and capability-gated, so in-process and
+WebSocket clients use the same editor, language, VCS, navigation, and task
+evidence operations. See [ADR 0006](docs/decisions/0006-m5-coding-workspace.md)
+for the choices and deferred limitations.

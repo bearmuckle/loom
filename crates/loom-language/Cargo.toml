@@ -1,0 +1,13 @@
+[package]
+name = "loom-language"
+description = "Language-service lifecycle, deterministic diagnostics, symbols, and navigation for Loom."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-core.workspace = true
+loom-workspace.workspace = true
+serde.workspace = true
+

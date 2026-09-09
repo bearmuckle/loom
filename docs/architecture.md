@@ -91,6 +91,27 @@ filesystem, and process primitives directly. This keeps provider
 normalization, authorization, auditing, cancellation, and future sandboxing
 in one place.
 
+M5 keeps `Workspace` as the authoritative root/revision boundary and layers
+`EditorWorkspace` on top of it. Editor buffers are an in-memory projection:
+they normalize text for editing, retain the original encoding/newline policy,
+and save through revision-checked workspace byte writes. A save that observes
+an external revision returns `external_change` and never overwrites the
+outside edit. Tabs and panes are client-facing layout state; sessions,
+workspaces, and agent runs remain the existing backend objects.
+
+`loom-language` currently exposes a lifecycle/capability interface and a
+deterministic basic implementation. It is deliberately not a claim that a
+full language server exists for every file type: descriptors report
+unsupported/unavailable services and operations return stable errors.
+`loom-vcs::GitService` scopes direct `git` argv execution to the canonical
+workspace root and validates every path before status, diff, index, or commit
+operations.
+
+The GPUI client projects these services into a compact activity/file sidebar,
+editor center, agent timeline/approval panel, diagnostics/outline and task
+result areas, and a Git/status footer. A remote client receives the same
+typed projections over M4 transport; no UI-only workspace truth is created.
+
 ## Agent runtime
 
 An agent session is a state machine, not an unbounded loop:

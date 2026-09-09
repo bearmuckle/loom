@@ -93,3 +93,19 @@ using another project's IDs; deployments that allow a token to select a
 project's initial root must additionally constrain the process account and
 filesystem permissions. A full per-user identity/invitation system and
 encrypted secret vault remain deferred.
+
+M5 preserves these boundaries for editor and source-control features. The
+editor opens and saves only through the canonical `Workspace` service; byte
+writes compare the saved revision first, reject traversal/outside-root
+symlinks, and report external changes without silently replacing them.
+Large-file and binary/invalid-encoding safeguards prevent the UI from loading
+unbounded or misleading text. Repository instructions and context references
+are displayed as untrusted data and do not change approval policy.
+
+Git integration executes `git` with `Command::args` from a canonical,
+workspace-scoped root. It validates paths, rejects empty/NUL commit messages,
+does not interpolate shell syntax, and exposes conflicts as structured status.
+Commit and staging capabilities remain independently discoverable and
+authorization-gated. Language-service operations are capability checked; a
+missing service is surfaced as an explicit error rather than an assumed
+privileged process.
