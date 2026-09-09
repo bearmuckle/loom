@@ -1,7 +1,9 @@
 use std::{
     env, fs,
     io::{self, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -16,12 +18,21 @@ use loom_process::{TaskKind, TaskSpec, TaskStatus, TerminalEvent, TerminalStatus
 use loom_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
 };
-use loom_server::{InProcessBackend, InProcessConnection};
+use loom_server::{
+    AuthTokenStore, AuthorizationScope, InProcessBackend, InProcessConnection, RemoteServer,
+    RemoteServerConfig, WebSocketConnection, WebSocketTransport,
+};
 
 fn main() -> Result<(), LoomError> {
     let Some(options) = parse_args(env::args().skip(1))? else {
         return Ok(());
     };
+    if options.serve {
+        return run_server(options);
+    }
+    if options.m4_demo {
+        return run_m4_demo(options);
+    }
     let workspace_root = prepare_workspace(options.root.clone())?;
     let temporary_persistence = options.m3_demo && options.persistence.is_none();
     let persistence_path = options.persistence.clone().or_else(|| {
@@ -77,6 +88,10 @@ struct CliOptions {
     m2_demo: bool,
     m3_demo: bool,
     persistence: Option<PathBuf>,
+    serve: bool,
+    m4_demo: bool,
+    bind: SocketAddr,
+    token: Option<String>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOptions>, LoomError> {
@@ -89,6 +104,12 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
         m2_demo: false,
         m3_demo: false,
         persistence: None,
+        serve: false,
+        m4_demo: false,
+        bind: "127.0.0.1:8765"
+            .parse()
+            .expect("valid default bind address"),
+        token: None,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -99,6 +120,18 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--manual-approval" => options.manual_approval = true,
             "--m2-demo" => options.m2_demo = true,
             "--m3-demo" => options.m3_demo = true,
+            "--serve" => options.serve = true,
+            "--m4-demo" => options.m4_demo = true,
+            "--bind" => {
+                options.bind = required_value(&mut args, "--bind")?
+                    .parse()
+                    .map_err(|error| {
+                        LoomError::invalid_request(format!(
+                            "--bind must be a socket address: {error}"
+                        ))
+                    })?;
+            }
+            "--token" => options.token = Some(required_value(&mut args, "--token")?),
             "--persistence" => {
                 options.persistence =
                     Some(PathBuf::from(required_value(&mut args, "--persistence")?));
@@ -107,7 +140,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                 println!(
                     "Usage: loom [--name <name>] [--task <task>] [--model <id>] \
                      [--root <path>] [--manual-approval] [--m3-demo] \
-                     [--persistence <path>]"
+                     [--persistence <path>] [--serve --bind <addr> --token <token>] \
+                     [--m4-demo]"
                 );
                 println!("Add --m2-demo to exercise workspace, terminal, and task APIs.");
                 println!(
@@ -117,6 +151,11 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                 println!(
                     "The default workspace is an isolated directory in the system temp folder."
                 );
+                println!(
+                    "Use --serve with an explicit bearer --token to expose the standalone \
+                     WebSocket backend."
+                );
+                println!("Use --m4-demo to exercise a second reconnecting remote client.");
                 return Ok(None);
             }
             value if value.starts_with("--name=") => {
@@ -135,6 +174,14 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                 options.persistence =
                     Some(PathBuf::from(value["--persistence=".len()..].to_owned()));
             }
+            value if value.starts_with("--bind=") => {
+                options.bind = value["--bind=".len()..].parse().map_err(|error| {
+                    LoomError::invalid_request(format!("--bind must be a socket address: {error}"))
+                })?;
+            }
+            value if value.starts_with("--token=") => {
+                options.token = Some(value["--token=".len()..].to_owned());
+            }
             _ => {
                 return Err(LoomError::invalid_request(format!(
                     "unknown argument '{argument}'"
@@ -151,6 +198,256 @@ fn required_value(
 ) -> Result<String, LoomError> {
     args.next()
         .ok_or_else(|| LoomError::invalid_request(format!("{flag} requires a value")))
+}
+
+fn run_server(options: CliOptions) -> Result<(), LoomError> {
+    let token = options
+        .token
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| LoomError::invalid_request("--serve requires a non-empty --token"))?;
+    let persistence_path = options.persistence;
+    let backend = match persistence_path {
+        Some(path) => InProcessBackend::new_persistent(path)?,
+        None => InProcessBackend::new(),
+    };
+    let auth = Arc::new(AuthTokenStore::new());
+    let _issued = auth.insert(token, AuthorizationScope::all())?;
+    let config = RemoteServerConfig {
+        bind_addr: options.bind,
+        ..RemoteServerConfig::default()
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not start async runtime: {error}"),
+                false,
+            )
+        })?;
+    runtime.block_on(async move {
+        let server = RemoteServer::new(backend, auth, config).bind().await?;
+        println!(
+            "Loom remote backend listening at {}",
+            server.websocket_url()
+        );
+        println!("Health endpoint: http://{}/health", server.local_addr());
+        tokio::signal::ctrl_c().await.map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not wait for shutdown: {error}"),
+                false,
+            )
+        })?;
+        server.stop().await
+    })
+}
+
+fn run_m4_demo(options: CliOptions) -> Result<(), LoomError> {
+    let workspace_root = prepare_workspace(options.root)?;
+    let backend = InProcessBackend::new();
+    let auth = Arc::new(AuthTokenStore::new());
+    let token = "loom-m4-demo-token";
+    let _issued = auth.insert(token, AuthorizationScope::all())?;
+    let config = RemoteServerConfig::local_ephemeral();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not start async runtime: {error}"),
+                false,
+            )
+        })?;
+    runtime.block_on(async move {
+        let server = RemoteServer::new(backend, auth, config).bind().await?;
+        let result = m4_demo_remote(
+            server.websocket_url().to_owned(),
+            token.to_owned(),
+            workspace_root,
+            options.task,
+        )
+        .await;
+        let stop_result = server.stop().await;
+        result.and(stop_result)
+    })
+}
+
+async fn m4_demo_remote(
+    url: String,
+    token: String,
+    workspace_root: PathBuf,
+    task: String,
+) -> Result<(), LoomError> {
+    let transport = WebSocketTransport::new(url, token);
+    let mut first = transport.connect().await?;
+    negotiate_remote(&mut first).await?;
+    let project_id = ProjectId::new();
+    let session = match first
+        .request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
+            project_id,
+            name: "M4 remote reconnect".to_owned(),
+        }))
+        .await?
+        .result?
+    {
+        ServerResponse::AgentSessionCreated(snapshot) => snapshot,
+        response => return Err(unexpected_response("remote session creation", response)),
+    };
+    let run_id = match first
+        .request(RequestEnvelope::new(ClientRequest::StartAgentRun {
+            session_id: session.id,
+            task,
+            model: ModelId::new("deterministic/demo"),
+            workspace_root: workspace_root.display().to_string(),
+            system_instructions: Some("Use the available tools and report validation.".to_owned()),
+            repository_instructions: Some("Keep the demonstration change small.".to_owned()),
+        }))
+        .await?
+        .result?
+    {
+        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        response => return Err(unexpected_response("remote run start", response)),
+    };
+    println!("M4 client 1 started run {run_id}; disconnecting before approval");
+    drop(first);
+
+    let mut second = transport.connect().await?;
+    negotiate_remote(&mut second).await?;
+    let mut after = None;
+    let mut completed = false;
+    for _ in 0..100 {
+        let response = second
+            .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: Some(session.id),
+                after_sequence: after,
+            }))
+            .await?;
+        let events = match response.result? {
+            ServerResponse::SessionEvents { events }
+            | ServerResponse::SessionEventsSnapshot { events, .. } => events,
+            response => return Err(unexpected_response("remote event resume", response)),
+        };
+        if events.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+        for event in events {
+            after = Some(event.sequence);
+            if matches!(
+                &event.event,
+                ServerEvent::Agent {
+                    event: AgentEvent::StepStarted { run_id: event_run, .. }
+                } if *event_run == run_id
+            ) {
+                println!("M4 client 2 observed a resumed agent step");
+            }
+            if let ServerEvent::Agent {
+                event:
+                    AgentEvent::ToolApprovalRequired {
+                        run_id: event_run,
+                        call,
+                    },
+            } = &event.event
+                && *event_run == run_id
+            {
+                println!("M4 client 2 approving {}", call.name);
+                second
+                    .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+                        run_id,
+                        tool_call_id: call.id,
+                    }))
+                    .await?
+                    .result?;
+            }
+            if matches!(
+                &event.event,
+                ServerEvent::Agent {
+                    event: AgentEvent::RunCompleted { snapshot }
+                } if snapshot.id == run_id
+            ) {
+                completed = true;
+            }
+        }
+        if completed {
+            break;
+        }
+    }
+    let final_run = second
+        .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }))
+        .await?;
+    let ServerResponse::AgentRun(snapshot) = final_run.result? else {
+        return Err(LoomError::new(
+            ErrorCode::Internal,
+            "remote client received an unexpected final run response",
+            false,
+        ));
+    };
+    println!(
+        "M4 client 2 retrieved result: {} [{}]",
+        snapshot.summary.unwrap_or_else(|| "none".to_owned()),
+        run_state_name(snapshot.state)
+    );
+    second.close().await?;
+    Ok(())
+}
+
+async fn negotiate_remote(connection: &mut WebSocketConnection) -> Result<(), LoomError> {
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+        .await?;
+    if !matches!(response.result?, ServerResponse::Capabilities(_)) {
+        return Err(LoomError::new(
+            ErrorCode::UnsupportedProtocol,
+            "remote server did not return capability discovery",
+            false,
+        ));
+    }
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities: client_capabilities(),
+        }))
+        .await?;
+    match response.result? {
+        ServerResponse::Negotiated(_) => Ok(()),
+        response => Err(unexpected_response("remote negotiation", response)),
+    }
+}
+
+fn client_capabilities() -> CapabilitySet {
+    CapabilitySet::new([
+        Capability::CreateAgentSession,
+        Capability::ReadAgentSession,
+        Capability::SubscribeSessionEvents,
+        Capability::StartAgentRun,
+        Capability::ReadAgentRun,
+        Capability::ControlAgentRun,
+        Capability::PauseAgentRun,
+        Capability::ResumeAgentRun,
+        Capability::ForkAgentSession,
+        Capability::RetryFromCheckpoint,
+        Capability::ApproveAgentAction,
+        Capability::ListProviders,
+        Capability::ReadProviderHealth,
+        Capability::ReadUsage,
+        Capability::InspectContext,
+        Capability::OpenWorkspace,
+        Capability::ReadWorkspace,
+        Capability::WriteWorkspace,
+        Capability::SubscribeWorkspaceEvents,
+        Capability::OpenTerminal,
+        Capability::ControlTerminal,
+        Capability::ReadTask,
+        Capability::StartTask,
+        Capability::ControlTask,
+        Capability::ConfigureApprovalPolicy,
+        Capability::ManageCheckpoints,
+        Capability::TakeoverWorkspace,
+        Capability::JsonProtocol,
+    ])
 }
 
 fn demonstrate_m2_services(

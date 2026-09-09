@@ -42,6 +42,14 @@ impl RequestEnvelope {
             request,
         }
     }
+
+    pub fn with_request_id(request_id: RequestId, request: ClientRequest) -> Self {
+        Self {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            request_id,
+            request,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -51,6 +59,7 @@ pub enum ClientRequest {
         client_version: ProtocolVersion,
         capabilities: CapabilitySet,
     },
+    DiscoverCapabilities,
     CreateAgentSession {
         project_id: ProjectId,
         name: String,
@@ -219,7 +228,7 @@ pub enum ClientRequest {
 impl ClientRequest {
     pub const fn required_capability(&self) -> Option<Capability> {
         match self {
-            Self::Negotiate { .. } => None,
+            Self::Negotiate { .. } | Self::DiscoverCapabilities => None,
             Self::CreateAgentSession { .. } => Some(Capability::CreateAgentSession),
             Self::GetAgentSession { .. } => Some(Capability::ReadAgentSession),
             Self::GetSessionEvents { .. } => Some(Capability::SubscribeSessionEvents),
@@ -265,6 +274,36 @@ impl ClientRequest {
             Self::CancelTask { .. } => Some(Capability::ControlTask),
         }
     }
+
+    pub const fn is_retryable_mutation(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateAgentSession { .. }
+                | Self::StartAgentRun { .. }
+                | Self::StartAgentRunWithOptions { .. }
+                | Self::ApproveAgentAction { .. }
+                | Self::RejectAgentAction { .. }
+                | Self::InterruptAgentRun { .. }
+                | Self::RetryAgentStep { .. }
+                | Self::PauseAgentRun { .. }
+                | Self::ResumeAgentRun { .. }
+                | Self::RetryAgentFromCheckpoint { .. }
+                | Self::ForkAgentSession { .. }
+                | Self::OpenWorkspace { .. }
+                | Self::ApplyWorkspaceEdit { .. }
+                | Self::TakeWorkspaceControl { .. }
+                | Self::CreateCheckpoint { .. }
+                | Self::RevertCheckpoint { .. }
+                | Self::UndoWorkspaceEdit { .. }
+                | Self::SetApprovalPolicy { .. }
+                | Self::OpenTerminal { .. }
+                | Self::WriteTerminalInput { .. }
+                | Self::ResizeTerminal { .. }
+                | Self::CancelTerminal { .. }
+                | Self::StartTask { .. }
+                | Self::CancelTask { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -296,6 +335,7 @@ impl ResponseEnvelope {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ServerResponse {
     Negotiated(NegotiationResult),
+    Capabilities(NegotiationResult),
     AgentSessionCreated(AgentSessionSnapshot),
     AgentSessionForked(AgentSessionSnapshot),
     AgentSession(AgentSessionSnapshot),
@@ -304,6 +344,12 @@ pub enum ServerResponse {
     RunCheckpoint(loom_workspace::Checkpoint),
     SessionEvents {
         events: Vec<ServerEventEnvelope>,
+    },
+    SessionEventsSnapshot {
+        session: AgentSessionSnapshot,
+        events: Vec<ServerEventEnvelope>,
+        oldest_sequence: EventSequence,
+        latest_sequence: EventSequence,
     },
     Models {
         models: Vec<ModelDescriptor>,
@@ -349,6 +395,20 @@ pub enum ServerResponse {
 pub struct NegotiationResult {
     pub protocol_version: ProtocolVersion,
     pub capabilities: CapabilitySet,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ClientFrame {
+    Request(Box<RequestEnvelope>),
+    Cancel { request_id: RequestId },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum ServerFrame {
+    Response(ResponseEnvelope),
+    Event(ServerEventEnvelope),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -467,6 +527,22 @@ pub fn encode_event(event: &ServerEventEnvelope) -> Result<Vec<u8>, CodecError> 
 }
 
 pub fn decode_event(bytes: &[u8]) -> Result<ServerEventEnvelope, CodecError> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+pub fn encode_client_frame(frame: &ClientFrame) -> Result<Vec<u8>, CodecError> {
+    Ok(serde_json::to_vec(frame)?)
+}
+
+pub fn decode_client_frame(bytes: &[u8]) -> Result<ClientFrame, CodecError> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+pub fn encode_server_frame(frame: &ServerFrame) -> Result<Vec<u8>, CodecError> {
+    Ok(serde_json::to_vec(frame)?)
+}
+
+pub fn decode_server_frame(bytes: &[u8]) -> Result<ServerFrame, CodecError> {
     Ok(serde_json::from_slice(bytes)?)
 }
 

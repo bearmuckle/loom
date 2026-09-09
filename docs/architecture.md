@@ -175,6 +175,27 @@ checkpoints, policy decisions, provider health, and usage ledgers. A runtime
 that was executing during a process crash is recovered in `paused` state so a
 new connection must explicitly resume it.
 
+M4 keeps `InProcessBackend` as the single domain service and adds a transport
+adapter in `loom-server::remote`:
+
+```text
+HTTP upgrade + bearer token
+          |
+  bounded WebSocket connection
+          |
+ authenticated InProcessConnection
+          |
+ existing journal/runtime/workspace/provider services
+```
+
+`RemoteServerConfig` makes the bind address, path, heartbeat, request
+deadline, frame size, and outbound capacity explicit. It defaults to loopback
+and `/ws`; a `RunningRemoteServer` owns graceful shutdown. The
+`WebSocketTransport` client uses the same JSON codecs as protocol tests, so a
+native client and a browser client do not need different domain operations.
+Transport tasks may time out or be cancelled, but backend work that already
+entered the synchronous runtime is deliberately not tied to the connection.
+
 ## Repository layout
 
 The repository should evolve toward a Rust workspace:

@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -27,10 +27,23 @@ use loom_tools::ToolExecutor;
 use loom_workspace::Workspace;
 use serde::{Deserialize, Serialize};
 
+mod auth;
+mod remote;
+
+pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
+pub use remote::{
+    RemoteServer, RemoteServerConfig, RunningRemoteServer, WebSocketConnection, WebSocketTransport,
+};
+
+const DEFAULT_EVENT_RETENTION: usize = 4096;
+const IDEMPOTENCY_RETENTION: usize = 1024;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct EventJournal {
     next_sequence: EventSequence,
     events: Vec<ServerEventEnvelope>,
+    #[serde(default = "default_event_retention")]
+    retention_limit: usize,
 }
 
 impl EventJournal {
@@ -52,8 +65,61 @@ impl EventJournal {
 
     fn next(&mut self) -> EventSequence {
         self.next_sequence = self.next_sequence.next();
+        if self.retention_limit == 0 {
+            self.retention_limit = DEFAULT_EVENT_RETENTION;
+        }
+        let excess = self
+            .events
+            .len()
+            .saturating_add(1)
+            .saturating_sub(self.retention_limit);
+        if excess > 0 {
+            self.events.drain(..excess);
+        }
         self.next_sequence
     }
+
+    fn is_cursor_stale(&self, after_sequence: Option<EventSequence>) -> bool {
+        let Some(after_sequence) = after_sequence else {
+            return false;
+        };
+        self.events
+            .first()
+            .is_some_and(|first| after_sequence.next() < first.sequence)
+    }
+
+    fn set_retention(&mut self, limit: usize) {
+        self.retention_limit = limit;
+        let excess = self.events.len().saturating_sub(limit);
+        if excess > 0 {
+            self.events.drain(..excess);
+        }
+    }
+
+    fn events_since(
+        &self,
+        session_id: Option<AgentSessionId>,
+        after_sequence: Option<EventSequence>,
+    ) -> Vec<ServerEventEnvelope> {
+        self.events
+            .iter()
+            .filter(|event| {
+                session_id.is_none_or(|id| event.session_id == id)
+                    && after_sequence.is_none_or(|sequence| event.sequence > sequence)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn default_event_retention() -> usize {
+    DEFAULT_EVENT_RETENTION
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct IdempotencyRecord {
+    request: ClientRequest,
+    response: ResponseEnvelope,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -69,6 +135,8 @@ struct PersistedBackendState {
     provider_health: BTreeMap<ProviderId, ProviderHealth>,
     provider_usage: UsageLedger,
     models: Vec<ModelDescriptor>,
+    #[serde(default)]
+    idempotency: BTreeMap<loom_core::RequestId, IdempotencyRecord>,
 }
 
 struct StartRunInput {
@@ -94,6 +162,8 @@ pub struct InProcessBackend {
     models: Vec<ModelDescriptor>,
     providers: ProviderRegistry,
     persistence: Option<FilePersistence>,
+    idempotency: Mutex<BTreeMap<loom_core::RequestId, IdempotencyRecord>>,
+    mutation_lock: Mutex<()>,
 }
 
 impl InProcessBackend {
@@ -266,6 +336,8 @@ impl InProcessBackend {
             models,
             providers,
             persistence,
+            idempotency: Mutex::new(BTreeMap::new()),
+            mutation_lock: Mutex::new(()),
         });
         backend.restore_persisted()?;
         Ok(backend)
@@ -275,6 +347,15 @@ impl InProcessBackend {
         InProcessConnection {
             backend: Arc::clone(self),
             negotiated_capabilities: Arc::new(Mutex::new(None)),
+            auth: None,
+        }
+    }
+
+    pub fn connect_authenticated(self: &Arc<Self>, auth: AuthSession) -> InProcessConnection {
+        InProcessConnection {
+            backend: Arc::clone(self),
+            negotiated_capabilities: Arc::new(Mutex::new(None)),
+            auth: Some(auth),
         }
     }
 
@@ -397,6 +478,10 @@ impl InProcessBackend {
             *target = state.journal;
         }
         {
+            let mut target = self.idempotency()?;
+            *target = state.idempotency;
+        }
+        {
             let mut target = self.policies()?;
             *target = state.policies;
         }
@@ -499,6 +584,7 @@ impl InProcessBackend {
             provider_health: self.providers.export_health()?,
             provider_usage: self.providers.usage()?,
             models: self.models.clone(),
+            idempotency: self.idempotency()?.clone(),
         };
         persistence.save_versioned(CURRENT_SCHEMA_VERSION, &state)
     }
@@ -525,12 +611,83 @@ impl InProcessBackend {
         }
         Ok(())
     }
+
+    fn idempotency(
+        &self,
+    ) -> Result<MutexGuard<'_, BTreeMap<loom_core::RequestId, IdempotencyRecord>>> {
+        self.idempotency.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "idempotency cache lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn mutation_lock(&self) -> Result<MutexGuard<'_, ()>> {
+        self.mutation_lock.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "mutation serialization lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn cached_response(
+        &self,
+        request_id: loom_core::RequestId,
+        request: &ClientRequest,
+    ) -> Result<Option<ResponseEnvelope>> {
+        let cache = self.idempotency()?;
+        let Some(record) = cache.get(&request_id) else {
+            return Ok(None);
+        };
+        if &record.request != request {
+            return Err(LoomError::conflict(format!(
+                "request id {request_id} was already used for a different mutation"
+            )));
+        }
+        Ok(Some(record.response.clone()))
+    }
+
+    fn remember_response(
+        &self,
+        request_id: loom_core::RequestId,
+        request: ClientRequest,
+        response: ResponseEnvelope,
+    ) -> Result<()> {
+        let mut cache = self.idempotency()?;
+        cache.insert(request_id, IdempotencyRecord { request, response });
+        while cache.len() > IDEMPOTENCY_RETENTION {
+            let Some(first) = cache.keys().next().copied() else {
+                break;
+            };
+            cache.remove(&first);
+        }
+        Ok(())
+    }
+
+    pub fn set_event_retention(&self, limit: usize) -> Result<()> {
+        if limit == 0 {
+            return Err(LoomError::invalid_request(
+                "event retention limit must be greater than zero",
+            ));
+        }
+        self.journal()?.set_retention(limit);
+        Ok(())
+    }
+
+    pub fn event_retention(&self) -> Result<usize> {
+        Ok(self.journal()?.retention_limit.max(1))
+    }
 }
 
 #[derive(Clone)]
 pub struct InProcessConnection {
     backend: Arc<InProcessBackend>,
     negotiated_capabilities: Arc<Mutex<Option<CapabilitySet>>>,
+    auth: Option<AuthSession>,
 }
 
 impl InProcessConnection {
@@ -600,6 +757,11 @@ impl InProcessConnection {
 
     pub fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
         let request_id = request.request_id;
+        if let Some(auth) = &self.auth {
+            if let Err(error) = auth.verify() {
+                return ResponseEnvelope::failure(request_id, error);
+            }
+        }
         if !request
             .protocol_version
             .is_compatible_with(CURRENT_PROTOCOL_VERSION)
@@ -610,15 +772,46 @@ impl InProcessConnection {
             );
         }
 
+        let retryable = request.request.is_retryable_mutation();
+        let _mutation_guard = if retryable {
+            match self.backend.mutation_lock() {
+                Ok(guard) => Some(guard),
+                Err(error) => return ResponseEnvelope::failure(request_id, error),
+            }
+        } else {
+            None
+        };
+        let request_for_cache = request.request.clone();
+        if retryable {
+            match self.backend.cached_response(request_id, &request_for_cache) {
+                Ok(Some(response)) => return response,
+                Ok(None) => {}
+                Err(error) => return ResponseEnvelope::failure(request_id, error),
+            }
+        }
+
         let result = match request.request {
             ClientRequest::Negotiate {
                 client_version,
                 capabilities,
             } => self.negotiate(client_version, capabilities),
+            ClientRequest::DiscoverCapabilities => self.discover_capabilities(),
             request => self.handle_after_negotiation(request),
         };
         let result = match result {
-            Ok(response) => self.backend.persist_state().map(|()| response),
+            Ok(response) => {
+                if retryable {
+                    let response_envelope = ResponseEnvelope::success(request_id, response.clone());
+                    if let Err(error) = self.backend.remember_response(
+                        request_id,
+                        request_for_cache,
+                        response_envelope,
+                    ) {
+                        return ResponseEnvelope::failure(request_id, error);
+                    }
+                }
+                self.backend.persist_state().map(|()| response)
+            }
             Err(error) => Err(error),
         };
 
@@ -636,7 +829,9 @@ impl InProcessConnection {
         if !client_version.is_compatible_with(CURRENT_PROTOCOL_VERSION) {
             return Err(unsupported_version_error(client_version));
         }
-        let negotiated = capabilities.intersection(&self.backend.supported_capabilities);
+        let negotiated = capabilities
+            .intersection(&self.backend.supported_capabilities)
+            .intersection(&self.authorized_capabilities());
         *self.negotiated_capabilities()? = Some(negotiated.clone());
 
         Ok(ServerResponse::Negotiated(NegotiationResult {
@@ -645,7 +840,19 @@ impl InProcessConnection {
         }))
     }
 
+    fn discover_capabilities(&self) -> Result<ServerResponse> {
+        let capabilities = self
+            .backend
+            .supported_capabilities
+            .intersection(&self.authorized_capabilities());
+        Ok(ServerResponse::Capabilities(NegotiationResult {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            capabilities,
+        }))
+    }
+
     fn handle_after_negotiation(&self, request: ClientRequest) -> Result<ServerResponse> {
+        self.authorize_request(&request)?;
         let capabilities = self
             .negotiated_capabilities()?
             .clone()
@@ -661,7 +868,9 @@ impl InProcessConnection {
         }
 
         match request {
-            ClientRequest::Negotiate { .. } => unreachable!("negotiation is handled above"),
+            ClientRequest::Negotiate { .. } | ClientRequest::DiscoverCapabilities => {
+                unreachable!("capability requests are handled above")
+            }
             ClientRequest::CreateAgentSession { project_id, name } => {
                 let (snapshot, record) = self.backend.sessions()?.create(project_id, name)?;
                 self.backend.journal()?.append_session(record);
@@ -675,17 +884,21 @@ impl InProcessConnection {
                 session_id,
                 after_sequence,
             } => {
-                let events = self
-                    .backend
-                    .journal()?
-                    .events
-                    .iter()
-                    .filter(|event| {
-                        session_id.is_none_or(|id| event.session_id == id)
-                            && after_sequence.is_none_or(|sequence| event.sequence > sequence)
-                    })
-                    .cloned()
-                    .collect();
+                let journal = self.backend.journal()?;
+                let events = journal.events_since(session_id, after_sequence);
+                if let Some(session_id) = session_id
+                    && journal.is_cursor_stale(after_sequence)
+                {
+                    return Ok(ServerResponse::SessionEventsSnapshot {
+                        session: self.backend.sessions()?.get(session_id)?,
+                        events,
+                        oldest_sequence: journal
+                            .events
+                            .first()
+                            .map_or(EventSequence::default(), |event| event.sequence),
+                        latest_sequence: journal.next_sequence,
+                    });
+                }
                 Ok(ServerResponse::SessionEvents { events })
             }
             ClientRequest::StartAgentRun {
@@ -1011,6 +1224,239 @@ impl InProcessConnection {
         }
     }
 
+    fn authorize_request(&self, request: &ClientRequest) -> Result<()> {
+        let Some(auth) = &self.auth else {
+            return Ok(());
+        };
+        if let Some(capability) = request.required_capability()
+            && !auth.scope().allows_capability(capability)
+        {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                format!("token is not authorized for capability {capability:?}"),
+                false,
+            ));
+        }
+
+        let mut project_id = None;
+        let mut session_id = None;
+        let mut run_id = None;
+        match request {
+            ClientRequest::OpenWorkspace {
+                project_id: requested_project,
+                root,
+            } => {
+                project_id = Some(*requested_project);
+                if !auth
+                    .scope()
+                    .allows_workspace_root(*requested_project, Path::new(root))
+                {
+                    return Err(LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        "token is not authorized for the requested workspace root",
+                        false,
+                    ));
+                }
+            }
+            ClientRequest::CreateAgentSession {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetWorkspaceSnapshot {
+                project_id: requested_project,
+            }
+            | ClientRequest::GetWorkspaceEvents {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::ReadWorkspaceFile {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::ApplyWorkspaceEdit {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::TakeWorkspaceControl {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::RevertCheckpoint {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::UndoWorkspaceEdit {
+                project_id: requested_project,
+            }
+            | ClientRequest::SetApprovalPolicy {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::OpenTerminal {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::WriteTerminalInput {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::ResizeTerminal {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetTerminalEvents {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::CancelTerminal {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::StartTask {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetTask {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetTaskEvents {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::CancelTask {
+                project_id: requested_project,
+                ..
+            } => project_id = Some(*requested_project),
+            ClientRequest::GetAgentSession {
+                session_id: requested_session,
+            }
+            | ClientRequest::GetSessionUsage {
+                session_id: requested_session,
+            }
+            | ClientRequest::ForkAgentSession {
+                session_id: requested_session,
+                ..
+            } => session_id = Some(*requested_session),
+            ClientRequest::GetSessionEvents {
+                session_id: requested_session,
+                ..
+            } => session_id = *requested_session,
+            ClientRequest::StartAgentRun {
+                session_id: requested_session,
+                ..
+            }
+            | ClientRequest::StartAgentRunWithOptions {
+                session_id: requested_session,
+                ..
+            } => session_id = Some(*requested_session),
+            ClientRequest::GetAgentRun {
+                run_id: requested_run,
+            }
+            | ClientRequest::GetRunCheckpoint {
+                run_id: requested_run,
+            }
+            | ClientRequest::ApproveAgentAction {
+                run_id: requested_run,
+                ..
+            }
+            | ClientRequest::RejectAgentAction {
+                run_id: requested_run,
+                ..
+            }
+            | ClientRequest::InterruptAgentRun {
+                run_id: requested_run,
+            }
+            | ClientRequest::RetryAgentStep {
+                run_id: requested_run,
+            }
+            | ClientRequest::PauseAgentRun {
+                run_id: requested_run,
+            }
+            | ClientRequest::ResumeAgentRun {
+                run_id: requested_run,
+            }
+            | ClientRequest::RetryAgentFromCheckpoint {
+                run_id: requested_run,
+                ..
+            }
+            | ClientRequest::GetRunUsage {
+                run_id: requested_run,
+            }
+            | ClientRequest::InspectAgentContext {
+                run_id: requested_run,
+            } => run_id = Some(*requested_run),
+            ClientRequest::CreateCheckpoint {
+                project_id: requested_project,
+                session_id: Some(requested_session),
+                ..
+            } => {
+                project_id = Some(*requested_project);
+                session_id = Some(*requested_session);
+            }
+            ClientRequest::Negotiate { .. }
+            | ClientRequest::DiscoverCapabilities
+            | ClientRequest::ListModels
+            | ClientRequest::ListProviders
+            | ClientRequest::DiscoverProviderModels { .. }
+            | ClientRequest::GetProviderHealth { .. } => {}
+            ClientRequest::CreateCheckpoint {
+                session_id: None, ..
+            } => {}
+        }
+
+        if let Some(session_id) = session_id {
+            if !auth.scope().allows_session(session_id) {
+                return Err(unauthorized_session(session_id));
+            }
+            let session_project = self.backend.sessions()?.get(session_id)?.project_id;
+            if project_id.is_some_and(|requested_project| requested_project != session_project) {
+                return Err(LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    "session does not belong to the requested workspace",
+                    false,
+                ));
+            }
+            project_id = Some(session_project);
+        } else if run_id.is_none()
+            && project_id.is_none()
+            && matches!(
+                request,
+                ClientRequest::GetSessionEvents {
+                    session_id: None,
+                    ..
+                }
+            )
+            && (auth.scope().projects.is_some() || auth.scope().sessions.is_some())
+        {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "an unrestricted token is required to list events across sessions",
+                false,
+            ));
+        }
+
+        if let Some(run_id) = run_id {
+            let session_id = self
+                .backend
+                .runs()?
+                .get(&run_id)
+                .ok_or_else(|| LoomError::not_found("agent run", run_id))?
+                .session_id();
+            if !auth.scope().allows_session(session_id) {
+                return Err(unauthorized_session(session_id));
+            }
+            project_id = Some(self.backend.sessions()?.get(session_id)?.project_id);
+        }
+
+        if let Some(project_id) = project_id
+            && !auth.scope().allows_project(project_id)
+        {
+            return Err(unauthorized_project(project_id));
+        }
+        Ok(())
+    }
+
     fn start_run(
         &self,
         session_id: AgentSessionId,
@@ -1185,12 +1631,36 @@ fn session_state_for_event(event: &AgentEvent) -> Option<AgentSessionState> {
     })
 }
 
+fn unauthorized_project(project_id: ProjectId) -> LoomError {
+    LoomError::new(
+        ErrorCode::AuthorizationDenied,
+        format!("token is not authorized for project {project_id}"),
+        false,
+    )
+}
+
+fn unauthorized_session(session_id: AgentSessionId) -> LoomError {
+    LoomError::new(
+        ErrorCode::AuthorizationDenied,
+        format!("token is not authorized for session {session_id}"),
+        false,
+    )
+}
+
 impl InProcessConnection {
     pub fn disconnected(backend: Arc<InProcessBackend>) -> Self {
         Self {
             backend,
             negotiated_capabilities: Arc::new(Mutex::new(None)),
+            auth: None,
         }
+    }
+
+    fn authorized_capabilities(&self) -> CapabilitySet {
+        self.auth
+            .as_ref()
+            .and_then(|auth| auth.scope().capabilities.clone())
+            .unwrap_or_else(|| self.backend.supported_capabilities.clone())
     }
 }
 
@@ -1975,6 +2445,36 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, ErrorCode::MalformedPayload);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retryable_mutation_idempotency_survives_backend_restart() {
+        let path =
+            std::env::temp_dir().join(format!("loom-server-idempotency-{}.json", ProjectId::new()));
+        let request_id = loom_core::RequestId::new();
+        let request = RequestEnvelope::with_request_id(
+            request_id,
+            ClientRequest::CreateAgentSession {
+                project_id: ProjectId::new(),
+                name: "durable idempotency".to_owned(),
+            },
+        );
+        let first = {
+            let backend = InProcessBackend::new_persistent(&path).unwrap();
+            let connection = backend.connect();
+            negotiate(&connection);
+            connection.request(request.clone())
+        };
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let second = connection.request(request);
+        assert_eq!(first, second);
+        assert!(matches!(
+            first.result,
+            Ok(ServerResponse::AgentSessionCreated(_))
+        ));
         fs::remove_file(path).unwrap();
     }
 

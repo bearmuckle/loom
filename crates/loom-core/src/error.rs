@@ -9,6 +9,9 @@ pub enum ErrorCode {
     InvalidRequest,
     InvalidState,
     MalformedPayload,
+    AuthenticationRequired,
+    AuthenticationFailed,
+    AuthorizationDenied,
     NotFound,
     Conflict,
     CapabilityDenied,
@@ -25,6 +28,9 @@ pub enum ErrorCode {
     ContextLimitExceeded,
     SessionLimitExceeded,
     RecoveryRequired,
+    RequestCancelled,
+    DeadlineExceeded,
+    Backpressure,
     Internal,
 }
 
@@ -34,6 +40,9 @@ impl fmt::Display for ErrorCode {
             Self::InvalidRequest => "invalid_request",
             Self::InvalidState => "invalid_state",
             Self::MalformedPayload => "malformed_payload",
+            Self::AuthenticationRequired => "authentication_required",
+            Self::AuthenticationFailed => "authentication_failed",
+            Self::AuthorizationDenied => "authorization_denied",
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::CapabilityDenied => "capability_denied",
@@ -50,6 +59,9 @@ impl fmt::Display for ErrorCode {
             Self::ContextLimitExceeded => "context_limit_exceeded",
             Self::SessionLimitExceeded => "session_limit_exceeded",
             Self::RecoveryRequired => "recovery_required",
+            Self::RequestCancelled => "request_cancelled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::Backpressure => "backpressure",
             Self::Internal => "internal",
         };
         formatter.write_str(value)

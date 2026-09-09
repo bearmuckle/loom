@@ -31,6 +31,22 @@ implicitly trusted.
 - Record security-relevant actions without recording secret values.
 - Support revoking a client/session without restarting the backend.
 
+M4's standalone service uses opaque bearer tokens stored as SHA-256 digests
+in memory. Issued-token debug output is redacted, authentication failures do
+not echo the supplied token, and authorization headers are not copied into
+protocol events. Revocation is checked on every request, including requests
+from an already-upgraded WebSocket. Token grants can restrict capabilities,
+projects, and sessions; an unrestricted grant is an explicit deployment
+choice rather than an implicit network default.
+Scope builders may also pin a project to a canonical workspace root before
+the first `OpenWorkspace`.
+
+The service binds to `127.0.0.1` by default. Binding a non-loopback address
+requires an explicit `--bind` choice and a token. TLS termination is expected
+to be supplied by the deployment boundary for remote use; the current
+standalone listener is plain WebSocket (`ws://`) and must not be exposed
+directly to an untrusted network.
+
 ## Agent permissions
 
 Tool permissions should be typed and policy-driven rather than inferred from
@@ -69,3 +85,11 @@ compacted, but required items produce an explicit context-limit error.
 Session time, token, tool-call, and cost budgets emit limit events and end a
 run rather than silently truncating output, switching providers, or bypassing
 approval policy.
+
+Workspace roots remain backend-owned after the first `OpenWorkspace` for a
+project and canonical workspace checks from M2 still reject traversal and
+outside-root symlinks. M4 project/session authorization prevents a token from
+using another project's IDs; deployments that allow a token to select a
+project's initial root must additionally constrain the process account and
+filesystem permissions. A full per-user identity/invitation system and
+encrypted secret vault remain deferred.

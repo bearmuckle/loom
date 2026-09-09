@@ -86,6 +86,21 @@ the GPUI shell exposes provider count and pause/resume controls.
 - Add protocol compatibility and migration tests.
 - Keep agent execution and event journaling independent of frontend lifetime.
 
+M4 implementation notes:
+
+- `loom-server` provides an opt-in, loopback-by-default JSON WebSocket service
+  and a native `WebSocketTransport` fixture. Bearer tokens are scoped to
+  capabilities/projects/sessions and are checked on every request.
+- `GetSessionEvents` resumes from a global sequence. Bounded retention returns
+  `SessionEventsSnapshot` with a resume cursor when history is unavailable, and
+  retryable mutations are deduplicated by durable request ID.
+- Heartbeats, request deadlines, cancellation frames, malformed-payload
+  responses, and bounded outbound queues are transport protections; runtime
+  and journal state remain backend-owned after disconnect.
+- `cargo run -p loom-cli -- --m4-demo` demonstrates a second client
+  reconnecting, observing steps, approving both deterministic tool actions,
+  and retrieving the completed result.
+
 **Exit condition:** a second native client can securely reconnect to a running
 agent, observe its current step, approve an action, and retrieve its result.
 
