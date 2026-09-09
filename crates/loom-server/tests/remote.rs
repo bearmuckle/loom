@@ -1,0 +1,498 @@
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+
+use futures_util::{SinkExt, StreamExt};
+use loom_agent::AgentEvent;
+use loom_core::{
+    AgentSessionId, Capability, CapabilitySet, ErrorCode, EventSequence, ProjectId, RequestId,
+};
+use loom_model::ModelId;
+use loom_protocol::{
+    CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
+    decode_response,
+};
+use loom_server::{
+    AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
+    WebSocketConnection, WebSocketTransport,
+};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{Message, client::IntoClientRequest},
+};
+
+fn capabilities() -> CapabilitySet {
+    CapabilitySet::new([
+        Capability::CreateAgentSession,
+        Capability::ReadAgentSession,
+        Capability::SubscribeSessionEvents,
+        Capability::StartAgentRun,
+        Capability::ReadAgentRun,
+        Capability::ControlAgentRun,
+        Capability::ApproveAgentAction,
+        Capability::OpenWorkspace,
+        Capability::ReadWorkspace,
+        Capability::OpenTerminal,
+        Capability::ControlTerminal,
+        Capability::JsonProtocol,
+    ])
+}
+
+async fn server() -> (
+    Arc<InProcessBackend>,
+    Arc<AuthTokenStore>,
+    loom_server::IssuedToken,
+    loom_server::RunningRemoteServer,
+) {
+    let backend = InProcessBackend::new();
+    let auth = Arc::new(AuthTokenStore::new());
+    let token = auth
+        .insert("remote-test-token", AuthorizationScope::all())
+        .unwrap();
+    let server = RemoteServer::new(
+        Arc::clone(&backend),
+        Arc::clone(&auth),
+        RemoteServerConfig {
+            heartbeat_interval: Duration::from_millis(25),
+            request_timeout: Duration::from_secs(5),
+            ..RemoteServerConfig::local_ephemeral()
+        },
+    )
+    .bind()
+    .await
+    .unwrap();
+    (backend, auth, token, server)
+}
+
+async fn negotiate(connection: &mut WebSocketConnection) {
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.result,
+        Ok(ServerResponse::Capabilities(_))
+    ));
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities: capabilities(),
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
+}
+
+fn workspace() -> PathBuf {
+    let root = std::env::temp_dir().join(format!("loom-remote-{}", ProjectId::new()));
+    fs::create_dir_all(&root).unwrap();
+    root
+}
+
+async fn session(
+    connection: &mut WebSocketConnection,
+    project_id: ProjectId,
+) -> loom_core::AgentSessionSnapshot {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
+            project_id,
+            name: "remote session".to_owned(),
+        }))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::AgentSessionCreated(snapshot) => snapshot,
+        response => panic!("unexpected session response: {response:?}"),
+    }
+}
+
+async fn events(
+    connection: &mut WebSocketConnection,
+    session_id: AgentSessionId,
+    after_sequence: Option<EventSequence>,
+) -> Vec<loom_protocol::ServerEventEnvelope> {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            after_sequence,
+        }))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::SessionEvents { events }
+        | ServerResponse::SessionEventsSnapshot { events, .. } => events,
+        response => panic!("unexpected event response: {response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejects_unauthenticated_websocket_clients_before_capability_discovery() {
+    let (_backend, _auth, _token, server) = server().await;
+    let error = match WebSocketTransport::new(server.websocket_url(), "wrong-token")
+        .connect()
+        .await
+    {
+        Ok(_) => panic!("invalid token unexpectedly connected"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::AuthenticationFailed);
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn authorized_client_can_discover_and_revoke_access() {
+    let (_backend, auth, token, server) = server().await;
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token.clone());
+    let mut connection = transport.connect().await.unwrap();
+    negotiate(&mut connection).await;
+    let project_id = ProjectId::new();
+    let _ = session(&mut connection, project_id).await;
+    auth.revoke(&token.token_id).unwrap();
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::ListModels))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.result.unwrap_err().code,
+        ErrorCode::AuthenticationFailed
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn project_scopes_reject_workspace_and_session_operations() {
+    let backend = InProcessBackend::new();
+    let auth = Arc::new(AuthTokenStore::new());
+    let allowed_project = ProjectId::new();
+    let token = auth
+        .insert(
+            "scoped-token",
+            AuthorizationScope::for_projects(
+                [allowed_project],
+                CapabilitySet::new([
+                    Capability::CreateAgentSession,
+                    Capability::ReadAgentSession,
+                    Capability::SubscribeSessionEvents,
+                ]),
+            ),
+        )
+        .unwrap();
+    let server = RemoteServer::new(backend, auth, RemoteServerConfig::local_ephemeral())
+        .bind()
+        .await
+        .unwrap();
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token);
+    let mut connection = transport.connect().await.unwrap();
+    negotiate(&mut connection).await;
+    let denied = connection
+        .request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
+            project_id: ProjectId::new(),
+            name: "denied".to_owned(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.result.unwrap_err().code,
+        ErrorCode::AuthorizationDenied
+    );
+    let allowed = session(&mut connection, allowed_project).await;
+    let denied = connection
+        .request(RequestEnvelope::new(ClientRequest::GetAgentSession {
+            session_id: allowed.id,
+        }))
+        .await
+        .unwrap();
+    assert!(denied.result.is_ok());
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn workspace_scope_pins_initial_root() {
+    let backend = InProcessBackend::new();
+    let auth = Arc::new(AuthTokenStore::new());
+    let project_id = ProjectId::new();
+    let allowed_root = workspace();
+    let denied_root = workspace();
+    let token = auth
+        .insert(
+            "workspace-scoped-token",
+            AuthorizationScope::for_projects(
+                [project_id],
+                CapabilitySet::new([Capability::OpenWorkspace]),
+            )
+            .with_workspace_root(project_id, &allowed_root),
+        )
+        .unwrap();
+    let server = RemoteServer::new(backend, auth, RemoteServerConfig::local_ephemeral())
+        .bind()
+        .await
+        .unwrap();
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token);
+    let mut connection = transport.connect().await.unwrap();
+    negotiate(&mut connection).await;
+    let denied = connection
+        .request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+            project_id,
+            root: denied_root.display().to_string(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.result.unwrap_err().code,
+        ErrorCode::WorkspaceAccessDenied
+    );
+    let allowed = connection
+        .request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+            project_id,
+            root: allowed_root.display().to_string(),
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        allowed.result,
+        Ok(ServerResponse::WorkspaceOpened(_))
+    ));
+    fs::remove_dir_all(allowed_root).unwrap();
+    fs::remove_dir_all(denied_root).unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
+    let (_backend, _auth, token, server) = server().await;
+    let root = workspace();
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token);
+    let mut first = transport.connect().await.unwrap();
+    negotiate(&mut first).await;
+    let project_id = ProjectId::new();
+    let session = session(&mut first, project_id).await;
+    let run_id = match first
+        .request(RequestEnvelope::new(ClientRequest::StartAgentRun {
+            session_id: session.id,
+            task: "remote durable task".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            workspace_root: root.display().to_string(),
+            system_instructions: None,
+            repository_instructions: None,
+        }))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    drop(first);
+
+    let mut second = transport.connect().await.unwrap();
+    negotiate(&mut second).await;
+    let mut after = None;
+    let mut approvals = 0;
+    let mut completed = false;
+    for _ in 0..100 {
+        let batch = events(&mut second, session.id, after).await;
+        if batch.is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            continue;
+        }
+        for event in batch {
+            after = Some(event.sequence);
+            if let ServerEvent::Agent {
+                event:
+                    AgentEvent::ToolApprovalRequired {
+                        run_id: event_run,
+                        call,
+                    },
+            } = &event.event
+                && *event_run == run_id
+            {
+                approvals += 1;
+                second
+                    .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+                        run_id,
+                        tool_call_id: call.id,
+                    }))
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+            }
+            if matches!(
+                &event.event,
+                ServerEvent::Agent {
+                    event: AgentEvent::RunCompleted { snapshot }
+                } if snapshot.id == run_id
+            ) {
+                completed = true;
+            }
+        }
+        if completed {
+            break;
+        }
+    }
+    assert!(approvals >= 2);
+    assert!(completed);
+    let run = second
+        .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        run.result.unwrap(),
+        ServerResponse::AgentRun(snapshot)
+            if snapshot.state == loom_agent::AgentRunState::Completed
+    ));
+    fs::remove_dir_all(root).unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn stale_cursors_return_a_snapshot_fallback() {
+    let (backend, _auth, token, server) = server().await;
+    backend.set_event_retention(2).unwrap();
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token);
+    let mut connection = transport.connect().await.unwrap();
+    negotiate(&mut connection).await;
+    let first = session(&mut connection, ProjectId::new()).await;
+    let _second = session(&mut connection, ProjectId::new()).await;
+    let _third = session(&mut connection, ProjectId::new()).await;
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(first.id),
+            after_sequence: Some(EventSequence::default()),
+        }))
+        .await
+        .unwrap();
+    match response.result.unwrap() {
+        ServerResponse::SessionEventsSnapshot {
+            session,
+            events,
+            oldest_sequence,
+            latest_sequence,
+        } => {
+            assert_eq!(session.id, first.id);
+            assert!(events.is_empty());
+            assert!(oldest_sequence.value() > 1);
+            assert_eq!(latest_sequence.value(), 3);
+        }
+        response => panic!("expected snapshot fallback, got {response:?}"),
+    }
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn duplicate_mutation_request_ids_are_idempotent() {
+    let (_backend, _auth, token, server) = server().await;
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token);
+    let mut connection = transport.connect().await.unwrap();
+    negotiate(&mut connection).await;
+    let request_id = RequestId::new();
+    let request = RequestEnvelope::with_request_id(
+        request_id,
+        ClientRequest::CreateAgentSession {
+            project_id: ProjectId::new(),
+            name: "idempotent".to_owned(),
+        },
+    );
+    let first = connection.request(request.clone()).await.unwrap();
+    drop(connection);
+    let mut reconnected = transport.connect().await.unwrap();
+    negotiate(&mut reconnected).await;
+    let second = reconnected.request(request).await.unwrap();
+    assert_eq!(first, second);
+    let ServerResponse::AgentSessionCreated(snapshot) = first.result.unwrap() else {
+        panic!("unexpected idempotent response");
+    };
+    let events = events(&mut reconnected, snapshot.id, None).await;
+    assert_eq!(events.len(), 1);
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_payloads_receive_structured_errors() {
+    let (_backend, _auth, token, server) = server().await;
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token);
+    let mut request = transport.url().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", "Bearer remote-test-token".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    socket
+        .send(Message::Text("{not-json".to_owned().into()))
+        .await
+        .unwrap();
+    let Some(Ok(Message::Text(response))) = socket.next().await else {
+        panic!("server did not return malformed payload response");
+    };
+    let response = decode_response(response.as_bytes()).unwrap();
+    assert_eq!(
+        response.result.unwrap_err().code,
+        ErrorCode::MalformedPayload
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_execution_continues_after_client_disconnect() {
+    let (_backend, _auth, token, server) = server().await;
+    let root = workspace();
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token);
+    let mut first = transport.connect().await.unwrap();
+    negotiate(&mut first).await;
+    let project_id = ProjectId::new();
+    first
+        .request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+            project_id,
+            root: root.display().to_string(),
+        }))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
+    let terminal = match first
+        .request(RequestEnvelope::new(ClientRequest::OpenTerminal {
+            project_id,
+            command: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "sleep 0.05; printf done".to_owned()],
+            cwd: None,
+        }))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::TerminalOpened(snapshot) => snapshot,
+        response => panic!("unexpected terminal response: {response:?}"),
+    };
+    drop(first);
+
+    let mut second = transport.connect().await.unwrap();
+    negotiate(&mut second).await;
+    let mut exited = false;
+    for _ in 0..100 {
+        let response = second
+            .request(RequestEnvelope::new(ClientRequest::GetTerminalEvents {
+                project_id,
+                terminal_id: terminal.id,
+                after_sequence: None,
+            }))
+            .await
+            .unwrap();
+        let ServerResponse::TerminalEvents { events } = response.result.unwrap() else {
+            panic!("unexpected terminal event response");
+        };
+        if events
+            .iter()
+            .any(|event| matches!(event.event, loom_process::TerminalEvent::Exited { .. }))
+        {
+            exited = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(exited);
+    fs::remove_dir_all(root).unwrap();
+    server.stop().await.unwrap();
+}

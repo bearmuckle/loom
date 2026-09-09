@@ -133,3 +133,40 @@ available. The persistence file can be selected explicitly with
 `--persistence <path>`. See
 [ADR 0004](docs/decisions/0004-m3-providers-and-durable-orchestration.md) for
 the persistence, provider, context, and recovery tradeoffs.
+
+## M4 remote backend control
+
+M4 adds an opt-in standalone service without changing the in-process protocol:
+
+- `loom-server` exposes the existing typed request/response envelopes over a
+  JSON WebSocket transport suitable for native and browser clients;
+- the default bind address is loopback. Network binding is explicit and the
+  service requires a bearer token before protocol negotiation, capability
+  discovery, workspace access, or provider access;
+- tokens can be scoped to capabilities, projects, and sessions and are
+  revocable while connections are open. Tokens and provider secrets are never
+  written to event journals or request logs;
+- bounded journal retention returns a typed session snapshot fallback when a
+  reconnecting cursor is older than retained history. Retryable mutations use
+  request IDs as durable idempotency keys;
+- heartbeats, request deadlines, cancellation frames, malformed-payload
+  errors, and bounded outbound queues make transport failure explicit while
+  the backend runtime continues independently of a frontend connection.
+
+Start a local service with an explicit token and optional durable state:
+
+```sh
+cargo run -p loom-cli -- --serve --token "$LOOM_TOKEN" \
+  --bind 127.0.0.1:8765 --persistence ~/.local/share/loom/state.json
+```
+
+The deterministic two-client fixture starts a loopback server, disconnects the
+first client while a run is awaiting approval, reconnects a second client,
+resumes events, approves the pending actions, and retrieves the result:
+
+```sh
+cargo run -p loom-cli -- --m4-demo
+```
+
+See [ADR 0005](docs/decisions/0005-m4-remote-backend-control.md) for the
+transport/authentication/reconnect choices and their current limitations.

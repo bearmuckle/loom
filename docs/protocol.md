@@ -14,11 +14,12 @@ Use a transport abstraction with these initial implementations:
 | Browser client and local/remote backend | WebSocket over HTTP(S) | HTTP request/stream endpoints where required by a host |
 | Native client and remote backend | QUIC when deployment supports it | WebSocket or HTTP/2-compatible stream |
 
-The protocol payload should be independent of the transport. Start with a
-compact, schema-driven binary representation such as MessagePack or CBOR, and
-provide JSON only as a debugging and integration format. The choice should be
-settled with benchmarks that include large file responses and high-frequency
-terminal output.
+The protocol payload is independent of the transport. M4 implements the
+initial JSON WebSocket adapter through `loom-server::WebSocketTransport`;
+in-process clients continue to use the same typed envelopes. JSON is
+intentionally retained as the inspectable contract until payload benchmarks
+settle a MessagePack/CBOR migration. A future codec can sit behind the same
+transport boundary without changing request IDs or event sequences.
 
 ## Protocol requirements
 
@@ -35,10 +36,39 @@ terminal output.
   are exposed.
 - Redaction rules for secrets in logs and event history.
 
+M4 adds `DiscoverCapabilities`, additive `ClientFrame`/`ServerFrame` codec
+types, and `SessionEventsSnapshot`. Existing `RequestEnvelope`,
+`ResponseEnvelope`, and `ServerEventEnvelope` JSON forms remain valid.
+Version compatibility is major-version based: a client may negotiate a newer
+minor version within the same major, while an incompatible major returns the
+existing `unsupported_protocol` error.
+
+The WebSocket service authenticates during the HTTP upgrade using a bearer
+token, then creates an authenticated view of the existing in-process
+connection. Each request re-checks the token so revocation takes effect
+without restarting the service. Capability negotiation is intersected with
+the token grant, and every project/session/run request is checked against the
+token's explicit scope.
+
 The backend should journal enough event metadata to replay the current
 projection after reconnecting, while avoiding unbounded memory growth. A
 client that falls behind must be able to request a fresh snapshot and resume
 from a known sequence.
+
+M4 retains a bounded global journal (4096 events by default). If a
+session-specific cursor is older than the retained range,
+`GetSessionEvents` returns `SessionEventsSnapshot` with the current session
+projection, retained events, the oldest available sequence, and the latest
+global sequence. The client must replace its projection and resume from the
+latest sequence in the response. Requests with a stable `RequestId` are
+idempotent for retryable mutations; the bounded idempotency cache is persisted
+with durable backend state.
+
+The server sends WebSocket ping heartbeats, applies a configured request
+deadline, accepts cancellation frames for pending transport tasks, and uses a
+bounded outbound queue. A full queue closes the connection rather than
+unboundedly buffering output. Disconnecting a client never cancels the
+backend's synchronous agent, process, terminal, or journal work.
 
 ## Example domain operations
 

@@ -7,9 +7,10 @@ use loom_core::{
 use loom_model::ModelId;
 use loom_process::{TaskKind, TaskSpec};
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ResponseEnvelope, ServerEvent,
-    ServerEventEnvelope, ServerResponse, decode_event, decode_request, decode_response,
-    encode_event, encode_request, encode_response,
+    CURRENT_PROTOCOL_VERSION, ClientFrame, ClientRequest, RequestEnvelope, ResponseEnvelope,
+    ServerEvent, ServerEventEnvelope, ServerFrame, ServerResponse, decode_client_frame,
+    decode_event, decode_request, decode_response, decode_server_frame, encode_client_frame,
+    encode_event, encode_request, encode_response, encode_server_frame,
 };
 use loom_workspace::{WorkspaceEdit, WorkspaceSnapshot};
 
@@ -180,6 +181,44 @@ fn m3_run_options_provider_and_context_contracts_round_trip() {
     );
     assert_eq!(
         decode_response(&encode_response(&response).unwrap()).unwrap(),
+        response
+    );
+}
+
+#[test]
+fn m4_capability_discovery_and_version_migration_are_additive() {
+    let request = RequestEnvelope::with_version(
+        ProtocolVersion::new(1, 7),
+        ClientRequest::DiscoverCapabilities,
+    );
+    assert_eq!(
+        decode_request(&encode_request(&request).unwrap()).unwrap(),
+        request
+    );
+    assert!(
+        request
+            .protocol_version
+            .is_compatible_with(CURRENT_PROTOCOL_VERSION)
+    );
+    assert!(!ProtocolVersion::new(2, 0).is_compatible_with(CURRENT_PROTOCOL_VERSION));
+}
+
+#[test]
+fn m4_transport_frames_preserve_typed_envelopes() {
+    let request = ClientFrame::Request(Box::new(RequestEnvelope::new(
+        ClientRequest::DiscoverCapabilities,
+    )));
+    assert_eq!(
+        decode_client_frame(&encode_client_frame(&request).unwrap()).unwrap(),
+        request
+    );
+
+    let response = ServerFrame::Response(ResponseEnvelope::failure(
+        loom_core::RequestId::new(),
+        loom_core::LoomError::malformed_payload("fixture"),
+    ));
+    assert_eq!(
+        decode_server_frame(&encode_server_frame(&response).unwrap()).unwrap(),
         response
     );
 }
