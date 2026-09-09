@@ -33,9 +33,10 @@ Workspace and process services are usable in-process and through typed JSON
 requests without coupling clients to a provider or a platform shell. The
 terminal resize operation records the requested dimensions but does not yet
 allocate a native PTY, so applications that require terminal-specific control
-sequences remain deferred. Event journals, checkpoints, and task metadata are
-currently in memory and are lost when the backend exits; durable persistence
-and reconnecting process ownership are M3/M4 work. Workspace watches use
+sequences remain deferred. At the M2 boundary, event journals, checkpoints,
+and task metadata are in memory and are lost when the backend exits. M3 adds
+a durable backend snapshot for sessions, agent events, checkpoints, and model
+usage; reconnecting process ownership remains M4 work. Workspace watches use
 snapshot polling, which is deterministic and portable but does not provide
 kernel-native notifications or push delivery until a transport layer is added.
 

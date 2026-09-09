@@ -1,12 +1,13 @@
 [package]
 name = "loom-agent"
-description = "Single-agent runtime, state machine, and event model for Loom M1."
+description = "Single-agent runtime, durable state machine, context limits, and events for Loom."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+loom-context.workspace = true
 loom-core.workspace = true
 loom-model.workspace = true
 loom-providers.workspace = true

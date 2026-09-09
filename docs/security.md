@@ -19,6 +19,13 @@ implicitly trusted.
 - Keep provider credentials in a backend secret store or OS credential
   facility and expose only opaque credential IDs to clients.
 - Never transmit secrets as part of ordinary workspace snapshots or logs.
+- Durable state contains credential references and provider metadata only;
+  raw API keys are resolved in memory for a provider call and are not
+  serialized in the event journal, health errors, or protocol responses.
+- The M3 JSON state file is an atomic application snapshot, not an encrypted
+  secret vault. Deployments must place it and any credential store under the
+  backend user's protected data directory and use filesystem permissions
+  appropriate to the deployment.
 - Provide cancellation and resource limits for processes, streams, model
   calls, and tasks.
 - Record security-relevant actions without recording secret values.
@@ -54,3 +61,11 @@ requests. Its default `ApprovalPolicy` allows reads, pauses writes and
 commands for approval, requests approval for network actions, and denies
 destructive actions. The policy evaluation is included in the agent event
 stream before a tool executes.
+
+M3 makes context and resource boundaries visible as structured state. Input
+context is assembled from system instructions, repository instructions, task,
+summaries, and conversation items; optional conversation items may be
+compacted, but required items produce an explicit context-limit error.
+Session time, token, tool-call, and cost budgets emit limit events and end a
+run rather than silently truncating output, switching providers, or bypassing
+approval policy.

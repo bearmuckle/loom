@@ -8,11 +8,14 @@ rust-version.workspace = true
 
 [dependencies]
 loom-agent.workspace = true
+loom-context.workspace = true
 loom-core.workspace = true
 loom-model.workspace = true
 loom-protocol.workspace = true
 loom-providers.workspace = true
 loom-process.workspace = true
+loom-persistence.workspace = true
 loom-session.workspace = true
 loom-tools.workspace = true
 loom-workspace.workspace = true
+serde.workspace = true

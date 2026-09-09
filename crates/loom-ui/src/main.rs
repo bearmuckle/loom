@@ -31,6 +31,7 @@ struct LoomView {
     timeline: Vec<TimelineItem>,
     summary: Option<String>,
     workspace_entries: usize,
+    provider_count: usize,
 }
 
 #[derive(Clone)]
@@ -52,6 +53,7 @@ impl LoomView {
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate(&connection)?;
+        let provider_count = provider_count(&connection)?;
         let model = ModelId::new("deterministic/demo");
         let (session, run) = start_demo_run(&connection, &workspace_root, &model)?;
         let workspace_entries = workspace_snapshot(&connection, session.project_id)?
@@ -72,6 +74,7 @@ impl LoomView {
             timeline: Vec::new(),
             summary: None,
             workspace_entries,
+            provider_count,
         };
         view.collect_events()?;
         Ok(view)
@@ -101,6 +104,7 @@ impl LoomView {
             ServerEvent::AgentSessionStateChanged { current, .. } => {
                 self.session_state = *current;
             }
+            ServerEvent::AgentSessionForked { .. } => {}
             ServerEvent::Agent { event } => match event {
                 AgentEvent::RunStarted { snapshot } => {
                     self.run_state = snapshot.state;
@@ -113,6 +117,24 @@ impl LoomView {
                         .map(|step| step.description.clone())
                         .collect(),
                 )),
+                AgentEvent::StepStarted { index, .. } => self
+                    .timeline
+                    .push(TimelineItem::Status(format!("Step {} started", index + 1))),
+                AgentEvent::StepCompleted { index, .. } => self.timeline.push(
+                    TimelineItem::Status(format!("Step {} completed", index + 1)),
+                ),
+                AgentEvent::ContextInspected { inspection, .. } => {
+                    self.timeline.push(TimelineItem::Status(format!(
+                        "Context: {} input tokens ({} omitted)",
+                        inspection.included_tokens, inspection.omitted_tokens
+                    )))
+                }
+                AgentEvent::ProviderError { error, .. } => self
+                    .timeline
+                    .push(TimelineItem::Status(format!("Provider error: {error}"))),
+                AgentEvent::ContextError { error, .. } => self
+                    .timeline
+                    .push(TimelineItem::Status(format!("Context error: {error}"))),
                 AgentEvent::AssistantMessageDelta { text, .. } => {
                     if let Some(TimelineItem::Assistant(message)) = self.timeline.last_mut() {
                         message.push_str(text);
@@ -173,6 +195,18 @@ impl LoomView {
                         usage.input_tokens, usage.output_tokens
                     )))
                 }
+                AgentEvent::RunUsageUpdated { usage, .. } => {
+                    self.timeline.push(TimelineItem::Status(format!(
+                        "Total usage: {} input / {} output / {} tool calls",
+                        usage.input_tokens, usage.output_tokens, usage.tool_calls
+                    )))
+                }
+                AgentEvent::RunLimitReached { status, .. } => self.timeline.push(
+                    TimelineItem::Status(format!("Limit reached: {:?}", status.exceeded)),
+                ),
+                AgentEvent::RecoveryRequired { reason, .. } => self
+                    .timeline
+                    .push(TimelineItem::Status(format!("Recovery required: {reason}"))),
                 AgentEvent::RunStateChanged { state, .. } => {
                     self.run_state = *state;
                     self.session_state = session_state_for_run(*state);
@@ -199,6 +233,16 @@ impl LoomView {
             ServerEvent::Task { event } => {
                 self.timeline
                     .push(TimelineItem::Status(format!("Task: {:?}", event.event)));
+            }
+            ServerEvent::ProviderHealthChanged {
+                provider_id,
+                health,
+            } => {
+                self.timeline.push(TimelineItem::Status(format!(
+                    "Provider {} health: {:?}",
+                    provider_id.as_str(),
+                    health.state
+                )));
             }
         }
     }
@@ -259,6 +303,7 @@ impl LoomView {
             AgentRunState::Planning
                 | AgentRunState::Executing
                 | AgentRunState::AwaitingApproval
+                | AgentRunState::Paused
                 | AgentRunState::Evaluating
         ) {
             self.connection
@@ -319,6 +364,38 @@ impl LoomView {
         if let Err(error) = response.result {
             self.timeline
                 .push(TimelineItem::Status(format!("Interrupt error: {error}")));
+        } else if let Err(error) = self.collect_events() {
+            self.timeline
+                .push(TimelineItem::Status(format!("Event error: {error}")));
+        }
+        cx.notify();
+    }
+
+    fn pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let response =
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::PauseAgentRun {
+                    run_id: self.run_id,
+                }));
+        if let Err(error) = response.result {
+            self.timeline
+                .push(TimelineItem::Status(format!("Pause error: {error}")));
+        } else if let Err(error) = self.collect_events() {
+            self.timeline
+                .push(TimelineItem::Status(format!("Event error: {error}")));
+        }
+        cx.notify();
+    }
+
+    fn resume(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let response =
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::ResumeAgentRun {
+                    run_id: self.run_id,
+                }));
+        if let Err(error) = response.result {
+            self.timeline
+                .push(TimelineItem::Status(format!("Resume error: {error}")));
         } else if let Err(error) = self.collect_events() {
             self.timeline
                 .push(TimelineItem::Status(format!("Event error: {error}")));
@@ -506,6 +583,7 @@ impl Render for LoomView {
             AgentRunState::Planning
                 | AgentRunState::Executing
                 | AgentRunState::AwaitingApproval
+                | AgentRunState::Paused
                 | AgentRunState::Evaluating
         );
         let run_failed = self.run_state == AgentRunState::Failed;
@@ -523,6 +601,36 @@ impl Render for LoomView {
                     .cursor_pointer()
                     .child("Interrupt")
                     .on_click(cx.listener(Self::interrupt)),
+            );
+            if self.run_state != AgentRunState::Paused {
+                header_actions = header_actions.child(
+                    div()
+                        .id("pause-run")
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x493b1a))
+                        .text_color(rgb(0xfef3c7))
+                        .text_sm()
+                        .cursor_pointer()
+                        .child("Pause")
+                        .on_click(cx.listener(Self::pause)),
+                );
+            }
+        }
+        if self.run_state == AgentRunState::Paused {
+            header_actions = header_actions.child(
+                div()
+                    .id("resume-run")
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(0x14532d))
+                    .text_color(rgb(0xbbf7d0))
+                    .text_sm()
+                    .cursor_pointer()
+                    .child("Resume")
+                    .on_click(cx.listener(Self::resume)),
             );
         }
         if run_failed {
@@ -603,7 +711,7 @@ impl Render for LoomView {
                             div()
                                 .text_sm()
                                 .text_color(rgb(0x8f98a6))
-                                .child("M2 agent session"),
+                                .child("M3 durable agent session"),
                         ),
                     )
                     .child(format!(
@@ -772,6 +880,12 @@ impl Render for LoomView {
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x8f98a6))
+                                    .child(format!("Providers  {}", self.provider_count)),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x8f98a6))
                                     .child(format!("Events  {}", self.timeline.len())),
                             )
                             .when(approval_visible, |element| {
@@ -818,7 +932,15 @@ fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
             Capability::StartAgentRun,
             Capability::ReadAgentRun,
             Capability::ControlAgentRun,
+            Capability::PauseAgentRun,
+            Capability::ResumeAgentRun,
+            Capability::ForkAgentSession,
+            Capability::RetryFromCheckpoint,
             Capability::ApproveAgentAction,
+            Capability::ListProviders,
+            Capability::ReadProviderHealth,
+            Capability::ReadUsage,
+            Capability::InspectContext,
             Capability::OpenWorkspace,
             Capability::ReadWorkspace,
             Capability::WriteWorkspace,
@@ -850,6 +972,14 @@ fn create_session(
     match response.result? {
         ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
         response => Err(unexpected_response("session creation", response)),
+    }
+}
+
+fn provider_count(connection: &InProcessConnection) -> Result<usize, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::ListProviders));
+    match response.result? {
+        ServerResponse::Providers { providers } => Ok(providers.len()),
+        response => Err(unexpected_response("provider list", response)),
     }
 }
 
@@ -941,6 +1071,7 @@ fn session_state_for_run(state: AgentRunState) -> AgentSessionState {
         AgentRunState::Planning => AgentSessionState::Planning,
         AgentRunState::Executing => AgentSessionState::Executing,
         AgentRunState::AwaitingApproval => AgentSessionState::AwaitingApproval,
+        AgentRunState::Paused => AgentSessionState::Paused,
         AgentRunState::Evaluating => AgentSessionState::Evaluating,
         AgentRunState::Completed => AgentSessionState::Completed,
         AgentRunState::Failed => AgentSessionState::Failed,
@@ -954,6 +1085,7 @@ const fn session_state_name(state: AgentSessionState) -> &'static str {
         AgentSessionState::Queued => "queued",
         AgentSessionState::Planning => "planning",
         AgentSessionState::AwaitingApproval => "awaiting approval",
+        AgentSessionState::Paused => "paused",
         AgentSessionState::Executing => "executing",
         AgentSessionState::Evaluating => "evaluating",
         AgentSessionState::NeedsInput => "needs input",
@@ -968,6 +1100,7 @@ const fn run_state_name(state: AgentRunState) -> &'static str {
         AgentRunState::Planning => "planning",
         AgentRunState::Executing => "executing",
         AgentRunState::AwaitingApproval => "awaiting approval",
+        AgentRunState::Paused => "paused",
         AgentRunState::Evaluating => "evaluating",
         AgentRunState::Completed => "completed",
         AgentRunState::Failed => "failed",

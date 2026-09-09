@@ -58,6 +58,7 @@ uuid_id!(CheckpointId);
 uuid_id!(ProjectId);
 uuid_id!(RequestId);
 uuid_id!(RunId);
+uuid_id!(StepId);
 uuid_id!(ToolCallId);
 uuid_id!(TerminalId);
 uuid_id!(TaskId);

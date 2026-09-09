@@ -94,6 +94,32 @@ disconnects. Policy evaluations are agent events before a tool executes, and
 the existing approval request/decision events remain authoritative for
 approval-required actions.
 
+M3 adds typed provider and durable-orchestration requests:
+
+```text
+StartAgentRunWithOptions
+PauseAgentRun / ResumeAgentRun
+ForkAgentSession
+RetryAgentFromCheckpoint
+ListProviders / ListModels
+DiscoverProviderModels
+GetProviderHealth
+GetRunUsage
+InspectAgentContext
+```
+
+`StartAgentRunWithOptions` carries `SessionLimits` and
+`ContextAssemblyOptions`. Limits are reported in `RunLimitReached` and
+`RunUsageUpdated` events; a context budget failure is a structured
+`context_limit_exceeded` failure rather than silent truncation or provider
+failover. `ContextInspected` events identify required, included, omitted, and
+compacted context items.
+
+Provider summaries contain provider/model IDs, capabilities, credential
+reference IDs, and health state, never raw credentials. Normalized provider
+authentication, rate-limit, invalid-response, and unavailable errors retain
+retryability without echoing response bodies or request headers.
+
 Important event families include `AgentMessageDelta`,
 `AgentPlanProposed`, `AgentStepStarted`, `ToolCallRequested`,
 `ToolApprovalRequired`, `ToolCallStarted`, `ToolOutputChunk`,
@@ -101,6 +127,19 @@ Important event families include `AgentMessageDelta`,
 `WorkspaceChanged`, and `AgentRunCompleted`. Events must identify the
 session, run, step, tool call, and sequence number so a client can render
 partial progress and recover a consistent view.
+
+M3 also journals `StepStarted`, `StepCompleted`, `ContextInspected`,
+`RunUsageUpdated`, `RunLimitReached`, approval/policy events, and forked
+session history. `ProviderError`, `ContextError`, and `RecoveryRequired`
+events retain normalized failure reasons without secret material. The backend
+persists these events before acknowledging the
+mutating request when durable mode is enabled. On restart, unfinished
+provider calls are not replayed implicitly: recoverable runtime state is
+paused and the client explicitly resumes or retries from its workspace
+checkpoint. If a referenced credential is unavailable, the run remains
+inspectable in `paused` state and receives `RecoveryRequired`; resuming then
+returns the normalized provider authentication error rather than switching
+models.
 
 ## Reconnect and consistency
 

@@ -1,7 +1,7 @@
 use loom_core::ToolCallId;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ProviderId(String);
 
@@ -21,7 +21,13 @@ impl From<&str> for ProviderId {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+impl From<String> for ProviderId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct ModelId(String);
 
@@ -41,12 +47,33 @@ impl From<&str> for ModelId {
     }
 }
 
+impl From<String> for ModelId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelCapabilities {
     pub streaming: bool,
     pub tool_calling: bool,
     pub vision: bool,
     pub json_mode: bool,
+}
+
+impl ModelCapabilities {
+    pub fn intersect(self, other: Self) -> Self {
+        Self {
+            streaming: self.streaming && other.streaming,
+            tool_calling: self.tool_calling && other.tool_calling,
+            vision: self.vision && other.vision,
+            json_mode: self.json_mode && other.json_mode,
+        }
+    }
+
+    pub fn intersection(&self, other: &Self) -> Self {
+        self.clone().intersect(other.clone())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

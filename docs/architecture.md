@@ -62,13 +62,17 @@ Suggested backend boundaries:
 - `loom-session`: durable agent sessions, conversation history, reconnect
   state, forks, handoff, and lifecycle.
 - `loom-agent`: agent loop, planning, tool-call dispatch, interruption,
-  retries, checkpoints, context compaction, and completion.
+  retries, checkpoints, context compaction, limits, pause/resume, and
+  completion.
 - `loom-model`: provider-independent model requests, streamed responses,
   tool-call normalization, token accounting, and model capabilities.
 - `loom-providers`: adapters for hosted APIs, OpenAI-compatible endpoints,
   local model servers, authentication, rate limits, and provider health.
-- `loom-context`: repository instructions, prompt assembly, file references,
-  conversation summaries, token budgets, and context inspection.
+- `loom-context`: context inspection and assembly, repository/system
+  instructions, summaries, compaction, and explicit token budgets.
+- `loom-persistence`: atomic versioned state storage used by the in-process
+  backend. Its JSON file format is an implementation detail; domain and
+  protocol types remain provider-neutral.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
   result normalization, and tool adapters.
 - `loom-workspace`: file tree, file contents, watches, edits, and snapshots.
@@ -96,6 +100,8 @@ queued -> planning -> awaiting_approval -> executing -> evaluating
                          ^                    |          |
                          |                    +----------+
                          |                         |
+                         +---------- paused -------+
+                                      |
                          +---- needs_input <-------+
                                       |
                          completed / failed / cancelled
@@ -130,8 +136,10 @@ The agent runtime talks to a normalized model interface:
 ModelProvider
   list_models()
   describe_model()
+  negotiate_capabilities()
   stream_completion(messages, tools, options)
   count_tokens(messages, tools)
+  health_check()
   cancel(request_id)
 ```
 
@@ -152,6 +160,21 @@ Local models may have weaker tool calling, smaller context windows, or
 different streaming behavior. The capability handshake must let the runtime
 adapt prompts and feature availability without making the UI provider-aware.
 
+M3 implements the registry with deterministic, OpenAI-compatible, and Ollama
+configurations. Credentials are represented by opaque references; the
+registry resolves them only while constructing a backend provider. Usage is
+recorded as normalized token/cost records, and transport/status failures are
+mapped to stable Loom error codes. Provider configuration summaries never
+contain endpoints with credential material or raw keys.
+
+The first durable implementation stores a versioned backend snapshot through
+an atomic temporary-file replacement. It includes the session manager state,
+authoritative event journal, serializable agent runtime state (including
+messages, pending approvals, steps, limits, and usage), workspace state and
+checkpoints, policy decisions, provider health, and usage ledgers. A runtime
+that was executing during a process crash is recovered in `paused` state so a
+new connection must explicitly resume it.
+
 ## Repository layout
 
 The repository should evolve toward a Rust workspace:
@@ -164,6 +187,7 @@ crates/
   loom-model/
   loom-providers/
   loom-context/
+  loom-persistence/
   loom-tools/
   loom-workspace/
   loom-process/

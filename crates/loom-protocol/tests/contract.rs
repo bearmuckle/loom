@@ -1,7 +1,8 @@
 use loom_agent::{AgentEvent, AgentRunSnapshot, AgentRunState};
+use loom_context::ContextAssemblyOptions;
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet,
-    EventSequence, ProjectId, ProtocolVersion, RunId, Timestamp,
+    EventSequence, ProjectId, ProtocolVersion, RunId, SessionLimits, Timestamp,
 };
 use loom_model::ModelId;
 use loom_process::{TaskKind, TaskSpec};
@@ -144,4 +145,41 @@ fn m2_workspace_and_task_requests_round_trip_without_untyped_envelopes() {
     let decoded_response = decode_response(&encode_response(&response).unwrap()).unwrap();
     assert_eq!(decoded_response, response);
     assert_eq!(task.kind, TaskKind::Test);
+}
+
+#[test]
+fn m3_run_options_provider_and_context_contracts_round_trip() {
+    let request = RequestEnvelope::new(ClientRequest::StartAgentRunWithOptions {
+        session_id: AgentSessionId::new(),
+        task: "durable task".to_owned(),
+        model: ModelId::new("deterministic/demo"),
+        workspace_root: "/workspace".to_owned(),
+        system_instructions: Some("system".to_owned()),
+        repository_instructions: Some("repository".to_owned()),
+        limits: SessionLimits {
+            max_tool_calls: Some(3),
+            max_cost_micros: Some(10_000),
+            ..Default::default()
+        },
+        context: ContextAssemblyOptions {
+            context_window: Some(4_096),
+            max_input_tokens: Some(2_048),
+            reserved_output_tokens: Some(512),
+        },
+    });
+    assert_eq!(
+        decode_request(&encode_request(&request).unwrap()).unwrap(),
+        request
+    );
+
+    let response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::Providers {
+            providers: Vec::new(),
+        },
+    );
+    assert_eq!(
+        decode_response(&encode_response(&response).unwrap()).unwrap(),
+        response
+    );
 }
