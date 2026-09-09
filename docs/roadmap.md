@@ -121,6 +121,23 @@ agent, observe its current step, approve an action, and retrieve its result.
 from prompt through agent plan, implementation, validation, diff review, and
 commit preparation.
 
+M5 implementation notes:
+
+- `loom-workspace::EditorWorkspace` is a buffer/layout projection over the
+  existing canonical `Workspace`; it has conflict-safe revision checks,
+  bounded text loading, undo/redo, autosave policy, encoding/newline
+  preservation, navigation/search, and agent markers.
+- `loom-language` provides lifecycle/capability descriptors and deterministic
+  diagnostics, symbols, definitions, and references for common text
+  languages. Full external LSP process management is deferred.
+- `loom-vcs` provides scoped Git status/diff/index/commit/branch/conflict
+  operations through direct process arguments. Other VCS providers are
+  deferred.
+- Task snapshots expose bounded output, artifacts, and stable evidence links;
+  run snapshots can attach those links to final summaries. The native GPUI
+  projection includes file navigation, editor state, timeline/approvals,
+  diagnostics/outline, task results, and Git status.
+
 ### M6 - Browser and wasm target
 
 - Build the shared frontend for wasm with the selected GPUI variant.

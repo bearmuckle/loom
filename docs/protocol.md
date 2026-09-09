@@ -171,6 +171,30 @@ inspectable in `paused` state and receives `RecoveryRequired`; resuming then
 returns the normalized provider authentication error rather than switching
 models.
 
+M5 adds additive, capability-gated operations for the coding workspace:
+
+```text
+OpenEditorBuffer / EditEditorBuffer / UndoEditorBuffer / RedoEditorBuffer
+SaveEditorBuffer / ReloadEditorBuffer / SetAutosavePolicy
+GetEditorLayout / SplitEditor / FocusEditorPane / CloseEditorBuffer
+GetFileTree / FuzzyFindFiles / SearchWorkspace / GetContextFiles
+DiscoverLanguageServices / StartLanguageService / StopLanguageService
+GetDiagnostics / GetSymbols / GoToDefinition / FindReferences
+GetVcsStatus / GetVcsDiff / StageVcsPaths / UnstageVcsPaths
+CreateVcsCommit / GetVcsBranches / GetVcsConflicts
+GetTaskEvidence / AttachRunEvidence
+```
+
+Editor operations return structured buffer/layout snapshots. Buffer saves
+carry the backend revision implicitly and return `external_change` rather
+than overwriting an external edit. Language descriptors expose lifecycle
+state and per-operation capabilities. VCS responses contain status, patch,
+branch, commit, and conflict data without exposing command credentials or
+shell strings. Task evidence uses bounded artifact metadata and stable
+`loom://task/...` links. Every operation is available through both
+`InProcessConnection` and the authenticated WebSocket adapter after normal
+version/capability negotiation.
+
 ## Reconnect and consistency
 
 The backend event stream is authoritative. A client connection should:

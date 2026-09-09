@@ -28,6 +28,12 @@ pub enum ErrorCode {
     ContextLimitExceeded,
     SessionLimitExceeded,
     RecoveryRequired,
+    UnsupportedCapability,
+    FileTooLarge,
+    InvalidEncoding,
+    ExternalChange,
+    LanguageService,
+    Vcs,
     RequestCancelled,
     DeadlineExceeded,
     Backpressure,
@@ -59,6 +65,12 @@ impl fmt::Display for ErrorCode {
             Self::ContextLimitExceeded => "context_limit_exceeded",
             Self::SessionLimitExceeded => "session_limit_exceeded",
             Self::RecoveryRequired => "recovery_required",
+            Self::UnsupportedCapability => "unsupported_capability",
+            Self::FileTooLarge => "file_too_large",
+            Self::InvalidEncoding => "invalid_encoding",
+            Self::ExternalChange => "external_change",
+            Self::LanguageService => "language_service",
+            Self::Vcs => "vcs",
             Self::RequestCancelled => "request_cancelled",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Backpressure => "backpressure",
@@ -87,6 +99,10 @@ impl LoomError {
 
     pub fn invalid_request(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::InvalidRequest, message, false)
+    }
+
+    pub fn invalid_state(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::InvalidState, message, false)
     }
 
     pub fn malformed_payload(message: impl Into<String>) -> Self {

@@ -1,0 +1,12 @@
+[package]
+name = "loom-vcs"
+description = "Scoped Git status, diff, index, branch, and commit integration for Loom."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-core.workspace = true
+serde.workspace = true
+

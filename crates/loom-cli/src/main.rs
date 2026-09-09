@@ -446,6 +446,19 @@ fn client_capabilities() -> CapabilitySet {
         Capability::ConfigureApprovalPolicy,
         Capability::ManageCheckpoints,
         Capability::TakeoverWorkspace,
+        Capability::WorkspaceNavigation,
+        Capability::SearchWorkspace,
+        Capability::ReadWorkspaceInstructions,
+        Capability::ReadDiagnostics,
+        Capability::ReadSymbols,
+        Capability::GoToDefinition,
+        Capability::FindReferences,
+        Capability::LanguageServiceLifecycle,
+        Capability::ReadVcsStatus,
+        Capability::ReadVcsDiff,
+        Capability::MutateVcsIndex,
+        Capability::CreateVcsCommit,
+        Capability::ReadTaskEvidence,
         Capability::JsonProtocol,
     ])
 }
@@ -736,6 +749,19 @@ fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
             Capability::ConfigureApprovalPolicy,
             Capability::ManageCheckpoints,
             Capability::TakeoverWorkspace,
+            Capability::WorkspaceNavigation,
+            Capability::SearchWorkspace,
+            Capability::ReadWorkspaceInstructions,
+            Capability::ReadDiagnostics,
+            Capability::ReadSymbols,
+            Capability::GoToDefinition,
+            Capability::FindReferences,
+            Capability::LanguageServiceLifecycle,
+            Capability::ReadVcsStatus,
+            Capability::ReadVcsDiff,
+            Capability::MutateVcsIndex,
+            Capability::CreateVcsCommit,
+            Capability::ReadTaskEvidence,
             Capability::JsonProtocol,
         ]),
     }));
@@ -862,10 +888,21 @@ fn stream_run(
                     false,
                 ));
             };
+            let evidence = if snapshot.evidence.is_empty() {
+                "none".to_owned()
+            } else {
+                snapshot
+                    .evidence
+                    .iter()
+                    .map(|link| format!("{} ({})", link.label, link.uri))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             println!(
-                "Final summary [{}]: {}",
+                "Final summary [{}]: {} | evidence: {}",
                 run_state_name(snapshot.state),
-                snapshot.summary.unwrap_or_else(|| "none".to_owned())
+                snapshot.summary.unwrap_or_else(|| "none".to_owned()),
+                evidence
             );
             return Ok(());
         }

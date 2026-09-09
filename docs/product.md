@@ -98,6 +98,14 @@ Features should be added behind stable domain interfaces. A client must be
 able to discover which capabilities a backend supports instead of assuming
 that every installation has the same tools available.
 
+The M5 vertical slice makes these interfaces concrete without changing the
+agent/session authority: editor buffers and layout are a projection over the
+backend workspace, language services report their lifecycle/capabilities,
+Git mutations are explicit user actions, and build/test/lint results retain
+bounded output plus evidence links for the final run summary. The compact
+GPUI layout keeps the agent timeline and approvals visible beside the editor,
+diagnostics, task results, and repository status.
+
 ## Guiding principles
 
 1. **Backend owns truth.** The frontend renders state and submits commands; it

@@ -62,6 +62,8 @@ uuid_id!(StepId);
 uuid_id!(ToolCallId);
 uuid_id!(TerminalId);
 uuid_id!(TaskId);
+uuid_id!(BufferId);
+uuid_id!(PaneId);
 
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,

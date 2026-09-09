@@ -12,6 +12,16 @@ use loom_core::{
 };
 use serde::{Deserialize, Serialize};
 
+mod editor;
+
+pub use editor::{
+    AgentChangeKind, AgentChangeMarker, AutosavePolicy, BufferEdit, BufferEncoding, BufferId,
+    BufferSnapshot, ContextFileKind, ContextFileReference, EditorLayoutSnapshot,
+    EditorPaneSnapshot, EditorTabSnapshot, EditorWorkspace, FileTreeEntry, FileTreeEntryKind,
+    NewlineStyle, PaneId, SearchMatch, SearchQuery, SplitDirection, SymbolNavigationHint,
+    TextRange,
+};
+
 const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -60,6 +70,20 @@ pub struct WorkspaceFile {
     pub path: String,
     pub content: String,
     pub revision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceBytes {
+    pub path: String,
+    pub bytes: Vec<u8>,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceByteWriteResult {
+    pub path: String,
+    pub before_revision: String,
+    pub after_revision: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -119,6 +143,8 @@ pub struct UndoResult {
 pub struct WorkspaceEditHistory {
     pub path: String,
     pub before: Option<String>,
+    #[serde(default)]
+    pub before_bytes: Option<Vec<u8>>,
     pub after_revision: String,
     pub source: WorkspaceControl,
 }
@@ -148,6 +174,7 @@ struct WorkspaceState {
 struct EditRecord {
     path: String,
     before: Option<String>,
+    before_bytes: Option<Vec<u8>>,
     after_revision: String,
     source: WorkspaceControl,
 }
@@ -259,6 +286,7 @@ impl Workspace {
                 .map(|edit| WorkspaceEditHistory {
                     path: edit.path.clone(),
                     before: edit.before.clone(),
+                    before_bytes: edit.before_bytes.clone(),
                     after_revision: edit.after_revision.clone(),
                     source: edit.source,
                 })
@@ -348,6 +376,7 @@ impl Workspace {
             .map(|edit| EditRecord {
                 path: edit.path,
                 before: edit.before,
+                before_bytes: edit.before_bytes,
                 after_revision: edit.after_revision,
                 source: edit.source,
             })
@@ -379,11 +408,11 @@ impl Workspace {
     }
 
     pub fn read_file(&self, relative: &str) -> Result<WorkspaceFile> {
-        let path = self.resolve_relative(relative, false)?;
-        let content = fs::read_to_string(&path).map_err(|error| {
+        let file = self.read_file_bytes(relative)?;
+        let content = String::from_utf8(file.bytes).map_err(|error| {
             LoomError::new(
-                ErrorCode::ToolExecution,
-                format!("could not read '{relative}': {error}"),
+                ErrorCode::InvalidEncoding,
+                format!("workspace file '{relative}' is not valid UTF-8: {error}"),
                 false,
             )
         })?;
@@ -391,6 +420,101 @@ impl Workspace {
             path: relative.to_owned(),
             revision: revision(&content),
             content,
+        })
+    }
+
+    pub fn read_file_bytes(&self, relative: &str) -> Result<WorkspaceBytes> {
+        let path = self.resolve_relative(relative, false)?;
+        let bytes = fs::read(&path).map_err(|error| {
+            LoomError::new(
+                ErrorCode::ToolExecution,
+                format!("could not read '{relative}': {error}"),
+                false,
+            )
+        })?;
+        let revision = revision_bytes(&bytes);
+        Ok(WorkspaceBytes {
+            path: relative.to_owned(),
+            bytes,
+            revision,
+        })
+    }
+
+    pub fn write_file_bytes(
+        &self,
+        relative: &str,
+        bytes: Vec<u8>,
+        expected_revision: Option<&str>,
+    ) -> Result<WorkspaceByteWriteResult> {
+        self.write_file_bytes_from(relative, bytes, expected_revision, WorkspaceControl::User)
+    }
+
+    pub fn write_file_bytes_from(
+        &self,
+        relative: &str,
+        bytes: Vec<u8>,
+        expected_revision: Option<&str>,
+        source: WorkspaceControl,
+    ) -> Result<WorkspaceByteWriteResult> {
+        let mut state = self.lock_state()?;
+        if source == WorkspaceControl::Agent && state.control == WorkspaceControl::User {
+            return Err(LoomError::new(
+                ErrorCode::Conflict,
+                "workspace is under user control; agent edits are paused",
+                false,
+            ));
+        }
+        let path = self.resolve_relative(relative, true)?;
+        let before_bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(LoomError::new(
+                    ErrorCode::ToolExecution,
+                    format!("could not read '{relative}' before writing: {error}"),
+                    false,
+                ));
+            }
+        };
+        let before_revision = revision_bytes(&before_bytes);
+        if expected_revision.is_some_and(|expected| expected != before_revision) {
+            return Err(LoomError::new(
+                ErrorCode::ExternalChange,
+                format!(
+                    "workspace file '{relative}' changed before saving (expected {}, found {before_revision})",
+                    expected_revision.unwrap_or_default()
+                ),
+                false,
+            ));
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::ToolExecution,
+                    format!("could not create write destination: {error}"),
+                    false,
+                )
+            })?;
+        }
+        fs::write(&path, &bytes).map_err(|error| {
+            LoomError::new(
+                ErrorCode::ToolExecution,
+                format!("could not write '{relative}': {error}"),
+                false,
+            )
+        })?;
+        let after_revision = revision_bytes(&bytes);
+        state.edits.push(EditRecord {
+            path: relative.to_owned(),
+            before: String::from_utf8(before_bytes.clone()).ok(),
+            before_bytes: Some(before_bytes),
+            after_revision: after_revision.clone(),
+            source,
+        });
+        Ok(WorkspaceByteWriteResult {
+            path: relative.to_owned(),
+            before_revision,
+            after_revision,
         })
     }
 
@@ -475,6 +599,7 @@ impl Workspace {
         state.edits.push(EditRecord {
             path: edit.path.clone(),
             before,
+            before_bytes: None,
             after_revision: after_revision.clone(),
             source,
         });
@@ -616,6 +741,7 @@ impl Workspace {
             state.edits.push(EditRecord {
                 path: relative,
                 before: Some(current),
+                before_bytes: None,
                 after_revision: next_revision,
                 source: WorkspaceControl::User,
             });
@@ -660,13 +786,16 @@ impl Workspace {
         }
         match edit.before {
             Some(before) => fs::write(&path, &before),
-            None => fs::remove_file(&path).or_else(|error| {
-                if error.kind() == ErrorKind::NotFound {
-                    Ok(())
-                } else {
-                    Err(error)
-                }
-            }),
+            None => match edit.before_bytes {
+                Some(before) => fs::write(&path, before),
+                None => fs::remove_file(&path).or_else(|error| {
+                    if error.kind() == ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                }),
+            },
         }
         .map_err(|error| {
             LoomError::new(

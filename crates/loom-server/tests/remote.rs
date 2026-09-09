@@ -30,6 +30,20 @@ fn capabilities() -> CapabilitySet {
         Capability::ApproveAgentAction,
         Capability::OpenWorkspace,
         Capability::ReadWorkspace,
+        Capability::WriteWorkspace,
+        Capability::WorkspaceNavigation,
+        Capability::SearchWorkspace,
+        Capability::ReadWorkspaceInstructions,
+        Capability::ReadDiagnostics,
+        Capability::ReadSymbols,
+        Capability::GoToDefinition,
+        Capability::FindReferences,
+        Capability::LanguageServiceLifecycle,
+        Capability::ReadVcsStatus,
+        Capability::ReadVcsDiff,
+        Capability::MutateVcsIndex,
+        Capability::CreateVcsCommit,
+        Capability::ReadTaskEvidence,
         Capability::OpenTerminal,
         Capability::ControlTerminal,
         Capability::JsonProtocol,
@@ -147,6 +161,16 @@ async fn authorized_client_can_discover_and_revoke_access() {
     let transport = WebSocketTransport::new(server.websocket_url(), token.token.clone());
     let mut connection = transport.connect().await.unwrap();
     negotiate(&mut connection).await;
+    let discovered = connection
+        .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+        .await
+        .unwrap();
+    let discovered = match discovered.result {
+        Ok(ServerResponse::Capabilities(result)) => result.capabilities,
+        other => panic!("unexpected capability response: {other:?}"),
+    };
+    assert!(discovered.contains(Capability::WorkspaceNavigation));
+    assert!(discovered.contains(Capability::ReadVcsStatus));
     let project_id = ProjectId::new();
     let _ = session(&mut connection, project_id).await;
     auth.revoke(&token.token_id).unwrap();

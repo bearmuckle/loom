@@ -1,17 +1,22 @@
 use loom_agent::{AgentEvent, AgentRunSnapshot};
 use loom_context::ContextAssemblyOptions;
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, Capability, CapabilitySet, EventSequence, LoomError,
-    ProjectId, ProtocolVersion, RequestId, RunId, SessionEvent, SessionEventRecord, SessionLimits,
-    ToolCallId, UsageSnapshot,
+    AgentSessionId, AgentSessionSnapshot, BufferId, Capability, CapabilitySet, EventSequence,
+    LoomError, PaneId, ProjectId, ProtocolVersion, RequestId, RunId, SessionEvent,
+    SessionEventRecord, SessionLimits, ToolCallId, UsageSnapshot,
 };
+use loom_language::{Diagnostic, LanguageServiceDescriptor, Location, Position, Symbol};
 use loom_model::{ModelDescriptor, ModelId, ProviderId};
 use loom_process::{
-    TaskEventRecord, TaskSnapshot, TaskSpec, TerminalEventRecord, TerminalSnapshot,
+    TaskEventRecord, TaskEvidenceLink, TaskSnapshot, TaskSpec, TerminalEventRecord,
+    TerminalSnapshot,
 };
 use loom_providers::{ProviderHealth, ProviderSummary, ProviderUsageSummary};
+use loom_vcs::{GitBranch, GitCommit, GitDiff, GitRepositoryStatus};
 use loom_workspace::{
-    Checkpoint, RevertResult, UndoResult, WorkspaceChange, WorkspaceControl, WorkspaceEdit,
+    AgentChangeMarker, AutosavePolicy, BufferEdit, BufferSnapshot, Checkpoint,
+    ContextFileReference, EditorLayoutSnapshot, FileTreeEntry, RevertResult, SearchMatch,
+    SearchQuery, SplitDirection, UndoResult, WorkspaceChange, WorkspaceControl, WorkspaceEdit,
     WorkspaceEditResult, WorkspaceFile, WorkspaceSnapshot,
 };
 use serde::{Deserialize, Serialize};
@@ -223,6 +228,151 @@ pub enum ClientRequest {
         project_id: ProjectId,
         task_id: loom_core::TaskId,
     },
+    OpenEditorBuffer {
+        project_id: ProjectId,
+        path: String,
+    },
+    GetEditorBuffer {
+        project_id: ProjectId,
+        buffer_id: BufferId,
+    },
+    EditEditorBuffer {
+        project_id: ProjectId,
+        buffer_id: BufferId,
+        edit: BufferEdit,
+    },
+    UndoEditorBuffer {
+        project_id: ProjectId,
+        buffer_id: BufferId,
+    },
+    RedoEditorBuffer {
+        project_id: ProjectId,
+        buffer_id: BufferId,
+    },
+    SaveEditorBuffer {
+        project_id: ProjectId,
+        buffer_id: BufferId,
+    },
+    ReloadEditorBuffer {
+        project_id: ProjectId,
+        buffer_id: BufferId,
+        discard_dirty: bool,
+    },
+    MarkExternalEditorChanges {
+        project_id: ProjectId,
+    },
+    SetAutosavePolicy {
+        project_id: ProjectId,
+        policy: AutosavePolicy,
+    },
+    GetEditorLayout {
+        project_id: ProjectId,
+    },
+    SplitEditor {
+        project_id: ProjectId,
+        direction: SplitDirection,
+    },
+    FocusEditorPane {
+        project_id: ProjectId,
+        pane_id: PaneId,
+    },
+    FocusEditorTab {
+        project_id: ProjectId,
+        pane_id: PaneId,
+        buffer_id: BufferId,
+    },
+    CloseEditorBuffer {
+        project_id: ProjectId,
+        buffer_id: BufferId,
+        force: bool,
+    },
+    GetFileTree {
+        project_id: ProjectId,
+    },
+    FuzzyFindFiles {
+        project_id: ProjectId,
+        query: String,
+        limit: usize,
+    },
+    SearchWorkspace {
+        project_id: ProjectId,
+        query: SearchQuery,
+    },
+    GetContextFiles {
+        project_id: ProjectId,
+    },
+    RecordAgentChange {
+        project_id: ProjectId,
+        buffer_id: BufferId,
+        marker: AgentChangeMarker,
+    },
+    ClearAgentMarkers {
+        project_id: ProjectId,
+        buffer_id: BufferId,
+    },
+    DiscoverLanguageServices {
+        project_id: ProjectId,
+    },
+    StartLanguageService {
+        project_id: ProjectId,
+        path: String,
+    },
+    StopLanguageService {
+        project_id: ProjectId,
+        path: String,
+    },
+    GetDiagnostics {
+        project_id: ProjectId,
+        path: String,
+    },
+    GetSymbols {
+        project_id: ProjectId,
+        path: String,
+    },
+    GoToDefinition {
+        project_id: ProjectId,
+        path: String,
+        position: Position,
+    },
+    FindReferences {
+        project_id: ProjectId,
+        path: String,
+        position: Position,
+    },
+    GetVcsStatus {
+        project_id: ProjectId,
+    },
+    GetVcsDiff {
+        project_id: ProjectId,
+        path: Option<String>,
+        staged: bool,
+    },
+    StageVcsPaths {
+        project_id: ProjectId,
+        paths: Vec<String>,
+    },
+    UnstageVcsPaths {
+        project_id: ProjectId,
+        paths: Vec<String>,
+    },
+    CreateVcsCommit {
+        project_id: ProjectId,
+        message: String,
+    },
+    GetVcsBranches {
+        project_id: ProjectId,
+    },
+    GetVcsConflicts {
+        project_id: ProjectId,
+    },
+    GetTaskEvidence {
+        project_id: ProjectId,
+        task_id: loom_core::TaskId,
+    },
+    AttachRunEvidence {
+        run_id: RunId,
+        evidence: Vec<loom_core::EvidenceLink>,
+    },
 }
 
 impl ClientRequest {
@@ -272,6 +422,44 @@ impl ClientRequest {
             Self::StartTask { .. } => Some(Capability::StartTask),
             Self::GetTask { .. } | Self::GetTaskEvents { .. } => Some(Capability::ReadTask),
             Self::CancelTask { .. } => Some(Capability::ControlTask),
+            Self::OpenEditorBuffer { .. }
+            | Self::GetEditorBuffer { .. }
+            | Self::ReloadEditorBuffer { .. }
+            | Self::MarkExternalEditorChanges { .. }
+            | Self::GetEditorLayout { .. }
+            | Self::FocusEditorPane { .. }
+            | Self::FocusEditorTab { .. }
+            | Self::GetFileTree { .. } => Some(Capability::WorkspaceNavigation),
+            Self::EditEditorBuffer { .. }
+            | Self::UndoEditorBuffer { .. }
+            | Self::RedoEditorBuffer { .. }
+            | Self::SaveEditorBuffer { .. }
+            | Self::SetAutosavePolicy { .. }
+            | Self::SplitEditor { .. }
+            | Self::CloseEditorBuffer { .. }
+            | Self::RecordAgentChange { .. }
+            | Self::ClearAgentMarkers { .. } => Some(Capability::WriteWorkspace),
+            Self::FuzzyFindFiles { .. } | Self::SearchWorkspace { .. } => {
+                Some(Capability::SearchWorkspace)
+            }
+            Self::GetContextFiles { .. } => Some(Capability::ReadWorkspaceInstructions),
+            Self::DiscoverLanguageServices { .. }
+            | Self::StartLanguageService { .. }
+            | Self::StopLanguageService { .. } => Some(Capability::LanguageServiceLifecycle),
+            Self::GetDiagnostics { .. } => Some(Capability::ReadDiagnostics),
+            Self::GetSymbols { .. } => Some(Capability::ReadSymbols),
+            Self::GoToDefinition { .. } => Some(Capability::GoToDefinition),
+            Self::FindReferences { .. } => Some(Capability::FindReferences),
+            Self::GetVcsStatus { .. }
+            | Self::GetVcsBranches { .. }
+            | Self::GetVcsConflicts { .. } => Some(Capability::ReadVcsStatus),
+            Self::GetVcsDiff { .. } => Some(Capability::ReadVcsDiff),
+            Self::StageVcsPaths { .. } | Self::UnstageVcsPaths { .. } => {
+                Some(Capability::MutateVcsIndex)
+            }
+            Self::CreateVcsCommit { .. } => Some(Capability::CreateVcsCommit),
+            Self::GetTaskEvidence { .. } => Some(Capability::ReadTaskEvidence),
+            Self::AttachRunEvidence { .. } => Some(Capability::ControlAgentRun),
         }
     }
 
@@ -302,6 +490,24 @@ impl ClientRequest {
                 | Self::CancelTerminal { .. }
                 | Self::StartTask { .. }
                 | Self::CancelTask { .. }
+                | Self::OpenEditorBuffer { .. }
+                | Self::EditEditorBuffer { .. }
+                | Self::UndoEditorBuffer { .. }
+                | Self::RedoEditorBuffer { .. }
+                | Self::SaveEditorBuffer { .. }
+                | Self::ReloadEditorBuffer { .. }
+                | Self::MarkExternalEditorChanges { .. }
+                | Self::SetAutosavePolicy { .. }
+                | Self::SplitEditor { .. }
+                | Self::FocusEditorPane { .. }
+                | Self::FocusEditorTab { .. }
+                | Self::CloseEditorBuffer { .. }
+                | Self::RecordAgentChange { .. }
+                | Self::ClearAgentMarkers { .. }
+                | Self::StageVcsPaths { .. }
+                | Self::UnstageVcsPaths { .. }
+                | Self::CreateVcsCommit { .. }
+                | Self::AttachRunEvidence { .. }
         )
     }
 }
@@ -388,6 +594,50 @@ pub enum ServerResponse {
     Task(TaskSnapshot),
     TaskEvents {
         events: Vec<TaskEventRecord>,
+    },
+    EditorBuffer(BufferSnapshot),
+    EditorBuffers {
+        buffers: Vec<BufferSnapshot>,
+    },
+    EditorLayout(EditorLayoutSnapshot),
+    AutosavePolicy(AutosavePolicy),
+    FileTree {
+        entries: Vec<FileTreeEntry>,
+    },
+    FuzzyFiles {
+        paths: Vec<String>,
+    },
+    SearchMatches {
+        matches: Vec<SearchMatch>,
+    },
+    ContextFiles {
+        files: Vec<ContextFileReference>,
+    },
+    LanguageServices {
+        services: Vec<LanguageServiceDescriptor>,
+    },
+    Diagnostics {
+        path: String,
+        diagnostics: Vec<Diagnostic>,
+    },
+    Symbols {
+        path: String,
+        symbols: Vec<Symbol>,
+    },
+    Locations {
+        locations: Vec<Location>,
+    },
+    VcsStatus(GitRepositoryStatus),
+    VcsDiff(GitDiff),
+    VcsCommit(GitCommit),
+    VcsBranches {
+        branches: Vec<GitBranch>,
+    },
+    VcsConflicts {
+        paths: Vec<String>,
+    },
+    TaskEvidence {
+        evidence: Vec<TaskEvidenceLink>,
     },
 }
 

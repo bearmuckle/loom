@@ -1,6 +1,6 @@
 [package]
 name = "loom-ui"
-description = "GPUI native client for the Loom M1 single-agent vertical slice."
+description = "GPUI native coding workspace and agent client for Loom M5."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,8 +14,11 @@ path = "src/main.rs"
 gpui.workspace = true
 loom-agent.workspace = true
 loom-core.workspace = true
+loom-language.workspace = true
 loom-model.workspace = true
+loom-process.workspace = true
 loom-protocol.workspace = true
 loom-server.workspace = true
+loom-vcs.workspace = true
 loom-workspace.workspace = true
 serde_json.workspace = true

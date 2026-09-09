@@ -3088,6 +3088,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-language"
+version = "0.1.0"
+dependencies = [
+ "loom-core",
+ "loom-workspace",
+ "serde",
+]
+
+[[package]]
 name = "loom-model"
 version = "0.1.0"
 dependencies = [
@@ -3121,9 +3130,11 @@ dependencies = [
  "loom-agent",
  "loom-context",
  "loom-core",
+ "loom-language",
  "loom-model",
  "loom-process",
  "loom-providers",
+ "loom-vcs",
  "loom-workspace",
  "serde",
  "serde_json",
@@ -3150,6 +3161,7 @@ dependencies = [
  "loom-agent",
  "loom-context",
  "loom-core",
+ "loom-language",
  "loom-model",
  "loom-persistence",
  "loom-process",
@@ -3157,6 +3169,7 @@ dependencies = [
  "loom-providers",
  "loom-session",
  "loom-tools",
+ "loom-vcs",
  "loom-workspace",
  "serde",
  "sha2 0.10.9",
@@ -3191,11 +3204,22 @@ dependencies = [
  "gpui",
  "loom-agent",
  "loom-core",
+ "loom-language",
  "loom-model",
+ "loom-process",
  "loom-protocol",
  "loom-server",
+ "loom-vcs",
  "loom-workspace",
  "serde_json",
+]
+
+[[package]]
+name = "loom-vcs"
+version = "0.1.0"
+dependencies = [
+ "loom-core",
+ "serde",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ use loom_protocol::{
     decode_event, decode_request, decode_response, decode_server_frame, encode_client_frame,
     encode_event, encode_request, encode_response, encode_server_frame,
 };
+use loom_workspace::{BufferEdit, SearchQuery, TextRange};
 use loom_workspace::{WorkspaceEdit, WorkspaceSnapshot};
 
 #[test]
@@ -92,6 +93,7 @@ fn agent_event_json_round_trip_preserves_run_identity() {
         updated_at: Timestamp::from_unix_millis(3),
         completed_at: None,
         summary: None,
+        evidence: Vec::new(),
     };
     let event = ServerEventEnvelope {
         protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -220,5 +222,50 @@ fn m4_transport_frames_preserve_typed_envelopes() {
     assert_eq!(
         decode_server_frame(&encode_server_frame(&response).unwrap()).unwrap(),
         response
+    );
+}
+
+#[test]
+fn m5_editor_language_vcs_and_evidence_contracts_round_trip() {
+    let project_id = ProjectId::new();
+    let editor = RequestEnvelope::new(ClientRequest::EditEditorBuffer {
+        project_id,
+        buffer_id: loom_core::BufferId::new(),
+        edit: BufferEdit {
+            range: TextRange::new(0, 1),
+            replacement: "x".to_owned(),
+        },
+    });
+    assert_eq!(
+        decode_request(&encode_request(&editor).unwrap()).unwrap(),
+        editor
+    );
+    let search = RequestEnvelope::new(ClientRequest::SearchWorkspace {
+        project_id,
+        query: SearchQuery::literal("workspace"),
+    });
+    assert_eq!(
+        decode_request(&encode_request(&search).unwrap()).unwrap(),
+        search
+    );
+    let response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::Locations {
+            locations: Vec::new(),
+        },
+    );
+    assert_eq!(
+        decode_response(&encode_response(&response).unwrap()).unwrap(),
+        response
+    );
+    let vcs = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::TaskEvidence {
+            evidence: Vec::new(),
+        },
+    );
+    assert_eq!(
+        decode_response(&encode_response(&vcs).unwrap()).unwrap(),
+        vcs
     );
 }

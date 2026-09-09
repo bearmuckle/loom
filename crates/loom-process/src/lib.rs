@@ -478,6 +478,14 @@ pub struct TaskArtifact {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskEvidenceLink {
+    pub label: String,
+    pub uri: String,
+    pub artifact_path: String,
+    pub exists: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TaskSnapshot {
     pub id: TaskId,
     pub kind: TaskKind,
@@ -493,6 +501,8 @@ pub struct TaskSnapshot {
     pub output: String,
     pub output_truncated: bool,
     pub artifacts: Vec<TaskArtifact>,
+    #[serde(default)]
+    pub evidence: Vec<TaskEvidenceLink>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -528,6 +538,7 @@ struct TaskState {
 
 #[derive(Debug)]
 struct TaskHandle {
+    id: TaskId,
     state: Mutex<TaskState>,
     child: Mutex<Option<Child>>,
     cancel_requested: AtomicBool,
@@ -598,6 +609,7 @@ impl TaskSupervisor {
             output: String::new(),
             output_truncated: false,
             artifacts: Vec::new(),
+            evidence: Vec::new(),
         };
         let mut child = Command::new(&spec.command)
             .args(&spec.args)
@@ -628,6 +640,7 @@ impl TaskSupervisor {
             )
         })?;
         let handle = Arc::new(TaskHandle {
+            id,
             state: Mutex::new(TaskState {
                 snapshot: snapshot.clone(),
                 events: VecDeque::new(),
@@ -865,6 +878,15 @@ fn wait_for_task(handle: Arc<TaskHandle>, event_limit: usize) {
             }
         })
         .collect::<Vec<_>>();
+    let evidence = artifacts
+        .iter()
+        .map(|artifact| TaskEvidenceLink {
+            label: format!("{} evidence", artifact.path),
+            uri: format!("loom://task/{}/artifact/{}", handle.id, artifact.path),
+            artifact_path: artifact.path.clone(),
+            exists: artifact.exists,
+        })
+        .collect::<Vec<_>>();
     let _ = append_task_event(
         &handle,
         event_limit,
@@ -878,6 +900,7 @@ fn wait_for_task(handle: Arc<TaskHandle>, event_limit: usize) {
             snapshot.exit_code = exit_code;
             snapshot.completed_at = Some(Timestamp::now());
             snapshot.artifacts = artifacts;
+            snapshot.evidence = evidence;
         },
     );
 }
@@ -1040,6 +1063,7 @@ mod tests {
                 assert!(current.output.len() <= 5);
                 assert!(current.output_truncated);
                 assert!(current.artifacts[0].exists);
+                assert!(current.evidence[0].uri.starts_with("loom://task/"));
                 fs::remove_dir_all(root).unwrap();
                 return;
             }
