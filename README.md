@@ -28,6 +28,8 @@ The project specification is split into focused documents:
   reconnect behavior, provider-neutral operations, and streaming.
 - [Security model](docs/security.md) - trust boundaries, permissions,
   credentials, prompt injection, and resource limits.
+- [Known competitors and prior art](docs/competitors.md) - comparable
+  products, useful patterns, near-misses, and design lessons.
 - [Roadmap and quality bar](docs/roadmap.md) - milestones, exit conditions,
   performance, testing, decisions, and first-release non-goals.
 

@@ -29,6 +29,11 @@ and provider/model configurations. The editor, terminal, source control, and
 diagnostics are the agent's observable working environment as well as tools
 the user can operate directly.
 
+Current competitors and prior art are tracked in
+[Known competitors and prior art](competitors.md). That document records
+products that meet or approach Loom's remote-control and portable-backend
+requirements, along with patterns to adopt and failure modes to avoid.
+
 ## Target workflows
 
 Loom should support these concrete workflows:
