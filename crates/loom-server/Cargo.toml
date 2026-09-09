@@ -12,5 +12,7 @@ loom-core.workspace = true
 loom-model.workspace = true
 loom-protocol.workspace = true
 loom-providers.workspace = true
+loom-process.workspace = true
 loom-session.workspace = true
 loom-tools.workspace = true
+loom-workspace.workspace = true

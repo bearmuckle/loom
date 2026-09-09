@@ -67,3 +67,31 @@ The GPUI client starts against an isolated temporary workspace and pauses on
 write/command approvals. See [ADR 0001](docs/decisions/0001-foundation.md) and
 [ADR 0002](docs/decisions/0002-m1-agent-vertical-slice.md) for the
 implementation decisions.
+
+## M2 workspace and human control
+
+M2 adds workspace, process, and recovery services while keeping the M1
+in-process protocol and approval flow compatible:
+
+- `loom-workspace` opens a canonical, workspace-scoped root and provides
+  bounded file snapshots, safe reads/edits, polling change events, checkpoints,
+  undo/revert, conflict detection, and an explicit user takeover boundary.
+- `loom-process` provides persistent standard-process terminals with output
+  event streams, input, recorded resize state, exit status, cancellation, and
+  bounded build/test/lint-style task supervision with artifact metadata.
+- Typed `ApprovalPolicy` decisions cover reads, writes, commands, network, and
+  destructive actions. Agent policy evaluations are journaled next to the
+  existing approval prompts, so automatic, approval-required, and denied
+  actions remain visible to clients.
+
+The native shell can exercise the M2 surfaces after an agent run:
+
+```sh
+cargo run -p loom-cli -- --m2-demo --manual-approval
+```
+
+The GPUI client displays the workspace snapshot count and the same approval,
+reject, interrupt, and retry controls. See
+[ADR 0003](docs/decisions/0003-m2-workspace-and-human-control.md) for the
+implementation tradeoffs and deferred PTY, persistence, and remote-watch
+work.

@@ -74,6 +74,26 @@ GetRepositoryStatus
 CreateCommit
 ```
 
+M2 adds typed workspace and process requests rather than exposing filesystem or
+process primitives directly:
+
+```text
+OpenWorkspace / GetWorkspaceSnapshot / GetWorkspaceEvents
+ReadWorkspaceFile / ApplyWorkspaceEdit / TakeWorkspaceControl
+CreateCheckpoint / RevertCheckpoint / UndoWorkspaceEdit
+SetApprovalPolicy
+OpenTerminal / WriteTerminalInput / ResizeTerminal
+GetTerminalEvents / CancelTerminal
+StartTask / GetTask / GetTaskEvents / CancelTask
+```
+
+Workspace edits carry an optional content revision and return a structured
+conflict when it no longer matches. Terminal and task output is delivered as
+bounded, sequence-numbered records; snapshots remain available after a client
+disconnects. Policy evaluations are agent events before a tool executes, and
+the existing approval request/decision events remain authoritative for
+approval-required actions.
+
 Important event families include `AgentMessageDelta`,
 `AgentPlanProposed`, `AgentStepStarted`, `ToolCallRequested`,
 `ToolApprovalRequired`, `ToolCallStarted`, `ToolOutputChunk`,

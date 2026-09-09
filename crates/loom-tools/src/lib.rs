@@ -4,8 +4,9 @@ use std::{
     process::Command,
 };
 
-use loom_core::{LoomError, Result, ToolCallId};
+use loom_core::{ActionKind, ApprovalPolicy, ProjectId, Result, ToolCallId};
 use loom_model::{ToolCall, ToolDefinition};
+use loom_workspace::{Workspace, WorkspaceEdit};
 use serde::Deserialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,6 +43,14 @@ impl ToolKind {
     pub const fn requires_approval(self) -> bool {
         matches!(self, Self::ApplyPatch | Self::RunCommand)
     }
+
+    pub const fn action_kind(self) -> ActionKind {
+        match self {
+            Self::ListFiles | Self::ReadFile | Self::SearchText => ActionKind::Read,
+            Self::ApplyPatch => ActionKind::Write,
+            Self::RunCommand => ActionKind::Command,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -75,31 +84,40 @@ impl ToolResult {
 pub struct ToolExecutor {
     root: PathBuf,
     max_output_bytes: usize,
+    workspace: Workspace,
 }
 
 impl ToolExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
-        if !root.is_dir() {
-            return Err(LoomError::invalid_request(format!(
-                "workspace root '{}' is not a directory",
-                root.display()
-            )));
-        }
-        let root = fs::canonicalize(&root).map_err(|error| {
-            LoomError::new(
-                loom_core::ErrorCode::ToolExecution,
-                format!(
-                    "could not resolve workspace root '{}': {error}",
-                    root.display()
-                ),
-                false,
-            )
-        })?;
-        Ok(Self {
+        let workspace = Workspace::open(ProjectId::new(), root)?;
+        Ok(Self::new_with_workspace(workspace))
+    }
+
+    pub fn new_with_workspace(workspace: Workspace) -> Self {
+        let root = workspace.root().to_owned();
+        Self {
             root,
             max_output_bytes: 64 * 1024,
+            workspace,
+        }
+    }
+
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
+    }
+
+    pub fn policy_evaluation(
+        &self,
+        call: &ToolCall,
+        policy: &ApprovalPolicy,
+    ) -> Option<loom_core::PolicyEvaluation> {
+        ToolKind::from_name(&call.name).map(|kind| {
+            loom_core::PolicyEvaluation::evaluate(policy, kind.action_kind(), &call.name)
         })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     pub fn workspace_root(&self) -> &Path {
@@ -183,61 +201,32 @@ impl ToolExecutor {
             Ok(arguments) => arguments,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let path = match self.resolve_relative(&arguments.path) {
-            Ok(path) => path,
-            Err(error) => return ToolResult::failure(call, error),
+        let current_file = match self.workspace.read_file(&arguments.path) {
+            Ok(file) => file,
+            Err(error) if error.code == loom_core::ErrorCode::NotFound => {
+                loom_workspace::WorkspaceFile {
+                    path: arguments.path.clone(),
+                    content: String::new(),
+                    revision: String::new(),
+                }
+            }
+            Err(error) => return ToolResult::failure(call, error.message),
         };
-        let current = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => {
-                return ToolResult::failure(
-                    call,
-                    format!(
-                        "could not read '{}' before patching: {error}",
-                        arguments.path
-                    ),
-                );
-            }
-        };
-
-        let next = if arguments.old_text.is_empty() {
-            if !current.is_empty() {
-                return ToolResult::failure(
-                    call,
-                    "old_text is required when replacing an existing file",
-                );
-            }
-            arguments.new_text
-        } else {
-            let occurrences = current.match_indices(&arguments.old_text).count();
-            if occurrences != 1 {
-                return ToolResult::failure(
-                    call,
-                    format!(
-                        "expected old_text exactly once in '{}', found {occurrences} matches",
-                        arguments.path
-                    ),
-                );
-            }
-            current.replacen(&arguments.old_text, &arguments.new_text, 1)
-        };
-
-        if let Some(parent) = path.parent() {
-            if let Err(error) = fs::create_dir_all(parent) {
-                return ToolResult::failure(
-                    call,
-                    format!("could not create patch destination: {error}"),
-                );
-            }
-        }
-        let diff = unified_diff(&arguments.path, &current, &next);
-        match fs::write(&path, next) {
-            Ok(()) => ToolResult::success(
+        match self.workspace.apply_edit(WorkspaceEdit {
+            path: arguments.path.clone(),
+            old_text: arguments.old_text,
+            new_text: arguments.new_text,
+            expected_revision: if current_file.revision.is_empty() {
+                None
+            } else {
+                Some(current_file.revision)
+            },
+        }) {
+            Ok(result) => ToolResult::success(
                 call,
-                self.limit_output(format!("updated {}\n{diff}", arguments.path)),
+                self.limit_output(format!("updated {}\n{}", result.path, result.diff)),
             ),
-            Err(error) => ToolResult::failure(call, format!("could not write file: {error}")),
+            Err(error) => ToolResult::failure(call, error.message),
         }
     }
 
@@ -302,28 +291,28 @@ impl ToolExecutor {
             ));
         }
         let mut resolved = self.root.clone();
-        let mut unresolved = false;
         for component in path.components() {
             let Component::Normal(component) = component else {
                 continue;
             };
-            if unresolved {
-                resolved.push(component);
-                continue;
-            }
             let candidate = resolved.join(component);
-            if candidate.exists() {
-                resolved = fs::canonicalize(&candidate)
-                    .map_err(|error| format!("could not resolve '{}': {error}", relative))?;
-                if !resolved.starts_with(&self.root) {
-                    return Err(format!(
-                        "path '{}' must stay inside the workspace root",
-                        relative
-                    ));
+            match fs::symlink_metadata(&candidate) {
+                Ok(_) => {
+                    resolved = fs::canonicalize(&candidate)
+                        .map_err(|error| format!("could not resolve '{}': {error}", relative))?;
+                    if !resolved.starts_with(&self.root) {
+                        return Err(format!(
+                            "path '{}' must stay inside the workspace root",
+                            relative
+                        ));
+                    }
                 }
-            } else {
-                resolved.push(component);
-                unresolved = true;
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(format!("workspace path '{}' was not found", relative));
+                }
+                Err(error) => {
+                    return Err(format!("could not resolve '{}': {error}", relative));
+                }
             }
         }
         Ok(resolved)
@@ -424,21 +413,6 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(
 ) -> std::result::Result<T, String> {
     serde_json::from_value(call.arguments.clone())
         .map_err(|error| format!("invalid arguments for '{}': {error}", call.name))
-}
-
-fn unified_diff(path: &str, before: &str, after: &str) -> String {
-    let mut diff = format!("--- {path}\n+++ {path}\n");
-    for line in before.lines() {
-        diff.push('-');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    for line in after.lines() {
-        diff.push('+');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    diff
 }
 
 pub fn tool_definitions() -> Vec<ToolDefinition> {

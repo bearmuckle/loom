@@ -1,4 +1,7 @@
-use loom_core::{AgentSessionId, ErrorCode, LoomError, Result, RunId, Timestamp};
+use loom_core::{
+    AgentSessionId, ApprovalPolicy, ErrorCode, LoomError, PolicyEvaluation, Result, RunId,
+    Timestamp,
+};
 use loom_model::{
     CompletionOptions, MessageRole, ModelId, ModelMessage, ModelRequest, ModelStreamEvent,
     TokenUsage, ToolCall,
@@ -73,6 +76,11 @@ pub enum AgentEvent {
         run_id: RunId,
         call: ToolCall,
     },
+    ToolPolicyEvaluated {
+        run_id: RunId,
+        call: ToolCall,
+        evaluation: PolicyEvaluation,
+    },
     ToolApprovalDecided {
         run_id: RunId,
         tool_call_id: loom_core::ToolCallId,
@@ -145,6 +153,7 @@ pub struct AgentRuntime {
     last_failed_call: Option<ToolCall>,
     next_message_id: u64,
     active_message_id: Option<u64>,
+    approval_policy: ApprovalPolicy,
 }
 
 impl AgentRuntime {
@@ -195,7 +204,20 @@ impl AgentRuntime {
             last_failed_call: None,
             next_message_id: 0,
             active_message_id: None,
+            approval_policy: ApprovalPolicy::default(),
         }
+    }
+
+    pub fn new_with_policy(
+        session_id: AgentSessionId,
+        task: AgentTask,
+        provider: Box<dyn ModelProvider>,
+        tools: ToolExecutor,
+        approval_policy: ApprovalPolicy,
+    ) -> Self {
+        let mut runtime = Self::new(session_id, task, provider, tools);
+        runtime.approval_policy = approval_policy;
+        runtime
     }
 
     pub fn run_id(&self) -> RunId {
@@ -394,7 +416,41 @@ impl AgentRuntime {
                             });
                             continue;
                         };
-                        if kind.requires_approval() {
+                        let evaluation = self
+                            .tools
+                            .policy_evaluation(&call, &self.approval_policy)
+                            .unwrap_or_else(|| {
+                                PolicyEvaluation::evaluate(
+                                    &self.approval_policy,
+                                    kind.action_kind(),
+                                    &call.name,
+                                )
+                            });
+                        events.push(AgentEvent::ToolPolicyEvaluated {
+                            run_id: self.run.id,
+                            call: call.clone(),
+                            evaluation: evaluation.clone(),
+                        });
+                        if matches!(evaluation.decision, loom_core::PolicyDecision::Deny) {
+                            let result = ToolResult {
+                                tool_call_id: call.id,
+                                name: call.name.clone(),
+                                success: false,
+                                output: evaluation.reason,
+                            };
+                            events.push(AgentEvent::ToolCallCompleted {
+                                run_id: self.run.id,
+                                result,
+                            });
+                            events.extend(
+                                self.finish_failed("tool call denied by the workspace policy"),
+                            );
+                            return Ok(events);
+                        }
+                        if matches!(
+                            evaluation.decision,
+                            loom_core::PolicyDecision::RequireApproval
+                        ) {
                             self.pending_approval = Some(PendingApproval { call: call.clone() });
                             events.extend(self.set_state(AgentRunState::AwaitingApproval));
                             events.push(AgentEvent::ToolApprovalRequired {

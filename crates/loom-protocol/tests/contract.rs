@@ -4,11 +4,13 @@ use loom_core::{
     EventSequence, ProjectId, ProtocolVersion, RunId, Timestamp,
 };
 use loom_model::ModelId;
+use loom_process::{TaskKind, TaskSpec};
 use loom_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ResponseEnvelope, ServerEvent,
     ServerEventEnvelope, ServerResponse, decode_event, decode_request, decode_response,
     encode_event, encode_request, encode_response,
 };
+use loom_workspace::{WorkspaceEdit, WorkspaceSnapshot};
 
 #[test]
 fn request_json_round_trip_preserves_typed_envelope() {
@@ -105,4 +107,41 @@ fn agent_event_json_round_trip_preserves_run_identity() {
 
     assert_eq!(decoded, event);
     assert_eq!(run.state, AgentRunState::Executing);
+}
+
+#[test]
+fn m2_workspace_and_task_requests_round_trip_without_untyped_envelopes() {
+    let request = RequestEnvelope::new(ClientRequest::ApplyWorkspaceEdit {
+        project_id: ProjectId::new(),
+        edit: WorkspaceEdit {
+            path: "src/lib.rs".to_owned(),
+            old_text: "old".to_owned(),
+            new_text: "new".to_owned(),
+            expected_revision: Some("revision".to_owned()),
+        },
+    });
+    let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
+    assert_eq!(decoded, request);
+
+    let task = TaskSpec {
+        kind: TaskKind::Test,
+        label: "contract task".to_owned(),
+        command: "printf".to_owned(),
+        args: vec!["ok".to_owned()],
+        cwd: None,
+        output_limit_bytes: Some(128),
+        artifact_paths: vec!["target/result.txt".to_owned()],
+    };
+    let response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::WorkspaceSnapshot(WorkspaceSnapshot {
+            project_id: ProjectId::new(),
+            root: "/workspace".to_owned(),
+            captured_at: Timestamp::from_unix_millis(4),
+            entries: Vec::new(),
+        }),
+    );
+    let decoded_response = decode_response(&encode_response(&response).unwrap()).unwrap();
+    assert_eq!(decoded_response, response);
+    assert_eq!(task.kind, TaskKind::Test);
 }
