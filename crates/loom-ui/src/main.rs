@@ -18,6 +18,7 @@ use loom_server::{InProcessBackend, InProcessConnection};
 
 struct LoomView {
     connection: InProcessConnection,
+    project_id: ProjectId,
     session_id: AgentSessionId,
     run_id: RunId,
     workspace_root: PathBuf,
@@ -29,6 +30,7 @@ struct LoomView {
     pending_approval: Option<ToolCall>,
     timeline: Vec<TimelineItem>,
     summary: Option<String>,
+    workspace_entries: usize,
 }
 
 #[derive(Clone)]
@@ -52,8 +54,12 @@ impl LoomView {
         negotiate(&connection)?;
         let model = ModelId::new("deterministic/demo");
         let (session, run) = start_demo_run(&connection, &workspace_root, &model)?;
+        let workspace_entries = workspace_snapshot(&connection, session.project_id)?
+            .entries
+            .len();
         let mut view = Self {
             connection,
+            project_id: session.project_id,
             session_id: session.id,
             run_id: run.id,
             workspace_root,
@@ -65,6 +71,7 @@ impl LoomView {
             pending_approval: None,
             timeline: Vec::new(),
             summary: None,
+            workspace_entries,
         };
         view.collect_events()?;
         Ok(view)
@@ -132,6 +139,12 @@ impl LoomView {
                         active: true,
                     });
                 }
+                AgentEvent::ToolPolicyEvaluated { evaluation, .. } => {
+                    self.timeline.push(TimelineItem::Status(format!(
+                        "Policy {:?}: {}",
+                        evaluation.decision, evaluation.reason
+                    )));
+                }
                 AgentEvent::ToolApprovalDecided { decision, .. } => {
                     for item in &mut self.timeline {
                         if let TimelineItem::Approval { active, .. } = item {
@@ -173,6 +186,20 @@ impl LoomView {
                     }
                 }
             },
+            ServerEvent::WorkspaceChanged { change } => {
+                self.timeline.push(TimelineItem::Status(format!(
+                    "Workspace {:?}: {}",
+                    change.kind, change.path
+                )));
+            }
+            ServerEvent::Terminal { event } => {
+                self.timeline
+                    .push(TimelineItem::Status(format!("Terminal: {:?}", event.event)));
+            }
+            ServerEvent::Task { event } => {
+                self.timeline
+                    .push(TimelineItem::Status(format!("Task: {:?}", event.event)));
+            }
         }
     }
 
@@ -205,6 +232,12 @@ impl LoomView {
             self.timeline
                 .push(TimelineItem::Status(format!("Refresh error: {error}")));
         }
+        match workspace_snapshot(&self.connection, self.project_id) {
+            Ok(snapshot) => self.workspace_entries = snapshot.entries.len(),
+            Err(error) => self.timeline.push(TimelineItem::Status(format!(
+                "Workspace refresh error: {error}"
+            ))),
+        }
         cx.notify();
     }
 
@@ -236,6 +269,7 @@ impl LoomView {
         }
         reset_demo_workspace(&self.workspace_root)?;
         let (session, run) = start_demo_run(&self.connection, &self.workspace_root, &self.model)?;
+        self.project_id = session.project_id;
         self.session_id = session.id;
         self.run_id = run.id;
         self.task = run.task;
@@ -245,6 +279,9 @@ impl LoomView {
         self.pending_approval = None;
         self.timeline.clear();
         self.summary = None;
+        self.workspace_entries = workspace_snapshot(&self.connection, self.project_id)?
+            .entries
+            .len();
         self.collect_events()
     }
 
@@ -566,7 +603,7 @@ impl Render for LoomView {
                             div()
                                 .text_sm()
                                 .text_color(rgb(0x8f98a6))
-                                .child("M1 agent session"),
+                                .child("M2 agent session"),
                         ),
                     )
                     .child(format!(
@@ -659,7 +696,7 @@ impl Render for LoomView {
                                             .p_2()
                                             .rounded_sm()
                                             .bg(rgb(0x292d38))
-                                            .child(div().text_sm().child("* M1 demo"))
+                                            .child(div().text_sm().child("* M2 demo"))
                                             .child(
                                                 div()
                                                     .text_sm()
@@ -726,6 +763,12 @@ impl Render for LoomView {
                                     .child(format!("Workspace  {}", self.workspace_root.display())),
                             )
                             .child(
+                                div().text_sm().text_color(rgb(0x8f98a6)).child(format!(
+                                    "Workspace entries  {}",
+                                    self.workspace_entries
+                                )),
+                            )
+                            .child(
                                 div()
                                     .text_sm()
                                     .text_color(rgb(0x8f98a6))
@@ -776,6 +819,18 @@ fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
             Capability::ReadAgentRun,
             Capability::ControlAgentRun,
             Capability::ApproveAgentAction,
+            Capability::OpenWorkspace,
+            Capability::ReadWorkspace,
+            Capability::WriteWorkspace,
+            Capability::SubscribeWorkspaceEvents,
+            Capability::OpenTerminal,
+            Capability::ControlTerminal,
+            Capability::ReadTask,
+            Capability::StartTask,
+            Capability::ControlTask,
+            Capability::ConfigureApprovalPolicy,
+            Capability::ManageCheckpoints,
+            Capability::TakeoverWorkspace,
             Capability::JsonProtocol,
         ]),
     }));
@@ -790,7 +845,7 @@ fn create_session(
 ) -> Result<loom_core::AgentSessionSnapshot, LoomError> {
     let response = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
         project_id: ProjectId::new(),
-        name: "M1 demo".to_owned(),
+        name: "M2 demo".to_owned(),
     }));
     match response.result? {
         ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
@@ -823,6 +878,19 @@ fn start_demo_run(
     Ok((session, run))
 }
 
+fn workspace_snapshot(
+    connection: &InProcessConnection,
+    project_id: ProjectId,
+) -> Result<loom_workspace::WorkspaceSnapshot, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceSnapshot {
+        project_id,
+    }));
+    match response.result? {
+        ServerResponse::WorkspaceSnapshot(snapshot) => Ok(snapshot),
+        response => Err(unexpected_response("workspace snapshot", response)),
+    }
+}
+
 fn prepare_workspace() -> Result<PathBuf, LoomError> {
     let root = std::env::temp_dir().join("loom-m1-ui");
     fs::create_dir_all(&root).map_err(|error| {
@@ -834,7 +902,7 @@ fn prepare_workspace() -> Result<PathBuf, LoomError> {
     })?;
     let readme = root.join("README.md");
     if !readme.exists() {
-        fs::write(readme, "Workspace used by the Loom M1 GPUI demo.\n").map_err(|error| {
+        fs::write(readme, "Workspace used by the Loom M2 GPUI demo.\n").map_err(|error| {
             LoomError::new(
                 ErrorCode::ToolExecution,
                 format!("could not seed UI workspace: {error}"),
@@ -921,7 +989,7 @@ fn main() {
             WindowOptions {
                 focus: true,
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Loom M1".into()),
+                    title: Some("Loom M2".into()),
                     ..Default::default()
                 }),
                 window_background: WindowBackgroundAppearance::Opaque,

@@ -46,3 +46,11 @@ explicit by default.
 The first release does not need a complete multi-user identity system, but it
 must have an explicit trust boundary so one can be added without redesigning
 the protocol.
+
+M2 implements the local boundary with canonical workspace roots, traversal and
+outside-root symlink rejection, revision-checked edits, workspace-scoped task
+working directories, and project ownership checks for terminal/task control
+requests. Its default `ApprovalPolicy` allows reads, pauses writes and
+commands for approval, requests approval for network actions, and denies
+destructive actions. The policy evaluation is included in the agent event
+stream before a tool executes.

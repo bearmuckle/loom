@@ -4,6 +4,13 @@ use loom_core::{
     ProjectId, ProtocolVersion, RequestId, RunId, SessionEvent, SessionEventRecord, ToolCallId,
 };
 use loom_model::{ModelDescriptor, ModelId};
+use loom_process::{
+    TaskEventRecord, TaskSnapshot, TaskSpec, TerminalEventRecord, TerminalSnapshot,
+};
+use loom_workspace::{
+    Checkpoint, RevertResult, UndoResult, WorkspaceChange, WorkspaceControl, WorkspaceEdit,
+    WorkspaceEditResult, WorkspaceFile, WorkspaceSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -79,6 +86,88 @@ pub enum ClientRequest {
         run_id: RunId,
     },
     ListModels,
+    OpenWorkspace {
+        project_id: ProjectId,
+        root: String,
+    },
+    GetWorkspaceSnapshot {
+        project_id: ProjectId,
+    },
+    GetWorkspaceEvents {
+        project_id: ProjectId,
+        after_sequence: Option<EventSequence>,
+    },
+    ReadWorkspaceFile {
+        project_id: ProjectId,
+        path: String,
+    },
+    ApplyWorkspaceEdit {
+        project_id: ProjectId,
+        edit: WorkspaceEdit,
+    },
+    TakeWorkspaceControl {
+        project_id: ProjectId,
+        control: WorkspaceControl,
+    },
+    CreateCheckpoint {
+        project_id: ProjectId,
+        session_id: Option<AgentSessionId>,
+        label: String,
+    },
+    RevertCheckpoint {
+        project_id: ProjectId,
+        checkpoint_id: loom_core::CheckpointId,
+    },
+    UndoWorkspaceEdit {
+        project_id: ProjectId,
+    },
+    SetApprovalPolicy {
+        project_id: ProjectId,
+        policy: loom_core::ApprovalPolicy,
+    },
+    OpenTerminal {
+        project_id: ProjectId,
+        command: String,
+        args: Vec<String>,
+        cwd: Option<String>,
+    },
+    WriteTerminalInput {
+        project_id: ProjectId,
+        terminal_id: loom_core::TerminalId,
+        input: String,
+    },
+    ResizeTerminal {
+        project_id: ProjectId,
+        terminal_id: loom_core::TerminalId,
+        rows: u16,
+        columns: u16,
+    },
+    GetTerminalEvents {
+        project_id: ProjectId,
+        terminal_id: loom_core::TerminalId,
+        after_sequence: Option<EventSequence>,
+    },
+    CancelTerminal {
+        project_id: ProjectId,
+        terminal_id: loom_core::TerminalId,
+    },
+    StartTask {
+        project_id: ProjectId,
+        spec: TaskSpec,
+    },
+    GetTask {
+        project_id: ProjectId,
+        task_id: loom_core::TaskId,
+    },
+    GetTaskEvents {
+        project_id: ProjectId,
+        task_id: loom_core::TaskId,
+        after_sequence: Option<EventSequence>,
+    },
+    CancelTask {
+        project_id: ProjectId,
+        task_id: loom_core::TaskId,
+    },
 }
 
 impl ClientRequest {
@@ -97,6 +186,25 @@ impl ClientRequest {
                 Some(Capability::ControlAgentRun)
             }
             Self::ListModels => None,
+            Self::OpenWorkspace { .. } => Some(Capability::OpenWorkspace),
+            Self::GetWorkspaceSnapshot { .. } | Self::ReadWorkspaceFile { .. } => {
+                Some(Capability::ReadWorkspace)
+            }
+            Self::GetWorkspaceEvents { .. } => Some(Capability::SubscribeWorkspaceEvents),
+            Self::ApplyWorkspaceEdit { .. } => Some(Capability::WriteWorkspace),
+            Self::TakeWorkspaceControl { .. } => Some(Capability::TakeoverWorkspace),
+            Self::CreateCheckpoint { .. }
+            | Self::RevertCheckpoint { .. }
+            | Self::UndoWorkspaceEdit { .. } => Some(Capability::ManageCheckpoints),
+            Self::SetApprovalPolicy { .. } => Some(Capability::ConfigureApprovalPolicy),
+            Self::OpenTerminal { .. } => Some(Capability::OpenTerminal),
+            Self::WriteTerminalInput { .. }
+            | Self::ResizeTerminal { .. }
+            | Self::CancelTerminal { .. } => Some(Capability::ControlTerminal),
+            Self::GetTerminalEvents { .. } => Some(Capability::ControlTerminal),
+            Self::StartTask { .. } => Some(Capability::StartTask),
+            Self::GetTask { .. } | Self::GetTaskEvents { .. } => Some(Capability::ReadTask),
+            Self::CancelTask { .. } => Some(Capability::ControlTask),
         }
     }
 }
@@ -136,6 +244,22 @@ pub enum ServerResponse {
     AgentRun(AgentRunSnapshot),
     SessionEvents { events: Vec<ServerEventEnvelope> },
     Models { models: Vec<ModelDescriptor> },
+    WorkspaceOpened(WorkspaceSnapshot),
+    WorkspaceSnapshot(WorkspaceSnapshot),
+    WorkspaceEvents { events: Vec<WorkspaceChange> },
+    WorkspaceFile(WorkspaceFile),
+    WorkspaceEditApplied(WorkspaceEditResult),
+    WorkspaceControl(WorkspaceControl),
+    CheckpointCreated(Checkpoint),
+    CheckpointReverted(RevertResult),
+    WorkspaceUndo(UndoResult),
+    ApprovalPolicy(loom_core::ApprovalPolicy),
+    TerminalOpened(TerminalSnapshot),
+    Terminal(TerminalSnapshot),
+    TerminalEvents { events: Vec<TerminalEventRecord> },
+    TaskStarted(TaskSnapshot),
+    Task(TaskSnapshot),
+    TaskEvents { events: Vec<TaskEventRecord> },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -164,6 +288,15 @@ pub enum ServerEvent {
     },
     Agent {
         event: AgentEvent,
+    },
+    WorkspaceChanged {
+        change: WorkspaceChange,
+    },
+    Terminal {
+        event: TerminalEventRecord,
+    },
+    Task {
+        event: TaskEventRecord,
     },
 }
 

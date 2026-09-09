@@ -12,6 +12,9 @@ pub enum ErrorCode {
     NotFound,
     Conflict,
     CapabilityDenied,
+    ApprovalRequired,
+    WorkspaceAccessDenied,
+    ProcessCancelled,
     UnsupportedProtocol,
     ProviderUnavailable,
     ToolExecution,
@@ -27,6 +30,9 @@ impl fmt::Display for ErrorCode {
             Self::NotFound => "not_found",
             Self::Conflict => "conflict",
             Self::CapabilityDenied => "capability_denied",
+            Self::ApprovalRequired => "approval_required",
+            Self::WorkspaceAccessDenied => "workspace_access_denied",
+            Self::ProcessCancelled => "process_cancelled",
             Self::UnsupportedProtocol => "unsupported_protocol",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::ToolExecution => "tool_execution",
@@ -71,6 +77,14 @@ impl LoomError {
 
     pub fn unsupported_protocol(message: impl Into<String>) -> Self {
         Self::new(ErrorCode::UnsupportedProtocol, message, false)
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::Conflict, message, false)
+    }
+
+    pub fn approval_required(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::ApprovalRequired, message, false)
     }
 }
 

@@ -2993,6 +2993,7 @@ dependencies = [
  "loom-agent",
  "loom-core",
  "loom-model",
+ "loom-process",
  "loom-protocol",
  "loom-server",
  "serde_json",
@@ -3017,12 +3018,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-process"
+version = "0.1.0"
+dependencies = [
+ "loom-core",
+ "serde",
+]
+
+[[package]]
 name = "loom-protocol"
 version = "0.1.0"
 dependencies = [
  "loom-agent",
  "loom-core",
  "loom-model",
+ "loom-process",
+ "loom-workspace",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -3045,10 +3056,12 @@ dependencies = [
  "loom-agent",
  "loom-core",
  "loom-model",
+ "loom-process",
  "loom-protocol",
  "loom-providers",
  "loom-session",
  "loom-tools",
+ "loom-workspace",
 ]
 
 [[package]]
@@ -3064,6 +3077,7 @@ version = "0.1.0"
 dependencies = [
  "loom-core",
  "loom-model",
+ "loom-workspace",
  "serde",
  "serde_json",
 ]
@@ -3078,7 +3092,16 @@ dependencies = [
  "loom-model",
  "loom-protocol",
  "loom-server",
+ "loom-workspace",
  "serde_json",
+]
+
+[[package]]
+name = "loom-workspace"
+version = "0.1.0"
+dependencies = [
+ "loom-core",
+ "serde",
 ]
 
 [[package]]

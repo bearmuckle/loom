@@ -1,6 +1,6 @@
 [package]
-name = "loom-tools"
-description = "Workspace-scoped tools used by Loom agent runs."
+name = "loom-workspace"
+description = "Workspace snapshots, scoped edits, watches, and checkpoints for Loom."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,4 @@ rust-version.workspace = true
 
 [dependencies]
 loom-core.workspace = true
-loom-model.workspace = true
-loom-workspace.workspace = true
 serde.workspace = true
-serde_json.workspace = true

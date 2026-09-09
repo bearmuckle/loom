@@ -2,6 +2,8 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 use loom_agent::{AgentEvent, AgentRunState};
@@ -10,6 +12,7 @@ use loom_core::{
     RunId,
 };
 use loom_model::ModelId;
+use loom_process::{TaskKind, TaskSpec, TaskStatus, TerminalEvent, TerminalStatus};
 use loom_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
 };
@@ -27,7 +30,7 @@ fn main() -> Result<(), LoomError> {
     let session = create_session(&connection, &options.name)?;
     let run_id = start_run(&connection, session.id, &options, &workspace_root)?;
 
-    println!("Loom native M1 shell");
+    println!("Loom native M2 shell");
     println!(
         "Connected in-process using protocol {}.{}",
         CURRENT_PROTOCOL_VERSION.major, CURRENT_PROTOCOL_VERSION.minor
@@ -36,6 +39,9 @@ fn main() -> Result<(), LoomError> {
     println!("Session {}: {}", session.id, session.name);
     println!("Task: {}", options.task);
     stream_run(&connection, session.id, run_id, options.manual_approval)?;
+    if options.m2_demo {
+        demonstrate_m2_services(&connection, session.project_id, &workspace_root)?;
+    }
     Ok(())
 }
 
@@ -45,6 +51,7 @@ struct CliOptions {
     model: ModelId,
     root: Option<PathBuf>,
     manual_approval: bool,
+    m2_demo: bool,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOptions>, LoomError> {
@@ -54,6 +61,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
         model: ModelId::new("deterministic/demo"),
         root: None,
         manual_approval: false,
+        m2_demo: false,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -62,11 +70,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--model" => options.model = ModelId::new(required_value(&mut args, "--model")?),
             "--root" => options.root = Some(PathBuf::from(required_value(&mut args, "--root")?)),
             "--manual-approval" => options.manual_approval = true,
+            "--m2-demo" => options.m2_demo = true,
             "--help" | "-h" => {
                 println!(
                     "Usage: loom [--name <name>] [--task <task>] [--model <id>] \
                      [--root <path>] [--manual-approval]"
                 );
+                println!("Add --m2-demo to exercise workspace, terminal, and task APIs.");
                 println!(
                     "The default workspace is an isolated directory in the system temp folder."
                 );
@@ -102,8 +112,144 @@ fn required_value(
         .ok_or_else(|| LoomError::invalid_request(format!("{flag} requires a value")))
 }
 
+fn demonstrate_m2_services(
+    connection: &InProcessConnection,
+    project_id: ProjectId,
+    workspace_root: &Path,
+) -> Result<(), LoomError> {
+    let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+        project_id,
+        root: workspace_root.display().to_string(),
+    }));
+    let snapshot = match opened.result? {
+        ServerResponse::WorkspaceOpened(snapshot) => snapshot,
+        response => return Err(unexpected_response("workspace open", response)),
+    };
+    println!(
+        "M2 workspace snapshot: {} entries under {}",
+        snapshot.entries.len(),
+        snapshot.root
+    );
+
+    let (command, args) = if cfg!(windows) {
+        (
+            "cmd".to_owned(),
+            vec!["/C".to_owned(), "echo terminal".to_owned()],
+        )
+    } else {
+        ("printf".to_owned(), vec!["terminal\\n".to_owned()])
+    };
+    let terminal = match connection
+        .request(RequestEnvelope::new(ClientRequest::OpenTerminal {
+            project_id,
+            command,
+            args,
+            cwd: None,
+        }))
+        .result?
+    {
+        ServerResponse::TerminalOpened(snapshot) => snapshot,
+        response => return Err(unexpected_response("terminal open", response)),
+    };
+    connection
+        .request(RequestEnvelope::new(ClientRequest::ResizeTerminal {
+            project_id,
+            terminal_id: terminal.id,
+            rows: 30,
+            columns: 100,
+        }))
+        .result?;
+    let mut after_terminal = None;
+    for _ in 0..100 {
+        let events = match connection
+            .request(RequestEnvelope::new(ClientRequest::GetTerminalEvents {
+                project_id,
+                terminal_id: terminal.id,
+                after_sequence: after_terminal,
+            }))
+            .result?
+        {
+            ServerResponse::TerminalEvents { events } => events,
+            response => return Err(unexpected_response("terminal events", response)),
+        };
+        let finished = events.iter().any(|event| {
+            matches!(
+                event.event,
+                TerminalEvent::Exited {
+                    status: TerminalStatus::Exited
+                        | TerminalStatus::Failed
+                        | TerminalStatus::Cancelled,
+                    ..
+                }
+            )
+        });
+        for event in events {
+            after_terminal = Some(event.sequence);
+            println!("M2 terminal #{}: {:?}", event.sequence, event.event);
+        }
+        if finished {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let (command, args) = if cfg!(windows) {
+        (
+            "cmd".to_owned(),
+            vec!["/C".to_owned(), "echo task".to_owned()],
+        )
+    } else {
+        ("printf".to_owned(), vec!["task\\n".to_owned()])
+    };
+    let task = match connection
+        .request(RequestEnvelope::new(ClientRequest::StartTask {
+            project_id,
+            spec: TaskSpec {
+                kind: TaskKind::Test,
+                label: "M2 demo task".to_owned(),
+                command,
+                args,
+                cwd: None,
+                output_limit_bytes: Some(16 * 1024),
+                artifact_paths: Vec::new(),
+            },
+        }))
+        .result?
+    {
+        ServerResponse::TaskStarted(snapshot) => snapshot,
+        response => return Err(unexpected_response("task start", response)),
+    };
+    for _ in 0..100 {
+        let snapshot = match connection
+            .request(RequestEnvelope::new(ClientRequest::GetTask {
+                project_id,
+                task_id: task.id,
+            }))
+            .result?
+        {
+            ServerResponse::Task(snapshot) => snapshot,
+            response => return Err(unexpected_response("task status", response)),
+        };
+        if matches!(
+            snapshot.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            println!(
+                "M2 task {} [{:?}]: {}",
+                snapshot.label,
+                snapshot.status,
+                snapshot.output.trim()
+            );
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 fn prepare_workspace(root: Option<PathBuf>) -> Result<PathBuf, LoomError> {
-    let root = root.unwrap_or_else(|| env::temp_dir().join("loom-m1-demo"));
+    let default_root = env::temp_dir().join("loom-m1-demo");
+    let root = root.unwrap_or_else(|| default_root.clone());
     fs::create_dir_all(&root).map_err(|error| {
         LoomError::new(
             ErrorCode::ToolExecution,
@@ -126,6 +272,18 @@ fn prepare_workspace(root: Option<PathBuf>) -> Result<PathBuf, LoomError> {
                 )
             })?;
         }
+        if root == default_root {
+            let demo_file = root.join("loom-m1-demo.txt");
+            if demo_file.exists() {
+                fs::remove_file(demo_file).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::ToolExecution,
+                        format!("could not reset demo workspace: {error}"),
+                        false,
+                    )
+                })?;
+            }
+        }
     }
     Ok(root)
 }
@@ -141,6 +299,18 @@ fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
             Capability::ReadAgentRun,
             Capability::ControlAgentRun,
             Capability::ApproveAgentAction,
+            Capability::OpenWorkspace,
+            Capability::ReadWorkspace,
+            Capability::WriteWorkspace,
+            Capability::SubscribeWorkspaceEvents,
+            Capability::OpenTerminal,
+            Capability::ControlTerminal,
+            Capability::ReadTask,
+            Capability::StartTask,
+            Capability::ControlTask,
+            Capability::ConfigureApprovalPolicy,
+            Capability::ManageCheckpoints,
+            Capability::TakeoverWorkspace,
             Capability::JsonProtocol,
         ]),
     }));
@@ -334,6 +504,9 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
             AgentEvent::ToolApprovalRequired { call, .. } => {
                 println!("Approval required: {}", call.name);
             }
+            AgentEvent::ToolPolicyEvaluated { evaluation, .. } => {
+                println!("Policy: {:?} ({})", evaluation.decision, evaluation.reason);
+            }
             AgentEvent::ToolApprovalDecided { decision, .. } => {
                 println!("Approval decision: {decision:?}");
             }
@@ -361,6 +534,15 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
                 println!("Run completed [{}]", run_state_name(snapshot.state))
             }
         },
+        ServerEvent::WorkspaceChanged { change } => {
+            println!("Workspace {:?}: {}", change.kind, change.path);
+        }
+        ServerEvent::Terminal { event } => {
+            println!("Terminal event: {:?}", event.event);
+        }
+        ServerEvent::Task { event } => {
+            println!("Task event: {:?}", event.event);
+        }
     }
 }
 

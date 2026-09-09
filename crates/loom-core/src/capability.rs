@@ -12,6 +12,18 @@ pub enum Capability {
     ReadAgentRun,
     ControlAgentRun,
     ApproveAgentAction,
+    OpenWorkspace,
+    ReadWorkspace,
+    WriteWorkspace,
+    SubscribeWorkspaceEvents,
+    OpenTerminal,
+    ControlTerminal,
+    ReadTask,
+    StartTask,
+    ControlTask,
+    ConfigureApprovalPolicy,
+    ManageCheckpoints,
+    TakeoverWorkspace,
     JsonProtocol,
 }
 

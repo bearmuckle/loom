@@ -59,6 +59,8 @@ uuid_id!(ProjectId);
 uuid_id!(RequestId);
 uuid_id!(RunId);
 uuid_id!(ToolCallId);
+uuid_id!(TerminalId);
+uuid_id!(TaskId);
 
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
