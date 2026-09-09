@@ -1,0 +1,16 @@
+[package]
+name = "loom-cli"
+description = "Native command-line shell for the Loom foundation vertical slice."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "loom"
+path = "src/main.rs"
+
+[dependencies]
+loom-core.workspace = true
+loom-protocol.workspace = true
+loom-server.workspace = true

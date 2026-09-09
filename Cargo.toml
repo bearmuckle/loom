@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/loom-core",
+    "crates/loom-model",
+    "crates/loom-protocol",
+    "crates/loom-session",
+    "crates/loom-server",
+    "crates/loom-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+version = "0.1.0"
+
+[workspace.dependencies]
+loom-core = { path = "crates/loom-core" }
+loom-model = { path = "crates/loom-model" }
+loom-protocol = { path = "crates/loom-protocol" }
+loom-session = { path = "crates/loom-session" }
+loom-server = { path = "crates/loom-server" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+uuid = { version = "1.16", features = ["serde", "v4"] }

@@ -35,3 +35,18 @@ These documents describe the intended first implementation. Each milestone
 should produce a demonstrable vertical slice, and architecture decisions
 should be recorded as implementation settles details such as the GPUI
 variant, schema format, persistence engine, and supported deployment targets.
+
+## Foundation implementation
+
+The M0 foundation is a Rust workspace with shared domain types, provider-
+neutral model types, a versioned JSON protocol, an in-process backend, and a
+native command-line shell. Run the vertical slice with:
+
+```sh
+cargo run -p loom-cli -- --name "Foundation demo"
+```
+
+The shell negotiates protocol capabilities, creates an empty agent session,
+and renders the authoritative session event stream. See
+[ADR 0001](docs/decisions/0001-foundation.md) for the initial implementation
+decisions and deferred frontend choices.

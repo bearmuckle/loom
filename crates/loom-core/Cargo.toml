@@ -1,0 +1,12 @@
+[package]
+name = "loom-core"
+description = "Shared identifiers, errors, protocol versions, capabilities, and domain types for Loom."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

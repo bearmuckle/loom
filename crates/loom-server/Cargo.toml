@@ -1,0 +1,13 @@
+[package]
+name = "loom-server"
+description = "In-process Loom backend used by native clients and protocol tests."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-core.workspace = true
+loom-model.workspace = true
+loom-protocol.workspace = true
+loom-session.workspace = true
