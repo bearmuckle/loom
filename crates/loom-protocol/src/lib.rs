@@ -746,7 +746,7 @@ pub enum ClientFrame {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ServerFrame {
-    Response(ResponseEnvelope),
+    Response(Box<ResponseEnvelope>),
     Event(ServerEventEnvelope),
 }
 

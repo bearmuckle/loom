@@ -214,10 +214,10 @@ fn m4_transport_frames_preserve_typed_envelopes() {
         request
     );
 
-    let response = ServerFrame::Response(ResponseEnvelope::failure(
+    let response = ServerFrame::Response(Box::new(ResponseEnvelope::failure(
         loom_core::RequestId::new(),
         loom_core::LoomError::malformed_payload("fixture"),
-    ));
+    )));
     assert_eq!(
         decode_server_frame(&encode_server_frame(&response).unwrap()).unwrap(),
         response
