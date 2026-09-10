@@ -3052,6 +3052,7 @@ dependencies = [
  "loom-providers",
  "loom-tools",
  "serde",
+ "serde_json",
  "uuid",
 ]
 
@@ -3204,7 +3205,6 @@ dependencies = [
  "gpui",
  "loom-agent",
  "loom-core",
- "loom-language",
  "loom-model",
  "loom-process",
  "loom-protocol",
@@ -3212,6 +3212,9 @@ dependencies = [
  "loom-vcs",
  "loom-workspace",
  "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

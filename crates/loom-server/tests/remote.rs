@@ -23,6 +23,7 @@ fn capabilities() -> CapabilitySet {
     CapabilitySet::new([
         Capability::CreateAgentSession,
         Capability::ReadAgentSession,
+        Capability::ControlAgentSession,
         Capability::SubscribeSessionEvents,
         Capability::StartAgentRun,
         Capability::ReadAgentRun,

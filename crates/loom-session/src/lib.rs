@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{cmp::Reverse, collections::BTreeMap};
 
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, LoomError, ProjectId,
@@ -67,7 +67,6 @@ impl SessionManager {
                         ));
                     };
                     if current.project_id != snapshot.project_id
-                        || current.name != snapshot.name
                         || current.created_at != snapshot.created_at
                     {
                         return Err(LoomError::new(
@@ -101,6 +100,52 @@ impl SessionManager {
                         return Err(LoomError::new(
                             loom_core::ErrorCode::MalformedPayload,
                             "session fork event references an unknown source session",
+                            false,
+                        ));
+                    }
+                }
+                SessionEvent::AgentSessionRenamed { session_id, name } => {
+                    if *session_id != record.session_id {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session rename event id does not match its record",
+                            false,
+                        ));
+                    }
+                    if !state.sessions.contains_key(session_id) {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session rename event references a missing session",
+                            false,
+                        ));
+                    }
+                    if name.trim().is_empty() {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session rename event contains an empty name",
+                            false,
+                        ));
+                    }
+                }
+                SessionEvent::AgentSessionArchived { session_id } => {
+                    if *session_id != record.session_id {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session archive event id does not match its record",
+                            false,
+                        ));
+                    }
+                    let Some(current) = state.sessions.get(session_id) else {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session archive event references a missing session",
+                            false,
+                        ));
+                    };
+                    if current.state != AgentSessionState::Archived {
+                        return Err(LoomError::new(
+                            loom_core::ErrorCode::MalformedPayload,
+                            "session archive event does not match the session map",
                             false,
                         ));
                     }
@@ -177,6 +222,98 @@ impl SessionManager {
             .ok_or_else(|| LoomError::not_found("agent session", session_id))
     }
 
+    pub fn list(
+        &self,
+        project_id: Option<ProjectId>,
+        include_archived: bool,
+    ) -> Vec<AgentSessionSnapshot> {
+        let mut sessions = self
+            .sessions
+            .values()
+            .filter(|snapshot| {
+                project_id.is_none_or(|project_id| snapshot.project_id == project_id)
+                    && (include_archived || snapshot.state != AgentSessionState::Archived)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|snapshot| Reverse(snapshot.updated_at));
+        sessions
+    }
+
+    pub fn rename(
+        &mut self,
+        session_id: AgentSessionId,
+        name: impl Into<String>,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "agent session name must not be empty",
+            ));
+        }
+        let snapshot = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| LoomError::not_found("agent session", session_id))?;
+        if snapshot.state == AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "archived agent sessions cannot be renamed",
+            ));
+        }
+        if snapshot.name == name {
+            return Err(LoomError::invalid_request(
+                "agent session already has the requested name",
+            ));
+        }
+        snapshot.name = name.clone();
+        snapshot.updated_at = Timestamp::now();
+        let snapshot = snapshot.clone();
+        let record = self.record(
+            session_id,
+            snapshot.updated_at,
+            SessionEvent::AgentSessionRenamed { session_id, name },
+        );
+        Ok((snapshot, record))
+    }
+
+    pub fn archive(
+        &mut self,
+        session_id: AgentSessionId,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        let snapshot = self
+            .sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| LoomError::not_found("agent session", session_id))?;
+        if snapshot.state == AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "agent session is already archived",
+            ));
+        }
+        if matches!(
+            snapshot.state,
+            AgentSessionState::Queued
+                | AgentSessionState::Planning
+                | AgentSessionState::AwaitingApproval
+                | AgentSessionState::Paused
+                | AgentSessionState::Executing
+                | AgentSessionState::Evaluating
+                | AgentSessionState::NeedsInput
+        ) {
+            return Err(LoomError::invalid_state(
+                "running agent sessions must be stopped before archiving",
+            ));
+        }
+        snapshot.state = AgentSessionState::Archived;
+        snapshot.updated_at = Timestamp::now();
+        let snapshot = snapshot.clone();
+        let record = self.record(
+            session_id,
+            snapshot.updated_at,
+            SessionEvent::AgentSessionArchived { session_id },
+        );
+        Ok((snapshot, record))
+    }
+
     pub fn transition(
         &mut self,
         session_id: AgentSessionId,
@@ -187,6 +324,11 @@ impl SessionManager {
             .get_mut(&session_id)
             .ok_or_else(|| LoomError::not_found("agent session", session_id))?;
         let previous = snapshot.state;
+        if previous == AgentSessionState::Archived {
+            return Err(LoomError::invalid_state(
+                "archived agent sessions cannot change state",
+            ));
+        }
         if previous == state {
             return Err(LoomError::invalid_request(
                 "agent session is already in the requested state",
@@ -332,5 +474,33 @@ mod tests {
                 ..
             } if source_session_id == source.id
         ));
+    }
+
+    #[test]
+    fn renames_and_archives_sessions_without_deleting_history() {
+        let project_id = ProjectId::new();
+        let mut manager = SessionManager::default();
+        let (snapshot, _) = manager.create(project_id, "Initial").unwrap();
+
+        let (renamed, rename_event) = manager.rename(snapshot.id, "Renamed").unwrap();
+        assert_eq!(renamed.name, "Renamed");
+        assert!(matches!(
+            rename_event.event,
+            SessionEvent::AgentSessionRenamed { ref name, .. } if name == "Renamed"
+        ));
+        let (renamed_again, _) = manager.rename(snapshot.id, "Renamed again").unwrap();
+        assert_eq!(renamed_again.name, "Renamed again");
+
+        let (archived, archive_event) = manager.archive(snapshot.id).unwrap();
+        assert_eq!(archived.state, AgentSessionState::Archived);
+        let restored = SessionManager::from_state(manager.export_state()).unwrap();
+        assert_eq!(restored.get(archived.id).unwrap(), archived);
+        assert!(manager.list(Some(project_id), false).is_empty());
+        assert_eq!(manager.list(Some(project_id), true), vec![archived.clone()]);
+        assert!(matches!(
+            archive_event.event,
+            SessionEvent::AgentSessionArchived { session_id } if session_id == archived.id
+        ));
+        assert_eq!(manager.get(archived.id).unwrap(), archived);
     }
 }

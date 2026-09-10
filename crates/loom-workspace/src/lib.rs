@@ -24,6 +24,13 @@ pub use editor::{
 
 const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
 
+fn is_ignored_directory(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(".git" | "target" | "node_modules" | ".venv" | "vendor")
+    )
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceEntryKind {
@@ -910,7 +917,7 @@ impl Workspace {
                 )
             })?;
             let name = entry.file_name();
-            if name == ".git" {
+            if is_ignored_directory(&name) {
                 continue;
             }
             let child_relative = relative.join(&name);
