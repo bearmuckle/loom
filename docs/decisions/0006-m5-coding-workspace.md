@@ -38,6 +38,18 @@ creating a second workspace or session model.
    and evidence requests/responses are capability-gated and work through the
    existing in-process and WebSocket transports. The GPUI layout is a
    projection, not an authority.
+7. **Use GPUI's native text-input seam.** The native client implements
+   `EntityInputHandler` and paints a cursor, selection, and multi-line buffer
+   through `ElementInputHandler`. Every accepted insertion or deletion is
+   sent through the existing revision-checked editor request before the UI
+   marks the buffer dirty, so save, undo, redo, and external-change conflicts
+   remain backend-owned.
+8. **Keep explicit native entry points safe.** `loom-ui` accepts
+   `--workspace PATH` and `--task DESCRIPTION` for a real repository task.
+   With no workspace argument it opens an isolated deterministic temporary
+   demo, preserving a low-risk startup path for smoke tests and exploration.
+   The visible backend indicator identifies the current in-process protocol
+   connection and exposes a reconnect/refresh action.
 
 ## Deferred limitations
 
@@ -48,5 +60,9 @@ creating a second workspace or session model.
   does not yet model worktrees, remotes, hooks, or provider-specific VCS.
 - Buffer/layout state is currently process-local and is not persisted in the
   durable backend snapshot; reopening a client reconstructs it from files.
-- The GPUI smoke surface is intentionally compact; richer text editing,
-  keymap dispatch, and diff panes remain follow-up work.
+- The editor intentionally uses a compact deterministic renderer: it does not
+  yet provide syntax highlighting, soft wrapping, a full diff pane, or
+  incremental LSP indexing.
+- The native client currently uses the in-process connection; the typed
+  request/response seam remains compatible with the remote WebSocket client,
+  but native remote connection selection is follow-up work.
