@@ -191,10 +191,23 @@ backend-owned workspace and remote protocol boundaries:
   stable `loom://task/...` evidence links. Agent run snapshots can attach
   evidence links to final summaries.
 - The GPUI layout now has activity/file navigation, an editor center with
-  tabs and unsaved/conflict indicators, an agent timeline/approval panel,
-  diagnostics/outline and task-result areas, and a Git/status footer.
+  selectable tabs, a real cursor/selection text input, keyboard insertion,
+  deletion/navigation, backend-backed undo/redo/save, and unsaved/conflict
+  indicators. The agent timeline/approval panel, diagnostics/outline,
+  task-result areas, and Git/status footer remain live protocol projections.
+
+The native client accepts an explicit workspace and task while retaining an
+isolated deterministic demo as the safe default:
+
+```sh
+cargo run -p loom-ui -- --workspace /path/to/repository \
+  --task "fix the failing parser test"
+```
+
+Use `--demo` to explicitly select the isolated workspace.
 
 M5 protocol requests are additive and capability-gated, so in-process and
 WebSocket clients use the same editor, language, VCS, navigation, and task
-evidence operations. See [ADR 0006](docs/decisions/0006-m5-coding-workspace.md)
-for the choices and deferred limitations.
+evidence operations. The native UI is a projection, not an authority. See
+[ADR 0006](docs/decisions/0006-m5-coding-workspace.md) for the choices and
+remaining limitations.
