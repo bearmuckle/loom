@@ -91,26 +91,19 @@ filesystem, and process primitives directly. This keeps provider
 normalization, authorization, auditing, cancellation, and future sandboxing
 in one place.
 
-M5 keeps `Workspace` as the authoritative root/revision boundary and layers
-`EditorWorkspace` on top of it. Editor buffers are an in-memory projection:
-they normalize text for editing, retain the original encoding/newline policy,
-and save through revision-checked workspace byte writes. A save that observes
-an external revision returns `external_change` and never overwrites the
-outside edit. Tabs and panes are client-facing layout state; sessions,
-workspaces, and agent runs remain the existing backend objects.
+M5 deliberately does not turn `loom-workspace` into a second editor
+authority. The GPUI client projects the existing backend-owned project,
+session, run, approval, workspace-change, task, and evidence state into a
+small session navigator and one active-session canvas. The canvas contains
+the chronological agent conversation and tool timeline plus a composer for
+new tasks, follow-up direction, and answers to agent questions.
 
-`loom-language` currently exposes a lifecycle/capability interface and a
-deterministic basic implementation. It is deliberately not a claim that a
-full language server exists for every file type: descriptors report
-unsupported/unavailable services and operations return stable errors.
-`loom-vcs::GitService` scopes direct `git` argv execution to the canonical
-workspace root and validates every path before status, diff, index, or commit
-operations.
-
-The GPUI client projects these services into a compact activity/file sidebar,
-editor center, agent timeline/approval panel, diagnostics/outline and task
-result areas, and a Git/status footer. A remote client receives the same
-typed projections over M4 transport; no UI-only workspace truth is created.
+Changed paths, bounded diffs, task artifacts, and repository status are
+read-only review projections opened in a drawer or focused overlay. They are
+loaded through the canonical workspace, process, and VCS services and remain
+scoped to the active project/session. No local editable buffer, tab/pane
+layout, language-service state, or client-owned orchestration state is needed
+for M5. A remote client receives the same projections over the M4 transport.
 
 ## Agent runtime
 

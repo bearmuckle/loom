@@ -171,29 +171,36 @@ inspectable in `paused` state and receives `RecoveryRequired`; resuming then
 returns the normalized provider authentication error rather than switching
 models.
 
-M5 adds additive, capability-gated operations for the coding workspace:
+M5 adds only the capability-gated projections required for the focused agent
+client:
 
 ```text
-OpenEditorBuffer / EditEditorBuffer / UndoEditorBuffer / RedoEditorBuffer
-SaveEditorBuffer / ReloadEditorBuffer / SetAutosavePolicy
-GetEditorLayout / SplitEditor / FocusEditorPane / CloseEditorBuffer
-GetFileTree / FuzzyFindFiles / SearchWorkspace / GetContextFiles
-DiscoverLanguageServices / StartLanguageService / StopLanguageService
-GetDiagnostics / GetSymbols / GoToDefinition / FindReferences
-GetVcsStatus / GetVcsDiff / StageVcsPaths / UnstageVcsPaths
-CreateVcsCommit / GetVcsBranches / GetVcsConflicts
-GetTaskEvidence / AttachRunEvidence
+ListProjects / ListAgentSessions / GetAgentSessionSnapshot
+GetAgentRunSnapshot / GetSessionEvents
+GetWorkspaceChanges / ReadWorkspaceFile / GetVcsDiff
+GetTask / GetTaskEvidence
 ```
 
-Editor operations return structured buffer/layout snapshots. Buffer saves
-carry the backend revision implicitly and return `external_change` rather
-than overwriting an external edit. Language descriptors expose lifecycle
-state and per-operation capabilities. VCS responses contain status, patch,
-branch, commit, and conflict data without exposing command credentials or
-shell strings. Task evidence uses bounded artifact metadata and stable
-`loom://task/...` links. Every operation is available through both
-`InProcessConnection` and the authenticated WebSocket adapter after normal
-version/capability negotiation.
+The existing M1-M4 mutations remain the control surface:
+
+```text
+CreateAgentSession / StartAgentRun / SendAgentMessage
+PauseAgentRun / ResumeAgentRun / InterruptAgentRun
+ApproveAgentAction / RejectAgentAction / RetryAgentStep
+```
+
+Session and run snapshots must be sufficient to render the active
+conversation, plan, step state, tool calls, approvals, bounded output,
+questions, errors, and final summary after reconnect. Review responses are
+read-only, project-scoped, and bounded; diffs and task artifacts retain stable
+references without exposing credentials or shell strings.
+
+M5 does not add editor-buffer mutations, language-server lifecycle requests,
+interactive terminal panes, VCS staging, branch management, or commit
+operations. Those remain backend/tool capabilities or later client surfaces.
+All M5 operations work through both `InProcessConnection` and the
+authenticated WebSocket adapter after normal version and capability
+negotiation.
 
 ## Reconnect and consistency
 
