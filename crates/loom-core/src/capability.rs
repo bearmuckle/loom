@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub enum Capability {
     CreateAgentSession,
     ReadAgentSession,
+    ControlAgentSession,
     SubscribeSessionEvents,
     StartAgentRun,
     ReadAgentRun,

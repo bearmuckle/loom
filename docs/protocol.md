@@ -178,13 +178,14 @@ client:
 ListProjects / ListAgentSessions / GetAgentSessionSnapshot
 GetAgentRunSnapshot / GetSessionEvents
 GetWorkspaceChanges / ReadWorkspaceFile / GetVcsDiff
-GetTask / GetTaskEvidence
+ListTasks / GetTask / GetTaskEvidence
 ```
 
 The existing M1-M4 mutations remain the control surface:
 
 ```text
-CreateAgentSession / StartAgentRun / SendAgentMessage
+CreateAgentSession / RenameAgentSession / ArchiveAgentSession
+StartAgentRun / SendAgentMessage
 PauseAgentRun / ResumeAgentRun / InterruptAgentRun
 ApproveAgentAction / RejectAgentAction / RetryAgentStep
 ```

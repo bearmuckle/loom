@@ -1,4 +1,4 @@
-use loom_agent::{AgentEvent, AgentRunSnapshot, AgentRunState};
+use loom_agent::{AgentEvent, AgentPlanStep, AgentRunSnapshot, AgentRunState};
 use loom_context::ContextAssemblyOptions;
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet,
@@ -12,7 +12,6 @@ use loom_protocol::{
     decode_event, decode_request, decode_response, decode_server_frame, encode_client_frame,
     encode_event, encode_request, encode_response, encode_server_frame,
 };
-use loom_workspace::{BufferEdit, SearchQuery, TextRange};
 use loom_workspace::{WorkspaceEdit, WorkspaceSnapshot};
 
 #[test]
@@ -215,10 +214,10 @@ fn m4_transport_frames_preserve_typed_envelopes() {
         request
     );
 
-    let response = ServerFrame::Response(ResponseEnvelope::failure(
+    let response = ServerFrame::Response(Box::new(ResponseEnvelope::failure(
         loom_core::RequestId::new(),
         loom_core::LoomError::malformed_payload("fixture"),
-    ));
+    )));
     assert_eq!(
         decode_server_frame(&encode_server_frame(&response).unwrap()).unwrap(),
         response
@@ -226,46 +225,91 @@ fn m4_transport_frames_preserve_typed_envelopes() {
 }
 
 #[test]
-fn m5_editor_language_vcs_and_evidence_contracts_round_trip() {
+fn m5_session_run_review_and_evidence_contracts_round_trip() {
     let project_id = ProjectId::new();
-    let editor = RequestEnvelope::new(ClientRequest::EditEditorBuffer {
-        project_id,
-        buffer_id: loom_core::BufferId::new(),
-        edit: BufferEdit {
-            range: TextRange::new(0, 1),
-            replacement: "x".to_owned(),
-        },
+    let sessions = RequestEnvelope::new(ClientRequest::ListAgentSessions {
+        project_id: Some(project_id),
+        include_archived: false,
     });
     assert_eq!(
-        decode_request(&encode_request(&editor).unwrap()).unwrap(),
-        editor
+        decode_request(&encode_request(&sessions).unwrap()).unwrap(),
+        sessions
     );
-    let search = RequestEnvelope::new(ClientRequest::SearchWorkspace {
-        project_id,
-        query: SearchQuery::literal("workspace"),
+    let message = RequestEnvelope::new(ClientRequest::SendAgentMessage {
+        run_id: RunId::new(),
+        message: "continue with validation".to_owned(),
     });
     assert_eq!(
-        decode_request(&encode_request(&search).unwrap()).unwrap(),
-        search
+        decode_request(&encode_request(&message).unwrap()).unwrap(),
+        message
+    );
+    let changes = RequestEnvelope::new(ClientRequest::GetWorkspaceChanges {
+        project_id,
+        after_sequence: Some(EventSequence::new(4)),
+    });
+    assert_eq!(
+        decode_request(&encode_request(&changes).unwrap()).unwrap(),
+        changes
+    );
+    let tasks = RequestEnvelope::new(ClientRequest::ListTasks { project_id });
+    assert_eq!(
+        decode_request(&encode_request(&tasks).unwrap()).unwrap(),
+        tasks
     );
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::Locations {
-            locations: Vec::new(),
+        ServerResponse::Projects {
+            projects: vec![loom_protocol::ProjectSnapshot {
+                id: project_id,
+                name: "workspace".to_owned(),
+                root: Some("/workspace".to_owned()),
+                session_count: 1,
+                updated_at: Some(Timestamp::from_unix_millis(5)),
+            }],
         },
     );
     assert_eq!(
         decode_response(&encode_response(&response).unwrap()).unwrap(),
         response
     );
-    let vcs = ResponseEnvelope::success(
+    let run = AgentRunSnapshot {
+        id: RunId::new(),
+        session_id: AgentSessionId::new(),
+        task: "review".to_owned(),
+        model: ModelId::new("deterministic/demo"),
+        state: AgentRunState::Completed,
+        started_at: Timestamp::from_unix_millis(6),
+        updated_at: Timestamp::from_unix_millis(7),
+        completed_at: Some(Timestamp::from_unix_millis(8)),
+        summary: Some("done".to_owned()),
+        evidence: Vec::new(),
+    };
+    let run_snapshot = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::AgentRunSnapshot(loom_protocol::AgentRunSnapshotProjection {
+            run,
+            plan: vec![AgentPlanStep {
+                id: "validate".to_owned(),
+                description: "Validate the change".to_owned(),
+            }],
+            messages: Vec::new(),
+            pending_approval: None,
+            pending_input: None,
+            usage: Default::default(),
+        }),
+    );
+    assert_eq!(
+        decode_response(&encode_response(&run_snapshot).unwrap()).unwrap(),
+        run_snapshot
+    );
+    let evidence = ResponseEnvelope::success(
         loom_core::RequestId::new(),
         ServerResponse::TaskEvidence {
             evidence: Vec::new(),
         },
     );
     assert_eq!(
-        decode_response(&encode_response(&vcs).unwrap()).unwrap(),
-        vcs
+        decode_response(&encode_response(&evidence).unwrap()).unwrap(),
+        evidence
     );
 }

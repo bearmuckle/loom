@@ -954,6 +954,12 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
                 session_state_name(snapshot.state)
             );
         }
+        ServerEvent::AgentSessionRenamed { name, .. } => {
+            println!("session renamed: {name}");
+        }
+        ServerEvent::AgentSessionArchived { .. } => {
+            println!("session archived");
+        }
         ServerEvent::Agent { event } => match event {
             AgentEvent::RunStarted { snapshot } => {
                 println!("Run {} [{}]", snapshot.id, run_state_name(snapshot.state));
@@ -984,6 +990,12 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
             }
             AgentEvent::AssistantMessageDelta { text, .. } => {
                 println!("Assistant: {}", text.trim_end());
+            }
+            AgentEvent::UserMessage { text, .. } => {
+                println!("User: {}", text.trim_end());
+            }
+            AgentEvent::NeedsInput { prompt, .. } => {
+                println!("Input required: {}", prompt.trim_end());
             }
             AgentEvent::ToolCallRequested { call, .. } => {
                 println!(
@@ -1078,6 +1090,7 @@ const fn session_state_name(state: AgentSessionState) -> &'static str {
         AgentSessionState::Completed => "completed",
         AgentSessionState::Failed => "failed",
         AgentSessionState::Cancelled => "cancelled",
+        AgentSessionState::Archived => "archived",
     }
 }
 
@@ -1087,6 +1100,7 @@ const fn run_state_name(state: AgentRunState) -> &'static str {
         AgentRunState::Executing => "executing",
         AgentRunState::AwaitingApproval => "awaiting_approval",
         AgentRunState::Paused => "paused",
+        AgentRunState::NeedsInput => "needs_input",
         AgentRunState::Evaluating => "evaluating",
         AgentRunState::Completed => "completed",
         AgentRunState::Failed => "failed",

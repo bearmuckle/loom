@@ -39,3 +39,23 @@ These documents describe the intended first implementation. The roadmap and
 architecture decision records are the source of truth for scope and
 implementation tradeoffs; this README intentionally keeps the product
 direction and document index concise.
+
+## Native M5 client
+
+Run the native client against the current repository or an explicit workspace:
+
+```text
+cargo run -p loom-ui -- --workspace /path/to/project
+```
+
+The client persists local session state outside the repository and reopens the
+same project and sessions on the next launch. Configure a real
+OpenAI-compatible backend with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
+`--model MODEL`; the deterministic provider is available only for the explicit
+`--demo` flow.
+
+The same client can attach to an authenticated remote backend:
+
+```text
+LOOM_REMOTE_URL=ws://127.0.0.1:8080/ws LOOM_TOKEN=... cargo run -p loom-ui
+```

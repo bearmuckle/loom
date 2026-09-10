@@ -18,6 +18,7 @@ pub enum AgentRunState {
     Executing,
     AwaitingApproval,
     Paused,
+    NeedsInput,
     Evaluating,
     Completed,
     Failed,
@@ -93,6 +94,14 @@ pub enum AgentEvent {
         run_id: RunId,
         message_id: u64,
         text: String,
+    },
+    UserMessage {
+        run_id: RunId,
+        text: String,
+    },
+    NeedsInput {
+        run_id: RunId,
+        prompt: String,
     },
     ToolCallRequested {
         run_id: RunId,
@@ -175,6 +184,8 @@ pub struct AgentRuntimeState {
     pub plan: AgentPlan,
     pub messages: Vec<ModelMessage>,
     pub pending_approval: Option<ToolCall>,
+    #[serde(default)]
+    pub pending_input: Option<String>,
     pub last_failed_call: Option<ToolCall>,
     pub next_message_id: u64,
     pub active_message_id: Option<u64>,
@@ -218,6 +229,7 @@ pub struct AgentRuntime {
     tools: ToolExecutor,
     messages: Vec<ModelMessage>,
     pending_approval: Option<PendingApproval>,
+    pending_input: Option<String>,
     last_failed_call: Option<ToolCall>,
     next_message_id: u64,
     active_message_id: Option<u64>,
@@ -268,22 +280,7 @@ impl AgentRuntime {
             summary: None,
             evidence: Vec::new(),
         };
-        let plan = AgentPlan {
-            steps: vec![
-                AgentPlanStep {
-                    id: "inspect".to_owned(),
-                    description: "Inspect the workspace and relevant files".to_owned(),
-                },
-                AgentPlanStep {
-                    id: "change".to_owned(),
-                    description: "Apply the focused repository change".to_owned(),
-                },
-                AgentPlanStep {
-                    id: "validate".to_owned(),
-                    description: "Run validation and report the result".to_owned(),
-                },
-            ],
-        };
+        let plan = AgentPlan { steps: Vec::new() };
         let messages = initial_messages(&task);
         Self {
             session_id,
@@ -294,6 +291,7 @@ impl AgentRuntime {
             tools,
             messages,
             pending_approval: None,
+            pending_input: None,
             last_failed_call: None,
             next_message_id: 0,
             active_message_id: None,
@@ -367,6 +365,20 @@ impl AgentRuntime {
         self.context_inspection.clone()
     }
 
+    pub fn plan(&self) -> AgentPlan {
+        self.plan.clone()
+    }
+
+    pub fn pending_approval(&self) -> Option<ToolCall> {
+        self.pending_approval
+            .as_ref()
+            .map(|pending| pending.call.clone())
+    }
+
+    pub fn pending_input(&self) -> Option<String> {
+        self.pending_input.clone()
+    }
+
     pub fn messages(&self) -> Vec<ModelMessage> {
         self.messages.clone()
     }
@@ -390,6 +402,7 @@ impl AgentRuntime {
                 .pending_approval
                 .as_ref()
                 .map(|pending| pending.call.clone()),
+            pending_input: self.pending_input.clone(),
             last_failed_call: self.last_failed_call.clone(),
             next_message_id: self.next_message_id,
             active_message_id: self.active_message_id,
@@ -427,6 +440,18 @@ impl AgentRuntime {
                 false,
             ));
         }
+        if state.pending_input.is_some()
+            && !matches!(
+                state.run.state,
+                AgentRunState::NeedsInput | AgentRunState::Paused
+            )
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted input is attached to a run that is neither waiting for input nor paused",
+                false,
+            ));
+        }
         if provider.descriptor().id != state.task.model {
             return Err(LoomError::new(
                 ErrorCode::ProviderUnavailable,
@@ -447,6 +472,7 @@ impl AgentRuntime {
             tools,
             messages: state.messages,
             pending_approval: state.pending_approval.map(|call| PendingApproval { call }),
+            pending_input: state.pending_input,
             last_failed_call: state.last_failed_call,
             next_message_id: state.next_message_id,
             active_message_id: state.active_message_id,
@@ -468,15 +494,15 @@ impl AgentRuntime {
                 false,
             ));
         }
-        let mut events = vec![
-            AgentEvent::RunStarted {
-                snapshot: self.run.clone(),
-            },
-            AgentEvent::PlanProposed {
+        let mut events = vec![AgentEvent::RunStarted {
+            snapshot: self.run.clone(),
+        }];
+        if !self.plan.steps.is_empty() {
+            events.push(AgentEvent::PlanProposed {
                 run_id: self.run.id,
                 plan: self.plan.clone(),
-            },
-        ];
+            });
+        }
         events.extend(self.set_state(AgentRunState::Executing));
         events.extend(self.advance()?);
         Ok(events)
@@ -593,12 +619,79 @@ impl AgentRuntime {
         }
         let mut events = if self.pending_approval.is_some() {
             self.set_state(AgentRunState::AwaitingApproval)
+        } else if self.pending_input.is_some() {
+            self.set_state(AgentRunState::NeedsInput)
         } else {
             self.set_state(AgentRunState::Executing)
         };
-        if self.pending_approval.is_none() {
+        if self.pending_approval.is_none() && self.pending_input.is_none() {
             events.extend(self.advance()?);
         }
+        Ok(events)
+    }
+
+    pub fn send_message(&mut self, message: impl Into<String>) -> Result<Vec<AgentEvent>> {
+        let message = message.into();
+        if message.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "agent message must not be empty",
+            ));
+        }
+        if self.pending_approval.is_some() {
+            return Err(LoomError::invalid_state(
+                "resolve the pending tool approval before sending a message",
+            ));
+        }
+        if matches!(
+            self.run.state,
+            AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+        ) {
+            return Err(LoomError::invalid_state(
+                "agent run is currently processing a message",
+            ));
+        }
+        self.messages
+            .push(ModelMessage::new(MessageRole::User, message.clone()));
+        self.pending_input = None;
+        self.active_message_id = None;
+        self.last_failed_call = None;
+        self.run.completed_at = None;
+        self.run.summary = None;
+        let mut events = vec![AgentEvent::UserMessage {
+            run_id: self.run.id,
+            text: message,
+        }];
+        events.extend(self.set_state(AgentRunState::Executing));
+        events.extend(self.advance()?);
+        Ok(events)
+    }
+
+    pub fn request_input(&mut self, prompt: impl Into<String>) -> Result<Vec<AgentEvent>> {
+        let prompt = prompt.into();
+        if prompt.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "agent input prompt must not be empty",
+            ));
+        }
+        if self.pending_approval.is_some() {
+            return Err(LoomError::invalid_state(
+                "resolve the pending tool approval before requesting input",
+            ));
+        }
+        if matches!(
+            self.run.state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        ) {
+            return Err(LoomError::invalid_state(
+                "finished agent runs cannot request input",
+            ));
+        }
+        self.pending_input = Some(prompt.clone());
+        let mut events = self.set_state(AgentRunState::NeedsInput);
+        events.push(AgentEvent::NeedsInput {
+            run_id: self.run.id,
+            prompt,
+        });
         Ok(events)
     }
 
@@ -650,6 +743,7 @@ impl AgentRuntime {
                 | AgentRunState::AwaitingApproval
                 | AgentRunState::Evaluating
                 | AgentRunState::Paused
+                | AgentRunState::NeedsInput
         ) {
             return Err(LoomError::new(
                 ErrorCode::InvalidState,
@@ -663,6 +757,7 @@ impl AgentRuntime {
         self.run.state = AgentRunState::Planning;
         self.messages = initial_messages(&self.task);
         self.pending_approval = None;
+        self.pending_input = None;
         self.last_failed_call = None;
         self.next_message_id = 0;
         self.active_message_id = None;
@@ -690,6 +785,7 @@ impl AgentRuntime {
                         | AgentRunState::Failed
                         | AgentRunState::Cancelled
                         | AgentRunState::Paused
+                        | AgentRunState::NeedsInput
                 )
             {
                 return Ok(events);
@@ -886,6 +982,108 @@ impl AgentRuntime {
                             events.push(AgentEvent::ToolApprovalRequired {
                                 run_id: self.run.id,
                                 call,
+                            });
+                            return Ok(events);
+                        }
+                        if kind == ToolKind::ProposePlan {
+                            let steps = call
+                                .arguments
+                                .get("steps")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|steps| {
+                                    steps
+                                        .iter()
+                                        .enumerate()
+                                        .filter_map(|(index, step)| {
+                                            step.as_str()
+                                                .filter(|step| !step.trim().is_empty())
+                                                .map(|description| AgentPlanStep {
+                                                    id: format!("step-{}", index + 1),
+                                                    description: description.to_owned(),
+                                                })
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            if steps.is_empty() {
+                                let output =
+                                    "propose_plan requires a non-empty steps array".to_owned();
+                                let result = ToolResult {
+                                    tool_call_id: call.id,
+                                    name: call.name.clone(),
+                                    success: false,
+                                    output: output.clone(),
+                                };
+                                events.push(AgentEvent::ToolCallCompleted {
+                                    run_id: self.run.id,
+                                    result,
+                                });
+                                self.step_id = None;
+                                self.step_index = self.step_index.saturating_add(1);
+                                events.push(AgentEvent::StepCompleted {
+                                    run_id: self.run.id,
+                                    step_id,
+                                    index: step_index,
+                                });
+                                events.extend(self.finish_failed(output));
+                                return Ok(events);
+                            }
+                            self.plan = AgentPlan {
+                                steps: steps.clone(),
+                            };
+                            events.push(AgentEvent::PlanProposed {
+                                run_id: self.run.id,
+                                plan: self.plan.clone(),
+                            });
+                            self.step_id = None;
+                            self.step_index = self.step_index.saturating_add(1);
+                            events.push(AgentEvent::StepCompleted {
+                                run_id: self.run.id,
+                                step_id,
+                                index: step_index,
+                            });
+                            return Ok(events);
+                        }
+                        if kind == ToolKind::AskUser {
+                            let Some(prompt) = call
+                                .arguments
+                                .get("prompt")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|prompt| !prompt.trim().is_empty())
+                            else {
+                                let output = "ask_user requires a non-empty prompt".to_owned();
+                                let result = ToolResult {
+                                    tool_call_id: call.id,
+                                    name: call.name.clone(),
+                                    success: false,
+                                    output: output.clone(),
+                                };
+                                events.push(AgentEvent::ToolCallCompleted {
+                                    run_id: self.run.id,
+                                    result,
+                                });
+                                self.step_id = None;
+                                self.step_index = self.step_index.saturating_add(1);
+                                events.push(AgentEvent::StepCompleted {
+                                    run_id: self.run.id,
+                                    step_id,
+                                    index: step_index,
+                                });
+                                events.extend(self.finish_failed(output));
+                                return Ok(events);
+                            };
+                            self.pending_input = Some(prompt.to_owned());
+                            self.step_id = None;
+                            self.step_index = self.step_index.saturating_add(1);
+                            events.push(AgentEvent::StepCompleted {
+                                run_id: self.run.id,
+                                step_id,
+                                index: step_index,
+                            });
+                            events.extend(self.set_state(AgentRunState::NeedsInput));
+                            events.push(AgentEvent::NeedsInput {
+                                run_id: self.run.id,
+                                prompt: prompt.to_owned(),
                             });
                             return Ok(events);
                         }
@@ -1151,6 +1349,10 @@ impl AgentRuntime {
 
 fn initial_messages(task: &AgentTask) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
+    messages.push(ModelMessage::new(
+        MessageRole::System,
+        "Use propose_plan for an ordered plan before workspace changes, and use ask_user when information from the user is required to continue.",
+    ));
     if let Some(system) = &task.system_instructions {
         messages.push(ModelMessage::new(MessageRole::System, system));
     }
@@ -1326,6 +1528,36 @@ mod tests {
             )
         }));
         runtime.resume().unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn follow_up_message_resumes_a_run_waiting_for_input() {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task = AgentTask::new("follow up", ModelId::new("deterministic/demo")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(DeterministicProvider::demo()),
+            tools,
+        );
+
+        let requested = runtime
+            .request_input("Which validation should I run?")
+            .unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::NeedsInput);
+        assert!(requested.iter().any(|event| {
+            matches!(event, AgentEvent::NeedsInput { prompt, .. } if prompt.contains("validation"))
+        }));
+
+        let continued = runtime
+            .send_message("Run the standard validation.")
+            .unwrap();
+        assert!(continued.iter().any(|event| {
+            matches!(event, AgentEvent::UserMessage { text, .. } if text.contains("standard"))
+        }));
         assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
         fs::remove_dir_all(root).unwrap();
     }

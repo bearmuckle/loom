@@ -16,7 +16,8 @@ use loom_model::{ModelDescriptor, ModelId, ProviderId};
 use loom_persistence::{CURRENT_SCHEMA_VERSION, FilePersistence};
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, NegotiationResult, RequestEnvelope, ResponseEnvelope,
+    AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
+    ClientRequest, NegotiationResult, ProjectSnapshot, RequestEnvelope, ResponseEnvelope,
     ServerEventEnvelope, ServerResponse, unsupported_version_error,
 };
 use loom_providers::{
@@ -39,6 +40,10 @@ pub use remote::{
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
 const IDEMPOTENCY_RETENTION: usize = 1024;
+const MAX_REVIEW_CHANGES: usize = 512;
+const MAX_REVIEW_DIFF_BYTES: usize = 64 * 1024;
+const MAX_REVIEW_FILE_BYTES: usize = 128 * 1024;
+const MAX_RUN_MESSAGE_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct EventJournal {
@@ -253,6 +258,45 @@ impl InProcessBackend {
         Self::with_provider_registry(providers)
     }
 
+    pub fn with_openai_compatible_persistent(
+        endpoint: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<ModelId>,
+        path: impl Into<PathBuf>,
+    ) -> Result<Arc<Self>> {
+        let model = model.into();
+        let descriptor = ModelDescriptor {
+            id: model,
+            provider: loom_model::ProviderId::new("openai-compatible"),
+            display_name: "OpenAI-compatible model".to_owned(),
+            context_window: None,
+            capabilities: loom_model::ModelCapabilities {
+                streaming: false,
+                tool_calling: true,
+                vision: false,
+                json_mode: true,
+            },
+        };
+        let credentials = Arc::new(loom_providers::InMemoryCredentialStore::default());
+        let api_key = api_key.into();
+        let credential = if api_key.is_empty() {
+            None
+        } else {
+            let reference = CredentialRef::new("ui-openai-compatible");
+            credentials.insert(reference.clone(), api_key);
+            Some(reference)
+        };
+        let providers = ProviderRegistry::with_credentials(credentials);
+        providers.register(ProviderConfig::openai_compatible(
+            "openai-compatible",
+            "OpenAI-compatible model",
+            endpoint,
+            descriptor,
+            credential,
+        ))?;
+        Self::with_provider_registry_persistent(providers, path)
+    }
+
     pub fn with_provider_registry(providers: ProviderRegistry) -> Arc<Self> {
         let models = providers
             .list_models()
@@ -314,6 +358,7 @@ impl InProcessBackend {
             supported_capabilities: CapabilitySet::new([
                 Capability::CreateAgentSession,
                 Capability::ReadAgentSession,
+                Capability::ControlAgentSession,
                 Capability::SubscribeSessionEvents,
                 Capability::StartAgentRun,
                 Capability::ReadAgentRun,
@@ -744,6 +789,89 @@ pub struct InProcessConnection {
 }
 
 impl InProcessConnection {
+    fn run_snapshot_projection(
+        &self,
+        run_id: loom_core::RunId,
+    ) -> Result<AgentRunSnapshotProjection> {
+        let runs = self.backend.runs()?;
+        let run = runs
+            .get(&run_id)
+            .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
+        Ok(run_snapshot_projection(run))
+    }
+
+    fn session_snapshot_projection(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<AgentSessionSnapshotProjection> {
+        let session = self.backend.sessions()?.get(session_id)?;
+        let active_run = self
+            .backend
+            .runs()?
+            .values()
+            .filter(|run| run.session_id() == session_id)
+            .max_by_key(|run| run.snapshot().updated_at)
+            .map(run_snapshot_projection);
+        let latest_sequence = self
+            .backend
+            .journal()?
+            .events
+            .iter()
+            .filter(|event| event.session_id == session_id)
+            .map(|event| event.sequence)
+            .max()
+            .unwrap_or_default();
+        Ok(AgentSessionSnapshotProjection {
+            session,
+            active_run,
+            latest_sequence,
+        })
+    }
+
+    fn project_snapshots(&self) -> Result<Vec<ProjectSnapshot>> {
+        let sessions = self.backend.sessions()?.list(None, true);
+        let workspaces = self.backend.workspaces()?;
+        let mut projects = BTreeMap::new();
+
+        for (project_id, workspace) in workspaces.iter() {
+            let name = workspace
+                .root()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or("Project")
+                .to_owned();
+            projects.insert(
+                *project_id,
+                ProjectSnapshot {
+                    id: *project_id,
+                    name,
+                    root: Some(workspace.root().display().to_string()),
+                    session_count: 0,
+                    updated_at: None,
+                },
+            );
+        }
+        drop(workspaces);
+
+        for session in sessions {
+            let project = projects
+                .entry(session.project_id)
+                .or_insert_with(|| ProjectSnapshot {
+                    id: session.project_id,
+                    name: format!("Project {}", session.project_id),
+                    root: None,
+                    session_count: 0,
+                    updated_at: None,
+                });
+            project.session_count = project.session_count.saturating_add(1);
+            project.updated_at = Some(project.updated_at.map_or(session.updated_at, |updated| {
+                updated.max(session.updated_at)
+            }));
+        }
+        Ok(projects.into_values().collect())
+    }
+
     fn open_workspace(&self, project_id: ProjectId, root: String) -> Result<Workspace> {
         let candidate = Workspace::open(project_id, PathBuf::from(root))?;
         let mut workspaces = self.backend.workspaces()?;
@@ -955,6 +1083,36 @@ impl InProcessConnection {
             ClientRequest::Negotiate { .. } | ClientRequest::DiscoverCapabilities => {
                 unreachable!("capability requests are handled above")
             }
+            ClientRequest::ListProjects => {
+                let projects = self
+                    .project_snapshots()?
+                    .into_iter()
+                    .filter(|project| {
+                        self.auth
+                            .as_ref()
+                            .is_none_or(|auth| auth.scope().allows_project(project.id))
+                    })
+                    .collect();
+                Ok(ServerResponse::Projects { projects })
+            }
+            ClientRequest::ListAgentSessions {
+                project_id,
+                include_archived,
+            } => {
+                let sessions = self
+                    .backend
+                    .sessions()?
+                    .list(project_id, include_archived)
+                    .into_iter()
+                    .filter(|session| {
+                        self.auth.as_ref().is_none_or(|auth| {
+                            auth.scope().allows_project(session.project_id)
+                                && auth.scope().allows_session(session.id)
+                        })
+                    })
+                    .collect();
+                Ok(ServerResponse::AgentSessions { sessions })
+            }
             ClientRequest::CreateAgentSession { project_id, name } => {
                 let (snapshot, record) = self.backend.sessions()?.create(project_id, name)?;
                 self.backend.journal()?.append_session(record);
@@ -964,14 +1122,35 @@ impl InProcessConnection {
                 let snapshot = self.backend.sessions()?.get(session_id)?;
                 Ok(ServerResponse::AgentSession(snapshot))
             }
+            ClientRequest::GetAgentSessionSnapshot { session_id } => Ok(
+                ServerResponse::AgentSessionSnapshot(self.session_snapshot_projection(session_id)?),
+            ),
+            ClientRequest::RenameAgentSession { session_id, name } => {
+                let (snapshot, record) = self.backend.sessions()?.rename(session_id, name)?;
+                self.backend.journal()?.append_session(record);
+                Ok(ServerResponse::AgentSessionRenamed(snapshot))
+            }
+            ClientRequest::ArchiveAgentSession { session_id } => {
+                let (snapshot, record) = self.backend.sessions()?.archive(session_id)?;
+                self.backend.journal()?.append_session(record);
+                Ok(ServerResponse::AgentSessionArchived(snapshot))
+            }
             ClientRequest::GetSessionEvents {
                 session_id,
                 after_sequence,
             } => {
                 let journal = self.backend.journal()?;
                 let events = journal.events_since(session_id, after_sequence);
+                let history_missing = session_id.is_some()
+                    && after_sequence.is_none()
+                    && !events.iter().any(|event| {
+                        matches!(
+                            &event.event,
+                            loom_protocol::ServerEvent::AgentSessionCreated { .. }
+                        )
+                    });
                 if let Some(session_id) = session_id
-                    && journal.is_cursor_stale(after_sequence)
+                    && (journal.is_cursor_stale(after_sequence) || history_missing)
                 {
                     return Ok(ServerResponse::SessionEventsSnapshot {
                         session: self.backend.sessions()?.get(session_id)?,
@@ -1030,6 +1209,9 @@ impl InProcessConnection {
                     .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
                 Ok(ServerResponse::AgentRun(run.snapshot()))
             }
+            ClientRequest::GetAgentRunSnapshot { run_id } => Ok(ServerResponse::AgentRunSnapshot(
+                self.run_snapshot_projection(run_id)?,
+            )),
             ClientRequest::GetRunCheckpoint { run_id } => {
                 let (project_id, checkpoint_id) = {
                     let runs = self.backend.runs()?;
@@ -1061,6 +1243,9 @@ impl InProcessConnection {
                 tool_call_id,
                 reason,
             } => self.control_run(run_id, |run| run.reject(tool_call_id, reason)),
+            ClientRequest::SendAgentMessage { run_id, message } => {
+                self.control_run(run_id, |run| run.send_message(message))
+            }
             ClientRequest::InterruptAgentRun { run_id } => {
                 self.control_run(run_id, AgentRuntime::interrupt)
             }
@@ -1184,9 +1369,23 @@ impl InProcessConnection {
             } => Ok(ServerResponse::WorkspaceEvents {
                 events: self.workspace(project_id)?.changes_since(after_sequence)?,
             }),
-            ClientRequest::ReadWorkspaceFile { project_id, path } => Ok(
-                ServerResponse::WorkspaceFile(self.workspace(project_id)?.read_file(&path)?),
-            ),
+            ClientRequest::GetWorkspaceChanges {
+                project_id,
+                after_sequence,
+            } => {
+                let mut changes = self.workspace(project_id)?.changes_since(after_sequence)?;
+                let truncated = changes.len() > MAX_REVIEW_CHANGES;
+                if changes.len() > MAX_REVIEW_CHANGES {
+                    let start = changes.len() - MAX_REVIEW_CHANGES;
+                    changes = changes.split_off(start);
+                }
+                Ok(ServerResponse::WorkspaceChanges { changes, truncated })
+            }
+            ClientRequest::ReadWorkspaceFile { project_id, path } => {
+                let mut file = self.workspace(project_id)?.read_file(&path)?;
+                file.content = bounded_review_text(&file.content, MAX_REVIEW_FILE_BYTES);
+                Ok(ServerResponse::WorkspaceFile(file))
+            }
             ClientRequest::ApplyWorkspaceEdit { project_id, edit } => {
                 Ok(ServerResponse::WorkspaceEditApplied(
                     self.workspace(project_id)?.apply_user_edit(edit)?,
@@ -1284,6 +1483,9 @@ impl InProcessConnection {
                 let supervisor = self.task_supervisor(project_id)?;
                 Ok(ServerResponse::TaskStarted(supervisor.start(spec)?))
             }
+            ClientRequest::ListTasks { project_id } => Ok(ServerResponse::Tasks {
+                tasks: self.task_supervisor(project_id)?.list()?,
+            }),
             ClientRequest::GetTask {
                 project_id,
                 task_id,
@@ -1488,9 +1690,11 @@ impl InProcessConnection {
                 project_id,
                 path,
                 staged,
-            } => Ok(ServerResponse::VcsDiff(
-                self.vcs(project_id)?.diff(path.as_deref(), staged)?,
-            )),
+            } => {
+                let mut diff = self.vcs(project_id)?.diff(path.as_deref(), staged)?;
+                diff.patch = bounded_review_text(&diff.patch, MAX_REVIEW_DIFF_BYTES);
+                Ok(ServerResponse::VcsDiff(diff))
+            }
             ClientRequest::StageVcsPaths { project_id, paths } => Ok(ServerResponse::VcsStatus(
                 self.vcs(project_id)?.stage(&paths)?,
             )),
@@ -1554,7 +1758,11 @@ impl InProcessConnection {
                     ));
                 }
             }
-            ClientRequest::CreateAgentSession {
+            ClientRequest::ListAgentSessions {
+                project_id: Some(requested_project),
+                ..
+            }
+            | ClientRequest::CreateAgentSession {
                 project_id: requested_project,
                 ..
             }
@@ -1562,6 +1770,10 @@ impl InProcessConnection {
                 project_id: requested_project,
             }
             | ClientRequest::GetWorkspaceEvents {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetWorkspaceChanges {
                 project_id: requested_project,
                 ..
             }
@@ -1611,6 +1823,9 @@ impl InProcessConnection {
             | ClientRequest::StartTask {
                 project_id: requested_project,
                 ..
+            }
+            | ClientRequest::ListTasks {
+                project_id: requested_project,
             }
             | ClientRequest::GetTask {
                 project_id: requested_project,
@@ -1759,6 +1974,16 @@ impl InProcessConnection {
             ClientRequest::GetAgentSession {
                 session_id: requested_session,
             }
+            | ClientRequest::GetAgentSessionSnapshot {
+                session_id: requested_session,
+            }
+            | ClientRequest::RenameAgentSession {
+                session_id: requested_session,
+                ..
+            }
+            | ClientRequest::ArchiveAgentSession {
+                session_id: requested_session,
+            }
             | ClientRequest::GetSessionUsage {
                 session_id: requested_session,
             }
@@ -1779,6 +2004,9 @@ impl InProcessConnection {
                 ..
             } => session_id = Some(*requested_session),
             ClientRequest::GetAgentRun {
+                run_id: requested_run,
+            }
+            | ClientRequest::GetAgentRunSnapshot {
                 run_id: requested_run,
             }
             | ClientRequest::GetRunCheckpoint {
@@ -1814,6 +2042,10 @@ impl InProcessConnection {
             | ClientRequest::InspectAgentContext {
                 run_id: requested_run,
             } => run_id = Some(*requested_run),
+            ClientRequest::SendAgentMessage {
+                run_id: requested_run,
+                ..
+            } => run_id = Some(*requested_run),
             ClientRequest::AttachRunEvidence {
                 run_id: requested_run,
                 ..
@@ -1828,6 +2060,10 @@ impl InProcessConnection {
             }
             ClientRequest::Negotiate { .. }
             | ClientRequest::DiscoverCapabilities
+            | ClientRequest::ListProjects
+            | ClientRequest::ListAgentSessions {
+                project_id: None, ..
+            }
             | ClientRequest::ListModels
             | ClientRequest::ListProviders
             | ClientRequest::DiscoverProviderModels { .. }
@@ -2063,10 +2299,46 @@ fn session_state_for_event(event: &AgentEvent) -> Option<AgentSessionState> {
         AgentRunState::AwaitingApproval => AgentSessionState::AwaitingApproval,
         AgentRunState::Evaluating => AgentSessionState::Evaluating,
         AgentRunState::Paused => AgentSessionState::Paused,
+        AgentRunState::NeedsInput => AgentSessionState::NeedsInput,
         AgentRunState::Completed => AgentSessionState::Completed,
         AgentRunState::Failed => AgentSessionState::Failed,
         AgentRunState::Cancelled => AgentSessionState::Cancelled,
     })
+}
+
+fn bounded_review_text(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let end = value
+        .char_indices()
+        .map(|(index, character)| (index, index + character.len_utf8()))
+        .take_while(|(_, end)| *end <= limit)
+        .map(|(_, end)| end)
+        .last()
+        .unwrap_or_default();
+    let mut result = value[..end].to_owned();
+    result.push_str("\n...[review output truncated]");
+    result
+}
+
+fn run_snapshot_projection(runtime: &AgentRuntime) -> AgentRunSnapshotProjection {
+    let mut messages = runtime.messages();
+    for message in &mut messages {
+        message.content = bounded_review_text(&message.content, MAX_RUN_MESSAGE_BYTES);
+    }
+    let mut run = runtime.snapshot();
+    if let Some(summary) = &mut run.summary {
+        *summary = bounded_review_text(summary, MAX_RUN_MESSAGE_BYTES);
+    }
+    AgentRunSnapshotProjection {
+        run,
+        plan: runtime.plan().steps,
+        messages,
+        pending_approval: runtime.pending_approval(),
+        pending_input: runtime.pending_input(),
+        usage: runtime.usage(),
+    }
 }
 
 fn unauthorized_project(project_id: ProjectId) -> LoomError {
@@ -2122,6 +2394,7 @@ mod tests {
             capabilities: CapabilitySet::new([
                 Capability::CreateAgentSession,
                 Capability::ReadAgentSession,
+                Capability::ControlAgentSession,
                 Capability::SubscribeSessionEvents,
                 Capability::StartAgentRun,
                 Capability::ReadAgentRun,
@@ -2195,6 +2468,7 @@ mod tests {
             capabilities: CapabilitySet::new([
                 Capability::CreateAgentSession,
                 Capability::ReadAgentSession,
+                Capability::ControlAgentSession,
                 Capability::SubscribeSessionEvents,
                 Capability::StartAgentRun,
                 Capability::ReadAgentRun,
@@ -2227,6 +2501,124 @@ mod tests {
         let root = std::env::temp_dir().join(format!("loom-server-{}", ProjectId::new()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn m5_session_projections_reconnect_and_archive_authoritatively() {
+        let root = workspace();
+        fs::write(root.join("README.md"), "M5 session projection\n").unwrap();
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        negotiate_m5(&connection);
+        let project_id = ProjectId::new();
+
+        let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+            project_id,
+            root: root.display().to_string(),
+        }));
+        assert!(matches!(
+            opened.result,
+            Ok(ServerResponse::WorkspaceOpened(_))
+        ));
+
+        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
+            project_id,
+            name: "Navigator session".to_owned(),
+        }));
+        let session = match created.result.unwrap() {
+            ServerResponse::AgentSessionCreated(snapshot) => snapshot,
+            response => panic!("unexpected response: {response:?}"),
+        };
+
+        let projects = connection.request(RequestEnvelope::new(ClientRequest::ListProjects));
+        let ServerResponse::Projects { projects } = projects.result.unwrap() else {
+            panic!("unexpected project response");
+        };
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].session_count, 1);
+
+        let renamed = connection.request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+            session_id: session.id,
+            name: "Renamed session".to_owned(),
+        }));
+        let session = match renamed.result.unwrap() {
+            ServerResponse::AgentSessionRenamed(snapshot) => snapshot,
+            response => panic!("unexpected rename response: {response:?}"),
+        };
+        assert_eq!(session.name, "Renamed session");
+
+        let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
+            session_id: session.id,
+            task: "inspect the workspace".to_owned(),
+            model: loom_model::ModelId::new("deterministic/demo"),
+            workspace_root: root.display().to_string(),
+            system_instructions: None,
+            repository_instructions: None,
+        }));
+        let run_id = match started.result.unwrap() {
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            response => panic!("unexpected run response: {response:?}"),
+        };
+
+        let snapshot = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshot {
+                session_id: session.id,
+            },
+        ));
+        let ServerResponse::AgentSessionSnapshot(snapshot) = snapshot.result.unwrap() else {
+            panic!("unexpected session snapshot response");
+        };
+        assert_eq!(snapshot.session.id, session.id);
+        assert_eq!(
+            snapshot.active_run.as_ref().map(|run| run.run.id),
+            Some(run_id)
+        );
+        assert!(snapshot.active_run.unwrap().plan.is_empty());
+
+        let run = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+            run_id,
+        }));
+        let ServerResponse::AgentRunSnapshot(run) = run.result.unwrap() else {
+            panic!("unexpected run snapshot response");
+        };
+        assert_eq!(run.run.id, run_id);
+        assert!(!run.messages.is_empty());
+
+        let changes =
+            connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceChanges {
+                project_id,
+                after_sequence: None,
+            }));
+        assert!(matches!(
+            changes.result,
+            Ok(ServerResponse::WorkspaceChanges { .. })
+        ));
+
+        let interrupted =
+            connection.request(RequestEnvelope::new(ClientRequest::InterruptAgentRun {
+                run_id,
+            }));
+        assert!(matches!(
+            interrupted.result,
+            Ok(ServerResponse::AgentRun(_))
+        ));
+        let archived =
+            connection.request(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
+                session_id: session.id,
+            }));
+        assert!(matches!(
+            archived.result,
+            Ok(ServerResponse::AgentSessionArchived(_))
+        ));
+        let sessions = connection.request(RequestEnvelope::new(ClientRequest::ListAgentSessions {
+            project_id: Some(project_id),
+            include_archived: false,
+        }));
+        let ServerResponse::AgentSessions { sessions } = sessions.result.unwrap() else {
+            panic!("unexpected session list response");
+        };
+        assert!(sessions.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2521,6 +2913,13 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(task_done);
+        let listed = connection.request(RequestEnvelope::new(ClientRequest::ListTasks {
+            project_id,
+        }));
+        let ServerResponse::Tasks { tasks } = listed.result.unwrap() else {
+            panic!("unexpected task list response");
+        };
+        assert!(tasks.iter().any(|task| task.id == task_id));
         let task_events = connection.request(RequestEnvelope::new(ClientRequest::GetTaskEvents {
             project_id,
             task_id,

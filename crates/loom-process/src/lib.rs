@@ -679,6 +679,22 @@ impl TaskSupervisor {
         snapshot_after_task(&handle)
     }
 
+    pub fn list(&self) -> Result<Vec<TaskSnapshot>> {
+        let handles = self
+            .tasks
+            .lock()
+            .map_err(|_| internal_lock_error("task supervisor"))?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut snapshots = handles
+            .iter()
+            .map(|handle| snapshot_after_task(handle))
+            .collect::<Result<Vec<_>>>()?;
+        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.updated_at));
+        Ok(snapshots)
+    }
+
     pub fn cancel(&self, id: TaskId) -> Result<TaskSnapshot> {
         let handle = self.handle(id)?;
         let snapshot = snapshot_after_task(&handle)?;

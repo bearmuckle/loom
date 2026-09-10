@@ -16,6 +16,7 @@ pub enum AgentSessionState {
     Completed,
     Failed,
     Cancelled,
+    Archived,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,6 +43,13 @@ pub enum SessionEvent {
     AgentSessionForked {
         source_session_id: AgentSessionId,
         snapshot: AgentSessionSnapshot,
+    },
+    AgentSessionRenamed {
+        session_id: AgentSessionId,
+        name: String,
+    },
+    AgentSessionArchived {
+        session_id: AgentSessionId,
     },
 }
 
