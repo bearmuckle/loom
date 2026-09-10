@@ -100,6 +100,8 @@ pub struct ModelMessage {
     pub content: String,
     pub name: Option<String>,
     pub tool_call_id: Option<ToolCallId>,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl ModelMessage {
@@ -109,6 +111,7 @@ impl ModelMessage {
             content: content.into(),
             name: None,
             tool_call_id: None,
+            tool_calls: Vec::new(),
         }
     }
 }

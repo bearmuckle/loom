@@ -117,6 +117,10 @@ pub enum ClientRequest {
         session_id: Option<AgentSessionId>,
         after_sequence: Option<EventSequence>,
     },
+    GetRecentSessionEvents {
+        session_id: AgentSessionId,
+        limit: u32,
+    },
     StartAgentRun {
         session_id: AgentSessionId,
         task: String,
@@ -444,7 +448,9 @@ impl ClientRequest {
             Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
                 Some(Capability::ControlAgentSession)
             }
-            Self::GetSessionEvents { .. } => Some(Capability::SubscribeSessionEvents),
+            Self::GetSessionEvents { .. } | Self::GetRecentSessionEvents { .. } => {
+                Some(Capability::SubscribeSessionEvents)
+            }
             Self::StartAgentRun { .. } => Some(Capability::StartAgentRun),
             Self::StartAgentRunWithOptions { .. } => Some(Capability::StartAgentRun),
             Self::GetAgentRun { .. } | Self::GetAgentRunSnapshot { .. } => {

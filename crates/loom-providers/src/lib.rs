@@ -1,7 +1,11 @@
 use std::{
     collections::BTreeMap,
-    fmt,
+    fmt, fs,
+    io::Write,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
 };
 
 use loom_core::{ErrorCode, LoomError, Result, Timestamp, ToolCallId, UsageSnapshot};
@@ -10,6 +14,19 @@ use loom_model::{
     ModelRequest, ModelStreamEvent, ProviderId, TokenUsage, ToolCall,
 };
 use serde::{Deserialize, Serialize};
+
+pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
+pub const GITHUB_COPILOT_CREDENTIAL_REF: &str = "github-copilot";
+pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-5.6-luna";
+const GITHUB_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
+const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
+const GITHUB_COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
+const GITHUB_COPILOT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
+const GITHUB_COPILOT_EDITOR_VERSION: &str = "vscode/1.96.2";
+const GITHUB_COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
+const GITHUB_COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
+const GITHUB_API_VERSION: &str = "2025-04-01";
 
 pub trait ModelProvider: Send {
     fn descriptor(&self) -> &ModelDescriptor;
@@ -66,6 +83,7 @@ pub enum ProviderKind {
     Deterministic,
     OpenAiCompatible,
     Ollama,
+    GitHubCopilot,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -98,6 +116,177 @@ impl From<String> for CredentialRef {
 
 pub trait CredentialStore: Send + Sync {
     fn resolve(&self, reference: &CredentialRef) -> Result<String>;
+}
+
+#[derive(Clone)]
+pub struct FileCredentialStore {
+    path: PathBuf,
+    values: Arc<Mutex<BTreeMap<String, String>>>,
+}
+
+impl fmt::Debug for FileCredentialStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FileCredentialStore")
+            .field("path", &self.path)
+            .field(
+                "credential_count",
+                &self.values.lock().map(|values| values.len()).unwrap_or(0),
+            )
+            .finish()
+    }
+}
+
+impl FileCredentialStore {
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        let values = Self::read_values(&path)?;
+        Ok(Self {
+            path,
+            values: Arc::new(Mutex::new(values)),
+        })
+    }
+
+    pub fn default_path() -> PathBuf {
+        std::env::var_os("LOOM_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_CONFIG_HOME")
+                    .map(PathBuf::from)
+                    .map(|path| path.join("loom"))
+            })
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|path| path.join(".config").join("loom"))
+            })
+            .unwrap_or_else(|| PathBuf::from(".loom"))
+            .join("credentials.json")
+    }
+
+    pub fn insert(
+        &self,
+        reference: impl Into<CredentialRef>,
+        secret: impl Into<String>,
+    ) -> Result<()> {
+        let mut values = self.values.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "credential store lock was poisoned",
+                true,
+            )
+        })?;
+        values.insert(reference.into().0, secret.into());
+        self.persist(&values)
+    }
+
+    pub fn remove(&self, reference: &CredentialRef) -> Result<bool> {
+        let mut values = self.values.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "credential store lock was poisoned",
+                true,
+            )
+        })?;
+        let removed = values.remove(reference.as_str()).is_some();
+        if removed {
+            self.persist(&values)?;
+        }
+        Ok(removed)
+    }
+
+    fn persist(&self, values: &BTreeMap<String, String>) -> Result<()> {
+        let parent = self.path.parent().ok_or_else(|| {
+            LoomError::invalid_request("credential store path must have a parent directory")
+        })?;
+        fs::create_dir_all(parent).map_err(|error| credential_store_error(&self.path, error))?;
+        let temporary = self.path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(values).map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not encode credential store: {error}"),
+                false,
+            )
+        })?;
+        let mut file = fs::OpenOptions::new();
+        file.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            file.mode(0o600);
+        }
+        file.open(&temporary)
+            .and_then(|mut file| file.write_all(&bytes))
+            .map_err(|error| credential_store_error(&temporary, error))?;
+        restrict_file_permissions(&temporary)?;
+        fs::rename(&temporary, &self.path)
+            .map_err(|error| credential_store_error(&self.path, error))?;
+        restrict_file_permissions(&self.path)?;
+        Ok(())
+    }
+
+    fn read_values(path: &Path) -> Result<BTreeMap<String, String>> {
+        if !path.is_file() {
+            return Ok(BTreeMap::new());
+        }
+        let bytes = fs::read(path).map_err(|error| credential_store_error(path, error))?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!(
+                    "credential store '{}' contains invalid JSON: {error}",
+                    path.display()
+                ),
+                false,
+            )
+        })
+    }
+}
+
+impl CredentialStore for FileCredentialStore {
+    fn resolve(&self, reference: &CredentialRef) -> Result<String> {
+        let mut values = self.values.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "credential store lock was poisoned",
+                true,
+            )
+        })?;
+        *values = Self::read_values(&self.path)?;
+        values.get(reference.as_str()).cloned().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::ProviderAuthentication,
+                format!(
+                    "credential reference '{}' was not found",
+                    reference.as_str()
+                ),
+                false,
+            )
+        })
+    }
+}
+
+fn credential_store_error(path: &Path, error: impl fmt::Display) -> LoomError {
+    LoomError::new(
+        ErrorCode::Internal,
+        format!(
+            "could not access credential store '{}': {error}",
+            path.display()
+        ),
+        false,
+    )
+}
+
+fn restrict_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| credential_store_error(path, error))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -228,6 +417,19 @@ impl ProviderConfig {
         }
     }
 
+    pub fn github_copilot(credential: impl Into<CredentialRef>) -> Self {
+        Self {
+            id: ProviderId::new(GITHUB_COPILOT_PROVIDER_ID),
+            kind: ProviderKind::GitHubCopilot,
+            display_name: "GitHub Copilot".to_owned(),
+            endpoint: Some(GITHUB_COPILOT_API_ENDPOINT.to_owned()),
+            models: vec![github_copilot_descriptor()],
+            credential: Some(credential.into()),
+            input_cost_micros_per_1k: 0,
+            output_cost_micros_per_1k: 0,
+        }
+    }
+
     pub fn with_pricing(
         mut self,
         input_cost_micros_per_1k: u64,
@@ -236,6 +438,21 @@ impl ProviderConfig {
         self.input_cost_micros_per_1k = input_cost_micros_per_1k;
         self.output_cost_micros_per_1k = output_cost_micros_per_1k;
         self
+    }
+}
+
+pub fn github_copilot_descriptor() -> ModelDescriptor {
+    ModelDescriptor {
+        id: ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL),
+        provider: ProviderId::new(GITHUB_COPILOT_PROVIDER_ID),
+        display_name: "GitHub Copilot GPT-5.6 Luna".to_owned(),
+        context_window: Some(128_000),
+        capabilities: ModelCapabilities {
+            streaming: false,
+            tool_calling: true,
+            vision: true,
+            json_mode: true,
+        },
     }
 }
 
@@ -402,7 +619,30 @@ impl ProviderRegistry {
     }
 
     pub fn demo() -> Self {
-        let credentials = Arc::new(InMemoryCredentialStore::default());
+        Self::build_demo(Arc::new(InMemoryCredentialStore::default()), false)
+    }
+
+    pub fn demo_with_credentials(credentials: Arc<dyn CredentialStore>) -> Self {
+        Self::build_demo(credentials, true)
+    }
+
+    pub fn configured(credentials: Arc<dyn CredentialStore>) -> Result<Self> {
+        let registry = Self::with_credentials(Arc::clone(&credentials));
+        registry.register(ProviderConfig::github_copilot(CredentialRef::new(
+            GITHUB_COPILOT_CREDENTIAL_REF,
+        )))?;
+        if let Some(endpoint) = std::env::var_os("LOOM_OLLAMA_ENDPOINT") {
+            let endpoint = endpoint.to_string_lossy();
+            if !endpoint.trim().is_empty() {
+                let model =
+                    std::env::var("LOOM_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.2".to_owned());
+                registry.register(ProviderConfig::ollama(endpoint.into_owned(), model))?;
+            }
+        }
+        Ok(registry)
+    }
+
+    fn build_demo(credentials: Arc<dyn CredentialStore>, include_github_copilot: bool) -> Self {
         let registry = Self::with_credentials(credentials);
         registry
             .register(ProviderConfig::deterministic())
@@ -433,6 +673,13 @@ impl ProviderRegistry {
                 None,
             ))
             .expect("valid OpenAI-compatible provider");
+        if include_github_copilot {
+            registry
+                .register(ProviderConfig::github_copilot(CredentialRef::new(
+                    GITHUB_COPILOT_CREDENTIAL_REF,
+                )))
+                .expect("valid GitHub Copilot provider");
+        }
         registry
     }
 
@@ -501,6 +748,10 @@ impl ProviderRegistry {
         self.register(ProviderConfig::ollama(endpoint, model))
     }
 
+    pub fn register_github_copilot(&self, credential: impl Into<CredentialRef>) -> Result<()> {
+        self.register(ProviderConfig::github_copilot(credential))
+    }
+
     pub fn add_model(&self, provider_id: &ProviderId, model: ModelDescriptor) -> Result<()> {
         if model.id.as_str().trim().is_empty() || model.provider.as_str().trim().is_empty() {
             return Err(LoomError::invalid_request(
@@ -536,6 +787,7 @@ impl ProviderRegistry {
             .map_err(|_| internal_lock_error("provider health"))?;
         Ok(configurations
             .values()
+            .filter(|config| self.is_configured(config))
             .map(|config| ProviderSummary {
                 id: config.id.clone(),
                 kind: config.kind,
@@ -557,8 +809,16 @@ impl ProviderRegistry {
             .map_err(|_| internal_lock_error("provider configuration"))?;
         Ok(configurations
             .values()
+            .filter(|config| self.is_configured(config))
             .flat_map(|config| config.models.iter().cloned())
             .collect())
+    }
+
+    fn is_configured(&self, config: &ProviderConfig) -> bool {
+        config
+            .credential
+            .as_ref()
+            .is_none_or(|reference| self.credentials.resolve(reference).is_ok())
     }
 
     pub fn models(&self) -> Result<Vec<ModelDescriptor>> {
@@ -575,6 +835,17 @@ impl ProviderRegistry {
             .ok_or_else(|| LoomError::not_found("provider", provider_id.as_str()))?;
         if config.kind == ProviderKind::Deterministic {
             return Ok(config.models);
+        }
+        if config.kind == ProviderKind::GitHubCopilot {
+            let provider = self.create_github_copilot_provider(&config)?;
+            let models = provider.discover_models()?;
+            self.configurations
+                .lock()
+                .map_err(|_| internal_lock_error("provider configuration"))?
+                .get_mut(provider_id)
+                .ok_or_else(|| LoomError::not_found("provider", provider_id.as_str()))?
+                .models = models.clone();
+            return Ok(models);
         }
         let endpoint = config.endpoint.as_deref().ok_or_else(|| {
             LoomError::invalid_request(format!(
@@ -779,6 +1050,10 @@ impl ProviderRegistry {
                 })?;
                 Box::new(OllamaProvider::with_descriptor(endpoint, descriptor))
             }
+            ProviderKind::GitHubCopilot => Box::new(
+                self.create_github_copilot_provider(&config)?
+                    .with_model_descriptor(descriptor),
+            ),
         };
         Ok(Box::new(AccountingProvider {
             inner: provider,
@@ -786,6 +1061,36 @@ impl ProviderRegistry {
             input_cost_micros_per_1k: config.input_cost_micros_per_1k,
             output_cost_micros_per_1k: config.output_cost_micros_per_1k,
         }))
+    }
+
+    fn create_github_copilot_provider(
+        &self,
+        config: &ProviderConfig,
+    ) -> Result<GitHubCopilotProvider> {
+        let credential = config.credential.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::ProviderAuthentication,
+                format!(
+                    "provider '{}' has no configured credential",
+                    config.id.as_str()
+                ),
+                false,
+            )
+        })?;
+        let github_token = self.credentials.resolve(credential)?;
+        let endpoint = config
+            .endpoint
+            .as_deref()
+            .unwrap_or(GITHUB_COPILOT_API_ENDPOINT);
+        Ok(GitHubCopilotProvider::with_descriptor(
+            endpoint,
+            github_token,
+            config
+                .models
+                .first()
+                .cloned()
+                .unwrap_or_else(github_copilot_descriptor),
+        ))
     }
 
     pub fn pricing(&self, model: &ModelId) -> Result<(u64, u64)> {
@@ -827,7 +1132,29 @@ impl ProviderRegistry {
     }
 
     pub fn restore_configs(&self, configs: Vec<ProviderConfig>) -> Result<()> {
+        let existing = self
+            .configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?
+            .clone();
         for config in configs {
+            if let Some(current) = existing.get(&config.id) {
+                if config.kind == ProviderKind::GitHubCopilot && config.models.len() <= 1 {
+                    continue;
+                }
+                if config.kind != ProviderKind::GitHubCopilot {
+                    continue;
+                }
+                if current.credential != config.credential {
+                    continue;
+                }
+            } else if config
+                .credential
+                .as_ref()
+                .is_none_or(|reference| self.credentials.resolve(reference).is_err())
+            {
+                continue;
+            }
             self.register(config)?;
         }
         Ok(())
@@ -1109,6 +1436,348 @@ pub fn deterministic_descriptor() -> ModelDescriptor {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct GitHubDeviceCode {
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+    device_code: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct OAuthTokenResponse {
+    access_token: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+pub struct GitHubCopilotAuthenticator {
+    client_id: String,
+}
+
+impl Default for GitHubCopilotAuthenticator {
+    fn default() -> Self {
+        Self {
+            client_id: GITHUB_OAUTH_CLIENT_ID.to_owned(),
+        }
+    }
+}
+
+impl GitHubCopilotAuthenticator {
+    pub fn begin(&self) -> Result<GitHubDeviceCode> {
+        let response = ureq::post(GITHUB_DEVICE_CODE_URL)
+            .set("Accept", "application/json")
+            .set("Content-Type", "application/json")
+            .send_json(serde_json::json!({
+                "client_id": self.client_id.as_str(),
+                "scope": "read:user"
+            }))
+            .map_err(|error| normalize_oauth_error("GitHub device authorization", error))?;
+        response.into_json().map_err(|error| {
+            LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                format!("GitHub device authorization returned invalid JSON: {error}"),
+                false,
+            )
+        })
+    }
+
+    pub fn poll(&self, device: &GitHubDeviceCode) -> Result<String> {
+        let deadline = Instant::now() + Duration::from_secs(device.expires_in);
+        let mut interval = Duration::from_secs(device.interval.max(1));
+        loop {
+            if Instant::now() >= deadline {
+                return Err(LoomError::new(
+                    ErrorCode::ProviderAuthentication,
+                    "GitHub device authorization expired",
+                    false,
+                ));
+            }
+            let response = ureq::post(GITHUB_ACCESS_TOKEN_URL)
+                .set("Accept", "application/json")
+                .set("Content-Type", "application/json")
+                .send_json(serde_json::json!({
+                    "client_id": self.client_id.as_str(),
+                    "device_code": device.device_code.as_str(),
+                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+                }));
+            match response {
+                Ok(response) => {
+                    let body: OAuthTokenResponse = response.into_json().map_err(|error| {
+                        LoomError::new(
+                            ErrorCode::ProviderInvalidResponse,
+                            format!("GitHub token response was invalid JSON: {error}"),
+                            false,
+                        )
+                    })?;
+                    if let Some(token) =
+                        body.access_token.as_ref().filter(|token| !token.is_empty())
+                    {
+                        return Ok(token.clone());
+                    }
+                    match body.error.as_deref() {
+                        Some("authorization_pending") => thread::sleep(interval),
+                        Some("slow_down") => {
+                            interval = interval.saturating_add(Duration::from_secs(5));
+                            thread::sleep(interval);
+                        }
+                        _ => return Err(oauth_response_error(body)),
+                    }
+                }
+                Err(ureq::Error::Status(400, response)) => {
+                    let body: OAuthTokenResponse = response.into_json().unwrap_or_default();
+                    match body.error.as_deref() {
+                        Some("authorization_pending") => thread::sleep(interval),
+                        Some("slow_down") => {
+                            interval = interval.saturating_add(Duration::from_secs(5));
+                            thread::sleep(interval);
+                        }
+                        _ => return Err(oauth_response_error(body)),
+                    }
+                }
+                Err(error @ ureq::Error::Status(_, _)) => {
+                    return Err(normalize_oauth_error("GitHub token exchange", error));
+                }
+                Err(error) => {
+                    return Err(normalize_oauth_error("GitHub token exchange", error));
+                }
+            }
+        }
+    }
+}
+
+pub struct GitHubCopilotProvider {
+    api_endpoint: String,
+    token_endpoint: String,
+    github_token: String,
+    descriptor: ModelDescriptor,
+    responses_call_ids: BTreeMap<String, ToolCallId>,
+}
+
+impl GitHubCopilotProvider {
+    pub fn new(github_token: impl Into<String>, model: impl Into<ModelId>) -> Self {
+        let model = model.into();
+        Self::with_descriptor(
+            GITHUB_COPILOT_API_ENDPOINT,
+            github_token,
+            ModelDescriptor {
+                id: model,
+                provider: ProviderId::new(GITHUB_COPILOT_PROVIDER_ID),
+                display_name: "GitHub Copilot model".to_owned(),
+                context_window: Some(128_000),
+                capabilities: ModelCapabilities {
+                    streaming: false,
+                    tool_calling: true,
+                    vision: true,
+                    json_mode: true,
+                },
+            },
+        )
+    }
+
+    pub fn with_descriptor(
+        api_endpoint: impl Into<String>,
+        github_token: impl Into<String>,
+        descriptor: ModelDescriptor,
+    ) -> Self {
+        Self::with_endpoints(
+            api_endpoint,
+            GITHUB_COPILOT_TOKEN_URL,
+            github_token,
+            descriptor,
+        )
+    }
+
+    pub fn with_endpoints(
+        api_endpoint: impl Into<String>,
+        token_endpoint: impl Into<String>,
+        github_token: impl Into<String>,
+        descriptor: ModelDescriptor,
+    ) -> Self {
+        Self {
+            api_endpoint: api_endpoint.into(),
+            token_endpoint: token_endpoint.into(),
+            github_token: github_token.into(),
+            descriptor,
+            responses_call_ids: BTreeMap::new(),
+        }
+    }
+
+    pub fn with_model_descriptor(mut self, descriptor: ModelDescriptor) -> Self {
+        self.descriptor = descriptor;
+        self
+    }
+
+    pub fn discover_models(&self) -> Result<Vec<ModelDescriptor>> {
+        let token = self.fetch_copilot_token()?;
+        let response = ureq::get(&format!("{}/models", trim_endpoint(&token.api_endpoint)))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {}", token.value))
+            .set("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
+            .set("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION)
+            .set("Copilot-Integration-Id", "vscode-chat")
+            .set("Openai-Intent", "conversation-panel")
+            .set("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .set("X-Vscode-User-Agent-Library-Version", "electron-fetch")
+            .set("User-Agent", GITHUB_COPILOT_USER_AGENT)
+            .call()
+            .map_err(|error| {
+                normalize_provider_request_error("github-copilot model discovery", error)
+            })?;
+        let body: serde_json::Value = response.into_json().map_err(|error| {
+            LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                format!("GitHub Copilot model discovery returned invalid JSON: {error}"),
+                false,
+            )
+        })?;
+        let models = body
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::ProviderInvalidResponse,
+                    "GitHub Copilot model discovery did not contain a data array",
+                    false,
+                )
+            })?
+            .iter()
+            .map(|model| {
+                let id = model
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::ProviderInvalidResponse,
+                            "GitHub Copilot returned a model without an id",
+                            false,
+                        )
+                    })?;
+                Ok(ModelDescriptor {
+                    id: ModelId::new(id),
+                    provider: self.descriptor.provider.clone(),
+                    display_name: id.to_owned(),
+                    context_window: self.descriptor.context_window,
+                    capabilities: self.descriptor.capabilities.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if models.is_empty() {
+            return Err(LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                "GitHub Copilot model discovery returned no models",
+                false,
+            ));
+        }
+        Ok(models)
+    }
+
+    fn fetch_copilot_token(&self) -> Result<CopilotAccessToken> {
+        let response = ureq::get(&self.token_endpoint)
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("token {}", self.github_token))
+            .set("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
+            .set("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION)
+            .set("Copilot-Integration-Id", "vscode-chat")
+            .set("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .set("X-Vscode-User-Agent-Library-Version", "electron-fetch")
+            .set("User-Agent", GITHUB_COPILOT_USER_AGENT)
+            .call()
+            .map_err(|error| {
+                normalize_provider_request_error("github-copilot token exchange", error)
+            })?;
+        let body: serde_json::Value = response.into_json().map_err(|error| {
+            LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                format!("GitHub Copilot token response was invalid JSON: {error}"),
+                false,
+            )
+        })?;
+        let value = body
+            .get("token")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::ProviderAuthentication,
+                    "GitHub Copilot token response did not contain a token",
+                    false,
+                )
+            })?;
+        let api_endpoint = body
+            .get("endpoints")
+            .and_then(|endpoints| endpoints.get("api"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map_or_else(|| self.api_endpoint.clone(), ToOwned::to_owned);
+        Ok(CopilotAccessToken {
+            value: value.to_owned(),
+            api_endpoint,
+        })
+    }
+}
+
+struct CopilotAccessToken {
+    value: String,
+    api_endpoint: String,
+}
+
+impl ModelProvider for GitHubCopilotProvider {
+    fn descriptor(&self) -> &ModelDescriptor {
+        &self.descriptor
+    }
+
+    fn stream(&mut self, request: &ModelRequest) -> Result<Vec<ModelStreamEvent>> {
+        if request.model != self.descriptor.id {
+            return Err(LoomError::invalid_request(format!(
+                "request model '{}' does not match provider model '{}'",
+                request.model.as_str(),
+                self.descriptor.id.as_str()
+            )));
+        }
+        let token = self.fetch_copilot_token()?;
+        let (endpoint, payload, provider) = if uses_responses_endpoint(request.model.as_str()) {
+            (
+                format!("{}/responses", trim_endpoint(&token.api_endpoint)),
+                responses_request_payload(request),
+                "github-copilot responses",
+            )
+        } else {
+            (
+                format!("{}/chat/completions", trim_endpoint(&token.api_endpoint)),
+                openai_request_payload(request),
+                "github-copilot chat completion",
+            )
+        };
+        let events = send_openai_request(
+            &endpoint,
+            &format!("Bearer {}", token.value),
+            &[
+                ("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION),
+                ("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION),
+                ("Openai-Intent", "conversation-panel"),
+                ("Copilot-Integration-Id", "vscode-chat"),
+                ("X-GitHub-Api-Version", GITHUB_API_VERSION),
+                ("X-Vscode-User-Agent-Library-Version", "electron-fetch"),
+                ("User-Agent", GITHUB_COPILOT_USER_AGENT),
+            ],
+            payload,
+            provider,
+            if uses_responses_endpoint(request.model.as_str()) {
+                Some(&mut self.responses_call_ids)
+            } else {
+                None
+            },
+        )?;
+        Ok(events)
+    }
+
+    fn health_check(&mut self) -> Result<()> {
+        self.fetch_copilot_token().map(|_| ())
+    }
+}
+
 pub struct OpenAiCompatibleProvider {
     endpoint: String,
     api_key: String,
@@ -1203,33 +1872,19 @@ impl ModelProvider for OpenAiCompatibleProvider {
             payload["stop"] = serde_json::json!(request.options.stop_sequences);
         }
 
-        let request_builder = ureq::post(&self.endpoint).set("Content-Type", "application/json");
-        let request_builder = if self.api_key.is_empty() {
-            request_builder
+        let authorization = if self.api_key.is_empty() {
+            String::new()
         } else {
-            request_builder.set("Authorization", &format!("Bearer {}", self.api_key))
+            bearer_header(&self.api_key)
         };
-        let response = request_builder
-            .send_json(payload)
-            .map_err(|error| match error {
-                ureq::Error::Status(status, _) => {
-                    normalize_provider_error(self.descriptor.provider.as_str(), status)
-                }
-                ureq::Error::Transport(error) => {
-                    normalize_transport_error(self.descriptor.provider.as_str(), &error.to_string())
-                }
-            })?;
-        let body: serde_json::Value = response.into_json().map_err(|error| {
-            LoomError::new(
-                ErrorCode::ProviderInvalidResponse,
-                format!(
-                    "{} returned a response that was not valid JSON: {error}",
-                    self.descriptor.provider.as_str()
-                ),
-                false,
-            )
-        })?;
-        normalize_openai_response(&body)
+        send_openai_request(
+            &self.endpoint,
+            &authorization,
+            &[],
+            payload,
+            self.descriptor.provider.as_str(),
+            None,
+        )
     }
 
     fn health_check(&mut self) -> Result<()> {
@@ -1298,6 +1953,309 @@ impl ModelProvider for OllamaProvider {
     fn health_check(&mut self) -> Result<()> {
         self.inner.health_check()
     }
+}
+
+fn openai_request_payload(request: &ModelRequest) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "model": request.model.as_str(),
+        "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
+        "stream": false
+    });
+    if !request.tools.is_empty() {
+        payload["tools"] = serde_json::Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.input_schema
+                        }
+                    })
+                })
+                .collect(),
+        );
+    }
+    if let Some(temperature) = request.options.temperature {
+        payload["temperature"] = serde_json::json!(temperature);
+    }
+    if let Some(max_output_tokens) = request.options.max_output_tokens {
+        payload["max_tokens"] = serde_json::json!(max_output_tokens);
+    }
+    if !request.options.stop_sequences.is_empty() {
+        payload["stop"] = serde_json::json!(request.options.stop_sequences);
+    }
+    payload
+}
+
+fn uses_responses_endpoint(model: &str) -> bool {
+    model.starts_with("gpt-5")
+}
+
+fn responses_request_payload(request: &ModelRequest) -> serde_json::Value {
+    let input = request
+        .messages
+        .iter()
+        .flat_map(|message| {
+            if message.role == MessageRole::Tool {
+                vec![serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": message
+                        .tool_call_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default(),
+                    "output": message.content
+                })]
+            } else if !message.tool_calls.is_empty() {
+                message
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::json!({
+                                "type": "function_call",
+                                "call_id": call.id.to_string(),
+                                "name": call.name,
+                                "arguments": call.arguments.to_string()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                let content_type = if message.role == MessageRole::Assistant {
+                    "output_text"
+                } else {
+                    "input_text"
+                };
+                vec![serde_json::json!({
+                    "role": match message.role {
+                        MessageRole::System => "system",
+                        MessageRole::User => "user",
+                        MessageRole::Assistant => "assistant",
+                        MessageRole::Tool => unreachable!(),
+                    },
+                    "content": [{
+                        "type": content_type,
+                        "text": message.content
+                    }]
+                })]
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut payload = serde_json::json!({
+        "model": request.model.as_str(),
+        "input": input,
+        "stream": false
+    });
+    if !request.tools.is_empty() {
+        payload["tools"] = serde_json::Value::Array(
+            request
+                .tools
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema
+                    })
+                })
+                .collect(),
+        );
+    }
+    if let Some(max_output_tokens) = request.options.max_output_tokens {
+        payload["max_output_tokens"] = serde_json::json!(max_output_tokens);
+    }
+    payload
+}
+
+fn send_openai_request(
+    endpoint: &str,
+    authorization: &str,
+    headers: &[(&str, &str)],
+    payload: serde_json::Value,
+    provider: &str,
+    call_ids: Option<&mut BTreeMap<String, ToolCallId>>,
+) -> Result<Vec<ModelStreamEvent>> {
+    let request = ureq::post(endpoint).set("Content-Type", "application/json");
+    let request = if authorization.is_empty() {
+        request
+    } else {
+        request.set("Authorization", authorization)
+    };
+    let request = headers
+        .iter()
+        .fold(request, |request, (name, value)| request.set(name, value));
+    let response = request
+        .send_json(payload)
+        .map_err(|error| normalize_provider_request_error(provider, error))?;
+    let body: serde_json::Value = response.into_json().map_err(|error| {
+        LoomError::new(
+            ErrorCode::ProviderInvalidResponse,
+            format!("{provider} returned a response that was not valid JSON: {error}"),
+            false,
+        )
+    })?;
+    if provider.contains("responses") {
+        if let Some(call_ids) = call_ids {
+            normalize_responses_response(&body, call_ids)
+        } else {
+            normalize_responses_response(&body, &mut BTreeMap::new())
+        }
+    } else {
+        normalize_openai_response(&body)
+    }
+}
+
+fn normalize_responses_response(
+    body: &serde_json::Value,
+    call_ids: &mut BTreeMap<String, ToolCallId>,
+) -> Result<Vec<ModelStreamEvent>> {
+    let mut events = Vec::new();
+    if let Some(output) = body.get("output").and_then(serde_json::Value::as_array) {
+        for item in output {
+            match item.get("type").and_then(serde_json::Value::as_str) {
+                Some("message") => {
+                    if let Some(content) = item.get("content").and_then(serde_json::Value::as_array)
+                    {
+                        for part in content {
+                            if let Some(text) = part.get("text").and_then(serde_json::Value::as_str)
+                            {
+                                events.push(ModelStreamEvent::TextDelta {
+                                    text: text.to_owned(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    let name = item
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            LoomError::new(
+                                ErrorCode::ProviderInvalidResponse,
+                                "Copilot Responses function call did not contain a name",
+                                false,
+                            )
+                        })?;
+                    let arguments = item
+                        .get("arguments")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|arguments| {
+                            serde_json::from_str(arguments).map_err(|error| {
+                                LoomError::new(
+                                    ErrorCode::ProviderInvalidResponse,
+                                    format!(
+                                        "Copilot Responses tool arguments were invalid: {error}"
+                                    ),
+                                    false,
+                                )
+                            })
+                        })
+                        .transpose()?
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let remote_call_id = item
+                        .get("call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let call_id = call_ids.entry(remote_call_id).or_default().to_owned();
+                    events.push(ModelStreamEvent::ToolCallDelta {
+                        call: ToolCall {
+                            id: call_id,
+                            name: name.to_owned(),
+                            arguments,
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(usage) = body.get("usage") {
+        events.push(ModelStreamEvent::Usage {
+            usage: TokenUsage {
+                input_tokens: usage
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                output_tokens: usage
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                cached_input_tokens: usage
+                    .get("input_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+            },
+        });
+    }
+    events.push(ModelStreamEvent::Completed {
+        reason: if body.get("status").and_then(serde_json::Value::as_str) == Some("completed") {
+            FinishReason::Stop
+        } else {
+            FinishReason::Error
+        },
+    });
+    Ok(events)
+}
+
+fn bearer_header(token: &str) -> String {
+    let mut value = String::from("Bearer ");
+    value.push_str(token);
+    value
+}
+
+fn trim_endpoint(endpoint: &str) -> String {
+    endpoint.trim_end_matches('/').to_owned()
+}
+
+fn normalize_provider_request_error(provider: &str, error: ureq::Error) -> LoomError {
+    match error {
+        ureq::Error::Status(status, response) => {
+            let detail = response.into_string().unwrap_or_default();
+            let detail = detail
+                .replace("Bearer ", "Bearer [redacted] ")
+                .replace("token ", "token [redacted] ");
+            let detail = detail.chars().take(512).collect::<String>();
+            if detail.trim().is_empty() {
+                normalize_provider_error(provider, status)
+            } else {
+                LoomError::new(
+                    ErrorCode::ProviderInvalidResponse,
+                    format!("{provider} rejected the request (HTTP {status}): {detail}"),
+                    false,
+                )
+            }
+        }
+        ureq::Error::Transport(error) => normalize_transport_error(provider, &error.to_string()),
+    }
+}
+
+fn normalize_oauth_error(operation: &str, error: ureq::Error) -> LoomError {
+    match error {
+        ureq::Error::Status(status, _) => LoomError::new(
+            ErrorCode::ProviderAuthentication,
+            format!("{operation} failed (HTTP {status})"),
+            false,
+        ),
+        ureq::Error::Transport(error) => normalize_transport_error(operation, &error.to_string()),
+    }
+}
+
+fn oauth_response_error(response: OAuthTokenResponse) -> LoomError {
+    let detail = response
+        .error_description
+        .or(response.error)
+        .unwrap_or_else(|| "GitHub did not issue an access token".to_owned());
+    LoomError::new(
+        ErrorCode::ProviderAuthentication,
+        format!("GitHub authentication failed: {detail}"),
+        false,
+    )
 }
 
 fn ollama_chat_endpoint(mut endpoint: String) -> String {
@@ -1402,6 +2360,24 @@ fn message_json(message: &ModelMessage) -> serde_json::Value {
     }
     if let Some(tool_call_id) = message.tool_call_id {
         value["tool_call_id"] = serde_json::json!(tool_call_id.to_string());
+    }
+    if !message.tool_calls.is_empty() {
+        value["tool_calls"] = serde_json::Value::Array(
+            message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    serde_json::json!({
+                        "id": call.id.to_string(),
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments.to_string()
+                        }
+                    })
+                })
+                .collect(),
+        );
     }
     value
 }
@@ -1533,6 +2509,7 @@ fn internal_lock_error(resource: &str) -> LoomError {
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         io::{Read, Write},
         net::TcpListener,
         thread,
@@ -1724,5 +2701,97 @@ mod tests {
             "http://127.0.0.1:11434/v1/chat/completions"
         );
         assert_eq!(provider.descriptor().provider.as_str(), "ollama");
+    }
+
+    #[test]
+    fn file_credential_store_round_trips_secrets_without_exposing_them_in_debug() {
+        let path =
+            std::env::temp_dir().join(format!("loom-credentials-test-{}.json", std::process::id()));
+        let store = FileCredentialStore::open(&path).unwrap();
+        store.insert("test", "secret-value").unwrap();
+        assert_eq!(
+            store.resolve(&CredentialRef::new("test")).unwrap(),
+            "secret-value"
+        );
+        assert!(!format!("{store:?}").contains("secret-value"));
+        let reopened = FileCredentialStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.resolve(&CredentialRef::new("test")).unwrap(),
+            "secret-value"
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn github_copilot_exchanges_github_token_before_chat_completion() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut token_stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = token_stream.read(&mut request).unwrap();
+            let token_request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                token_request
+                    .lines()
+                    .any(|line| line.starts_with("Authorization: token "))
+            );
+            let token_body =
+                format!(r#"{{"token":"copilot-token","endpoints":{{"api":"http://{address}"}}}}"#);
+            write!(
+                token_stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                token_body.len(),
+                token_body
+            )
+            .unwrap();
+
+            let (mut chat_stream, _) = listener.accept().unwrap();
+            let read = chat_stream.read(&mut request).unwrap();
+            let chat_request = String::from_utf8_lossy(&request[..read]);
+            let chat_request = chat_request.to_ascii_lowercase();
+            assert!(
+                chat_request
+                    .lines()
+                    .any(|line| line.starts_with("authorization: bearer "))
+            );
+            assert!(chat_request.contains("editor-version: vscode/1.96.2"));
+            let chat_body = r#"{"choices":[{"message":{"content":"copilot response"},"finish_reason":"stop"}]}"#;
+            write!(
+                chat_stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                chat_body.len(),
+                chat_body
+            )
+            .unwrap();
+        });
+        let descriptor = ModelDescriptor {
+            id: ModelId::new("gpt-4o"),
+            provider: ProviderId::new(GITHUB_COPILOT_PROVIDER_ID),
+            display_name: "GitHub Copilot".to_owned(),
+            context_window: Some(128_000),
+            capabilities: ModelCapabilities::default(),
+        };
+        let mut provider = GitHubCopilotProvider::with_endpoints(
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+            "github-token",
+            descriptor,
+        );
+        let events = provider
+            .stream(&ModelRequest {
+                model: ModelId::new("gpt-4o"),
+                messages: vec![ModelMessage::new(MessageRole::User, "hello")],
+                tools: Vec::new(),
+                options: Default::default(),
+            })
+            .unwrap();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ModelStreamEvent::TextDelta { text } if text == "copilot response"
+            )
+        }));
+        server.join().unwrap();
     }
 }

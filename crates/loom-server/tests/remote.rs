@@ -448,8 +448,19 @@ async fn malformed_payloads_receive_structured_errors() {
         .send(Message::Text("{not-json".to_owned().into()))
         .await
         .unwrap();
-    let Some(Ok(Message::Text(response))) = socket.next().await else {
-        panic!("server did not return malformed payload response");
+    let response = loop {
+        match socket.next().await {
+            Some(Ok(Message::Text(response))) => break response,
+            Some(Ok(Message::Ping(payload))) => {
+                socket.send(Message::Pong(payload)).await.unwrap();
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Binary(_))) => {}
+            Some(Ok(Message::Frame(_))) => {}
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                panic!("server did not return malformed payload response");
+            }
+        }
     };
     let response = decode_response(response.as_bytes()).unwrap();
     assert_eq!(
