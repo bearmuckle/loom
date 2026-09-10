@@ -16,6 +16,7 @@ loom-core.workspace = true
 loom-model.workspace = true
 loom-process.workspace = true
 loom-protocol.workspace = true
+loom-providers.workspace = true
 loom-server.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

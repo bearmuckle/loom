@@ -18,6 +18,9 @@ use loom_process::{TaskKind, TaskSpec, TaskStatus, TerminalEvent, TerminalStatus
 use loom_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
 };
+use loom_providers::{
+    CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
+};
 use loom_server::{
     AuthTokenStore, AuthorizationScope, InProcessBackend, InProcessConnection, RemoteServer,
     RemoteServerConfig, WebSocketConnection, WebSocketTransport,
@@ -27,6 +30,9 @@ fn main() -> Result<(), LoomError> {
     let Some(options) = parse_args(env::args().skip(1))? else {
         return Ok(());
     };
+    if let Some(provider) = &options.login_provider {
+        return run_login(provider);
+    }
     if options.serve {
         return run_server(options);
     }
@@ -41,7 +47,13 @@ fn main() -> Result<(), LoomError> {
             .then(|| env::temp_dir().join(format!("loom-m3-demo-{}.json", ProjectId::new())))
     });
     let backend = match persistence_path.as_deref() {
+        Some(path) if options.model.as_str() != "deterministic/demo" => {
+            InProcessBackend::new_persistent_with_github_copilot(path)?
+        }
         Some(path) => InProcessBackend::new_persistent(path)?,
+        None if options.model.as_str() != "deterministic/demo" => {
+            InProcessBackend::new_with_github_copilot()?
+        }
         None => InProcessBackend::new(),
     };
     let connection = backend.connect();
@@ -92,6 +104,7 @@ struct CliOptions {
     m4_demo: bool,
     bind: SocketAddr,
     token: Option<String>,
+    login_provider: Option<String>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOptions>, LoomError> {
@@ -110,6 +123,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             .parse()
             .expect("valid default bind address"),
         token: None,
+        login_provider: None,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -132,6 +146,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                     })?;
             }
             "--token" => options.token = Some(required_value(&mut args, "--token")?),
+            "--login" => {
+                options.login_provider = Some(required_value(&mut args, "--login")?);
+            }
             "--persistence" => {
                 options.persistence =
                     Some(PathBuf::from(required_value(&mut args, "--persistence")?));
@@ -141,7 +158,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                     "Usage: loom [--name <name>] [--task <task>] [--model <id>] \
                      [--root <path>] [--manual-approval] [--m3-demo] \
                      [--persistence <path>] [--serve --bind <addr> --token <token>] \
-                     [--m4-demo]"
+                     [--m4-demo] [--login github-copilot]"
                 );
                 println!("Add --m2-demo to exercise workspace, terminal, and task APIs.");
                 println!(
@@ -156,6 +173,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                      WebSocket backend."
                 );
                 println!("Use --m4-demo to exercise a second reconnecting remote client.");
+                println!("Use --login github-copilot to authenticate GitHub Copilot.");
                 return Ok(None);
             }
             value if value.starts_with("--name=") => {
@@ -182,6 +200,9 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             value if value.starts_with("--token=") => {
                 options.token = Some(value["--token=".len()..].to_owned());
             }
+            value if value.starts_with("--login=") => {
+                options.login_provider = Some(value["--login=".len()..].to_owned());
+            }
             _ => {
                 return Err(LoomError::invalid_request(format!(
                     "unknown argument '{argument}'"
@@ -200,6 +221,33 @@ fn required_value(
         .ok_or_else(|| LoomError::invalid_request(format!("{flag} requires a value")))
 }
 
+fn run_login(provider: &str) -> Result<(), LoomError> {
+    if provider != "github-copilot" {
+        return Err(LoomError::invalid_request(format!(
+            "unsupported provider '{provider}'; supported providers: github-copilot"
+        )));
+    }
+    let authenticator = GitHubCopilotAuthenticator::default();
+    let device = authenticator.begin()?;
+    println!(
+        "Open {} and enter code {}.",
+        device.verification_uri, device.user_code
+    );
+    println!(
+        "Waiting for GitHub authorization (expires in {} seconds)...",
+        device.expires_in
+    );
+    let token = authenticator.poll(&device)?;
+    let credentials = FileCredentialStore::open(FileCredentialStore::default_path())?;
+    credentials.insert(CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF), token)?;
+    println!("GitHub Copilot login succeeded.");
+    println!(
+        "Credentials saved in {}.",
+        FileCredentialStore::default_path().display()
+    );
+    Ok(())
+}
+
 fn run_server(options: CliOptions) -> Result<(), LoomError> {
     let token = options
         .token
@@ -207,7 +255,13 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
         .ok_or_else(|| LoomError::invalid_request("--serve requires a non-empty --token"))?;
     let persistence_path = options.persistence;
     let backend = match persistence_path {
+        Some(path) if options.model.as_str() != "deterministic/demo" => {
+            InProcessBackend::new_persistent_with_github_copilot(path)?
+        }
         Some(path) => InProcessBackend::new_persistent(path)?,
+        None if options.model.as_str() != "deterministic/demo" => {
+            InProcessBackend::new_with_github_copilot()?
+        }
         None => InProcessBackend::new(),
     };
     let auth = Arc::new(AuthTokenStore::new());

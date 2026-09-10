@@ -890,6 +890,7 @@ impl AgentRuntime {
                             return Ok(events);
                         }
                         self.usage.add_tool_call();
+                        self.append_assistant_tool_call(call.clone());
                         events.push(AgentEvent::RunUsageUpdated {
                             run_id: self.run.id,
                             usage: self.usage.clone(),
@@ -916,6 +917,7 @@ impl AgentRuntime {
                                 content: output.clone(),
                                 name: Some(result.name.clone()),
                                 tool_call_id: Some(result.tool_call_id),
+                                tool_calls: Vec::new(),
                             });
                             self.last_failed_call = Some(call);
                             self.step_id = None;
@@ -1191,6 +1193,7 @@ impl AgentRuntime {
             content: result.output.clone(),
             name: Some(result.name.clone()),
             tool_call_id: Some(result.tool_call_id),
+            tool_calls: Vec::new(),
         });
         (events, result)
     }
@@ -1291,6 +1294,22 @@ impl AgentRuntime {
         }
         self.messages
             .push(ModelMessage::new(MessageRole::Assistant, text));
+    }
+
+    fn append_assistant_tool_call(&mut self, call: ToolCall) {
+        if let Some(last) = self.messages.last_mut()
+            && last.role == MessageRole::Assistant
+        {
+            last.tool_calls.push(call);
+            return;
+        }
+        self.messages.push(ModelMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: vec![call],
+        });
     }
 
     fn assistant_message_id(&mut self) -> u64 {
