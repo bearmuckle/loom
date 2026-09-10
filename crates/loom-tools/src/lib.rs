@@ -9,11 +9,20 @@ use loom_model::{ToolCall, ToolDefinition};
 use loom_workspace::{Workspace, WorkspaceEdit};
 use serde::Deserialize;
 
+fn is_ignored_directory(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(".git" | "target" | "node_modules" | ".venv" | "vendor")
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolKind {
     ListFiles,
     ReadFile,
     SearchText,
+    ProposePlan,
+    AskUser,
     ApplyPatch,
     RunCommand,
 }
@@ -24,6 +33,8 @@ impl ToolKind {
             "list_files" => Some(Self::ListFiles),
             "read_file" => Some(Self::ReadFile),
             "search_text" => Some(Self::SearchText),
+            "propose_plan" => Some(Self::ProposePlan),
+            "ask_user" => Some(Self::AskUser),
             "apply_patch" => Some(Self::ApplyPatch),
             "run_command" => Some(Self::RunCommand),
             _ => None,
@@ -35,6 +46,8 @@ impl ToolKind {
             Self::ListFiles => "list_files",
             Self::ReadFile => "read_file",
             Self::SearchText => "search_text",
+            Self::ProposePlan => "propose_plan",
+            Self::AskUser => "ask_user",
             Self::ApplyPatch => "apply_patch",
             Self::RunCommand => "run_command",
         }
@@ -46,7 +59,11 @@ impl ToolKind {
 
     pub const fn action_kind(self) -> ActionKind {
         match self {
-            Self::ListFiles | Self::ReadFile | Self::SearchText => ActionKind::Read,
+            Self::ListFiles
+            | Self::ReadFile
+            | Self::SearchText
+            | Self::ProposePlan
+            | Self::AskUser => ActionKind::Read,
             Self::ApplyPatch => ActionKind::Write,
             Self::RunCommand => ActionKind::Command,
         }
@@ -133,6 +150,10 @@ impl ToolExecutor {
             ToolKind::ListFiles => self.list_files(call),
             ToolKind::ReadFile => self.read_file(call),
             ToolKind::SearchText => self.search_text(call),
+            ToolKind::ProposePlan | ToolKind::AskUser => ToolResult::failure(
+                call,
+                "control tool is handled by the agent runtime and cannot be executed directly",
+            ),
             ToolKind::ApplyPatch => self.apply_patch(call),
             ToolKind::RunCommand => self.run_command(call),
         }
@@ -330,7 +351,7 @@ impl ToolExecutor {
             let entry =
                 entry.map_err(|error| format!("could not read directory entry: {error}"))?;
             let name = entry.file_name();
-            if name == ".git" {
+            if is_ignored_directory(&name) {
                 continue;
             }
             let child_relative = relative.join(&name);
@@ -364,7 +385,7 @@ impl ToolExecutor {
                 let entry =
                     entry.map_err(|error| format!("could not read directory entry: {error}"))?;
                 let name = entry.file_name();
-                if name == ".git" {
+                if is_ignored_directory(&name) {
                     continue;
                 }
                 if entry
@@ -446,6 +467,32 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "path": {"type": "string"}
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::ProposePlan.name().to_owned(),
+            description: "Propose an ordered plan before changing the workspace.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["steps"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::AskUser.name().to_owned(),
+            description: "Pause the run and ask the user for information needed to continue."
+                .to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"prompt": {"type": "string"}},
+                "required": ["prompt"],
                 "additionalProperties": false
             }),
         },

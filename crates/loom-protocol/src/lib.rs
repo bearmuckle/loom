@@ -1,12 +1,12 @@
-use loom_agent::{AgentEvent, AgentRunSnapshot};
+use loom_agent::{AgentEvent, AgentPlanStep, AgentRunSnapshot};
 use loom_context::ContextAssemblyOptions;
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, BufferId, Capability, CapabilitySet, EventSequence,
     LoomError, PaneId, ProjectId, ProtocolVersion, RequestId, RunId, SessionEvent,
-    SessionEventRecord, SessionLimits, ToolCallId, UsageSnapshot,
+    SessionEventRecord, SessionLimits, Timestamp, ToolCallId, UsageSnapshot,
 };
 use loom_language::{Diagnostic, LanguageServiceDescriptor, Location, Position, Symbol};
-use loom_model::{ModelDescriptor, ModelId, ProviderId};
+use loom_model::{ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall};
 use loom_process::{
     TaskEventRecord, TaskEvidenceLink, TaskSnapshot, TaskSpec, TerminalEventRecord,
     TerminalSnapshot,
@@ -23,6 +23,32 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectSnapshot {
+    pub id: ProjectId,
+    pub name: String,
+    pub root: Option<String>,
+    pub session_count: usize,
+    pub updated_at: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentRunSnapshotProjection {
+    pub run: AgentRunSnapshot,
+    pub plan: Vec<AgentPlanStep>,
+    pub messages: Vec<ModelMessage>,
+    pub pending_approval: Option<ToolCall>,
+    pub pending_input: Option<String>,
+    pub usage: UsageSnapshot,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentSessionSnapshotProjection {
+    pub session: AgentSessionSnapshot,
+    pub active_run: Option<AgentRunSnapshotProjection>,
+    pub latest_sequence: EventSequence,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {
@@ -65,11 +91,26 @@ pub enum ClientRequest {
         capabilities: CapabilitySet,
     },
     DiscoverCapabilities,
+    ListProjects,
+    ListAgentSessions {
+        project_id: Option<ProjectId>,
+        include_archived: bool,
+    },
     CreateAgentSession {
         project_id: ProjectId,
         name: String,
     },
     GetAgentSession {
+        session_id: AgentSessionId,
+    },
+    GetAgentSessionSnapshot {
+        session_id: AgentSessionId,
+    },
+    RenameAgentSession {
+        session_id: AgentSessionId,
+        name: String,
+    },
+    ArchiveAgentSession {
         session_id: AgentSessionId,
     },
     GetSessionEvents {
@@ -97,6 +138,9 @@ pub enum ClientRequest {
     GetAgentRun {
         run_id: RunId,
     },
+    GetAgentRunSnapshot {
+        run_id: RunId,
+    },
     GetRunCheckpoint {
         run_id: RunId,
     },
@@ -108,6 +152,10 @@ pub enum ClientRequest {
         run_id: RunId,
         tool_call_id: ToolCallId,
         reason: Option<String>,
+    },
+    SendAgentMessage {
+        run_id: RunId,
+        message: String,
     },
     InterruptAgentRun {
         run_id: RunId,
@@ -154,6 +202,10 @@ pub enum ClientRequest {
         project_id: ProjectId,
     },
     GetWorkspaceEvents {
+        project_id: ProjectId,
+        after_sequence: Option<EventSequence>,
+    },
+    GetWorkspaceChanges {
         project_id: ProjectId,
         after_sequence: Option<EventSequence>,
     },
@@ -214,6 +266,9 @@ pub enum ClientRequest {
     StartTask {
         project_id: ProjectId,
         spec: TaskSpec,
+    },
+    ListTasks {
+        project_id: ProjectId,
     },
     GetTask {
         project_id: ProjectId,
@@ -379,12 +434,22 @@ impl ClientRequest {
     pub const fn required_capability(&self) -> Option<Capability> {
         match self {
             Self::Negotiate { .. } | Self::DiscoverCapabilities => None,
+            Self::ListProjects | Self::ListAgentSessions { .. } => {
+                Some(Capability::ReadAgentSession)
+            }
             Self::CreateAgentSession { .. } => Some(Capability::CreateAgentSession),
-            Self::GetAgentSession { .. } => Some(Capability::ReadAgentSession),
+            Self::GetAgentSession { .. } | Self::GetAgentSessionSnapshot { .. } => {
+                Some(Capability::ReadAgentSession)
+            }
+            Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
+                Some(Capability::ControlAgentSession)
+            }
             Self::GetSessionEvents { .. } => Some(Capability::SubscribeSessionEvents),
             Self::StartAgentRun { .. } => Some(Capability::StartAgentRun),
             Self::StartAgentRunWithOptions { .. } => Some(Capability::StartAgentRun),
-            Self::GetAgentRun { .. } => Some(Capability::ReadAgentRun),
+            Self::GetAgentRun { .. } | Self::GetAgentRunSnapshot { .. } => {
+                Some(Capability::ReadAgentRun)
+            }
             Self::GetRunCheckpoint { .. } => Some(Capability::ReadAgentRun),
             Self::ApproveAgentAction { .. } | Self::RejectAgentAction { .. } => {
                 Some(Capability::ApproveAgentAction)
@@ -392,6 +457,7 @@ impl ClientRequest {
             Self::InterruptAgentRun { .. } | Self::RetryAgentStep { .. } => {
                 Some(Capability::ControlAgentRun)
             }
+            Self::SendAgentMessage { .. } => Some(Capability::ControlAgentRun),
             Self::PauseAgentRun { .. } => Some(Capability::PauseAgentRun),
             Self::ResumeAgentRun { .. } => Some(Capability::ResumeAgentRun),
             Self::RetryAgentFromCheckpoint { .. } => Some(Capability::RetryFromCheckpoint),
@@ -408,6 +474,7 @@ impl ClientRequest {
                 Some(Capability::ReadWorkspace)
             }
             Self::GetWorkspaceEvents { .. } => Some(Capability::SubscribeWorkspaceEvents),
+            Self::GetWorkspaceChanges { .. } => Some(Capability::ReadWorkspace),
             Self::ApplyWorkspaceEdit { .. } => Some(Capability::WriteWorkspace),
             Self::TakeWorkspaceControl { .. } => Some(Capability::TakeoverWorkspace),
             Self::CreateCheckpoint { .. }
@@ -420,7 +487,9 @@ impl ClientRequest {
             | Self::CancelTerminal { .. } => Some(Capability::ControlTerminal),
             Self::GetTerminalEvents { .. } => Some(Capability::ControlTerminal),
             Self::StartTask { .. } => Some(Capability::StartTask),
-            Self::GetTask { .. } | Self::GetTaskEvents { .. } => Some(Capability::ReadTask),
+            Self::ListTasks { .. } | Self::GetTask { .. } | Self::GetTaskEvents { .. } => {
+                Some(Capability::ReadTask)
+            }
             Self::CancelTask { .. } => Some(Capability::ControlTask),
             Self::OpenEditorBuffer { .. }
             | Self::GetEditorBuffer { .. }
@@ -467,10 +536,13 @@ impl ClientRequest {
         matches!(
             self,
             Self::CreateAgentSession { .. }
+                | Self::RenameAgentSession { .. }
+                | Self::ArchiveAgentSession { .. }
                 | Self::StartAgentRun { .. }
                 | Self::StartAgentRunWithOptions { .. }
                 | Self::ApproveAgentAction { .. }
                 | Self::RejectAgentAction { .. }
+                | Self::SendAgentMessage { .. }
                 | Self::InterruptAgentRun { .. }
                 | Self::RetryAgentStep { .. }
                 | Self::PauseAgentRun { .. }
@@ -542,11 +614,21 @@ impl ResponseEnvelope {
 pub enum ServerResponse {
     Negotiated(NegotiationResult),
     Capabilities(NegotiationResult),
+    Projects {
+        projects: Vec<ProjectSnapshot>,
+    },
+    AgentSessions {
+        sessions: Vec<AgentSessionSnapshot>,
+    },
     AgentSessionCreated(AgentSessionSnapshot),
     AgentSessionForked(AgentSessionSnapshot),
     AgentSession(AgentSessionSnapshot),
+    AgentSessionSnapshot(AgentSessionSnapshotProjection),
+    AgentSessionRenamed(AgentSessionSnapshot),
+    AgentSessionArchived(AgentSessionSnapshot),
     AgentRunStarted(AgentRunSnapshot),
     AgentRun(AgentRunSnapshot),
+    AgentRunSnapshot(AgentRunSnapshotProjection),
     RunCheckpoint(loom_workspace::Checkpoint),
     SessionEvents {
         events: Vec<ServerEventEnvelope>,
@@ -578,6 +660,10 @@ pub enum ServerResponse {
     WorkspaceEvents {
         events: Vec<WorkspaceChange>,
     },
+    WorkspaceChanges {
+        changes: Vec<WorkspaceChange>,
+        truncated: bool,
+    },
     WorkspaceFile(WorkspaceFile),
     WorkspaceEditApplied(WorkspaceEditResult),
     WorkspaceControl(WorkspaceControl),
@@ -591,6 +677,9 @@ pub enum ServerResponse {
         events: Vec<TerminalEventRecord>,
     },
     TaskStarted(TaskSnapshot),
+    Tasks {
+        tasks: Vec<TaskSnapshot>,
+    },
     Task(TaskSnapshot),
     TaskEvents {
         events: Vec<TaskEventRecord>,
@@ -683,6 +772,13 @@ pub enum ServerEvent {
         source_session_id: AgentSessionId,
         snapshot: AgentSessionSnapshot,
     },
+    AgentSessionRenamed {
+        session_id: AgentSessionId,
+        name: String,
+    },
+    AgentSessionArchived {
+        session_id: AgentSessionId,
+    },
     Agent {
         event: AgentEvent,
     },
@@ -727,6 +823,12 @@ impl ServerEventEnvelope {
                 source_session_id,
                 snapshot,
             },
+            SessionEvent::AgentSessionRenamed { session_id, name } => {
+                ServerEvent::AgentSessionRenamed { session_id, name }
+            }
+            SessionEvent::AgentSessionArchived { session_id } => {
+                ServerEvent::AgentSessionArchived { session_id }
+            }
         };
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,

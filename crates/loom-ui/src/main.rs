@@ -1,100 +1,101 @@
 use std::{
-    fs,
+    collections::BTreeSet,
+    env, fs,
     ops::Range,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use gpui::{
-    App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Element, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
-    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, Render, ShapedLine, SharedString, Style, TextRun, TitlebarOptions,
-    UTF16Selection, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowOptions, actions, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    App, Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Decorations,
+    Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
+    GlobalElementId, HitboxBehavior, KeyBinding, LayoutId, MouseButton, MouseDownEvent, PaintQuad,
+    Pixels, Point, Render, ResizeEdge, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowDecorations,
+    WindowOptions, actions, canvas, div, fill, point, prelude::*, px, relative, rgb, rgba, size,
+    transparent_black,
 };
 use loom_agent::{AgentEvent, AgentRunSnapshot, AgentRunState};
 use loom_core::{
-    AgentSessionId, AgentSessionState, Capability, CapabilitySet, ErrorCode, EventSequence,
-    LoomError, ProjectId, RunId,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet, ErrorCode,
+    EventSequence, LoomError, ProjectId, RunId,
 };
-use loom_language::{Diagnostic, LanguageServiceDescriptor, Symbol};
-use loom_model::{ModelId, ToolCall};
-use loom_process::{TaskKind, TaskSnapshot, TaskSpec, TaskStatus};
+use loom_model::{MessageRole, ModelId, ToolCall};
+use loom_process::{TaskSnapshot, TaskStatus};
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
+    AgentRunSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest, ProjectSnapshot,
+    RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse,
 };
-use loom_server::{InProcessBackend, InProcessConnection};
-use loom_vcs::{GitRepositoryStatus, GitService};
-use loom_workspace::{
-    BufferEdit, BufferId, BufferSnapshot, EditorLayoutSnapshot, FileTreeEntry, SearchMatch,
-    SearchQuery, TextRange,
-};
+use loom_server::{InProcessBackend, InProcessConnection, WebSocketConnection, WebSocketTransport};
+use loom_vcs::{GitDiff, GitRepositoryStatus, GitService};
+use loom_workspace::{WorkspaceChange, WorkspaceFile};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+const MAX_TIMELINE_OUTPUT: usize = 32 * 1024;
+const MAX_REVIEW_CHANGES: usize = 80;
+const MAX_REVIEW_DIFF: usize = 48 * 1024;
 
 actions!(
-    loom_editor,
+    loom_composer,
     [
-        Backspace,
-        Delete,
-        Left,
-        Right,
-        Up,
-        Down,
-        SelectLeft,
-        SelectRight,
-        SelectUp,
-        SelectDown,
-        SelectAll,
-        Home,
-        End,
-        SelectHome,
-        SelectEnd,
-        Paste,
-        Copy,
-        Cut,
-        Save,
-        Undo,
-        Redo
+        Backspace, Delete, Left, Right, SelectAll, Home, End, Paste, Copy, Submit
     ]
 );
 
-struct LoomView {
-    connection: InProcessConnection,
-    project_id: ProjectId,
-    session_id: AgentSessionId,
-    run_id: RunId,
-    workspace_root: PathBuf,
-    model: ModelId,
-    task: String,
-    after_sequence: Option<EventSequence>,
-    session_state: AgentSessionState,
-    run_state: AgentRunState,
-    pending_approval: Option<ToolCall>,
-    timeline: Vec<TimelineItem>,
-    summary: Option<String>,
-    workspace_entries: usize,
-    provider_count: usize,
-    file_tree: Vec<FileTreeEntry>,
-    open_buffers: Vec<BufferSnapshot>,
-    active_buffer: Option<BufferId>,
-    editor_layout: Option<EditorLayoutSnapshot>,
-    diagnostics: Vec<Diagnostic>,
-    symbols: Vec<Symbol>,
-    search_matches: Vec<SearchMatch>,
-    language_services: Vec<LanguageServiceDescriptor>,
-    vcs_status: Option<GitRepositoryStatus>,
-    vcs_error: Option<String>,
-    task_results: Vec<TaskSnapshot>,
-    editor_input: TextBufferState,
-    editor_focus_handle: FocusHandle,
-    editor_layout_cache: Option<EditorLayoutCache>,
-    backend_status: BackendStatus,
-    demo_workspace: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReviewPanel {
+    Changes,
+    Diff,
+    Evidence,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+enum BackendStatus {
+    Connected,
+    Error(LoomError),
+}
+
+#[derive(Clone, Debug)]
+struct ReviewState {
+    open: bool,
+    panel: ReviewPanel,
+    changes: Vec<WorkspaceChange>,
+    diff: Option<GitDiff>,
+    diff_path: Option<String>,
+    vcs: Option<GitRepositoryStatus>,
+    evidence: Vec<String>,
+    selected_file: Option<WorkspaceFile>,
+}
+
+#[derive(Clone, Debug)]
+struct RenameDialogState {
+    session: AgentSessionSnapshot,
+    input: TextBufferState,
+}
+
+impl Default for ReviewState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            panel: ReviewPanel::Changes,
+            changes: Vec::new(),
+            diff: None,
+            diff_path: None,
+            vcs: None,
+            evidence: Vec::new(),
+            selected_file: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 enum TimelineItem {
-    Plan(Vec<String>),
+    User(String),
     Assistant(String),
+    Plan(Vec<String>),
+    StepStarted { index: u32 },
+    StepCompleted { index: u32 },
     ToolRequested { name: String, arguments: String },
     Approval { name: String, active: bool },
     ToolStarted(String),
@@ -102,13 +103,8 @@ enum TimelineItem {
     ToolCompleted { name: String, success: bool },
     Status(String),
     Error { operation: String, error: LoomError },
+    NeedsInput(String),
     Summary { text: String, evidence: Vec<String> },
-}
-
-#[derive(Clone, Debug)]
-enum BackendStatus {
-    Connected,
-    Error(LoomError),
 }
 
 #[derive(Clone, Debug)]
@@ -119,36 +115,13 @@ struct TextBufferState {
     marked_range: Option<Range<usize>>,
 }
 
-#[derive(Clone, Debug)]
-struct CachedEditorLine {
-    range: Range<usize>,
-    layout: ShapedLine,
-}
-
-#[derive(Clone, Debug)]
-struct EditorLayoutCache {
-    bounds: Bounds<Pixels>,
-    line_height: Pixels,
-    lines: Vec<CachedEditorLine>,
-}
-
-struct TextEditorElement {
-    view: Entity<LoomView>,
-}
-
-struct TextEditorPrepaint {
-    bounds: Bounds<Pixels>,
-    lines: Vec<(Range<usize>, ShapedLine)>,
-    selections: Vec<PaintQuad>,
-    cursor: Option<PaintQuad>,
-}
-
 impl TextBufferState {
     fn new(text: impl Into<String>) -> Self {
         let text = text.into();
+        let end = text.len();
         Self {
-            selected_range: text.len()..text.len(),
             text,
+            selected_range: end..end,
             selection_reversed: false,
             marked_range: None,
         }
@@ -167,9 +140,8 @@ impl TextBufferState {
     }
 
     fn offset_to_utf16(&self, offset: usize) -> usize {
-        let offset = offset.min(self.text.len());
         self.text
-            .get(..offset)
+            .get(..offset.min(self.text.len()))
             .unwrap_or_default()
             .chars()
             .map(char::len_utf16)
@@ -235,20 +207,6 @@ impl TextBufferState {
         (line, offset.saturating_sub(ranges[line].start))
     }
 
-    fn offset_for_line_and_column(&self, line: usize, column: usize) -> usize {
-        let ranges = self.line_ranges();
-        let range = &ranges[line.min(ranges.len().saturating_sub(1))];
-        let end = range.end;
-        let mut offset = range.start;
-        for (index, character) in self.text[range.clone()].char_indices() {
-            if index >= column {
-                break;
-            }
-            offset = range.start + index + character.len_utf8();
-        }
-        offset.min(end)
-    }
-
     fn move_to(&mut self, offset: usize, extend: bool) {
         let offset = offset.min(self.text.len());
         if extend {
@@ -273,38 +231,6 @@ impl TextBufferState {
         self.selection_reversed = offset < anchor;
     }
 
-    fn move_vertical(&mut self, direction: i32, extend: bool) {
-        let (line, column) = self.line_and_column(self.cursor_offset());
-        let target = if direction.is_negative() {
-            line.saturating_sub(direction.unsigned_abs() as usize)
-        } else {
-            line.saturating_add(direction as usize)
-        };
-        let target = target.min(self.line_ranges().len().saturating_sub(1));
-        self.move_to(self.offset_for_line_and_column(target, column), extend);
-    }
-
-    fn move_home(&mut self, extend: bool) {
-        let (line, _) = self.line_and_column(self.cursor_offset());
-        let offset = self.line_ranges()[line].start;
-        self.move_to(offset, extend);
-    }
-
-    fn move_end(&mut self, extend: bool) {
-        let (line, _) = self.line_and_column(self.cursor_offset());
-        let offset = self.line_ranges()[line].end;
-        self.move_to(offset, extend);
-    }
-
-    fn replace_range(&mut self, range: Range<usize>, replacement: &str) {
-        let replacement = replacement.replace("\r\n", "\n").replace('\r', "\n");
-        self.text.replace_range(range.clone(), &replacement);
-        let cursor = range.start + replacement.len();
-        self.selected_range = cursor..cursor;
-        self.selection_reversed = false;
-        self.marked_range = None;
-    }
-
     fn replace_utf16(
         &mut self,
         range_utf16: Option<Range<usize>>,
@@ -316,9 +242,12 @@ impl TextBufferState {
             .or_else(|| self.marked_range.clone())
             .unwrap_or_else(|| self.selected_range.clone());
         let replacement = replacement.replace("\r\n", "\n").replace('\r', "\n");
-        let replacement_range = range.start..range.start + replacement.len();
-        self.replace_range(range, &replacement);
-        replacement_range
+        self.text.replace_range(range.clone(), &replacement);
+        let cursor = range.start + replacement.len();
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        range.start..cursor
     }
 
     fn select_all(&mut self) {
@@ -331,19 +260,195 @@ impl TextBufferState {
     }
 }
 
+struct TextInputElement {
+    view: Entity<LoomView>,
+    field: InputField,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputField {
+    Composer,
+    Rename,
+}
+
+struct TextInputPrepaint {
+    bounds: Bounds<Pixels>,
+    lines: Vec<(Range<usize>, ShapedLine)>,
+    selection: Option<PaintQuad>,
+    cursor: Option<PaintQuad>,
+}
+
+struct LoomTooltip {
+    text: SharedString,
+}
+
+impl Render for LoomTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(rgb(0x20242c))
+            .border_1()
+            .border_color(rgb(0x3b4555))
+            .text_sm()
+            .text_color(rgb(0xe5e7eb))
+            .child(self.text.clone())
+    }
+}
+
+enum ClientConnection {
+    InProcess(InProcessConnection),
+    Remote {
+        runtime: Arc<tokio::runtime::Runtime>,
+        url: String,
+        token: String,
+        connection: Mutex<WebSocketConnection>,
+    },
+}
+
+impl ClientConnection {
+    fn remote(url: String, token: String) -> Result<Self, LoomError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!("could not create remote client runtime: {error}"),
+                    false,
+                )
+            })?;
+        let connection = runtime.block_on(WebSocketTransport::new(&url, &token).connect())?;
+        Ok(Self::Remote {
+            runtime: Arc::new(runtime),
+            url,
+            token,
+            connection: Mutex::new(connection),
+        })
+    }
+
+    fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        match self {
+            Self::InProcess(connection) => connection.request(request),
+            Self::Remote {
+                runtime,
+                connection,
+                ..
+            } => {
+                let request_id = request.request_id;
+                let result = connection
+                    .lock()
+                    .map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "remote connection lock was poisoned",
+                            true,
+                        )
+                    })
+                    .and_then(|mut connection| runtime.block_on(connection.request(request)));
+                match result {
+                    Ok(response) => response,
+                    Err(error) => ResponseEnvelope::failure(request_id, error),
+                }
+            }
+        }
+    }
+
+    fn reconnect(&mut self) -> Result<(), LoomError> {
+        let Self::Remote {
+            runtime,
+            url,
+            token,
+            connection,
+        } = self
+        else {
+            return Ok(());
+        };
+        let replacement =
+            runtime.block_on(WebSocketTransport::new(url.as_str(), token.as_str()).connect())?;
+        let mut current = connection.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "remote connection lock was poisoned",
+                true,
+            )
+        })?;
+        *current = replacement;
+        Ok(())
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::InProcess(_) => "local",
+            Self::Remote { .. } => "remote",
+        }
+    }
+}
+
+struct LoomView {
+    connection: ClientConnection,
+    project_id: ProjectId,
+    project: Option<ProjectSnapshot>,
+    workspace_root: PathBuf,
+    projects: Vec<ProjectSnapshot>,
+    sessions: Vec<AgentSessionSnapshot>,
+    active_session: AgentSessionSnapshot,
+    active_run: Option<AgentRunSnapshot>,
+    active_run_id: Option<RunId>,
+    model: ModelId,
+    models: Vec<ModelId>,
+    model_picker_open: bool,
+    after_sequence: Option<EventSequence>,
+    timeline: Vec<TimelineItem>,
+    pending_approval: Option<ToolCall>,
+    pending_input: Option<String>,
+    composer: TextBufferState,
+    composer_focus_handle: FocusHandle,
+    input_field: InputField,
+    session_state: AgentSessionState,
+    run_state: Option<AgentRunState>,
+    summary: Option<String>,
+    review: ReviewState,
+    tasks: Vec<TaskSnapshot>,
+    session_menu: Option<AgentSessionId>,
+    rename_dialog: Option<RenameDialogState>,
+    rename_focus_handle: FocusHandle,
+    backend_status: BackendStatus,
+    demo_workspace: bool,
+}
+
 impl LoomView {
-    fn editor_utf8_index_for_point(&self, point: Point<Pixels>) -> Option<usize> {
-        let cache = self.editor_layout_cache.as_ref()?;
-        let local = cache.bounds.localize(&point)?;
-        let line_index = (local.y / cache.line_height).floor().max(0.) as usize;
-        let line = cache.lines.get(line_index)?;
-        Some(
-            line.range.start
-                + line
-                    .layout
-                    .closest_index_for_x(local.x)
-                    .min(line.range.len()),
-        )
+    fn input_state(&self, field: InputField) -> Option<&TextBufferState> {
+        match field {
+            InputField::Composer => Some(&self.composer),
+            InputField::Rename => self.rename_dialog.as_ref().map(|dialog| &dialog.input),
+        }
+    }
+
+    fn input_state_mut(&mut self, field: InputField) -> Option<&mut TextBufferState> {
+        match field {
+            InputField::Composer => Some(&mut self.composer),
+            InputField::Rename => self.rename_dialog.as_mut().map(|dialog| &mut dialog.input),
+        }
+    }
+
+    fn input_focus_handle(&self, field: InputField) -> FocusHandle {
+        match field {
+            InputField::Composer => self.composer_focus_handle.clone(),
+            InputField::Rename => self.rename_focus_handle.clone(),
+        }
+    }
+
+    fn edit_input(&self) -> &TextBufferState {
+        self.input_state(self.input_field)
+            .expect("focused input field is present")
+    }
+
+    fn edit_input_mut(&mut self) -> &mut TextBufferState {
+        let field = self.input_field;
+        self.input_state_mut(field)
+            .expect("focused input field is present")
     }
 }
 
@@ -355,9 +460,10 @@ impl EntityInputHandler for LoomView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let range = self.editor_input.range_from_utf16(&range_utf16);
-        actual_range.replace(self.editor_input.range_to_utf16(&range));
-        self.editor_input.text.get(range).map(str::to_owned)
+        let input = self.input_state(self.input_field)?;
+        let range = input.range_from_utf16(&range_utf16);
+        actual_range.replace(input.range_to_utf16(&range));
+        input.text.get(range).map(str::to_owned)
     }
 
     fn selected_text_range(
@@ -366,11 +472,10 @@ impl EntityInputHandler for LoomView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        let input = self.input_state(self.input_field)?;
         Some(UTF16Selection {
-            range: self
-                .editor_input
-                .range_to_utf16(&self.editor_input.selected_range),
-            reversed: self.editor_input.selection_reversed,
+            range: input.range_to_utf16(&input.selected_range),
+            reversed: input.selection_reversed,
         })
     }
 
@@ -379,14 +484,20 @@ impl EntityInputHandler for LoomView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        self.editor_input
+        self.input_state(self.input_field)?
             .marked_range
             .as_ref()
-            .map(|range| self.editor_input.range_to_utf16(range))
+            .map(|range| {
+                self.input_state(self.input_field)
+                    .expect("composer input exists")
+                    .range_to_utf16(range)
+            })
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        self.editor_input.marked_range = None;
+        if let Some(input) = self.input_state_mut(self.input_field) {
+            input.marked_range = None;
+        }
     }
 
     fn replace_text_in_range(
@@ -396,7 +507,10 @@ impl EntityInputHandler for LoomView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.replace_input_text(range_utf16, new_text, None, cx);
+        if let Some(input) = self.input_state_mut(self.input_field) {
+            input.replace_utf16(range_utf16, new_text);
+        }
+        cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
@@ -407,56 +521,46 @@ impl EntityInputHandler for LoomView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.replace_input_text(range_utf16, new_text, new_selected_range_utf16, cx);
+        let Some(input) = self.input_state_mut(self.input_field) else {
+            return;
+        };
+        let replacement = input.replace_utf16(range_utf16, new_text);
+        if let Some(selected) = new_selected_range_utf16 {
+            let selected = input.range_from_utf16(&selected);
+            input.selected_range =
+                replacement.start + selected.start..replacement.start + selected.end;
+            input.marked_range = Some(replacement);
+        }
+        cx.notify();
     }
 
     fn bounds_for_range(
         &mut self,
-        range_utf16: Range<usize>,
+        _range_utf16: Range<usize>,
         _element_bounds: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let cache = self.editor_layout_cache.as_ref()?;
-        let range = self.editor_input.range_from_utf16(&range_utf16);
-        let line_index = cache
-            .lines
-            .iter()
-            .position(|line| range.start <= line.range.end && range.end >= line.range.start)?;
-        let line = &cache.lines[line_index];
-        let start = range.start.clamp(line.range.start, line.range.end);
-        let end = range.end.clamp(line.range.start, line.range.end);
-        let top = cache.bounds.top() + cache.line_height * line_index;
-        Some(Bounds::from_corners(
-            point(
-                cache.bounds.left() + line.layout.x_for_index(start - line.range.start),
-                top,
-            ),
-            point(
-                cache.bounds.left() + line.layout.x_for_index(end - line.range.start),
-                top + cache.line_height,
-            ),
-        ))
+        None
     }
 
     fn character_index_for_point(
         &mut self,
-        point: Point<Pixels>,
+        _point: Point<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        self.editor_utf8_index_for_point(point)
-            .map(|offset| self.editor_input.offset_to_utf16(offset))
+        None
     }
 }
 
 impl Focusable for LoomView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.editor_focus_handle.clone()
+        self.composer_focus_handle.clone()
     }
 }
 
-impl IntoElement for TextEditorElement {
+impl IntoElement for TextInputElement {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -464,9 +568,9 @@ impl IntoElement for TextEditorElement {
     }
 }
 
-impl Element for TextEditorElement {
+impl Element for TextInputElement {
     type RequestLayoutState = ();
-    type PrepaintState = TextEditorPrepaint;
+    type PrepaintState = TextInputPrepaint;
 
     fn id(&self) -> Option<ElementId> {
         None
@@ -483,7 +587,11 @@ impl Element for TextEditorElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let line_count = self.view.read(cx).editor_input.line_count();
+        let line_count = self
+            .view
+            .read(cx)
+            .input_state(self.field)
+            .map_or(1, TextBufferState::line_count);
         let mut style = Style::default();
         style.size.width = relative(1.).into();
         style.size.height = (window.line_height() * line_count).into();
@@ -500,34 +608,25 @@ impl Element for TextEditorElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let input = self.view.read(cx);
-        let text = input.editor_input.text.clone();
-        let ranges = input.editor_input.line_ranges();
+        let Some(input) = input.input_state(self.field) else {
+            return TextInputPrepaint {
+                bounds,
+                lines: Vec::new(),
+                selection: None,
+                cursor: None,
+            };
+        };
+        let text = input.text.clone();
+        let ranges = input.line_ranges();
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
         let mut lines = Vec::with_capacity(ranges.len());
-        let markers = input
-            .active_buffer
-            .and_then(|buffer_id| {
-                input
-                    .open_buffers
-                    .iter()
-                    .find(|buffer| buffer.id == buffer_id)
-            })
-            .map(|buffer| buffer.agent_markers.clone())
-            .unwrap_or_default();
-        for (line_index, range) in ranges.into_iter().enumerate() {
+        for range in ranges {
             let line_text = text[range.clone()].to_owned();
-            let line_number = line_index as u32 + 1;
             let run = TextRun {
                 len: line_text.len(),
                 font: style.font(),
-                color: if markers.iter().any(|marker| {
-                    marker.start_line <= line_number && marker.end_line >= line_number
-                }) {
-                    rgb(0xfbbf24).into()
-                } else {
-                    style.color
-                },
+                color: style.color,
                 background_color: None,
                 underline: None,
                 strikethrough: None,
@@ -542,57 +641,56 @@ impl Element for TextEditorElement {
         }
 
         let line_height = window.line_height();
-        let mut selections = Vec::new();
-        if !input.editor_input.selected_range.is_empty() {
-            for (line_index, (range, line)) in lines.iter().enumerate() {
-                let start = input.editor_input.selected_range.start.max(range.start);
-                let end = input.editor_input.selected_range.end.min(range.end);
-                if start >= end {
-                    continue;
-                }
-                let top = bounds.top() + line_height * line_index;
-                selections.push(fill(
-                    Bounds::from_corners(
-                        point(bounds.left() + line.x_for_index(start - range.start), top),
-                        point(
-                            bounds.left() + line.x_for_index(end - range.start),
-                            top + line_height,
-                        ),
-                    ),
-                    rgba(0x335b8def),
-                ));
-            }
-        }
-
-        let cursor = if input.editor_input.selected_range.is_empty() {
-            let cursor_offset = input.editor_input.cursor_offset();
+        let selection = if input.selected_range.is_empty() {
+            None
+        } else {
+            let range = &input.selected_range;
             lines
                 .iter()
                 .enumerate()
-                .find_map(|(line_index, (range, line))| {
-                    if cursor_offset < range.start || cursor_offset > range.end {
-                        return None;
-                    }
-                    let top = bounds.top() + line_height * line_index;
-                    Some(fill(
+                .find_map(|(index, (line_range, line))| {
+                    let start = range.start.max(line_range.start);
+                    let end = range.end.min(line_range.end);
+                    (start < end).then(|| {
+                        fill(
+                            Bounds::from_corners(
+                                point(
+                                    bounds.left() + line.x_for_index(start - line_range.start),
+                                    bounds.top() + line_height * index,
+                                ),
+                                point(
+                                    bounds.left() + line.x_for_index(end - line_range.start),
+                                    bounds.top() + line_height * (index + 1),
+                                ),
+                            ),
+                            rgba(0x335b8def),
+                        )
+                    })
+                })
+        };
+        let cursor = if input.selected_range.is_empty() {
+            let offset = input.cursor_offset();
+            lines.iter().enumerate().find_map(|(index, (range, line))| {
+                (offset >= range.start && offset <= range.end).then(|| {
+                    fill(
                         Bounds::new(
                             point(
-                                bounds.left() + line.x_for_index(cursor_offset - range.start),
-                                top,
+                                bounds.left() + line.x_for_index(offset - range.start),
+                                bounds.top() + line_height * index,
                             ),
                             size(px(2.), line_height),
                         ),
                         rgb(0x60a5fa),
-                    ))
+                    )
                 })
+            })
         } else {
             None
         };
-
-        TextEditorPrepaint {
+        TextInputPrepaint {
             bounds,
             lines,
-            selections,
+            selection,
             cursor,
         }
     }
@@ -607,21 +705,24 @@ impl Element for TextEditorElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let focus_handle = self.view.read(cx).editor_focus_handle.clone();
+        let focus_handle = self.view.read(cx).input_focus_handle(self.field);
+        self.view.update(cx, |view, _| {
+            view.input_field = self.field;
+        });
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(prepaint.bounds, self.view.clone()),
             cx,
         );
-        for selection in prepaint.selections.drain(..) {
+        if let Some(selection) = prepaint.selection.take() {
             window.paint_quad(selection);
         }
         let line_height = window.line_height();
-        for (line_index, (_, line)) in prepaint.lines.iter().enumerate() {
+        for (index, (_, line)) in prepaint.lines.iter().enumerate() {
             let _ = line.paint(
                 point(
                     prepaint.bounds.left(),
-                    prepaint.bounds.top() + line_height * line_index,
+                    prepaint.bounds.top() + line_height * index,
                 ),
                 line_height,
                 window,
@@ -633,195 +734,545 @@ impl Element for TextEditorElement {
         {
             window.paint_quad(cursor);
         }
-        let layout = EditorLayoutCache {
-            bounds: prepaint.bounds,
-            line_height,
-            lines: prepaint
-                .lines
-                .iter()
-                .map(|(range, layout)| CachedEditorLine {
-                    range: range.clone(),
-                    layout: layout.clone(),
-                })
-                .collect(),
-        };
-        self.view.update(cx, |view, _| {
-            view.editor_layout_cache = Some(layout);
-        });
     }
 }
 
 impl LoomView {
-    fn try_new(options: &UiOptions, editor_focus_handle: FocusHandle) -> Result<Self, LoomError> {
-        let (workspace_root, demo_workspace) = prepare_workspace(options)?;
-        let backend = InProcessBackend::new();
-        let connection = backend.connect();
-        negotiate(&connection)?;
-        let provider_count = provider_count(&connection)?;
-        let model = ModelId::new("deterministic/demo");
-        let (session, run) = start_run(&connection, &workspace_root, &model, options.task.clone())?;
-        let workspace_entries = workspace_snapshot(&connection, session.project_id)?
-            .entries
-            .len();
+    fn try_new(
+        options: &UiOptions,
+        focus_handle: FocusHandle,
+        rename_focus_handle: FocusHandle,
+    ) -> Result<Self, LoomError> {
+        let (connection, workspace_root, project_id, demo_workspace) =
+            if let Some(remote_url) = &options.remote {
+                let token = options.token.as_deref().ok_or_else(|| {
+                    LoomError::invalid_request("remote connections require LOOM_TOKEN to be set")
+                })?;
+                let connection = ClientConnection::remote(remote_url.clone(), token.to_owned())?;
+                negotiate(&connection)?;
+                let projects = list_projects(&connection)?;
+                let project = select_remote_project(&projects, options.workspace.as_deref())?;
+                let workspace_root = project.root.clone().map(PathBuf::from).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        "selected remote project has no configured workspace root",
+                        false,
+                    )
+                })?;
+                (connection, workspace_root, project.id, false)
+            } else {
+                let (workspace_root, demo_workspace) = prepare_workspace(options)?;
+                let project_id = if demo_workspace {
+                    ProjectId::new()
+                } else {
+                    stable_project_id(&workspace_root)
+                };
+                let backend = if demo_workspace {
+                    InProcessBackend::new()
+                } else if let Some(endpoint) = &options.endpoint {
+                    InProcessBackend::with_openai_compatible_persistent(
+                        endpoint,
+                        options.api_key.as_deref().unwrap_or_default(),
+                        options.model.clone(),
+                        backend_persistence_path(&workspace_root)?,
+                    )?
+                } else {
+                    InProcessBackend::new_persistent(backend_persistence_path(&workspace_root)?)?
+                };
+                (
+                    ClientConnection::InProcess(backend.connect()),
+                    workspace_root,
+                    project_id,
+                    demo_workspace,
+                )
+            };
+        if options.remote.is_none() {
+            negotiate(&connection)?;
+            open_workspace(&connection, project_id, &workspace_root)?;
+        }
+        let sessions = list_sessions(&connection, project_id)?;
+        let session = sessions.into_iter().next().map_or_else(
+            || create_session(&connection, project_id, "New session"),
+            Ok,
+        )?;
+        let models = list_models(&connection)?;
+        let model = options.model.clone();
+        let run = if demo_workspace {
+            Some(start_run(
+                &connection,
+                &session,
+                &workspace_root,
+                &model,
+                &options.task,
+            )?)
+        } else {
+            None
+        };
         let mut view = Self {
             connection,
-            project_id: session.project_id,
-            session_id: session.id,
-            run_id: run.id,
+            project_id,
+            project: None,
             workspace_root,
+            projects: Vec::new(),
+            sessions: vec![session.clone()],
+            active_session: session.clone(),
+            active_run: run.clone(),
+            active_run_id: run.as_ref().map(|run| run.id),
             model,
-            task: run.task.clone(),
+            models,
+            model_picker_open: false,
             after_sequence: None,
-            session_state: session.state,
-            run_state: run.state,
-            pending_approval: None,
             timeline: Vec::new(),
-            summary: None,
-            workspace_entries,
-            provider_count,
-            file_tree: Vec::new(),
-            open_buffers: Vec::new(),
-            active_buffer: None,
-            editor_layout: None,
-            diagnostics: Vec::new(),
-            symbols: Vec::new(),
-            search_matches: Vec::new(),
-            language_services: Vec::new(),
-            vcs_status: None,
-            vcs_error: None,
-            task_results: Vec::new(),
-            editor_input: TextBufferState::new(""),
-            editor_focus_handle,
-            editor_layout_cache: None,
+            pending_approval: None,
+            pending_input: None,
+            composer: TextBufferState::new(""),
+            composer_focus_handle: focus_handle,
+            input_field: InputField::Composer,
+            session_state: session.state,
+            run_state: run.as_ref().map(|run| run.state),
+            summary: run.as_ref().and_then(|run| run.summary.clone()),
+            review: ReviewState::default(),
+            tasks: Vec::new(),
+            session_menu: None,
+            rename_dialog: None,
+            rename_focus_handle,
             backend_status: BackendStatus::Connected,
             demo_workspace,
         };
-        view.refresh_workspace_surfaces(true)?;
-        view.collect_events()?;
+        view.refresh_sessions()?;
+        let active_session = view.active_session.clone();
+        view.load_session(active_session);
         Ok(view)
     }
 
-    fn refresh_workspace_surfaces(&mut self, open_default: bool) -> Result<(), LoomError> {
-        self.backend_status = BackendStatus::Connected;
-        let file_tree = self
-            .connection
-            .request(RequestEnvelope::new(ClientRequest::GetFileTree {
-                project_id: self.project_id,
-            }));
-        match file_tree.result {
-            Ok(ServerResponse::FileTree { entries }) => self.file_tree = entries,
-            Err(error) => self.record_backend_error("file tree refresh", error),
-            Ok(response) => self.record_unexpected_response("file tree refresh", response),
+    fn record_status(&mut self, status: impl Into<String>) {
+        self.timeline.push(TimelineItem::Status(status.into()));
+    }
+
+    fn record_backend_error(&mut self, operation: &str, error: LoomError) {
+        self.backend_status = BackendStatus::Error(error.clone());
+        self.timeline.push(TimelineItem::Error {
+            operation: operation.to_owned(),
+            error,
+        });
+    }
+
+    fn unexpected_response(operation: &str, response: ServerResponse) -> LoomError {
+        LoomError::new(
+            ErrorCode::Internal,
+            format!("backend returned unexpected {operation} response: {response:?}"),
+            false,
+        )
+    }
+
+    fn refresh_sessions(&mut self) -> Result<(), LoomError> {
+        let response =
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::ListAgentSessions {
+                    project_id: Some(self.project_id),
+                    include_archived: false,
+                }));
+        match response.result? {
+            ServerResponse::AgentSessions { sessions } => {
+                self.sessions = sessions;
+                if let Some(active) = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == self.active_session.id)
+                {
+                    self.active_session = active.clone();
+                    self.session_state = active.state;
+                }
+            }
+            response => return Err(Self::unexpected_response("session list", response)),
         }
 
-        if open_default && self.open_buffers.is_empty() {
-            let path = self
-                .file_tree
-                .iter()
-                .find(|entry| {
-                    entry.kind == loom_workspace::FileTreeEntryKind::File
-                        && entry.path == "README.md"
-                })
-                .or_else(|| {
-                    self.file_tree
-                        .iter()
-                        .find(|entry| entry.kind == loom_workspace::FileTreeEntryKind::File)
-                })
-                .map(|entry| entry.path.clone());
-            if let Some(path) = path {
-                self.open_file_path(path);
-            } else {
+        let response = self
+            .connection
+            .request(RequestEnvelope::new(ClientRequest::ListProjects));
+        match response.result? {
+            ServerResponse::Projects { projects } => {
+                self.projects = projects;
+                self.project = self
+                    .projects
+                    .iter()
+                    .find(|project| project.id == self.project_id)
+                    .cloned();
+            }
+            response => return Err(Self::unexpected_response("project list", response)),
+        }
+        self.backend_status = BackendStatus::Connected;
+        Ok(())
+    }
+
+    fn reset_projection(&mut self) {
+        self.timeline.clear();
+        self.pending_approval = None;
+        self.pending_input = None;
+        self.active_run = None;
+        self.active_run_id = None;
+        self.run_state = None;
+        self.summary = None;
+        self.after_sequence = None;
+    }
+
+    fn activate_session(&mut self, session: AgentSessionSnapshot) {
+        self.active_session = session;
+        self.session_state = self.active_session.state;
+        self.reset_projection();
+        self.review.selected_file = None;
+        self.review.changes.clear();
+        self.review.diff = None;
+        self.review.diff_path = None;
+        self.review.evidence.clear();
+        self.tasks.clear();
+    }
+
+    fn load_session(&mut self, session: AgentSessionSnapshot) {
+        self.activate_session(session);
+        let projection_run_id = match self
+            .connection
+            .request(RequestEnvelope::new(
+                ClientRequest::GetAgentSessionSnapshot {
+                    session_id: self.active_session.id,
+                },
+            ))
+            .result
+        {
+            Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
+                self.active_session = projection.session;
+                self.session_state = self.active_session.state;
+                self.active_run = projection.active_run.as_ref().map(|run| run.run.clone());
+                self.active_run_id = projection.active_run.as_ref().map(|run| run.run.id);
+                self.run_state = self.active_run.as_ref().map(|run| run.state);
+                self.active_run_id
+            }
+            Err(error) => {
+                self.record_backend_error("load session snapshot", error);
+                None
+            }
+            Ok(response) => {
                 self.record_backend_error(
-                    "open initial editor buffer",
-                    LoomError::new(
-                        ErrorCode::NotFound,
-                        "workspace has no file that can be opened",
-                        false,
+                    "load session snapshot",
+                    Self::unexpected_response("session snapshot", response),
+                );
+                None
+            }
+        };
+        if let Err(error) = self.collect_events() {
+            self.record_backend_error("load session events", error);
+        }
+        if self.active_run_id.is_none() {
+            self.active_run_id = projection_run_id;
+        }
+        if let Err(error) = self.refresh_run_snapshot() {
+            self.record_backend_error("load run snapshot", error);
+        }
+        self.refresh_review();
+    }
+
+    fn collect_events(&mut self) -> Result<(), LoomError> {
+        let response =
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: Some(self.active_session.id),
+                    after_sequence: self.after_sequence,
+                }));
+        match response.result? {
+            ServerResponse::SessionEvents { events } => {
+                for event in events {
+                    self.after_sequence = Some(event.sequence);
+                    self.consume_event(&event.event);
+                }
+            }
+            ServerResponse::SessionEventsSnapshot {
+                session,
+                events,
+                latest_sequence,
+                ..
+            } => {
+                self.active_session = session;
+                self.reset_projection();
+                self.after_sequence = Some(latest_sequence);
+                for event in events {
+                    self.after_sequence = Some(event.sequence);
+                    self.consume_event(&event.event);
+                }
+            }
+            response => return Err(Self::unexpected_response("session event stream", response)),
+        }
+        self.backend_status = BackendStatus::Connected;
+        Ok(())
+    }
+
+    fn consume_event(&mut self, event: &ServerEvent) {
+        match event {
+            ServerEvent::AgentSessionCreated { snapshot } => {
+                self.active_session = snapshot.clone();
+                self.session_state = snapshot.state;
+            }
+            ServerEvent::AgentSessionStateChanged { current, .. } => {
+                self.session_state = *current;
+                self.active_session.state = *current;
+            }
+            ServerEvent::AgentSessionForked { .. } => {}
+            ServerEvent::AgentSessionRenamed { name, .. } => {
+                self.active_session.name = name.clone();
+            }
+            ServerEvent::AgentSessionArchived { .. } => {
+                self.session_state = AgentSessionState::Archived;
+                self.active_session.state = AgentSessionState::Archived;
+            }
+            ServerEvent::Agent { event } => self.consume_agent_event(event),
+            ServerEvent::WorkspaceChanged { change } => {
+                self.record_status(format!("Workspace {:?}: {}", change.kind, change.path));
+            }
+            ServerEvent::Terminal { .. } | ServerEvent::Task { .. } => {}
+            ServerEvent::ProviderHealthChanged {
+                provider_id,
+                health,
+            } => self.record_status(format!(
+                "Provider {} health: {:?}",
+                provider_id.as_str(),
+                health.state
+            )),
+        }
+    }
+
+    fn consume_agent_event(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::RunStarted { snapshot } => {
+                self.active_run = Some(snapshot.clone());
+                self.active_run_id = Some(snapshot.id);
+                self.run_state = Some(snapshot.state);
+                self.timeline
+                    .push(TimelineItem::Status("Agent run started".to_owned()));
+            }
+            AgentEvent::PlanProposed { plan, .. } => self.timeline.push(TimelineItem::Plan(
+                plan.steps
+                    .iter()
+                    .map(|step| step.description.clone())
+                    .collect(),
+            )),
+            AgentEvent::UserMessage { text, .. } => {
+                self.timeline.push(TimelineItem::User(text.clone()));
+            }
+            AgentEvent::AssistantMessageDelta { text, .. } => {
+                if let Some(TimelineItem::Assistant(message)) = self.timeline.last_mut() {
+                    message.push_str(text);
+                } else {
+                    self.timeline.push(TimelineItem::Assistant(text.clone()));
+                }
+            }
+            AgentEvent::StepStarted { index, .. } => {
+                self.timeline
+                    .push(TimelineItem::StepStarted { index: *index });
+            }
+            AgentEvent::StepCompleted { index, .. } => {
+                self.timeline
+                    .push(TimelineItem::StepCompleted { index: *index });
+            }
+            AgentEvent::ContextInspected { inspection, .. } => self.record_status(format!(
+                "Context: {} input tokens, {} omitted",
+                inspection.included_tokens, inspection.omitted_tokens
+            )),
+            AgentEvent::ProviderError { error, .. } | AgentEvent::ContextError { error, .. } => {
+                self.timeline.push(TimelineItem::Error {
+                    operation: "agent".to_owned(),
+                    error: error.clone(),
+                });
+            }
+            AgentEvent::ToolCallRequested { call, .. } => {
+                self.timeline.push(TimelineItem::ToolRequested {
+                    name: call.name.clone(),
+                    arguments: bounded(&serde_json::to_string(&call.arguments).unwrap_or_default()),
+                });
+            }
+            AgentEvent::ToolApprovalRequired { call, .. } => {
+                for item in &mut self.timeline {
+                    if let TimelineItem::Approval { active, .. } = item {
+                        *active = false;
+                    }
+                }
+                self.pending_approval = Some(call.clone());
+                self.timeline.push(TimelineItem::Approval {
+                    name: call.name.clone(),
+                    active: true,
+                });
+            }
+            AgentEvent::ToolPolicyEvaluated { evaluation, .. } => self.record_status(format!(
+                "Policy {:?}: {}",
+                evaluation.decision, evaluation.reason
+            )),
+            AgentEvent::ToolApprovalDecided { decision, .. } => {
+                self.pending_approval = None;
+                for item in &mut self.timeline {
+                    if let TimelineItem::Approval { active, .. } = item {
+                        *active = false;
+                    }
+                }
+                self.record_status(format!("Approval: {decision:?}"));
+            }
+            AgentEvent::ToolCallStarted { call, .. } => {
+                self.timeline
+                    .push(TimelineItem::ToolStarted(call.name.clone()));
+            }
+            AgentEvent::ToolOutputChunk { chunk, .. } => {
+                if let Some(TimelineItem::ToolOutput(output)) = self.timeline.last_mut() {
+                    output.push_str(chunk);
+                    *output = bounded(output);
+                } else {
+                    self.timeline.push(TimelineItem::ToolOutput(bounded(chunk)));
+                }
+            }
+            AgentEvent::ToolCallCompleted { result, .. } => {
+                self.timeline.push(TimelineItem::ToolCompleted {
+                    name: result.name.clone(),
+                    success: result.success,
+                });
+            }
+            AgentEvent::NeedsInput { prompt, .. } => {
+                self.pending_input = Some(prompt.clone());
+                self.timeline.push(TimelineItem::NeedsInput(prompt.clone()));
+            }
+            AgentEvent::RunUsage { usage, .. } => self.record_status(format!(
+                "Usage: {} input / {} output tokens",
+                usage.input_tokens, usage.output_tokens
+            )),
+            AgentEvent::RunUsageUpdated { usage, .. } => self.record_status(format!(
+                "Total usage: {} input / {} output / {} tool calls",
+                usage.input_tokens, usage.output_tokens, usage.tool_calls
+            )),
+            AgentEvent::RunLimitReached { status, .. } => {
+                self.record_status(format!("Limit reached: {:?}", status.exceeded));
+            }
+            AgentEvent::RecoveryRequired { reason, .. } => {
+                self.record_status(format!("Recovery required: {reason}"));
+            }
+            AgentEvent::RunStateChanged { state, .. } => {
+                self.run_state = Some(*state);
+                self.session_state = session_state_for_run(*state);
+                self.active_session.state = self.session_state;
+            }
+            AgentEvent::RunCompleted { snapshot } => {
+                self.active_run = Some(snapshot.clone());
+                self.active_run_id = Some(snapshot.id);
+                self.run_state = Some(snapshot.state);
+                self.session_state = session_state_for_run(snapshot.state);
+                self.active_session.state = self.session_state;
+                self.summary = snapshot.summary.clone();
+                if let Some(summary) = &snapshot.summary {
+                    self.timeline.push(TimelineItem::Summary {
+                        text: summary.clone(),
+                        evidence: snapshot
+                            .evidence
+                            .iter()
+                            .map(|link| format!("{} ({})", link.label, link.uri))
+                            .collect(),
+                    });
+                }
+            }
+        }
+    }
+
+    fn refresh_run_snapshot(&mut self) -> Result<(), LoomError> {
+        let Some(run_id) = self.active_run_id else {
+            return Ok(());
+        };
+        let response =
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+                    run_id,
+                }));
+        match response.result? {
+            ServerResponse::AgentRunSnapshot(projection) => {
+                self.apply_run_projection(projection);
+                Ok(())
+            }
+            response => Err(Self::unexpected_response("run snapshot", response)),
+        }
+    }
+
+    fn apply_run_projection(&mut self, projection: AgentRunSnapshotProjection) {
+        self.active_run_id = Some(projection.run.id);
+        self.active_run = Some(projection.run.clone());
+        self.run_state = Some(projection.run.state);
+        self.summary = projection.run.summary.clone();
+        self.pending_approval = projection.pending_approval;
+        self.pending_input = projection.pending_input;
+        if self.timeline.is_empty() {
+            let mut timeline = Vec::new();
+            for message in projection.messages {
+                match message.role {
+                    MessageRole::User => timeline.push(TimelineItem::User(message.content)),
+                    MessageRole::Assistant => {
+                        timeline.push(TimelineItem::Assistant(message.content))
+                    }
+                    MessageRole::Tool => {
+                        timeline.push(TimelineItem::ToolOutput(bounded(&message.content)))
+                    }
+                    MessageRole::System => {}
+                }
+            }
+            if !projection.plan.is_empty() {
+                self.timeline.insert(
+                    0,
+                    TimelineItem::Plan(
+                        projection
+                            .plan
+                            .into_iter()
+                            .map(|step| step.description)
+                            .collect(),
                     ),
                 );
             }
+            self.timeline = timeline;
         }
+        if let Some(summary) = &projection.run.summary
+            && !self
+                .timeline
+                .iter()
+                .any(|item| matches!(item, TimelineItem::Summary { .. }))
+        {
+            self.timeline.push(TimelineItem::Summary {
+                text: summary.clone(),
+                evidence: projection
+                    .run
+                    .evidence
+                    .iter()
+                    .map(|link| format!("{} ({})", link.label, link.uri))
+                    .collect(),
+            });
+        }
+    }
 
-        let layout =
+    fn refresh_review(&mut self) {
+        let changes =
             self.connection
-                .request(RequestEnvelope::new(ClientRequest::GetEditorLayout {
+                .request(RequestEnvelope::new(ClientRequest::GetWorkspaceChanges {
                     project_id: self.project_id,
+                    after_sequence: None,
                 }));
-        match layout.result {
-            Ok(ServerResponse::EditorLayout(layout)) => self.editor_layout = Some(layout),
-            Err(error) => self.record_backend_error("editor layout refresh", error),
-            Ok(response) => self.record_unexpected_response("editor layout refresh", response),
-        }
-
-        let services = self.connection.request(RequestEnvelope::new(
-            ClientRequest::DiscoverLanguageServices {
-                project_id: self.project_id,
-            },
-        ));
-        match services.result {
-            Ok(ServerResponse::LanguageServices { services }) => self.language_services = services,
-            Err(error) => self.record_backend_error("language service discovery", error),
-            Ok(response) => self.record_unexpected_response("language service discovery", response),
-        }
-
-        let active_path = self.active_path();
-        if let Some(path) = active_path {
-            let started = self.connection.request(RequestEnvelope::new(
-                ClientRequest::StartLanguageService {
-                    project_id: self.project_id,
-                    path: path.clone(),
-                },
-            ));
-            match started.result {
-                Ok(ServerResponse::LanguageServices { services }) => {
-                    self.language_services = services
+        match changes.result {
+            Ok(ServerResponse::WorkspaceChanges { changes, truncated }) => {
+                let mut seen = BTreeSet::new();
+                self.review.changes = changes
+                    .into_iter()
+                    .rev()
+                    .filter(|change| seen.insert(change.path.clone()))
+                    .take(MAX_REVIEW_CHANGES)
+                    .collect();
+                if truncated {
+                    self.record_status(
+                        "Workspace review is showing the most recent changes".to_owned(),
+                    );
                 }
-                Err(error) => self.record_backend_error("language service start", error),
-                Ok(response) => self.record_unexpected_response("language service start", response),
             }
-
-            let diagnostics =
-                self.connection
-                    .request(RequestEnvelope::new(ClientRequest::GetDiagnostics {
-                        project_id: self.project_id,
-                        path: path.clone(),
-                    }));
-            match diagnostics.result {
-                Ok(ServerResponse::Diagnostics {
-                    diagnostics,
-                    path: _,
-                }) => self.diagnostics = diagnostics,
-                Err(error) => self.record_backend_error("diagnostics refresh", error),
-                Ok(response) => self.record_unexpected_response("diagnostics refresh", response),
-            }
-
-            let symbols =
-                self.connection
-                    .request(RequestEnvelope::new(ClientRequest::GetSymbols {
-                        project_id: self.project_id,
-                        path,
-                    }));
-            match symbols.result {
-                Ok(ServerResponse::Symbols { symbols, path: _ }) => self.symbols = symbols,
-                Err(error) => self.record_backend_error("outline refresh", error),
-                Ok(response) => self.record_unexpected_response("outline refresh", response),
-            }
-        } else {
-            self.diagnostics.clear();
-            self.symbols.clear();
-            self.record_status("No active file for language diagnostics".to_owned());
-        }
-
-        let search =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::SearchWorkspace {
-                    project_id: self.project_id,
-                    query: SearchQuery::literal("TODO"),
-                }));
-        match search.result {
-            Ok(ServerResponse::SearchMatches { matches }) => self.search_matches = matches,
-            Err(error) => self.record_backend_error("workspace search refresh", error),
-            Ok(response) => self.record_unexpected_response("workspace search refresh", response),
+            Err(error) => self.record_backend_error("workspace review refresh", error),
+            Ok(response) => self.record_backend_error(
+                "workspace review refresh",
+                Self::unexpected_response("workspace changes", response),
+            ),
         }
 
         let status = self
@@ -830,1074 +1281,788 @@ impl LoomView {
                 project_id: self.project_id,
             }));
         match status.result {
-            Ok(ServerResponse::VcsStatus(status)) => {
-                self.vcs_status = Some(status);
-                self.vcs_error = None;
-            }
+            Ok(ServerResponse::VcsStatus(status)) => self.review.vcs = Some(status),
             Err(error) => {
-                self.vcs_error = Some(error.to_string());
-                self.record_backend_error("VCS status refresh", error);
+                self.review.vcs = None;
+                self.record_status(format!("VCS review unavailable: {error}"));
             }
-            Ok(response) => self.record_unexpected_response("VCS status refresh", response),
+            Ok(response) => self.record_backend_error(
+                "VCS review refresh",
+                Self::unexpected_response("VCS status", response),
+            ),
         }
-        let external = self.connection.request(RequestEnvelope::new(
-            ClientRequest::MarkExternalEditorChanges {
-                project_id: self.project_id,
-            },
-        ));
-        match external.result {
-            Ok(ServerResponse::EditorBuffers { buffers }) => {
-                for buffer in buffers {
-                    if let Some(existing) = self
-                        .open_buffers
-                        .iter_mut()
-                        .find(|existing| existing.id == buffer.id)
-                    {
-                        *existing = buffer;
-                    }
-                }
-            }
-            Err(error) => self.record_backend_error("external change refresh", error),
-            Ok(response) => self.record_unexpected_response("external change refresh", response),
-        }
-        self.refresh_task_results();
+    }
+
+    fn create_session_and_select(&mut self, name: String) -> Result<(), LoomError> {
+        let snapshot = create_session(&self.connection, self.project_id, &name)?;
+        self.sessions.push(snapshot.clone());
+        self.activate_session(snapshot);
+        self.backend_status = BackendStatus::Connected;
         Ok(())
     }
 
-    fn refresh_task_results(&mut self) {
-        let ids = self
-            .task_results
-            .iter()
-            .map(|task| task.id)
-            .collect::<Vec<_>>();
-        for task_id in ids {
-            let response = self
-                .connection
-                .request(RequestEnvelope::new(ClientRequest::GetTask {
-                    project_id: self.project_id,
-                    task_id,
-                }));
-            match response.result {
-                Ok(ServerResponse::Task(task)) => {
-                    if let Some(existing) = self
-                        .task_results
-                        .iter_mut()
-                        .find(|existing| existing.id == task.id)
-                    {
-                        *existing = task;
-                    } else {
-                        self.task_results.push(task);
-                    }
-                }
-                Err(error) => self.record_backend_error("task refresh", error),
-                Ok(response) => self.record_unexpected_response("task refresh", response),
-            }
-        }
-    }
-
-    fn record_status(&mut self, status: String) {
-        self.timeline.push(TimelineItem::Status(status));
-    }
-
-    fn record_backend_error(&mut self, operation: &str, error: LoomError) {
-        self.backend_status = BackendStatus::Error(error.clone());
-        self.timeline
-            .push(backend_error_timeline_item(operation, &error));
-    }
-
-    fn record_unexpected_response(&mut self, operation: &str, response: ServerResponse) {
-        self.record_backend_error(operation, unexpected_response(operation, response));
-    }
-
-    fn active_path(&self) -> Option<String> {
-        let active_id = self.active_buffer?;
-        self.open_buffers
-            .iter()
-            .find(|buffer| buffer.id == active_id)
-            .map(|buffer| buffer.path.clone())
-    }
-
-    fn replace_input_text(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        new_text: &str,
-        new_selected_range_utf16: Option<Range<usize>>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(buffer_id) = self.active_buffer else {
+    fn confirm_rename(&mut self) {
+        let Some(dialog) = self.rename_dialog.take() else {
             return;
         };
-        let previous = self.editor_input.clone();
-        let range = range_utf16
-            .as_ref()
-            .map(|range| self.editor_input.range_from_utf16(range))
-            .or_else(|| self.editor_input.marked_range.clone())
-            .unwrap_or_else(|| self.editor_input.selected_range.clone());
-        let replacement = new_text.replace("\r\n", "\n").replace('\r', "\n");
-        let edit = BufferEdit {
-            range: TextRange::new(range.start, range.end),
-            replacement: replacement.clone(),
-        };
-        let replacement_range = self
-            .editor_input
-            .replace_utf16(range_utf16.clone(), &replacement);
-        if let Some(selected_range_utf16) = &new_selected_range_utf16 {
-            let replacement_state = TextBufferState::new(replacement.clone());
-            let selected = replacement_state.range_from_utf16(selected_range_utf16);
-            self.editor_input.selected_range =
-                replacement_range.start + selected.start..replacement_range.start + selected.end;
-            self.editor_input.selection_reversed = false;
+        let name = dialog.input.text.trim().to_owned();
+        if name.is_empty() {
+            self.record_status("Session name cannot be empty");
+            self.rename_dialog = Some(dialog);
+            return;
         }
-        if new_selected_range_utf16.is_some() && !replacement.is_empty() {
-            self.editor_input.marked_range = Some(replacement_range);
-        }
-
         let response =
             self.connection
-                .request(RequestEnvelope::new(ClientRequest::EditEditorBuffer {
-                    project_id: self.project_id,
-                    buffer_id,
-                    edit,
+                .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                    session_id: dialog.session.id,
+                    name,
                 }));
         match response.result {
-            Ok(ServerResponse::EditorBuffer(buffer)) => {
-                self.replace_buffer_snapshot(buffer);
-                self.backend_status = BackendStatus::Connected;
+            Ok(ServerResponse::AgentSessionRenamed(snapshot)) => {
+                self.active_session = snapshot;
+                if let Err(error) = self.refresh_sessions() {
+                    self.record_backend_error("session list refresh", error);
+                }
             }
             Err(error) => {
-                self.editor_input = previous;
-                self.record_backend_error("editor input", error);
+                self.rename_dialog = Some(dialog);
+                self.record_backend_error("rename session", error);
             }
-            Ok(response) => {
-                self.editor_input = previous;
-                self.record_unexpected_response("editor input", response);
+            Ok(response) => self.record_backend_error(
+                "rename session",
+                Self::unexpected_response("session rename", response),
+            ),
+        }
+    }
+
+    fn archive_active(&mut self) {
+        let response =
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
+                    session_id: self.active_session.id,
+                }));
+        match response.result {
+            Ok(ServerResponse::AgentSessionArchived(_)) => {
+                if let Err(error) = self.refresh_sessions() {
+                    self.record_backend_error("session list refresh", error);
+                    return;
+                }
+                if let Some(session) = self.sessions.first().cloned() {
+                    self.load_session(session);
+                } else if let Err(error) = self.create_session_and_select("New session".to_owned())
+                {
+                    self.record_backend_error("create replacement session", error);
+                }
             }
+            Err(error) => self.record_backend_error("archive session", error),
+            Ok(response) => self.record_backend_error(
+                "archive session",
+                Self::unexpected_response("session archive", response),
+            ),
         }
-        cx.notify();
     }
 
-    fn move_editor_left(&mut self, extend: bool, cx: &mut Context<Self>) {
-        if self.editor_input.selected_range.is_empty() || extend {
-            let offset = self
-                .editor_input
-                .previous_boundary(self.editor_input.cursor_offset());
-            self.editor_input.move_to(offset, extend);
-        } else {
-            self.editor_input
-                .move_to(self.editor_input.selected_range.start, false);
+    fn start_active_run(&mut self, task: String) {
+        match start_run(
+            &self.connection,
+            &self.active_session,
+            &self.workspace_root,
+            &self.model,
+            &task,
+        ) {
+            Ok(run) => {
+                self.active_run = Some(run.clone());
+                self.active_run_id = Some(run.id);
+                self.run_state = Some(run.state);
+                self.session_state = AgentSessionState::Planning;
+                self.timeline.clear();
+                self.after_sequence = None;
+                if let Err(error) = self.collect_events() {
+                    self.record_backend_error("start run events", error);
+                }
+                self.refresh_review();
+            }
+            Err(error) => self.record_backend_error("start run", error),
         }
-        cx.notify();
     }
 
-    fn move_editor_right(&mut self, extend: bool, cx: &mut Context<Self>) {
-        if self.editor_input.selected_range.is_empty() || extend {
-            let offset = self
-                .editor_input
-                .next_boundary(self.editor_input.cursor_offset());
-            self.editor_input.move_to(offset, extend);
-        } else {
-            self.editor_input
-                .move_to(self.editor_input.selected_range.end, false);
-        }
-        cx.notify();
-    }
-
-    fn delete_backward(&mut self, cx: &mut Context<Self>) {
-        if self.editor_input.selected_range.is_empty() {
-            let cursor = self.editor_input.cursor_offset();
-            if cursor == 0 {
+    fn send_message(&mut self, message: String) {
+        let Some(run_id) = self.active_run_id else {
+            if !self.demo_workspace && self.model.as_str() == "deterministic/demo" {
+                self.record_backend_error(
+                    "start run",
+                    LoomError::invalid_state(
+                        "configure LOOM_OPENAI_ENDPOINT and LOOM_MODEL, or launch with --demo, before starting a real run",
+                    ),
+                );
                 return;
             }
-            self.editor_input.selected_range = self.editor_input.previous_boundary(cursor)..cursor;
-            self.editor_input.selection_reversed = false;
-        }
-        self.replace_input_text(None, "", None, cx);
-    }
-
-    fn delete_forward(&mut self, cx: &mut Context<Self>) {
-        if self.editor_input.selected_range.is_empty() {
-            let cursor = self.editor_input.cursor_offset();
-            if cursor >= self.editor_input.text.len() {
-                return;
-            }
-            self.editor_input.selected_range = cursor..self.editor_input.next_boundary(cursor);
-            self.editor_input.selection_reversed = false;
-        }
-        self.replace_input_text(None, "", None, cx);
-    }
-
-    fn copy_editor_selection(&mut self, cx: &mut Context<Self>) {
-        if !self.editor_input.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.editor_input.text[self.editor_input.selected_range.clone()].to_owned(),
-            ));
-        }
-    }
-
-    fn editor_mouse_down(
-        &mut self,
-        event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(offset) = self.editor_utf8_index_for_point(event.position) else {
+            self.start_active_run(message);
             return;
         };
-        if event.modifiers.shift {
-            self.editor_input.select_to(offset);
-        } else {
-            self.editor_input.move_to(offset, false);
+        let response =
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::SendAgentMessage {
+                    run_id,
+                    message,
+                }));
+        match response.result {
+            Ok(ServerResponse::AgentRun(run)) => {
+                self.active_run = Some(run);
+                self.pending_input = None;
+                if let Err(error) = self.collect_events() {
+                    self.record_backend_error("message event stream", error);
+                }
+                if let Err(error) = self.refresh_run_snapshot() {
+                    self.record_backend_error("message run snapshot", error);
+                }
+                self.refresh_review();
+            }
+            Err(error) => self.record_backend_error("send message", error),
+            Ok(response) => self.record_backend_error(
+                "send message",
+                Self::unexpected_response("send message", response),
+            ),
         }
-        self.editor_focus_handle.focus(window);
+    }
+
+    fn submit_composer(&mut self) {
+        let text = self.composer.text.trim().to_owned();
+        if text.is_empty() {
+            return;
+        }
+        self.composer.set_text("");
+        self.send_message(text);
+    }
+
+    fn run_control(&mut self, request: ClientRequest, operation: &str) {
+        let response = self.connection.request(RequestEnvelope::new(request));
+        match response.result {
+            Ok(ServerResponse::AgentRun(run)) => {
+                self.active_run = Some(run.clone());
+                self.active_run_id = Some(run.id);
+                self.run_state = Some(run.state);
+                if let Err(error) = self.collect_events() {
+                    self.record_backend_error(operation, error);
+                }
+                self.refresh_review();
+            }
+            Err(error) => self.record_backend_error(operation, error),
+            Ok(response) => {
+                self.record_backend_error(operation, Self::unexpected_response(operation, response))
+            }
+        }
+    }
+
+    fn approve(&mut self) {
+        let Some(call) = self.pending_approval.take() else {
+            return;
+        };
+        let Some(run_id) = self.active_run_id else {
+            self.record_backend_error(
+                "approve action",
+                LoomError::invalid_state("approval is not associated with an active run"),
+            );
+            self.pending_approval = Some(call);
+            return;
+        };
+        self.run_control(
+            ClientRequest::ApproveAgentAction {
+                run_id,
+                tool_call_id: call.id,
+            },
+            "approve action",
+        );
+    }
+
+    fn reject(&mut self) {
+        let Some(call) = self.pending_approval.take() else {
+            return;
+        };
+        let Some(run_id) = self.active_run_id else {
+            self.record_backend_error(
+                "reject action",
+                LoomError::invalid_state("approval is not associated with an active run"),
+            );
+            self.pending_approval = Some(call);
+            return;
+        };
+        self.run_control(
+            ClientRequest::RejectAgentAction {
+                run_id,
+                tool_call_id: call.id,
+                reason: Some("rejected by the user".to_owned()),
+            },
+            "reject action",
+        );
+    }
+
+    fn refresh(&mut self) {
+        if let Err(error) = self.refresh_sessions() {
+            self.record_backend_error("refresh sessions", error);
+        }
+        if let Err(error) = self.collect_events() {
+            self.record_backend_error("refresh events", error);
+        }
+        if let Err(error) = self.refresh_run_snapshot() {
+            self.record_backend_error("refresh run", error);
+        }
+        self.refresh_review();
+    }
+
+    fn reconnect(&mut self) {
+        match self
+            .connection
+            .reconnect()
+            .and_then(|()| negotiate(&self.connection))
+        {
+            Ok(()) => {
+                self.backend_status = BackendStatus::Connected;
+                self.refresh();
+            }
+            Err(error) => self.record_backend_error("reconnect", error),
+        }
+    }
+
+    fn focus_composer(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_focus_handle.focus(window);
         cx.notify();
     }
 
-    fn editor_mouse_move(
-        &mut self,
-        event: &MouseMoveEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if event.pressed_button != Some(MouseButton::Left) {
-            return;
-        }
-        if let Some(offset) = self.editor_utf8_index_for_point(event.position) {
-            self.editor_input.select_to(offset);
-            cx.notify();
-        }
-    }
-
-    fn editor_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
+    fn focus_rename(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.rename_focus_handle.focus(window);
+        cx.notify();
     }
 
     fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        self.delete_backward(cx);
+        if self.edit_input().selected_range.is_empty() {
+            let cursor = self.edit_input().cursor_offset();
+            if cursor == 0 {
+                return;
+            }
+            let input = self.edit_input_mut();
+            input.selected_range = input.previous_boundary(cursor)..cursor;
+        }
+        self.edit_input_mut().replace_utf16(None, "");
+        cx.notify();
     }
 
     fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        self.delete_forward(cx);
+        if self.edit_input().selected_range.is_empty() {
+            let cursor = self.edit_input().cursor_offset();
+            if cursor >= self.edit_input().text.len() {
+                return;
+            }
+            let input = self.edit_input_mut();
+            input.selected_range = cursor..input.next_boundary(cursor);
+        }
+        self.edit_input_mut().replace_utf16(None, "");
+        cx.notify();
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_editor_left(false, cx);
+        let offset = if self.edit_input().selected_range.is_empty() {
+            self.edit_input()
+                .previous_boundary(self.edit_input().cursor_offset())
+        } else {
+            self.edit_input().selected_range.start
+        };
+        self.edit_input_mut().move_to(offset, false);
+        cx.notify();
     }
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_editor_right(false, cx);
-    }
-
-    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_editor_left(true, cx);
-    }
-
-    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_editor_right(true, cx);
-    }
-
-    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor_input.move_vertical(-1, false);
-        cx.notify();
-    }
-
-    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor_input.move_vertical(1, false);
-        cx.notify();
-    }
-
-    fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor_input.move_vertical(-1, true);
-        cx.notify();
-    }
-
-    fn select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor_input.move_vertical(1, true);
+        let offset = if self.edit_input().selected_range.is_empty() {
+            self.edit_input()
+                .next_boundary(self.edit_input().cursor_offset())
+        } else {
+            self.edit_input().selected_range.end
+        };
+        self.edit_input_mut().move_to(offset, false);
         cx.notify();
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor_input.select_all();
+        self.edit_input_mut().select_all();
         cx.notify();
     }
 
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor_input.move_home(false);
+        let (line, _) = self
+            .edit_input()
+            .line_and_column(self.edit_input().cursor_offset());
+        let offset = self.edit_input().line_ranges()[line].start;
+        self.edit_input_mut().move_to(offset, false);
         cx.notify();
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor_input.move_end(false);
+        let (line, _) = self
+            .edit_input()
+            .line_and_column(self.edit_input().cursor_offset());
+        let offset = self.edit_input().line_ranges()[line].end;
+        self.edit_input_mut().move_to(offset, false);
         cx.notify();
     }
 
-    fn select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor_input.move_home(true);
-        cx.notify();
-    }
-
-    fn select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
-        self.editor_input.move_end(true);
-        cx.notify();
-    }
-
-    fn paste(&mut self, _: &Paste, _window: &mut Window, cx: &mut Context<Self>) {
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_input_text(None, &text, None, cx);
+            self.edit_input_mut().replace_utf16(None, &text);
+            cx.notify();
         }
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        self.copy_editor_selection(cx);
-    }
-
-    fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
-        self.copy_editor_selection(cx);
-        if !self.editor_input.selected_range.is_empty() {
-            self.replace_input_text(None, "", None, cx);
+        if !self.edit_input().selected_range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.edit_input().text[self.edit_input().selected_range.clone()].to_owned(),
+            ));
         }
     }
 
-    fn collect_events(&mut self) -> Result<(), LoomError> {
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-                    session_id: Some(self.session_id),
-                    after_sequence: self.after_sequence,
-                }));
-        let events = match response.result? {
-            ServerResponse::SessionEvents { events } => events,
-            response => return Err(unexpected_response("event stream", response)),
-        };
-        for event in events {
-            self.after_sequence = Some(event.sequence);
-            self.consume_event(&event.event);
-        }
-        Ok(())
-    }
-
-    fn consume_event(&mut self, event: &ServerEvent) {
-        match event {
-            ServerEvent::AgentSessionCreated { .. } => {}
-            ServerEvent::AgentSessionStateChanged { current, .. } => {
-                self.session_state = *current;
-            }
-            ServerEvent::AgentSessionForked { .. } => {}
-            ServerEvent::Agent { event } => match event {
-                AgentEvent::RunStarted { snapshot } => {
-                    self.run_state = snapshot.state;
-                    self.timeline
-                        .push(TimelineItem::Status("Agent run started".to_owned()));
-                }
-                AgentEvent::PlanProposed { plan, .. } => self.timeline.push(TimelineItem::Plan(
-                    plan.steps
-                        .iter()
-                        .map(|step| step.description.clone())
-                        .collect(),
-                )),
-                AgentEvent::StepStarted { index, .. } => self
-                    .timeline
-                    .push(TimelineItem::Status(format!("Step {} started", index + 1))),
-                AgentEvent::StepCompleted { index, .. } => self.timeline.push(
-                    TimelineItem::Status(format!("Step {} completed", index + 1)),
-                ),
-                AgentEvent::ContextInspected { inspection, .. } => {
-                    self.timeline.push(TimelineItem::Status(format!(
-                        "Context: {} input tokens ({} omitted)",
-                        inspection.included_tokens, inspection.omitted_tokens
-                    )))
-                }
-                AgentEvent::ProviderError { error, .. } => self
-                    .timeline
-                    .push(TimelineItem::Status(format!("Provider error: {error}"))),
-                AgentEvent::ContextError { error, .. } => self
-                    .timeline
-                    .push(TimelineItem::Status(format!("Context error: {error}"))),
-                AgentEvent::AssistantMessageDelta { text, .. } => {
-                    if let Some(TimelineItem::Assistant(message)) = self.timeline.last_mut() {
-                        message.push_str(text);
-                    } else {
-                        self.timeline.push(TimelineItem::Assistant(text.clone()));
-                    }
-                }
-                AgentEvent::ToolCallRequested { call, .. } => {
-                    self.timeline.push(TimelineItem::ToolRequested {
-                        name: call.name.clone(),
-                        arguments: serde_json::to_string(&call.arguments)
-                            .unwrap_or_else(|_| "{}".to_owned()),
-                    });
-                }
-                AgentEvent::ToolApprovalRequired { call, .. } => {
-                    for item in &mut self.timeline {
-                        if let TimelineItem::Approval { active, .. } = item {
-                            *active = false;
-                        }
-                    }
-                    self.pending_approval = Some(call.clone());
-                    self.timeline.push(TimelineItem::Approval {
-                        name: call.name.clone(),
-                        active: true,
-                    });
-                }
-                AgentEvent::ToolPolicyEvaluated { evaluation, .. } => {
-                    self.timeline.push(TimelineItem::Status(format!(
-                        "Policy {:?}: {}",
-                        evaluation.decision, evaluation.reason
-                    )));
-                }
-                AgentEvent::ToolApprovalDecided { decision, .. } => {
-                    for item in &mut self.timeline {
-                        if let TimelineItem::Approval { active, .. } = item {
-                            *active = false;
-                        }
-                    }
-                    self.timeline
-                        .push(TimelineItem::Status(format!("Approval: {decision:?}")));
-                }
-                AgentEvent::ToolCallStarted { call, .. } => {
-                    self.timeline
-                        .push(TimelineItem::ToolStarted(call.name.clone()));
-                }
-                AgentEvent::ToolOutputChunk { chunk, .. } => {
-                    self.timeline.push(TimelineItem::ToolOutput(chunk.clone()));
-                }
-                AgentEvent::ToolCallCompleted { result, .. } => {
-                    self.timeline.push(TimelineItem::ToolCompleted {
-                        name: result.name.clone(),
-                        success: result.success,
-                    });
-                }
-                AgentEvent::RunUsage { usage, .. } => {
-                    self.timeline.push(TimelineItem::Status(format!(
-                        "Usage: {} input / {} output tokens",
-                        usage.input_tokens, usage.output_tokens
-                    )))
-                }
-                AgentEvent::RunUsageUpdated { usage, .. } => {
-                    self.timeline.push(TimelineItem::Status(format!(
-                        "Total usage: {} input / {} output / {} tool calls",
-                        usage.input_tokens, usage.output_tokens, usage.tool_calls
-                    )))
-                }
-                AgentEvent::RunLimitReached { status, .. } => self.timeline.push(
-                    TimelineItem::Status(format!("Limit reached: {:?}", status.exceeded)),
-                ),
-                AgentEvent::RecoveryRequired { reason, .. } => self
-                    .timeline
-                    .push(TimelineItem::Status(format!("Recovery required: {reason}"))),
-                AgentEvent::RunStateChanged { state, .. } => {
-                    self.run_state = *state;
-                    self.session_state = session_state_for_run(*state);
-                }
-                AgentEvent::RunCompleted { snapshot } => {
-                    self.run_state = snapshot.state;
-                    self.session_state = session_state_for_run(snapshot.state);
-                    self.summary = snapshot.summary.clone();
-                    if let Some(summary) = &snapshot.summary {
-                        self.timeline.push(TimelineItem::Summary {
-                            text: summary.clone(),
-                            evidence: snapshot
-                                .evidence
-                                .iter()
-                                .map(|link| format!("{} ({})", link.label, link.uri))
-                                .collect(),
-                        });
-                    }
-                }
-            },
-            ServerEvent::WorkspaceChanged { change } => {
-                self.timeline.push(TimelineItem::Status(format!(
-                    "Workspace {:?}: {}",
-                    change.kind, change.path
-                )));
-            }
-            ServerEvent::Terminal { event } => {
-                self.timeline
-                    .push(TimelineItem::Status(format!("Terminal: {:?}", event.event)));
-            }
-            ServerEvent::Task { event } => {
-                self.timeline
-                    .push(TimelineItem::Status(format!("Task: {:?}", event.event)));
-            }
-            ServerEvent::ProviderHealthChanged {
-                provider_id,
-                health,
-            } => {
-                self.timeline.push(TimelineItem::Status(format!(
-                    "Provider {} health: {:?}",
-                    provider_id.as_str(),
-                    health.state
-                )));
-            }
-        }
-    }
-
-    fn approve(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(call) = self.pending_approval.take() else {
-            return;
-        };
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
-                    run_id: self.run_id,
-                    tool_call_id: call.id,
-                }));
-        if let Err(error) = response.result {
-            self.record_backend_error("approval", error);
-            self.pending_approval = Some(call);
-            cx.notify();
-            return;
-        }
-        if let Err(error) = self.collect_events() {
-            self.record_backend_error("approval event stream", error);
-        }
-        cx.notify();
-    }
-
-    fn refresh(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        match workspace_snapshot(&self.connection, self.project_id) {
-            Ok(snapshot) => self.workspace_entries = snapshot.entries.len(),
-            Err(error) => self.record_backend_error("workspace refresh", error),
-        }
-        let _ = self.refresh_workspace_surfaces(false);
-        if let Err(error) = self.collect_events() {
-            self.record_backend_error("refresh event stream", error);
-        }
-        cx.notify();
-    }
-
-    fn open_readme(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_file_path("README.md".to_owned());
-        cx.notify();
-    }
-
-    fn open_file_path(&mut self, path: String) {
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::OpenEditorBuffer {
-                    project_id: self.project_id,
-                    path,
-                }));
-        match response.result {
-            Ok(ServerResponse::EditorBuffer(buffer)) => {
-                self.activate_buffer(buffer);
-                self.backend_status = BackendStatus::Connected;
-            }
-            Err(error) => self.record_backend_error("open file", error),
-            Ok(response) => self.record_unexpected_response("open file", response),
-        }
-    }
-
-    fn save_active(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.save_active_now(cx);
-    }
-
-    fn save_active_now(&mut self, cx: &mut Context<Self>) {
-        let Some(buffer_id) = self.active_buffer else {
-            return;
-        };
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::SaveEditorBuffer {
-                    project_id: self.project_id,
-                    buffer_id,
-                }));
-        match response.result {
-            Ok(ServerResponse::EditorBuffer(buffer)) => {
-                self.replace_buffer_snapshot(buffer);
-                self.backend_status = BackendStatus::Connected;
-            }
-            Err(error) => {
-                if matches!(error.code, ErrorCode::ExternalChange | ErrorCode::Conflict) {
-                    self.mark_active_external_change();
-                }
-                self.record_backend_error("save buffer", error);
-            }
-            Ok(response) => self.record_unexpected_response("save buffer", response),
-        }
-        cx.notify();
-    }
-
-    fn mark_active_external_change(&mut self) {
-        let Some(buffer_id) = self.active_buffer else {
-            return;
-        };
-        if let Some(buffer) = self
-            .open_buffers
-            .iter_mut()
-            .find(|buffer| buffer.id == buffer_id)
-        {
-            buffer.external_change = true;
-        }
-    }
-
-    fn reload_active(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(buffer_id) = self.active_buffer else {
-            return;
-        };
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::ReloadEditorBuffer {
-                    project_id: self.project_id,
-                    buffer_id,
-                    discard_dirty: true,
-                }));
-        match response.result {
-            Ok(ServerResponse::EditorBuffer(buffer)) => {
-                self.replace_buffer_snapshot(buffer);
-                self.backend_status = BackendStatus::Connected;
-            }
-            Err(error) => self.record_backend_error("reload buffer", error),
-            Ok(response) => self.record_unexpected_response("reload buffer", response),
-        }
-        cx.notify();
-    }
-
-    fn undo_active(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.undo_active_now(cx);
-    }
-
-    fn undo_active_now(&mut self, cx: &mut Context<Self>) {
-        let Some(buffer_id) = self.active_buffer else {
-            return;
-        };
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::UndoEditorBuffer {
-                    project_id: self.project_id,
-                    buffer_id,
-                }));
-        match response.result {
-            Ok(ServerResponse::EditorBuffer(buffer)) => {
-                self.replace_buffer_snapshot(buffer);
-                self.backend_status = BackendStatus::Connected;
-            }
-            Err(error) => self.record_backend_error("undo buffer", error),
-            Ok(response) => self.record_unexpected_response("undo buffer", response),
-        }
-        cx.notify();
-    }
-
-    fn redo_active(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.redo_active_now(cx);
-    }
-
-    fn redo_active_now(&mut self, cx: &mut Context<Self>) {
-        let Some(buffer_id) = self.active_buffer else {
-            return;
-        };
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::RedoEditorBuffer {
-                    project_id: self.project_id,
-                    buffer_id,
-                }));
-        match response.result {
-            Ok(ServerResponse::EditorBuffer(buffer)) => {
-                self.replace_buffer_snapshot(buffer);
-                self.backend_status = BackendStatus::Connected;
-            }
-            Err(error) => self.record_backend_error("redo buffer", error),
-            Ok(response) => self.record_unexpected_response("redo buffer", response),
-        }
-        cx.notify();
-    }
-
-    fn save_action(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
-        self.save_active_now(cx);
-    }
-
-    fn undo_action(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        self.undo_active_now(cx);
-    }
-
-    fn redo_action(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        self.redo_active_now(cx);
-    }
-
-    fn run_task(&mut self, kind: TaskKind, cx: &mut Context<Self>) {
-        let label = format!("{kind:?} workspace task");
-        let response = self
-            .connection
-            .request(RequestEnvelope::new(ClientRequest::StartTask {
-                project_id: self.project_id,
-                spec: TaskSpec {
-                    kind,
-                    label,
-                    command: "cargo".to_owned(),
-                    args: vec![format!("{kind:?}").to_ascii_lowercase()],
-                    cwd: None,
-                    output_limit_bytes: Some(16 * 1024),
-                    artifact_paths: Vec::new(),
-                },
-            }));
-        match response.result {
-            Ok(ServerResponse::TaskStarted(task)) => self.task_results.push(task),
-            Err(error) => self.record_backend_error("start task", error),
-            Ok(response) => self.record_unexpected_response("start task", response),
-        }
-        cx.notify();
-    }
-
-    fn run_build(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_task(TaskKind::Build, cx);
-    }
-
-    fn run_test(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_task(TaskKind::Test, cx);
-    }
-
-    fn run_lint(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_task(TaskKind::Lint, cx);
-    }
-
-    fn activate_buffer(&mut self, buffer: BufferSnapshot) {
-        self.active_buffer = Some(buffer.id);
-        if let Some(existing) = self
-            .open_buffers
-            .iter_mut()
-            .find(|existing| existing.id == buffer.id)
-        {
-            *existing = buffer.clone();
+    fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+        if self.rename_dialog.is_some() {
+            self.confirm_rename();
         } else {
-            self.open_buffers.push(buffer.clone());
+            self.submit_composer();
         }
-        self.editor_input.set_text(buffer.text);
-        self.editor_layout_cache = None;
-        self.diagnostics.clear();
-        self.symbols.clear();
+        cx.notify();
     }
 
-    fn replace_buffer_snapshot(&mut self, buffer: BufferSnapshot) {
-        self.active_buffer = Some(buffer.id);
-        if let Some(existing) = self
-            .open_buffers
-            .iter_mut()
-            .find(|existing| existing.id == buffer.id)
-        {
-            *existing = buffer.clone();
-        } else {
-            self.open_buffers.push(buffer.clone());
-        }
-        if self.editor_input.text != buffer.text {
-            self.editor_input.set_text(buffer.text);
-            self.editor_layout_cache = None;
-        }
+    fn select_session(&mut self, session: AgentSessionSnapshot, cx: &mut Context<Self>) {
+        self.load_session(session);
+        cx.notify();
     }
 
-    fn focus_tab(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
-        let Some(pane_id) = self
-            .editor_layout
-            .as_ref()
-            .map(|layout| layout.focused_pane)
-        else {
+    fn select_project(&mut self, project: ProjectSnapshot, cx: &mut Context<Self>) {
+        let Some(root) = project.root.clone() else {
             self.record_backend_error(
-                "focus editor tab",
-                LoomError::invalid_state("editor layout is unavailable"),
+                "open project",
+                LoomError::invalid_state("project has no configured workspace root"),
             );
             cx.notify();
             return;
         };
+        self.project_id = project.id;
+        self.project = Some(project);
+        self.workspace_root = PathBuf::from(root);
+        if let Err(error) = self.refresh_sessions() {
+            self.record_backend_error("open project", error);
+        } else if let Some(session) = self.sessions.first().cloned() {
+            self.load_session(session);
+        } else if let Err(error) = self.create_session_and_select("New session".to_owned()) {
+            self.record_backend_error("create project session", error);
+        }
+        cx.notify();
+    }
+
+    fn toggle_model_picker(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.model_picker_open = !self.model_picker_open;
+        cx.notify();
+    }
+
+    fn select_model(&mut self, model: ModelId, cx: &mut Context<Self>) {
+        self.model = model;
+        self.model_picker_open = false;
+        cx.notify();
+    }
+
+    fn new_session(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let name = format!("Session {}", self.sessions.len().saturating_add(1));
+        if let Err(error) = self.create_session_and_select(name) {
+            self.record_backend_error("create session", error);
+        }
+        cx.notify();
+    }
+
+    fn begin_session_rename(&mut self, session: AgentSessionSnapshot, window: &mut Window) {
+        self.load_session(session);
+        self.rename_dialog = Some(RenameDialogState {
+            session: self.active_session.clone(),
+            input: TextBufferState::new(self.active_session.name.clone()),
+        });
+        self.rename_focus_handle.focus(window);
+    }
+
+    fn approve_action(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.approve();
+        cx.notify();
+    }
+
+    fn reject_action(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.reject();
+        cx.notify();
+    }
+
+    fn pause_run(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run_id) = self.active_run_id {
+            self.run_control(ClientRequest::PauseAgentRun { run_id }, "pause run");
+        }
+        cx.notify();
+    }
+
+    fn resume_run(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run_id) = self.active_run_id {
+            self.run_control(ClientRequest::ResumeAgentRun { run_id }, "resume run");
+        }
+        cx.notify();
+    }
+
+    fn interrupt_run(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run_id) = self.active_run_id {
+            self.run_control(ClientRequest::InterruptAgentRun { run_id }, "interrupt run");
+        }
+        cx.notify();
+    }
+
+    fn retry_run(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(run_id) = self.active_run_id {
+            self.run_control(ClientRequest::RetryAgentStep { run_id }, "retry step");
+        }
+        cx.notify();
+    }
+
+    fn toggle_changes_sidebar(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.review.panel = ReviewPanel::Changes;
+        self.review.open = !self.review.open;
+        self.refresh_review();
+        cx.notify();
+    }
+
+    fn show_review(
+        &mut self,
+        _panel: ReviewPanel,
+        event: &ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_changes_sidebar(event, window, cx);
+    }
+
+    fn close_review(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.review.open = false;
+        cx.notify();
+    }
+
+    fn open_review_file(&mut self, path: String) {
         let response =
             self.connection
-                .request(RequestEnvelope::new(ClientRequest::FocusEditorTab {
+                .request(RequestEnvelope::new(ClientRequest::ReadWorkspaceFile {
                     project_id: self.project_id,
-                    pane_id,
-                    buffer_id,
+                    path,
                 }));
         match response.result {
-            Ok(ServerResponse::EditorLayout(layout)) => {
-                self.editor_layout = Some(layout);
-                if let Some(buffer) = self
-                    .open_buffers
-                    .iter()
-                    .find(|buffer| buffer.id == buffer_id)
-                    .cloned()
-                {
-                    self.activate_buffer(buffer);
-                } else {
-                    self.record_backend_error(
-                        "focus editor tab",
-                        LoomError::not_found("editor buffer", buffer_id),
-                    );
-                }
-                self.backend_status = BackendStatus::Connected;
+            Ok(ServerResponse::WorkspaceFile(mut file)) => {
+                file.content = bounded_to(&file.content, MAX_REVIEW_DIFF);
+                self.review.diff_path = Some(file.path.clone());
+                self.review.selected_file = Some(file);
+                self.review.open = true;
+                self.review.panel = ReviewPanel::Changes;
             }
-            Err(error) => self.record_backend_error("focus editor tab", error),
-            Ok(response) => self.record_unexpected_response("focus editor tab", response),
+            Err(error) => self.record_backend_error("read review file", error),
+            Ok(response) => self.record_backend_error(
+                "read review file",
+                Self::unexpected_response("workspace file", response),
+            ),
         }
-        cx.notify();
     }
 
-    fn restart(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = self.restart_demo() {
-            self.record_backend_error("new run", error);
-        }
-        cx.notify();
-    }
-
-    fn close(&mut self, _: &ClickEvent, window: &mut Window, _: &mut Context<Self>) {
-        window.remove_window();
-    }
-
-    fn restart_demo(&mut self) -> Result<(), LoomError> {
-        if matches!(
-            self.run_state,
-            AgentRunState::Planning
-                | AgentRunState::Executing
-                | AgentRunState::AwaitingApproval
-                | AgentRunState::Paused
-                | AgentRunState::Evaluating
-        ) {
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::InterruptAgentRun {
-                    run_id: self.run_id,
-                }))
-                .result?;
-        }
-        if self.demo_workspace {
-            reset_demo_workspace(&self.workspace_root)?;
-        }
-        let (session, run) = start_run(
-            &self.connection,
-            &self.workspace_root,
-            &self.model,
-            self.task.clone(),
-        )?;
-        self.project_id = session.project_id;
-        self.session_id = session.id;
-        self.run_id = run.id;
-        self.task = run.task;
-        self.after_sequence = None;
-        self.session_state = session.state;
-        self.run_state = run.state;
-        self.pending_approval = None;
-        self.timeline.clear();
-        self.summary = None;
-        self.open_buffers.clear();
-        self.active_buffer = None;
-        self.editor_input.set_text("");
-        self.editor_layout_cache = None;
-        self.editor_layout = None;
-        self.diagnostics.clear();
-        self.symbols.clear();
-        self.task_results.clear();
-        self.workspace_entries = workspace_snapshot(&self.connection, self.project_id)?
-            .entries
-            .len();
-        self.refresh_workspace_surfaces(true)?;
-        self.collect_events()
-    }
-
-    fn reject(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(call) = self.pending_approval.take() else {
-            return;
-        };
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::RejectAgentAction {
-                    run_id: self.run_id,
-                    tool_call_id: call.id,
-                    reason: Some("Denied in the GPUI shell".to_owned()),
+    fn render_session_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = div().flex().flex_col().gap_1();
+        for (index, session) in self.sessions.iter().enumerate() {
+            let active = session.id == self.active_session.id;
+            let session = session.clone();
+            let group = format!("session-row-{index}");
+            let menu_session = session.clone();
+            let actions = div()
+                .absolute()
+                .right_1()
+                .top_1()
+                .flex()
+                .items_center()
+                .opacity(if self.session_menu == Some(session.id) {
+                    1.
+                } else {
+                    0.
+                })
+                .group_hover(group.clone(), |style| style.opacity(1.))
+                .child(
+                    div()
+                        .id(("session-menu-button", index))
+                        .w(px(22.))
+                        .h(px(22.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .bg(rgb(0x242833))
+                        .hover(|style| style.bg(rgb(0x293244)))
+                        .text_sm()
+                        .text_color(rgb(0x94a3b8))
+                        .cursor_pointer()
+                        .tooltip(|_, cx| {
+                            cx.new(|_| LoomTooltip {
+                                text: "Session actions".into(),
+                            })
+                            .into()
+                        })
+                        .child("...")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.session_menu = if this.session_menu == Some(menu_session.id) {
+                                None
+                            } else {
+                                Some(menu_session.id)
+                            };
+                            cx.notify();
+                        })),
+                );
+            let menu = if self.session_menu == Some(session.id) {
+                let rename_session = session.clone();
+                let archive_session = session.clone();
+                Some(
+                    div()
+                        .id(("session-menu", index))
+                        .absolute()
+                        .right_1()
+                        .top(px(30.))
+                        .w(px(140.))
+                        .p_1()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .rounded_sm()
+                        .bg(rgb(0x20242c))
+                        .border_1()
+                        .border_color(rgb(0x3b4555))
+                        .child(
+                            div()
+                                .id(("session-menu-rename", index))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .text_sm()
+                                .text_color(rgb(0xb7c0d0))
+                                .hover(|style| style.bg(rgb(0x293244)))
+                                .cursor_pointer()
+                                .child("Rename")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.session_menu = None;
+                                    this.begin_session_rename(rename_session.clone(), window);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id(("session-menu-archive", index))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .text_sm()
+                                .text_color(rgb(0xd8a9ae))
+                                .hover(|style| style.bg(rgb(0x43292d)))
+                                .cursor_pointer()
+                                .child("Archive")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.session_menu = None;
+                                    this.load_session(archive_session.clone());
+                                    this.archive_active();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            } else {
+                None
+            };
+            let card = div()
+                .id(("session", index))
+                .group(group)
+                .relative()
+                .w_full()
+                .px_2()
+                .py_2()
+                .pr(px(58.))
+                .rounded_sm()
+                .bg(if active { rgb(0x293244) } else { rgb(0x1b1d24) })
+                .text_color(if active { rgb(0xf3f4f6) } else { rgb(0xb7c0d0) })
+                .cursor_pointer()
+                .child(
+                    div()
+                        .text_sm()
+                        .child(session.name.clone())
+                        .when(session.state == AgentSessionState::Archived, |element| {
+                            element.text_color(rgb(0x64748b))
+                        }),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(state_color(session.state))
+                        .child(session_state_name(session.state)),
+                )
+                .child(actions)
+                .when_some(menu, |element, menu| element.child(menu))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.session_menu = None;
+                    this.select_session(session.clone(), cx);
                 }));
-        if let Err(error) = response.result {
-            self.record_backend_error("rejection", error);
-            self.pending_approval = Some(call);
-            cx.notify();
-            return;
+            list = list.child(card);
         }
-        if let Err(error) = self.collect_events() {
-            self.record_backend_error("rejection event stream", error);
+        if self.sessions.is_empty() {
+            list = list.child(
+                div()
+                    .p_2()
+                    .text_sm()
+                    .text_color(rgb(0x8f98a6))
+                    .child("No sessions"),
+            );
         }
-        cx.notify();
+        list
     }
 
-    fn interrupt(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::InterruptAgentRun {
-                    run_id: self.run_id,
-                }));
-        if let Err(error) = response.result {
-            self.record_backend_error("interrupt", error);
-        } else if let Err(error) = self.collect_events() {
-            self.record_backend_error("interrupt event stream", error);
+    fn render_model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut picker = div()
+            .w_full()
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .bg(rgb(0x20242c))
+            .border_1()
+            .border_color(rgb(0x3b4555));
+        for (index, model) in self.models.iter().enumerate() {
+            let model = model.clone();
+            let active = model == self.model;
+            picker = picker.child(
+                div()
+                    .id(("model-option", index))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(if active { rgb(0x293244) } else { rgb(0x1b1d24) })
+                    .text_sm()
+                    .text_color(if active { rgb(0xe5e7eb) } else { rgb(0xb7c0d0) })
+                    .cursor_pointer()
+                    .child(model.as_str().to_owned())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_model(model.clone(), cx);
+                    })),
+            );
         }
-        cx.notify();
+        if self.models.is_empty() {
+            picker = picker.child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xfca5a5))
+                    .child("No model is configured"),
+            );
+        }
+        picker
     }
 
-    fn pause(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::PauseAgentRun {
-                    run_id: self.run_id,
-                }));
-        if let Err(error) = response.result {
-            self.record_backend_error("pause", error);
-        } else if let Err(error) = self.collect_events() {
-            self.record_backend_error("pause event stream", error);
-        }
-        cx.notify();
-    }
-
-    fn resume(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::ResumeAgentRun {
-                    run_id: self.run_id,
-                }));
-        if let Err(error) = response.result {
-            self.record_backend_error("resume", error);
-        } else if let Err(error) = self.collect_events() {
-            self.record_backend_error("resume event stream", error);
-        }
-        cx.notify();
-    }
-
-    fn retry(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::RetryAgentStep {
-                    run_id: self.run_id,
-                }));
-        if let Err(error) = response.result {
-            self.record_backend_error("retry", error);
-        } else if let Err(error) = self.collect_events() {
-            self.record_backend_error("retry event stream", error);
-        }
-        cx.notify();
-    }
-
-    fn render_timeline(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut timeline = div().flex().flex_col().gap_1().p_3().text_size(px(13.));
-        for item in &self.timeline {
-            timeline = timeline.child(self.render_timeline_item(item, cx));
-        }
-        timeline
-    }
-
-    fn render_timeline_item(
-        &self,
-        item: &TimelineItem,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    fn render_timeline_item(&self, item: &TimelineItem) -> gpui::AnyElement {
         match item {
+            TimelineItem::User(text) => div()
+                .p_2()
+                .rounded_sm()
+                .bg(rgb(0x20242c))
+                .text_color(rgb(0xdbeafe))
+                .child(div().text_xs().text_color(rgb(0x8f98a6)).child("You"))
+                .child(text.clone())
+                .into_any(),
+            TimelineItem::Assistant(text) => div()
+                .p_2()
+                .rounded_sm()
+                .bg(rgb(0x17191f))
+                .text_color(rgb(0xf3f4f6))
+                .child(div().text_xs().text_color(rgb(0x9ad7bd)).child("Agent"))
+                .child(text.clone())
+                .into_any(),
             TimelineItem::Plan(steps) => {
                 let mut card = div()
                     .p_2()
                     .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(0x30343f))
-                    .bg(rgb(0x20242c))
+                    .bg(rgb(0x1e293b))
                     .text_color(rgb(0xdbeafe))
-                    .child("Plan");
+                    .child(div().text_xs().text_color(rgb(0x93c5fd)).child("PLAN"));
                 for (index, step) in steps.iter().enumerate() {
-                    card = card.child(div().text_sm().text_color(rgb(0xb7c0d0)).child(format!(
-                        "{}. {}",
-                        index + 1,
-                        step
-                    )));
+                    card = card.child(div().text_sm().child(format!("{}. {}", index + 1, step)));
                 }
                 card.into_any()
             }
-            TimelineItem::Assistant(message) => div()
+            TimelineItem::StepStarted { index } => div()
                 .px_2()
-                .py_2()
-                .border_b_1()
-                .border_color(rgb(0x2a2d34))
-                .text_color(rgb(0xf3f4f6))
-                .child(div().text_sm().text_color(rgb(0x9da7b5)).child("Assistant"))
-                .child(message.clone())
+                .py_1()
+                .text_sm()
+                .text_color(rgb(0xfef3c7))
+                .child(format!("Step {} started", index + 1))
+                .into_any(),
+            TimelineItem::StepCompleted { index } => div()
+                .px_2()
+                .py_1()
+                .text_sm()
+                .text_color(rgb(0x9ad7bd))
+                .child(format!("Step {} completed", index + 1))
                 .into_any(),
             TimelineItem::ToolRequested { name, arguments } => div()
-                .px_2()
-                .py_2()
+                .p_2()
                 .rounded_sm()
-                .bg(rgb(0x1d2026))
-                .text_color(rgb(0xd1d5db))
+                .bg(rgb(0x242833))
+                .text_color(rgb(0xcbd5e1))
                 .child(format!("Tool requested  {name}"))
                 .child(
                     div()
-                        .text_sm()
+                        .text_xs()
                         .text_color(rgb(0x8f98a6))
                         .child(arguments.clone()),
                 )
                 .into_any(),
-            TimelineItem::Approval { name, active } => {
-                let mut card = div()
-                    .p_2()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(0xf59e0b))
-                    .bg(rgb(0x2a2415))
-                    .text_color(rgb(0xfef3c7))
-                    .child(format!("Approval required  {name}"));
-                if *active {
-                    card = card.child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .mt_2()
-                            .child(
-                                div()
-                                    .id("deny-action")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(0x4b2020))
-                                    .text_color(rgb(0xfca5a5))
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .child("Deny")
-                                    .on_click(cx.listener(Self::reject)),
-                            )
-                            .child(
-                                div()
-                                    .id("approve-action")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(0x14532d))
-                                    .text_color(rgb(0xbbf7d0))
-                                    .text_sm()
-                                    .cursor_pointer()
-                                    .child("Approve")
-                                    .on_click(cx.listener(Self::approve)),
-                            ),
-                    );
-                }
-                card.into_any()
-            }
+            TimelineItem::Approval { name, active } => div()
+                .p_2()
+                .rounded_sm()
+                .bg(if *active {
+                    rgb(0x493b1a)
+                } else {
+                    rgb(0x242833)
+                })
+                .text_color(if *active {
+                    rgb(0xfef3c7)
+                } else {
+                    rgb(0x94a3b8)
+                })
+                .child(if *active {
+                    format!("Approval required  {name}")
+                } else {
+                    format!("Approval resolved  {name}")
+                })
+                .into_any(),
             TimelineItem::ToolStarted(name) => div()
                 .px_2()
                 .py_1()
-                .rounded_sm()
-                .bg(rgb(0x172554))
-                .text_color(rgb(0xbfdbfe))
-                .child(format!("Tool running  {name}"))
+                .text_sm()
+                .text_color(rgb(0xcbd5e1))
+                .child(format!("Tool started  {name}"))
                 .into_any(),
             TimelineItem::ToolOutput(output) => div()
-                .px_2()
-                .py_1()
+                .mx_2()
+                .p_2()
                 .rounded_sm()
-                .bg(rgb(0x111827))
-                .text_color(rgb(0xcbd5e1))
-                .child(div().text_sm().text_color(rgb(0x8f98a6)).child("Output"))
+                .bg(rgb(0x0f1115))
+                .text_xs()
+                .text_color(rgb(0x94a3b8))
                 .child(output.clone())
                 .into_any(),
             TimelineItem::ToolCompleted { name, success } => div()
                 .px_2()
                 .py_1()
-                .rounded_sm()
-                .bg(if *success {
-                    rgb(0x14532d)
+                .text_sm()
+                .text_color(if *success {
+                    rgb(0x9ad7bd)
                 } else {
-                    rgb(0x4b2020)
+                    rgb(0xfca5a5)
                 })
-                .text_color(rgb(0xf3f4f6))
                 .child(format!(
                     "Tool completed  {name} [{}]",
                     if *success { "ok" } else { "failed" }
@@ -1911,8 +2076,7 @@ impl LoomView {
                 .child(status.clone())
                 .into_any(),
             TimelineItem::Error { operation, error } => div()
-                .px_2()
-                .py_1()
+                .p_2()
                 .rounded_sm()
                 .bg(rgb(0x4b2020))
                 .text_sm()
@@ -1925,467 +2089,727 @@ impl LoomView {
                     if error.retryable { " (retryable)" } else { "" }
                 ))
                 .into_any(),
-            TimelineItem::Summary { text, evidence } => div()
+            TimelineItem::NeedsInput(prompt) => div()
                 .p_2()
                 .rounded_sm()
-                .bg(rgb(0x064e3b))
-                .text_color(rgb(0xd1fae5))
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0x9ad7bd))
-                        .child("Final summary"),
-                )
-                .child(text.clone())
-                .children(evidence.iter().map(|link| {
-                    div()
-                        .text_sm()
-                        .text_color(rgb(0x9ad7bd))
-                        .child(format!("Evidence: {link}"))
-                }))
+                .bg(rgb(0x3b2f66))
+                .text_color(rgb(0xe9d5ff))
+                .child(format!("Agent needs input: {prompt}"))
                 .into_any(),
-        }
-    }
-
-    fn render_file_tree(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut tree = div().flex().flex_col().gap_1();
-        for (index, entry) in self.file_tree.iter().take(160).enumerate() {
-            let indent = "  ".repeat(entry.depth as usize);
-            let marker = match entry.kind {
-                loom_workspace::FileTreeEntryKind::File => "-",
-                loom_workspace::FileTreeEntryKind::Directory => "v",
-            };
-            let row = div()
-                .px_1()
-                .py_1()
-                .text_sm()
-                .text_color(if entry.kind == loom_workspace::FileTreeEntryKind::File {
-                    rgb(0xb7c0d0)
-                } else {
-                    rgb(0x8f98a6)
-                })
-                .child(format!("{indent}{marker} {}", entry.path));
-            if entry.kind == loom_workspace::FileTreeEntryKind::File {
-                let path = entry.path.clone();
-                tree = tree.child(
-                    row.id(("file-tree", index))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.open_file_path(path.clone());
-                            cx.notify();
-                        }))
-                        .into_any(),
-                );
-            } else {
-                tree = tree.child(row);
+            TimelineItem::Summary { text, evidence } => {
+                let mut card = div()
+                    .p_2()
+                    .rounded_sm()
+                    .bg(rgb(0x064e3b))
+                    .text_color(rgb(0xd1fae5))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x9ad7bd))
+                            .child("FINAL SUMMARY"),
+                    )
+                    .child(text.clone());
+                for link in evidence {
+                    card = card.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x9ad7bd))
+                            .child(format!("Evidence: {link}")),
+                    );
+                }
+                card.into_any()
             }
         }
-        tree
     }
 
-    fn render_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let panel = div()
-            .size_full()
+    fn render_timeline(&self) -> impl IntoElement {
+        let mut timeline = div().flex().flex_col().gap_2().p_3();
+        if self.timeline.is_empty() {
+            timeline = timeline.child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .text_color(rgb(0x8f98a6))
+                    .child("Start a task to see the agent run here."),
+            );
+        }
+        for item in &self.timeline {
+            timeline = timeline.child(self.render_timeline_item(item));
+        }
+        timeline
+    }
+
+    fn render_review(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = match self.review.panel {
+            ReviewPanel::Changes => "CHANGED FILES",
+            ReviewPanel::Diff => "READ-ONLY DIFF",
+            ReviewPanel::Evidence => "TASK EVIDENCE",
+        };
+        let mut body = div()
+            .flex_1()
+            .id("changes-sidebar-scroll")
+            .overflow_y_scroll()
             .flex()
             .flex_col()
-            .bg(rgb(0x111318))
-            .text_size(px(13.));
-        let mut tabs = div()
-            .w_full()
-            .h(px(34.))
-            .flex()
-            .items_center()
             .gap_1()
-            .px_2()
-            .bg(rgb(0x1b1d24))
-            .border_b_1()
-            .border_color(rgb(0x30343f));
-        for (index, buffer) in self.open_buffers.iter().enumerate() {
-            let active = self.active_buffer == Some(buffer.id);
-            let buffer_id = buffer.id;
-            tabs = tabs.child(
-                div()
-                    .id(("editor-tab", index))
-                    .px_2()
-                    .py_1()
-                    .bg(if active { rgb(0x293244) } else { rgb(0x20242c) })
-                    .text_color(if active { rgb(0xf3f4f6) } else { rgb(0x8f98a6) })
-                    .cursor_pointer()
-                    .child(format!(
-                        "{}{}",
-                        if buffer.dirty { "● " } else { "" },
-                        if buffer.external_change {
-                            format!("{} !", buffer.path)
-                        } else {
-                            buffer.path.clone()
-                        }
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.focus_tab(buffer_id, cx);
-                    })),
-            );
-        }
-        if self.open_buffers.is_empty() {
-            tabs = tabs.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x8f98a6))
-                    .child("No file open — select a file from the tree"),
-            );
-        }
-        let code = div()
-            .flex_1()
-            .id("editor-code")
-            .overflow_y_scroll()
-            .p_3()
-            .bg(rgb(0x0f1115))
-            .text_color(rgb(0xd1d5db))
-            .text_size(px(13.))
-            .key_context("CodeEditor")
-            .track_focus(&self.editor_focus_handle)
-            .cursor(CursorStyle::IBeam)
-            .on_action(cx.listener(Self::backspace))
-            .on_action(cx.listener(Self::delete))
-            .on_action(cx.listener(Self::left))
-            .on_action(cx.listener(Self::right))
-            .on_action(cx.listener(Self::up))
-            .on_action(cx.listener(Self::down))
-            .on_action(cx.listener(Self::select_left))
-            .on_action(cx.listener(Self::select_right))
-            .on_action(cx.listener(Self::select_up))
-            .on_action(cx.listener(Self::select_down))
-            .on_action(cx.listener(Self::select_all))
-            .on_action(cx.listener(Self::home))
-            .on_action(cx.listener(Self::end))
-            .on_action(cx.listener(Self::select_home))
-            .on_action(cx.listener(Self::select_end))
-            .on_action(cx.listener(Self::paste))
-            .on_action(cx.listener(Self::copy))
-            .on_action(cx.listener(Self::cut))
-            .on_action(cx.listener(Self::save_action))
-            .on_action(cx.listener(Self::undo_action))
-            .on_action(cx.listener(Self::redo_action))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::editor_mouse_down))
-            .on_mouse_move(cx.listener(Self::editor_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::editor_mouse_up))
-            .child(TextEditorElement { view: cx.entity() })
-            .when(self.active_buffer.is_none(), |element| {
-                element.child("Open a file to begin editing")
-            })
-            .when(
-                self.open_buffers
-                    .iter()
-                    .find(|buffer| Some(buffer.id) == self.active_buffer)
-                    .is_some_and(|buffer| buffer.external_change),
-                |element| {
-                    element.child(
+            .p_2();
+        match self.review.panel {
+            ReviewPanel::Changes => {
+                if self.review.changes.is_empty() {
+                    body = body.child(
                         div()
-                            .mt_2()
+                            .text_sm()
+                            .text_color(rgb(0x8f98a6))
+                            .child("No workspace changes recorded"),
+                    );
+                }
+                for (index, change) in self.review.changes.iter().take(24).enumerate() {
+                    let path = change.path.clone();
+                    body = body.child(
+                        div()
+                            .id(("review-file", index))
+                            .text_sm()
+                            .text_color(change_color(change.kind))
+                            .cursor_pointer()
+                            .child(format!("{:?}  {}", change.kind, change.path))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_review_file(path.clone());
+                                cx.notify();
+                            })),
+                    );
+                }
+                if let Some(status) = &self.review.vcs {
+                    for (index, file) in status.files.iter().take(24).enumerate() {
+                        let path = file.path.clone();
+                        body = body.child(
+                            div()
+                                .id(("git-file", index))
+                                .text_sm()
+                                .text_color(rgb(0xfef3c7))
+                                .cursor_pointer()
+                                .child(format!("Git  {:?}  {}", file.worktree, file.path))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_review_file(path.clone());
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                }
+                if let Some(file) = &self.review.selected_file {
+                    body = body.child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(0x93c5fd))
+                            .child(format!("READ-ONLY FILE  {}", file.path)),
+                    );
+                    body = body.child(
+                        div()
                             .p_2()
-                            .bg(rgb(0x4b2020))
-                            .text_color(rgb(0xfca5a5))
+                            .bg(rgb(0x0f1115))
+                            .text_xs()
+                            .text_color(rgb(0xcbd5e1))
+                            .child(file.content.clone()),
+                    );
+                }
+            }
+            ReviewPanel::Diff => {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child("Projection only; editing and staging are not available in M5."),
+                );
+                body = body.child(
+                    div()
+                        .mt_1()
+                        .p_2()
+                        .bg(rgb(0x0f1115))
+                        .text_xs()
+                        .text_color(rgb(0xcbd5e1))
+                        .child(
+                            self.review
+                                .diff
+                                .as_ref()
+                                .map(|diff| diff.patch.clone())
+                                .unwrap_or_else(|| "No diff available".to_owned()),
+                        ),
+                );
+            }
+            ReviewPanel::Evidence => {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child("TASK RESULT AND EVIDENCE"),
+                );
+                if let Some(summary) = &self.summary {
+                    body = body.child(
+                        div()
+                            .p_2()
+                            .rounded_sm()
+                            .bg(rgb(0x064e3b))
+                            .text_sm()
+                            .text_color(rgb(0xd1fae5))
+                            .child(summary.clone()),
+                    );
+                }
+                if self.tasks.is_empty() {
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8f98a6))
+                            .child("No validation tasks have been run"),
+                    );
+                }
+                for task in self.tasks.iter().take(6) {
+                    let status_color = match task.status {
+                        TaskStatus::Completed => rgb(0x9ad7bd),
+                        TaskStatus::Failed | TaskStatus::Cancelled => rgb(0xfca5a5),
+                        TaskStatus::Queued | TaskStatus::Running => rgb(0xfef3c7),
+                    };
+                    body = body.child(
+                        div()
+                            .p_2()
+                            .rounded_sm()
+                            .bg(rgb(0x20242c))
+                            .text_sm()
+                            .text_color(status_color)
+                            .child(format!("{}  {:?}", task.label, task.status))
                             .child(
                                 div()
-                                    .child("External change detected — reload before saving")
-                                    .child(
-                                        div()
-                                            .id("reload-editor")
-                                            .mt_1()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_sm()
-                                            .bg(rgb(0x78350f))
-                                            .text_color(rgb(0xfef3c7))
-                                            .cursor_pointer()
-                                            .child("Reload external file")
-                                            .on_click(cx.listener(Self::reload_active)),
-                                    ),
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(0x94a3b8))
+                                    .child(bounded(&task.output)),
                             ),
-                    )
-                },
-            );
-        panel.child(tabs).child(code)
-    }
-
-    fn render_diagnostics(&self) -> impl IntoElement {
-        let mut panel = div().flex().flex_col().gap_1().p_2();
-        panel = panel.child(
-            div()
-                .text_sm()
-                .text_color(rgb(0x8f98a6))
-                .child(format!("DIAGNOSTICS ({})", self.diagnostics.len())),
-        );
-        for diagnostic in self.diagnostics.iter().take(8) {
-            panel = panel.child(
-                div()
-                    .text_sm()
-                    .text_color(
-                        if matches!(
-                            diagnostic.severity,
-                            loom_language::DiagnosticSeverity::Error
-                        ) {
-                            rgb(0xfca5a5)
-                        } else {
-                            rgb(0xfef3c7)
-                        },
-                    )
-                    .child(format!(
-                        "{}:{} {}",
-                        diagnostic.range.start.line + 1,
-                        diagnostic.range.start.character + 1,
-                        diagnostic.message
-                    )),
-            );
-        }
-        if !self.symbols.is_empty() {
-            panel = panel.child(
-                div()
-                    .mt_1()
-                    .text_sm()
-                    .text_color(rgb(0x8f98a6))
-                    .child(format!("OUTLINE ({})", self.symbols.len())),
-            );
-            for symbol in self.symbols.iter().take(8) {
-                panel = panel.child(div().text_sm().text_color(rgb(0xb7c0d0)).child(format!(
-                    "{}  {}",
-                    symbol.location.range.start.line + 1,
-                    symbol.name
-                )));
+                    );
+                    for artifact in task.artifacts.iter().take(3) {
+                        body =
+                            body.child(div().text_xs().text_color(rgb(0x9ad7bd)).child(format!(
+                                "Artifact  {}{}",
+                                artifact.path,
+                                if artifact.exists { "" } else { " (missing)" }
+                            )));
+                    }
+                }
+                if self.review.evidence.is_empty() {
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8f98a6))
+                            .child("No evidence links attached"),
+                    );
+                }
+                for evidence in &self.review.evidence {
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x9ad7bd))
+                            .child(evidence.clone()),
+                    );
+                }
             }
         }
-        panel
+        div()
+            .w(px(340.))
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x17191f))
+            .border_l_1()
+            .border_color(rgb(0x30343f))
+            .child(
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_xs().text_color(rgb(0x93c5fd)).child(title))
+                    .child(
+                        div()
+                            .id("close-review")
+                            .px_1()
+                            .py_1()
+                            .text_xs()
+                            .text_color(rgb(0x8f98a6))
+                            .cursor_pointer()
+                            .child("Close")
+                            .on_click(cx.listener(Self::close_review)),
+                    )
+                    .child(
+                        div().text_xs().text_color(rgb(0x8f98a6)).child(
+                            self.review
+                                .vcs
+                                .as_ref()
+                                .map(|status| {
+                                    format!(
+                                        "{}  {}",
+                                        status.branch.as_deref().unwrap_or("detached"),
+                                        if status.clean { "clean" } else { "modified" }
+                                    )
+                                })
+                                .unwrap_or_else(|| "VCS unavailable".to_owned()),
+                        ),
+                    ),
+            )
+            .child(body)
     }
 
-    fn render_task_results(&self) -> impl IntoElement {
-        let mut panel = div().flex().flex_col().gap_1().p_2();
-        panel = panel.child(
-            div()
-                .text_sm()
-                .text_color(rgb(0x8f98a6))
-                .child("TASK RESULTS"),
-        );
-        for task in self.task_results.iter().rev().take(4) {
-            panel = panel.child(
+    fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let placeholder = if self.pending_input.is_some() {
+            "Answer the agent question..."
+        } else if self.active_run_id.is_some() {
+            "Send follow-up direction..."
+        } else {
+            "Describe a task..."
+        };
+        div()
+            .w_full()
+            .p_2()
+            .bg(rgb(0x17191f))
+            .border_t_1()
+            .border_color(rgb(0x30343f))
+            .child(
+                div()
+                    .w_full()
+                    .min_h(px(42.))
+                    .p_2()
+                    .rounded_sm()
+                    .bg(rgb(0x0f1115))
+                    .border_1()
+                    .border_color(rgb(0x3b4555))
+                    .text_color(rgb(0xe5e7eb))
+                    .key_context("Composer")
+                    .track_focus(&self.composer_focus_handle)
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_composer))
+                    .on_action(cx.listener(Self::backspace))
+                    .on_action(cx.listener(Self::delete))
+                    .on_action(cx.listener(Self::left))
+                    .on_action(cx.listener(Self::right))
+                    .on_action(cx.listener(Self::select_all))
+                    .on_action(cx.listener(Self::home))
+                    .on_action(cx.listener(Self::end))
+                    .on_action(cx.listener(Self::paste))
+                    .on_action(cx.listener(Self::copy))
+                    .on_action(cx.listener(Self::submit))
+                    .child(TextInputElement {
+                        view: cx.entity(),
+                        field: InputField::Composer,
+                    })
+                    .when(self.composer.text.is_empty(), |element| {
+                        element.child(div().text_sm().text_color(rgb(0x64748b)).child(placeholder))
+                    }),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x64748b))
+                            .child("Enter to send  |  backend-owned session state"),
+                    )
+                    .child(
+                        div()
+                            .id("send-composer")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x2563eb))
+                            .text_sm()
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .child("Send")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_composer();
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
+    fn render_rename_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(dialog) = &self.rename_dialog else {
+            return div().into_any();
+        };
+        div()
+            .id("rename-dialog")
+            .absolute()
+            .top(px(120.))
+            .left(px(280.))
+            .w(px(420.))
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x1b1d24))
+            .border_1()
+            .border_color(rgb(0x3b4555))
+            .shadow_lg()
+            .text_color(rgb(0xe5e7eb))
+            .child(
                 div()
                     .text_sm()
-                    .text_color(if task.status == TaskStatus::Completed {
-                        rgb(0x9ad7bd)
-                    } else if matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled) {
-                        rgb(0xfca5a5)
-                    } else {
-                        rgb(0xfef3c7)
-                    })
-                    .child(format!(
-                        "{}  {:?}  {} evidence",
-                        task.label,
-                        task.status,
-                        task.evidence.len()
-                    )),
-            );
-            for evidence in task.evidence.iter().take(2) {
-                panel = panel.child(
+                    .text_color(rgb(0xf3f4f6))
+                    .child("Rename session"),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(format!("Current name: {}", dialog.session.name)),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .w_full()
+                    .min_h(px(34.))
+                    .p_2()
+                    .rounded_sm()
+                    .bg(rgb(0x0f1115))
+                    .border_1()
+                    .border_color(rgb(0x3b4555))
+                    .text_color(rgb(0xe5e7eb))
+                    .key_context("RenameDialog")
+                    .track_focus(&self.rename_focus_handle)
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_rename))
+                    .on_action(cx.listener(Self::backspace))
+                    .on_action(cx.listener(Self::delete))
+                    .on_action(cx.listener(Self::left))
+                    .on_action(cx.listener(Self::right))
+                    .on_action(cx.listener(Self::select_all))
+                    .on_action(cx.listener(Self::home))
+                    .on_action(cx.listener(Self::end))
+                    .on_action(cx.listener(Self::paste))
+                    .on_action(cx.listener(Self::copy))
+                    .on_action(cx.listener(Self::submit))
+                    .child(TextInputElement {
+                        view: cx.entity(),
+                        field: InputField::Rename,
+                    }),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("cancel-rename")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x242833))
+                            .hover(|style| style.bg(rgb(0x293244)))
+                            .text_sm()
+                            .cursor_pointer()
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.rename_dialog = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("confirm-rename")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x2563eb))
+                            .text_sm()
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .child("Rename")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_rename();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any()
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let run_active = self.run_state.is_some_and(|state| {
+            matches!(
+                state,
+                AgentRunState::Planning
+                    | AgentRunState::Executing
+                    | AgentRunState::AwaitingApproval
+                    | AgentRunState::Paused
+                    | AgentRunState::NeedsInput
+                    | AgentRunState::Evaluating
+            )
+        });
+        let mut actions = div().flex().items_center().gap_1();
+        if self.pending_approval.is_some() {
+            actions = actions
+                .child(
                     div()
+                        .id("approve-action")
+                        .w(px(26.))
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .bg(rgb(0x202b28))
+                        .hover(|style| style.bg(rgb(0x29433a)))
+                        .text_color(rgb(0x9ad7bd))
                         .text_sm()
-                        .text_color(rgb(0x8f98a6))
-                        .child(format!("-> {} ({})", evidence.label, evidence.uri)),
+                        .cursor_pointer()
+                        .tooltip(|_, cx| {
+                            cx.new(|_| LoomTooltip {
+                                text: "Approve action".into(),
+                            })
+                            .into()
+                        })
+                        .child("✓")
+                        .on_click(cx.listener(Self::approve_action)),
+                )
+                .child(
+                    div()
+                        .id("reject-action")
+                        .w(px(26.))
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .bg(rgb(0x2b2022))
+                        .hover(|style| style.bg(rgb(0x43292d)))
+                        .text_color(rgb(0xfca5a5))
+                        .text_sm()
+                        .cursor_pointer()
+                        .tooltip(|_, cx| {
+                            cx.new(|_| LoomTooltip {
+                                text: "Reject action".into(),
+                            })
+                            .into()
+                        })
+                        .child("×")
+                        .on_click(cx.listener(Self::reject_action)),
+                );
+        }
+        if self.active_run_id.is_some() {
+            if run_active && self.run_state != Some(AgentRunState::Paused) {
+                actions = actions.child(
+                    div()
+                        .id("pause-run")
+                        .w(px(26.))
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .bg(rgb(0x242833))
+                        .hover(|style| style.bg(rgb(0x293244)))
+                        .text_color(rgb(0xfef3c7))
+                        .text_sm()
+                        .cursor_pointer()
+                        .tooltip(|_, cx| {
+                            cx.new(|_| LoomTooltip {
+                                text: "Pause run".into(),
+                            })
+                            .into()
+                        })
+                        .child("Ⅱ")
+                        .on_click(cx.listener(Self::pause_run)),
+                );
+            }
+            if self.run_state == Some(AgentRunState::Paused) {
+                actions = actions.child(
+                    div()
+                        .id("resume-run")
+                        .w(px(26.))
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .bg(rgb(0x202b28))
+                        .hover(|style| style.bg(rgb(0x29433a)))
+                        .text_color(rgb(0x9ad7bd))
+                        .text_sm()
+                        .cursor_pointer()
+                        .tooltip(|_, cx| {
+                            cx.new(|_| LoomTooltip {
+                                text: "Resume run".into(),
+                            })
+                            .into()
+                        })
+                        .child("▶")
+                        .on_click(cx.listener(Self::resume_run)),
+                );
+            }
+            if run_active {
+                actions = actions.child(
+                    div()
+                        .id("interrupt-run")
+                        .w(px(26.))
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .bg(rgb(0x2b2022))
+                        .hover(|style| style.bg(rgb(0x43292d)))
+                        .text_color(rgb(0xfca5a5))
+                        .text_sm()
+                        .cursor_pointer()
+                        .tooltip(|_, cx| {
+                            cx.new(|_| LoomTooltip {
+                                text: "Interrupt run".into(),
+                            })
+                            .into()
+                        })
+                        .child("■")
+                        .on_click(cx.listener(Self::interrupt_run)),
+                );
+            }
+            if self.run_state == Some(AgentRunState::Failed) {
+                actions = actions.child(
+                    div()
+                        .id("retry-run")
+                        .w(px(26.))
+                        .h(px(26.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .bg(rgb(0x242833))
+                        .hover(|style| style.bg(rgb(0x293244)))
+                        .text_color(rgb(0xfef3c7))
+                        .text_sm()
+                        .cursor_pointer()
+                        .tooltip(|_, cx| {
+                            cx.new(|_| LoomTooltip {
+                                text: "Retry failed step".into(),
+                            })
+                            .into()
+                        })
+                        .child("↻")
+                        .on_click(cx.listener(Self::retry_run)),
                 );
             }
         }
-        panel
-    }
-
-    fn render_vcs_status(&self) -> impl IntoElement {
-        let text = if let Some(status) = &self.vcs_status {
-            format!(
-                "Git  {}  |  {} changed  |  {} conflicts",
-                status.branch.as_deref().unwrap_or("detached"),
-                status.files.len(),
-                status.conflicts.len()
-            )
-        } else {
-            format!(
-                "Git unavailable{}",
-                self.vcs_error
-                    .as_deref()
-                    .map_or(String::new(), |error| format!(": {error}"))
-            )
-        };
-        div()
-            .text_sm()
-            .text_color(
-                if self
-                    .vcs_status
-                    .as_ref()
-                    .is_some_and(|status| !status.conflicts.is_empty())
-                {
-                    rgb(0xfca5a5)
-                } else {
-                    rgb(0x8f98a6)
-                },
-            )
-            .child(text)
-    }
-
-    fn render_backend_status(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (label, color) = match &self.backend_status {
-            BackendStatus::Connected => {
-                ("Backend: in-process / connected".to_owned(), rgb(0x9ad7bd))
-            }
-            BackendStatus::Error(error) => (
-                format!(
-                    "Backend: error [{}]{}",
-                    error.code,
-                    if error.retryable { " / retryable" } else { "" }
-                ),
-                rgb(0xfca5a5),
-            ),
-        };
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .text_sm()
-            .text_color(color)
-            .child(label)
+        actions
             .child(
                 div()
-                    .id("reconnect-backend")
-                    .px_1()
-                    .py_1()
+                    .id("refresh")
+                    .w(px(26.))
+                    .h(px(26.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
                     .rounded_sm()
-                    .bg(rgb(0x293244))
-                    .text_color(rgb(0xdbeafe))
+                    .bg(rgb(0x20242c))
+                    .hover(|style| style.bg(rgb(0x293244)))
+                    .text_color(rgb(0x94a3b8))
+                    .text_sm()
                     .cursor_pointer()
-                    .child("Reconnect")
-                    .on_click(cx.listener(Self::reconnect)),
+                    .tooltip(|_, cx| {
+                        cx.new(|_| LoomTooltip {
+                            text: "Refresh session state".into(),
+                        })
+                        .into()
+                    })
+                    .child("↻")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.refresh();
+                        cx.notify();
+                    })),
             )
-    }
-
-    fn reconnect(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.backend_status = BackendStatus::Connected;
-        let _ = self.refresh_workspace_surfaces(false);
-        if let Err(error) = self.collect_events() {
-            self.record_backend_error("reconnect event stream", error);
-        }
-        cx.notify();
+            .child(
+                div()
+                    .id("reconnect")
+                    .w(px(26.))
+                    .h(px(26.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .bg(rgb(0x20242c))
+                    .hover(|style| style.bg(rgb(0x293244)))
+                    .text_color(rgb(0x94a3b8))
+                    .text_sm()
+                    .cursor_pointer()
+                    .tooltip(|_, cx| {
+                        cx.new(|_| LoomTooltip {
+                            text: "Reconnect backend".into(),
+                        })
+                        .into()
+                    })
+                    .child("⇄")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reconnect();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("toggle-changes-sidebar")
+                    .w(px(26.))
+                    .h(px(26.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .bg(rgb(0x20242c))
+                    .hover(|style| style.bg(rgb(0x293244)))
+                    .text_color(rgb(0x94a3b8))
+                    .text_sm()
+                    .cursor_pointer()
+                    .tooltip(|_, cx| {
+                        cx.new(|_| LoomTooltip {
+                            text: "Toggle changes sidebar".into(),
+                        })
+                        .into()
+                    })
+                    .child("Δ")
+                    .on_click(cx.listener(Self::toggle_changes_sidebar)),
+            )
     }
 }
 
 impl Render for LoomView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let approval_visible = self.pending_approval.is_some();
-        let run_active = matches!(
-            self.run_state,
-            AgentRunState::Planning
-                | AgentRunState::Executing
-                | AgentRunState::AwaitingApproval
-                | AgentRunState::Paused
-                | AgentRunState::Evaluating
-        );
-        let run_failed = self.run_state == AgentRunState::Failed;
-        let mut header_actions = div().flex().items_center().gap_1();
-        if run_active {
-            header_actions = header_actions.child(
-                div()
-                    .id("interrupt-run")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x4b2020))
-                    .text_color(rgb(0xfca5a5))
-                    .text_sm()
-                    .cursor_pointer()
-                    .child("Interrupt")
-                    .on_click(cx.listener(Self::interrupt)),
-            );
-            if self.run_state != AgentRunState::Paused {
-                header_actions = header_actions.child(
-                    div()
-                        .id("pause-run")
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(rgb(0x493b1a))
-                        .text_color(rgb(0xfef3c7))
-                        .text_sm()
-                        .cursor_pointer()
-                        .child("Pause")
-                        .on_click(cx.listener(Self::pause)),
-                );
-            }
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (backend_label, backend_color) = match &self.backend_status {
+            BackendStatus::Connected => (
+                format!("{} / connected", self.connection.description()),
+                rgb(0x9ad7bd),
+            ),
+            BackendStatus::Error(error) => (
+                if error.retryable {
+                    format!("{} / retryable error", self.connection.description())
+                } else {
+                    format!("{} / backend error", self.connection.description())
+                },
+                rgb(0xfca5a5),
+            ),
+        };
+        let project_name = self
+            .project
+            .as_ref()
+            .map(|project| project.name.as_str())
+            .unwrap_or("Project");
+        let decorations = window.window_decorations();
+        let rounded = !window.is_maximized();
+        let shadow_size = px(8.);
+        if matches!(decorations, Decorations::Client { .. }) {
+            window.set_client_inset(shadow_size);
         }
-        if self.run_state == AgentRunState::Paused {
-            header_actions = header_actions.child(
-                div()
-                    .id("resume-run")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x14532d))
-                    .text_color(rgb(0xbbf7d0))
-                    .text_sm()
-                    .cursor_pointer()
-                    .child("Resume")
-                    .on_click(cx.listener(Self::resume)),
-            );
-        }
-        if run_failed {
-            header_actions = header_actions.child(
-                div()
-                    .id("retry-run")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x78350f))
-                    .text_color(rgb(0xfef3c7))
-                    .text_sm()
-                    .cursor_pointer()
-                    .child("Retry step")
-                    .on_click(cx.listener(Self::retry)),
-            );
-        }
-        header_actions = header_actions
-            .child(
-                div()
-                    .id("refresh-events")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x293244))
-                    .text_color(rgb(0xdbeafe))
-                    .text_sm()
-                    .cursor_pointer()
-                    .child("Refresh")
-                    .on_click(cx.listener(Self::refresh)),
-            )
-            .child(
-                div()
-                    .id("new-run")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x293244))
-                    .text_color(rgb(0xdbeafe))
-                    .text_sm()
-                    .cursor_pointer()
-                    .child("New run")
-                    .on_click(cx.listener(Self::restart)),
-            )
-            .child(
-                div()
-                    .id("close-window")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x4b2020))
-                    .text_color(rgb(0xfca5a5))
-                    .text_sm()
-                    .cursor_pointer()
-                    .child("Close")
-                    .on_click(cx.listener(Self::close)),
-            );
-        div()
+        let content = div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(0x111318))
@@ -2393,30 +2817,76 @@ impl Render for LoomView {
             .text_size(px(13.))
             .child(
                 div()
-                    .h(px(38.))
+                    .h(px(40.))
                     .w_full()
+                    .px_3()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .px_3()
                     .bg(rgb(0x1b1d24))
                     .border_b_1()
                     .border_color(rgb(0x30343f))
                     .child(
-                        div().flex().items_center().gap_2().child("Loom").child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0x8f98a6))
-                                .child("M5 coding workspace"),
-                        ),
+                        div()
+                            .id("window-titlebar-drag")
+                            .flex()
+                            .flex_1()
+                            .items_center()
+                            .gap_2()
+                            .cursor_pointer()
+                            .window_control_area(WindowControlArea::Drag)
+                            .on_mouse_down(MouseButton::Left, |event, window, _| {
+                                if event.click_count == 2 {
+                                    window.zoom_window();
+                                } else {
+                                    window.start_window_move();
+                                }
+                            })
+                            .child("Loom")
+                            .child(div().text_sm().text_color(rgb(0x8f98a6)).child(format!(
+                                "{}  /  {}",
+                                project_name, self.active_session.name
+                            ))),
                     )
-                    .child(format!(
-                        "{}  -  {}",
-                        self.model.as_str(),
-                        run_state_name(self.run_state)
-                    ))
-                    .child(self.render_backend_status(cx))
-                    .child(header_actions),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(backend_color)
+                            .child(format!(
+                                "{}  {}",
+                                session_state_name(self.session_state),
+                                backend_label
+                            ))
+                            .child(
+                                div().flex().items_center().gap_1().ml_2().child(
+                                    div()
+                                        .id("window-close")
+                                        .w(px(22.))
+                                        .h(px(22.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_sm()
+                                        .text_sm()
+                                        .text_color(rgb(0xfca5a5))
+                                        .hover(|style| style.bg(rgb(0x7f1d1d)))
+                                        .cursor_pointer()
+                                        .tooltip(|_, cx| {
+                                            cx.new(|_| LoomTooltip {
+                                                text: "Close window".into(),
+                                            })
+                                            .into()
+                                        })
+                                        .child("×")
+                                        .on_click(|_, window, _| {
+                                            window.remove_window();
+                                        }),
+                                ),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -2425,109 +2895,119 @@ impl Render for LoomView {
                     .overflow_hidden()
                     .child(
                         div()
-                            .w(px(240.))
+                            .w(px(250.))
                             .h_full()
+                            .p_2()
                             .flex()
+                            .flex_col()
+                            .gap_2()
                             .bg(rgb(0x17191f))
                             .border_r_1()
                             .border_color(rgb(0x30343f))
                             .child(
                                 div()
-                                    .w(px(40.))
-                                    .h_full()
-                                    .p_2()
                                     .flex()
                                     .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div().text_xs().text_color(rgb(0x93c5fd)).child("PROJECTS"),
+                                    )
+                                    .children(self.projects.iter().enumerate().map(
+                                        |(index, project)| {
+                                            let active = project.id == self.project_id;
+                                            let project = project.clone();
+                                            div()
+                                                .id(("project", index))
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(if active {
+                                                    rgb(0x242833)
+                                                } else {
+                                                    rgb(0x1b1d24)
+                                                })
+                                                .text_xs()
+                                                .text_color(if active {
+                                                    rgb(0xe5e7eb)
+                                                } else {
+                                                    rgb(0x8f98a6)
+                                                })
+                                                .cursor_pointer()
+                                                .child(project.name.clone())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.select_project(project.clone(), cx);
+                                                }))
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("model-picker")
+                                    .w_full()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x1b1d24))
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .cursor_pointer()
+                                    .child(format!("Model  {}", self.model.as_str()))
+                                    .on_click(cx.listener(Self::toggle_model_picker)),
+                            )
+                            .when(self.model_picker_open, |element| {
+                                element.child(self.render_model_picker(cx))
+                            })
+                            .child(
+                                div()
+                                    .flex()
                                     .items_center()
-                                    .gap_2()
-                                    .bg(rgb(0x14161a))
-                                    .border_r_1()
-                                    .border_color(rgb(0x30343f))
+                                    .justify_between()
                                     .child(
-                                        div()
-                                            .w(px(24.))
-                                            .h(px(24.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded_sm()
-                                            .bg(rgb(0x293d5a))
-                                            .text_sm()
-                                            .child("L"),
+                                        div().text_xs().text_color(rgb(0x93c5fd)).child("SESSIONS"),
                                     )
                                     .child(
                                         div()
-                                            .w(px(24.))
-                                            .h(px(24.))
+                                            .id("new-session")
+                                            .w(px(26.))
+                                            .h(px(26.))
                                             .flex()
                                             .items_center()
                                             .justify_center()
                                             .rounded_sm()
-                                            .bg(rgb(0x292d38))
+                                            .bg(rgb(0x20242c))
+                                            .hover(|style| style.bg(rgb(0x293244)))
                                             .text_sm()
-                                            .text_color(rgb(0xdbeafe))
-                                            .child("S"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("activity-refresh")
-                                            .w(px(24.))
-                                            .h(px(24.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded_sm()
-                                            .text_sm()
-                                            .text_color(rgb(0x8f98a6))
-                                            .child("R")
+                                            .text_color(rgb(0x94a3b8))
                                             .cursor_pointer()
-                                            .on_click(cx.listener(Self::refresh)),
+                                            .tooltip(|_, cx| {
+                                                cx.new(|_| LoomTooltip {
+                                                    text: "Create session".into(),
+                                                })
+                                                .into()
+                                            })
+                                            .child("+")
+                                            .on_click(cx.listener(Self::new_session)),
                                     ),
                             )
                             .child(
                                 div()
                                     .flex_1()
-                                    .h_full()
-                                    .p_3()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .child(
-                                        div().text_sm().text_color(rgb(0x8f98a6)).child("SESSIONS"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("session-entry")
-                                            .p_2()
-                                            .rounded_sm()
-                                            .bg(rgb(0x292d38))
-                                            .child(div().text_sm().child("* Coding workspace"))
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(0x94a3b8))
-                                                    .child(session_state_name(self.session_state)),
-                                            )
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(Self::refresh)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("new-session")
-                                            .text_sm()
-                                            .text_color(rgb(0x8f98a6))
-                                            .child("+ New session")
-                                            .cursor_pointer()
-                                            .on_click(cx.listener(Self::restart)),
-                                    )
-                                    .child(
-                                        div()
-                                            .mt_2()
-                                            .text_sm()
-                                            .text_color(rgb(0x8f98a6))
-                                            .child("FILES"),
-                                    )
-                                    .child(self.render_file_tree(cx)),
+                                    .id("session-list")
+                                    .overflow_y_scroll()
+                                    .child(self.render_session_list(cx)),
+                            )
+                            .child(
+                                div()
+                                    .pt_2()
+                                    .border_t_1()
+                                    .border_color(rgb(0x30343f))
+                                    .text_xs()
+                                    .text_color(rgb(0x64748b))
+                                    .child(format!(
+                                        "{} sessions  |  {}",
+                                        self.sessions.len(),
+                                        self.workspace_root.display()
+                                    )),
                             ),
                     )
                     .child(
@@ -2535,235 +3015,278 @@ impl Render for LoomView {
                             .flex_1()
                             .h_full()
                             .flex()
+                            .flex_col()
                             .overflow_hidden()
                             .child(
                                 div()
-                                    .flex_1()
-                                    .h_full()
+                                    .w_full()
+                                    .px_3()
+                                    .py_2()
                                     .flex()
-                                    .flex_col()
-                                    .overflow_hidden()
-                                    .child(
-                                        div()
-                                            .h(px(34.))
-                                            .w_full()
-                                            .px_2()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .bg(rgb(0x17191f))
-                                            .border_b_1()
-                                            .border_color(rgb(0x30343f))
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(0x8f98a6))
-                                                    .child("WORKSPACE"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("open-readme")
-                                                    .px_2()
-                                                    .py_1()
-                                                    .text_sm()
-                                                    .bg(rgb(0x293244))
-                                                    .cursor_pointer()
-                                                    .child("Open README")
-                                                    .on_click(cx.listener(Self::open_readme)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("save-buffer")
-                                                    .px_2()
-                                                    .py_1()
-                                                    .text_sm()
-                                                    .bg(rgb(0x14532d))
-                                                    .cursor_pointer()
-                                                    .child("Save")
-                                                    .on_click(cx.listener(Self::save_active)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("undo-buffer")
-                                                    .px_2()
-                                                    .py_1()
-                                                    .text_sm()
-                                                    .bg(rgb(0x20242c))
-                                                    .cursor_pointer()
-                                                    .child("Undo")
-                                                    .on_click(cx.listener(Self::undo_active)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("redo-buffer")
-                                                    .px_2()
-                                                    .py_1()
-                                                    .text_sm()
-                                                    .bg(rgb(0x20242c))
-                                                    .cursor_pointer()
-                                                    .child("Redo")
-                                                    .on_click(cx.listener(Self::redo_active)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .text_color(rgb(0x8f98a6))
-                                                    .child("Ctrl+P  Ctrl+Shift+F  Ctrl+S"),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .overflow_hidden()
-                                            .child(self.render_editor(cx)),
-                                    )
-                                    .child(
-                                        div()
-                                            .h(px(150.))
-                                            .w_full()
-                                            .flex()
-                                            .id("workspace-results")
-                                            .overflow_y_scroll()
-                                            .bg(rgb(0x17191f))
-                                            .border_t_1()
-                                            .border_color(rgb(0x30343f))
-                                            .child(div().flex_1().child(self.render_diagnostics()))
-                                            .child(
-                                                div().flex_1().child(self.render_task_results()),
-                                            ),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .w(px(340.))
-                                    .h_full()
-                                    .id("agent-timeline")
-                                    .overflow_y_scroll()
-                                    .bg(rgb(0x17191f))
-                                    .border_l_1()
+                                    .items_center()
+                                    .justify_between()
+                                    .bg(rgb(0x14161a))
+                                    .border_b_1()
                                     .border_color(rgb(0x30343f))
                                     .child(
-                                        div().id("timeline").p_2().child(self.render_timeline(cx)),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .h_full()
-                            .w(px(280.))
-                            .p_3()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .bg(rgb(0x17191f))
-                            .border_l_1()
-                            .border_color(rgb(0x30343f))
-                            .child(div().text_sm().text_color(rgb(0x8f98a6)).child("INSPECTOR"))
-                            .child(
-                                div()
-                                    .p_2()
-                                    .rounded_sm()
-                                    .bg(rgb(0x20242c))
-                                    .child(format!("Run  {}", run_state_name(self.run_state)))
-                                    .child(
                                         div()
-                                            .text_sm()
-                                            .text_color(rgb(0x8f98a6))
-                                            .child(format!("Model  {}", self.model.as_str())),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0xb7c0d0))
-                                    .child(format!("Task  {}", self.task)),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x8f98a6))
-                                    .child(format!("Workspace  {}", self.workspace_root.display())),
-                            )
-                            .child(
-                                div().text_sm().text_color(rgb(0x8f98a6)).child(format!(
-                                    "Workspace entries  {}",
-                                    self.workspace_entries
-                                )),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x8f98a6))
-                                    .child(format!("Providers  {}", self.provider_count)),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x8f98a6))
-                                    .child(format!("Events  {}", self.timeline.len())),
-                            )
-                            .child(
-                                div().text_sm().text_color(rgb(0x8f98a6)).child(format!(
-                                    "Search matches  {}",
-                                    self.search_matches.len()
-                                )),
-                            )
-                            .child(div().text_sm().text_color(rgb(0x8f98a6)).child(format!(
-                                        "Language services  {}",
-                                        self.language_services
-                                            .iter()
-                                            .filter(|service| {
-                                                service.state
-                                                    == loom_language::LanguageServiceState::Ready
-                                            })
-                                            .count()
-                                    )))
-                            .child(self.render_vcs_status())
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .id("build-task")
-                                            .px_2()
-                                            .py_1()
-                                            .text_sm()
-                                            .bg(rgb(0x293244))
-                                            .cursor_pointer()
-                                            .child("Build")
-                                            .on_click(cx.listener(Self::run_build)),
+                                            .flex()
+                                            .flex_col()
+                                            .child(self.active_run.as_ref().map_or_else(
+                                                || "No active run".to_owned(),
+                                                |run| run.task.clone(),
+                                            ))
+                                            .child(
+                                                div().text_xs().text_color(rgb(0x8f98a6)).child(
+                                                    format!(
+                                                        "{}  |  {}  |  {} model{}",
+                                                        self.run_state
+                                                            .map(run_state_name)
+                                                            .unwrap_or("idle"),
+                                                        self.model.as_str(),
+                                                        self.models.len(),
+                                                        if self.models.len() == 1 {
+                                                            ""
+                                                        } else {
+                                                            "s"
+                                                        }
+                                                    ),
+                                                ),
+                                            ),
                                     )
                                     .child(
                                         div()
-                                            .id("test-task")
-                                            .px_2()
-                                            .py_1()
-                                            .text_sm()
-                                            .bg(rgb(0x293244))
-                                            .cursor_pointer()
-                                            .child("Test")
-                                            .on_click(cx.listener(Self::run_test)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("lint-task")
-                                            .px_2()
-                                            .py_1()
-                                            .text_sm()
-                                            .bg(rgb(0x293244))
-                                            .cursor_pointer()
-                                            .child("Lint")
-                                            .on_click(cx.listener(Self::run_lint)),
+                                            .flex()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .id("review-changes")
+                                                    .w(px(28.))
+                                                    .h(px(26.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x20242c))
+                                                    .hover(|style| style.bg(rgb(0x293244)))
+                                                    .text_sm()
+                                                    .text_color(rgb(0x94a3b8))
+                                                    .cursor_pointer()
+                                                    .tooltip(|_, cx| {
+                                                        cx.new(|_| LoomTooltip {
+                                                            text: "Changed files".into(),
+                                                        })
+                                                        .into()
+                                                    })
+                                                    .child("Δ")
+                                                    .on_click(cx.listener(
+                                                        |this, event, window, cx| {
+                                                            this.show_review(
+                                                                ReviewPanel::Changes,
+                                                                event,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("review-diff")
+                                                    .w(px(28.))
+                                                    .h(px(26.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x20242c))
+                                                    .hover(|style| style.bg(rgb(0x293244)))
+                                                    .text_sm()
+                                                    .text_color(rgb(0x94a3b8))
+                                                    .cursor_pointer()
+                                                    .tooltip(|_, cx| {
+                                                        cx.new(|_| LoomTooltip {
+                                                            text: "Read-only diff".into(),
+                                                        })
+                                                        .into()
+                                                    })
+                                                    .child("≡")
+                                                    .on_click(cx.listener(
+                                                        |this, event, window, cx| {
+                                                            this.show_review(
+                                                                ReviewPanel::Diff,
+                                                                event,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("review-evidence")
+                                                    .w(px(28.))
+                                                    .h(px(26.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x20242c))
+                                                    .hover(|style| style.bg(rgb(0x293244)))
+                                                    .text_sm()
+                                                    .text_color(rgb(0x94a3b8))
+                                                    .cursor_pointer()
+                                                    .tooltip(|_, cx| {
+                                                        cx.new(|_| LoomTooltip {
+                                                            text: "Task evidence".into(),
+                                                        })
+                                                        .into()
+                                                    })
+                                                    .child("✓")
+                                                    .on_click(cx.listener(
+                                                        |this, event, window, cx| {
+                                                            this.show_review(
+                                                                ReviewPanel::Evidence,
+                                                                event,
+                                                                window,
+                                                                cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            )
+                                            .when(
+                                                self.workspace_root.join("Cargo.toml").is_file(),
+                                                |element| {
+                                                    element
+                                                        .child(
+                                                            div()
+                                                                .id("run-build")
+                                                                .w(px(28.))
+                                                                .h(px(26.))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .rounded_sm()
+                                                                .bg(rgb(0x20242c))
+                                                                .hover(|style| {
+                                                                    style.bg(rgb(0x293244))
+                                                                })
+                                                                .text_sm()
+                                                                .text_color(rgb(0x94a3b8))
+                                                                .cursor_pointer()
+                                                                .tooltip(|_, cx| {
+                                                                    cx.new(|_| LoomTooltip {
+                                                                        text: "Run cargo check"
+                                                                            .into(),
+                                                                    })
+                                                                    .into()
+                                                                })
+                                                                .child("✓")
+                                                                .on_click(
+                                                                    cx.listener(|_, _, _, _| {}),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id("run-tests")
+                                                                .w(px(28.))
+                                                                .h(px(26.))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .rounded_sm()
+                                                                .bg(rgb(0x20242c))
+                                                                .hover(|style| {
+                                                                    style.bg(rgb(0x293244))
+                                                                })
+                                                                .text_sm()
+                                                                .text_color(rgb(0x94a3b8))
+                                                                .cursor_pointer()
+                                                                .tooltip(|_, cx| {
+                                                                    cx.new(|_| LoomTooltip {
+                                                                        text: "Run cargo test"
+                                                                            .into(),
+                                                                    })
+                                                                    .into()
+                                                                })
+                                                                .child("T")
+                                                                .on_click(
+                                                                    cx.listener(|_, _, _, _| {}),
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id("run-lint")
+                                                                .w(px(28.))
+                                                                .h(px(26.))
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .rounded_sm()
+                                                                .bg(rgb(0x20242c))
+                                                                .hover(|style| {
+                                                                    style.bg(rgb(0x293244))
+                                                                })
+                                                                .text_sm()
+                                                                .text_color(rgb(0x94a3b8))
+                                                                .cursor_pointer()
+                                                                .tooltip(|_, cx| {
+                                                                    cx.new(|_| LoomTooltip {
+                                                                        text: "Run cargo clippy"
+                                                                            .into(),
+                                                                    })
+                                                                    .into()
+                                                                })
+                                                                .child("≡")
+                                                                .on_click(
+                                                                    cx.listener(|_, _, _, _| {}),
+                                                                ),
+                                                        )
+                                                },
+                                            )
+                                            .when(true, |_| div())
+                                            .child(
+                                                div()
+                                                    .id("toggle-changes-sidebar")
+                                                    .w(px(28.))
+                                                    .h(px(26.))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded_sm()
+                                                    .bg(rgb(0x20242c))
+                                                    .hover(|style| style.bg(rgb(0x293244)))
+                                                    .text_sm()
+                                                    .text_color(rgb(0x94a3b8))
+                                                    .cursor_pointer()
+                                                    .tooltip(|_, cx| {
+                                                        cx.new(|_| LoomTooltip {
+                                                            text: "Toggle changes sidebar".into(),
+                                                        })
+                                                        .into()
+                                                    })
+                                                    .child("Δ")
+                                                    .on_click(
+                                                        cx.listener(Self::toggle_changes_sidebar),
+                                                    ),
+                                            ),
                                     ),
                             )
-                            .when(approval_visible, |element| {
-                                element
-                                    .border_1()
-                                    .border_color(rgb(0xf59e0b))
-                                    .child("Approval is waiting")
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .id("timeline-scroll")
+                                    .overflow_y_scroll()
+                                    .child(self.render_timeline()),
+                            )
+                            .child(self.render_composer(cx))
+                            .when(self.rename_dialog.is_some(), |element| {
+                                element.child(self.render_rename_dialog(cx))
                             }),
-                    ),
+                    )
+                    .when(self.review.open, |element| {
+                        element.child(self.render_review(cx))
+                    }),
             )
             .child(
                 div()
@@ -2775,142 +3298,334 @@ impl Render for LoomView {
                     .bg(rgb(0x1b1d24))
                     .border_t_1()
                     .border_color(rgb(0x30343f))
-                    .text_sm()
-                    .text_color(if self.summary.is_some() {
-                        rgb(0x9ad7bd)
-                    } else {
-                        rgb(0x8f98a6)
-                    })
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
                     .child(format!(
-                        "{}  |  {}  |  {} events  |  {} buffers{}  |  {}",
+                        "{}  |  {} timeline items  |  {}",
                         session_state_name(self.session_state),
-                        self.workspace_root.display(),
                         self.timeline.len(),
-                        self.open_buffers.len(),
-                        if self.open_buffers.iter().any(|buffer| buffer.dirty) {
-                            "  |  unsaved"
+                        if self.demo_workspace {
+                            "demo workspace"
                         } else {
-                            ""
-                        },
-                        match &self.backend_status {
-                            BackendStatus::Connected => "backend connected",
-                            BackendStatus::Error(_) => "backend error",
+                            "workspace"
                         }
                     )),
-            )
+            );
+        let content = content
+            .when(rounded, |element| element.rounded_lg())
+            .border_1()
+            .border_color(if rounded {
+                rgb(0x3b4555)
+            } else {
+                rgb(0x1b1d24)
+            })
+            .overflow_hidden();
+        match decorations {
+            Decorations::Server => div().size_full().child(content),
+            Decorations::Client { .. } => div()
+                .size_full()
+                .bg(transparent_black())
+                .child(
+                    canvas(
+                        |_bounds, window, _cx| {
+                            window.insert_hitbox(
+                                Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    window.window_bounds().get_bounds().size,
+                                ),
+                                HitboxBehavior::Normal,
+                            )
+                        },
+                        move |_bounds, hitbox, window, _cx| {
+                            let size = window.window_bounds().get_bounds().size;
+                            let Some(edge) =
+                                resize_edge(window.mouse_position(), shadow_size, size)
+                            else {
+                                return;
+                            };
+                            window.set_cursor_style(
+                                match edge {
+                                    ResizeEdge::Top | ResizeEdge::Bottom => {
+                                        CursorStyle::ResizeUpDown
+                                    }
+                                    ResizeEdge::Left | ResizeEdge::Right => {
+                                        CursorStyle::ResizeLeftRight
+                                    }
+                                    ResizeEdge::TopLeft | ResizeEdge::BottomRight => {
+                                        CursorStyle::ResizeUpLeftDownRight
+                                    }
+                                    ResizeEdge::TopRight | ResizeEdge::BottomLeft => {
+                                        CursorStyle::ResizeUpRightDownLeft
+                                    }
+                                },
+                                &hitbox,
+                            );
+                        },
+                    )
+                    .size_full()
+                    .absolute(),
+                )
+                .child(content)
+                .on_mouse_move(|_, window, _| window.refresh())
+                .on_mouse_down(MouseButton::Left, move |event, window, _| {
+                    let size = window.window_bounds().get_bounds().size;
+                    if let Some(edge) = resize_edge(event.position, shadow_size, size) {
+                        window.start_window_resize(edge);
+                    }
+                }),
+        }
     }
 }
 
-fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
+fn resize_edge(
+    position: Point<Pixels>,
+    inset: Pixels,
+    size: gpui::Size<Pixels>,
+) -> Option<ResizeEdge> {
+    let edge = if position.y < inset && position.x < inset {
+        ResizeEdge::TopLeft
+    } else if position.y < inset && position.x > size.width - inset {
+        ResizeEdge::TopRight
+    } else if position.y < inset {
+        ResizeEdge::Top
+    } else if position.y > size.height - inset && position.x < inset {
+        ResizeEdge::BottomLeft
+    } else if position.y > size.height - inset && position.x > size.width - inset {
+        ResizeEdge::BottomRight
+    } else if position.y > size.height - inset {
+        ResizeEdge::Bottom
+    } else if position.x < inset {
+        ResizeEdge::Left
+    } else if position.x > size.width - inset {
+        ResizeEdge::Right
+    } else {
+        return None;
+    };
+    Some(edge)
+}
+
+fn bounded(value: &str) -> String {
+    bounded_to(value, MAX_TIMELINE_OUTPUT)
+}
+
+fn bounded_to(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let end = value
+        .char_indices()
+        .map(|(index, character)| (index, index + character.len_utf8()))
+        .take_while(|(_, end)| *end <= limit)
+        .map(|(_, end)| end)
+        .last()
+        .unwrap_or_default();
+    let mut result = value[..end].to_owned();
+    result.push_str("\n...[output truncated]");
+    result
+}
+
+fn state_color(state: AgentSessionState) -> gpui::Rgba {
+    match state {
+        AgentSessionState::Completed => rgb(0x9ad7bd),
+        AgentSessionState::Failed | AgentSessionState::Cancelled => rgb(0xfca5a5),
+        AgentSessionState::AwaitingApproval | AgentSessionState::NeedsInput => rgb(0xfef3c7),
+        AgentSessionState::Archived => rgb(0x64748b),
+        _ => rgb(0x93c5fd),
+    }
+}
+
+fn change_color(kind: loom_workspace::WorkspaceChangeKind) -> gpui::Rgba {
+    match kind {
+        loom_workspace::WorkspaceChangeKind::Created => rgb(0x9ad7bd),
+        loom_workspace::WorkspaceChangeKind::Deleted => rgb(0xfca5a5),
+        loom_workspace::WorkspaceChangeKind::Modified => rgb(0xfef3c7),
+    }
+}
+
+fn session_state_for_run(state: AgentRunState) -> AgentSessionState {
+    match state {
+        AgentRunState::Planning => AgentSessionState::Planning,
+        AgentRunState::Executing => AgentSessionState::Executing,
+        AgentRunState::AwaitingApproval => AgentSessionState::AwaitingApproval,
+        AgentRunState::Paused => AgentSessionState::Paused,
+        AgentRunState::NeedsInput => AgentSessionState::NeedsInput,
+        AgentRunState::Evaluating => AgentSessionState::Evaluating,
+        AgentRunState::Completed => AgentSessionState::Completed,
+        AgentRunState::Failed => AgentSessionState::Failed,
+        AgentRunState::Cancelled => AgentSessionState::Cancelled,
+    }
+}
+
+const fn session_state_name(state: AgentSessionState) -> &'static str {
+    match state {
+        AgentSessionState::Idle => "idle",
+        AgentSessionState::Queued => "queued",
+        AgentSessionState::Planning => "planning",
+        AgentSessionState::AwaitingApproval => "awaiting approval",
+        AgentSessionState::Paused => "paused",
+        AgentSessionState::Executing => "executing",
+        AgentSessionState::Evaluating => "evaluating",
+        AgentSessionState::NeedsInput => "needs input",
+        AgentSessionState::Completed => "completed",
+        AgentSessionState::Failed => "failed",
+        AgentSessionState::Cancelled => "cancelled",
+        AgentSessionState::Archived => "archived",
+    }
+}
+
+const fn run_state_name(state: AgentRunState) -> &'static str {
+    match state {
+        AgentRunState::Planning => "planning",
+        AgentRunState::Executing => "executing",
+        AgentRunState::AwaitingApproval => "awaiting approval",
+        AgentRunState::Paused => "paused",
+        AgentRunState::NeedsInput => "needs input",
+        AgentRunState::Evaluating => "evaluating",
+        AgentRunState::Completed => "completed",
+        AgentRunState::Failed => "failed",
+        AgentRunState::Cancelled => "cancelled",
+    }
+}
+
+fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> {
     let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
         client_version: CURRENT_PROTOCOL_VERSION,
         capabilities: CapabilitySet::new([
             Capability::CreateAgentSession,
             Capability::ReadAgentSession,
+            Capability::ControlAgentSession,
             Capability::SubscribeSessionEvents,
             Capability::StartAgentRun,
             Capability::ReadAgentRun,
             Capability::ControlAgentRun,
             Capability::PauseAgentRun,
             Capability::ResumeAgentRun,
-            Capability::ForkAgentSession,
-            Capability::RetryFromCheckpoint,
             Capability::ApproveAgentAction,
-            Capability::ListProviders,
-            Capability::ReadProviderHealth,
-            Capability::ReadUsage,
-            Capability::InspectContext,
             Capability::OpenWorkspace,
             Capability::ReadWorkspace,
-            Capability::WriteWorkspace,
-            Capability::SubscribeWorkspaceEvents,
-            Capability::OpenTerminal,
-            Capability::ControlTerminal,
+            Capability::ReadVcsStatus,
+            Capability::ReadVcsDiff,
             Capability::ReadTask,
             Capability::StartTask,
             Capability::ControlTask,
-            Capability::ConfigureApprovalPolicy,
-            Capability::ManageCheckpoints,
-            Capability::TakeoverWorkspace,
-            Capability::WorkspaceNavigation,
-            Capability::SearchWorkspace,
-            Capability::ReadWorkspaceInstructions,
-            Capability::ReadDiagnostics,
-            Capability::ReadSymbols,
-            Capability::GoToDefinition,
-            Capability::FindReferences,
-            Capability::LanguageServiceLifecycle,
-            Capability::ReadVcsStatus,
-            Capability::ReadVcsDiff,
-            Capability::MutateVcsIndex,
-            Capability::CreateVcsCommit,
             Capability::ReadTaskEvidence,
             Capability::JsonProtocol,
         ]),
     }));
     match response.result? {
         ServerResponse::Negotiated(_) => Ok(()),
-        response => Err(unexpected_response("negotiation", response)),
+        response => Err(LoomView::unexpected_response("negotiation", response)),
+    }
+}
+
+fn open_workspace(
+    connection: &ClientConnection,
+    project_id: ProjectId,
+    root: &Path,
+) -> Result<(), LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+        project_id,
+        root: root.display().to_string(),
+    }));
+    match response.result? {
+        ServerResponse::WorkspaceOpened(_) => Ok(()),
+        response => Err(LoomView::unexpected_response("workspace open", response)),
     }
 }
 
 fn create_session(
-    connection: &InProcessConnection,
-) -> Result<loom_core::AgentSessionSnapshot, LoomError> {
+    connection: &ClientConnection,
+    project_id: ProjectId,
+    name: &str,
+) -> Result<AgentSessionSnapshot, LoomError> {
     let response = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-        project_id: ProjectId::new(),
-        name: "Coding workspace".to_owned(),
+        project_id,
+        name: name.to_owned(),
     }));
     match response.result? {
         ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
-        response => Err(unexpected_response("session creation", response)),
+        response => Err(LoomView::unexpected_response("session creation", response)),
     }
 }
 
-fn provider_count(connection: &InProcessConnection) -> Result<usize, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ListProviders));
+fn list_sessions(
+    connection: &ClientConnection,
+    project_id: ProjectId,
+) -> Result<Vec<AgentSessionSnapshot>, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::ListAgentSessions {
+        project_id: Some(project_id),
+        include_archived: false,
+    }));
     match response.result? {
-        ServerResponse::Providers { providers } => Ok(providers.len()),
-        response => Err(unexpected_response("provider list", response)),
+        ServerResponse::AgentSessions { sessions } => Ok(sessions),
+        response => Err(LoomView::unexpected_response("session list", response)),
+    }
+}
+
+fn list_projects(connection: &ClientConnection) -> Result<Vec<ProjectSnapshot>, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::ListProjects));
+    match response.result? {
+        ServerResponse::Projects { projects } => Ok(projects),
+        response => Err(LoomView::unexpected_response("project list", response)),
+    }
+}
+
+fn select_remote_project(
+    projects: &[ProjectSnapshot],
+    requested_root: Option<&Path>,
+) -> Result<ProjectSnapshot, LoomError> {
+    let project = requested_root
+        .and_then(|root| {
+            let requested = root.to_string_lossy();
+            projects.iter().find(|project| {
+                project
+                    .root
+                    .as_deref()
+                    .is_some_and(|project_root| project_root == requested)
+            })
+        })
+        .or_else(|| projects.first())
+        .cloned()
+        .ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::NotFound,
+                "remote backend has no open projects",
+                false,
+            )
+        })?;
+    Ok(project)
+}
+
+fn list_models(connection: &ClientConnection) -> Result<Vec<ModelId>, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::ListModels));
+    match response.result? {
+        ServerResponse::Models { models } => Ok(models.into_iter().map(|model| model.id).collect()),
+        response => Err(LoomView::unexpected_response("model list", response)),
     }
 }
 
 fn start_run(
-    connection: &InProcessConnection,
+    connection: &ClientConnection,
+    session: &AgentSessionSnapshot,
     workspace_root: &Path,
     model: &ModelId,
-    task: String,
-) -> Result<(loom_core::AgentSessionSnapshot, AgentRunSnapshot), LoomError> {
-    let session = create_session(connection)?;
+    task: &str,
+) -> Result<AgentRunSnapshot, LoomError> {
     let response = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
         session_id: session.id,
-        task,
+        task: task.to_owned(),
         model: model.clone(),
         workspace_root: workspace_root.display().to_string(),
         system_instructions: Some(
             "Work methodically, use the available tools, and report validation.".to_owned(),
         ),
         repository_instructions: Some(
-            "Keep the demonstration change small and workspace-scoped.".to_owned(),
+            "Keep the change focused and provide reviewable evidence.".to_owned(),
         ),
     }));
-    let run = match response.result? {
-        ServerResponse::AgentRunStarted(run) => run,
-        response => return Err(unexpected_response("agent run start", response)),
-    };
-    Ok((session, run))
-}
-
-fn workspace_snapshot(
-    connection: &InProcessConnection,
-    project_id: ProjectId,
-) -> Result<loom_workspace::WorkspaceSnapshot, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceSnapshot {
-        project_id,
-    }));
     match response.result? {
-        ServerResponse::WorkspaceSnapshot(snapshot) => Ok(snapshot),
-        response => Err(unexpected_response("workspace snapshot", response)),
+        ServerResponse::AgentRunStarted(run) => Ok(run),
+        response => Err(LoomView::unexpected_response("agent run start", response)),
     }
 }
 
@@ -2919,6 +3634,11 @@ struct UiOptions {
     workspace: Option<PathBuf>,
     task: String,
     demo: bool,
+    model: ModelId,
+    endpoint: Option<String>,
+    api_key: Option<String>,
+    remote: Option<String>,
+    token: Option<String>,
 }
 
 impl UiOptions {
@@ -2928,7 +3648,14 @@ impl UiOptions {
     {
         let mut workspace = None;
         let mut task = "make a small repository change and validate it".to_owned();
-        let mut demo = true;
+        let mut demo = false;
+        let mut model = env::var("LOOM_MODEL")
+            .map(ModelId::new)
+            .unwrap_or_else(|_| ModelId::new("deterministic/demo"));
+        let mut endpoint = env::var("LOOM_OPENAI_ENDPOINT").ok();
+        let api_key = env::var("LOOM_API_KEY").ok();
+        let mut remote = env::var("LOOM_REMOTE_URL").ok();
+        let token = env::var("LOOM_TOKEN").ok();
         let mut args = args.into_iter().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -2949,13 +3676,46 @@ impl UiOptions {
                         ));
                     }
                 }
+                "--model" => {
+                    model = ModelId::new(args.next().ok_or_else(|| {
+                        LoomError::invalid_request("--model requires a model id")
+                    })?);
+                    if model.as_str().trim().is_empty() {
+                        return Err(LoomError::invalid_request(
+                            "--model requires a non-empty model id",
+                        ));
+                    }
+                }
+                "--endpoint" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| LoomError::invalid_request("--endpoint requires a URL"))?;
+                    if value.trim().is_empty() {
+                        return Err(LoomError::invalid_request(
+                            "--endpoint requires a non-empty URL",
+                        ));
+                    }
+                    endpoint = Some(value);
+                }
+                "--remote" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| LoomError::invalid_request("--remote requires a URL"))?;
+                    if value.trim().is_empty() {
+                        return Err(LoomError::invalid_request(
+                            "--remote requires a non-empty URL",
+                        ));
+                    }
+                    remote = Some(value);
+                    demo = false;
+                }
                 "--demo" => {
                     workspace = None;
                     demo = true;
                 }
                 "--help" | "-h" => {
                     return Err(LoomError::invalid_request(
-                        "usage: loom-ui [--workspace PATH] [--task DESCRIPTION] [--demo]",
+                        "usage: loom-ui [--workspace PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] [--remote URL] [--demo]",
                     ));
                 }
                 unknown => {
@@ -2969,6 +3729,11 @@ impl UiOptions {
             workspace,
             task,
             demo,
+            model,
+            endpoint,
+            api_key,
+            remote,
+            token,
         })
     }
 }
@@ -2995,7 +3760,25 @@ fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomError> 
         return Ok((root, false));
     }
 
-    let root = std::env::temp_dir().join("loom-m5-ui-demo");
+    if !options.demo {
+        let root = fs::canonicalize(env::current_dir().map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not determine current workspace: {error}"),
+                false,
+            )
+        })?)
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not open current workspace: {error}"),
+                false,
+            )
+        })?;
+        return Ok((root, false));
+    }
+
+    let root = env::temp_dir().join("loom-m5-ui-demo");
     fs::create_dir_all(&root).map_err(|error| {
         LoomError::new(
             ErrorCode::ToolExecution,
@@ -3007,7 +3790,7 @@ fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomError> 
     if !readme.exists() {
         fs::write(
             readme,
-            "Workspace used by the Loom M5 GPUI coding workspace.\n",
+            "Workspace used by the Loom M5 agent workspace demo.\n",
         )
         .map_err(|error| {
             LoomError::new(
@@ -3020,79 +3803,34 @@ fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomError> 
     if !root.join(".git").is_dir() {
         GitService::init(&root)?;
     }
-    reset_demo_workspace(&root)?;
     Ok((root, options.demo))
 }
 
-fn reset_demo_workspace(root: &Path) -> Result<(), LoomError> {
-    let demo_file = root.join("loom-m5-demo.txt");
-    if demo_file.exists() {
-        fs::remove_file(demo_file).map_err(|error| {
-            LoomError::new(
-                ErrorCode::ToolExecution,
-                format!("could not reset UI workspace: {error}"),
-                false,
-            )
-        })?;
-    }
-    Ok(())
+fn backend_persistence_path(root: &Path) -> Result<PathBuf, LoomError> {
+    let state_root = env::var_os("LOOM_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("XDG_STATE_HOME").map(PathBuf::from))
+        .or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
+        })
+        .unwrap_or_else(|| env::temp_dir().join("loom-state"));
+    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+    let project_key = digest
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(state_root
+        .join("loom")
+        .join("projects")
+        .join(format!("{project_key}.json")))
 }
 
-fn unexpected_response(operation: &str, response: ServerResponse) -> LoomError {
-    LoomError::new(
-        ErrorCode::Internal,
-        format!("backend returned unexpected {operation} response: {response:?}"),
-        false,
-    )
-}
-
-fn backend_error_timeline_item(operation: &str, error: &LoomError) -> TimelineItem {
-    TimelineItem::Error {
-        operation: operation.to_owned(),
-        error: error.clone(),
-    }
-}
-
-fn session_state_for_run(state: AgentRunState) -> AgentSessionState {
-    match state {
-        AgentRunState::Planning => AgentSessionState::Planning,
-        AgentRunState::Executing => AgentSessionState::Executing,
-        AgentRunState::AwaitingApproval => AgentSessionState::AwaitingApproval,
-        AgentRunState::Paused => AgentSessionState::Paused,
-        AgentRunState::Evaluating => AgentSessionState::Evaluating,
-        AgentRunState::Completed => AgentSessionState::Completed,
-        AgentRunState::Failed => AgentSessionState::Failed,
-        AgentRunState::Cancelled => AgentSessionState::Cancelled,
-    }
-}
-
-const fn session_state_name(state: AgentSessionState) -> &'static str {
-    match state {
-        AgentSessionState::Idle => "idle",
-        AgentSessionState::Queued => "queued",
-        AgentSessionState::Planning => "planning",
-        AgentSessionState::AwaitingApproval => "awaiting approval",
-        AgentSessionState::Paused => "paused",
-        AgentSessionState::Executing => "executing",
-        AgentSessionState::Evaluating => "evaluating",
-        AgentSessionState::NeedsInput => "needs input",
-        AgentSessionState::Completed => "completed",
-        AgentSessionState::Failed => "failed",
-        AgentSessionState::Cancelled => "cancelled",
-    }
-}
-
-const fn run_state_name(state: AgentRunState) -> &'static str {
-    match state {
-        AgentRunState::Planning => "planning",
-        AgentRunState::Executing => "executing",
-        AgentRunState::AwaitingApproval => "awaiting approval",
-        AgentRunState::Paused => "paused",
-        AgentRunState::Evaluating => "evaluating",
-        AgentRunState::Completed => "completed",
-        AgentRunState::Failed => "failed",
-        AgentRunState::Cancelled => "cancelled",
-    }
+fn stable_project_id(root: &Path) -> ProjectId {
+    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    ProjectId::from_uuid(Uuid::from_bytes(bytes))
 }
 
 fn main() {
@@ -3105,37 +3843,21 @@ fn main() {
     };
     Application::new().run(move |cx: &mut App| {
         cx.bind_keys([
-            KeyBinding::new("backspace", Backspace, Some("CodeEditor")),
-            KeyBinding::new("delete", Delete, Some("CodeEditor")),
-            KeyBinding::new("left", Left, Some("CodeEditor")),
-            KeyBinding::new("right", Right, Some("CodeEditor")),
-            KeyBinding::new("up", Up, Some("CodeEditor")),
-            KeyBinding::new("down", Down, Some("CodeEditor")),
-            KeyBinding::new("shift-left", SelectLeft, Some("CodeEditor")),
-            KeyBinding::new("shift-right", SelectRight, Some("CodeEditor")),
-            KeyBinding::new("shift-up", SelectUp, Some("CodeEditor")),
-            KeyBinding::new("shift-down", SelectDown, Some("CodeEditor")),
-            KeyBinding::new("home", Home, Some("CodeEditor")),
-            KeyBinding::new("end", End, Some("CodeEditor")),
-            KeyBinding::new("shift-home", SelectHome, Some("CodeEditor")),
-            KeyBinding::new("shift-end", SelectEnd, Some("CodeEditor")),
-            KeyBinding::new("cmd-a", SelectAll, Some("CodeEditor")),
-            KeyBinding::new("ctrl-a", SelectAll, Some("CodeEditor")),
-            KeyBinding::new("cmd-v", Paste, Some("CodeEditor")),
-            KeyBinding::new("ctrl-v", Paste, Some("CodeEditor")),
-            KeyBinding::new("cmd-c", Copy, Some("CodeEditor")),
-            KeyBinding::new("ctrl-c", Copy, Some("CodeEditor")),
-            KeyBinding::new("cmd-x", Cut, Some("CodeEditor")),
-            KeyBinding::new("ctrl-x", Cut, Some("CodeEditor")),
-            KeyBinding::new("cmd-s", Save, Some("CodeEditor")),
-            KeyBinding::new("ctrl-s", Save, Some("CodeEditor")),
-            KeyBinding::new("cmd-z", Undo, Some("CodeEditor")),
-            KeyBinding::new("ctrl-z", Undo, Some("CodeEditor")),
-            KeyBinding::new("cmd-shift-z", Redo, Some("CodeEditor")),
-            KeyBinding::new("ctrl-shift-z", Redo, Some("CodeEditor")),
-            KeyBinding::new("ctrl-y", Redo, Some("CodeEditor")),
+            KeyBinding::new("backspace", Backspace, Some("Composer")),
+            KeyBinding::new("delete", Delete, Some("Composer")),
+            KeyBinding::new("left", Left, Some("Composer")),
+            KeyBinding::new("right", Right, Some("Composer")),
+            KeyBinding::new("cmd-a", SelectAll, Some("Composer")),
+            KeyBinding::new("ctrl-a", SelectAll, Some("Composer")),
+            KeyBinding::new("home", Home, Some("Composer")),
+            KeyBinding::new("end", End, Some("Composer")),
+            KeyBinding::new("cmd-v", Paste, Some("Composer")),
+            KeyBinding::new("ctrl-v", Paste, Some("Composer")),
+            KeyBinding::new("cmd-c", Copy, Some("Composer")),
+            KeyBinding::new("ctrl-c", Copy, Some("Composer")),
+            KeyBinding::new("enter", Submit, Some("Composer")),
         ]);
-        let view = match LoomView::try_new(&options, cx.focus_handle()) {
+        let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
             Ok(view) => view,
             Err(error) => {
                 eprintln!("could not initialize Loom UI: {error}");
@@ -3143,16 +3865,17 @@ fn main() {
                 return;
             }
         };
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+        let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
         let window = match cx.open_window(
             WindowOptions {
                 focus: true,
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Loom M5".into()),
-                    ..Default::default()
-                }),
-                window_background: WindowBackgroundAppearance::Opaque,
-                window_decorations: Some(WindowDecorations::Server),
+                titlebar: None,
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Client),
+                is_movable: true,
+                is_resizable: true,
+                is_minimizable: true,
+                window_min_size: Some(size(px(720.), px(480.))),
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
@@ -3166,10 +3889,10 @@ fn main() {
             }
         };
         if let Err(error) = window.update(cx, |view, window, cx| {
-            view.editor_focus_handle.focus(window);
+            view.composer_focus_handle.focus(window);
             cx.activate(true);
         }) {
-            eprintln!("failed to focus Loom editor: {error}");
+            eprintln!("failed to focus Loom composer: {error}");
             cx.quit();
         }
     });
@@ -3187,9 +3910,9 @@ mod tests {
         assert_eq!(buffer.text, "axc\nsecond");
 
         buffer.move_to(2, false);
-        buffer.move_to(4, true);
+        buffer.select_to(4);
         assert_eq!(buffer.selected_range, 2..4);
-        buffer.replace_range(buffer.selected_range.clone(), "😀");
+        buffer.replace_utf16(None, "😀");
         assert_eq!(buffer.text, "ax😀second");
         assert_eq!(buffer.cursor_offset(), 6);
         assert_eq!(buffer.offset_to_utf16(6), 4);
@@ -3197,16 +3920,10 @@ mod tests {
     }
 
     #[test]
-    fn backend_error_projection_keeps_structured_error_fields() {
-        let error = LoomError::new(ErrorCode::ExternalChange, "changed on disk", true);
-        let item = backend_error_timeline_item("save buffer", &error);
-        assert_eq!(
-            item,
-            TimelineItem::Error {
-                operation: "save buffer".to_owned(),
-                error,
-            }
-        );
+    fn bounded_projection_is_explicit() {
+        let value = bounded_to("abcdef", 3);
+        assert_eq!(value, "abc\n...[output truncated]");
+        assert!(bounded_to("😀😀", 4).starts_with('😀'));
     }
 
     #[test]
@@ -3216,28 +3933,35 @@ mod tests {
             "--workspace".to_owned(),
             "/tmp/project".to_owned(),
             "--task".to_owned(),
-            "fix the editor".to_owned(),
+            "fix the agent flow".to_owned(),
+            "--model".to_owned(),
+            "gpt-4o-mini".to_owned(),
+            "--endpoint".to_owned(),
+            "http://127.0.0.1:8000/v1/chat/completions".to_owned(),
+            "--remote".to_owned(),
+            "ws://127.0.0.1:8080/ws".to_owned(),
         ])
         .unwrap();
         assert_eq!(options.workspace, Some(PathBuf::from("/tmp/project")));
-        assert_eq!(options.task, "fix the editor");
+        assert_eq!(options.task, "fix the agent flow");
+        assert_eq!(options.model.as_str(), "gpt-4o-mini");
+        assert_eq!(
+            options.endpoint.as_deref(),
+            Some("http://127.0.0.1:8000/v1/chat/completions")
+        );
+        assert_eq!(options.remote.as_deref(), Some("ws://127.0.0.1:8080/ws"));
         assert!(!options.demo);
     }
 
     #[test]
-    fn run_state_projection_keeps_agent_and_session_status_aligned() {
-        assert_eq!(
-            session_state_for_run(AgentRunState::AwaitingApproval),
-            AgentSessionState::AwaitingApproval
-        );
-        assert_eq!(
-            session_state_for_run(AgentRunState::Completed),
-            AgentSessionState::Completed
-        );
-        assert_eq!(run_state_name(AgentRunState::Paused), "paused");
-        assert_eq!(
-            session_state_name(AgentSessionState::NeedsInput),
-            "needs input"
+    fn project_identity_and_persistence_path_are_stable_per_workspace() {
+        let first = Path::new("/tmp/loom-project");
+        let second = Path::new("/tmp/other-project");
+        assert_eq!(stable_project_id(first), stable_project_id(first));
+        assert_ne!(stable_project_id(first), stable_project_id(second));
+        assert_ne!(
+            backend_persistence_path(first).unwrap(),
+            backend_persistence_path(second).unwrap()
         );
     }
 }
