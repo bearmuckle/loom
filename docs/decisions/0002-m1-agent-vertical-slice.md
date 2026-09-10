@@ -17,9 +17,10 @@ Accepted for M1.
   directly without a shell. Text patches require an exact replacement so
   an unexpected file version cannot be overwritten silently.
 - Pin the first native GPUI client to `gpui = 0.2.2`. The client renders a
-  compact Zed-inspired workspace layout with a session rail, event timeline,
-  approval card, status bar, run inspector, native titlebar, and live controls
-  while continuing to use the protocol boundary and in-process backend.
+  compact workspace shell with a session rail, event timeline, approval card,
+  status bar, run inspector, native titlebar, and live controls while
+  continuing to use the protocol boundary and in-process backend. Zed is a
+  reference for visual density and theme only, not for product functionality.
 
 ## Consequences
 
@@ -28,6 +29,7 @@ OpenAI-compatible completion; the normalized agent event model is ready for
 provider-native streaming in a later provider milestone. The GPUI client
 uses a deterministic demo workspace, while project selection, persistent
 terminals, diffs, and browser transport remain later milestones. The visual
-scale follows Zed's compact workspace conventions rather than a dashboard
-layout: 12-14px UI text, narrow fixed side panels, subdued separators, and a
-short status bar.
+scale uses compact workspace conventions rather than a dashboard layout:
+12-14px UI text, narrow fixed side panels, subdued separators, and a short
+status bar. M5 later narrows the product surface further around agent
+sessions and orchestration.

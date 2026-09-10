@@ -104,39 +104,49 @@ M4 implementation notes:
 **Exit condition:** a second native client can securely reconnect to a running
 agent, observe its current step, approve an action, and retrieve its result.
 
-### M5 - Full coding workspace
+### M5 - Agent workspace and orchestration surface
 
-- Add the editor with tabs, splits, unsaved state, agent change markers, and
-  conflict-aware saves.
-- Integrate language-server lifecycle management, diagnostics, symbols,
-  definitions, and references.
-- Add fuzzy navigation, project-wide search, repository instructions, and
-  context file references.
-- Show repository status and diffs; add staging, unstaging, commit creation,
-  branch information, and conflict visibility.
-- Add test/build/lint result views and evidence links in the final agent
-  summary.
+M5 is the first focused native client for the product's primary object: a
+durable agent session. It should feel close to the GitHub Copilot app in
+information architecture and interaction model, while retaining Loom's
+backend-owned state, provider neutrality, and remote-control boundary.
 
-**Exit condition:** a user can complete a realistic issue-driven coding task
-from prompt through agent plan, implementation, validation, diff review, and
-commit preparation.
+- Provide a small project/session navigator with new-session, rename, resume,
+  archive, and connection-status actions.
+- Make the active session the main canvas: task prompt, streamed assistant
+  messages, proposed plan, step progress, tool calls, bounded command output,
+  approval requests, errors, and the final summary are one chronological,
+  collapsible run view.
+- Keep human control in the primary flow. The composer can start a run, send
+  follow-up direction, answer an agent question, and continue a paused run.
+  Pause, interrupt, retry, approve, and reject actions are visible where they
+  apply.
+- Add a small review surface for changed-file lists, read-only diffs, task
+  results, and evidence links. Details can open in a drawer or focused
+  overlay; there is no permanent IDE-style panel grid.
+- Preserve reconnect and resume behavior. Reopening a session reconstructs
+  the current run from backend snapshots and event history rather than from
+  client-local UI state.
+- Use a restrained, compact visual system: clear hierarchy, dense but
+  readable typography, subdued separators, and a calm dark/light theme.
+  Zed is a reference for visual tone only, not for editor features,
+  navigation, or layout behavior.
 
-M5 implementation notes:
+The M5 client should reuse the existing session, workspace, process, task,
+VCS, and protocol services. Add only the narrow session, run, review, and
+evidence projections that the UI needs; do not introduce an editor buffer
+authority or a second orchestration model.
 
-- `loom-workspace::EditorWorkspace` is a buffer/layout projection over the
-  existing canonical `Workspace`; it has conflict-safe revision checks,
-  bounded text loading, undo/redo, autosave policy, encoding/newline
-  preservation, navigation/search, and agent markers.
-- `loom-language` provides lifecycle/capability descriptors and deterministic
-  diagnostics, symbols, definitions, and references for common text
-  languages. Full external LSP process management is deferred.
-- `loom-vcs` provides scoped Git status/diff/index/commit/branch/conflict
-  operations through direct process arguments. Other VCS providers are
-  deferred.
-- Task snapshots expose bounded output, artifacts, and stable evidence links;
-  run snapshots can attach those links to final summaries. The native GPUI
-  projection includes file navigation, editor state, timeline/approvals,
-  diagnostics/outline, task results, and Git status.
+**Exit condition:** a user can open a project, start an agent session, watch a
+plan and live tool timeline, approve or interrupt work, provide follow-up
+direction, reconnect to a paused or running session, and review changed files,
+diffs, and validation evidence before continuing or handing off the task.
+
+M5 deliberately does not include editable buffers, tabs or splits, autosave,
+language-server UX, fuzzy project navigation, an interactive terminal,
+staging/commit controls, branch management, or a rich multi-agent topology
+view. Those capabilities may be added later without changing the
+session-centric product model.
 
 ### M6 - Browser and wasm target
 
@@ -145,7 +155,7 @@ M5 implementation notes:
 - Replace native-only APIs with platform adapters.
 - Add browser-specific file, clipboard, download, and accessibility behavior.
 
-**Exit condition:** the browser client can complete the M1-M5 workflows
+**Exit condition:** the browser client can complete the M1-M5 agent workflows
 against a remote backend using supported browsers.
 
 ### M7 - Extensibility and collaboration

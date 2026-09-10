@@ -1,68 +1,71 @@
-# ADR 0006: M5 coding workspace boundaries
+# ADR 0006: M5 agent workspace and orchestration surface
 
 ## Status
 
-Accepted for the M5 implementation.
+Accepted for the M5 redesign. The previous full coding-workspace scope is
+superseded.
 
 ## Context
 
-The M4 backend already owns canonical workspace roots, revision-checked
-edits, task supervision, durable agent sessions, capability negotiation, and
-authenticated remote connections. A coding workspace needs editor buffers,
-navigation, diagnostics, source control, and validation results without
-creating a second workspace or session model.
+The M4 backend already owns canonical workspaces, task supervision, durable
+agent sessions, capability negotiation, and authenticated remote connections.
+The previous M5 proposal expanded the native client into a small IDE with
+editor buffers, language services, navigation, and source-control controls.
+That scope makes the product center on manipulating files instead of
+orchestrating an agent.
+
+M5 should instead deliver the smallest useful agent client: a project and
+session navigator, one focused run view, an input composer, human-control
+actions, and a read-only review surface. The GitHub Copilot app is the
+functional reference for this structure. Zed is relevant only as a reference
+for compact visual tone and theme, not for editor behavior or product scope.
 
 ## Decisions
 
-1. **Buffers are a projection over `loom-workspace`.** `EditorWorkspace`
-   stores tabs, panes, undo/redo history, autosave policy, normalized editor
-   text, and agent markers in memory. Reads and writes go through the
-   existing canonical `Workspace`; saves compare the last observed byte
-   revision and return a structured external-change conflict.
-2. **Preserve text representation where practical.** UTF-8, UTF-8 with BOM,
-   UTF-16LE/BE, and LF/CRLF/CR styles are detected and restored on save.
-   Binary/invalid text and files above the bounded editor limit are rejected.
-3. **Use explicit basic language-service capabilities.** `loom-language`
-   exposes lifecycle state and operation capabilities and ships a deterministic
-   parser/search implementation for common languages. Unsupported languages
-   are visible errors, not silent UI assumptions.
-4. **Keep Git execution scoped and structured.** `loom-vcs` invokes `git`
-   using direct argv arguments from the canonical workspace root. Paths,
-   commit messages, status, diffs, staging, branches, and conflicts are
-   represented as typed values.
-5. **Reuse task artifacts as evidence.** M2/M3 task supervision remains the
-   source of build/test/lint output and artifacts. Each artifact gets a stable
-   `loom://task/...` evidence URI and a run may attach evidence links to its
-   final snapshot.
-6. **Make M5 additive in the protocol.** Editor, language, VCS, navigation,
-   and evidence requests/responses are capability-gated and work through the
-   existing in-process and WebSocket transports. The GPUI layout is a
-   projection, not an authority.
-7. **Use GPUI's native text-input seam.** The native client implements
-   `EntityInputHandler` and paints a cursor, selection, and multi-line buffer
-   through `ElementInputHandler`. Every accepted insertion or deletion is
-   sent through the existing revision-checked editor request before the UI
-   marks the buffer dirty, so save, undo, redo, and external-change conflicts
-   remain backend-owned.
-8. **Keep explicit native entry points safe.** `loom-ui` accepts
-   `--workspace PATH` and `--task DESCRIPTION` for a real repository task.
-   With no workspace argument it opens an isolated deterministic temporary
-   demo, preserving a low-risk startup path for smoke tests and exploration.
-   The visible backend indicator identifies the current in-process protocol
-   connection and exposes a reconnect/refresh action.
+1. **Make the session the primary UI object.** The client presents projects
+   and durable agent sessions, not a file tree or a set of editor buffers.
+   Creating, resuming, renaming, archiving, and reconnecting sessions use the
+   existing backend session model.
+2. **Use a minimal shell.** The default layout is a narrow project/session
+   navigator and a single active-session canvas. The canvas contains the
+   conversation and run timeline, with a composer at the bottom and
+   connection/session status in the shell. Approvals, changed files, diffs,
+   and evidence open as focused drawers or overlays instead of permanent
+   IDE-style panes.
+3. **Make orchestration visible and controllable.** Plans, step state, tool
+   calls, bounded output, approval prompts, questions, retries, failures, and
+   completion are first-class timeline items. The user can start, pause,
+   resume, interrupt, approve, reject, retry, and redirect without leaving
+   the active run.
+4. **Keep review read-only and task-oriented.** The client can show changed
+   paths, a bounded diff, task status, artifacts, and stable evidence links.
+   These are projections of backend workspace, VCS, and process state; M5
+   does not add local editable buffers, autosave, staging, or commit state.
+5. **Reuse the existing protocol and authority boundaries.** M5 uses the
+   in-process and authenticated WebSocket connections, resumable session
+   events, durable run snapshots, approval policy, and capability
+   negotiation already defined by M1-M4. New requests are limited to compact
+   session, run, review, and evidence projections where an existing snapshot
+   is insufficient.
+6. **Treat the frontend as a projection.** A client disconnect or restart
+   must not lose an agent run, approval, task result, or event history.
+   Reconnecting replaces stale local projections from the authoritative
+   snapshot before applying resumed events.
+7. **Use a restrained visual language.** Compact density, subdued separators,
+   clear status color, and dark/light theme support are intentional. Zed
+   informs visual tone only; its editor, panes, navigation, and interaction
+   model are outside M5.
 
-## Deferred limitations
+## Explicitly out of scope
 
-- The basic language service is deterministic and does not start external LSP
-  processes, parse every language, or provide incremental semantic indexing.
-- Search is bounded literal search rather than a full regex/index service.
-- The Git service supports one repository rooted at the opened workspace and
-  does not yet model worktrees, remotes, hooks, or provider-specific VCS.
-- Buffer/layout state is currently process-local and is not persisted in the
-  durable backend snapshot; reopening a client reconstructs it from files.
-- The editor intentionally uses a compact deterministic renderer: it does not
-  yet provide syntax highlighting, soft wrapping, a full diff pane, or
-  incremental LSP indexing.
-- The native client currently uses the in-process connection; the typed
-  request/response seam remains compatible with the remote WebSocket client,
-  but native remote connection selection is follow-up work.
+- Editable file buffers, tabs, splits, autosave, encoding preservation, and
+  external-edit conflict UI.
+- Language-server lifecycle controls, diagnostics navigation, symbols,
+  definitions, references, and project-wide fuzzy search.
+- Interactive terminal panes and direct command editing outside the existing
+  agent/task controls.
+- VCS staging, unstaging, commit creation, branch management, and conflict
+  resolution.
+- Rich multi-agent graph editing, worktree comparison, and selective merge
+  workflows.
+- Browser/wasm-specific UI work, which remains M6.

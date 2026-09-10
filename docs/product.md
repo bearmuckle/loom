@@ -83,11 +83,11 @@ The first release should optimize for this exact loop:
 | Agent context | Repository instructions, conversation history, file references, tool results, summaries, compaction, token budgets, and context inspection |
 | Permissions | Approval policies for file reads/writes, commands, network access, secrets, plugins, and destructive operations |
 | Tool execution | Search, file operations, patching, terminals, diagnostics, source control, language services, HTTP, and extensible tool adapters |
-| Editor | Multiple files, tabs, splits, undo/redo, autosave policy, encoding/newline preservation, large-file safeguards, and agent change markers |
-| Navigation | Fuzzy file open, project search, symbol outline, go-to-definition/references through language services |
-| Terminal | Multiple persistent sessions, streaming output, resize, input, exit status, cancellation, and environment selection |
+| Editor | Read-only file and diff previews tied to agent work; full editing remains a later surface |
+| Navigation | Project and session navigation plus direct links into agent changes; fuzzy and symbol navigation remain later |
+| Terminal | Bounded command and task output in the agent timeline; interactive terminals remain a later surface |
 | Tasks | Agent-owned and user-owned build/test/lint commands with run, monitor, cancel, restart, and artifact inspection |
-| Source control | Status, diff, staging, commit creation, branch awareness, and conflict visibility |
+| Source control | Read-only status and diff review for agent work; staging and commit controls remain later |
 | Diagnostics | Structured errors, warnings, locations, severity, and links back to source |
 | Review | Proposed edits, diff views, checkpoints, test evidence, commit preparation, and agent session transcripts |
 | Collaboration | Remote backend access, session sharing, reconnect, handoff, and a clear access/permission model |
@@ -98,13 +98,13 @@ Features should be added behind stable domain interfaces. A client must be
 able to discover which capabilities a backend supports instead of assuming
 that every installation has the same tools available.
 
-The M5 vertical slice makes these interfaces concrete without changing the
-agent/session authority: editor buffers and layout are a projection over the
-backend workspace, language services report their lifecycle/capabilities,
-Git mutations are explicit user actions, and build/test/lint results retain
-bounded output plus evidence links for the final run summary. The compact
-GPUI layout keeps the agent timeline and approvals visible beside the editor,
-diagnostics, task results, and repository status.
+The M5 vertical slice makes the orchestration experience concrete without
+changing the agent/session authority. A compact GPUI shell puts projects and
+sessions in a small navigator, the active conversation and run timeline in
+the main canvas, and the composer at the point of control. Approvals,
+changed-file diffs, task results, and evidence open as focused review
+surfaces. File contents and repository state are read-only projections in
+M5; the client is not a general-purpose editor.
 
 ## Guiding principles
 
