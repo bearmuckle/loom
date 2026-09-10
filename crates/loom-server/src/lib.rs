@@ -12,7 +12,7 @@ use loom_core::{
     EventSequence, LoomError, ProjectId, ProtocolVersion, Result, SessionEventRecord, Timestamp,
 };
 use loom_language::LanguageServiceManager;
-use loom_model::{ModelDescriptor, ModelId, ProviderId};
+use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
 use loom_persistence::{CURRENT_SCHEMA_VERSION, FilePersistence};
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -21,8 +21,9 @@ use loom_protocol::{
     ServerEventEnvelope, ServerResponse, unsupported_version_error,
 };
 use loom_providers::{
-    CredentialRef, ModelProvider, ProviderConfig, ProviderHealth, ProviderRegistry,
-    UnavailableProvider, UsageLedger, deterministic_descriptor,
+    CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, ModelProvider,
+    ProviderConfig, ProviderHealth, ProviderRegistry, UnavailableProvider, UsageLedger,
+    deterministic_descriptor,
 };
 use loom_session::SessionManager;
 use loom_tools::ToolExecutor;
@@ -44,6 +45,18 @@ const MAX_REVIEW_CHANGES: usize = 512;
 const MAX_REVIEW_DIFF_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_FILE_BYTES: usize = 128 * 1024;
 const MAX_RUN_MESSAGE_BYTES: usize = 32 * 1024;
+
+fn github_copilot_credentials() -> Result<Arc<FileCredentialStore>> {
+    let credentials = Arc::new(FileCredentialStore::open(
+        FileCredentialStore::default_path(),
+    )?);
+    if let Ok(token) = std::env::var("LOOM_GITHUB_TOKEN") {
+        if !token.trim().is_empty() {
+            credentials.insert(CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF), token)?;
+        }
+    }
+    Ok(credentials)
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct EventJournal {
@@ -117,6 +130,19 @@ impl EventJournal {
             .cloned()
             .collect()
     }
+
+    fn recent_events(&self, session_id: AgentSessionId, limit: usize) -> Vec<ServerEventEnvelope> {
+        self.events
+            .iter()
+            .filter(|event| event.session_id == session_id)
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
 }
 
 fn default_event_retention() -> usize {
@@ -179,6 +205,22 @@ pub struct InProcessBackend {
 impl InProcessBackend {
     pub fn new() -> Arc<Self> {
         Self::with_provider_registry(ProviderRegistry::demo())
+    }
+
+    pub fn new_with_github_copilot() -> Result<Arc<Self>> {
+        let credentials = github_copilot_credentials()?;
+        Self::with_provider_registry_persistent_credentials(
+            ProviderRegistry::configured(credentials)?,
+            None,
+        )
+    }
+
+    pub fn demo_with_github_copilot() -> Result<Arc<Self>> {
+        let credentials = github_copilot_credentials()?;
+        Self::with_provider_registry_persistent_credentials(
+            ProviderRegistry::demo_with_credentials(credentials),
+            None,
+        )
     }
 
     pub fn with_models(models: Vec<ModelDescriptor>) -> Arc<Self> {
@@ -297,6 +339,41 @@ impl InProcessBackend {
         Self::with_provider_registry_persistent(providers, path)
     }
 
+    pub fn with_openai_compatible_persistent_with_github_copilot(
+        endpoint: impl Into<String>,
+        api_key: impl Into<String>,
+        model: impl Into<ModelId>,
+        path: impl Into<PathBuf>,
+    ) -> Result<Arc<Self>> {
+        let model = model.into();
+        let descriptor = ModelDescriptor {
+            id: model,
+            provider: loom_model::ProviderId::new("openai-compatible"),
+            display_name: "OpenAI-compatible model".to_owned(),
+            context_window: None,
+            capabilities: loom_model::ModelCapabilities {
+                streaming: false,
+                tool_calling: true,
+                vision: false,
+                json_mode: true,
+            },
+        };
+        let credentials = github_copilot_credentials()?;
+        credentials.insert(CredentialRef::new("ui-openai-compatible"), api_key.into())?;
+        let providers = ProviderRegistry::with_credentials(credentials);
+        providers.register(ProviderConfig::openai_compatible(
+            "openai-compatible",
+            "OpenAI-compatible model",
+            endpoint,
+            descriptor,
+            Some(CredentialRef::new("ui-openai-compatible")),
+        ))?;
+        providers.register(ProviderConfig::github_copilot(CredentialRef::new(
+            GITHUB_COPILOT_CREDENTIAL_REF,
+        )))?;
+        Self::with_provider_registry_persistent(providers, path)
+    }
+
     pub fn with_provider_registry(providers: ProviderRegistry) -> Arc<Self> {
         let models = providers
             .list_models()
@@ -311,6 +388,14 @@ impl InProcessBackend {
             providers,
             Vec::new(),
             Some(FilePersistence::open(path.into())?),
+        )
+    }
+
+    pub fn new_persistent_with_github_copilot(path: impl Into<PathBuf>) -> Result<Arc<Self>> {
+        let credentials = github_copilot_credentials()?;
+        Self::with_provider_registry_persistent_credentials(
+            ProviderRegistry::configured(credentials)?,
+            Some(path.into()),
         )
     }
 
@@ -330,6 +415,17 @@ impl InProcessBackend {
             providers,
             Vec::new(),
             Some(FilePersistence::open(path.into())?),
+        )
+    }
+
+    fn with_provider_registry_persistent_credentials(
+        providers: ProviderRegistry,
+        path: Option<PathBuf>,
+    ) -> Result<Arc<Self>> {
+        Self::with_provider_registry_and_models(
+            providers,
+            Vec::new(),
+            path.map(FilePersistence::open).transpose()?,
         )
     }
 
@@ -623,16 +719,24 @@ impl InProcessBackend {
                     )
                 })?;
             let mut recovery_reason = None;
-            let provider = match self
-                .provider_at(&runtime_state.task.model, runtime_state.provider_cursor)
-            {
-                Ok(provider) => provider,
-                Err(error) => {
-                    let descriptor = self.providers.describe_model(&runtime_state.task.model)?;
-                    recovery_reason = Some(error.message.clone());
-                    Box::new(UnavailableProvider::new(descriptor, error))
-                }
-            };
+            let provider =
+                match self.provider_at(&runtime_state.task.model, runtime_state.provider_cursor) {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        let descriptor = self
+                            .providers
+                            .describe_model(&runtime_state.task.model)
+                            .unwrap_or_else(|_| ModelDescriptor {
+                                id: runtime_state.task.model.clone(),
+                                provider: ProviderId::new("recovered"),
+                                display_name: "Unavailable persisted model".to_owned(),
+                                context_window: None,
+                                capabilities: ModelCapabilities::default(),
+                            });
+                        recovery_reason = Some(error.message.clone());
+                        Box::new(UnavailableProvider::new(descriptor, error))
+                    }
+                };
             let tools = ToolExecutor::new_with_workspace(workspace);
             let mut runtime = AgentRuntime::from_state(runtime_state, provider, tools)?;
             if runtime.session_id() != session.id {
@@ -1163,6 +1267,12 @@ impl InProcessConnection {
                     });
                 }
                 Ok(ServerResponse::SessionEvents { events })
+            }
+            ClientRequest::GetRecentSessionEvents { session_id, limit } => {
+                let journal = self.backend.journal()?;
+                Ok(ServerResponse::SessionEvents {
+                    events: journal.recent_events(session_id, limit as usize),
+                })
             }
             ClientRequest::StartAgentRun {
                 session_id,
@@ -1995,6 +2105,10 @@ impl InProcessConnection {
                 session_id: requested_session,
                 ..
             } => session_id = *requested_session,
+            ClientRequest::GetRecentSessionEvents {
+                session_id: requested_session,
+                ..
+            } => session_id = Some(*requested_session),
             ClientRequest::StartAgentRun {
                 session_id: requested_session,
                 ..

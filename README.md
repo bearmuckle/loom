@@ -51,8 +51,27 @@ cargo run -p loom-ui -- --workspace /path/to/project
 The client persists local session state outside the repository and reopens the
 same project and sessions on the next launch. Configure a real
 OpenAI-compatible backend with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
-`--model MODEL`; the deterministic provider is available only for the explicit
+`--model MODEL`. For GitHub Copilot, launch the UI and click **Log in** in the
+title bar; Loom shows GitHub's device URL and one-time code in the window:
+
+```text
+cargo run -p loom-ui -- --workspace /path/to/project
+```
+
+The login stores the GitHub OAuth token in the Loom credentials file with
+owner-only permissions. Loom exchanges it for a short-lived Copilot API token
+when it calls a model; neither token is included in backend state or protocol
+responses. The deterministic provider is available only for the explicit
 `--demo` flow.
+
+Only configured providers appear in the model picker. To expose an Ollama
+model, configure it before starting the UI:
+
+```text
+LOOM_OLLAMA_ENDPOINT=http://127.0.0.1:11434 \
+LOOM_OLLAMA_MODEL=llama3.2 \
+cargo run -p loom-ui -- --workspace /path/to/project
+```
 
 The same client can attach to an authenticated remote backend:
 
