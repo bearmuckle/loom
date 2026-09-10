@@ -331,6 +331,22 @@ impl TextBufferState {
     }
 }
 
+impl LoomView {
+    fn editor_utf8_index_for_point(&self, point: Point<Pixels>) -> Option<usize> {
+        let cache = self.editor_layout_cache.as_ref()?;
+        let local = cache.bounds.localize(&point)?;
+        let line_index = (local.y / cache.line_height).floor().max(0.) as usize;
+        let line = cache.lines.get(line_index)?;
+        Some(
+            line.range.start
+                + line
+                    .layout
+                    .closest_index_for_x(local.x)
+                    .min(line.range.len()),
+        )
+    }
+}
+
 impl EntityInputHandler for LoomView {
     fn text_for_range(
         &mut self,
@@ -429,17 +445,8 @@ impl EntityInputHandler for LoomView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let cache = self.editor_layout_cache.as_ref()?;
-        let local = cache.bounds.localize(&point)?;
-        let line_index = (local.y / cache.line_height).floor().max(0.) as usize;
-        let line = cache.lines.get(line_index)?;
-        Some(
-            line.range.start
-                + line
-                    .layout
-                    .closest_index_for_x(local.x)
-                    .min(line.range.len()),
-        )
+        self.editor_utf8_index_for_point(point)
+            .map(|offset| self.editor_input.offset_to_utf16(offset))
     }
 }
 
@@ -1033,7 +1040,7 @@ impl LoomView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(offset) = self.character_index_for_point(event.position, window, cx) else {
+        let Some(offset) = self.editor_utf8_index_for_point(event.position) else {
             return;
         };
         if event.modifiers.shift {
@@ -1054,7 +1061,7 @@ impl LoomView {
         if event.pressed_button != Some(MouseButton::Left) {
             return;
         }
-        if let Some(offset) = self.character_index_for_point(event.position, _window, cx) {
+        if let Some(offset) = self.editor_utf8_index_for_point(event.position) {
             self.editor_input.select_to(offset);
             cx.notify();
         }
