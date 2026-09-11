@@ -804,6 +804,8 @@ impl LoomView {
             view.update(cx, |view, cx| {
                 if view.run_is_active() {
                     view.poll_run_once(cx);
+                } else {
+                    view.run_poll_scheduled = false;
                 }
             })
             .ok();
