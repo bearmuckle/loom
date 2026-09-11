@@ -3895,11 +3895,14 @@ dependencies = [
 name = "loom-ui"
 version = "0.1.0"
 dependencies = [
+ "futures-channel",
+ "getrandom 0.2.17",
  "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
+ "js-sys",
  "loom-agent",
  "loom-core",
  "loom-model",
@@ -3914,6 +3917,9 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

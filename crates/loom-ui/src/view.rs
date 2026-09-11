@@ -31,20 +31,17 @@ use loom_protocol::{
     ProjectSnapshot, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse, TaskSnapshot,
     TaskStatus,
 };
+#[cfg(not(target_family = "wasm"))]
 use loom_providers::{
     CredentialRef, CredentialStore, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF,
     GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode,
 };
+#[cfg(not(target_family = "wasm"))]
 use loom_server::InProcessBackend;
 
 use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
-    connection::{
-        BackendWorker, ClientConnection, create_session, list_models, list_projects,
-        list_provider_ids, list_sessions, negotiate, open_workspace, select_remote_project,
-        start_run, unexpected_response,
-    },
-    platform::{UiOptions, backend_persistence_path, prepare_workspace, stable_project_id},
+    connection::{BackendWorker, ClientConnection, select_remote_project, unexpected_response},
     state::{
         AgentMode, BackendStatus, GitHubLoginState, RenameDialogState, ReviewPanel, ReviewState,
         ThemeChoice, TimelineItem, bounded, bounded_to, run_state_name, session_state_for_run,
@@ -59,6 +56,39 @@ use crate::{
         state_color,
     },
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::{
+    connection::{
+        create_session, list_models, list_projects, list_provider_ids, list_sessions, negotiate,
+        open_workspace, start_run,
+    },
+    platform::{UiOptions, backend_persistence_path, prepare_workspace, stable_project_id},
+};
+#[cfg(target_family = "wasm")]
+use crate::{
+    browser::BrowserOptions,
+    connection::{
+        create_session_async, list_models_async, list_projects_async, list_sessions_async,
+        negotiate_async, open_workspace_async,
+    },
+};
+
+/// Opens a URL in a new tab/window. Natively this shells out to the OS's
+/// "open" handler; in the browser it's just `window.open`.
+#[cfg(not(target_family = "wasm"))]
+fn open_external_url(url: &str) -> Result<(), std::io::Error> {
+    open::that(url)
+}
+
+#[cfg(target_family = "wasm")]
+fn open_external_url(url: &str) -> Result<(), std::io::Error> {
+    let opened = web_sys::window().and_then(|window| window.open_with_url(url).ok().flatten());
+    if opened.is_some() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("the browser blocked opening a new tab"))
+    }
+}
 
 pub(crate) struct LoomView {
     /// Used for the synchronous bootstrap before the window exists.
@@ -251,6 +281,7 @@ impl Focusable for LoomView {
 }
 
 impl LoomView {
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn try_new(
         options: &UiOptions,
         focus_handle: FocusHandle,
@@ -264,7 +295,10 @@ impl LoomView {
                 let connection = ClientConnection::remote(remote_url.clone(), token.to_owned())?;
                 negotiate(&connection)?;
                 let projects = list_projects(&connection)?;
-                let project = select_remote_project(&projects, options.workspace.as_deref())?;
+                let project = select_remote_project(
+                    &projects,
+                    options.workspace.as_deref().and_then(|path| path.to_str()),
+                )?;
                 let workspace_root = project.root.clone().map(PathBuf::from).ok_or_else(|| {
                     LoomError::new(
                         ErrorCode::WorkspaceAccessDenied,
@@ -391,6 +425,108 @@ impl LoomView {
         Ok(view)
     }
 
+    /// Builds the view for the browser client: connects to a remote backend
+    /// over the in-page WebSocket transport and resolves the same project /
+    /// session / model state that native's remote-mode bootstrap resolves,
+    /// using the `_async` request helpers since nothing may block the page's
+    /// single JS thread. Unlike [`Self::try_new`], this does not load the
+    /// active session's snapshot/events itself (that requires a `Context`,
+    /// which does not exist yet); the caller finishes bootstrapping once the
+    /// view is mounted, via [`Self::select_session`], [`Self::reload_sessions`]
+    /// and [`Self::refresh_models_async`].
+    #[cfg(target_family = "wasm")]
+    pub(crate) async fn try_new_browser(
+        options: &BrowserOptions,
+        focus_handle: FocusHandle,
+        rename_focus_handle: FocusHandle,
+    ) -> Result<Self, LoomError> {
+        let connection = ClientConnection::browser(options.remote(), options.token())?;
+        negotiate_async(&connection).await?;
+        let projects = list_projects_async(&connection).await?;
+        // A freshly started `--serve` backend has no projects open yet; if
+        // none match (or none exist), open the requested workspace as a new
+        // project ourselves, the same way the native remote-mode M4 demo
+        // does.
+        let (project, project_id, workspace_root) =
+            match select_remote_project(&projects, options.workspace()) {
+                Ok(project) => {
+                    let workspace_root = project.root.clone().map(PathBuf::from).ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::WorkspaceAccessDenied,
+                            "selected remote project has no configured workspace root",
+                            false,
+                        )
+                    })?;
+                    let project_id = project.id;
+                    (Some(project), project_id, workspace_root)
+                }
+                Err(error) => {
+                    let root = options.workspace().ok_or(error)?;
+                    let project_id = ProjectId::new();
+                    open_workspace_async(&connection, project_id, root).await?;
+                    (None, project_id, PathBuf::from(root))
+                }
+            };
+        let sessions = list_sessions_async(&connection, project_id).await?;
+        let session = match sessions.into_iter().next() {
+            Some(session) => session,
+            None => create_session_async(&connection, project_id, "New session").await?,
+        };
+        let models = list_models_async(&connection).await?;
+        let model = options
+            .model()
+            .cloned()
+            .filter(|model| models.contains(model))
+            .or_else(|| models.first().cloned())
+            .unwrap_or_else(|| ModelId::new("default"));
+
+        Ok(Self {
+            backend: BackendWorker::spawn(connection.clone()),
+            connection,
+            project_id,
+            project,
+            workspace_root,
+            projects,
+            sessions: vec![session.clone()],
+            active_session: session.clone(),
+            active_run: None,
+            active_run_id: None,
+            default_model: model.clone(),
+            session_models: BTreeMap::new(),
+            agent_mode: AgentMode::Agent,
+            agent_mode_picker_open: false,
+            session_task_cache: BTreeMap::new(),
+            optimistic_messages: Vec::new(),
+            sending_message: false,
+            model,
+            models,
+            model_picker_open: false,
+            settings_open: false,
+            theme_choice: ThemeChoice::System,
+            dark_theme: true,
+            after_sequence: None,
+            timeline: Vec::new(),
+            pending_approval: None,
+            pending_input: None,
+            composer: TextBufferState::new(""),
+            composer_focus_handle: focus_handle,
+            input_field: InputField::Composer,
+            session_state: session.state,
+            run_state: None,
+            summary: None,
+            review: ReviewState::default(),
+            tasks: Vec::new(),
+            rename_dialog: None,
+            rename_focus_handle,
+            backend_status: BackendStatus::Connected,
+            demo_workspace: false,
+            login_enabled: false,
+            github_connected: false,
+            github_login: None,
+            run_poll_scheduled: false,
+        })
+    }
+
     /// Submits a backend request without blocking the UI thread and applies the
     /// answer on the UI thread once it arrives.
     pub(crate) fn dispatch(
@@ -401,7 +537,7 @@ impl LoomView {
     ) {
         let pending = self.backend.submit(RequestEnvelope::new(request));
         cx.spawn(async move |view, cx| {
-            let response = cx.background_spawn(async move { pending.wait() }).await;
+            let response = cx.background_spawn(async move { pending.wait().await }).await;
             view.update(cx, |view, cx| {
                 apply(view, response, cx);
                 cx.notify();
@@ -425,6 +561,7 @@ impl LoomView {
 
     /// Refreshes the model list. The synchronous variant is only used during
     /// the startup bootstrap, before the window exists.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn refresh_models(&mut self) {
         let provider_ids = match list_provider_ids(&self.connection) {
             Ok(provider_ids) => provider_ids,
@@ -528,6 +665,7 @@ impl LoomView {
 
     /// Loads the session and project lists synchronously for the startup
     /// bootstrap. Interactive refreshes use [`Self::reload_sessions`].
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), LoomError> {
         let response =
             self.connection
@@ -652,6 +790,7 @@ impl LoomView {
     /// Only used by the startup bootstrap, before a window exists; every
     /// interactive path uses [`Self::select_session`], which goes through the
     /// connection worker.
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn load_session(&mut self, session: AgentSessionSnapshot) {
         self.activate_session(session);
         let projection_sequence = match self
@@ -699,6 +838,7 @@ impl LoomView {
         // central view. Review/VCS data is loaded when the review pane opens.
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn collect_events_since(
         &mut self,
         after_sequence: Option<EventSequence>,
@@ -1252,9 +1392,9 @@ impl LoomView {
                     // The worker executes both requests in order; the rename is
                     // cosmetic, so its outcome does not gate the run.
                     if let Some(rename_request) = rename_request {
-                        let _ = rename_request.wait();
+                        let _ = rename_request.wait().await;
                     }
-                    run_request.wait()
+                    run_request.wait().await
                 })
                 .await;
             view.update(cx, |view, cx| view.finish_send_response(response, cx))
@@ -1445,7 +1585,7 @@ impl LoomView {
         ));
         cx.spawn(async move |view, cx| {
             let snapshot = cx
-                .background_spawn(async move { snapshot_request.wait() })
+                .background_spawn(async move { snapshot_request.wait().await })
                 .await;
             let after_sequence = match &snapshot.result {
                 Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
@@ -1459,7 +1599,7 @@ impl LoomView {
                     after_sequence,
                 }));
             let events = cx
-                .background_spawn(async move { events_request.wait() })
+                .background_spawn(async move { events_request.wait().await })
                 .await;
             view.update(cx, |view, cx| {
                 view.finish_async_session_load(session_id, snapshot, events, cx);
@@ -1583,6 +1723,11 @@ impl LoomView {
     pub(crate) fn start_github_login(&mut self, cx: &mut Context<Self>) {
         self.github_login = Some(GitHubLoginState::Starting);
         cx.notify();
+        self.start_github_login_flow(cx);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn start_github_login_flow(&mut self, cx: &mut Context<Self>) {
         let task = cx.background_spawn(async { GitHubCopilotAuthenticator::default().begin() });
         cx.spawn(async move |view, cx| {
             let result = task.await;
@@ -1592,6 +1737,19 @@ impl LoomView {
         .detach();
     }
 
+    /// GitHub Copilot device-code sign-in relies on `loom-providers`'
+    /// credential store and OAuth flow, which have no browser equivalent (no
+    /// OS keychain, no writable local file). The browser client cannot offer
+    /// this login path.
+    #[cfg(target_family = "wasm")]
+    fn start_github_login_flow(&mut self, cx: &mut Context<Self>) {
+        self.github_login = Some(GitHubLoginState::Error(
+            "GitHub sign-in isn't available in the browser client yet.".to_owned(),
+        ));
+        cx.notify();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn handle_github_device_code(
         &mut self,
         result: Result<GitHubDeviceCode, LoomError>,
@@ -1621,6 +1779,7 @@ impl LoomView {
         .detach();
     }
 
+    #[cfg(not(target_family = "wasm"))]
     pub(crate) fn finish_github_login(
         &mut self,
         result: Result<String, LoomError>,
@@ -2711,7 +2870,7 @@ impl LoomView {
                                 .on_click({
                                     let verification_uri = verification_uri.clone();
                                     cx.listener(move |this, _, _, cx| {
-                                        if let Err(error) = open::that(&verification_uri) {
+                                        if let Err(error) = open_external_url(&verification_uri) {
                                             this.record_status(format!(
                                                 "Could not open GitHub URL: {error}"
                                             ));
