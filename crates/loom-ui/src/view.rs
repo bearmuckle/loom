@@ -737,41 +737,45 @@ impl LoomView {
     }
 
     /// Applies newly journaled session events through the connection worker.
-    pub(crate) fn collect_events_async(&mut self, cx: &mut Context<Self>) {
+    fn poll_run_once(&mut self, cx: &mut Context<Self>) {
         self.dispatch(
             cx,
             ClientRequest::GetSessionEvents {
                 session_id: Some(self.active_session.id),
                 after_sequence: self.after_sequence,
             },
-            |view, response, _| match response.result {
-                Ok(ServerResponse::SessionEvents { events }) => {
-                    for event in events {
-                        view.after_sequence = Some(event.sequence);
-                        view.consume_event(&event.event);
+            |view, response, cx| {
+                match response.result {
+                    Ok(ServerResponse::SessionEvents { events }) => {
+                        for event in events {
+                            view.after_sequence = Some(event.sequence);
+                            view.consume_event(&event.event);
+                        }
+                        view.backend_status = BackendStatus::Connected;
                     }
-                    view.backend_status = BackendStatus::Connected;
-                }
-                Ok(ServerResponse::SessionEventsSnapshot {
-                    session,
-                    events,
-                    latest_sequence,
-                    ..
-                }) => {
-                    view.active_session = session;
-                    view.reset_projection();
-                    view.after_sequence = Some(latest_sequence);
-                    for event in events {
-                        view.after_sequence = Some(event.sequence);
-                        view.consume_event(&event.event);
+                    Ok(ServerResponse::SessionEventsSnapshot {
+                        session,
+                        events,
+                        latest_sequence,
+                        ..
+                    }) => {
+                        view.active_session = session;
+                        view.reset_projection();
+                        view.after_sequence = Some(latest_sequence);
+                        for event in events {
+                            view.after_sequence = Some(event.sequence);
+                            view.consume_event(&event.event);
+                        }
+                        view.backend_status = BackendStatus::Connected;
                     }
-                    view.backend_status = BackendStatus::Connected;
+                    Err(error) => view.record_backend_error("session event stream", error),
+                    Ok(response) => view.record_backend_error(
+                        "session event stream",
+                        unexpected_response("session event stream", response),
+                    ),
                 }
-                Err(error) => view.record_backend_error("session event stream", error),
-                Ok(response) => view.record_backend_error(
-                    "session event stream",
-                    unexpected_response("session event stream", response),
-                ),
+                view.run_poll_scheduled = false;
+                view.schedule_run_poll(cx);
             },
         );
     }
@@ -798,11 +802,8 @@ impl LoomView {
             })
             .await;
             view.update(cx, |view, cx| {
-                view.run_poll_scheduled = false;
                 if view.run_is_active() {
-                    view.collect_events_async(cx);
-                    view.refresh_run_snapshot_async(cx);
-                    view.schedule_run_poll(cx);
+                    view.poll_run_once(cx);
                 }
             })
             .ok();
@@ -810,25 +811,12 @@ impl LoomView {
         .detach();
     }
 
-    /// Refreshes the active run projection through the connection worker.
-    pub(crate) fn refresh_run_snapshot_async(&mut self, cx: &mut Context<Self>) {
-        let Some(run_id) = self.active_run_id else {
+    fn start_run_polling(&mut self, cx: &mut Context<Self>) {
+        if self.run_poll_scheduled || self.active_run_id.is_none() {
             return;
-        };
-        self.dispatch(
-            cx,
-            ClientRequest::GetAgentRunSnapshot { run_id },
-            |view, response, _| match response.result {
-                Ok(ServerResponse::AgentRunSnapshot(projection)) => {
-                    view.apply_run_projection(projection);
-                }
-                Err(error) => view.record_backend_error("run snapshot", error),
-                Ok(response) => view.record_backend_error(
-                    "run snapshot",
-                    unexpected_response("run snapshot", response),
-                ),
-            },
-        );
+        }
+        self.run_poll_scheduled = true;
+        self.poll_run_once(cx);
     }
 
     pub(crate) fn consume_event(&mut self, event: &ServerEvent) {
@@ -1022,7 +1010,14 @@ impl LoomView {
                 match message.role {
                     MessageRole::User => timeline.push(TimelineItem::User(message.content)),
                     MessageRole::Assistant => {
-                        timeline.push(TimelineItem::Assistant(message.content))
+                        if let Some(TimelineItem::Assistant(previous)) = timeline.last_mut() {
+                            if !previous.is_empty() && !message.content.is_empty() {
+                                previous.push_str("\n\n");
+                            }
+                            previous.push_str(&message.content);
+                        } else {
+                            timeline.push(TimelineItem::Assistant(message.content));
+                        }
                     }
                     MessageRole::Tool => {
                         timeline.push(TimelineItem::ToolOutput(bounded(&message.content)))
@@ -1284,9 +1279,7 @@ impl LoomView {
                         .insert(0, TimelineItem::User(run.task.clone()));
                 }
                 self.pending_input = None;
-                self.collect_events_async(cx);
-                self.refresh_run_snapshot_async(cx);
-                self.schedule_run_poll(cx);
+                self.start_run_polling(cx);
                 if let Some(run) = &self.active_run
                     && !self
                         .timeline
