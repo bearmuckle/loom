@@ -158,21 +158,6 @@ session-centric product model.
 **Exit condition:** the browser client can complete the M1-M5 agent workflows
 against a remote backend using supported browsers.
 
-### M7 - Extensibility and collaboration
-
-- Publish protocol, model-provider, tool, and extension interfaces.
-- Add parallel child agents, isolated worktrees, session handoff, comparison,
-  and selective merge/discard.
-- Add provider adapters, additional VCS systems, language servers, task
-  runners, and deployment targets.
-- Add session sharing, invitations, revocation, and audit history.
-- Add performance tooling and deployment documentation.
-
-**Exit condition:** a third-party adapter can be added without modifying
-frontend views or the backend session model; two authorized clients can work
-against one session predictably; and a multi-agent task has inspectable
-dependencies and outcomes.
-
 ## Quality bar
 
 ### Correctness
@@ -217,7 +202,6 @@ These choices should be recorded as architecture decision records when made:
 - MessagePack versus CBOR, and the schema/code-generation approach.
 - Whether QUIC is a first-release transport or a later optimization.
 - The persistence engine for sessions, event journals, and configuration.
-- The language-server process model and sandboxing strategy.
 - The minimum authentication mechanism for remote deployments.
 - The supported source-control providers beyond Git.
 - The provider adapter contract and local model compatibility baseline.
@@ -231,3 +215,5 @@ These choices should be recorded as architecture decision records when made:
 - Building a hosted service before the standalone backend and protocol are
   reliable.
 - Hiding destructive or privileged actions behind automatic behavior.
+- Extensibility, collaboration, and language-server integration are deferred
+  until the M0-M6 product loop has proven stable.

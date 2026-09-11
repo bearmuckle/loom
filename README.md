@@ -34,6 +34,8 @@ The project specification is split into focused documents:
   performance, testing, decisions, and first-release non-goals.
 - [M5 agent workspace and orchestration surface](docs/decisions/0006-m5-coding-workspace.md) -
   the focused session-first client specification.
+- [Implementation audit](docs/audit.md) - current gaps between the
+  specification and the implementation, and descoped code still present.
 
 These documents describe the intended first implementation. The roadmap and
 architecture decision records are the source of truth for scope and
