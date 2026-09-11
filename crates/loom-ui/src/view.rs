@@ -882,6 +882,9 @@ impl LoomView {
                 }
             }
             AgentEvent::AssistantMessageDelta { text, .. } => {
+                if text.is_empty() {
+                    return;
+                }
                 if let Some(TimelineItem::Assistant(message)) = self.timeline.last_mut() {
                     message.push_str(text);
                 } else {
@@ -1012,6 +1015,9 @@ impl LoomView {
                 match message.role {
                     MessageRole::User => timeline.push(TimelineItem::User(message.content)),
                     MessageRole::Assistant => {
+                        if message.content.is_empty() {
+                            continue;
+                        }
                         if let Some(TimelineItem::Assistant(previous)) = timeline.last_mut() {
                             if !previous.is_empty() && !message.content.is_empty() {
                                 previous.push_str("\n\n");
