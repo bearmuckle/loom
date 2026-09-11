@@ -78,7 +78,6 @@ pub(crate) struct LoomView {
     pub(crate) session_models: BTreeMap<AgentSessionId, ModelId>,
     pub(crate) agent_mode: AgentMode,
     pub(crate) agent_mode_picker_open: bool,
-    pub(crate) session_event_cache: BTreeMap<AgentSessionId, Vec<ServerEvent>>,
     pub(crate) session_task_cache: BTreeMap<AgentSessionId, String>,
     pub(crate) optimistic_messages: Vec<String>,
     pub(crate) sending_message: bool,
@@ -348,7 +347,6 @@ impl LoomView {
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
             agent_mode_picker_open: false,
-            session_event_cache: BTreeMap::new(),
             session_task_cache: BTreeMap::new(),
             optimistic_messages: Vec::new(),
             sending_message: false,
@@ -656,7 +654,7 @@ impl LoomView {
     /// connection worker.
     pub(crate) fn load_session(&mut self, session: AgentSessionSnapshot) {
         self.activate_session(session);
-        let projection_run_id = match self
+        let projection_sequence = match self
             .connection
             .request(RequestEnvelope::new(
                 ClientRequest::GetAgentSessionSnapshot {
@@ -668,15 +666,13 @@ impl LoomView {
             Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
                 self.active_session = projection.session;
                 self.session_state = self.active_session.state;
-                self.active_run = projection.active_run.as_ref().map(|run| run.run.clone());
-                self.active_run_id = projection.active_run.as_ref().map(|run| run.run.id);
-                self.run_state = self.active_run.as_ref().map(|run| run.state);
-                if let Some(run) = &self.active_run {
-                    self.model = run.model.clone();
+                if let Some(run) = projection.active_run {
+                    self.model = run.run.model.clone();
                     self.session_task_cache
-                        .insert(self.active_session.id, run.task.clone());
+                        .insert(self.active_session.id, run.run.task.clone());
+                    self.apply_run_projection(run);
                 }
-                self.active_run_id
+                Some(projection.latest_sequence)
             }
             Err(error) => {
                 self.record_backend_error("load session snapshot", error);
@@ -690,11 +686,8 @@ impl LoomView {
                 None
             }
         };
-        if let Err(error) = self.collect_recent_events() {
+        if let Err(error) = self.collect_events_since(projection_sequence) {
             self.record_backend_error("load session events", error);
-        }
-        if self.active_run_id.is_none() {
-            self.active_run_id = projection_run_id;
         }
         self.ensure_session_task_message(self.active_session.id);
         if let Some(run) = &self.active_run {
@@ -704,6 +697,43 @@ impl LoomView {
         }
         // The session projection and event stream are sufficient for the
         // central view. Review/VCS data is loaded when the review pane opens.
+    }
+
+    fn collect_events_since(
+        &mut self,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<(), LoomError> {
+        let response =
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: Some(self.active_session.id),
+                    after_sequence,
+                }));
+        match response.result? {
+            ServerResponse::SessionEvents { events } => {
+                for event in events {
+                    self.after_sequence = Some(event.sequence);
+                    self.consume_event(&event.event);
+                }
+            }
+            ServerResponse::SessionEventsSnapshot {
+                session,
+                events,
+                latest_sequence,
+                ..
+            } => {
+                self.active_session = session;
+                self.reset_projection();
+                self.after_sequence = Some(latest_sequence);
+                for event in events {
+                    self.after_sequence = Some(event.sequence);
+                    self.consume_event(&event.event);
+                }
+            }
+            response => return Err(unexpected_response("session event stream", response)),
+        }
+        self.backend_status = BackendStatus::Connected;
+        Ok(())
     }
 
     /// Applies newly journaled session events through the connection worker.
@@ -799,26 +829,6 @@ impl LoomView {
                 ),
             },
         );
-    }
-
-    pub(crate) fn collect_recent_events(&mut self) -> Result<(), LoomError> {
-        let response = self.connection.request(RequestEnvelope::new(
-            ClientRequest::GetRecentSessionEvents {
-                session_id: self.active_session.id,
-                limit: 32,
-            },
-        ));
-        match response.result? {
-            ServerResponse::SessionEvents { events } => {
-                for event in events {
-                    self.after_sequence = Some(event.sequence);
-                    self.consume_event(&event.event);
-                }
-            }
-            response => return Err(unexpected_response("recent session events", response)),
-        }
-        self.backend_status = BackendStatus::Connected;
-        Ok(())
     }
 
     pub(crate) fn consume_event(&mut self, event: &ServerEvent) {
@@ -1426,30 +1436,27 @@ impl LoomView {
         self.settings_open = false;
         self.review.open = false;
         self.activate_session(session.clone());
-        if let Some(events) = self.session_event_cache.get(&session.id).cloned() {
-            for event in events {
-                self.consume_event(&event);
-            }
-        }
         self.ensure_session_task_message(session.id);
         let session_id = session.id;
-        let needs_snapshot = !self.session_task_cache.contains_key(&session_id);
-        let snapshot_request = needs_snapshot.then(|| {
-            self.backend.submit(RequestEnvelope::new(
-                ClientRequest::GetAgentSessionSnapshot { session_id },
-            ))
-        });
-        let events_request = self.backend.submit(RequestEnvelope::new(
-            ClientRequest::GetRecentSessionEvents {
-                session_id,
-                limit: 32,
-            },
+        let backend = self.backend.clone();
+        let snapshot_request = self.backend.submit(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshot { session_id },
         ));
         cx.spawn(async move |view, cx| {
-            let snapshot = match snapshot_request {
-                Some(request) => Some(cx.background_spawn(async move { request.wait() }).await),
-                None => None,
+            let snapshot = cx
+                .background_spawn(async move { snapshot_request.wait() })
+                .await;
+            let after_sequence = match &snapshot.result {
+                Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
+                    Some(projection.latest_sequence)
+                }
+                _ => None,
             };
+            let events_request =
+                backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: Some(session_id),
+                    after_sequence,
+                }));
             let events = cx
                 .background_spawn(async move { events_request.wait() })
                 .await;
@@ -1465,31 +1472,39 @@ impl LoomView {
     pub(crate) fn finish_async_session_load(
         &mut self,
         session_id: AgentSessionId,
-        snapshot_response: Option<ResponseEnvelope>,
+        snapshot_response: ResponseEnvelope,
         events_response: ResponseEnvelope,
         cx: &mut Context<Self>,
     ) {
         if self.active_session.id != session_id {
             return;
         }
-        if let Some(snapshot_response) = snapshot_response {
-            if let Ok(ServerResponse::AgentSessionSnapshot(projection)) = snapshot_response.result {
+        match snapshot_response.result {
+            Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
                 self.active_session = projection.session;
-                self.active_run = projection.active_run.as_ref().map(|run| run.run.clone());
-                self.active_run_id = projection.active_run.as_ref().map(|run| run.run.id);
-                self.run_state = self.active_run.as_ref().map(|run| run.state);
-                if let Some(run) = &self.active_run {
-                    self.session_task_cache.insert(session_id, run.task.clone());
+                self.reset_projection();
+                self.after_sequence = Some(projection.latest_sequence);
+                if let Some(run) = projection.active_run {
+                    self.session_task_cache
+                        .insert(session_id, run.run.task.clone());
+                    self.model = run.run.model.clone();
+                    self.apply_run_projection(run);
                 }
             }
+            Err(error) => {
+                self.record_backend_error("load session snapshot", error);
+                self.reset_projection();
+            }
+            Ok(response) => {
+                self.record_backend_error(
+                    "load session snapshot",
+                    unexpected_response("session snapshot", response),
+                );
+                self.reset_projection();
+            }
         }
-        self.reset_projection();
         match events_response.result {
             Ok(ServerResponse::SessionEvents { events }) => {
-                self.session_event_cache.insert(
-                    session_id,
-                    events.iter().map(|event| event.event.clone()).collect(),
-                );
                 for event in events {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
