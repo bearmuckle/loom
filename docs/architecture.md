@@ -26,8 +26,8 @@
 
 ## Frontend
 
-The frontend is a GPUI application, using `gpui-gc` or the maintained GPUI
-variant required for browser support. `loom-ui` is organized into:
+The frontend is a GPUI application using `gpui-kit` for shared native and
+browser support. `loom-ui` is organized into:
 
 - `view`: the session navigator, run canvas, composer, review drawer, and the
   client-side projection they render.
@@ -103,20 +103,20 @@ filesystem, and process primitives directly. This keeps provider
 normalization, authorization, auditing, cancellation, and future sandboxing
 in one place.
 
-M5 deliberately does not turn `loom-workspace` into a second editor
-authority; it owns files, snapshots, edits, checkpoints, and repository
-instruction discovery, and nothing else. The GPUI client projects the existing backend-owned project,
-session, run, approval, workspace-change, task, and evidence state into a
-small session navigator and one active-session canvas. The canvas contains
-the chronological agent conversation and tool timeline plus a composer for
-new tasks, follow-up direction, and answers to agent questions.
+`loom-workspace` is not a second editor authority; it owns files, snapshots,
+edits, checkpoints, and repository instruction discovery. The GPUI client
+projects backend-owned project, session, run, approval, workspace-change,
+task, and evidence state into a session navigator and active-session canvas.
+The canvas contains the chronological agent conversation and tool timeline
+plus a composer for new tasks, follow-up direction, and answers to agent
+questions.
 
 Changed paths, bounded diffs, task artifacts, and repository status are
 read-only review projections opened in a drawer or focused overlay. They are
 loaded through the canonical workspace, process, and VCS services and remain
-scoped to the active project/session. No local editable buffer, tab/pane
-layout, language-service state, or client-owned orchestration state is needed
-for M5. A remote client receives the same projections over the M4 transport.
+scoped to the active project/session. The client does not own an editable
+buffer, tab/pane layout, language-service state, or orchestration state. A
+remote client receives the same projections over the authenticated transport.
 
 ## Agent runtime
 
@@ -187,7 +187,7 @@ authentication, errors, and usage metrics into the normalized interface.
 Provider configuration belongs to the backend and secrets are referenced by
 credential IDs; raw keys must not be sent to or persisted by the frontend.
 
-The initial provider classes are:
+Supported provider classes are:
 
 - Hosted providers with native APIs and tool calling.
 - OpenAI-compatible HTTP endpoints for self-hosted and organization gateways.
@@ -199,23 +199,20 @@ Local models may have weaker tool calling, smaller context windows, or
 different streaming behavior. The capability handshake must let the runtime
 adapt prompts and feature availability without making the UI provider-aware.
 
-M3 implements the registry with deterministic, OpenAI-compatible, and Ollama
-configurations. Credentials are represented by opaque references; the
-registry resolves them only while constructing a backend provider. Usage is
-recorded as normalized token/cost records, and transport/status failures are
-mapped to stable Loom error codes. Provider configuration summaries never
-contain endpoints with credential material or raw keys.
+Provider configuration uses opaque credential references, resolved only while
+constructing a backend provider. Usage is recorded as normalized token and
+cost records, and transport or status failures map to stable Loom error
+codes. Provider configuration summaries never contain credential material or
+raw keys.
 
-The first durable implementation stores a versioned backend snapshot through
-an atomic temporary-file replacement. It includes the session manager state,
-authoritative event journal, serializable agent runtime state (including
-messages, pending approvals, steps, limits, and usage), workspace state and
+The persistence layer stores a versioned backend snapshot through an atomic
+temporary-file replacement. It includes session state, the authoritative
+event journal, serializable agent runtime state, workspace state and
 checkpoints, policy decisions, provider health, and usage ledgers. A runtime
 that was executing during a process crash is recovered in `paused` state so a
 new connection must explicitly resume it.
 
-M4 keeps `InProcessBackend` as the single domain service and adds a transport
-adapter in `loom-server::remote`:
+Remote access uses the same domain services through a transport adapter:
 
 ```text
 HTTP upgrade + bearer token

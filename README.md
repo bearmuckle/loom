@@ -1,82 +1,43 @@
 # Loom
 
+> Loom is early experimental software. Interfaces and behavior may change, and
+> it is not yet suitable for production or sensitive workloads.
+
 Loom is a cross-platform, remote-first agentic development environment. It
 combines a native or browser-based interface with a Rust backend that
 orchestrates persistent coding-agent sessions, workspace state, tool
 execution, and integrations.
-
-The primary product is an agent orchestration application with a code
-workspace. A user gives an agent a repository task, watches it inspect,
-plan, edit, run tools, respond to failures, and produce a reviewable result.
-The user remains in control through approvals, interruption, feedback,
-checkpoints, and explicit permission policies.
 
 The backend can run locally, as a child process, or remotely. Hosted model
 providers, OpenAI-compatible endpoints, and local model runtimes should be
 usable through the same session and tool model. Native and browser clients
 should be interchangeable views of the same durable backend session.
 
-## Specification
+## Why Loom
 
-The project specification is split into focused documents:
+- **Cross-platform performance:** A native Rust stack can stay lightweight
+  across platforms instead of depending on a heavy desktop runtime.
+- **Remote-first workflows:** Agents can run near repositories and services,
+  without tying development work to a single computer.
+- **User-controlled trust:** Loom can run on infrastructure you control, with
+  open code and explicit permissions for workspace access, tools, and
+  credentials.
 
-- [Product scope and use cases](docs/product.md) - target users, workflows,
-  feature areas, principles, and the first end-to-end experience.
-- [Architecture](docs/architecture.md) - frontend, Rust backend, agent
-  runtime, model providers, tools, and repository structure.
-- [Communication protocol](docs/protocol.md) - transports, event model,
-  reconnect behavior, provider-neutral operations, and streaming.
-- [Security model](docs/security.md) - trust boundaries, permissions,
-  credentials, prompt injection, and resource limits.
-- [Known competitors and prior art](docs/competitors.md) - comparable
-  products, useful patterns, near-misses, and design lessons.
-- [Roadmap and quality bar](docs/roadmap.md) - milestones, exit conditions,
-  performance, testing, decisions, and first-release non-goals.
-- [M5 agent workspace and orchestration surface](docs/decisions/0006-m5-coding-workspace.md) -
-  the focused session-first client specification.
-- [Implementation audit](docs/audit.md) - current gaps between the
-  specification and the implementation, and descoped code still present.
+## Build and run
 
-These documents describe the intended first implementation. The roadmap and
-architecture decision records are the source of truth for scope and
-implementation tradeoffs; this README intentionally keeps the product
-direction and document index concise.
-
-## Native M5 client
-
-Run the native client against the current repository or an explicit workspace:
+Requires Rust 1.85 or newer.
 
 ```text
+cargo build
 cargo run -p loom-ui -- --workspace /path/to/project
 ```
 
-The client persists local session state outside the repository and reopens the
-same project and sessions on the next launch. Configure a real
-OpenAI-compatible backend with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
-`--model MODEL`. For GitHub Copilot, launch the UI and click **Log in** in the
-title bar; Loom shows GitHub's device URL and one-time code in the window:
+Demo mode:
 
 ```text
-cargo run -p loom-ui -- --workspace /path/to/project
+cargo run -p loom-ui -- --demo
 ```
 
-The login stores the GitHub OAuth token in the Loom credentials file with
-owner-only permissions. Loom exchanges it for a short-lived Copilot API token
-when it calls a model; neither token is included in backend state or protocol
-responses. The deterministic provider is available only for the explicit
-`--demo` flow.
-
-Only configured providers appear in the model picker. To expose an Ollama
-model, configure it before starting the UI:
-
-```text
-LOOM_OLLAMA_ENDPOINT=http://127.0.0.1:11434 \
-LOOM_OLLAMA_MODEL=llama3.2 \
-cargo run -p loom-ui -- --workspace /path/to/project
-```
-
-The same client can attach to an authenticated remote backend:
-
-```text
-LOOM_REMOTE_URL=ws://127.0.0.1:8080/ws LOOM_TOKEN=... cargo run -p loom-ui
-```
+Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
+`LOOM_MODEL`, or connect to a remote backend with `LOOM_REMOTE_URL` and
+`LOOM_TOKEN`. GitHub Copilot login is available in the UI.
