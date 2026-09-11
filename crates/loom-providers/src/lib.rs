@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt, fs,
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
@@ -10,8 +10,14 @@ use std::{
 
 use loom_core::{ErrorCode, LoomError, Result, Timestamp, ToolCallId, UsageSnapshot};
 use loom_model::{
-    FinishReason, MessageRole, ModelCapabilities, ModelDescriptor, ModelId, ModelMessage,
-    ModelRequest, ModelStreamEvent, ProviderId, TokenUsage, ToolCall,
+    CancellationToken, FinishReason, MessageRole, ModelCapabilities, ModelDescriptor, ModelId,
+    ModelMessage, ModelRequest, ModelStreamEvent, ModelStreamSink, ProviderId, StreamFlow,
+    TokenUsage, ToolCall,
+};
+pub use loom_model::{
+    ModelProvider, ProviderDescriptor, ProviderHealth, ProviderHealthState, ProviderKind,
+    ProviderSummary, ProviderUsageRecord, ProviderUsageSummary, UnavailableProvider,
+    estimate_tokens,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,64 +33,6 @@ const GITHUB_COPILOT_EDITOR_VERSION: &str = "vscode/1.96.2";
 const GITHUB_COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
 const GITHUB_COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
 const GITHUB_API_VERSION: &str = "2025-04-01";
-
-pub trait ModelProvider: Send {
-    fn descriptor(&self) -> &ModelDescriptor;
-
-    fn stream(&mut self, request: &ModelRequest) -> Result<Vec<ModelStreamEvent>>;
-
-    fn list_models(&self) -> Vec<ModelDescriptor> {
-        vec![self.descriptor().clone()]
-    }
-
-    fn capabilities(&self) -> ModelCapabilities {
-        self.descriptor().capabilities.clone()
-    }
-
-    fn count_tokens(&self, request: &ModelRequest) -> u64 {
-        estimate_tokens(request)
-    }
-
-    fn health_check(&mut self) -> Result<()> {
-        Ok(())
-    }
-
-    fn reset(&mut self) {}
-}
-
-pub struct UnavailableProvider {
-    descriptor: ModelDescriptor,
-    error: LoomError,
-}
-
-impl UnavailableProvider {
-    pub fn new(descriptor: ModelDescriptor, error: LoomError) -> Self {
-        Self { descriptor, error }
-    }
-}
-
-impl ModelProvider for UnavailableProvider {
-    fn descriptor(&self) -> &ModelDescriptor {
-        &self.descriptor
-    }
-
-    fn stream(&mut self, _request: &ModelRequest) -> Result<Vec<ModelStreamEvent>> {
-        Err(self.error.clone())
-    }
-
-    fn health_check(&mut self) -> Result<()> {
-        Err(self.error.clone())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    Deterministic,
-    OpenAiCompatible,
-    Ollama,
-    GitHubCopilot,
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -454,64 +402,6 @@ pub fn github_copilot_descriptor() -> ModelDescriptor {
             json_mode: true,
         },
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProviderHealth {
-    pub state: ProviderHealthState,
-    pub checked_at: Option<Timestamp>,
-    pub consecutive_failures: u32,
-    pub last_error: Option<LoomError>,
-}
-
-impl Default for ProviderHealth {
-    fn default() -> Self {
-        Self {
-            state: ProviderHealthState::Unknown,
-            checked_at: None,
-            consecutive_failures: 0,
-            last_error: None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderHealthState {
-    Unknown,
-    Healthy,
-    Degraded,
-    Unavailable,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProviderSummary {
-    pub id: ProviderId,
-    pub kind: ProviderKind,
-    pub display_name: String,
-    pub models: Vec<ModelDescriptor>,
-    pub credential_id: Option<String>,
-    pub health: ProviderHealth,
-}
-
-pub type ProviderDescriptor = ProviderSummary;
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProviderUsageSummary {
-    pub requests: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub cost_micros: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProviderUsageRecord {
-    pub provider: ProviderId,
-    pub model: ModelId,
-    pub usage: TokenUsage,
-    pub cost_micros: u64,
-    pub recorded_at: Timestamp,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1262,20 +1152,29 @@ impl ModelProvider for AccountingProvider {
         self.inner.descriptor()
     }
 
-    fn stream(&mut self, request: &ModelRequest) -> Result<Vec<ModelStreamEvent>> {
-        let events = self.inner.stream(request)?;
+    fn stream(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        sink: &mut dyn ModelStreamSink,
+    ) -> Result<()> {
         let mut usage = TokenUsage::default();
-        for event in &events {
-            if let ModelStreamEvent::Usage { usage: event_usage } = event {
-                usage.input_tokens = usage.input_tokens.saturating_add(event_usage.input_tokens);
-                usage.output_tokens = usage
-                    .output_tokens
-                    .saturating_add(event_usage.output_tokens);
-                usage.cached_input_tokens = usage
-                    .cached_input_tokens
-                    .saturating_add(event_usage.cached_input_tokens);
-            }
-        }
+        let result = {
+            let usage = &mut usage;
+            self.inner.stream(request, cancel, &mut |event| {
+                if let ModelStreamEvent::Usage { usage: event_usage } = &event {
+                    usage.input_tokens =
+                        usage.input_tokens.saturating_add(event_usage.input_tokens);
+                    usage.output_tokens = usage
+                        .output_tokens
+                        .saturating_add(event_usage.output_tokens);
+                    usage.cached_input_tokens = usage
+                        .cached_input_tokens
+                        .saturating_add(event_usage.cached_input_tokens);
+                }
+                sink.emit(event)
+            })
+        };
         let cost_micros = cost_for_usage(
             &usage,
             self.input_cost_micros_per_1k,
@@ -1290,7 +1189,7 @@ impl ModelProvider for AccountingProvider {
                 usage,
                 cost_micros,
             );
-        Ok(events)
+        result
     }
 
     fn count_tokens(&self, request: &ModelRequest) -> u64 {
@@ -1406,14 +1305,25 @@ impl ModelProvider for DeterministicProvider {
         &self.descriptor
     }
 
-    fn stream(&mut self, _request: &ModelRequest) -> Result<Vec<ModelStreamEvent>> {
+    fn stream(
+        &mut self,
+        _request: &ModelRequest,
+        cancel: &CancellationToken,
+        sink: &mut dyn ModelStreamSink,
+    ) -> Result<()> {
         let events = self.steps.get(self.cursor).cloned().unwrap_or_else(|| {
             vec![ModelStreamEvent::Completed {
                 reason: FinishReason::Stop,
             }]
         });
         self.cursor = self.cursor.saturating_add(1);
-        Ok(events)
+        for event in events {
+            cancel.check()?;
+            if sink.emit(event)? == StreamFlow::Stop {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn reset(&mut self) {
@@ -1728,7 +1638,12 @@ impl ModelProvider for GitHubCopilotProvider {
         &self.descriptor
     }
 
-    fn stream(&mut self, request: &ModelRequest) -> Result<Vec<ModelStreamEvent>> {
+    fn stream(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        sink: &mut dyn ModelStreamSink,
+    ) -> Result<()> {
         if request.model != self.descriptor.id {
             return Err(LoomError::invalid_request(format!(
                 "request model '{}' does not match provider model '{}'",
@@ -1736,8 +1651,10 @@ impl ModelProvider for GitHubCopilotProvider {
                 self.descriptor.id.as_str()
             )));
         }
+        cancel.check()?;
         let token = self.fetch_copilot_token()?;
-        let (endpoint, payload, provider) = if uses_responses_endpoint(request.model.as_str()) {
+        let responses_api = uses_responses_endpoint(request.model.as_str());
+        let (endpoint, payload, provider) = if responses_api {
             (
                 format!("{}/responses", trim_endpoint(&token.api_endpoint)),
                 responses_request_payload(request),
@@ -1750,9 +1667,9 @@ impl ModelProvider for GitHubCopilotProvider {
                 "github-copilot chat completion",
             )
         };
-        let events = send_openai_request(
+        send_openai_request(
             &endpoint,
-            &format!("Bearer {}", token.value),
+            &bearer_header(&token.value),
             &[
                 ("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION),
                 ("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION),
@@ -1764,13 +1681,14 @@ impl ModelProvider for GitHubCopilotProvider {
             ],
             payload,
             provider,
-            if uses_responses_endpoint(request.model.as_str()) {
+            if responses_api {
                 Some(&mut self.responses_call_ids)
             } else {
                 None
             },
-        )?;
-        Ok(events)
+            cancel,
+            sink,
+        )
     }
 
     fn health_check(&mut self) -> Result<()> {
@@ -1831,7 +1749,12 @@ impl ModelProvider for OpenAiCompatibleProvider {
         &self.descriptor
     }
 
-    fn stream(&mut self, request: &ModelRequest) -> Result<Vec<ModelStreamEvent>> {
+    fn stream(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        sink: &mut dyn ModelStreamSink,
+    ) -> Result<()> {
         if request.model != self.descriptor.id {
             return Err(LoomError::invalid_request(format!(
                 "request model '{}' does not match provider model '{}'",
@@ -1839,6 +1762,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 self.descriptor.id.as_str()
             )));
         }
+        cancel.check()?;
         let mut payload = serde_json::json!({
             "model": request.model.as_str(),
             "messages": request.messages.iter().map(message_json).collect::<Vec<_>>(),
@@ -1884,6 +1808,8 @@ impl ModelProvider for OpenAiCompatibleProvider {
             payload,
             self.descriptor.provider.as_str(),
             None,
+            cancel,
+            sink,
         )
     }
 
@@ -1942,8 +1868,13 @@ impl ModelProvider for OllamaProvider {
         self.inner.descriptor()
     }
 
-    fn stream(&mut self, request: &ModelRequest) -> Result<Vec<ModelStreamEvent>> {
-        self.inner.stream(request)
+    fn stream(
+        &mut self,
+        request: &ModelRequest,
+        cancel: &CancellationToken,
+        sink: &mut dyn ModelStreamSink,
+    ) -> Result<()> {
+        self.inner.stream(request, cancel, sink)
     }
 
     fn count_tokens(&self, request: &ModelRequest) -> u64 {
@@ -2070,15 +2001,33 @@ fn responses_request_payload(request: &ModelRequest) -> serde_json::Value {
     payload
 }
 
+/// Sends an OpenAI-shaped request and forwards every decoded event to `sink`.
+///
+/// The request asks for server-sent events. When the endpoint honours that, the
+/// body is decoded chunk by chunk and text reaches the sink while the completion
+/// is still being produced; the cancellation token is checked between chunks so
+/// an interrupt does not have to wait for the completion. When the endpoint
+/// answers with a complete JSON document instead (declared by its content type),
+/// the document is normalized and emitted in one pass.
+#[allow(clippy::too_many_arguments)]
 fn send_openai_request(
     endpoint: &str,
     authorization: &str,
     headers: &[(&str, &str)],
-    payload: serde_json::Value,
+    mut payload: serde_json::Value,
     provider: &str,
     call_ids: Option<&mut BTreeMap<String, ToolCallId>>,
-) -> Result<Vec<ModelStreamEvent>> {
-    let request = ureq::post(endpoint).set("Content-Type", "application/json");
+    cancel: &CancellationToken,
+    sink: &mut dyn ModelStreamSink,
+) -> Result<()> {
+    let responses_api = provider.contains("responses");
+    payload["stream"] = serde_json::Value::Bool(true);
+    if !responses_api {
+        payload["stream_options"] = serde_json::json!({"include_usage": true});
+    }
+    let request = ureq::post(endpoint)
+        .set("Content-Type", "application/json")
+        .set("Accept", "text/event-stream");
     let request = if authorization.is_empty() {
         request
     } else {
@@ -2087,25 +2036,386 @@ fn send_openai_request(
     let request = headers
         .iter()
         .fold(request, |request, (name, value)| request.set(name, value));
+    cancel.check()?;
     let response = request
         .send_json(payload)
         .map_err(|error| normalize_provider_request_error(provider, error))?;
-    let body: serde_json::Value = response.into_json().map_err(|error| {
+    let event_stream = response
+        .header("content-type")
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+    let mut own_call_ids = BTreeMap::new();
+    let call_ids = call_ids.unwrap_or(&mut own_call_ids);
+    if !event_stream {
+        let body: serde_json::Value = response.into_json().map_err(|error| {
+            LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                format!("{provider} returned a response that was not valid JSON: {error}"),
+                false,
+            )
+        })?;
+        let events = if responses_api {
+            normalize_responses_response(&body, call_ids)?
+        } else {
+            normalize_openai_response(&body)?
+        };
+        for event in events {
+            cancel.check()?;
+            if sink.emit(event)? == StreamFlow::Stop {
+                break;
+            }
+        }
+        return Ok(());
+    }
+    let reader = BufReader::new(response.into_reader());
+    let mut decoder = if responses_api {
+        StreamDecoder::responses(provider.to_owned())
+    } else {
+        StreamDecoder::chat_completions(provider.to_owned())
+    };
+    for line in reader.lines() {
+        cancel.check()?;
+        let line = line.map_err(|error| {
+            normalize_transport_error(provider, &format!("event stream read failed: {error}"))
+        })?;
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() {
+            continue;
+        }
+        if payload == "[DONE]" {
+            break;
+        }
+        let chunk: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+            LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                format!("{provider} sent an event that was not valid JSON: {error}"),
+                false,
+            )
+        })?;
+        if decoder.accept(&chunk, call_ids, sink)? == StreamFlow::Stop {
+            return Ok(());
+        }
+    }
+    decoder.finish(sink)
+}
+
+/// Incremental decoder for the two OpenAI-shaped event streams Loom speaks.
+struct StreamDecoder {
+    provider: String,
+    responses_api: bool,
+    tool_calls: BTreeMap<u64, PartialToolCall>,
+    usage: Option<TokenUsage>,
+    finish_reason: Option<FinishReason>,
+    completed: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PartialToolCall {
+    name: String,
+    arguments: String,
+}
+
+impl StreamDecoder {
+    fn chat_completions(provider: String) -> Self {
+        Self {
+            provider,
+            responses_api: false,
+            tool_calls: BTreeMap::new(),
+            usage: None,
+            finish_reason: None,
+            completed: false,
+        }
+    }
+
+    fn responses(provider: String) -> Self {
+        Self {
+            provider,
+            responses_api: true,
+            tool_calls: BTreeMap::new(),
+            usage: None,
+            finish_reason: None,
+            completed: false,
+        }
+    }
+
+    fn accept(
+        &mut self,
+        chunk: &serde_json::Value,
+        call_ids: &mut BTreeMap<String, ToolCallId>,
+        sink: &mut dyn ModelStreamSink,
+    ) -> Result<StreamFlow> {
+        if self.responses_api {
+            self.accept_responses_event(chunk, call_ids, sink)
+        } else {
+            self.accept_chat_chunk(chunk, sink)
+        }
+    }
+
+    fn accept_chat_chunk(
+        &mut self,
+        chunk: &serde_json::Value,
+        sink: &mut dyn ModelStreamSink,
+    ) -> Result<StreamFlow> {
+        if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
+            self.usage = Some(openai_usage(usage));
+        }
+        let Some(choice) = chunk
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|choices| choices.first())
+        else {
+            return Ok(StreamFlow::Continue);
+        };
+        if let Some(reason) = choice
+            .get("finish_reason")
+            .and_then(serde_json::Value::as_str)
+        {
+            self.finish_reason = Some(finish_reason_from_str(reason));
+        }
+        let Some(delta) = choice.get("delta") else {
+            return Ok(StreamFlow::Continue);
+        };
+        if let Some(fragments) = delta
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        {
+            for fragment in fragments {
+                let index = fragment
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default();
+                let entry = self.tool_calls.entry(index).or_default();
+                if let Some(function) = fragment.get("function") {
+                    if let Some(name) = function.get("name").and_then(serde_json::Value::as_str) {
+                        entry.name.push_str(name);
+                    }
+                    if let Some(arguments) = function
+                        .get("arguments")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        entry.arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+        if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str) {
+            if !text.is_empty() {
+                return sink.emit(ModelStreamEvent::TextDelta {
+                    text: text.to_owned(),
+                });
+            }
+        }
+        Ok(StreamFlow::Continue)
+    }
+
+    fn accept_responses_event(
+        &mut self,
+        chunk: &serde_json::Value,
+        call_ids: &mut BTreeMap<String, ToolCallId>,
+        sink: &mut dyn ModelStreamSink,
+    ) -> Result<StreamFlow> {
+        match chunk.get("type").and_then(serde_json::Value::as_str) {
+            Some("response.output_text.delta") => {
+                let text = chunk
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    return sink.emit(ModelStreamEvent::TextDelta {
+                        text: text.to_owned(),
+                    });
+                }
+                Ok(StreamFlow::Continue)
+            }
+            Some("response.output_item.done") => {
+                let Some(item) = chunk.get("item") else {
+                    return Ok(StreamFlow::Continue);
+                };
+                if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+                    return Ok(StreamFlow::Continue);
+                }
+                let call = responses_function_call(item, call_ids)?;
+                sink.emit(ModelStreamEvent::ToolCallDelta { call })
+            }
+            Some("response.completed" | "response.incomplete" | "response.failed") => {
+                let response = chunk.get("response");
+                if let Some(usage) = response
+                    .and_then(|response| response.get("usage"))
+                    .filter(|usage| !usage.is_null())
+                {
+                    self.usage = Some(responses_usage(usage));
+                }
+                self.finish_reason = Some(
+                    if response
+                        .and_then(|response| response.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("completed")
+                    {
+                        FinishReason::Stop
+                    } else {
+                        FinishReason::Error
+                    },
+                );
+                self.completed = true;
+                Ok(StreamFlow::Continue)
+            }
+            Some("error") => Err(LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                format!(
+                    "{} reported a stream error: {}",
+                    self.provider,
+                    chunk
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("no detail")
+                ),
+                false,
+            )),
+            _ => Ok(StreamFlow::Continue),
+        }
+    }
+
+    /// Emits the events that are only known once the stream ends.
+    fn finish(self, sink: &mut dyn ModelStreamSink) -> Result<()> {
+        let mut saw_tool_call = false;
+        for (_, partial) in self.tool_calls {
+            if partial.name.trim().is_empty() {
+                return Err(LoomError::new(
+                    ErrorCode::ProviderInvalidResponse,
+                    format!("{} streamed a tool call without a name", self.provider),
+                    false,
+                ));
+            }
+            let arguments = parse_tool_arguments(&partial.arguments)?;
+            saw_tool_call = true;
+            if sink.emit(ModelStreamEvent::ToolCallDelta {
+                call: ToolCall {
+                    id: ToolCallId::new(),
+                    name: partial.name,
+                    arguments,
+                },
+            })? == StreamFlow::Stop
+            {
+                return Ok(());
+            }
+        }
+        if let Some(usage) = self.usage {
+            if sink.emit(ModelStreamEvent::Usage { usage })? == StreamFlow::Stop {
+                return Ok(());
+            }
+        }
+        let reason = self.finish_reason.unwrap_or(if saw_tool_call {
+            FinishReason::ToolCall
+        } else {
+            FinishReason::Stop
+        });
+        sink.emit(ModelStreamEvent::Completed { reason })?;
+        Ok(())
+    }
+}
+
+fn parse_tool_arguments(arguments: &str) -> Result<serde_json::Value> {
+    if arguments.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(arguments).map_err(|error| {
         LoomError::new(
             ErrorCode::ProviderInvalidResponse,
-            format!("{provider} returned a response that was not valid JSON: {error}"),
+            format!("tool arguments were not valid JSON: {error}"),
             false,
         )
-    })?;
-    if provider.contains("responses") {
-        if let Some(call_ids) = call_ids {
-            normalize_responses_response(&body, call_ids)
-        } else {
-            normalize_responses_response(&body, &mut BTreeMap::new())
-        }
-    } else {
-        normalize_openai_response(&body)
+    })
+}
+
+fn finish_reason_from_str(reason: &str) -> FinishReason {
+    match reason {
+        "stop" => FinishReason::Stop,
+        "tool_calls" | "function_call" => FinishReason::ToolCall,
+        "length" => FinishReason::Length,
+        "cancelled" => FinishReason::Cancelled,
+        _ => FinishReason::Error,
     }
+}
+
+fn openai_usage(usage: &serde_json::Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage
+            .get("prompt_tokens")
+            .or_else(|| usage.get("input_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        output_tokens: usage
+            .get("completion_tokens")
+            .or_else(|| usage.get("output_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        cached_input_tokens: usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+    }
+}
+
+fn responses_usage(usage: &serde_json::Value) -> TokenUsage {
+    TokenUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+        cached_input_tokens: usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default(),
+    }
+}
+
+fn responses_function_call(
+    item: &serde_json::Value,
+    call_ids: &mut BTreeMap<String, ToolCallId>,
+) -> Result<ToolCall> {
+    let name = item
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::ProviderInvalidResponse,
+                "Copilot Responses function call did not contain a name",
+                false,
+            )
+        })?;
+    let arguments = item
+        .get("arguments")
+        .and_then(serde_json::Value::as_str)
+        .map(|arguments| {
+            serde_json::from_str(arguments).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::ProviderInvalidResponse,
+                    format!("Copilot Responses tool arguments were invalid: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
+    let remote_call_id = item
+        .get("call_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let id = *call_ids.entry(remote_call_id).or_default();
+    Ok(ToolCall {
+        id,
+        name: name.to_owned(),
+        arguments,
+    })
 }
 
 fn normalize_responses_response(
@@ -2273,22 +2583,6 @@ fn health_endpoint(endpoint: &str) -> String {
     endpoint
         .strip_suffix("/chat/completions")
         .map_or_else(|| endpoint.to_owned(), |base| format!("{base}/models"))
-}
-
-pub fn estimate_tokens(request: &ModelRequest) -> u64 {
-    let message_chars = request
-        .messages
-        .iter()
-        .map(|message| message.content.chars().count())
-        .sum::<usize>();
-    let tool_chars = request
-        .tools
-        .iter()
-        .map(|tool| {
-            tool.description.chars().count() + tool.input_schema.to_string().chars().count()
-        })
-        .sum::<usize>();
-    ((message_chars.saturating_add(tool_chars) as u64).saturating_add(3)) / 4
 }
 
 pub fn cost_for_usage(
@@ -2515,7 +2809,133 @@ mod tests {
         thread,
     };
 
+    use loom_model::CollectingSink;
+
     use super::*;
+
+    fn collect(provider: &mut impl ModelProvider, request: &ModelRequest) -> Vec<ModelStreamEvent> {
+        let mut sink = CollectingSink::default();
+        provider
+            .stream(request, &CancellationToken::new(), &mut sink)
+            .unwrap();
+        sink.events
+    }
+
+    fn serve_once(
+        body: &'static str,
+        content_type: &'static str,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        (format!("http://{address}/v1/chat/completions"), server)
+    }
+
+    #[test]
+    fn openai_compatible_provider_emits_text_before_the_stream_ends() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"tial\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":",
+            "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":",
+            "{\"arguments\":\"\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":4}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (endpoint, server) = serve_once(body, "text/event-stream");
+        let mut provider =
+            OpenAiCompatibleProvider::new(endpoint, "", ModelId::new("fixture/model"));
+        let request = ModelRequest {
+            model: ModelId::new("fixture/model"),
+            messages: vec![ModelMessage::new(MessageRole::User, "hello")],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        let mut seen = Vec::new();
+        provider
+            .stream(&request, &CancellationToken::new(), &mut |event| {
+                seen.push(event);
+                Ok(StreamFlow::Continue)
+            })
+            .unwrap();
+        server.join().unwrap();
+        assert!(matches!(
+            seen.first(),
+            Some(ModelStreamEvent::TextDelta { text }) if text == "par"
+        ));
+        assert!(matches!(
+            seen.get(1),
+            Some(ModelStreamEvent::TextDelta { text }) if text == "tial"
+        ));
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ToolCallDelta { call }
+                if call.name == "read_file" && call.arguments["path"] == "README.md"
+        )));
+        assert!(seen.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::Usage { usage } if usage.input_tokens == 7
+        )));
+        assert!(matches!(
+            seen.last(),
+            Some(ModelStreamEvent::Completed {
+                reason: FinishReason::ToolCall
+            })
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_token_stops_a_provider_before_it_sends() {
+        let mut provider = DeterministicProvider::demo();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = provider
+            .stream(
+                &ModelRequest {
+                    model: ModelId::new("deterministic/demo"),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    options: Default::default(),
+                },
+                &cancel,
+                &mut CollectingSink::default(),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::RequestCancelled);
+    }
+
+    #[test]
+    fn a_sink_can_stop_a_stream_early() {
+        let mut provider = DeterministicProvider::demo();
+        let mut seen = 0_usize;
+        provider
+            .stream(
+                &ModelRequest {
+                    model: ModelId::new("deterministic/demo"),
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    options: Default::default(),
+                },
+                &CancellationToken::new(),
+                &mut |_event| {
+                    seen += 1;
+                    Ok(StreamFlow::Stop)
+                },
+            )
+            .unwrap();
+        assert_eq!(seen, 1);
+    }
 
     #[test]
     fn deterministic_provider_streams_tool_calls_and_completion() {
@@ -2527,14 +2947,14 @@ mod tests {
             options: Default::default(),
         };
 
-        let first = provider.stream(&request).unwrap();
+        let first = collect(&mut provider, &request);
         assert!(matches!(
             first.get(1),
             Some(ModelStreamEvent::ToolCallDelta { call })
                 if call.name == "list_files"
         ));
         let final_step = (0..3)
-            .map(|_| provider.stream(&request).unwrap())
+            .map(|_| collect(&mut provider, &request))
             .last()
             .unwrap();
         assert!(final_step.iter().any(|event| {
@@ -2612,14 +3032,15 @@ mod tests {
             "raw-key-never-in-events",
             ModelId::new("fixture/model"),
         );
-        let events = provider
-            .stream(&ModelRequest {
+        let events = collect(
+            &mut provider,
+            &ModelRequest {
                 model: ModelId::new("fixture/model"),
                 messages: vec![ModelMessage::new(MessageRole::User, "hello")],
                 tools: Vec::new(),
                 options: Default::default(),
-            })
-            .unwrap();
+            },
+        );
         assert!(events.iter().any(|event| {
             matches!(
                 event,
@@ -2778,14 +3199,15 @@ mod tests {
             "github-token",
             descriptor,
         );
-        let events = provider
-            .stream(&ModelRequest {
+        let events = collect(
+            &mut provider,
+            &ModelRequest {
                 model: ModelId::new("gpt-4o"),
                 messages: vec![ModelMessage::new(MessageRole::User, "hello")],
                 tools: Vec::new(),
                 options: Default::default(),
-            })
-            .unwrap();
+            },
+        );
         assert!(events.iter().any(|event| {
             matches!(
                 event,

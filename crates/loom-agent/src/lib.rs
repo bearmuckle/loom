@@ -1,163 +1,22 @@
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+
 use loom_context::{ContextAssembler, ContextAssemblyOptions, ContextInput, ContextInspection};
 use loom_core::{
     AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink, LimitKind, LimitStatus, LoomError,
     PolicyEvaluation, Result, RunId, SessionLimits, StepId, Timestamp, UsageSnapshot,
 };
 use loom_model::{
-    CompletionOptions, MessageRole, ModelId, ModelMessage, ModelRequest, ModelStreamEvent,
-    TokenUsage, ToolCall,
+    CancellationToken, CompletionOptions, MessageRole, ModelId, ModelMessage, ModelProvider,
+    ModelRequest, ModelStreamEvent, StreamFlow, ToolCall,
 };
-use loom_providers::ModelProvider;
+pub use loom_protocol::{
+    AgentEvent, AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState, ApprovalDecision,
+};
 use loom_tools::{ToolExecutor, ToolKind, ToolResult, tool_definitions};
 use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentRunState {
-    Planning,
-    Executing,
-    AwaitingApproval,
-    Paused,
-    NeedsInput,
-    Evaluating,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AgentRunSnapshot {
-    pub id: RunId,
-    pub session_id: AgentSessionId,
-    pub task: String,
-    pub model: ModelId,
-    pub state: AgentRunState,
-    pub started_at: Timestamp,
-    pub updated_at: Timestamp,
-    pub completed_at: Option<Timestamp>,
-    pub summary: Option<String>,
-    #[serde(default)]
-    pub evidence: Vec<EvidenceLink>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AgentPlan {
-    pub steps: Vec<AgentPlanStep>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AgentPlanStep {
-    pub id: String,
-    pub description: String,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalDecision {
-    Approved,
-    Rejected,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum AgentEvent {
-    RunStarted {
-        snapshot: AgentRunSnapshot,
-    },
-    PlanProposed {
-        run_id: RunId,
-        plan: AgentPlan,
-    },
-    StepStarted {
-        run_id: RunId,
-        step_id: StepId,
-        index: u32,
-    },
-    StepCompleted {
-        run_id: RunId,
-        step_id: StepId,
-        index: u32,
-    },
-    ContextInspected {
-        run_id: RunId,
-        inspection: ContextInspection,
-    },
-    ProviderError {
-        run_id: RunId,
-        error: LoomError,
-    },
-    ContextError {
-        run_id: RunId,
-        error: LoomError,
-    },
-    AssistantMessageDelta {
-        run_id: RunId,
-        message_id: u64,
-        text: String,
-    },
-    UserMessage {
-        run_id: RunId,
-        text: String,
-    },
-    NeedsInput {
-        run_id: RunId,
-        prompt: String,
-    },
-    ToolCallRequested {
-        run_id: RunId,
-        call: ToolCall,
-    },
-    ToolApprovalRequired {
-        run_id: RunId,
-        call: ToolCall,
-    },
-    ToolPolicyEvaluated {
-        run_id: RunId,
-        call: ToolCall,
-        evaluation: PolicyEvaluation,
-    },
-    ToolApprovalDecided {
-        run_id: RunId,
-        tool_call_id: loom_core::ToolCallId,
-        decision: ApprovalDecision,
-    },
-    ToolCallStarted {
-        run_id: RunId,
-        call: ToolCall,
-    },
-    ToolOutputChunk {
-        run_id: RunId,
-        tool_call_id: loom_core::ToolCallId,
-        chunk: String,
-    },
-    ToolCallCompleted {
-        run_id: RunId,
-        result: ToolResult,
-    },
-    RunUsage {
-        run_id: RunId,
-        usage: TokenUsage,
-    },
-    RunUsageUpdated {
-        run_id: RunId,
-        usage: UsageSnapshot,
-    },
-    RunLimitReached {
-        run_id: RunId,
-        status: LimitStatus,
-    },
-    RecoveryRequired {
-        run_id: RunId,
-        reason: String,
-    },
-    RunStateChanged {
-        run_id: RunId,
-        state: AgentRunState,
-    },
-    RunCompleted {
-        snapshot: AgentRunSnapshot,
-    },
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTask {
@@ -220,12 +79,139 @@ struct PendingApproval {
     call: ToolCall,
 }
 
+/// Out-of-band control of a run that is executing.
+///
+/// A control request never waits for the run: it raises a flag and cancels the
+/// in-flight model stream, and the run loop applies the transition at its next
+/// checkpoint.
+#[derive(Clone, Debug, Default)]
+pub struct RunControl {
+    inner: Arc<RunControlState>,
+}
+
+#[derive(Debug, Default)]
+struct RunControlState {
+    interrupt: AtomicBool,
+    pause: AtomicBool,
+    stream: Mutex<CancellationToken>,
+}
+
+impl RunControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Asks the run to stop and finish as cancelled.
+    pub fn request_interrupt(&self) {
+        let stream = self.locked_stream();
+        self.inner.interrupt.store(true, Ordering::SeqCst);
+        stream.cancel();
+    }
+
+    /// Asks the run to stop at its next checkpoint and stay resumable.
+    pub fn request_pause(&self) {
+        let stream = self.locked_stream();
+        self.inner.pause.store(true, Ordering::SeqCst);
+        stream.cancel();
+    }
+
+    pub fn is_interrupt_requested(&self) -> bool {
+        self.inner.interrupt.load(Ordering::SeqCst)
+    }
+
+    pub fn is_pause_requested(&self) -> bool {
+        self.inner.pause.load(Ordering::SeqCst)
+    }
+
+    /// True while a requested pause or interrupt has not been applied yet.
+    pub fn is_stopping(&self) -> bool {
+        self.is_interrupt_requested() || self.is_pause_requested()
+    }
+
+    /// Token handed to the provider for the next model call.
+    pub fn stream_token(&self) -> CancellationToken {
+        self.locked_stream().clone()
+    }
+
+    /// Clears a stop request after the owner has applied it directly.
+    pub fn clear_request(&self) {
+        let mut stream = self.locked_stream();
+        self.inner.interrupt.store(false, Ordering::SeqCst);
+        self.inner.pause.store(false, Ordering::SeqCst);
+        *stream = CancellationToken::new();
+    }
+
+    fn locked_stream(&self) -> std::sync::MutexGuard<'_, CancellationToken> {
+        self.inner
+            .stream
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Receives every agent event as it is produced.
+pub type AgentEventObserver = Arc<dyn Fn(&AgentEvent) + Send + Sync>;
+
+/// Events produced by one run operation, and whether the run still has work.
+#[derive(Clone, Debug)]
+pub struct RunProgress {
+    pub events: Vec<AgentEvent>,
+    pub continues: bool,
+}
+
+impl RunProgress {
+    fn running(events: Vec<AgentEvent>) -> Self {
+        Self {
+            events,
+            continues: true,
+        }
+    }
+
+    fn blocked(events: Vec<AgentEvent>) -> Self {
+        Self {
+            events,
+            continues: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepOutcome {
+    Continue,
+    Blocked,
+}
+
+/// Mutable state of one model step while its stream is being consumed.
+struct StepContext {
+    step_id: StepId,
+    step_index: u32,
+    events: Vec<AgentEvent>,
+    published: usize,
+    saw_tool_call: bool,
+    completed: bool,
+    finished: bool,
+}
+
+impl StepContext {
+    fn new(step_id: StepId, step_index: u32) -> Self {
+        Self {
+            step_id,
+            step_index,
+            events: Vec::new(),
+            published: 0,
+            saw_tool_call: false,
+            completed: false,
+            finished: false,
+        }
+    }
+}
+
 pub struct AgentRuntime {
     session_id: AgentSessionId,
     task: AgentTask,
     run: AgentRunSnapshot,
     plan: AgentPlan,
-    provider: Box<dyn ModelProvider>,
+    provider: Option<Box<dyn ModelProvider>>,
     tools: ToolExecutor,
     messages: Vec<ModelMessage>,
     pending_approval: Option<PendingApproval>,
@@ -240,6 +226,9 @@ pub struct AgentRuntime {
     provider_cursor: usize,
     step_id: Option<StepId>,
     step_index: u32,
+    control: RunControl,
+    observer: Option<AgentEventObserver>,
+    flush_offset: usize,
 }
 
 impl AgentRuntime {
@@ -287,7 +276,7 @@ impl AgentRuntime {
             task,
             run,
             plan,
-            provider,
+            provider: Some(provider),
             tools,
             messages,
             pending_approval: None,
@@ -302,6 +291,9 @@ impl AgentRuntime {
             provider_cursor: 0,
             step_id: None,
             step_index: 0,
+            control: RunControl::new(),
+            observer: None,
+            flush_offset: 0,
         }
     }
 
@@ -335,6 +327,108 @@ impl AgentRuntime {
 
     pub fn run_id(&self) -> RunId {
         self.run.id
+    }
+
+    /// Handle used to pause or interrupt this run while it is executing.
+    pub fn control(&self) -> RunControl {
+        self.control.clone()
+    }
+
+    /// Installs an observer that receives every event as it is produced,
+    /// including assistant deltas that arrive mid-completion.
+    ///
+    /// When an observer is installed the returned event vectors are still
+    /// complete; callers that journal through the observer must not journal the
+    /// returned events again.
+    pub fn set_event_observer(&mut self, observer: AgentEventObserver) {
+        self.observer = Some(observer);
+    }
+
+    fn take_provider(&mut self) -> Result<Box<dyn ModelProvider>> {
+        self.provider.take().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "agent run has no model provider attached",
+                false,
+            )
+        })
+    }
+
+    fn provider(&self) -> Result<&dyn ModelProvider> {
+        self.provider.as_deref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "agent run has no model provider attached",
+                false,
+            )
+        })
+    }
+
+    /// Publishes the events of the current call that the observer has not seen.
+    fn flush_prefix(&mut self, events: &[AgentEvent]) {
+        publish_events(self.observer.as_deref(), events, &mut self.flush_offset);
+    }
+
+    fn publish_progress(&mut self, result: Result<RunProgress>) -> Result<RunProgress> {
+        match result {
+            Ok(progress) => {
+                let events = self.publish(Ok(progress.events))?;
+                Ok(RunProgress {
+                    events,
+                    continues: progress.continues,
+                })
+            }
+            Err(error) => {
+                self.flush_offset = 0;
+                Err(error)
+            }
+        }
+    }
+
+    /// Publishes anything left over and ends the current call.
+    fn publish(&mut self, result: Result<Vec<AgentEvent>>) -> Result<Vec<AgentEvent>> {
+        match result {
+            Ok(events) => {
+                self.flush_prefix(&events);
+                self.flush_offset = 0;
+                Ok(events)
+            }
+            Err(error) => {
+                self.flush_offset = 0;
+                Err(error)
+            }
+        }
+    }
+
+    /// Applies a pause or interrupt that was requested while the run was busy.
+    fn apply_control_request(&mut self) -> Option<Vec<AgentEvent>> {
+        if matches!(
+            self.run.state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        ) {
+            self.control.clear_request();
+            return None;
+        }
+        if self.control.is_interrupt_requested() {
+            self.control.clear_request();
+            self.step_id = None;
+            let mut events = self.set_state(AgentRunState::Cancelled);
+            self.run.completed_at = Some(Timestamp::now());
+            self.run.summary = Some("Agent run interrupted by the user".to_owned());
+            events.push(AgentEvent::RunCompleted {
+                snapshot: self.run.clone(),
+            });
+            return Some(events);
+        }
+        if self.control.is_pause_requested() {
+            self.control.clear_request();
+            self.step_id = None;
+            if self.run.state == AgentRunState::Paused {
+                return Some(Vec::new());
+            }
+            return Some(self.set_state(AgentRunState::Paused));
+        }
+        None
     }
 
     pub fn session_id(&self) -> AgentSessionId {
@@ -468,7 +562,7 @@ impl AgentRuntime {
             task: state.task,
             run: state.run,
             plan: state.plan,
-            provider,
+            provider: Some(provider),
             tools,
             messages: state.messages,
             pending_approval: state.pending_approval.map(|call| PendingApproval { call }),
@@ -483,10 +577,34 @@ impl AgentRuntime {
             provider_cursor: state.provider_cursor,
             step_id: state.step_id,
             step_index: state.step_index,
+            control: RunControl::new(),
+            observer: None,
+            flush_offset: 0,
         })
     }
 
     pub fn start(&mut self) -> Result<Vec<AgentEvent>> {
+        let result = self.start_inner();
+        self.publish(result)
+    }
+
+    /// Starts the run without driving it, so an owner can register the run
+    /// before any model work happens.
+    pub fn begin(&mut self) -> Result<RunProgress> {
+        let result = self.begin_inner();
+        self.publish_progress(result)
+    }
+
+    fn start_inner(&mut self) -> Result<Vec<AgentEvent>> {
+        let progress = self.begin_inner()?;
+        let mut events = progress.events;
+        if progress.continues {
+            events.extend(self.advance()?);
+        }
+        Ok(events)
+    }
+
+    fn begin_inner(&mut self) -> Result<RunProgress> {
         if self.run.state != AgentRunState::Planning {
             return Err(LoomError::new(
                 ErrorCode::InvalidState,
@@ -504,11 +622,30 @@ impl AgentRuntime {
             });
         }
         events.extend(self.set_state(AgentRunState::Executing));
-        events.extend(self.advance()?);
-        Ok(events)
+        Ok(RunProgress::running(events))
     }
 
     pub fn approve(&mut self, tool_call_id: loom_core::ToolCallId) -> Result<Vec<AgentEvent>> {
+        let result = self.approve_inner(tool_call_id);
+        self.publish(result)
+    }
+
+    /// Applies an approval and runs the approved tool without driving the run.
+    pub fn approve_entry(&mut self, tool_call_id: loom_core::ToolCallId) -> Result<RunProgress> {
+        let result = self.approve_entry_inner(tool_call_id);
+        self.publish_progress(result)
+    }
+
+    fn approve_inner(&mut self, tool_call_id: loom_core::ToolCallId) -> Result<Vec<AgentEvent>> {
+        let progress = self.approve_entry_inner(tool_call_id)?;
+        let mut events = progress.events;
+        if progress.continues {
+            events.extend(self.advance()?);
+        }
+        Ok(events)
+    }
+
+    fn approve_entry_inner(&mut self, tool_call_id: loom_core::ToolCallId) -> Result<RunProgress> {
         if self.run.state != AgentRunState::AwaitingApproval {
             return Err(LoomError::new(
                 ErrorCode::InvalidState,
@@ -528,11 +665,10 @@ impl AgentRuntime {
         if !result.success {
             self.last_failed_call = Some(pending.call);
             events.extend(self.finish_failed(result.output));
-            return Ok(events);
+            return Ok(RunProgress::blocked(events));
         }
         self.last_failed_call = None;
-        events.extend(self.advance()?);
-        Ok(events)
+        Ok(RunProgress::running(events))
     }
 
     pub fn reject(
@@ -565,7 +701,7 @@ impl AgentRuntime {
             result,
         });
         events.extend(self.finish_failed(output));
-        Ok(events)
+        self.publish(Ok(events))
     }
 
     pub fn interrupt(&mut self) -> Result<Vec<AgentEvent>> {
@@ -585,7 +721,7 @@ impl AgentRuntime {
         events.push(AgentEvent::RunCompleted {
             snapshot: self.run.clone(),
         });
-        Ok(events)
+        self.publish(Ok(events))
     }
 
     pub fn pause(&mut self) -> Result<Vec<AgentEvent>> {
@@ -606,10 +742,31 @@ impl AgentRuntime {
                 false,
             ));
         }
-        Ok(self.set_state(AgentRunState::Paused))
+        let events = self.set_state(AgentRunState::Paused);
+        self.publish(Ok(events))
     }
 
     pub fn resume(&mut self) -> Result<Vec<AgentEvent>> {
+        let result = self.resume_inner();
+        self.publish(result)
+    }
+
+    /// Leaves the paused state without driving the run.
+    pub fn resume_entry(&mut self) -> Result<RunProgress> {
+        let result = self.resume_entry_inner();
+        self.publish_progress(result)
+    }
+
+    fn resume_inner(&mut self) -> Result<Vec<AgentEvent>> {
+        let progress = self.resume_entry_inner()?;
+        let mut events = progress.events;
+        if progress.continues {
+            events.extend(self.advance()?);
+        }
+        Ok(events)
+    }
+
+    fn resume_entry_inner(&mut self) -> Result<RunProgress> {
         if self.run.state != AgentRunState::Paused {
             return Err(LoomError::new(
                 ErrorCode::InvalidState,
@@ -617,7 +774,7 @@ impl AgentRuntime {
                 false,
             ));
         }
-        let mut events = if self.pending_approval.is_some() {
+        let events = if self.pending_approval.is_some() {
             self.set_state(AgentRunState::AwaitingApproval)
         } else if self.pending_input.is_some() {
             self.set_state(AgentRunState::NeedsInput)
@@ -625,12 +782,32 @@ impl AgentRuntime {
             self.set_state(AgentRunState::Executing)
         };
         if self.pending_approval.is_none() && self.pending_input.is_none() {
+            return Ok(RunProgress::running(events));
+        }
+        Ok(RunProgress::blocked(events))
+    }
+
+    pub fn send_message(&mut self, message: impl Into<String>) -> Result<Vec<AgentEvent>> {
+        let result = self.send_message_inner(message);
+        self.publish(result)
+    }
+
+    /// Records a user message without driving the run.
+    pub fn message_entry(&mut self, message: impl Into<String>) -> Result<RunProgress> {
+        let result = self.message_entry_inner(message);
+        self.publish_progress(result)
+    }
+
+    fn send_message_inner(&mut self, message: impl Into<String>) -> Result<Vec<AgentEvent>> {
+        let progress = self.message_entry_inner(message)?;
+        let mut events = progress.events;
+        if progress.continues {
             events.extend(self.advance()?);
         }
         Ok(events)
     }
 
-    pub fn send_message(&mut self, message: impl Into<String>) -> Result<Vec<AgentEvent>> {
+    fn message_entry_inner(&mut self, message: impl Into<String>) -> Result<RunProgress> {
         let message = message.into();
         if message.trim().is_empty() {
             return Err(LoomError::invalid_request(
@@ -662,8 +839,7 @@ impl AgentRuntime {
             text: message,
         }];
         events.extend(self.set_state(AgentRunState::Executing));
-        events.extend(self.advance()?);
-        Ok(events)
+        Ok(RunProgress::running(events))
     }
 
     pub fn request_input(&mut self, prompt: impl Into<String>) -> Result<Vec<AgentEvent>> {
@@ -692,21 +868,42 @@ impl AgentRuntime {
             run_id: self.run.id,
             prompt,
         });
-        Ok(events)
+        self.publish(Ok(events))
     }
 
     pub fn recover_after_restart(&mut self) -> Result<Vec<AgentEvent>> {
-        if matches!(
+        let events = if matches!(
             self.run.state,
             AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
         ) {
-            Ok(self.set_state(AgentRunState::Paused))
+            self.set_state(AgentRunState::Paused)
         } else {
-            Ok(Vec::new())
-        }
+            Vec::new()
+        };
+        self.publish(Ok(events))
     }
 
     pub fn retry(&mut self) -> Result<Vec<AgentEvent>> {
+        let result = self.retry_inner();
+        self.publish(result)
+    }
+
+    /// Re-runs the failed tool step without driving the run.
+    pub fn retry_entry(&mut self) -> Result<RunProgress> {
+        let result = self.retry_entry_inner();
+        self.publish_progress(result)
+    }
+
+    fn retry_inner(&mut self) -> Result<Vec<AgentEvent>> {
+        let progress = self.retry_entry_inner()?;
+        let mut events = progress.events;
+        if progress.continues {
+            events.extend(self.advance()?);
+        }
+        Ok(events)
+    }
+
+    fn retry_entry_inner(&mut self) -> Result<RunProgress> {
         let call = self.last_failed_call.clone().ok_or_else(|| {
             LoomError::new(
                 ErrorCode::InvalidState,
@@ -728,14 +925,33 @@ impl AgentRuntime {
         events.extend(tool_events);
         if result.success {
             self.last_failed_call = None;
+            return Ok(RunProgress::running(events));
+        }
+        events.extend(self.finish_failed(result.output));
+        Ok(RunProgress::blocked(events))
+    }
+
+    pub fn retry_from_checkpoint(&mut self) -> Result<Vec<AgentEvent>> {
+        let result = self.retry_from_checkpoint_inner();
+        self.publish(result)
+    }
+
+    /// Resets the run to its checkpoint without driving it.
+    pub fn checkpoint_retry_entry(&mut self) -> Result<RunProgress> {
+        let result = self.checkpoint_retry_entry_inner();
+        self.publish_progress(result)
+    }
+
+    fn retry_from_checkpoint_inner(&mut self) -> Result<Vec<AgentEvent>> {
+        let progress = self.checkpoint_retry_entry_inner()?;
+        let mut events = progress.events;
+        if progress.continues {
             events.extend(self.advance()?);
-        } else {
-            events.extend(self.finish_failed(result.output));
         }
         Ok(events)
     }
 
-    pub fn retry_from_checkpoint(&mut self) -> Result<Vec<AgentEvent>> {
+    fn checkpoint_retry_entry_inner(&mut self) -> Result<RunProgress> {
         if matches!(
             self.run.state,
             AgentRunState::Planning
@@ -763,412 +979,507 @@ impl AgentRuntime {
         self.active_message_id = None;
         self.usage = UsageSnapshot::default();
         self.context_inspection = None;
-        self.provider.reset();
+        if let Some(provider) = self.provider.as_mut() {
+            provider.reset();
+        }
         self.provider_cursor = 0;
         self.step_id = None;
         self.step_index = 0;
-        let mut events = vec![AgentEvent::RunStateChanged {
+        let events = vec![AgentEvent::RunStateChanged {
             run_id: self.run.id,
             state: AgentRunState::Planning,
         }];
-        events.extend(self.advance()?);
-        Ok(events)
+        Ok(RunProgress::running(events))
     }
 
+    /// Drives the run until it finishes or needs a human.
     fn advance(&mut self) -> Result<Vec<AgentEvent>> {
         let mut events = Vec::new();
         loop {
-            if self.pending_approval.is_some()
-                || matches!(
-                    self.run.state,
-                    AgentRunState::Completed
-                        | AgentRunState::Failed
-                        | AgentRunState::Cancelled
-                        | AgentRunState::Paused
-                        | AgentRunState::NeedsInput
-                )
-            {
-                return Ok(events);
-            }
-            if let Some(status) = self.exceeded_limits() {
-                events.push(AgentEvent::RunLimitReached {
-                    run_id: self.run.id,
-                    status,
-                });
-                events.extend(self.finish_failed("agent session limit reached"));
-                return Ok(events);
-            }
-            if self
-                .messages
-                .last()
-                .is_some_and(|message| message.role == MessageRole::Tool)
-            {
-                events.extend(self.set_state(AgentRunState::Evaluating));
-            } else if self.run.state != AgentRunState::Executing {
-                events.extend(self.set_state(AgentRunState::Executing));
-            }
-            let (request, inspection) = match self.model_request() {
-                Ok(request) => request,
-                Err(error) => {
-                    events.push(AgentEvent::ContextError {
-                        run_id: self.run.id,
-                        error: error.clone(),
-                    });
-                    if error.code == ErrorCode::ContextLimitExceeded {
-                        let mut status = self.limit_status();
-                        status.exceeded.push(LimitKind::ContextTokens);
-                        events.push(AgentEvent::RunLimitReached {
-                            run_id: self.run.id,
-                            status,
-                        });
-                    }
-                    events.extend(self.finish_failed(error.message));
-                    return Ok(events);
-                }
-            };
-            self.context_inspection = Some(inspection.clone());
-            events.push(AgentEvent::ContextInspected {
-                run_id: self.run.id,
-                inspection,
-            });
-            let step_id = StepId::new();
-            self.step_id = Some(step_id);
-            let step_index = self.step_index;
-            events.push(AgentEvent::StepStarted {
-                run_id: self.run.id,
-                step_id,
-                index: step_index,
-            });
-            self.provider_cursor = self.provider_cursor.saturating_add(1);
-            let stream = match self.provider.stream(&request) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    self.step_id = None;
-                    events.push(AgentEvent::ProviderError {
-                        run_id: self.run.id,
-                        error: error.clone(),
-                    });
-                    events.extend(self.finish_failed(error.message));
-                    return Ok(events);
-                }
-            };
-            if stream.is_empty() {
-                self.step_id = None;
-                events.extend(self.finish_failed("model returned an empty stream"));
-                return Ok(events);
-            }
-            let mut saw_tool_call = false;
-            let mut completed = false;
-            for item in stream {
-                match item {
-                    ModelStreamEvent::TextDelta { text } => {
-                        if !text.is_empty() {
-                            self.append_assistant_text(&text);
-                            let message_id = self.assistant_message_id();
-                            events.push(AgentEvent::AssistantMessageDelta {
-                                run_id: self.run.id,
-                                message_id,
-                                text,
-                            });
-                        }
-                    }
-                    ModelStreamEvent::ToolCallDelta { call } => {
-                        self.active_message_id = None;
-                        if self
-                            .options
-                            .limits
-                            .max_tool_calls
-                            .is_some_and(|limit| self.usage.tool_calls >= limit)
-                        {
-                            let status = self.limit_status();
-                            events.push(AgentEvent::RunLimitReached {
-                                run_id: self.run.id,
-                                status,
-                            });
-                            events.extend(self.finish_failed("agent session limit reached"));
-                            self.step_id = None;
-                            return Ok(events);
-                        }
-                        self.usage.add_tool_call();
-                        self.append_assistant_tool_call(call.clone());
-                        events.push(AgentEvent::RunUsageUpdated {
-                            run_id: self.run.id,
-                            usage: self.usage.clone(),
-                        });
-                        saw_tool_call = true;
-                        events.push(AgentEvent::ToolCallRequested {
-                            run_id: self.run.id,
-                            call: call.clone(),
-                        });
-                        let Some(kind) = ToolKind::from_name(&call.name) else {
-                            let output = format!("unknown tool '{}'", call.name);
-                            let result = ToolResult {
-                                tool_call_id: call.id,
-                                name: call.name.clone(),
-                                success: false,
-                                output: output.clone(),
-                            };
-                            events.push(AgentEvent::ToolCallCompleted {
-                                run_id: self.run.id,
-                                result: result.clone(),
-                            });
-                            self.messages.push(ModelMessage {
-                                role: MessageRole::Tool,
-                                content: output.clone(),
-                                name: Some(result.name.clone()),
-                                tool_call_id: Some(result.tool_call_id),
-                                tool_calls: Vec::new(),
-                            });
-                            self.last_failed_call = Some(call);
-                            self.step_id = None;
-                            self.step_index = self.step_index.saturating_add(1);
-                            events.push(AgentEvent::StepCompleted {
-                                run_id: self.run.id,
-                                step_id,
-                                index: step_index,
-                            });
-                            events.extend(self.finish_failed(output));
-                            return Ok(events);
-                        };
-                        let evaluation = self
-                            .tools
-                            .policy_evaluation(&call, &self.approval_policy)
-                            .unwrap_or_else(|| {
-                                PolicyEvaluation::evaluate(
-                                    &self.approval_policy,
-                                    kind.action_kind(),
-                                    &call.name,
-                                )
-                            });
-                        events.push(AgentEvent::ToolPolicyEvaluated {
-                            run_id: self.run.id,
-                            call: call.clone(),
-                            evaluation: evaluation.clone(),
-                        });
-                        if matches!(evaluation.decision, loom_core::PolicyDecision::Deny) {
-                            let result = ToolResult {
-                                tool_call_id: call.id,
-                                name: call.name.clone(),
-                                success: false,
-                                output: evaluation.reason,
-                            };
-                            events.push(AgentEvent::ToolCallCompleted {
-                                run_id: self.run.id,
-                                result,
-                            });
-                            self.step_id = None;
-                            self.step_index = self.step_index.saturating_add(1);
-                            events.push(AgentEvent::StepCompleted {
-                                run_id: self.run.id,
-                                step_id,
-                                index: step_index,
-                            });
-                            events.extend(
-                                self.finish_failed("tool call denied by the workspace policy"),
-                            );
-                            return Ok(events);
-                        }
-                        if matches!(
-                            evaluation.decision,
-                            loom_core::PolicyDecision::RequireApproval
-                        ) {
-                            self.pending_approval = Some(PendingApproval { call: call.clone() });
-                            self.step_id = None;
-                            self.step_index = self.step_index.saturating_add(1);
-                            events.push(AgentEvent::StepCompleted {
-                                run_id: self.run.id,
-                                step_id,
-                                index: step_index,
-                            });
-                            events.extend(self.set_state(AgentRunState::AwaitingApproval));
-                            events.push(AgentEvent::ToolApprovalRequired {
-                                run_id: self.run.id,
-                                call,
-                            });
-                            return Ok(events);
-                        }
-                        if kind == ToolKind::ProposePlan {
-                            let steps = call
-                                .arguments
-                                .get("steps")
-                                .and_then(serde_json::Value::as_array)
-                                .map(|steps| {
-                                    steps
-                                        .iter()
-                                        .enumerate()
-                                        .filter_map(|(index, step)| {
-                                            step.as_str()
-                                                .filter(|step| !step.trim().is_empty())
-                                                .map(|description| AgentPlanStep {
-                                                    id: format!("step-{}", index + 1),
-                                                    description: description.to_owned(),
-                                                })
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
-                            if steps.is_empty() {
-                                let output =
-                                    "propose_plan requires a non-empty steps array".to_owned();
-                                let result = ToolResult {
-                                    tool_call_id: call.id,
-                                    name: call.name.clone(),
-                                    success: false,
-                                    output: output.clone(),
-                                };
-                                events.push(AgentEvent::ToolCallCompleted {
-                                    run_id: self.run.id,
-                                    result,
-                                });
-                                self.step_id = None;
-                                self.step_index = self.step_index.saturating_add(1);
-                                events.push(AgentEvent::StepCompleted {
-                                    run_id: self.run.id,
-                                    step_id,
-                                    index: step_index,
-                                });
-                                events.extend(self.finish_failed(output));
-                                return Ok(events);
-                            }
-                            self.plan = AgentPlan {
-                                steps: steps.clone(),
-                            };
-                            events.push(AgentEvent::PlanProposed {
-                                run_id: self.run.id,
-                                plan: self.plan.clone(),
-                            });
-                            self.step_id = None;
-                            self.step_index = self.step_index.saturating_add(1);
-                            events.push(AgentEvent::StepCompleted {
-                                run_id: self.run.id,
-                                step_id,
-                                index: step_index,
-                            });
-                            return Ok(events);
-                        }
-                        if kind == ToolKind::AskUser {
-                            let Some(prompt) = call
-                                .arguments
-                                .get("prompt")
-                                .and_then(serde_json::Value::as_str)
-                                .filter(|prompt| !prompt.trim().is_empty())
-                            else {
-                                let output = "ask_user requires a non-empty prompt".to_owned();
-                                let result = ToolResult {
-                                    tool_call_id: call.id,
-                                    name: call.name.clone(),
-                                    success: false,
-                                    output: output.clone(),
-                                };
-                                events.push(AgentEvent::ToolCallCompleted {
-                                    run_id: self.run.id,
-                                    result,
-                                });
-                                self.step_id = None;
-                                self.step_index = self.step_index.saturating_add(1);
-                                events.push(AgentEvent::StepCompleted {
-                                    run_id: self.run.id,
-                                    step_id,
-                                    index: step_index,
-                                });
-                                events.extend(self.finish_failed(output));
-                                return Ok(events);
-                            };
-                            self.pending_input = Some(prompt.to_owned());
-                            self.step_id = None;
-                            self.step_index = self.step_index.saturating_add(1);
-                            events.push(AgentEvent::StepCompleted {
-                                run_id: self.run.id,
-                                step_id,
-                                index: step_index,
-                            });
-                            events.extend(self.set_state(AgentRunState::NeedsInput));
-                            events.push(AgentEvent::NeedsInput {
-                                run_id: self.run.id,
-                                prompt: prompt.to_owned(),
-                            });
-                            return Ok(events);
-                        }
-                        let (tool_events, result) = self.execute_tool(&call);
-                        events.extend(tool_events);
-                        if result.success {
-                            self.last_failed_call = None;
-                        } else {
-                            self.last_failed_call = Some(call);
-                            events.extend(self.finish_failed(result.output));
-                            return Ok(events);
-                        }
-                    }
-                    ModelStreamEvent::Usage { usage } => {
-                        self.usage.add_tokens(
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            usage.cached_input_tokens,
-                        );
-                        self.usage.add_cost_micros(
-                            usage
-                                .input_tokens
-                                .saturating_mul(self.options.input_cost_micros_per_1k)
-                                .saturating_add(
-                                    usage
-                                        .output_tokens
-                                        .saturating_mul(self.options.output_cost_micros_per_1k),
-                                )
-                                / 1_000,
-                        );
-                        events.push(AgentEvent::RunUsage {
-                            run_id: self.run.id,
-                            usage,
-                        });
-                        events.push(AgentEvent::RunUsageUpdated {
-                            run_id: self.run.id,
-                            usage: self.usage.clone(),
-                        });
-                        if let Some(status) = self.exceeded_limits() {
-                            events.push(AgentEvent::RunLimitReached {
-                                run_id: self.run.id,
-                                status,
-                            });
-                            events.extend(self.finish_failed("agent session limit reached"));
-                            self.step_id = None;
-                            return Ok(events);
-                        }
-                    }
-                    ModelStreamEvent::Completed { reason } => {
-                        completed = true;
-                        self.step_id = None;
-                        self.step_index = self.step_index.saturating_add(1);
-                        events.push(AgentEvent::StepCompleted {
-                            run_id: self.run.id,
-                            step_id,
-                            index: step_index,
-                        });
-                        if !saw_tool_call {
-                            if matches!(reason, loom_model::FinishReason::Stop) {
-                                events.extend(self.finish_completed());
-                            } else if matches!(reason, loom_model::FinishReason::Cancelled) {
-                                events.extend(self.finish_cancelled());
-                            } else {
-                                events.extend(
-                                    self.finish_failed(format!("model finished with {reason:?}")),
-                                );
-                            }
-                        }
-                    }
-                }
-                if self.pending_approval.is_some()
-                    || matches!(
-                        self.run.state,
-                        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
-                    )
-                {
-                    return Ok(events);
-                }
-            }
-            if completed && !saw_tool_call {
+            if self.advance_step(&mut events)? == StepOutcome::Blocked {
                 return Ok(events);
             }
         }
+    }
+
+    /// Runs one model step. An owner that drives the run itself calls this so
+    /// the run does not hold its lock across the whole loop.
+    pub fn run_step(&mut self) -> Result<RunProgress> {
+        let mut events = Vec::new();
+        let outcome = self.advance_step(&mut events);
+        match outcome {
+            Ok(outcome) => {
+                let events = self.publish(Ok(events))?;
+                Ok(RunProgress {
+                    events,
+                    continues: outcome == StepOutcome::Continue,
+                })
+            }
+            Err(error) => {
+                let _ = self.publish(Ok(events));
+                Err(error)
+            }
+        }
+    }
+
+    fn advance_step(&mut self, events: &mut Vec<AgentEvent>) -> Result<StepOutcome> {
+        if let Some(control_events) = self.apply_control_request() {
+            events.extend(control_events);
+            return Ok(StepOutcome::Blocked);
+        }
+        if self.pending_approval.is_some()
+            || matches!(
+                self.run.state,
+                AgentRunState::Completed
+                    | AgentRunState::Failed
+                    | AgentRunState::Cancelled
+                    | AgentRunState::Paused
+                    | AgentRunState::NeedsInput
+            )
+        {
+            return Ok(StepOutcome::Blocked);
+        }
+        if let Some(status) = self.exceeded_limits() {
+            events.push(AgentEvent::RunLimitReached {
+                run_id: self.run.id,
+                status,
+            });
+            events.extend(self.finish_failed("agent session limit reached"));
+            return Ok(StepOutcome::Blocked);
+        }
+        if self
+            .messages
+            .last()
+            .is_some_and(|message| message.role == MessageRole::Tool)
+        {
+            events.extend(self.set_state(AgentRunState::Evaluating));
+        } else if self.run.state != AgentRunState::Executing {
+            events.extend(self.set_state(AgentRunState::Executing));
+        }
+        let (request, inspection) = match self.model_request() {
+            Ok(request) => request,
+            Err(error) => {
+                events.push(AgentEvent::ContextError {
+                    run_id: self.run.id,
+                    error: error.clone(),
+                });
+                if error.code == ErrorCode::ContextLimitExceeded {
+                    let mut status = self.limit_status();
+                    status.exceeded.push(LimitKind::ContextTokens);
+                    events.push(AgentEvent::RunLimitReached {
+                        run_id: self.run.id,
+                        status,
+                    });
+                }
+                events.extend(self.finish_failed(error.message));
+                return Ok(StepOutcome::Blocked);
+            }
+        };
+        self.context_inspection = Some(inspection.clone());
+        events.push(AgentEvent::ContextInspected {
+            run_id: self.run.id,
+            inspection,
+        });
+        let step_id = StepId::new();
+        self.step_id = Some(step_id);
+        let step_index = self.step_index;
+        events.push(AgentEvent::StepStarted {
+            run_id: self.run.id,
+            step_id,
+            index: step_index,
+        });
+        self.provider_cursor = self.provider_cursor.saturating_add(1);
+        let mut ctx = StepContext::new(step_id, self.step_index);
+        self.flush_prefix(events);
+        let base = self.flush_offset;
+        let token = self.control.stream_token();
+        let mut provider = self.take_provider()?;
+        let stream_result = provider.stream(&request, &token, &mut |event| {
+            self.handle_stream_event(event, &mut ctx)
+        });
+        self.provider = Some(provider);
+        let StepContext {
+            events: step_events,
+            published,
+            saw_tool_call,
+            completed,
+            finished,
+            ..
+        } = ctx;
+        events.extend(step_events);
+        self.flush_offset = base.saturating_add(published);
+        match stream_result {
+            Ok(()) => {}
+            Err(error) if self.control.is_stopping() => {
+                // A pause or interrupt cancelled the in-flight completion.
+                debug_assert_eq!(error.code, ErrorCode::RequestCancelled);
+            }
+            Err(error) => {
+                self.step_id = None;
+                events.push(AgentEvent::ProviderError {
+                    run_id: self.run.id,
+                    error: error.clone(),
+                });
+                events.extend(self.finish_failed(error.message));
+                return Ok(StepOutcome::Blocked);
+            }
+        }
+        if let Some(events_from_control) = self.apply_control_request() {
+            events.extend(events_from_control);
+            return Ok(StepOutcome::Blocked);
+        }
+        if finished {
+            return Ok(StepOutcome::Blocked);
+        }
+        if !saw_tool_call && !completed {
+            self.step_id = None;
+            events.extend(self.finish_failed("model returned an empty stream"));
+            return Ok(StepOutcome::Blocked);
+        }
+        if completed && !saw_tool_call {
+            return Ok(StepOutcome::Blocked);
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    /// Applies one streamed model event to the run.
+    ///
+    /// This runs inside the provider's stream callback, so an assistant delta is
+    /// journaled while the completion is still arriving.
+    fn handle_stream_event(
+        &mut self,
+        event: ModelStreamEvent,
+        ctx: &mut StepContext,
+    ) -> Result<StreamFlow> {
+        let flow = self.handle_stream_event_inner(event, ctx);
+        publish_events(self.observer.as_deref(), &ctx.events, &mut ctx.published);
+        flow
+    }
+
+    fn handle_stream_event_inner(
+        &mut self,
+        event: ModelStreamEvent,
+        ctx: &mut StepContext,
+    ) -> Result<StreamFlow> {
+        match event {
+            ModelStreamEvent::TextDelta { text } => {
+                if !text.is_empty() {
+                    self.append_assistant_text(&text);
+                    let message_id = self.assistant_message_id();
+                    ctx.events.push(AgentEvent::AssistantMessageDelta {
+                        run_id: self.run.id,
+                        message_id,
+                        text,
+                    });
+                }
+            }
+            ModelStreamEvent::ToolCallDelta { call } => {
+                self.active_message_id = None;
+                if self
+                    .options
+                    .limits
+                    .max_tool_calls
+                    .is_some_and(|limit| self.usage.tool_calls >= limit)
+                {
+                    let status = self.limit_status();
+                    ctx.events.push(AgentEvent::RunLimitReached {
+                        run_id: self.run.id,
+                        status,
+                    });
+                    ctx.events
+                        .extend(self.finish_failed("agent session limit reached"));
+                    self.step_id = None;
+                    ctx.finished = true;
+                    return Ok(StreamFlow::Stop);
+                }
+                self.usage.add_tool_call();
+                self.append_assistant_tool_call(call.clone());
+                ctx.events.push(AgentEvent::RunUsageUpdated {
+                    run_id: self.run.id,
+                    usage: self.usage.clone(),
+                });
+                ctx.saw_tool_call = true;
+                ctx.events.push(AgentEvent::ToolCallRequested {
+                    run_id: self.run.id,
+                    call: call.clone(),
+                });
+                let Some(kind) = ToolKind::from_name(&call.name) else {
+                    let output = format!("unknown tool '{}'", call.name);
+                    let result = ToolResult {
+                        tool_call_id: call.id,
+                        name: call.name.clone(),
+                        success: false,
+                        output: output.clone(),
+                    };
+                    ctx.events.push(AgentEvent::ToolCallCompleted {
+                        run_id: self.run.id,
+                        result: result.clone(),
+                    });
+                    self.messages.push(ModelMessage {
+                        role: MessageRole::Tool,
+                        content: output.clone(),
+                        name: Some(result.name.clone()),
+                        tool_call_id: Some(result.tool_call_id),
+                        tool_calls: Vec::new(),
+                    });
+                    self.last_failed_call = Some(call);
+                    self.step_id = None;
+                    self.step_index = self.step_index.saturating_add(1);
+                    ctx.events.push(AgentEvent::StepCompleted {
+                        run_id: self.run.id,
+                        step_id: ctx.step_id,
+                        index: ctx.step_index,
+                    });
+                    ctx.events.extend(self.finish_failed(output));
+                    ctx.finished = true;
+                    return Ok(StreamFlow::Stop);
+                };
+                let evaluation = self
+                    .tools
+                    .policy_evaluation(&call, &self.approval_policy)
+                    .unwrap_or_else(|| {
+                        PolicyEvaluation::evaluate(
+                            &self.approval_policy,
+                            kind.action_kind(),
+                            &call.name,
+                        )
+                    });
+                ctx.events.push(AgentEvent::ToolPolicyEvaluated {
+                    run_id: self.run.id,
+                    call: call.clone(),
+                    evaluation: evaluation.clone(),
+                });
+                if matches!(evaluation.decision, loom_core::PolicyDecision::Deny) {
+                    let result = ToolResult {
+                        tool_call_id: call.id,
+                        name: call.name.clone(),
+                        success: false,
+                        output: evaluation.reason,
+                    };
+                    ctx.events.push(AgentEvent::ToolCallCompleted {
+                        run_id: self.run.id,
+                        result,
+                    });
+                    self.step_id = None;
+                    self.step_index = self.step_index.saturating_add(1);
+                    ctx.events.push(AgentEvent::StepCompleted {
+                        run_id: self.run.id,
+                        step_id: ctx.step_id,
+                        index: ctx.step_index,
+                    });
+                    ctx.events
+                        .extend(self.finish_failed("tool call denied by the workspace policy"));
+                    ctx.finished = true;
+                    return Ok(StreamFlow::Stop);
+                }
+                if matches!(
+                    evaluation.decision,
+                    loom_core::PolicyDecision::RequireApproval
+                ) {
+                    self.pending_approval = Some(PendingApproval { call: call.clone() });
+                    self.step_id = None;
+                    self.step_index = self.step_index.saturating_add(1);
+                    ctx.events.push(AgentEvent::StepCompleted {
+                        run_id: self.run.id,
+                        step_id: ctx.step_id,
+                        index: ctx.step_index,
+                    });
+                    ctx.events
+                        .extend(self.set_state(AgentRunState::AwaitingApproval));
+                    ctx.events.push(AgentEvent::ToolApprovalRequired {
+                        run_id: self.run.id,
+                        call,
+                    });
+                    ctx.finished = true;
+                    return Ok(StreamFlow::Stop);
+                }
+                if kind == ToolKind::ProposePlan {
+                    let steps = call
+                        .arguments
+                        .get("steps")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|steps| {
+                            steps
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, step)| {
+                                    step.as_str().filter(|step| !step.trim().is_empty()).map(
+                                        |description| AgentPlanStep {
+                                            id: format!("step-{}", index + 1),
+                                            description: description.to_owned(),
+                                        },
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if steps.is_empty() {
+                        let output = "propose_plan requires a non-empty steps array".to_owned();
+                        let result = ToolResult {
+                            tool_call_id: call.id,
+                            name: call.name.clone(),
+                            success: false,
+                            output: output.clone(),
+                        };
+                        ctx.events.push(AgentEvent::ToolCallCompleted {
+                            run_id: self.run.id,
+                            result,
+                        });
+                        self.step_id = None;
+                        self.step_index = self.step_index.saturating_add(1);
+                        ctx.events.push(AgentEvent::StepCompleted {
+                            run_id: self.run.id,
+                            step_id: ctx.step_id,
+                            index: ctx.step_index,
+                        });
+                        ctx.events.extend(self.finish_failed(output));
+                        ctx.finished = true;
+                        return Ok(StreamFlow::Stop);
+                    }
+                    self.plan = AgentPlan {
+                        steps: steps.clone(),
+                    };
+                    ctx.events.push(AgentEvent::PlanProposed {
+                        run_id: self.run.id,
+                        plan: self.plan.clone(),
+                    });
+                    self.step_id = None;
+                    self.step_index = self.step_index.saturating_add(1);
+                    ctx.events.push(AgentEvent::StepCompleted {
+                        run_id: self.run.id,
+                        step_id: ctx.step_id,
+                        index: ctx.step_index,
+                    });
+                    ctx.finished = true;
+                    return Ok(StreamFlow::Stop);
+                }
+                if kind == ToolKind::AskUser {
+                    let Some(prompt) = call
+                        .arguments
+                        .get("prompt")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|prompt| !prompt.trim().is_empty())
+                    else {
+                        let output = "ask_user requires a non-empty prompt".to_owned();
+                        let result = ToolResult {
+                            tool_call_id: call.id,
+                            name: call.name.clone(),
+                            success: false,
+                            output: output.clone(),
+                        };
+                        ctx.events.push(AgentEvent::ToolCallCompleted {
+                            run_id: self.run.id,
+                            result,
+                        });
+                        self.step_id = None;
+                        self.step_index = self.step_index.saturating_add(1);
+                        ctx.events.push(AgentEvent::StepCompleted {
+                            run_id: self.run.id,
+                            step_id: ctx.step_id,
+                            index: ctx.step_index,
+                        });
+                        ctx.events.extend(self.finish_failed(output));
+                        ctx.finished = true;
+                        return Ok(StreamFlow::Stop);
+                    };
+                    self.pending_input = Some(prompt.to_owned());
+                    self.step_id = None;
+                    self.step_index = self.step_index.saturating_add(1);
+                    ctx.events.push(AgentEvent::StepCompleted {
+                        run_id: self.run.id,
+                        step_id: ctx.step_id,
+                        index: ctx.step_index,
+                    });
+                    ctx.events.extend(self.set_state(AgentRunState::NeedsInput));
+                    ctx.events.push(AgentEvent::NeedsInput {
+                        run_id: self.run.id,
+                        prompt: prompt.to_owned(),
+                    });
+                    ctx.finished = true;
+                    return Ok(StreamFlow::Stop);
+                }
+                let (tool_events, result) = self.execute_tool(&call);
+                ctx.events.extend(tool_events);
+                if result.success {
+                    self.last_failed_call = None;
+                } else {
+                    self.last_failed_call = Some(call);
+                    ctx.events.extend(self.finish_failed(result.output));
+                    ctx.finished = true;
+                    return Ok(StreamFlow::Stop);
+                }
+            }
+            ModelStreamEvent::Usage { usage } => {
+                self.usage.add_tokens(
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cached_input_tokens,
+                );
+                self.usage.add_cost_micros(
+                    usage
+                        .input_tokens
+                        .saturating_mul(self.options.input_cost_micros_per_1k)
+                        .saturating_add(
+                            usage
+                                .output_tokens
+                                .saturating_mul(self.options.output_cost_micros_per_1k),
+                        )
+                        / 1_000,
+                );
+                ctx.events.push(AgentEvent::RunUsage {
+                    run_id: self.run.id,
+                    usage,
+                });
+                ctx.events.push(AgentEvent::RunUsageUpdated {
+                    run_id: self.run.id,
+                    usage: self.usage.clone(),
+                });
+                if let Some(status) = self.exceeded_limits() {
+                    ctx.events.push(AgentEvent::RunLimitReached {
+                        run_id: self.run.id,
+                        status,
+                    });
+                    ctx.events
+                        .extend(self.finish_failed("agent session limit reached"));
+                    self.step_id = None;
+                    ctx.finished = true;
+                    return Ok(StreamFlow::Stop);
+                }
+            }
+            ModelStreamEvent::Completed { reason } => {
+                ctx.completed = true;
+                self.step_id = None;
+                self.step_index = self.step_index.saturating_add(1);
+                ctx.events.push(AgentEvent::StepCompleted {
+                    run_id: self.run.id,
+                    step_id: ctx.step_id,
+                    index: ctx.step_index,
+                });
+                if !ctx.saw_tool_call {
+                    if matches!(reason, loom_model::FinishReason::Stop) {
+                        ctx.events.extend(self.finish_completed());
+                    } else if matches!(reason, loom_model::FinishReason::Cancelled) {
+                        ctx.events.extend(self.finish_cancelled());
+                    } else {
+                        ctx.events
+                            .extend(self.finish_failed(format!("model finished with {reason:?}")));
+                    }
+                }
+            }
+        }
+        if self.pending_approval.is_some()
+            || matches!(
+                self.run.state,
+                AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+            )
+        {
+            ctx.finished = true;
+            return Ok(StreamFlow::Stop);
+        }
+        if self.control.is_stopping() {
+            return Ok(StreamFlow::Stop);
+        }
+        Ok(StreamFlow::Continue)
     }
 
     fn execute_tool(&mut self, call: &ToolCall) -> (Vec<AgentEvent>, ToolResult) {
@@ -1226,7 +1537,7 @@ impl AgentRuntime {
         let mut context_options = self.options.context.clone();
         if context_options.context_window.is_none() {
             context_options.context_window =
-                self.provider.descriptor().context_window.map(u64::from);
+                self.provider()?.descriptor().context_window.map(u64::from);
         }
         if context_options.max_input_tokens.is_none() {
             context_options.max_input_tokens = self.options.limits.max_input_tokens;
@@ -1245,7 +1556,7 @@ impl AgentRuntime {
             },
             &context_options,
         )?;
-        let tools = if self.provider.descriptor().capabilities.tool_calling {
+        let tools = if self.provider()?.descriptor().capabilities.tool_calling {
             tool_definitions()
         } else {
             Vec::new()
@@ -1256,7 +1567,7 @@ impl AgentRuntime {
             tools,
             options: CompletionOptions::default(),
         };
-        let request_tokens = self.provider.count_tokens(&request);
+        let request_tokens = self.provider()?.count_tokens(&request);
         if assembly
             .inspection
             .budget
@@ -1385,6 +1696,20 @@ fn initial_messages(task: &AgentTask) -> Vec<ModelMessage> {
     messages
 }
 
+/// Sends the events that the observer has not seen yet and advances `cursor`.
+fn publish_events(
+    observer: Option<&(dyn Fn(&AgentEvent) + Send + Sync)>,
+    events: &[AgentEvent],
+    cursor: &mut usize,
+) {
+    if let Some(observer) = observer {
+        for event in events.iter().skip(*cursor) {
+            observer(event);
+        }
+    }
+    *cursor = events.len();
+}
+
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf};
@@ -1398,6 +1723,128 @@ mod tests {
         let root = std::env::temp_dir().join(format!("loom-agent-{}", ProjectId::new()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// Provider that blocks in the middle of a completion until it is released
+    /// or cancelled, so control requests can be exercised against a busy run.
+    struct BlockingProvider {
+        descriptor: loom_model::ModelDescriptor,
+        released: Arc<AtomicBool>,
+        entered: Arc<AtomicBool>,
+    }
+
+    impl ModelProvider for BlockingProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            sink.emit(ModelStreamEvent::TextDelta {
+                text: "working".to_owned(),
+            })?;
+            self.entered.store(true, Ordering::SeqCst);
+            loop {
+                cancel.check()?;
+                if self.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            sink.emit(ModelStreamEvent::Completed {
+                reason: loom_model::FinishReason::Stop,
+            })?;
+            Ok(())
+        }
+    }
+
+    fn blocking_runtime(entered: Arc<AtomicBool>, released: Arc<AtomicBool>) -> AgentRuntime {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task = AgentTask::new("stream slowly", ModelId::new("blocking/demo")).unwrap();
+        AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(BlockingProvider {
+                descriptor: loom_model::ModelDescriptor {
+                    id: ModelId::new("blocking/demo"),
+                    provider: loom_model::ProviderId::new("blocking"),
+                    display_name: "Blocking test provider".to_owned(),
+                    context_window: Some(8_192),
+                    capabilities: loom_model::ModelCapabilities {
+                        streaming: true,
+                        tool_calling: false,
+                        vision: false,
+                        json_mode: false,
+                    },
+                },
+                released,
+                entered,
+            }),
+            tools,
+        )
+    }
+
+    #[test]
+    fn assistant_deltas_reach_the_observer_before_the_completion_finishes() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let mut runtime = blocking_runtime(Arc::clone(&entered), Arc::clone(&released));
+        let observed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&observed);
+        runtime.set_event_observer(Arc::new(move |event: &AgentEvent| {
+            if let AgentEvent::AssistantMessageDelta { text, .. } = event {
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(text.clone());
+            }
+        }));
+        let control = runtime.control();
+        let worker = std::thread::spawn(move || {
+            let events = runtime.start().unwrap();
+            (runtime, events)
+        });
+        while !entered.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The completion has not finished, but the delta is already published.
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            ["working".to_owned()]
+        );
+        control.request_interrupt();
+        let (runtime, events) = worker.join().unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::Cancelled);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::AssistantMessageDelta { text, .. } if text == "working"
+        )));
+    }
+
+    #[test]
+    fn a_pause_request_stops_a_run_that_is_waiting_on_the_model() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let mut runtime = blocking_runtime(Arc::clone(&entered), Arc::clone(&released));
+        let control = runtime.control();
+        let worker = std::thread::spawn(move || {
+            runtime.start().unwrap();
+            runtime
+        });
+        while !entered.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        control.request_pause();
+        let runtime = worker.join().unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::Paused);
+        assert!(!control.is_stopping());
     }
 
     #[test]

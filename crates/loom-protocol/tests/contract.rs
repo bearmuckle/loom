@@ -1,18 +1,16 @@
-use loom_agent::{AgentEvent, AgentPlanStep, AgentRunSnapshot, AgentRunState};
-use loom_context::ContextAssemblyOptions;
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet,
     EventSequence, ProjectId, ProtocolVersion, RunId, SessionLimits, Timestamp,
 };
 use loom_model::ModelId;
-use loom_process::{TaskKind, TaskSpec};
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientFrame, ClientRequest, RequestEnvelope, ResponseEnvelope,
-    ServerEvent, ServerEventEnvelope, ServerFrame, ServerResponse, decode_client_frame,
-    decode_event, decode_request, decode_response, decode_server_frame, encode_client_frame,
-    encode_event, encode_request, encode_response, encode_server_frame,
+    AgentEvent, AgentPlanStep, AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION,
+    ClientFrame, ClientRequest, ContextAssemblyOptions, RequestEnvelope, ResponseEnvelope,
+    ServerEvent, ServerEventEnvelope, ServerFrame, ServerResponse, TaskKind, TaskSpec,
+    WorkspaceEdit, WorkspaceSnapshot, decode_client_frame, decode_event, decode_request,
+    decode_response, decode_server_frame, encode_client_frame, encode_event, encode_request,
+    encode_response, encode_server_frame,
 };
-use loom_workspace::{WorkspaceEdit, WorkspaceSnapshot};
 
 #[test]
 fn request_json_round_trip_preserves_typed_envelope() {

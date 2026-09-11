@@ -3754,6 +3754,7 @@ dependencies = [
  "loom-context",
  "loom-core",
  "loom-model",
+ "loom-protocol",
  "loom-providers",
  "loom-tools",
  "serde",
@@ -3782,6 +3783,7 @@ version = "0.1.0"
 dependencies = [
  "loom-core",
  "loom-model",
+ "loom-protocol",
  "serde",
 ]
 
@@ -3792,15 +3794,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "uuid",
-]
-
-[[package]]
-name = "loom-language"
-version = "0.1.0"
-dependencies = [
- "loom-core",
- "loom-workspace",
- "serde",
 ]
 
 [[package]]
@@ -3827,6 +3820,7 @@ name = "loom-process"
 version = "0.1.0"
 dependencies = [
  "loom-core",
+ "loom-protocol",
  "serde",
 ]
 
@@ -3834,15 +3828,8 @@ dependencies = [
 name = "loom-protocol"
 version = "0.1.0"
 dependencies = [
- "loom-agent",
- "loom-context",
  "loom-core",
- "loom-language",
  "loom-model",
- "loom-process",
- "loom-providers",
- "loom-vcs",
- "loom-workspace",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -3868,7 +3855,6 @@ dependencies = [
  "loom-agent",
  "loom-context",
  "loom-core",
- "loom-language",
  "loom-model",
  "loom-persistence",
  "loom-process",
@@ -3899,6 +3885,7 @@ version = "0.1.0"
 dependencies = [
  "loom-core",
  "loom-model",
+ "loom-protocol",
  "loom-workspace",
  "serde",
  "serde_json",
@@ -3934,6 +3921,7 @@ name = "loom-vcs"
 version = "0.1.0"
 dependencies = [
  "loom-core",
+ "loom-protocol",
  "serde",
 ]
 
@@ -3942,6 +3930,7 @@ name = "loom-workspace"
 version = "0.1.0"
 dependencies = [
  "loom-core",
+ "loom-protocol",
  "serde",
 ]
 

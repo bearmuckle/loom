@@ -34,7 +34,8 @@ approve the plan and patch, run a test command, and inspect the final diff.
 
 ### M2 - Workspace tools and human control
 
-- Open a configured project root and expose file snapshots and watches.
+- Open a configured project root and expose file snapshots. Change detection
+  is pull-based revision comparison; a watch mechanism is not implemented yet.
 - Add persistent terminals with output streaming, resize, input, and
   cancellation.
 - Add task supervision, bounded output buffers, backpressure, exit status, and
@@ -190,8 +191,10 @@ optimizing only loopback benchmarks.
 - Test provider streaming, tool-call normalization, cancellation, reconnect,
   backpressure, malformed payloads, and permission failures.
 - Run a small browser compatibility matrix once wasm work begins.
-- Keep deterministic fixtures for files, processes, diagnostics, VCS state,
-  model responses, and tool calls.
+- Keep deterministic fixtures for files, processes, VCS state, model
+  responses, and tool calls, including event-stream fixtures that prove a
+  delta is journaled before a completion ends and that a run can be
+  interrupted while a model call is open.
 
 ## Decisions to settle early
 

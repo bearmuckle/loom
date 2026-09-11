@@ -27,15 +27,24 @@
 ## Frontend
 
 The frontend is a GPUI application, using `gpui-gc` or the maintained GPUI
-variant required for browser support. It should be organized into:
+variant required for browser support. `loom-ui` is organized into:
 
-- `ui`: views, layout, input handling, commands, and theme.
-- `frontend-core`: client-side state projection, caching, routing, and
-  protocol requests.
-- `agent-ui`: session list, conversation, plan/approval controls, tool
-  timeline, context inspector, model selection, usage, and diff review.
-- `platform`: native windowing/clipboard/file dialogs and browser bindings.
-- `protocol-client`: transport-independent connection and request handling.
+- `view`: the session navigator, run canvas, composer, review drawer, and the
+  client-side projection they render.
+- `state`: projection types and pure formatting helpers derived from protocol
+  responses and events.
+- `connection`: the transport-independent protocol client plus the connection
+  worker that executes requests off the UI thread.
+- `text_input`: the text buffer and input element.
+- `theme`: window chrome, decorations, and colour.
+- `platform`: native adapters (process arguments, workspace preparation, local
+  credential storage, repository bootstrap) that a browser target cannot use
+  unchanged.
+
+Backend requests are submitted to a single connection worker thread and
+awaited on a background task, so no UI handler blocks on backend latency. The
+startup bootstrap (connect, negotiate, first session load) is deliberately
+synchronous because there is nothing to render yet.
 
 The native and wasm/browser targets should share domain state, view models,
 commands, and rendering wherever GPUI permits. Platform code must be a small
@@ -78,10 +87,13 @@ Suggested backend boundaries:
 - `loom-workspace`: file tree, file contents, watches, edits, and snapshots.
 - `loom-process`: commands, terminals, task supervision, output streaming, and
   cancellation.
-- `loom-vcs`: source-control abstraction and repository operations.
-- `loom-language`: language-server lifecycle, requests, diagnostics, and
-  symbols.
-- `loom-protocol`: versioned request/response/event schemas and codecs.
+- `loom-vcs`: source-control abstraction and read-only repository status,
+  diff, branch, and conflict reporting.
+- `loom-protocol`: versioned request/response/event schemas, the serializable
+  data-transfer types they carry, and codecs. It depends only on `loom-core`
+  and `loom-model`, so a client can speak the contract without linking the
+  backend implementation; the backend crates depend on the contract and
+  produce its types.
 - `loom-server`: listeners, authentication, connection management, and
   deployment configuration.
 - `loom-cli`: local server startup, diagnostics, and administration.
@@ -92,7 +104,8 @@ normalization, authorization, auditing, cancellation, and future sandboxing
 in one place.
 
 M5 deliberately does not turn `loom-workspace` into a second editor
-authority. The GPUI client projects the existing backend-owned project,
+authority; it owns files, snapshots, edits, checkpoints, and repository
+instruction discovery, and nothing else. The GPUI client projects the existing backend-owned project,
 session, run, approval, workspace-change, task, and evidence state into a
 small session navigator and one active-session canvas. The canvas contains
 the chronological agent conversation and tool timeline plus a composer for
@@ -129,6 +142,9 @@ must support:
 - Streaming model output and tool calls without requiring the frontend to
   remain connected.
 - Explicit stop, pause, resume, retry, and continue-after-feedback commands.
+  A run executes on a backend-owned worker and holds its runtime lock only for
+  the duration of one step, so control requests are serviceable while a model
+  call is open.
 - Parallel child tasks with bounded concurrency and clear parent ownership.
 - Per-session limits for time, model tokens, tool calls, processes, and cost.
 - Checkpoints before risky mutations and a way to restore or inspect them.
@@ -144,18 +160,27 @@ structured tool calls, and status metadata.
 
 ## Model provider abstraction
 
-The agent runtime talks to a normalized model interface:
+The agent runtime talks to a normalized model interface defined in
+`loom-model`:
 
 ```text
 ModelProvider
+  descriptor()
   list_models()
-  describe_model()
-  negotiate_capabilities()
-  stream_completion(messages, tools, options)
-  count_tokens(messages, tools)
+  capabilities()
+  stream(request, cancellation_token, sink)
+  count_tokens(request)
   health_check()
-  cancel(request_id)
+  reset()
 ```
+
+`stream` emits each normalized event through the sink as it is decoded, so the
+runtime journals an assistant delta before the completion has finished. The
+cancellation token is observed between chunks, which is how a pause or
+interrupt reaches an open model call. The sink can also ask a provider to stop
+early. Adapters request server-sent events; when an endpoint answers with a
+complete JSON document instead, declared by its content type, the document is
+normalized and emitted in one pass.
 
 Adapters translate provider-specific streaming formats, tool-call schemas,
 authentication, errors, and usage metrics into the normalized interface.
@@ -227,18 +252,14 @@ crates/
   loom-workspace/
   loom-process/
   loom-vcs/
-  loom-language/
   loom-protocol/
   loom-server/
   loom-cli/
-frontend/
-  src/
-  assets/
-tests/
-  protocol/
-  integration/
+  loom-ui/
 ```
 
-The exact layout can change as implementation begins. The important boundary
-is that shared Rust domain and protocol crates do not depend on a particular
-window system or browser API.
+Tests live with the crate they cover: unit tests in each crate, protocol
+contract tests in `crates/loom-protocol/tests`, and remote transport tests in
+`crates/loom-server/tests`. The important boundary is that shared Rust domain
+and protocol crates do not depend on a particular window system or browser
+API.

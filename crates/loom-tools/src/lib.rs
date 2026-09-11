@@ -4,8 +4,9 @@ use std::{
     process::Command,
 };
 
-use loom_core::{ActionKind, ApprovalPolicy, ProjectId, Result, ToolCallId};
+use loom_core::{ActionKind, ApprovalPolicy, ProjectId, Result};
 use loom_model::{ToolCall, ToolDefinition};
+pub use loom_protocol::ToolResult;
 use loom_workspace::{Workspace, WorkspaceEdit};
 use serde::Deserialize;
 
@@ -66,34 +67,6 @@ impl ToolKind {
             | Self::AskUser => ActionKind::Read,
             Self::ApplyPatch => ActionKind::Write,
             Self::RunCommand => ActionKind::Command,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct ToolResult {
-    pub tool_call_id: ToolCallId,
-    pub name: String,
-    pub success: bool,
-    pub output: String,
-}
-
-impl ToolResult {
-    fn success(call: &ToolCall, output: String) -> Self {
-        Self {
-            tool_call_id: call.id,
-            name: call.name.clone(),
-            success: true,
-            output,
-        }
-    }
-
-    fn failure(call: &ToolCall, output: impl Into<String>) -> Self {
-        Self {
-            tool_call_id: call.id,
-            name: call.name.clone(),
-            success: false,
-            output: output.into(),
         }
     }
 }
@@ -562,7 +535,7 @@ struct RunCommandArguments {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use loom_core::ProjectId;
+    use loom_core::{ProjectId, ToolCallId};
 
     use super::*;
 

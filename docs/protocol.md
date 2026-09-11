@@ -68,7 +68,8 @@ The server sends WebSocket ping heartbeats, applies a configured request
 deadline, accepts cancellation frames for pending transport tasks, and uses a
 bounded outbound queue. A full queue closes the connection rather than
 unboundedly buffering output. Disconnecting a client never cancels the
-backend's synchronous agent, process, terminal, or journal work.
+backend's agent, process, terminal, or journal work: a run executes on a
+backend-owned worker, not on the connection that started it.
 
 ## Example domain operations
 
@@ -99,9 +100,7 @@ WriteTerminalInput
 ResizeTerminal
 StartTask
 CancelTask
-GetDiagnostics
 GetRepositoryStatus
-CreateCommit
 ```
 
 M2 adds typed workspace and process requests rather than exposing filesystem or
@@ -196,12 +195,32 @@ questions, errors, and final summary after reconnect. Review responses are
 read-only, project-scoped, and bounded; diffs and task artifacts retain stable
 references without exposing credentials or shell strings.
 
-M5 does not add editor-buffer mutations, language-server lifecycle requests,
-interactive terminal panes, VCS staging, branch management, or commit
-operations. Those remain backend/tool capabilities or later client surfaces.
+The protocol has no editor-buffer, editor-layout, or language-service
+requests, and no VCS index or commit mutations. VCS status, diff, branch, and
+conflict reads remain available. Those descoped surfaces would be reintroduced
+with the milestone that needs them.
 All M5 operations work through both `InProcessConnection` and the
 authenticated WebSocket adapter after normal version and capability
 negotiation.
+
+## Run execution and control
+
+`StartAgentRun` registers the run and returns its snapshot as soon as the run
+is observable; the run itself proceeds on a backend worker. Clients follow
+progress through the session event stream, which receives assistant deltas
+while a model call is still open.
+
+`PauseAgentRun` and `InterruptAgentRun` raise a control flag and cancel the
+in-flight model stream rather than waiting for it, so they are answered while
+a model call is open. Requests that need exclusive access to a busy run
+(`ApproveAgentAction`, `SendAgentMessage`, `RetryAgentStep`, and the
+checkpoint retry) return a retryable `conflict` instead of blocking.
+
+Run projections (`GetAgentRunSnapshot`, `GetRunUsage`, `InspectAgentContext`)
+are served from the backend's cached run state. Run state, usage, pending
+approval, and pending input are updated from events as they are journaled; the
+message transcript in a projection is refreshed at each step boundary, so a
+transcript may lag the event stream by one in-flight model call.
 
 ## Reconnect and consistency
 

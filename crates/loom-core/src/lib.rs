@@ -10,8 +10,8 @@ mod version;
 pub use capability::{Capability, CapabilitySet};
 pub use error::{ErrorCode, LoomError, Result};
 pub use id::{
-    AgentSessionId, BufferId, CheckpointId, EventSequence, PaneId, ProjectId, RequestId, RunId,
-    StepId, TaskId, TerminalId, ToolCallId,
+    AgentSessionId, CheckpointId, EventSequence, ProjectId, RequestId, RunId, StepId, TaskId,
+    TerminalId, ToolCallId,
 };
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
 pub use policy::{ActionKind, ApprovalPolicy, PolicyDecision, PolicyEvaluation};
