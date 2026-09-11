@@ -9,7 +9,7 @@ use std::{
 use axum::{
     Router,
     extract::{
-        State,
+        Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
@@ -225,15 +225,37 @@ async fn health_handler() -> impl IntoResponse {
 async fn websocket_handler(
     upgrade: WebSocketUpgrade,
     headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
     State(state): State<RemoteState>,
 ) -> Response {
-    let auth = match bearer_token(&headers).and_then(|token| state.auth.authenticate(token)) {
-        Ok(auth) => auth,
-        Err(error) => return auth_error_response(error),
-    };
+    let auth =
+        match request_token(&headers, &query).and_then(|token| state.auth.authenticate(token)) {
+            Ok(auth) => auth,
+            Err(error) => return auth_error_response(error),
+        };
     upgrade
         .on_upgrade(move |socket| handle_socket(socket, state, auth))
         .into_response()
+}
+
+/// Resolves the bearer token for an incoming WebSocket upgrade.
+///
+/// Browser `WebSocket` clients cannot set arbitrary request headers during
+/// the handshake, so in-browser clients authenticate with an `access_token`
+/// query parameter instead of the `Authorization` header native clients use.
+/// The header takes precedence when both are present.
+fn request_token<'a>(
+    headers: &'a HeaderMap,
+    query: &'a HashMap<String, String>,
+) -> Result<&'a str> {
+    match bearer_token(headers) {
+        Ok(token) => Ok(token),
+        Err(header_error) => query
+            .get("access_token")
+            .map(String::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or(header_error),
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str> {

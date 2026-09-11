@@ -38,6 +38,16 @@ Demo mode:
 cargo run -p loom-ui -- --demo
 ```
 
+Browser target (GPUI currently requires a nightly compiler for wasm atomics):
+
+```text
+RUSTC_BOOTSTRAP=1 cargo check -p loom-ui --target wasm32-unknown-unknown
+```
+
+The wasm binary is a browser-hosted GPUI client; native-only workspace,
+process, and credential integrations remain available through the remote
+backend boundary.
+
 Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
 `LOOM_MODEL`, or connect to a remote backend with `LOOM_REMOTE_URL` and
 `LOOM_TOKEN`. GitHub Copilot login is available in the UI.

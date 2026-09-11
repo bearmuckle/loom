@@ -552,7 +552,16 @@ impl Workspace {
             .iter()
             .filter(|entry| entry.kind == WorkspaceEntryKind::File)
         {
-            let file = self.read_file(&entry.path)?;
+            let file = match self.read_file(&entry.path) {
+                Ok(file) => file,
+                Err(error) if error.code == ErrorCode::InvalidEncoding => {
+                    // Text checkpoints cannot represent binary files. They
+                    // remain in the workspace and are intentionally excluded
+                    // from text rollback state.
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             files.insert(
                 entry.path.clone(),
                 CheckpointFile {
@@ -1070,9 +1079,11 @@ mod tests {
     #[test]
     fn checkpoint_revert_and_user_takeover_are_conflict_safe() {
         let (workspace, root) = workspace();
+        fs::write(root.join("binary.bin"), [0, 159, 146, 150]).unwrap();
         let checkpoint = workspace
             .create_checkpoint(None, "before agent edit")
             .unwrap();
+        assert!(!checkpoint.files.contains_key("binary.bin"));
         let before = workspace.read_file("README.md").unwrap();
         workspace
             .apply_edit(WorkspaceEdit {
