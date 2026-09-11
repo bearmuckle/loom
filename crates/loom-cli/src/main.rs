@@ -26,6 +26,12 @@ use loom_server::{
     RemoteServerConfig, WebSocketConnection, WebSocketTransport,
 };
 
+/// How long the shell waits between event polls while a run is executing.
+const EVENT_POLL_INTERVAL_MS: u64 = 20;
+/// How many consecutive empty polls are tolerated before the run is treated as
+/// stalled.
+const MAX_IDLE_EVENT_POLLS: u32 = 1_500;
+
 fn main() -> Result<(), LoomError> {
     let Some(options) = parse_args(env::args().skip(1))? else {
         return Ok(());
@@ -500,18 +506,9 @@ fn client_capabilities() -> CapabilitySet {
         Capability::ConfigureApprovalPolicy,
         Capability::ManageCheckpoints,
         Capability::TakeoverWorkspace,
-        Capability::WorkspaceNavigation,
-        Capability::SearchWorkspace,
         Capability::ReadWorkspaceInstructions,
-        Capability::ReadDiagnostics,
-        Capability::ReadSymbols,
-        Capability::GoToDefinition,
-        Capability::FindReferences,
-        Capability::LanguageServiceLifecycle,
         Capability::ReadVcsStatus,
         Capability::ReadVcsDiff,
-        Capability::MutateVcsIndex,
-        Capability::CreateVcsCommit,
         Capability::ReadTaskEvidence,
         Capability::JsonProtocol,
     ])
@@ -803,18 +800,9 @@ fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
             Capability::ConfigureApprovalPolicy,
             Capability::ManageCheckpoints,
             Capability::TakeoverWorkspace,
-            Capability::WorkspaceNavigation,
-            Capability::SearchWorkspace,
             Capability::ReadWorkspaceInstructions,
-            Capability::ReadDiagnostics,
-            Capability::ReadSymbols,
-            Capability::GoToDefinition,
-            Capability::FindReferences,
-            Capability::LanguageServiceLifecycle,
             Capability::ReadVcsStatus,
             Capability::ReadVcsDiff,
-            Capability::MutateVcsIndex,
-            Capability::CreateVcsCommit,
             Capability::ReadTaskEvidence,
             Capability::JsonProtocol,
         ]),
@@ -870,6 +858,9 @@ fn stream_run(
     manual_approval: bool,
 ) -> Result<(), LoomError> {
     let mut after = None;
+    // The run executes on a backend worker, so an empty poll only means the
+    // current step has not journaled anything yet.
+    let mut idle_polls = 0_u32;
     loop {
         let response = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
@@ -880,12 +871,18 @@ fn stream_run(
             response => return Err(unexpected_response("event stream", response)),
         };
         if events.is_empty() {
-            return Err(LoomError::new(
-                ErrorCode::Internal,
-                "agent run produced no further events",
-                false,
-            ));
+            idle_polls = idle_polls.saturating_add(1);
+            if idle_polls > MAX_IDLE_EVENT_POLLS {
+                return Err(LoomError::new(
+                    ErrorCode::Internal,
+                    "agent run produced no further events",
+                    false,
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(EVENT_POLL_INTERVAL_MS));
+            continue;
         }
+        idle_polls = 0;
 
         let mut completed = false;
         for event in events {

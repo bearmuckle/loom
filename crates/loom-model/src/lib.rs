@@ -1,3 +1,11 @@
+mod provider;
+
+pub use provider::{
+    CancellationToken, CollectingSink, ModelProvider, ModelStreamSink, ProviderDescriptor,
+    ProviderHealth, ProviderHealthState, ProviderKind, ProviderSummary, ProviderUsageRecord,
+    ProviderUsageSummary, StreamFlow, UnavailableProvider, cancelled_error, estimate_tokens,
+};
+
 use loom_core::ToolCallId;
 use serde::{Deserialize, Serialize};
 

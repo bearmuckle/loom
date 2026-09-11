@@ -8,4 +8,5 @@ rust-version.workspace = true
 
 [dependencies]
 loom-core.workspace = true
+loom-protocol.workspace = true
 serde.workspace = true

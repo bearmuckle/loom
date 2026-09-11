@@ -32,18 +32,9 @@ fn capabilities() -> CapabilitySet {
         Capability::OpenWorkspace,
         Capability::ReadWorkspace,
         Capability::WriteWorkspace,
-        Capability::WorkspaceNavigation,
-        Capability::SearchWorkspace,
         Capability::ReadWorkspaceInstructions,
-        Capability::ReadDiagnostics,
-        Capability::ReadSymbols,
-        Capability::GoToDefinition,
-        Capability::FindReferences,
-        Capability::LanguageServiceLifecycle,
         Capability::ReadVcsStatus,
         Capability::ReadVcsDiff,
-        Capability::MutateVcsIndex,
-        Capability::CreateVcsCommit,
         Capability::ReadTaskEvidence,
         Capability::OpenTerminal,
         Capability::ControlTerminal,
@@ -170,7 +161,7 @@ async fn authorized_client_can_discover_and_revoke_access() {
         Ok(ServerResponse::Capabilities(result)) => result.capabilities,
         other => panic!("unexpected capability response: {other:?}"),
     };
-    assert!(discovered.contains(Capability::WorkspaceNavigation));
+    assert!(discovered.contains(Capability::ReadWorkspaceInstructions));
     assert!(discovered.contains(Capability::ReadVcsStatus));
     let project_id = ProjectId::new();
     let _ = session(&mut connection, project_id).await;

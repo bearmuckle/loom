@@ -3,7 +3,6 @@ members = [
     "crates/loom-core",
     "crates/loom-tools",
     "crates/loom-workspace",
-    "crates/loom-language",
     "crates/loom-vcs",
     "crates/loom-process",
     "crates/loom-model",
@@ -29,7 +28,6 @@ version = "0.1.0"
 loom-core = { path = "crates/loom-core" }
 loom-tools = { path = "crates/loom-tools" }
 loom-workspace = { path = "crates/loom-workspace" }
-loom-language = { path = "crates/loom-language" }
 loom-vcs = { path = "crates/loom-vcs" }
 loom-process = { path = "crates/loom-process" }
 loom-model = { path = "crates/loom-model" }

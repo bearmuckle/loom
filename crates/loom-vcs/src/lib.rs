@@ -5,63 +5,9 @@ use std::{
 };
 
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GitFileStatusKind {
-    Added,
-    Modified,
-    Deleted,
-    Renamed,
-    Copied,
-    Untracked,
-    Ignored,
-    Conflicted,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GitFileStatus {
-    pub path: String,
-    pub original_path: Option<String>,
-    pub index: GitFileStatusKind,
-    pub worktree: GitFileStatusKind,
-    pub conflicted: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GitRepositoryStatus {
-    pub root: String,
-    pub branch: Option<String>,
-    pub head: Option<String>,
-    pub files: Vec<GitFileStatus>,
-    pub conflicts: Vec<String>,
-    pub clean: bool,
-    pub captured_at: Timestamp,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GitDiff {
-    pub path: Option<String>,
-    pub staged: bool,
-    pub patch: String,
-    pub binary: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GitBranch {
-    pub name: String,
-    pub current: bool,
-    pub upstream: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GitCommit {
-    pub hash: String,
-    pub message: String,
-    pub branch: Option<String>,
-}
+pub use loom_protocol::{
+    GitBranch, GitDiff, GitFileStatus, GitFileStatusKind, GitRepositoryStatus,
+};
 
 #[derive(Clone, Debug)]
 pub struct GitService {
@@ -224,50 +170,6 @@ impl GitService {
         })
     }
 
-    pub fn stage(&self, paths: &[String]) -> Result<GitRepositoryStatus> {
-        self.run_paths("add", paths)?;
-        self.status()
-    }
-
-    pub fn unstage(&self, paths: &[String]) -> Result<GitRepositoryStatus> {
-        if paths.is_empty() {
-            return Err(LoomError::invalid_request(
-                "at least one path is required to unstage",
-            ));
-        }
-        let validated = paths
-            .iter()
-            .map(|path| self.validate_path(path))
-            .collect::<Result<Vec<_>>>()?;
-        let mut arguments = vec!["restore", "--staged", "--"];
-        arguments.extend(validated.iter().map(String::as_str));
-        self.run(&arguments)?;
-        self.status()
-    }
-
-    pub fn commit(&self, message: &str) -> Result<GitCommit> {
-        if message.trim().is_empty() {
-            return Err(LoomError::invalid_request("Git commit message is empty"));
-        }
-        if message.contains('\0') {
-            return Err(LoomError::invalid_request(
-                "Git commit message contains a NUL byte",
-            ));
-        }
-        self.run(&["commit", "--message", message])?;
-        let hash = self.run(&["rev-parse", "HEAD"])?;
-        let branch = self
-            .run(&["branch", "--show-current"])
-            .ok()
-            .map(|branch| branch.trim().to_owned())
-            .filter(|branch| !branch.is_empty());
-        Ok(GitCommit {
-            hash: hash.trim().to_owned(),
-            message: message.to_owned(),
-            branch,
-        })
-    }
-
     pub fn branches(&self) -> Result<Vec<GitBranch>> {
         let current = self.run(&["branch", "--show-current"])?.trim().to_owned();
         let output = self.run(&[
@@ -295,21 +197,6 @@ impl GitService {
 
     pub fn conflicts(&self) -> Result<Vec<String>> {
         Ok(self.status()?.conflicts)
-    }
-
-    fn run_paths(&self, command: &str, paths: &[String]) -> Result<()> {
-        if paths.is_empty() {
-            return Err(LoomError::invalid_request(format!(
-                "at least one path is required to {command}"
-            )));
-        }
-        let validated = paths
-            .iter()
-            .map(|path| self.validate_path(path))
-            .collect::<Result<Vec<_>>>()?;
-        let mut arguments = vec![command, "--"];
-        arguments.extend(validated.iter().map(String::as_str));
-        self.run(&arguments).map(|_| ())
     }
 
     fn validate_path(&self, path: &str) -> Result<String> {
@@ -419,7 +306,7 @@ mod tests {
     }
 
     #[test]
-    fn status_diff_stage_and_commit_are_structured() {
+    fn status_and_diff_are_structured() {
         let (git, root) = repository();
         fs::write(root.join("README.md"), "after\n").unwrap();
         fs::write(root.join("new.txt"), "new\n").unwrap();
@@ -428,23 +315,17 @@ mod tests {
         assert!(status.files.iter().any(|file| file.path == "README.md"));
         let diff = git.diff(Some("README.md"), false).unwrap();
         assert!(diff.patch.contains("-before"));
-        git.stage(&["README.md".to_owned(), "new.txt".to_owned()])
-            .unwrap();
-        assert!(git.diff(None, true).unwrap().patch.contains("+after"));
-        let commit = git.commit("update files").unwrap();
-        assert!(!commit.hash.is_empty());
-        assert!(git.status().unwrap().clean);
+        assert!(diff.patch.contains("+after"));
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn rejects_out_of_scope_paths_and_empty_commits() {
+    fn rejects_out_of_scope_diff_paths() {
         let (git, root) = repository();
         assert_eq!(
-            git.stage(&["../secret".to_owned()]).unwrap_err().code,
+            git.diff(Some("../secret"), false).unwrap_err().code,
             ErrorCode::WorkspaceAccessDenied
         );
-        assert_eq!(git.commit(" ").unwrap_err().code, ErrorCode::InvalidRequest);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -10,7 +10,6 @@ rust-version.workspace = true
 loom-agent.workspace = true
 loom-context.workspace = true
 loom-core.workspace = true
-loom-language.workspace = true
 loom-model.workspace = true
 loom-protocol.workspace = true
 loom-providers.workspace = true

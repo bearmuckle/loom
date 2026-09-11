@@ -1,96 +1,12 @@
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
 use loom_model::{MessageRole, ModelMessage};
+pub use loom_protocol::{
+    ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
+    ContextSummary,
+};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_OUTPUT_RESERVE: u64 = 1_024;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextItemKind {
-    SystemInstructions,
-    RepositoryInstructions,
-    Task,
-    Summary,
-    Conversation,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ContextItem {
-    pub kind: ContextItemKind,
-    pub label: String,
-    pub estimated_tokens: u64,
-    pub included: bool,
-    pub omission_reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ContextBudget {
-    pub context_window: Option<u64>,
-    pub requested_input_tokens: Option<u64>,
-    pub reserved_output_tokens: u64,
-    pub effective_input_tokens: Option<u64>,
-}
-
-impl ContextBudget {
-    pub fn new(
-        context_window: Option<u64>,
-        requested_input_tokens: Option<u64>,
-        reserved_output_tokens: u64,
-    ) -> Result<Self> {
-        if reserved_output_tokens == 0 {
-            return Err(LoomError::invalid_request(
-                "context output reserve must be greater than zero",
-            ));
-        }
-        let effective_input_tokens = match (context_window, requested_input_tokens) {
-            (Some(window), Some(requested)) => {
-                Some(window.saturating_sub(reserved_output_tokens).min(requested))
-            }
-            (Some(window), None) => Some(window.saturating_sub(reserved_output_tokens)),
-            (None, Some(requested)) => Some(requested),
-            (None, None) => None,
-        };
-        if effective_input_tokens == Some(0) {
-            return Err(LoomError::new(
-                ErrorCode::ContextLimitExceeded,
-                "context budget leaves no room for input",
-                false,
-            ));
-        }
-        Ok(Self {
-            context_window,
-            requested_input_tokens,
-            reserved_output_tokens,
-            effective_input_tokens,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ContextInspection {
-    pub items: Vec<ContextItem>,
-    pub total_tokens: u64,
-    pub included_tokens: u64,
-    pub omitted_tokens: u64,
-    pub budget: ContextBudget,
-    pub compacted: bool,
-    pub summary: Option<ContextSummary>,
-}
-
-impl ContextInspection {
-    pub fn within_budget(&self) -> bool {
-        self.budget
-            .effective_input_tokens
-            .is_none_or(|budget| self.included_tokens <= budget)
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ContextSummary {
-    pub text: String,
-    pub source_message_count: usize,
-    pub created_at: Timestamp,
-}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextAssembly {
@@ -105,13 +21,6 @@ pub struct ContextInput {
     pub task: String,
     pub conversation: Vec<ModelMessage>,
     pub existing_summary: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ContextAssemblyOptions {
-    pub context_window: Option<u64>,
-    pub max_input_tokens: Option<u64>,
-    pub reserved_output_tokens: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

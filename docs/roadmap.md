@@ -34,7 +34,8 @@ approve the plan and patch, run a test command, and inspect the final diff.
 
 ### M2 - Workspace tools and human control
 
-- Open a configured project root and expose file snapshots and watches.
+- Open a configured project root and expose file snapshots. Change detection
+  is pull-based revision comparison; a watch mechanism is not implemented yet.
 - Add persistent terminals with output streaming, resize, input, and
   cancellation.
 - Add task supervision, bounded output buffers, backpressure, exit status, and
@@ -158,21 +159,6 @@ session-centric product model.
 **Exit condition:** the browser client can complete the M1-M5 agent workflows
 against a remote backend using supported browsers.
 
-### M7 - Extensibility and collaboration
-
-- Publish protocol, model-provider, tool, and extension interfaces.
-- Add parallel child agents, isolated worktrees, session handoff, comparison,
-  and selective merge/discard.
-- Add provider adapters, additional VCS systems, language servers, task
-  runners, and deployment targets.
-- Add session sharing, invitations, revocation, and audit history.
-- Add performance tooling and deployment documentation.
-
-**Exit condition:** a third-party adapter can be added without modifying
-frontend views or the backend session model; two authorized clients can work
-against one session predictably; and a multi-agent task has inspectable
-dependencies and outcomes.
-
 ## Quality bar
 
 ### Correctness
@@ -205,8 +191,10 @@ optimizing only loopback benchmarks.
 - Test provider streaming, tool-call normalization, cancellation, reconnect,
   backpressure, malformed payloads, and permission failures.
 - Run a small browser compatibility matrix once wasm work begins.
-- Keep deterministic fixtures for files, processes, diagnostics, VCS state,
-  model responses, and tool calls.
+- Keep deterministic fixtures for files, processes, VCS state, model
+  responses, and tool calls, including event-stream fixtures that prove a
+  delta is journaled before a completion ends and that a run can be
+  interrupted while a model call is open.
 
 ## Decisions to settle early
 
@@ -217,7 +205,6 @@ These choices should be recorded as architecture decision records when made:
 - MessagePack versus CBOR, and the schema/code-generation approach.
 - Whether QUIC is a first-release transport or a later optimization.
 - The persistence engine for sessions, event journals, and configuration.
-- The language-server process model and sandboxing strategy.
 - The minimum authentication mechanism for remote deployments.
 - The supported source-control providers beyond Git.
 - The provider adapter contract and local model compatibility baseline.
@@ -231,3 +218,5 @@ These choices should be recorded as architecture decision records when made:
 - Building a hosted service before the standalone backend and protocol are
   reliable.
 - Hiding destructive or privileged actions behind automatic behavior.
+- Extensibility, collaboration, and language-server integration are deferred
+  until the M0-M6 product loop has proven stable.

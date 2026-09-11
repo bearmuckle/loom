@@ -1,17 +1,18 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak},
+    time::{Duration, Instant},
 };
 
 use loom_agent::{
-    AgentEvent, AgentRunState, AgentRuntime, AgentRuntimeOptions, AgentRuntimeState, AgentTask,
+    AgentEvent, AgentEventObserver, AgentRunSnapshot, AgentRunState, AgentRuntime,
+    AgentRuntimeOptions, AgentRuntimeState, AgentTask, RunControl, RunProgress,
 };
 use loom_core::{
     AgentSessionId, AgentSessionState, ApprovalPolicy, Capability, CapabilitySet, ErrorCode,
     EventSequence, LoomError, ProjectId, ProtocolVersion, Result, SessionEventRecord, Timestamp,
 };
-use loom_language::LanguageServiceManager;
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
 use loom_persistence::{CURRENT_SCHEMA_VERSION, FilePersistence};
 use loom_process::{TaskSupervisor, TerminalManager};
@@ -28,7 +29,7 @@ use loom_providers::{
 use loom_session::SessionManager;
 use loom_tools::ToolExecutor;
 use loom_vcs::GitService;
-use loom_workspace::{EditorWorkspace, Workspace};
+use loom_workspace::Workspace;
 use serde::{Deserialize, Serialize};
 
 mod auth;
@@ -172,6 +173,180 @@ struct PersistedBackendState {
     idempotency: BTreeMap<loom_core::RequestId, IdempotencyRecord>,
 }
 
+/// One agent run owned by the backend.
+///
+/// The runtime lock is held only while a step is executing. Reads and control
+/// requests use the cached state and the control handle instead, so a running
+/// model call never blocks another request.
+struct RunHandle {
+    run_id: loom_core::RunId,
+    session_id: AgentSessionId,
+    runtime: Mutex<AgentRuntime>,
+    control: RunControl,
+    state: Mutex<AgentRuntimeState>,
+    running: Mutex<bool>,
+    idle: Condvar,
+    failure: Mutex<Option<LoomError>>,
+}
+
+/// Whether a control request pauses a run or ends it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunStop {
+    Interrupt,
+    Pause,
+}
+
+/// How long a control request waits for a running step to honour it.
+const CONTROL_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an operation that needs exclusive runtime access waits for a step
+/// that is already finishing. A run that is genuinely busy is reported as a
+/// retryable conflict instead.
+const ENTRY_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+impl RunHandle {
+    fn new(runtime: AgentRuntime) -> Self {
+        Self {
+            run_id: runtime.run_id(),
+            session_id: runtime.session_id(),
+            control: runtime.control(),
+            state: Mutex::new(runtime.export_state()),
+            runtime: Mutex::new(runtime),
+            running: Mutex::new(false),
+            idle: Condvar::new(),
+            failure: Mutex::new(None),
+        }
+    }
+
+    fn state(&self) -> AgentRuntimeState {
+        self.locked_state().clone()
+    }
+
+    fn snapshot(&self) -> AgentRunSnapshot {
+        self.locked_state().run.clone()
+    }
+
+    fn locked_state(&self) -> MutexGuard<'_, AgentRuntimeState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn refresh(&self, runtime: &AgentRuntime) {
+        *self.locked_state() = runtime.export_state();
+    }
+
+    /// Keeps the cached run state current while a step is still executing.
+    ///
+    /// The transcript in the cached state is only replaced when the step ends;
+    /// live message deltas are observable through the event journal.
+    fn apply_event(&self, event: &AgentEvent) {
+        let mut state = self.locked_state();
+        match event {
+            AgentEvent::RunStarted { snapshot } | AgentEvent::RunCompleted { snapshot } => {
+                state.run = snapshot.clone();
+            }
+            AgentEvent::RunStateChanged {
+                state: run_state, ..
+            } => {
+                state.run.state = *run_state;
+                state.run.updated_at = Timestamp::now();
+            }
+            AgentEvent::RunUsageUpdated { usage, .. } => state.usage = usage.clone(),
+            AgentEvent::ToolApprovalRequired { call, .. } => {
+                state.pending_approval = Some(call.clone());
+            }
+            AgentEvent::ToolApprovalDecided { .. } => state.pending_approval = None,
+            AgentEvent::NeedsInput { prompt, .. } => {
+                state.pending_input = Some(prompt.clone());
+            }
+            AgentEvent::UserMessage { .. } => state.pending_input = None,
+            _ => {}
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        *self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_running(&self, running: bool) {
+        *self.running.lock().unwrap_or_else(PoisonError::into_inner) = running;
+        self.idle.notify_all();
+    }
+
+    /// Locks the runtime for an operation that requires exclusive access.
+    ///
+    /// Returns a retryable conflict instead of blocking when a step is in
+    /// flight, so a caller is never parked behind a model call.
+    fn try_runtime(&self) -> Result<MutexGuard<'_, AgentRuntime>> {
+        match self.runtime.try_lock() {
+            Ok(runtime) => Ok(runtime),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => Err(LoomError::new(
+                ErrorCode::Conflict,
+                format!("agent run {} is executing a step", self.run_id),
+                true,
+            )),
+        }
+    }
+
+    /// Locks the runtime for an operation that responds to a state the run has
+    /// already reached, allowing the worker a moment to finish its last step.
+    fn runtime_for_entry(&self) -> Result<MutexGuard<'_, AgentRuntime>> {
+        if self.is_running() && self.wait_until_idle_for(ENTRY_SETTLE_TIMEOUT).is_err() {
+            return Err(LoomError::new(
+                ErrorCode::Conflict,
+                format!("agent run {} is executing a step", self.run_id),
+                true,
+            ));
+        }
+        self.try_runtime()
+    }
+
+    /// Waits for an in-flight step to observe a pause or interrupt request.
+    fn wait_until_idle(&self) -> Result<()> {
+        self.wait_until_idle_for(CONTROL_SETTLE_TIMEOUT)
+    }
+
+    fn wait_until_idle_for(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+        while *running {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(LoomError::new(
+                    ErrorCode::DeadlineExceeded,
+                    format!("agent run {} did not stop in time", self.run_id),
+                    true,
+                ));
+            };
+            let (guard, timeout) = self
+                .idle
+                .wait_timeout(running, remaining)
+                .unwrap_or_else(PoisonError::into_inner);
+            running = guard;
+            if timeout.timed_out() && *running {
+                return Err(LoomError::new(
+                    ErrorCode::DeadlineExceeded,
+                    format!("agent run {} did not stop in time", self.run_id),
+                    true,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn take_failure(&self) -> Option<LoomError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    fn record_failure(&self, error: LoomError) {
+        let mut failure = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+        if failure.is_none() {
+            *failure = Some(error);
+        }
+    }
+}
+
 struct StartRunInput {
     session_id: AgentSessionId,
     task: String,
@@ -184,11 +359,9 @@ struct StartRunInput {
 
 pub struct InProcessBackend {
     sessions: Mutex<SessionManager>,
-    runs: Mutex<BTreeMap<loom_core::RunId, AgentRuntime>>,
+    runs: Mutex<BTreeMap<loom_core::RunId, Arc<RunHandle>>>,
     journal: Mutex<EventJournal>,
     workspaces: Mutex<BTreeMap<ProjectId, Workspace>>,
-    editors: Mutex<BTreeMap<ProjectId, EditorWorkspace>>,
-    language_services: Mutex<BTreeMap<ProjectId, LanguageServiceManager>>,
     vcs: Mutex<BTreeMap<ProjectId, GitService>>,
     task_supervisors: Mutex<BTreeMap<ProjectId, TaskSupervisor>>,
     policies: Mutex<BTreeMap<ProjectId, ApprovalPolicy>>,
@@ -199,7 +372,9 @@ pub struct InProcessBackend {
     providers: ProviderRegistry,
     persistence: Option<FilePersistence>,
     idempotency: Mutex<BTreeMap<loom_core::RequestId, IdempotencyRecord>>,
-    mutation_lock: Mutex<()>,
+    in_flight_requests: Mutex<BTreeMap<loom_core::RequestId, Arc<Mutex<()>>>>,
+    session_admissions: Mutex<BTreeMap<AgentSessionId, Arc<Mutex<()>>>>,
+    self_reference: Mutex<Weak<InProcessBackend>>,
 }
 
 impl InProcessBackend {
@@ -444,8 +619,6 @@ impl InProcessBackend {
             runs: Mutex::new(BTreeMap::new()),
             journal: Mutex::new(EventJournal::default()),
             workspaces: Mutex::new(BTreeMap::new()),
-            editors: Mutex::new(BTreeMap::new()),
-            language_services: Mutex::new(BTreeMap::new()),
             vcs: Mutex::new(BTreeMap::new()),
             task_supervisors: Mutex::new(BTreeMap::new()),
             policies: Mutex::new(BTreeMap::new()),
@@ -480,18 +653,9 @@ impl InProcessBackend {
                 Capability::ConfigureApprovalPolicy,
                 Capability::ManageCheckpoints,
                 Capability::TakeoverWorkspace,
-                Capability::WorkspaceNavigation,
-                Capability::SearchWorkspace,
                 Capability::ReadWorkspaceInstructions,
-                Capability::ReadDiagnostics,
-                Capability::ReadSymbols,
-                Capability::GoToDefinition,
-                Capability::FindReferences,
-                Capability::LanguageServiceLifecycle,
                 Capability::ReadVcsStatus,
                 Capability::ReadVcsDiff,
-                Capability::MutateVcsIndex,
-                Capability::CreateVcsCommit,
                 Capability::ReadTaskEvidence,
                 Capability::JsonProtocol,
             ]),
@@ -499,8 +663,14 @@ impl InProcessBackend {
             providers,
             persistence,
             idempotency: Mutex::new(BTreeMap::new()),
-            mutation_lock: Mutex::new(()),
+            in_flight_requests: Mutex::new(BTreeMap::new()),
+            session_admissions: Mutex::new(BTreeMap::new()),
+            self_reference: Mutex::new(Weak::new()),
         });
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
         backend.restore_persisted()?;
         Ok(backend)
     }
@@ -543,7 +713,7 @@ impl InProcessBackend {
         })
     }
 
-    fn runs(&self) -> Result<MutexGuard<'_, BTreeMap<loom_core::RunId, AgentRuntime>>> {
+    fn runs(&self) -> Result<MutexGuard<'_, BTreeMap<loom_core::RunId, Arc<RunHandle>>>> {
         self.runs
             .lock()
             .map_err(|_| LoomError::new(ErrorCode::Internal, "agent run lock was poisoned", true))
@@ -560,28 +730,6 @@ impl InProcessBackend {
             LoomError::new(
                 ErrorCode::Internal,
                 "workspace manager lock was poisoned",
-                true,
-            )
-        })
-    }
-
-    fn editors(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, EditorWorkspace>>> {
-        self.editors.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "editor workspace manager lock was poisoned",
-                true,
-            )
-        })
-    }
-
-    fn language_services(
-        &self,
-    ) -> Result<MutexGuard<'_, BTreeMap<ProjectId, LanguageServiceManager>>> {
-        self.language_services.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "language service manager lock was poisoned",
                 true,
             )
         })
@@ -750,7 +898,7 @@ impl InProcessBackend {
             if let Some(reason) = recovery_reason {
                 recovery_events.push(AgentEvent::RecoveryRequired { run_id, reason });
             }
-            restored_runs.insert(run_id, runtime);
+            restored_runs.insert(run_id, self.register_runtime(runtime));
             if !recovery_events.is_empty() {
                 self.append_recovery_events(session.id, recovery_events)?;
             }
@@ -767,7 +915,7 @@ impl InProcessBackend {
         let runs = self
             .runs()?
             .iter()
-            .map(|(run_id, runtime)| (*run_id, runtime.export_state()))
+            .map(|(run_id, handle)| (*run_id, handle.state()))
             .collect();
         let workspaces = self
             .workspaces()?
@@ -826,14 +974,122 @@ impl InProcessBackend {
         })
     }
 
-    fn mutation_lock(&self) -> Result<MutexGuard<'_, ()>> {
-        self.mutation_lock.lock().map_err(|_| {
+    /// Serializes retries of one request id without serializing unrelated
+    /// mutations, so a long-running request cannot block a control request.
+    fn request_slot(&self, request_id: loom_core::RequestId) -> Result<Arc<Mutex<()>>> {
+        let mut in_flight = self.in_flight_requests.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
-                "mutation serialization lock was poisoned",
+                "request serialization lock was poisoned",
                 true,
             )
+        })?;
+        Ok(Arc::clone(in_flight.entry(request_id).or_default()))
+    }
+
+    fn session_admission(&self, session_id: AgentSessionId) -> Result<Arc<Mutex<()>>> {
+        let mut admissions = self.session_admissions.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "session admission lock was poisoned",
+                true,
+            )
+        })?;
+        Ok(Arc::clone(admissions.entry(session_id).or_default()))
+    }
+
+    fn release_request_slot(&self, request_id: loom_core::RequestId) {
+        let mut in_flight = self
+            .in_flight_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if in_flight
+            .get(&request_id)
+            .is_some_and(|slot| Arc::strong_count(slot) == 1)
+        {
+            in_flight.remove(&request_id);
+        }
+    }
+
+    /// Journals one agent event and keeps the session state in step with it.
+    fn record_agent_event(&self, session_id: AgentSessionId, event: AgentEvent) -> Result<()> {
+        let state = session_state_for_event(&event);
+        self.journal()?.append_agent(session_id, event);
+        if let Some(state) = state {
+            let current = self.sessions()?.get(session_id)?.state;
+            if current != state {
+                let (_, record) = self.sessions()?.transition(session_id, state)?;
+                self.journal()?.append_session(record);
+            }
+        }
+        Ok(())
+    }
+
+    /// Observer installed on every runtime so events are journaled as they are
+    /// produced rather than after the run finishes.
+    fn run_observer(
+        self: &Arc<Self>,
+        handle: Weak<RunHandle>,
+        session_id: AgentSessionId,
+    ) -> AgentEventObserver {
+        let backend = Arc::downgrade(self);
+        Arc::new(move |event: &AgentEvent| {
+            let Some(backend) = backend.upgrade() else {
+                return;
+            };
+            let recorded = backend.record_agent_event(session_id, event.clone());
+            if let Some(handle) = handle.upgrade() {
+                handle.apply_event(event);
+                if let Err(error) = recorded {
+                    handle.record_failure(error);
+                }
+            }
         })
+    }
+
+    /// Wraps a runtime in a handle and attaches the journaling observer.
+    fn register_runtime(self: &Arc<Self>, mut runtime: AgentRuntime) -> Arc<RunHandle> {
+        let session_id = runtime.session_id();
+        Arc::new_cyclic(|weak: &Weak<RunHandle>| {
+            runtime.set_event_observer(self.run_observer(weak.clone(), session_id));
+            RunHandle::new(runtime)
+        })
+    }
+
+    /// Drives a registered run on its own worker so the request handler returns
+    /// as soon as the run is registered.
+    fn spawn_run_worker(self: &Arc<Self>, handle: Arc<RunHandle>) {
+        handle.set_running(true);
+        let backend = Arc::clone(self);
+        std::thread::spawn(move || {
+            loop {
+                let progress = {
+                    let mut runtime = handle
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let progress = runtime.run_step();
+                    handle.refresh(&runtime);
+                    progress
+                };
+                match progress {
+                    Ok(progress) => {
+                        if let Err(error) = backend.persist_state() {
+                            handle.record_failure(error);
+                            break;
+                        }
+                        if !progress.continues {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        handle.record_failure(error);
+                        break;
+                    }
+                }
+            }
+            handle.set_running(false);
+        });
     }
 
     fn cached_response(
@@ -897,11 +1153,21 @@ impl InProcessConnection {
         &self,
         run_id: loom_core::RunId,
     ) -> Result<AgentRunSnapshotProjection> {
-        let runs = self.backend.runs()?;
-        let run = runs
+        Ok(run_snapshot_projection(&self.run_handle(run_id)?.state()))
+    }
+
+    /// Looks a run up without touching its runtime lock.
+    fn run_handle(&self, run_id: loom_core::RunId) -> Result<Arc<RunHandle>> {
+        let handle = self
+            .backend
+            .runs()?
             .get(&run_id)
+            .cloned()
             .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
-        Ok(run_snapshot_projection(run))
+        if let Some(error) = handle.take_failure() {
+            return Err(error);
+        }
+        Ok(handle)
     }
 
     fn session_snapshot_projection(
@@ -913,8 +1179,10 @@ impl InProcessConnection {
             .backend
             .runs()?
             .values()
-            .filter(|run| run.session_id() == session_id)
-            .max_by_key(|run| run.snapshot().updated_at)
+            .filter(|handle| handle.session_id == session_id)
+            .map(|handle| handle.state())
+            .max_by_key(|state| state.run.updated_at)
+            .as_ref()
             .map(run_snapshot_projection);
         let latest_sequence = self
             .backend
@@ -1000,27 +1268,6 @@ impl InProcessConnection {
             .ok_or_else(|| LoomError::not_found("workspace", project_id))
     }
 
-    fn editor(&self, project_id: ProjectId) -> Result<EditorWorkspace> {
-        let workspace = self.workspace(project_id)?;
-        let mut editors = self.backend.editors()?;
-        let editor = editors
-            .entry(project_id)
-            .or_insert_with(|| EditorWorkspace::new(workspace))
-            .clone();
-        drop(editors);
-        editor.autosave_due(Timestamp::now())?;
-        Ok(editor)
-    }
-
-    fn language_services(&self, project_id: ProjectId) -> Result<LanguageServiceManager> {
-        self.workspace(project_id)?;
-        let mut services = self.backend.language_services()?;
-        Ok(services
-            .entry(project_id)
-            .or_insert_with(LanguageServiceManager::basic)
-            .clone())
-    }
-
     fn vcs(&self, project_id: ProjectId) -> Result<GitService> {
         if let Some(service) = self.backend.vcs()?.get(&project_id).cloned() {
             return Ok(service);
@@ -1089,14 +1336,17 @@ impl InProcessConnection {
         }
 
         let retryable = request.request.is_retryable_mutation();
-        let _mutation_guard = if retryable {
-            match self.backend.mutation_lock() {
-                Ok(guard) => Some(guard),
+        let slot = if retryable {
+            match self.backend.request_slot(request_id) {
+                Ok(slot) => Some(slot),
                 Err(error) => return ResponseEnvelope::failure(request_id, error),
             }
         } else {
             None
         };
+        let _request_guard = slot
+            .as_ref()
+            .map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner));
         let request_for_cache = request.request.clone();
         if retryable {
             match self.backend.cached_response(request_id, &request_for_cache) {
@@ -1131,10 +1381,16 @@ impl InProcessConnection {
             Err(error) => Err(error),
         };
 
-        match result {
+        let response = match result {
             Ok(response) => ResponseEnvelope::success(request_id, response),
             Err(error) => ResponseEnvelope::failure(request_id, error),
+        };
+        if retryable {
+            drop(_request_guard);
+            drop(slot);
+            self.backend.release_request_slot(request_id);
         }
+        response
     }
 
     fn negotiate(
@@ -1312,26 +1568,19 @@ impl InProcessConnection {
                     ..Default::default()
                 },
             }),
-            ClientRequest::GetAgentRun { run_id } => {
-                let runs = self.backend.runs()?;
-                let run = runs
-                    .get(&run_id)
-                    .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
-                Ok(ServerResponse::AgentRun(run.snapshot()))
-            }
+            ClientRequest::GetAgentRun { run_id } => Ok(ServerResponse::AgentRun(
+                self.run_handle(run_id)?.snapshot(),
+            )),
             ClientRequest::GetAgentRunSnapshot { run_id } => Ok(ServerResponse::AgentRunSnapshot(
                 self.run_snapshot_projection(run_id)?,
             )),
             ClientRequest::GetRunCheckpoint { run_id } => {
                 let (project_id, checkpoint_id) = {
-                    let runs = self.backend.runs()?;
-                    let runtime = runs
-                        .get(&run_id)
-                        .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
-                    let session = self.backend.sessions()?.get(runtime.session_id())?;
+                    let handle = self.run_handle(run_id)?;
+                    let session = self.backend.sessions()?.get(handle.session_id)?;
                     (
                         session.project_id,
-                        runtime.checkpoint_id().ok_or_else(|| {
+                        handle.state().options.checkpoint_id.ok_or_else(|| {
                             LoomError::new(
                                 ErrorCode::NotFound,
                                 format!("agent run {run_id} has no checkpoint"),
@@ -1347,26 +1596,29 @@ impl InProcessConnection {
             ClientRequest::ApproveAgentAction {
                 run_id,
                 tool_call_id,
-            } => self.control_run(run_id, |run| run.approve(tool_call_id)),
+            } => self.continue_run(run_id, |run| run.approve_entry(tool_call_id)),
             ClientRequest::RejectAgentAction {
                 run_id,
                 tool_call_id,
                 reason,
-            } => self.control_run(run_id, |run| run.reject(tool_call_id, reason)),
+            } => self.continue_run(run_id, |run| {
+                run.reject(tool_call_id, reason).map(|events| RunProgress {
+                    events,
+                    continues: false,
+                })
+            }),
             ClientRequest::SendAgentMessage { run_id, message } => {
-                self.control_run(run_id, |run| run.send_message(message))
+                self.continue_run(run_id, |run| run.message_entry(message))
             }
             ClientRequest::InterruptAgentRun { run_id } => {
-                self.control_run(run_id, AgentRuntime::interrupt)
+                self.stop_run(run_id, RunStop::Interrupt)
             }
             ClientRequest::RetryAgentStep { run_id } => {
-                self.control_run(run_id, AgentRuntime::retry)
+                self.continue_run(run_id, AgentRuntime::retry_entry)
             }
-            ClientRequest::PauseAgentRun { run_id } => {
-                self.control_run(run_id, AgentRuntime::pause)
-            }
+            ClientRequest::PauseAgentRun { run_id } => self.stop_run(run_id, RunStop::Pause),
             ClientRequest::ResumeAgentRun { run_id } => {
-                self.control_run(run_id, AgentRuntime::resume)
+                self.continue_run(run_id, AgentRuntime::resume_entry)
             }
             ClientRequest::RetryAgentFromCheckpoint {
                 run_id,
@@ -1416,17 +1668,16 @@ impl InProcessConnection {
                 self.backend.providers.check_health(&provider_id)?,
             )),
             ClientRequest::GetRunUsage { run_id } => {
-                let runs = self.backend.runs()?;
-                let runtime = runs
-                    .get(&run_id)
-                    .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
-                let usage = runtime.usage();
+                let state = self.run_handle(run_id)?.state();
                 let provider = self
                     .backend
                     .providers
                     .usage()?
-                    .summary(None, Some(&runtime.snapshot().model));
-                Ok(ServerResponse::RunUsage { usage, provider })
+                    .summary(None, Some(&state.run.model));
+                Ok(ServerResponse::RunUsage {
+                    usage: state.usage,
+                    provider,
+                })
             }
             ClientRequest::GetSessionUsage { session_id } => {
                 self.backend.sessions()?.get(session_id)?;
@@ -1434,9 +1685,9 @@ impl InProcessConnection {
                     .backend
                     .runs()?
                     .values()
-                    .filter(|runtime| runtime.session_id() == session_id)
-                    .fold(loom_core::UsageSnapshot::default(), |mut total, runtime| {
-                        let current = runtime.usage();
+                    .filter(|handle| handle.session_id == session_id)
+                    .fold(loom_core::UsageSnapshot::default(), |mut total, handle| {
+                        let current = handle.state().usage;
                         total.add_tokens(
                             current.input_tokens,
                             current.output_tokens,
@@ -1453,17 +1704,17 @@ impl InProcessConnection {
                 })
             }
             ClientRequest::InspectAgentContext { run_id } => {
-                let runs = self.backend.runs()?;
-                let runtime = runs
-                    .get(&run_id)
-                    .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
-                let inspection = runtime.context_inspection().ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::InvalidState,
-                        "agent run has not assembled context yet",
-                        false,
-                    )
-                })?;
+                let inspection = self
+                    .run_handle(run_id)?
+                    .state()
+                    .context_inspection
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::InvalidState,
+                            "agent run has not assembled context yet",
+                            false,
+                        )
+                    })?;
                 Ok(ServerResponse::ContextInspection(inspection))
             }
             ClientRequest::OpenWorkspace { project_id, root } => {
@@ -1623,175 +1874,8 @@ impl InProcessConnection {
             } => Ok(ServerResponse::TaskEvidence {
                 evidence: self.task_supervisor(project_id)?.get(task_id)?.evidence,
             }),
-            ClientRequest::OpenEditorBuffer { project_id, path } => Ok(
-                ServerResponse::EditorBuffer(self.editor(project_id)?.open_buffer(&path)?),
-            ),
-            ClientRequest::GetEditorBuffer {
-                project_id,
-                buffer_id,
-            } => Ok(ServerResponse::EditorBuffer(
-                self.editor(project_id)?.buffer(buffer_id)?,
-            )),
-            ClientRequest::EditEditorBuffer {
-                project_id,
-                buffer_id,
-                edit,
-            } => Ok(ServerResponse::EditorBuffer(
-                self.editor(project_id)?.edit_buffer(buffer_id, edit)?,
-            )),
-            ClientRequest::UndoEditorBuffer {
-                project_id,
-                buffer_id,
-            } => Ok(ServerResponse::EditorBuffer(
-                self.editor(project_id)?.undo(buffer_id)?,
-            )),
-            ClientRequest::RedoEditorBuffer {
-                project_id,
-                buffer_id,
-            } => Ok(ServerResponse::EditorBuffer(
-                self.editor(project_id)?.redo(buffer_id)?,
-            )),
-            ClientRequest::SaveEditorBuffer {
-                project_id,
-                buffer_id,
-            } => Ok(ServerResponse::EditorBuffer(
-                self.editor(project_id)?.save_buffer(buffer_id)?,
-            )),
-            ClientRequest::ReloadEditorBuffer {
-                project_id,
-                buffer_id,
-                discard_dirty,
-            } => Ok(ServerResponse::EditorBuffer(
-                self.editor(project_id)?
-                    .reload_buffer(buffer_id, discard_dirty)?,
-            )),
-            ClientRequest::MarkExternalEditorChanges { project_id } => {
-                let editor = self.editor(project_id)?;
-                editor.mark_external_changes()?;
-                Ok(ServerResponse::EditorBuffers {
-                    buffers: editor.buffers()?,
-                })
-            }
-            ClientRequest::SetAutosavePolicy { project_id, policy } => {
-                let editor = self.editor(project_id)?;
-                editor.set_autosave_policy(policy)?;
-                Ok(ServerResponse::AutosavePolicy(policy))
-            }
-            ClientRequest::GetEditorLayout { project_id } => Ok(ServerResponse::EditorLayout(
-                self.editor(project_id)?.layout()?,
-            )),
-            ClientRequest::SplitEditor {
-                project_id,
-                direction,
-            } => Ok(ServerResponse::EditorLayout(
-                self.editor(project_id)?.split(direction)?,
-            )),
-            ClientRequest::FocusEditorPane {
-                project_id,
-                pane_id,
-            } => Ok(ServerResponse::EditorLayout(
-                self.editor(project_id)?.focus_pane(pane_id)?,
-            )),
-            ClientRequest::FocusEditorTab {
-                project_id,
-                pane_id,
-                buffer_id,
-            } => Ok(ServerResponse::EditorLayout(
-                self.editor(project_id)?.focus_tab(pane_id, buffer_id)?,
-            )),
-            ClientRequest::CloseEditorBuffer {
-                project_id,
-                buffer_id,
-                force,
-            } => {
-                let editor = self.editor(project_id)?;
-                editor.close_buffer(buffer_id, force)?;
-                Ok(ServerResponse::EditorLayout(editor.layout()?))
-            }
-            ClientRequest::GetFileTree { project_id } => Ok(ServerResponse::FileTree {
-                entries: self.editor(project_id)?.file_tree()?,
-            }),
-            ClientRequest::FuzzyFindFiles {
-                project_id,
-                query,
-                limit,
-            } => Ok(ServerResponse::FuzzyFiles {
-                paths: self.editor(project_id)?.fuzzy_find_files(&query, limit)?,
-            }),
-            ClientRequest::SearchWorkspace { project_id, query } => {
-                Ok(ServerResponse::SearchMatches {
-                    matches: self.editor(project_id)?.search(query)?,
-                })
-            }
             ClientRequest::GetContextFiles { project_id } => Ok(ServerResponse::ContextFiles {
-                files: self.editor(project_id)?.context_files()?,
-            }),
-            ClientRequest::RecordAgentChange {
-                project_id,
-                buffer_id,
-                marker,
-            } => Ok(ServerResponse::EditorBuffer(
-                self.editor(project_id)?
-                    .record_agent_change(buffer_id, marker)?,
-            )),
-            ClientRequest::ClearAgentMarkers {
-                project_id,
-                buffer_id,
-            } => Ok(ServerResponse::EditorBuffer(
-                self.editor(project_id)?.clear_agent_markers(buffer_id)?,
-            )),
-            ClientRequest::DiscoverLanguageServices { project_id } => {
-                Ok(ServerResponse::LanguageServices {
-                    services: self.language_services(project_id)?.descriptors(),
-                })
-            }
-            ClientRequest::StartLanguageService { project_id, path } => {
-                let manager = self.language_services(project_id)?;
-                let descriptor = manager.start_for_path(&path)?;
-                Ok(ServerResponse::LanguageServices {
-                    services: vec![descriptor],
-                })
-            }
-            ClientRequest::StopLanguageService { project_id, path } => {
-                let manager = self.language_services(project_id)?;
-                let descriptor = manager.stop_for_path(&path)?;
-                Ok(ServerResponse::LanguageServices {
-                    services: vec![descriptor],
-                })
-            }
-            ClientRequest::GetDiagnostics { project_id, path } => Ok(ServerResponse::Diagnostics {
-                diagnostics: self
-                    .language_services(project_id)?
-                    .diagnostics(&self.workspace(project_id)?, &path)?,
-                path,
-            }),
-            ClientRequest::GetSymbols { project_id, path } => Ok(ServerResponse::Symbols {
-                symbols: self
-                    .language_services(project_id)?
-                    .symbols(&self.workspace(project_id)?, &path)?,
-                path,
-            }),
-            ClientRequest::GoToDefinition {
-                project_id,
-                path,
-                position,
-            } => Ok(ServerResponse::Locations {
-                locations: self
-                    .language_services(project_id)?
-                    .go_to_definition(&self.workspace(project_id)?, &path, position)?
-                    .into_iter()
-                    .collect(),
-            }),
-            ClientRequest::FindReferences {
-                project_id,
-                path,
-                position,
-            } => Ok(ServerResponse::Locations {
-                locations: self.language_services(project_id)?.references(
-                    &self.workspace(project_id)?,
-                    &path,
-                    position,
-                )?,
+                files: self.workspace(project_id)?.context_files()?,
             }),
             ClientRequest::GetVcsStatus { project_id } => {
                 Ok(ServerResponse::VcsStatus(self.vcs(project_id)?.status()?))
@@ -1805,18 +1889,6 @@ impl InProcessConnection {
                 diff.patch = bounded_review_text(&diff.patch, MAX_REVIEW_DIFF_BYTES);
                 Ok(ServerResponse::VcsDiff(diff))
             }
-            ClientRequest::StageVcsPaths { project_id, paths } => Ok(ServerResponse::VcsStatus(
-                self.vcs(project_id)?.stage(&paths)?,
-            )),
-            ClientRequest::UnstageVcsPaths { project_id, paths } => Ok(ServerResponse::VcsStatus(
-                self.vcs(project_id)?.unstage(&paths)?,
-            )),
-            ClientRequest::CreateVcsCommit {
-                project_id,
-                message,
-            } => Ok(ServerResponse::VcsCommit(
-                self.vcs(project_id)?.commit(&message)?,
-            )),
             ClientRequest::GetVcsBranches { project_id } => Ok(ServerResponse::VcsBranches {
                 branches: self.vcs(project_id)?.branches()?,
             }),
@@ -1824,12 +1896,11 @@ impl InProcessConnection {
                 paths: self.vcs(project_id)?.conflicts()?,
             }),
             ClientRequest::AttachRunEvidence { run_id, evidence } => {
-                let mut runs = self.backend.runs()?;
-                let runtime = runs
-                    .get_mut(&run_id)
-                    .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
+                let handle = self.run_handle(run_id)?;
+                let mut runtime = handle.runtime_for_entry()?;
                 runtime.add_evidence(evidence);
-                Ok(ServerResponse::AgentRun(runtime.snapshot()))
+                handle.refresh(&runtime);
+                Ok(ServerResponse::AgentRun(handle.snapshot()))
             }
         }
     }
@@ -1949,125 +2020,13 @@ impl InProcessConnection {
                 project_id: requested_project,
                 ..
             } => project_id = Some(*requested_project),
-            ClientRequest::OpenEditorBuffer {
+            ClientRequest::GetContextFiles {
                 project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetEditorBuffer {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::EditEditorBuffer {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::UndoEditorBuffer {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::RedoEditorBuffer {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::SaveEditorBuffer {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::ReloadEditorBuffer {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::MarkExternalEditorChanges {
-                project_id: requested_project,
-            }
-            | ClientRequest::SetAutosavePolicy {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetEditorLayout {
-                project_id: requested_project,
-            }
-            | ClientRequest::SplitEditor {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::FocusEditorPane {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::FocusEditorTab {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::CloseEditorBuffer {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetFileTree {
-                project_id: requested_project,
-            }
-            | ClientRequest::FuzzyFindFiles {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::SearchWorkspace {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetContextFiles {
-                project_id: requested_project,
-            }
-            | ClientRequest::RecordAgentChange {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::ClearAgentMarkers {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::DiscoverLanguageServices {
-                project_id: requested_project,
-            }
-            | ClientRequest::StartLanguageService {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::StopLanguageService {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetDiagnostics {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetSymbols {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GoToDefinition {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::FindReferences {
-                project_id: requested_project,
-                ..
             }
             | ClientRequest::GetVcsStatus {
                 project_id: requested_project,
             }
             | ClientRequest::GetVcsDiff {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::StageVcsPaths {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::UnstageVcsPaths {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::CreateVcsCommit {
                 project_id: requested_project,
                 ..
             }
@@ -2224,7 +2183,7 @@ impl InProcessConnection {
                 .runs()?
                 .get(&run_id)
                 .ok_or_else(|| LoomError::not_found("agent run", run_id))?
-                .session_id();
+                .session_id;
             if !auth.scope().allows_session(session_id) {
                 return Err(unauthorized_session(session_id));
             }
@@ -2260,6 +2219,10 @@ impl InProcessConnection {
     }
 
     fn start_run_with_options(&self, mut input: StartRunInput) -> Result<ServerResponse> {
+        let admission = self.backend.session_admission(input.session_id)?;
+        let _admission_guard = admission.try_lock().map_err(|_| {
+            LoomError::conflict("another agent run is already being started for this session")
+        })?;
         let session = self.backend.sessions()?.get(input.session_id)?;
         if session.state != AgentSessionState::Idle {
             return Err(LoomError::new(
@@ -2275,7 +2238,7 @@ impl InProcessConnection {
         input.options.output_cost_micros_per_1k = output_cost_micros_per_1k;
         let workspace = self.open_workspace(session.project_id, input.workspace_root)?;
         if input.repository_instructions.is_none() {
-            let instructions = self.editor(session.project_id)?.instruction_text()?;
+            let instructions = workspace.instruction_text()?;
             if !instructions.trim().is_empty() {
                 input.repository_instructions = Some(instructions);
             }
@@ -2287,7 +2250,7 @@ impl InProcessConnection {
         let mut agent_task = AgentTask::new(input.task, input.model)?;
         agent_task.system_instructions = input.system_instructions;
         agent_task.repository_instructions = input.repository_instructions;
-        let mut runtime = AgentRuntime::new_with_policy_and_options(
+        let runtime = AgentRuntime::new_with_policy_and_options(
             input.session_id,
             agent_task,
             provider,
@@ -2296,30 +2259,82 @@ impl InProcessConnection {
             input.options,
         );
         let run_id = runtime.run_id();
-        let events = runtime.start()?;
-        let snapshot = runtime.snapshot();
-        self.backend.runs()?.insert(run_id, runtime);
-        self.record_agent_events(input.session_id, events)?;
-        Ok(ServerResponse::AgentRunStarted(snapshot))
+        // The run is registered, and its events observable, before any model
+        // work starts, so a second client can control it immediately.
+        let handle = self.backend.register_runtime(runtime);
+        self.backend.runs()?.insert(run_id, Arc::clone(&handle));
+        let progress = {
+            let mut runtime = handle.try_runtime()?;
+            let progress = runtime.begin();
+            handle.refresh(&runtime);
+            progress?
+        };
+        if progress.continues {
+            self.backend.spawn_run_worker(Arc::clone(&handle));
+        }
+        Ok(ServerResponse::AgentRunStarted(handle.snapshot()))
     }
 
-    fn control_run(
+    /// Applies an operation that may leave the run with more work, then hands
+    /// the remaining work to the run worker instead of the request handler.
+    fn continue_run(
         &self,
         run_id: loom_core::RunId,
-        operation: impl FnOnce(&mut AgentRuntime) -> Result<Vec<AgentEvent>>,
+        operation: impl FnOnce(&mut AgentRuntime) -> Result<RunProgress>,
     ) -> Result<ServerResponse> {
-        let (session_id, snapshot, events) = {
-            let mut runs = self.backend.runs()?;
-            let runtime = runs
-                .get_mut(&run_id)
-                .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
-            let session_id = runtime.session_id();
-            let events = operation(runtime)?;
-            let snapshot = runtime.snapshot();
-            (session_id, snapshot, events)
+        let handle = self.run_handle(run_id)?;
+        let progress = {
+            let mut runtime = handle.runtime_for_entry()?;
+            let progress = operation(&mut runtime);
+            handle.refresh(&runtime);
+            progress?
         };
-        self.record_agent_events(session_id, events)?;
-        Ok(ServerResponse::AgentRun(snapshot))
+        if progress.continues {
+            self.backend.spawn_run_worker(Arc::clone(&handle));
+        }
+        Ok(ServerResponse::AgentRun(handle.snapshot()))
+    }
+
+    /// Pauses or interrupts a run. The request only raises the control flag, so
+    /// it is never queued behind the model call it is stopping.
+    fn stop_run(&self, run_id: loom_core::RunId, stop: RunStop) -> Result<ServerResponse> {
+        let handle = self.run_handle(run_id)?;
+        if handle.is_running() {
+            match stop {
+                RunStop::Interrupt => handle.control.request_interrupt(),
+                RunStop::Pause => handle.control.request_pause(),
+            }
+            handle.wait_until_idle()?;
+            if let Some(error) = handle.take_failure() {
+                return Err(error);
+            }
+            if handle.control.is_stopping() {
+                let state = handle.state().run.state;
+                if !matches!(
+                    state,
+                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                ) {
+                    let mut runtime = handle.try_runtime()?;
+                    let result = match stop {
+                        RunStop::Interrupt => runtime.interrupt(),
+                        RunStop::Pause => runtime.pause(),
+                    };
+                    handle.refresh(&runtime);
+                    result?;
+                    self.backend.persist_state()?;
+                }
+                handle.control.clear_request();
+            }
+            return Ok(ServerResponse::AgentRun(handle.snapshot()));
+        }
+        let mut runtime = handle.runtime_for_entry()?;
+        let result = match stop {
+            RunStop::Interrupt => runtime.interrupt(),
+            RunStop::Pause => runtime.pause(),
+        };
+        handle.refresh(&runtime);
+        result?;
+        Ok(ServerResponse::AgentRun(handle.snapshot()))
     }
 
     fn retry_from_checkpoint(
@@ -2327,66 +2342,16 @@ impl InProcessConnection {
         run_id: loom_core::RunId,
         checkpoint_id: loom_core::CheckpointId,
     ) -> Result<ServerResponse> {
-        let (session_id, project_id, persisted_checkpoint) = {
-            let runs = self.backend.runs()?;
-            let runtime = runs
-                .get(&run_id)
-                .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
-            (
-                runtime.session_id(),
-                self.backend
-                    .sessions()?
-                    .get(runtime.session_id())?
-                    .project_id,
-                runtime.export_state().options.checkpoint_id,
-            )
-        };
-        if persisted_checkpoint != Some(checkpoint_id) {
+        let handle = self.run_handle(run_id)?;
+        let project_id = self.backend.sessions()?.get(handle.session_id)?.project_id;
+        if handle.state().options.checkpoint_id != Some(checkpoint_id) {
             return Err(LoomError::conflict(format!(
                 "checkpoint {checkpoint_id} is not the checkpoint associated with run {run_id}"
             )));
         }
         self.workspace(project_id)?
             .revert_checkpoint(checkpoint_id)?;
-        let (snapshot, events) = {
-            let mut runs = self.backend.runs()?;
-            let runtime = runs
-                .get_mut(&run_id)
-                .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
-            let events = runtime.retry_from_checkpoint()?;
-            (runtime.snapshot(), events)
-        };
-        self.record_agent_events(session_id, events)?;
-        Ok(ServerResponse::AgentRun(snapshot))
-    }
-
-    fn record_agent_events(
-        &self,
-        session_id: AgentSessionId,
-        events: Vec<AgentEvent>,
-    ) -> Result<()> {
-        for event in events {
-            let state = session_state_for_event(&event);
-            self.backend.journal()?.append_agent(session_id, event);
-            if let Some(state) = state {
-                self.sync_session_state(session_id, state)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn sync_session_state(
-        &self,
-        session_id: AgentSessionId,
-        state: AgentSessionState,
-    ) -> Result<()> {
-        let current = self.backend.sessions()?.get(session_id)?.state;
-        if current == state {
-            return Ok(());
-        }
-        let (_, record) = self.backend.sessions()?.transition(session_id, state)?;
-        self.backend.journal()?.append_session(record);
-        Ok(())
+        self.continue_run(run_id, AgentRuntime::checkpoint_retry_entry)
     }
 
     fn negotiated_capabilities(&self) -> Result<MutexGuard<'_, Option<CapabilitySet>>> {
@@ -2436,22 +2401,22 @@ fn bounded_review_text(value: &str, limit: usize) -> String {
     result
 }
 
-fn run_snapshot_projection(runtime: &AgentRuntime) -> AgentRunSnapshotProjection {
-    let mut messages = runtime.messages();
+fn run_snapshot_projection(state: &AgentRuntimeState) -> AgentRunSnapshotProjection {
+    let mut messages = state.messages.clone();
     for message in &mut messages {
         message.content = bounded_review_text(&message.content, MAX_RUN_MESSAGE_BYTES);
     }
-    let mut run = runtime.snapshot();
+    let mut run = state.run.clone();
     if let Some(summary) = &mut run.summary {
         *summary = bounded_review_text(summary, MAX_RUN_MESSAGE_BYTES);
     }
     AgentRunSnapshotProjection {
         run,
-        plan: runtime.plan().steps,
+        plan: state.plan.steps.clone(),
         messages,
-        pending_approval: runtime.pending_approval(),
-        pending_input: runtime.pending_input(),
-        usage: runtime.usage(),
+        pending_approval: state.pending_approval.clone(),
+        pending_input: state.pending_input.clone(),
+        usage: state.usage.clone(),
     }
 }
 
@@ -2496,9 +2461,7 @@ mod tests {
     use loom_core::{CapabilitySet, PolicyDecision, ProjectId, ToolCallId};
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
     use loom_protocol::{ClientRequest, RequestEnvelope, ServerEvent, ServerResponse};
-    use loom_workspace::{
-        AutosavePolicy, BufferEdit, SearchQuery, TextRange, WorkspaceControl, WorkspaceEdit,
-    };
+    use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
     use super::*;
 
@@ -2591,24 +2554,38 @@ mod tests {
                 Capability::OpenWorkspace,
                 Capability::ReadWorkspace,
                 Capability::WriteWorkspace,
-                Capability::WorkspaceNavigation,
-                Capability::SearchWorkspace,
                 Capability::ReadWorkspaceInstructions,
-                Capability::ReadDiagnostics,
-                Capability::ReadSymbols,
-                Capability::GoToDefinition,
-                Capability::FindReferences,
-                Capability::LanguageServiceLifecycle,
                 Capability::ReadVcsStatus,
                 Capability::ReadVcsDiff,
-                Capability::MutateVcsIndex,
-                Capability::CreateVcsCommit,
                 Capability::ReadTask,
                 Capability::StartTask,
                 Capability::ReadTaskEvidence,
             ]),
         }));
         assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
+    }
+
+    /// Waits until a run stops needing the model, because a run is now driven by
+    /// its own worker rather than by the request that started it.
+    fn await_settled_run(
+        connection: &InProcessConnection,
+        run_id: loom_core::RunId,
+    ) -> loom_agent::AgentRunSnapshot {
+        for _ in 0..1_000 {
+            let response =
+                connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+            let Ok(ServerResponse::AgentRun(snapshot)) = response.result else {
+                panic!("unexpected run response");
+            };
+            if !matches!(
+                snapshot.state,
+                AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+            ) {
+                return snapshot;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("agent run did not settle");
     }
 
     fn workspace() -> PathBuf {
@@ -3100,6 +3077,7 @@ mod tests {
             ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
+        await_settled_run(&connection, run_id);
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: None,
@@ -3158,6 +3136,8 @@ mod tests {
                 ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
                 response => panic!("unexpected response: {response:?}"),
             };
+            await_settled_run(&connection, run_id);
+            backend.flush().unwrap();
             let events = match connection
                 .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
@@ -3270,10 +3250,11 @@ mod tests {
                 checkpoint_id: checkpoint.id,
             },
         ));
-        let ServerResponse::AgentRun(snapshot) = retried.result.unwrap() else {
-            panic!("unexpected retry response");
-        };
-        assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
+        assert!(matches!(retried.result, Ok(ServerResponse::AgentRun(_))));
+        assert_eq!(
+            await_settled_run(&reopened_connection, run_id).state,
+            AgentRunState::AwaitingApproval
+        );
         fs::remove_file(persistence).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
@@ -3305,6 +3286,7 @@ mod tests {
             ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
+        await_settled_run(&connection, run_id);
         let paused = connection.request(RequestEnvelope::new(ClientRequest::PauseAgentRun {
             run_id,
         }));
@@ -3382,12 +3364,13 @@ mod tests {
             },
         ));
         let run_id = match started.result.unwrap() {
-            ServerResponse::AgentRunStarted(snapshot) => {
-                assert_eq!(snapshot.state, AgentRunState::Failed);
-                snapshot.id
-            }
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
+        assert_eq!(
+            await_settled_run(&connection, run_id).state,
+            AgentRunState::Failed
+        );
         let events = match connection
             .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session_id),
@@ -3436,7 +3419,7 @@ mod tests {
     }
 
     #[test]
-    fn m5_workspace_navigation_language_vcs_and_task_evidence_are_authoritative() {
+    fn m5_workspace_context_vcs_and_task_evidence_are_authoritative() {
         let root = workspace();
         fs::write(root.join("README.md"), "fn answer() {\n TODO\n}\n").unwrap();
         let git = |arguments: &[&str]| {
@@ -3468,60 +3451,12 @@ mod tests {
             Ok(ServerResponse::WorkspaceOpened(_))
         ));
 
-        let buffer = connection.request(RequestEnvelope::new(ClientRequest::OpenEditorBuffer {
+        let context = connection.request(RequestEnvelope::new(ClientRequest::GetContextFiles {
             project_id,
-            path: "README.md".to_owned(),
-        }));
-        let buffer_id = match buffer.result.unwrap() {
-            ServerResponse::EditorBuffer(buffer) => buffer.id,
-            response => panic!("unexpected buffer response: {response:?}"),
-        };
-        let edited = connection.request(RequestEnvelope::new(ClientRequest::EditEditorBuffer {
-            project_id,
-            buffer_id,
-            edit: BufferEdit {
-                range: TextRange::new(0, 2),
-                replacement: "pub".to_owned(),
-            },
-        }));
-        assert!(matches!(edited.result, Ok(ServerResponse::EditorBuffer(_))));
-        let policy = connection.request(RequestEnvelope::new(ClientRequest::SetAutosavePolicy {
-            project_id,
-            policy: AutosavePolicy::AfterIdle { delay_ms: 1 },
         }));
         assert!(matches!(
-            policy.result,
-            Ok(ServerResponse::AutosavePolicy(_))
-        ));
-        let tree = connection.request(RequestEnvelope::new(ClientRequest::GetFileTree {
-            project_id,
-        }));
-        assert!(matches!(tree.result, Ok(ServerResponse::FileTree { .. })));
-        let search = connection.request(RequestEnvelope::new(ClientRequest::SearchWorkspace {
-            project_id,
-            query: SearchQuery::literal("TODO"),
-        }));
-        assert!(matches!(
-            search.result,
-            Ok(ServerResponse::SearchMatches { .. })
-        ));
-
-        let language =
-            connection.request(RequestEnvelope::new(ClientRequest::StartLanguageService {
-                project_id,
-                path: "README.md".to_owned(),
-            }));
-        assert!(matches!(
-            language.result,
-            Ok(ServerResponse::LanguageServices { .. })
-        ));
-        let diagnostics = connection.request(RequestEnvelope::new(ClientRequest::GetDiagnostics {
-            project_id,
-            path: "README.md".to_owned(),
-        }));
-        assert!(matches!(
-            diagnostics.result,
-            Ok(ServerResponse::Diagnostics { .. })
+            context.result,
+            Ok(ServerResponse::ContextFiles { .. })
         ));
         let vcs = connection.request(RequestEnvelope::new(ClientRequest::GetVcsStatus {
             project_id,
@@ -3578,6 +3513,181 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("task evidence fixture did not finish");
+    }
+
+    /// Serves an event stream that keeps a completion open until the client
+    /// gives up, so a run can be controlled while the model is still working.
+    fn slow_model_endpoint() -> (String, std::sync::mpsc::Receiver<()>) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            let _ = stream
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"thinking\"}}]}\n\n");
+            let _ = stream.flush();
+            let _ = sender.send(());
+            // Keep the completion open; the run must be stoppable anyway.
+            for _ in 0..600 {
+                if stream
+                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\".\"}}]}\n\n")
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = stream.flush();
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        (format!("http://{address}/v1/chat/completions"), receiver)
+    }
+
+    #[test]
+    fn a_running_model_call_can_be_interrupted_without_blocking_the_request() {
+        let root = workspace();
+        let (endpoint, started) = slow_model_endpoint();
+        let backend =
+            InProcessBackend::with_openai_compatible(endpoint, "key", ModelId::new("slow/model"));
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let project_id = ProjectId::new();
+        let session = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
+            project_id,
+            name: "interruptible run".to_owned(),
+        }));
+        let session_id = match session.result.unwrap() {
+            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        let started_run = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
+            session_id,
+            task: "stream for a long time".to_owned(),
+            model: ModelId::new("slow/model"),
+            workspace_root: root.display().to_string(),
+            system_instructions: None,
+            repository_instructions: None,
+        }));
+        let run_id = match started_run.result.unwrap() {
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("model stream started");
+
+        // A second connection controls the run while the first one's model call
+        // is still open.
+        let observer = backend.connect();
+        negotiate_m3(&observer);
+        // The delta is journaled while the completion is still open, so a second
+        // client sees it before the run ends.
+        let mut streamed = false;
+        for _ in 0..1_000 {
+            let events = observer.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                after_sequence: None,
+            }));
+            let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+                panic!("unexpected events response");
+            };
+            if events.iter().any(|event| {
+                matches!(
+                    &event.event,
+                    ServerEvent::Agent {
+                        event: AgentEvent::AssistantMessageDelta { text, .. }
+                    } if text == "thinking"
+                )
+            }) {
+                streamed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            streamed,
+            "an assistant delta was not journaled mid-completion"
+        );
+
+        let before = Instant::now();
+        let interrupted =
+            observer.request(RequestEnvelope::new(ClientRequest::InterruptAgentRun {
+                run_id,
+            }));
+        let elapsed = before.elapsed();
+        let ServerResponse::AgentRun(snapshot) = interrupted.result.unwrap() else {
+            panic!("unexpected interrupt response");
+        };
+        assert_eq!(snapshot.state, AgentRunState::Cancelled);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "interrupt waited {elapsed:?} for the model call"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_running_model_call_can_be_paused_and_resumed() {
+        let root = workspace();
+        let (endpoint, started) = slow_model_endpoint();
+        let backend =
+            InProcessBackend::with_openai_compatible(endpoint, "key", ModelId::new("slow/model"));
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let project_id = ProjectId::new();
+        let session = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
+            project_id,
+            name: "pausable run".to_owned(),
+        }));
+        let session_id = match session.result.unwrap() {
+            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        let started_run = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
+            session_id,
+            task: "stream for a long time".to_owned(),
+            model: ModelId::new("slow/model"),
+            workspace_root: root.display().to_string(),
+            system_instructions: None,
+            repository_instructions: None,
+        }));
+        let run_id = match started_run.result.unwrap() {
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("model stream started");
+        let before = Instant::now();
+        let paused = connection.request(RequestEnvelope::new(ClientRequest::PauseAgentRun {
+            run_id,
+        }));
+        let elapsed = before.elapsed();
+        let ServerResponse::AgentRun(snapshot) = paused.result.unwrap() else {
+            panic!("unexpected pause response");
+        };
+        assert_eq!(snapshot.state, AgentRunState::Paused);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "pause waited {elapsed:?} for the model call"
+        );
+        let current =
+            connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+        let ServerResponse::AgentRun(snapshot) = current.result.unwrap() else {
+            panic!("unexpected run response");
+        };
+        assert_eq!(snapshot.state, AgentRunState::Paused);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
