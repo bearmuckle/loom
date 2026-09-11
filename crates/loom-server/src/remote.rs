@@ -228,12 +228,11 @@ async fn websocket_handler(
     Query(query): Query<HashMap<String, String>>,
     State(state): State<RemoteState>,
 ) -> Response {
-    let auth = match request_token(&headers, &query)
-        .and_then(|token| state.auth.authenticate(token))
-    {
-        Ok(auth) => auth,
-        Err(error) => return auth_error_response(error),
-    };
+    let auth =
+        match request_token(&headers, &query).and_then(|token| state.auth.authenticate(token)) {
+            Ok(auth) => auth,
+            Err(error) => return auth_error_response(error),
+        };
     upgrade
         .on_upgrade(move |socket| handle_socket(socket, state, auth))
         .into_response()

@@ -331,9 +331,12 @@ pub(crate) fn select_remote_project(
 ) -> Result<ProjectSnapshot, LoomError> {
     let project = requested_root
         .and_then(|root| {
-            projects
-                .iter()
-                .find(|project| project.root.as_deref().is_some_and(|project_root| project_root == root))
+            projects.iter().find(|project| {
+                project
+                    .root
+                    .as_deref()
+                    .is_some_and(|project_root| project_root == root)
+            })
         })
         .or_else(|| projects.first())
         .cloned()

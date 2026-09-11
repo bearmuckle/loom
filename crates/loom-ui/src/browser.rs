@@ -13,7 +13,9 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use futures_channel::oneshot;
 use loom_core::{ErrorCode, LoomError, RequestId};
 use loom_model::ModelId;
-use loom_protocol::{RequestEnvelope, ResponseEnvelope, decode_event, decode_response, encode_request};
+use loom_protocol::{
+    RequestEnvelope, ResponseEnvelope, decode_event, decode_response, encode_request,
+};
 use wasm_bindgen::{JsCast, prelude::*};
 use web_sys::{CloseEvent, MessageEvent, UrlSearchParams, WebSocket};
 
@@ -32,9 +34,8 @@ impl BrowserOptions {
         let window = web_sys::window()
             .ok_or_else(|| LoomError::invalid_request("no browser window is available"))?;
         let search = window.location().search().unwrap_or_default();
-        let params = UrlSearchParams::new_with_str(&search).map_err(|_| {
-            LoomError::invalid_request("could not parse the page's query string")
-        })?;
+        let params = UrlSearchParams::new_with_str(&search)
+            .map_err(|_| LoomError::invalid_request("could not parse the page's query string"))?;
         let remote = params.get("remote").ok_or_else(|| {
             LoomError::invalid_request(
                 "the page URL must include ?remote=ws://host:port/ws for the browser client to connect",
@@ -116,7 +117,10 @@ impl BrowserConnection {
         let socket = WebSocket::new(&websocket_url(remote, token)).map_err(|error| {
             LoomError::new(
                 ErrorCode::Internal,
-                format!("could not open a WebSocket to '{remote}': {}", describe_js(&error)),
+                format!(
+                    "could not open a WebSocket to '{remote}': {}",
+                    describe_js(&error)
+                ),
                 false,
             )
         })?;
@@ -145,7 +149,10 @@ impl BrowserConnection {
                 return;
             };
             if let Ok(response) = decode_response(text.as_bytes()) {
-                if let Some(sender) = message_state.borrow_mut().pending.remove(&response.request_id)
+                if let Some(sender) = message_state
+                    .borrow_mut()
+                    .pending
+                    .remove(&response.request_id)
                 {
                     let _ = sender.send(response);
                 }

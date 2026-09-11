@@ -19,16 +19,18 @@ mod view;
 
 #[cfg(target_family = "wasm")]
 use crate::{browser::BrowserOptions, view::LoomView};
+use gpui::{App, KeyBinding, prelude::*};
 #[cfg(not(target_family = "wasm"))]
 use gpui::{
     Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
     WindowOptions, point, px, size,
 };
-use gpui::{App, KeyBinding, prelude::*};
 
+use crate::text_input::{
+    Backspace, Copy, Delete, End, Home, Left, Paste, Right, SelectAll, Submit,
+};
 #[cfg(not(target_family = "wasm"))]
 use crate::{platform::UiOptions, state::ThemeChoice, view::LoomView};
-use crate::text_input::{Backspace, Copy, Delete, End, Home, Left, Paste, Right, SelectAll, Submit};
 
 pub(crate) const MAX_TIMELINE_OUTPUT: usize = 32 * 1024;
 pub(crate) const MAX_REVIEW_CHANGES: usize = 80;
@@ -147,13 +149,12 @@ async fn start_browser_client(cx: &mut gpui::AsyncApp) {
     };
     let (composer_focus_handle, rename_focus_handle) =
         cx.update(|cx| (cx.focus_handle(), cx.focus_handle()));
-    let view =
-        match LoomView::try_new_browser(&options, composer_focus_handle, rename_focus_handle)
-            .await
-        {
-            Ok(view) => view,
-            Err(error) => return log_error("could not connect to the backend", error),
-        };
+    let view = match LoomView::try_new_browser(&options, composer_focus_handle, rename_focus_handle)
+        .await
+    {
+        Ok(view) => view,
+        Err(error) => return log_error("could not connect to the backend", error),
+    };
     let active_session = view.active_session.clone();
     let window = match cx.open_window(Default::default(), |_, cx| cx.new(|_| view)) {
         Ok(window) => window,
@@ -175,23 +176,22 @@ async fn start_browser_client(cx: &mut gpui::AsyncApp) {
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn start() {
     gpui_platform::web_init();
-    let application = gpui_platform::application_with_web_backend(
-        gpui_platform::WebBackendPreference::WebGl,
-    )
-    .with_assets(gpui_kit_assets::Assets::default())
-    .run_embedded(|cx: &mut App| {
-        // The web platform starts with an empty font database; without this the
-        // text system panics as soon as it tries to shape any text.
-        cx.text_system()
-            .add_fonts(vec![std::borrow::Cow::Borrowed(
-                include_bytes!("../assets/fonts/DejaVuSans.ttf").as_slice(),
-            )])
-            .expect("failed to load embedded font");
-        gpui_component::init(cx);
-        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-        bind_composer_keys(cx);
-        cx.spawn(async move |cx| start_browser_client(cx).await)
-            .detach();
-    });
+    let application =
+        gpui_platform::application_with_web_backend(gpui_platform::WebBackendPreference::WebGl)
+            .with_assets(gpui_kit_assets::Assets::default())
+            .run_embedded(|cx: &mut App| {
+                // The web platform starts with an empty font database; without this the
+                // text system panics as soon as it tries to shape any text.
+                cx.text_system()
+                    .add_fonts(vec![std::borrow::Cow::Borrowed(
+                        include_bytes!("../assets/fonts/DejaVuSans.ttf").as_slice(),
+                    )])
+                    .expect("failed to load embedded font");
+                gpui_component::init(cx);
+                gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+                bind_composer_keys(cx);
+                cx.spawn(async move |cx| start_browser_client(cx).await)
+                    .detach();
+            });
     APPLICATION.with(|slot| *slot.borrow_mut() = Some(application));
 }

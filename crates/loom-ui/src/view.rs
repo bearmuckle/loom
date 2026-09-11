@@ -56,14 +56,6 @@ use crate::{
         state_color,
     },
 };
-#[cfg(not(target_family = "wasm"))]
-use crate::{
-    connection::{
-        create_session, list_models, list_projects, list_provider_ids, list_sessions, negotiate,
-        open_workspace, start_run,
-    },
-    platform::{UiOptions, backend_persistence_path, prepare_workspace, stable_project_id},
-};
 #[cfg(target_family = "wasm")]
 use crate::{
     browser::BrowserOptions,
@@ -71,6 +63,14 @@ use crate::{
         create_session_async, list_models_async, list_projects_async, list_sessions_async,
         negotiate_async, open_workspace_async,
     },
+};
+#[cfg(not(target_family = "wasm"))]
+use crate::{
+    connection::{
+        create_session, list_models, list_projects, list_provider_ids, list_sessions, negotiate,
+        open_workspace, start_run,
+    },
+    platform::{UiOptions, backend_persistence_path, prepare_workspace, stable_project_id},
 };
 
 /// Opens a URL in a new tab/window. Natively this shells out to the OS's
@@ -86,7 +86,9 @@ fn open_external_url(url: &str) -> Result<(), std::io::Error> {
     if opened.is_some() {
         Ok(())
     } else {
-        Err(std::io::Error::other("the browser blocked opening a new tab"))
+        Err(std::io::Error::other(
+            "the browser blocked opening a new tab",
+        ))
     }
 }
 
@@ -450,13 +452,14 @@ impl LoomView {
         let (project, project_id, workspace_root) =
             match select_remote_project(&projects, options.workspace()) {
                 Ok(project) => {
-                    let workspace_root = project.root.clone().map(PathBuf::from).ok_or_else(|| {
-                        LoomError::new(
-                            ErrorCode::WorkspaceAccessDenied,
-                            "selected remote project has no configured workspace root",
-                            false,
-                        )
-                    })?;
+                    let workspace_root =
+                        project.root.clone().map(PathBuf::from).ok_or_else(|| {
+                            LoomError::new(
+                                ErrorCode::WorkspaceAccessDenied,
+                                "selected remote project has no configured workspace root",
+                                false,
+                            )
+                        })?;
                     let project_id = project.id;
                     (Some(project), project_id, workspace_root)
                 }
@@ -537,7 +540,9 @@ impl LoomView {
     ) {
         let pending = self.backend.submit(RequestEnvelope::new(request));
         cx.spawn(async move |view, cx| {
-            let response = cx.background_spawn(async move { pending.wait().await }).await;
+            let response = cx
+                .background_spawn(async move { pending.wait().await })
+                .await;
             view.update(cx, |view, cx| {
                 apply(view, response, cx);
                 cx.notify();
