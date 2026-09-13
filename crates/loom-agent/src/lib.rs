@@ -1397,6 +1397,13 @@ impl AgentRuntime {
                     });
                     ctx.events
                         .push(self.complete_tool_activity(&result, AgentActivityStatus::Completed));
+                    self.messages.push(ModelMessage {
+                        role: MessageRole::Tool,
+                        content: result.output.clone(),
+                        name: Some(result.name.clone()),
+                        tool_call_id: Some(result.tool_call_id),
+                        tool_calls: Vec::new(),
+                    });
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
                     ctx.events.push(AgentEvent::StepCompleted {
@@ -2312,6 +2319,14 @@ mod tests {
             AgentEvent::RunCompleted { snapshot }
                 if snapshot.state == AgentRunState::Completed
         )));
+        assert!(
+            runtime
+                .export_state()
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool
+                    && message.content == "plan proposed")
+        );
         assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
         fs::remove_dir_all(root).unwrap();
     }
