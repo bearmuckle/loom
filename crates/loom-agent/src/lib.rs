@@ -1446,6 +1446,13 @@ impl AgentRuntime {
                         return Ok(StreamFlow::Stop);
                     };
                     self.pending_input = Some(prompt.to_owned());
+                    self.messages.push(ModelMessage {
+                        role: MessageRole::Tool,
+                        content: format!("Waiting for user input: {prompt}"),
+                        name: Some(call.name.clone()),
+                        tool_call_id: Some(call.id),
+                        tool_calls: Vec::new(),
+                    });
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
                     ctx.events.push(AgentEvent::StepCompleted {
@@ -2136,6 +2143,57 @@ mod tests {
         }
     }
 
+    struct AskThenCompleteProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+    }
+
+    impl ModelProvider for AskThenCompleteProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                vec![ModelStreamEvent::ToolCallDelta {
+                    call: ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: "ask_user".to_owned(),
+                        arguments: serde_json::json!({
+                            "prompt": "Which archive behavior should I preserve?"
+                        }),
+                    },
+                }]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "The archive behavior is fixed.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
     fn blocking_runtime(entered: Arc<AtomicBool>, released: Arc<AtomicBool>) -> AgentRuntime {
         let root = workspace();
         let tools = ToolExecutor::new(&root).unwrap();
@@ -2328,6 +2386,53 @@ mod tests {
                     && message.content == "plan proposed")
         );
         assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ask_user_records_tool_output_before_follow_up_message() {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task =
+            AgentTask::new("fix archive behavior", ModelId::new("deterministic/ask")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(AskThenCompleteProvider {
+                descriptor: loom_providers::deterministic_descriptor(),
+                cursor: 0,
+            }),
+            tools,
+        );
+
+        runtime.start().unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::NeedsInput);
+        let state = runtime.export_state();
+        let call_id = state
+            .messages
+            .iter()
+            .find_map(|message| {
+                message
+                    .tool_calls
+                    .iter()
+                    .find(|call| call.name == "ask_user")
+                    .map(|call| call.id)
+            })
+            .unwrap();
+        assert!(state.messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.tool_call_id == Some(call_id)
+                && message.content.starts_with("Waiting for user input:")
+        }));
+
+        let events = runtime
+            .send_message("Preserve the current archive semantics.")
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::RunCompleted { snapshot }
+                if snapshot.state == AgentRunState::Completed
+        )));
         fs::remove_dir_all(root).unwrap();
     }
 
