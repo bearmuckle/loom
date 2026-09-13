@@ -523,7 +523,7 @@ impl AgentRuntime {
     }
 
     pub fn from_state(
-        state: AgentRuntimeState,
+        mut state: AgentRuntimeState,
         provider: Box<dyn ModelProvider>,
         tools: ToolExecutor,
     ) -> Result<Self> {
@@ -540,11 +540,7 @@ impl AgentRuntime {
                 AgentRunState::AwaitingApproval | AgentRunState::Paused
             )
         {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted approval is attached to a run that is neither awaiting approval nor paused",
-                false,
-            ));
+            state.pending_approval = None;
         }
         if state.pending_input.is_some()
             && !matches!(
@@ -552,11 +548,7 @@ impl AgentRuntime {
                 AgentRunState::NeedsInput | AgentRunState::Paused
             )
         {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted input is attached to a run that is neither waiting for input nor paused",
-                false,
-            ));
+            state.pending_input = None;
         }
         if provider.descriptor().id != state.task.model {
             return Err(LoomError::new(
@@ -1848,6 +1840,13 @@ impl AgentRuntime {
     }
 
     fn set_state(&mut self, state: AgentRunState) -> Vec<AgentEvent> {
+        if matches!(
+            state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        ) {
+            self.pending_approval = None;
+            self.pending_input = None;
+        }
         if self.run.state == state {
             return Vec::new();
         }
@@ -2723,6 +2722,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.messages(), runtime.messages());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_discards_waiting_state_from_finished_runs() {
+        let root = workspace();
+        let task = AgentTask::new(
+            "recover stale waiting state",
+            ModelId::new("deterministic/demo"),
+        )
+        .unwrap();
+        let runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        let mut state = runtime.export_state();
+        state.run.state = AgentRunState::Completed;
+        state.pending_approval = Some(ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "README.md"}),
+        });
+        state.pending_input = Some("stale input".to_owned());
+
+        let restored = AgentRuntime::from_state(
+            state,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap();
+
+        assert!(restored.pending_approval().is_none());
+        assert!(restored.export_state().pending_input.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
