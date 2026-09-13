@@ -1,15 +1,16 @@
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet,
-    EventSequence, ProjectId, ProtocolVersion, RunId, SessionLimits, Timestamp,
+    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet,
+    EventSequence, ProjectId, ProtocolVersion, RunId, SessionLimits, StepId, Timestamp,
 };
-use loom_model::ModelId;
+use loom_model::{ModelId, ToolCall};
 use loom_protocol::{
-    AgentEvent, AgentPlanStep, AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION,
-    ClientFrame, ClientRequest, ContextAssemblyOptions, RequestEnvelope, ResponseEnvelope,
-    ServerEvent, ServerEventEnvelope, ServerFrame, ServerResponse, TaskKind, TaskSpec,
-    WorkspaceEdit, WorkspaceSnapshot, decode_client_frame, decode_event, decode_request,
-    decode_response, decode_server_frame, encode_client_frame, encode_event, encode_request,
-    encode_response, encode_server_frame,
+    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
+    AgentPlanStep, AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientFrame,
+    ClientRequest, ContextAssemblyOptions, FileActivityOperation, RequestEnvelope,
+    ResponseEnvelope, ServerEvent, ServerEventEnvelope, ServerFrame, ServerResponse, TaskKind,
+    TaskSpec, ToolResult, WorkspaceEdit, WorkspaceSnapshot, decode_client_frame, decode_event,
+    decode_request, decode_response, decode_server_frame, encode_client_frame, encode_event,
+    encode_request, encode_response, encode_server_frame,
 };
 
 #[test]
@@ -108,6 +109,49 @@ fn agent_event_json_round_trip_preserves_run_identity() {
 
     assert_eq!(decoded, event);
     assert_eq!(run.state, AgentRunState::Executing);
+}
+
+#[test]
+fn activity_event_round_trip_preserves_typed_work_and_relationships() {
+    let session_id = AgentSessionId::new();
+    let run_id = RunId::new();
+    let step_id = StepId::new();
+    let call = ToolCall {
+        id: loom_core::ToolCallId::new(),
+        name: "read_file".to_owned(),
+        arguments: serde_json::json!({ "path": "src/lib.rs" }),
+    };
+    let activity = AgentActivityRecord {
+        id: ActivityId::new(),
+        run_id,
+        parent_id: Some(ActivityId::new()),
+        step_id: Some(step_id),
+        kind: AgentActivityKind::File,
+        status: AgentActivityStatus::Completed,
+        started_at: Timestamp::from_unix_millis(10),
+        completed_at: Some(Timestamp::from_unix_millis(12)),
+        elapsed_ms: Some(2),
+        data: AgentActivityData::File {
+            tool_call_id: call.id,
+            operation: FileActivityOperation::Read,
+            path: Some("src/lib.rs".to_owned()),
+            result: Some(ToolResult::success(&call, "contents".to_owned())),
+        },
+    };
+    let event = ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(9),
+        session_id,
+        event: ServerEvent::Agent {
+            event: AgentEvent::ActivityRecorded {
+                run_id,
+                activity: activity.clone(),
+            },
+        },
+    };
+
+    assert_eq!(decode_event(&encode_event(&event).unwrap()).unwrap(), event);
+    assert!(activity.parent_id.is_some());
 }
 
 #[test]
@@ -294,6 +338,7 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
             pending_approval: None,
             pending_input: None,
             usage: Default::default(),
+            activities: Vec::new(),
         }),
     );
     assert_eq!(

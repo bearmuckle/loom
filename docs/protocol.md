@@ -157,6 +157,15 @@ Important event families include `AgentMessageDelta`,
 session, run, step, tool call, and sequence number so a client can render
 partial progress and recover a consistent view.
 
+Agent activity history is additionally represented by additive
+`ActivityRecorded` events. Each record has a stable activity ID, an
+optional parent activity and step, status, timestamps, and elapsed duration.
+Model activities identify only the model turn; they do not invent or expose
+private model reasoning. Tool activities retain the observable call
+arguments and result, with typed file, search, and command details inferred
+from the existing tool schemas. Existing lifecycle and tool events remain
+authoritative and are preserved for older clients.
+
 M3 also journals `StepStarted`, `StepCompleted`, `ContextInspected`,
 `RunUsageUpdated`, `RunLimitReached`, approval/policy events, and forked
 session history. `ProviderError`, `ContextError`, and `RecoveryRequired`

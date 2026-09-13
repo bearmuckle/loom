@@ -1077,6 +1077,7 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
                     if result.success { "ok" } else { "failed" }
                 );
             }
+            AgentEvent::ActivityRecorded { .. } => {}
             AgentEvent::RunUsage { usage, .. } => println!(
                 "Usage: {} input / {} output tokens",
                 usage.input_tokens, usage.output_tokens

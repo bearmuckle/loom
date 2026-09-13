@@ -1128,6 +1128,7 @@ impl LoomView {
                     success: result.success,
                 });
             }
+            AgentEvent::ActivityRecorded { .. } => {}
             AgentEvent::NeedsInput { prompt, .. } => {
                 self.pending_input = Some(prompt.clone());
                 self.timeline.push(TimelineItem::NeedsInput(prompt.clone()));

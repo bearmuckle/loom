@@ -258,6 +258,17 @@ impl RunHandle {
                 state.pending_input = Some(prompt.clone());
             }
             AgentEvent::UserMessage { .. } => state.pending_input = None,
+            AgentEvent::ActivityRecorded { activity, .. } => {
+                if let Some(existing) = state
+                    .activities
+                    .iter_mut()
+                    .find(|existing| existing.id == activity.id)
+                {
+                    *existing = activity.clone();
+                } else {
+                    state.activities.push(activity.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -2417,6 +2428,7 @@ fn run_snapshot_projection(state: &AgentRuntimeState) -> AgentRunSnapshotProject
         pending_approval: state.pending_approval.clone(),
         pending_input: state.pending_input.clone(),
         usage: state.usage.clone(),
+        activities: state.activities.clone(),
     }
 }
 
@@ -2460,7 +2472,9 @@ mod tests {
     use loom_context::ContextAssemblyOptions;
     use loom_core::{CapabilitySet, PolicyDecision, ProjectId, ToolCallId};
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
-    use loom_protocol::{ClientRequest, RequestEnvelope, ServerEvent, ServerResponse};
+    use loom_protocol::{
+        AgentActivityStatus, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
+    };
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
     use super::*;
@@ -2814,6 +2828,21 @@ mod tests {
             panic!("unexpected response");
         };
         assert_eq!(snapshot.state, AgentRunState::Completed);
+        let history = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            after_sequence: None,
+        }));
+        let ServerResponse::SessionEvents { events } = history.result.unwrap() else {
+            panic!("unexpected history response");
+        };
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                ServerEvent::Agent {
+                    event: AgentEvent::ActivityRecorded { activity, .. }
+                } if activity.run_id == run_id && activity.completed_at.is_some()
+            )
+        }));
         assert!(root.join("loom-m1-demo.txt").is_file());
         fs::remove_dir_all(root).unwrap();
     }
@@ -3171,6 +3200,21 @@ mod tests {
             panic!("unexpected run response");
         };
         assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
+        let recovered_snapshot =
+            connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+                run_id,
+            }));
+        let ServerResponse::AgentRunSnapshot(projection) = recovered_snapshot.result.unwrap()
+        else {
+            panic!("unexpected run snapshot response");
+        };
+        assert!(!projection.activities.is_empty());
+        assert!(
+            projection
+                .activities
+                .iter()
+                .any(|activity| activity.status == AgentActivityStatus::AwaitingApproval)
+        );
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: None,
