@@ -202,6 +202,9 @@ PauseAgentRun / ResumeAgentRun / InterruptAgentRun
 ApproveAgentAction / RejectAgentAction / RetryAgentStep
 ```
 
+`ArchiveAgentSession` interrupts a non-terminal run for the session before
+archiving it, so clients do not need to issue a separate interrupt request.
+
 Session and run snapshots must be sufficient to render the active
 conversation, plan, step state, tool calls, approvals, bounded output,
 questions, errors, and final summary after reconnect. Review responses are

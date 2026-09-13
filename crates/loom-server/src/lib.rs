@@ -1509,11 +1509,7 @@ impl InProcessConnection {
                 self.backend.journal()?.append_session(record);
                 Ok(ServerResponse::AgentSessionRenamed(snapshot))
             }
-            ClientRequest::ArchiveAgentSession { session_id } => {
-                let (snapshot, record) = self.backend.sessions()?.archive(session_id)?;
-                self.backend.journal()?.append_session(record);
-                Ok(ServerResponse::AgentSessionArchived(snapshot))
-            }
+            ClientRequest::ArchiveAgentSession { session_id } => self.archive_session(session_id),
             ClientRequest::GetSessionEvents {
                 session_id,
                 after_sequence,
@@ -2356,6 +2352,45 @@ impl InProcessConnection {
         Ok(ServerResponse::AgentRun(handle.snapshot()))
     }
 
+    fn archive_session(&self, session_id: AgentSessionId) -> Result<ServerResponse> {
+        let session = self.backend.sessions()?.get(session_id)?;
+        if matches!(
+            session.state,
+            AgentSessionState::Queued
+                | AgentSessionState::Planning
+                | AgentSessionState::AwaitingApproval
+                | AgentSessionState::Paused
+                | AgentSessionState::Executing
+                | AgentSessionState::Evaluating
+                | AgentSessionState::NeedsInput
+        ) {
+            let run_id = self
+                .backend
+                .runs()?
+                .iter()
+                .filter(|(_, handle)| handle.session_id == session_id)
+                .map(|(run_id, handle)| (*run_id, handle.snapshot()))
+                .filter(|(_, snapshot)| {
+                    !matches!(
+                        snapshot.state,
+                        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                    )
+                })
+                .max_by_key(|(_, snapshot)| snapshot.updated_at)
+                .map(|(run_id, _)| run_id)
+                .ok_or_else(|| {
+                    LoomError::invalid_state(
+                        "running agent sessions must be stopped before archiving",
+                    )
+                })?;
+            self.stop_run(run_id, RunStop::Interrupt)?;
+        }
+
+        let (snapshot, record) = self.backend.sessions()?.archive(session_id)?;
+        self.backend.journal()?.append_session(record);
+        Ok(ServerResponse::AgentSessionArchived(snapshot))
+    }
+
     fn retry_from_checkpoint(
         &self,
         run_id: loom_core::RunId,
@@ -2707,14 +2742,6 @@ mod tests {
             Ok(ServerResponse::WorkspaceChanges { .. })
         ));
 
-        let interrupted =
-            connection.request(RequestEnvelope::new(ClientRequest::InterruptAgentRun {
-                run_id,
-            }));
-        assert!(matches!(
-            interrupted.result,
-            Ok(ServerResponse::AgentRun(_))
-        ));
         let archived =
             connection.request(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
                 session_id: session.id,

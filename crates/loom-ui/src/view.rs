@@ -276,6 +276,7 @@ pub(crate) struct LoomView {
     pub(crate) activity_records_seen: bool,
     pub(crate) expanded_activities: BTreeSet<ActivityId>,
     pub(crate) approval_request_in_flight: bool,
+    pub(crate) archive_request_in_flight: bool,
     pub(crate) pending_approval: Option<ToolCall>,
     pub(crate) pending_input: Option<String>,
     pub(crate) composer: TextBufferState,
@@ -553,6 +554,7 @@ impl LoomView {
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
             approval_request_in_flight: false,
+            archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
             composer: TextBufferState::new(""),
@@ -671,6 +673,7 @@ impl LoomView {
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
             approval_request_in_flight: false,
+            archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
             composer: TextBufferState::new(""),
@@ -1523,42 +1526,51 @@ impl LoomView {
     }
 
     pub(crate) fn archive_active(&mut self, cx: &mut Context<Self>) {
+        if self.archive_request_in_flight {
+            return;
+        }
+        self.archive_request_in_flight = true;
+        self.record_status("Archiving session...");
+        let session_id = self.active_session.id;
         self.dispatch(
             cx,
-            ClientRequest::ArchiveAgentSession {
-                session_id: self.active_session.id,
-            },
-            |view, response, cx| match response.result {
-                Ok(ServerResponse::AgentSessionArchived(_)) => {
-                    view.dispatch(
-                        cx,
-                        ClientRequest::ListAgentSessions {
-                            project_id: Some(view.project_id),
-                            include_archived: false,
-                        },
-                        |view, response, cx| match response.result {
-                            Ok(ServerResponse::AgentSessions { sessions }) => {
-                                view.sessions = sessions;
-                                if let Some(session) = view.sessions.first().cloned() {
-                                    view.select_session(session, cx);
-                                } else {
-                                    view.create_session_async("New session".to_owned(), cx);
+            ClientRequest::ArchiveAgentSession { session_id },
+            move |view, response, cx| {
+                view.archive_request_in_flight = false;
+                match response.result {
+                    Ok(ServerResponse::AgentSessionArchived(_)) => {
+                        view.dispatch(
+                            cx,
+                            ClientRequest::ListAgentSessions {
+                                project_id: Some(view.project_id),
+                                include_archived: false,
+                            },
+                            |view, response, cx| match response.result {
+                                Ok(ServerResponse::AgentSessions { sessions }) => {
+                                    view.sessions = sessions;
+                                    if let Some(session) = view.sessions.first().cloned() {
+                                        view.select_session(session, cx);
+                                    } else {
+                                        view.create_session_async("New session".to_owned(), cx);
+                                    }
+                                    view.reload_sessions(cx);
                                 }
-                                view.reload_sessions(cx);
-                            }
-                            Err(error) => view.record_backend_error("session list refresh", error),
-                            Ok(response) => view.record_backend_error(
-                                "session list refresh",
-                                unexpected_response("session list", response),
-                            ),
-                        },
-                    );
+                                Err(error) => {
+                                    view.record_backend_error("session list refresh", error)
+                                }
+                                Ok(response) => view.record_backend_error(
+                                    "session list refresh",
+                                    unexpected_response("session list", response),
+                                ),
+                            },
+                        );
+                    }
+                    Err(error) => view.record_backend_error("archive session", error),
+                    Ok(response) => view.record_backend_error(
+                        "archive session",
+                        unexpected_response("session archive", response),
+                    ),
                 }
-                Err(error) => view.record_backend_error("archive session", error),
-                Ok(response) => view.record_backend_error(
-                    "archive session",
-                    unexpected_response("session archive", response),
-                ),
             },
         );
     }
