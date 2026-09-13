@@ -1671,6 +1671,53 @@ impl LoomView {
         cx.notify();
     }
 
+    fn approve_pending_action(&mut self, cx: &mut Context<Self>) {
+        let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
+            return;
+        };
+        self.dispatch(
+            cx,
+            ClientRequest::ApproveAgentAction {
+                run_id,
+                tool_call_id: call.id,
+            },
+            |view, response, cx| view.finish_approval_response(response, cx),
+        );
+    }
+
+    fn reject_pending_action(&mut self, cx: &mut Context<Self>) {
+        let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
+            return;
+        };
+        self.dispatch(
+            cx,
+            ClientRequest::RejectAgentAction {
+                run_id,
+                tool_call_id: call.id,
+                reason: None,
+            },
+            |view, response, cx| view.finish_approval_response(response, cx),
+        );
+    }
+
+    fn finish_approval_response(&mut self, response: ResponseEnvelope, cx: &mut Context<Self>) {
+        match response.result {
+            Ok(ServerResponse::AgentRun(run)) | Ok(ServerResponse::AgentRunStarted(run)) => {
+                self.active_run = Some(run.clone());
+                self.active_run_id = Some(run.id);
+                self.run_state = Some(run.state);
+                self.session_state = session_state_for_run(run.state);
+                self.active_session.state = self.session_state;
+                self.start_run_polling(cx);
+            }
+            Err(error) => self.record_backend_error("approval", error),
+            Ok(response) => {
+                self.record_backend_error("approval", unexpected_response("approval", response))
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn submit_composer(&mut self, cx: &mut Context<Self>) {
         let text = self.composer.text.trim().to_owned();
         if text.is_empty() {
@@ -2521,6 +2568,51 @@ impl LoomView {
                     );
                 }
             }
+            if activity.status == AgentActivityStatus::AwaitingApproval
+                && self.pending_approval.is_some()
+            {
+                row = row.child(
+                    div()
+                        .ml(px(26.))
+                        .mt_1()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id((
+                                    "approve-activity",
+                                    ((index as u64) << 32) | activity_index as u64,
+                                ))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x24543d))
+                                .text_color(rgb(0xbbf7d0))
+                                .cursor_pointer()
+                                .child("Approve")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.approve_pending_action(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id((
+                                    "reject-activity",
+                                    ((index as u64) << 32) | activity_index as u64,
+                                ))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x542936))
+                                .text_color(rgb(0xfecdd3))
+                                .cursor_pointer()
+                                .child("Reject")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reject_pending_action(cx);
+                                })),
+                        ),
+                );
+            }
             section = section.child(row);
         }
         section.into_any()
@@ -2635,20 +2727,58 @@ impl LoomView {
                         .child(arguments.clone()),
                 )
                 .into_any(),
-            TimelineItem::Approval { name, active } => div()
-                .px_3()
-                .py_1()
-                .text_color(if *active {
-                    rgb(0xfef3c7)
-                } else {
-                    rgb(0x94a3b8)
-                })
-                .child(if *active {
-                    format!("Approval required  >_ {name}")
-                } else {
-                    format!("Approval resolved  >_ {name}")
-                })
-                .into_any(),
+            TimelineItem::Approval { name, active } => {
+                let mut row = div()
+                    .px_3()
+                    .py_1()
+                    .text_color(if *active {
+                        rgb(0xfef3c7)
+                    } else {
+                        rgb(0x94a3b8)
+                    })
+                    .child(if *active {
+                        format!("Approval required  >_ {name}")
+                    } else {
+                        format!("Approval resolved  >_ {name}")
+                    });
+                if *active && self.pending_approval.is_some() {
+                    row = row.child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(("approve-legacy", index))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x24543d))
+                                    .text_color(rgb(0xbbf7d0))
+                                    .cursor_pointer()
+                                    .child("Approve")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.approve_pending_action(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("reject-legacy", index))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x542936))
+                                    .text_color(rgb(0xfecdd3))
+                                    .cursor_pointer()
+                                    .child("Reject")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.reject_pending_action(cx);
+                                    })),
+                            ),
+                    );
+                }
+                row.into_any()
+            }
             TimelineItem::ToolStarted(name) => div()
                 .px_3()
                 .py_1()
