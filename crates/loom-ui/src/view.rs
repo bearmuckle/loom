@@ -22,8 +22,8 @@ use gpui_component::{
     text::TextView,
 };
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence, LoomError,
-    ProjectId, RunId,
+    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence,
+    LoomError, ProjectId, RunId,
 };
 use loom_model::{MessageRole, ModelId, ToolCall};
 use loom_protocol::{
@@ -202,6 +202,45 @@ fn activity_output(activity: &AgentActivityRecord) -> Option<&str> {
     }
 }
 
+fn activity_turn_title(activities: &[AgentActivityRecord]) -> &'static str {
+    if activities.iter().any(|activity| {
+        matches!(
+            &activity.data,
+            AgentActivityData::File {
+                operation: FileActivityOperation::Write,
+                ..
+            }
+        ) || matches!(
+            &activity.data,
+            AgentActivityData::ToolCall { call, .. } if call.name == "apply_patch"
+        )
+    }) {
+        "Making changes"
+    } else if activities
+        .iter()
+        .any(|activity| matches!(&activity.data, AgentActivityData::Command { .. }))
+    {
+        "Running commands"
+    } else if activities
+        .iter()
+        .any(|activity| matches!(&activity.data, AgentActivityData::Search { .. }))
+    {
+        "Searching the codebase"
+    } else if activities
+        .iter()
+        .any(|activity| matches!(&activity.data, AgentActivityData::File { .. }))
+    {
+        "Inspecting the workspace"
+    } else if activities
+        .iter()
+        .any(|activity| matches!(&activity.data, AgentActivityData::ToolCall { .. }))
+    {
+        "Using tools"
+    } else {
+        "Working on the task"
+    }
+}
+
 pub(crate) struct LoomView {
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
@@ -231,6 +270,7 @@ pub(crate) struct LoomView {
     pub(crate) after_sequence: Option<EventSequence>,
     pub(crate) timeline: Vec<TimelineItem>,
     pub(crate) activity_records_seen: bool,
+    pub(crate) expanded_activities: BTreeSet<ActivityId>,
     pub(crate) pending_approval: Option<ToolCall>,
     pub(crate) pending_input: Option<String>,
     pub(crate) composer: TextBufferState,
@@ -506,6 +546,7 @@ impl LoomView {
             after_sequence: None,
             timeline: Vec::new(),
             activity_records_seen: false,
+            expanded_activities: BTreeSet::new(),
             pending_approval: None,
             pending_input: None,
             composer: TextBufferState::new(""),
@@ -622,6 +663,7 @@ impl LoomView {
             after_sequence: None,
             timeline: Vec::new(),
             activity_records_seen: false,
+            expanded_activities: BTreeSet::new(),
             pending_approval: None,
             pending_input: None,
             composer: TextBufferState::new(""),
@@ -878,6 +920,7 @@ impl LoomView {
     pub(crate) fn reset_projection(&mut self) {
         self.timeline.clear();
         self.activity_records_seen = false;
+        self.expanded_activities.clear();
         self.pending_approval = None;
         self.pending_input = None;
         self.active_run = None;
@@ -2352,6 +2395,7 @@ impl LoomView {
         &self,
         activities: &[AgentActivityRecord],
         index: usize,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let model = activities.iter().find_map(|activity| match &activity.data {
             AgentActivityData::ModelTurn { model } => Some(model.as_str().to_owned()),
@@ -2360,10 +2404,7 @@ impl LoomView {
         let turn = activities
             .iter()
             .find(|activity| matches!(activity.data, AgentActivityData::ModelTurn { .. }));
-        let header = model.map_or_else(
-            || "Agent activity".to_owned(),
-            |model| format!("Agent turn · {model}"),
-        );
+        let title = activity_turn_title(activities);
         let turn_status = turn.map(|activity| {
             let duration = activity
                 .elapsed_ms
@@ -2392,7 +2433,12 @@ impl LoomView {
                     .text_xs()
                     .text_color(rgb(0x93c5fd))
                     .child("●")
-                    .child(header)
+                    .child(title)
+                    .when_some(model, |element, model| {
+                        element
+                            .child("·")
+                            .child(div().text_color(rgb(0x64748b)).child(model))
+                    })
                     .when_some(turn_status, |element, status| {
                         element
                             .child("·")
@@ -2406,6 +2452,7 @@ impl LoomView {
             let (label, detail) = activity_label(activity);
             let duration = activity.elapsed_ms.map(format_duration);
             let output = activity_output(activity);
+            let expanded = self.expanded_activities.contains(&activity.id);
             let status_color = match activity.status {
                 AgentActivityStatus::Failed => rgb(0xfca5a5),
                 AgentActivityStatus::Completed => rgb(0x9ad7bd),
@@ -2415,12 +2462,17 @@ impl LoomView {
                 AgentActivityStatus::Started => rgb(0x93c5fd),
                 AgentActivityStatus::Cancelled => rgb(0x94a3b8),
             };
+            let activity_id = activity.id;
             let mut row = div()
                 .id(("activity", ((index as u64) << 32) | activity_index as u64))
                 .flex()
                 .flex_col()
+                .cursor_pointer()
                 .text_xs()
                 .text_color(rgb(0xcbd5e1))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_activity(activity_id, cx);
+                }))
                 .child(
                     div()
                         .flex()
@@ -2432,10 +2484,9 @@ impl LoomView {
                                 .text_color(status_color)
                                 .child(activity_marker(activity.status)),
                         )
+                        .child(if expanded { "⌄" } else { "›" })
                         .child(label)
-                        .when_some(detail, |element, detail| {
-                            element.flex_1().text_color(rgb(0x94a3b8)).child(detail)
-                        })
+                        .flex_1()
                         .child(
                             div()
                                 .text_color(status_color)
@@ -2447,28 +2498,46 @@ impl LoomView {
                                 .child(format!(" · {duration}"))
                         }),
                 );
-            if let Some(output) = output {
-                row = row.child(
-                    div()
-                        .ml(px(14.))
-                        .max_w(px(560.))
-                        .border_l_1()
-                        .border_color(rgb(0x30343f))
-                        .pl_2()
-                        .text_color(rgb(0x8f98a6))
-                        .child(bounded_to(output, 420)),
-                );
+            if expanded {
+                if let Some(detail) = detail {
+                    row = row.child(
+                        div()
+                            .ml(px(26.))
+                            .max_w(px(560.))
+                            .text_color(rgb(0x94a3b8))
+                            .child(detail),
+                    );
+                }
+                if let Some(output) = output {
+                    row = row.child(
+                        div()
+                            .ml(px(26.))
+                            .max_w(px(560.))
+                            .border_l_1()
+                            .border_color(rgb(0x30343f))
+                            .pl_2()
+                            .text_color(rgb(0x8f98a6))
+                            .child(bounded_to(output, 420)),
+                    );
+                }
             }
             section = section.child(row);
         }
         section.into_any()
     }
 
+    fn toggle_activity(&mut self, activity_id: ActivityId, cx: &mut Context<Self>) {
+        if !self.expanded_activities.remove(&activity_id) {
+            self.expanded_activities.insert(activity_id);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn render_timeline_item(
         &self,
         item: &TimelineItem,
         index: usize,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let user_background = if self.dark_theme {
             gpui::rgb(0x1f4f78)
@@ -2520,7 +2589,7 @@ impl LoomView {
                 )
                 .into_any(),
             TimelineItem::ActivitySection { activities } => {
-                self.render_activity_section(activities, index)
+                self.render_activity_section(activities, index, cx)
             }
             TimelineItem::Plan {
                 steps,
