@@ -2164,8 +2164,26 @@ impl LoomView {
     }
 
     pub(crate) fn select_agent_mode(&mut self, mode: AgentMode, cx: &mut Context<Self>) {
-        self.agent_mode = mode;
         self.agent_mode_picker_open = false;
+        let policy = mode.approval_policy();
+        self.dispatch(
+            cx,
+            ClientRequest::SetApprovalPolicy {
+                project_id: self.project_id,
+                policy,
+            },
+            move |view, response, _| match response.result {
+                Ok(ServerResponse::ApprovalPolicy(_)) => {
+                    view.agent_mode = mode;
+                    view.record_status(format!("{} mode enabled", mode.label()));
+                }
+                Err(error) => view.record_backend_error("set approval mode", error),
+                Ok(response) => view.record_backend_error(
+                    "set approval mode",
+                    unexpected_response("approval policy", response),
+                ),
+            },
+        );
         cx.notify();
     }
 

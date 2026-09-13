@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use loom_core::{AgentSessionSnapshot, AgentSessionState, LoomError};
+use loom_core::{AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError};
 use loom_protocol::{
     AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitRepositoryStatus,
     WorkspaceChange, WorkspaceFile,
@@ -25,6 +25,7 @@ pub(crate) enum AgentMode {
     Ask,
     Edit,
     Agent,
+    AutoApprove,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,13 +48,21 @@ impl ThemeChoice {
 }
 
 impl AgentMode {
-    pub(crate) const ALL: [Self; 3] = [Self::Ask, Self::Edit, Self::Agent];
+    pub(crate) const ALL: [Self; 4] = [Self::Ask, Self::Edit, Self::Agent, Self::AutoApprove];
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Ask => "Ask",
             Self::Edit => "Edit",
             Self::Agent => "Agent",
+            Self::AutoApprove => "Auto approve",
+        }
+    }
+
+    pub(crate) fn approval_policy(self) -> ApprovalPolicy {
+        match self {
+            Self::AutoApprove => ApprovalPolicy::auto_approve(),
+            Self::Ask | Self::Edit | Self::Agent => ApprovalPolicy::default(),
         }
     }
 }

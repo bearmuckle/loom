@@ -123,6 +123,10 @@ disconnects. Policy evaluations are agent events before a tool executes, and
 the existing approval request/decision events remain authoritative for
 approval-required actions.
 
+The UI's **Auto approve** mode sets `ApprovalPolicy` to allow read, write,
+command, and network actions without prompting. Destructive actions remain
+denied and are not enabled by this mode.
+
 M3 adds typed provider and durable-orchestration requests:
 
 ```text
