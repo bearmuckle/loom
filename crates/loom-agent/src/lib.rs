@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use loom_context::{ContextAssembler, ContextAssemblyOptions, ContextInput, ContextInspection};
@@ -1754,6 +1757,7 @@ impl AgentRuntime {
             },
             &context_options,
         )?;
+        let messages = repair_tool_transcript(assembly.messages, &self.messages);
         let tools = if self.provider()?.descriptor().capabilities.tool_calling {
             tool_definitions()
         } else {
@@ -1761,7 +1765,7 @@ impl AgentRuntime {
         };
         let request = ModelRequest {
             model: self.task.model.clone(),
-            messages: assembly.messages,
+            messages,
             tools,
             options: CompletionOptions::default(),
         };
@@ -2026,6 +2030,68 @@ fn initial_messages(task: &AgentTask) -> Vec<ModelMessage> {
     messages
 }
 
+/// Keeps Responses API function calls paired with their tool outputs after
+/// context assembly or recovery from an older persisted runtime state.
+fn repair_tool_transcript(
+    messages: Vec<ModelMessage>,
+    source_messages: &[ModelMessage],
+) -> Vec<ModelMessage> {
+    let source_outputs: BTreeMap<_, _> = source_messages
+        .iter()
+        .filter_map(|message| {
+            (message.role == MessageRole::Tool)
+                .then_some(message.tool_call_id)
+                .flatten()
+                .map(|id| (id, message.clone()))
+        })
+        .collect();
+    let call_ids: BTreeSet<_> = messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().map(|call| call.id))
+        .collect();
+    let output_ids: BTreeSet<_> = messages
+        .iter()
+        .filter_map(|message| {
+            (message.role == MessageRole::Tool)
+                .then_some(message.tool_call_id)
+                .flatten()
+        })
+        .collect();
+    let mut repaired = Vec::with_capacity(messages.len());
+    for message in messages {
+        if message.role == MessageRole::Tool {
+            if message
+                .tool_call_id
+                .is_some_and(|tool_call_id| call_ids.contains(&tool_call_id))
+            {
+                repaired.push(message);
+            }
+            continue;
+        }
+        let tool_calls = message.tool_calls.clone();
+        repaired.push(message);
+        for call in tool_calls {
+            if output_ids.contains(&call.id) {
+                continue;
+            }
+            repaired.push(
+                source_outputs
+                    .get(&call.id)
+                    .cloned()
+                    .unwrap_or_else(|| ModelMessage {
+                        role: MessageRole::Tool,
+                        content: "No tool output was recorded; continue from the current state."
+                            .to_owned(),
+                        name: Some(call.name.clone()),
+                        tool_call_id: Some(call.id),
+                        tool_calls: Vec::new(),
+                    }),
+            );
+        }
+    }
+    repaired
+}
+
 /// Sends the events that the observer has not seen yet and advances `cursor`.
 fn publish_events(
     observer: Option<&(dyn Fn(&AgentEvent) + Send + Sync)>,
@@ -2053,6 +2119,47 @@ mod tests {
         let root = std::env::temp_dir().join(format!("loom-agent-{}", ProjectId::new()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn repairs_unpaired_tool_messages_for_provider_requests() {
+        let call = ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "archive.rs"}),
+        };
+        let assistant = ModelMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: vec![call.clone()],
+        };
+        let source_output = ModelMessage {
+            role: MessageRole::Tool,
+            content: "archive implementation".to_owned(),
+            name: Some(call.name.clone()),
+            tool_call_id: Some(call.id),
+            tool_calls: Vec::new(),
+        };
+        let repaired = repair_tool_transcript(
+            vec![
+                assistant,
+                ModelMessage {
+                    role: MessageRole::Tool,
+                    content: "orphan".to_owned(),
+                    name: None,
+                    tool_call_id: Some(loom_core::ToolCallId::new()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            &[source_output],
+        );
+
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[1].role, MessageRole::Tool);
+        assert_eq!(repaired[1].tool_call_id, Some(call.id));
+        assert_eq!(repaired[1].content, "archive implementation");
     }
 
     /// Provider that blocks in the middle of a completion until it is released
