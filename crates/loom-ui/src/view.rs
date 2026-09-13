@@ -1538,32 +1538,14 @@ impl LoomView {
             move |view, response, cx| {
                 view.archive_request_in_flight = false;
                 match response.result {
-                    Ok(ServerResponse::AgentSessionArchived(_)) => {
-                        view.dispatch(
-                            cx,
-                            ClientRequest::ListAgentSessions {
-                                project_id: Some(view.project_id),
-                                include_archived: false,
-                            },
-                            |view, response, cx| match response.result {
-                                Ok(ServerResponse::AgentSessions { sessions }) => {
-                                    view.sessions = sessions;
-                                    if let Some(session) = view.sessions.first().cloned() {
-                                        view.select_session(session, cx);
-                                    } else {
-                                        view.create_session_async("New session".to_owned(), cx);
-                                    }
-                                    view.reload_sessions(cx);
-                                }
-                                Err(error) => {
-                                    view.record_backend_error("session list refresh", error)
-                                }
-                                Ok(response) => view.record_backend_error(
-                                    "session list refresh",
-                                    unexpected_response("session list", response),
-                                ),
-                            },
-                        );
+                    Ok(ServerResponse::AgentSessionArchived(snapshot)) => {
+                        view.sessions.retain(|session| session.id != snapshot.id);
+                        if let Some(session) = view.sessions.first().cloned() {
+                            view.select_session(session, cx);
+                        } else {
+                            view.reset_projection();
+                            view.create_session_async("New session".to_owned(), cx);
+                        }
                     }
                     Err(error) => view.record_backend_error("archive session", error),
                     Ok(response) => view.record_backend_error(
