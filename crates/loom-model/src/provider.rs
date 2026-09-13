@@ -173,7 +173,29 @@ pub fn estimate_tokens(request: &ModelRequest) -> u64 {
     let message_chars = request
         .messages
         .iter()
-        .map(|message| message.content.chars().count())
+        .map(|message| {
+            let metadata_chars = message.name.as_deref().map_or(0, str::len).saturating_add(
+                message
+                    .tool_call_id
+                    .map_or(0, |tool_call_id| tool_call_id.to_string().len()),
+            );
+            let tool_call_chars = message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    call.name
+                        .len()
+                        .saturating_add(call.arguments.to_string().len())
+                        .saturating_add(32)
+                })
+                .sum::<usize>();
+            message
+                .content
+                .chars()
+                .count()
+                .saturating_add(metadata_chars)
+                .saturating_add(tool_call_chars)
+        })
         .sum::<usize>();
     let tool_chars = request
         .tools

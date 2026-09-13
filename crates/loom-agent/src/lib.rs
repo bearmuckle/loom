@@ -1743,6 +1743,23 @@ impl AgentRuntime {
         if context_options.max_input_tokens.is_none() {
             context_options.max_input_tokens = self.options.limits.max_input_tokens;
         }
+        let tools = if self.provider()?.descriptor().capabilities.tool_calling {
+            tool_definitions()
+        } else {
+            Vec::new()
+        };
+        let tool_tokens = self.provider()?.count_tokens(&ModelRequest {
+            model: self.task.model.clone(),
+            messages: Vec::new(),
+            tools: tools.clone(),
+            options: CompletionOptions::default(),
+        });
+        if let Some(context_window) = context_options.context_window {
+            context_options.context_window = Some(context_window.saturating_sub(tool_tokens));
+        }
+        if let Some(max_input_tokens) = context_options.max_input_tokens {
+            context_options.max_input_tokens = Some(max_input_tokens.saturating_sub(tool_tokens));
+        }
         let assembly = ContextAssembler::assemble(
             &ContextInput {
                 system_instructions: self.task.system_instructions.clone(),
@@ -1758,11 +1775,6 @@ impl AgentRuntime {
             &context_options,
         )?;
         let messages = repair_tool_transcript(assembly.messages, &self.messages);
-        let tools = if self.provider()?.descriptor().capabilities.tool_calling {
-            tool_definitions()
-        } else {
-            Vec::new()
-        };
         let request = ModelRequest {
             model: self.task.model.clone(),
             messages,

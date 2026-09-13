@@ -238,7 +238,28 @@ pub fn inspect_context(
 }
 
 pub fn estimate_message_tokens(message: &ModelMessage) -> u64 {
-    (message.content.chars().count() as u64).div_ceil(4)
+    let metadata_chars = message.name.as_deref().map_or(0, str::len).saturating_add(
+        message
+            .tool_call_id
+            .map_or(0, |tool_call_id| tool_call_id.to_string().len()),
+    );
+    let tool_call_chars = message
+        .tool_calls
+        .iter()
+        .map(|call| {
+            call.name
+                .len()
+                .saturating_add(call.arguments.to_string().len())
+                .saturating_add(32)
+        })
+        .sum::<usize>();
+    (message
+        .content
+        .chars()
+        .count()
+        .saturating_add(metadata_chars)
+        .saturating_add(tool_call_chars) as u64)
+        .div_ceil(4)
 }
 
 pub fn compact_messages(messages: &[ModelMessage]) -> ContextSummary {
