@@ -1404,7 +1404,6 @@ impl AgentRuntime {
                         step_id: ctx.step_id,
                         index: ctx.step_index,
                     });
-                    ctx.finished = true;
                     return Ok(StreamFlow::Stop);
                 }
                 if kind == ToolKind::AskUser {
@@ -2079,6 +2078,57 @@ mod tests {
         }
     }
 
+    struct PlanThenCompleteProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+    }
+
+    impl ModelProvider for PlanThenCompleteProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                vec![ModelStreamEvent::ToolCallDelta {
+                    call: ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: "propose_plan".to_owned(),
+                        arguments: serde_json::json!({
+                            "steps": ["Inspect the workspace", "Complete the requested task"]
+                        }),
+                    },
+                }]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "The requested task is complete.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
     fn blocking_runtime(entered: Arc<AtomicBool>, released: Arc<AtomicBool>) -> AgentRuntime {
         let root = workspace();
         let tools = ToolExecutor::new(&root).unwrap();
@@ -2233,6 +2283,36 @@ mod tests {
                 .filter(|activity| activity.kind == AgentActivityKind::ToolCall)
                 .all(|activity| activity.parent_id.is_some())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plan_proposal_continues_to_the_next_model_step() {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task = AgentTask::new("finish the task", ModelId::new("deterministic/plan")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(PlanThenCompleteProvider {
+                descriptor: loom_providers::deterministic_descriptor(),
+                cursor: 0,
+            }),
+            tools,
+        );
+
+        let events = runtime.start().unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::PlanProposed { plan, .. } if plan.steps.len() == 2
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::RunCompleted { snapshot }
+                if snapshot.state == AgentRunState::Completed
+        )));
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
         fs::remove_dir_all(root).unwrap();
     }
 
