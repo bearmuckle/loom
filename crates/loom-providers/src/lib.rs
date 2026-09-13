@@ -33,6 +33,7 @@ const GITHUB_COPILOT_EDITOR_VERSION: &str = "vscode/1.96.2";
 const GITHUB_COPILOT_PLUGIN_VERSION: &str = "copilot-chat/0.26.7";
 const GITHUB_COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.26.7";
 const GITHUB_API_VERSION: &str = "2025-04-01";
+const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
@@ -756,14 +757,18 @@ impl ProviderRegistry {
         } else {
             request.set("Authorization", &format!("Bearer {credential}"))
         };
-        let response = request.call().map_err(|error| match error {
-            ureq::Error::Status(status, _) => {
-                normalize_provider_error(provider_id.as_str(), status)
-            }
-            ureq::Error::Transport(error) => {
-                normalize_transport_error(provider_id.as_str(), &error.to_string())
-            }
-        })?;
+        let response =
+            request
+                .timeout(PROVIDER_REQUEST_TIMEOUT)
+                .call()
+                .map_err(|error| match error {
+                    ureq::Error::Status(status, _) => {
+                        normalize_provider_error(provider_id.as_str(), status)
+                    }
+                    ureq::Error::Transport(error) => {
+                        normalize_transport_error(provider_id.as_str(), &error.to_string())
+                    }
+                })?;
         let body: serde_json::Value = response.into_json().map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
@@ -1377,6 +1382,7 @@ impl Default for GitHubCopilotAuthenticator {
 impl GitHubCopilotAuthenticator {
     pub fn begin(&self) -> Result<GitHubDeviceCode> {
         let response = ureq::post(GITHUB_DEVICE_CODE_URL)
+            .timeout(PROVIDER_REQUEST_TIMEOUT)
             .set("Accept", "application/json")
             .set("Content-Type", "application/json")
             .send_json(serde_json::json!({
@@ -1405,6 +1411,7 @@ impl GitHubCopilotAuthenticator {
                 ));
             }
             let response = ureq::post(GITHUB_ACCESS_TOKEN_URL)
+                .timeout(PROVIDER_REQUEST_TIMEOUT)
                 .set("Accept", "application/json")
                 .set("Content-Type", "application/json")
                 .send_json(serde_json::json!({
@@ -1522,6 +1529,7 @@ impl GitHubCopilotProvider {
     pub fn discover_models(&self) -> Result<Vec<ModelDescriptor>> {
         let token = self.fetch_copilot_token()?;
         let response = ureq::get(&format!("{}/models", trim_endpoint(&token.api_endpoint)))
+            .timeout(PROVIDER_REQUEST_TIMEOUT)
             .set("Accept", "application/json")
             .set("Authorization", &format!("Bearer {}", token.value))
             .set("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
@@ -1585,6 +1593,7 @@ impl GitHubCopilotProvider {
 
     fn fetch_copilot_token(&self) -> Result<CopilotAccessToken> {
         let response = ureq::get(&self.token_endpoint)
+            .timeout(PROVIDER_REQUEST_TIMEOUT)
             .set("Accept", "application/json")
             .set("Authorization", &format!("token {}", self.github_token))
             .set("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
@@ -1814,7 +1823,9 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 
     fn health_check(&mut self) -> Result<()> {
-        let response = ureq::get(&health_endpoint(&self.endpoint)).call();
+        let response = ureq::get(&health_endpoint(&self.endpoint))
+            .timeout(PROVIDER_REQUEST_TIMEOUT)
+            .call();
         match response {
             Ok(_) => Ok(()),
             Err(ureq::Error::Status(status, _)) => Err(normalize_provider_error(
@@ -2026,6 +2037,7 @@ fn send_openai_request(
         payload["stream_options"] = serde_json::json!({"include_usage": true});
     }
     let request = ureq::post(endpoint)
+        .timeout(PROVIDER_REQUEST_TIMEOUT)
         .set("Content-Type", "application/json")
         .set("Accept", "text/event-stream");
     let request = if authorization.is_empty() {

@@ -3,6 +3,8 @@
 //! Everything here is derived from protocol responses and events; the backend
 //! stays authoritative.
 
+use std::collections::BTreeSet;
+
 use loom_core::{AgentSessionSnapshot, AgentSessionState, LoomError};
 use loom_protocol::{AgentRunState, GitDiff, GitRepositoryStatus, WorkspaceChange, WorkspaceFile};
 
@@ -109,18 +111,35 @@ impl Default for ReviewState {
 pub(crate) enum TimelineItem {
     User(String),
     Assistant(String),
-    Plan(Vec<String>),
-    StepStarted { index: u32 },
-    StepCompleted { index: u32 },
-    ToolRequested { name: String, arguments: String },
-    Approval { name: String, active: bool },
+    Plan {
+        steps: Vec<String>,
+        completed: BTreeSet<u32>,
+        active: Option<u32>,
+    },
+    ToolRequested {
+        name: String,
+        arguments: String,
+    },
+    Approval {
+        name: String,
+        active: bool,
+    },
     ToolStarted(String),
     ToolOutput(String),
-    ToolCompleted { name: String, success: bool },
+    ToolCompleted {
+        name: String,
+        success: bool,
+    },
     Status(String),
-    Error { operation: String, error: LoomError },
+    Error {
+        operation: String,
+        error: LoomError,
+    },
     NeedsInput(String),
-    Summary { text: String, evidence: Vec<String> },
+    Summary {
+        text: String,
+        evidence: Vec<String>,
+    },
 }
 
 pub(crate) fn bounded(value: &str) -> String {
