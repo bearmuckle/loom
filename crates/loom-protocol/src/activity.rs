@@ -1,4 +1,4 @@
-use loom_core::{ActivityId, RunId, StepId, Timestamp, ToolCallId};
+use loom_core::{ActivityId, RunId, StepId, Timestamp};
 use loom_model::{ModelId, ToolCall};
 use serde::{Deserialize, Serialize};
 
@@ -44,19 +44,19 @@ pub enum AgentActivityData {
         result: Option<ToolResult>,
     },
     File {
-        tool_call_id: ToolCallId,
+        call: ToolCall,
         operation: FileActivityOperation,
         path: Option<String>,
         result: Option<ToolResult>,
     },
     Search {
-        tool_call_id: ToolCallId,
+        call: ToolCall,
         query: String,
         path: Option<String>,
         result: Option<ToolResult>,
     },
     Command {
-        tool_call_id: ToolCallId,
+        call: ToolCall,
         command: String,
         args: Vec<String>,
         cwd: Option<String>,

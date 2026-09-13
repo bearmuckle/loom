@@ -1876,7 +1876,7 @@ fn activity_data_for_call(
         "list_files" => (
             AgentActivityKind::File,
             AgentActivityData::File {
-                tool_call_id: call.id,
+                call: call.clone(),
                 operation: FileActivityOperation::List,
                 path: string_argument("path").or_else(|| Some(".".to_owned())),
                 result,
@@ -1885,7 +1885,7 @@ fn activity_data_for_call(
         "read_file" => (
             AgentActivityKind::File,
             AgentActivityData::File {
-                tool_call_id: call.id,
+                call: call.clone(),
                 operation: FileActivityOperation::Read,
                 path: string_argument("path"),
                 result,
@@ -1894,7 +1894,7 @@ fn activity_data_for_call(
         "apply_patch" => (
             AgentActivityKind::File,
             AgentActivityData::File {
-                tool_call_id: call.id,
+                call: call.clone(),
                 operation: FileActivityOperation::Write,
                 path: string_argument("path"),
                 result,
@@ -1903,7 +1903,7 @@ fn activity_data_for_call(
         "search_text" => (
             AgentActivityKind::Search,
             AgentActivityData::Search {
-                tool_call_id: call.id,
+                call: call.clone(),
                 query: string_argument("query").unwrap_or_default(),
                 path: string_argument("path"),
                 result,
@@ -1912,7 +1912,7 @@ fn activity_data_for_call(
         "run_command" => (
             AgentActivityKind::Command,
             AgentActivityData::Command {
-                tool_call_id: call.id,
+                call: call.clone(),
                 command: string_argument("command").unwrap_or_default(),
                 args: call
                     .arguments
@@ -1947,35 +1947,32 @@ fn activity_data_with_result(data: AgentActivityData, result: ToolResult) -> Age
             result: Some(result),
         },
         AgentActivityData::File {
-            tool_call_id,
+            call,
             operation,
             path,
             ..
         } => AgentActivityData::File {
-            tool_call_id,
+            call,
             operation,
             path,
             result: Some(result),
         },
         AgentActivityData::Search {
-            tool_call_id,
-            query,
-            path,
-            ..
+            call, query, path, ..
         } => AgentActivityData::Search {
-            tool_call_id,
+            call,
             query,
             path,
             result: Some(result),
         },
         AgentActivityData::Command {
-            tool_call_id,
+            call,
             command,
             args,
             cwd,
             ..
         } => AgentActivityData::Command {
-            tool_call_id,
+            call,
             command,
             args,
             cwd,
@@ -1990,15 +1987,9 @@ fn activity_contains_call(
 ) -> bool {
     match &activity.data {
         AgentActivityData::ToolCall { call, .. } => call.id == tool_call_id,
-        AgentActivityData::File {
-            tool_call_id: id, ..
-        }
-        | AgentActivityData::Search {
-            tool_call_id: id, ..
-        }
-        | AgentActivityData::Command {
-            tool_call_id: id, ..
-        } => *id == tool_call_id,
+        AgentActivityData::File { call, .. }
+        | AgentActivityData::Search { call, .. }
+        | AgentActivityData::Command { call, .. } => call.id == tool_call_id,
         AgentActivityData::ModelTurn { .. } => false,
     }
 }

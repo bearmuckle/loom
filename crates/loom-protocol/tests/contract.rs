@@ -132,7 +132,7 @@ fn activity_event_round_trip_preserves_typed_work_and_relationships() {
         completed_at: Some(Timestamp::from_unix_millis(12)),
         elapsed_ms: Some(2),
         data: AgentActivityData::File {
-            tool_call_id: call.id,
+            call: call.clone(),
             operation: FileActivityOperation::Read,
             path: Some("src/lib.rs".to_owned()),
             result: Some(ToolResult::success(&call, "contents".to_owned())),
