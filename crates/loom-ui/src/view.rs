@@ -241,6 +241,10 @@ fn activity_turn_title(activities: &[AgentActivityRecord]) -> &'static str {
     }
 }
 
+fn is_redundant_completion_summary(summary: &str) -> bool {
+    summary.starts_with("Completed task:")
+}
+
 pub(crate) struct LoomView {
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
@@ -1346,7 +1350,9 @@ impl LoomView {
                 self.session_state = session_state_for_run(snapshot.state);
                 self.active_session.state = self.session_state;
                 self.summary = snapshot.summary.clone();
-                if let Some(summary) = &snapshot.summary {
+                if let Some(summary) = &snapshot.summary
+                    && !is_redundant_completion_summary(summary)
+                {
                     self.timeline.push(TimelineItem::Summary {
                         text: summary.clone(),
                         evidence: snapshot
@@ -1416,6 +1422,7 @@ impl LoomView {
             upsert_activity(&mut self.timeline, activity);
         }
         if let Some(summary) = &projection.run.summary
+            && !is_redundant_completion_summary(summary)
             && !self
                 .timeline
                 .iter()
