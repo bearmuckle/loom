@@ -271,6 +271,7 @@ pub(crate) struct LoomView {
     pub(crate) timeline: Vec<TimelineItem>,
     pub(crate) activity_records_seen: bool,
     pub(crate) expanded_activities: BTreeSet<ActivityId>,
+    pub(crate) approval_request_in_flight: bool,
     pub(crate) pending_approval: Option<ToolCall>,
     pub(crate) pending_input: Option<String>,
     pub(crate) composer: TextBufferState,
@@ -547,6 +548,7 @@ impl LoomView {
             timeline: Vec::new(),
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
+            approval_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
             composer: TextBufferState::new(""),
@@ -664,6 +666,7 @@ impl LoomView {
             timeline: Vec::new(),
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
+            approval_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
             composer: TextBufferState::new(""),
@@ -921,6 +924,7 @@ impl LoomView {
         self.timeline.clear();
         self.activity_records_seen = false;
         self.expanded_activities.clear();
+        self.approval_request_in_flight = false;
         self.pending_approval = None;
         self.pending_input = None;
         self.active_run = None;
@@ -1284,6 +1288,7 @@ impl LoomView {
             AgentEvent::ToolPolicyEvaluated { .. } => {}
             AgentEvent::ToolApprovalDecided { .. } => {
                 self.pending_approval = None;
+                self.approval_request_in_flight = false;
                 for item in &mut self.timeline {
                     if let TimelineItem::Approval { active, .. } = item {
                         *active = false;
@@ -1672,9 +1677,13 @@ impl LoomView {
     }
 
     fn approve_pending_action(&mut self, cx: &mut Context<Self>) {
+        if self.approval_request_in_flight {
+            return;
+        }
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
             return;
         };
+        self.approval_request_in_flight = true;
         self.dispatch(
             cx,
             ClientRequest::ApproveAgentAction {
@@ -1686,9 +1695,13 @@ impl LoomView {
     }
 
     fn reject_pending_action(&mut self, cx: &mut Context<Self>) {
+        if self.approval_request_in_flight {
+            return;
+        }
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
             return;
         };
+        self.approval_request_in_flight = true;
         self.dispatch(
             cx,
             ClientRequest::RejectAgentAction {
@@ -1710,8 +1723,12 @@ impl LoomView {
                 self.active_session.state = self.session_state;
                 self.start_run_polling(cx);
             }
-            Err(error) => self.record_backend_error("approval", error),
+            Err(error) => {
+                self.approval_request_in_flight = false;
+                self.record_backend_error("approval", error);
+            }
             Ok(response) => {
+                self.approval_request_in_flight = false;
                 self.record_backend_error("approval", unexpected_response("approval", response))
             }
         }
@@ -2570,6 +2587,7 @@ impl LoomView {
             }
             if activity.status == AgentActivityStatus::AwaitingApproval
                 && self.pending_approval.is_some()
+                && !self.approval_request_in_flight
             {
                 row = row.child(
                     div()
@@ -2611,6 +2629,16 @@ impl LoomView {
                                     this.reject_pending_action(cx);
                                 })),
                         ),
+                );
+            } else if activity.status == AgentActivityStatus::AwaitingApproval
+                && self.approval_request_in_flight
+            {
+                row = row.child(
+                    div()
+                        .ml(px(26.))
+                        .mt_1()
+                        .text_color(rgb(0x94a3b8))
+                        .child("Submitting approval..."),
                 );
             }
             section = section.child(row);
@@ -2741,7 +2769,7 @@ impl LoomView {
                     } else {
                         format!("Approval resolved  >_ {name}")
                     });
-                if *active && self.pending_approval.is_some() {
+                if *active && self.pending_approval.is_some() && !self.approval_request_in_flight {
                     row = row.child(
                         div()
                             .mt_1()
@@ -2775,6 +2803,13 @@ impl LoomView {
                                         this.reject_pending_action(cx);
                                     })),
                             ),
+                    );
+                } else if *active && self.approval_request_in_flight {
+                    row = row.child(
+                        div()
+                            .mt_1()
+                            .text_color(rgb(0x94a3b8))
+                            .child("Submitting approval..."),
                     );
                 }
                 row.into_any()

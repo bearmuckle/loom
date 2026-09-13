@@ -301,7 +301,15 @@ impl RunHandle {
     /// Locks the runtime for an operation that responds to a state the run has
     /// already reached, allowing the worker a moment to finish its last step.
     fn runtime_for_entry(&self) -> Result<MutexGuard<'_, AgentRuntime>> {
-        if self.is_running() && self.wait_until_idle_for(ENTRY_SETTLE_TIMEOUT).is_err() {
+        // Approval events are journaled before the worker releases the runtime
+        // lock. Give that transition the same settle time as other control
+        // operations so a client can approve as soon as the prompt appears.
+        let settle_timeout = if self.state().run.state == AgentRunState::AwaitingApproval {
+            CONTROL_SETTLE_TIMEOUT
+        } else {
+            ENTRY_SETTLE_TIMEOUT
+        };
+        if self.is_running() && self.wait_until_idle_for(settle_timeout).is_err() {
             return Err(LoomError::new(
                 ErrorCode::Conflict,
                 format!("agent run {} is executing a step", self.run_id),
