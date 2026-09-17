@@ -177,20 +177,16 @@ struct IdempotencyRecord {
     response: ResponseEnvelope,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 struct PersistedBackendState {
-    schema_version: u32,
     sessions: loom_session::SessionManagerState,
     journal: EventJournal,
     runs: BTreeMap<loom_core::RunId, AgentRuntimeState>,
     workspaces: BTreeMap<ProjectId, loom_workspace::WorkspaceStateSnapshot>,
     policies: BTreeMap<ProjectId, ApprovalPolicy>,
-    terminal_projects: BTreeMap<loom_core::TerminalId, ProjectId>,
     provider_configs: Vec<ProviderConfig>,
     provider_health: BTreeMap<ProviderId, ProviderHealth>,
     provider_usage: UsageLedger,
-    models: Vec<ModelDescriptor>,
-    #[serde(default)]
     idempotency: BTreeMap<loom_core::RequestId, IdempotencyRecord>,
 }
 
@@ -821,49 +817,39 @@ impl InProcessBackend {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
         };
-        let state = if let Some(sessions) = persistence
-            .load_section::<loom_session::SessionManagerState>("sessions", CURRENT_SCHEMA_VERSION)?
-        {
-            let required = |name: &str| -> Result<Value> {
-                persistence
-                    .load_section(name, CURRENT_SCHEMA_VERSION)?
-                    .ok_or_else(|| {
-                        LoomError::new(
-                            ErrorCode::MalformedPayload,
-                            format!("persistence section '{name}' is missing"),
-                            false,
-                        )
-                    })
-            };
-            PersistedBackendState {
-                schema_version: CURRENT_SCHEMA_VERSION,
-                sessions,
-                journal: from_json(required("journal")?)?,
-                runs: from_json(required("runs")?)?,
-                workspaces: from_json(required("workspaces")?)?,
-                policies: from_json(required("policies")?)?,
-                terminal_projects: from_json(required("terminal_projects")?)?,
-                provider_configs: from_json(required("provider_configs")?)?,
-                provider_health: from_json(required("provider_health")?)?,
-                provider_usage: from_json(required("provider_usage")?)?,
-                models: from_json(required("models")?)?,
-                idempotency: from_json(required("idempotency")?)?,
-            }
-        } else {
-            let Some(state) =
-                persistence.load_versioned::<PersistedBackendState>(CURRENT_SCHEMA_VERSION)?
-            else {
-                return Ok(());
-            };
-            state
+        let mut needs_persist = false;
+        let Some(sessions) = persistence.load_section::<loom_session::SessionManagerState>(
+            "sessions",
+            CURRENT_SCHEMA_VERSION,
+        )?
+        else {
+            return Ok(());
         };
-        if state.schema_version != CURRENT_SCHEMA_VERSION {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted backend state has an unsupported schema version",
-                false,
-            ));
-        }
+        let required = |name: &str| -> Result<Value> {
+            persistence
+                .load_section(name, CURRENT_SCHEMA_VERSION)?
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persistence section '{name}' is missing"),
+                        false,
+                    )
+                })
+        };
+        let state = PersistedBackendState {
+            sessions,
+            journal: from_json(required("journal")?)?,
+            runs: from_json(required("runs")?)?,
+            workspaces: from_json(required("workspaces")?)?,
+            policies: from_json(required("policies")?)?,
+            provider_configs: from_json(required("provider_configs")?)?,
+            provider_health: from_json(required("provider_health")?)?,
+            provider_usage: from_json(required("provider_usage")?)?,
+            idempotency: from_json(required("idempotency")?)?,
+        };
+        let _: BTreeMap<loom_core::TerminalId, ProjectId> =
+            from_json(required("terminal_projects")?)?;
+        let _: Vec<ModelDescriptor> = from_json(required("models")?)?;
         let sessions = SessionManager::from_state(state.sessions)?;
         {
             let mut target = self.sessions()?;
@@ -972,10 +958,13 @@ impl InProcessBackend {
             restored_runs.insert(run_id, self.register_runtime(runtime));
             if !recovery_events.is_empty() {
                 self.append_recovery_events(session.id, recovery_events)?;
+                needs_persist = true;
             }
         }
         *self.runs()? = restored_runs;
-        self.persist_state()?;
+        if needs_persist {
+            self.persist_state()?;
+        }
         Ok(())
     }
 
@@ -1326,10 +1315,10 @@ impl InProcessConnection {
     }
 
     fn open_workspace(&self, project_id: ProjectId, root: String) -> Result<Workspace> {
-        let candidate = Workspace::open(project_id, PathBuf::from(root))?;
+        let requested_root = Workspace::canonical_root(&root)?;
         let mut workspaces = self.backend.workspaces()?;
         if let Some(existing) = workspaces.get(&project_id) {
-            if existing.root() != candidate.root() {
+            if existing.root() != requested_root {
                 return Err(LoomError::conflict(format!(
                     "project {project_id} is already configured for workspace '{}'",
                     existing.root().display()
@@ -1337,6 +1326,7 @@ impl InProcessConnection {
             }
             return Ok(existing.clone());
         }
+        let candidate = Workspace::open(project_id, requested_root)?;
         workspaces.insert(project_id, candidate.clone());
         Ok(candidate)
     }
@@ -1416,7 +1406,8 @@ impl InProcessConnection {
             );
         }
 
-        let retryable = request.request.is_retryable_mutation();
+        let durable_mutation = request.request.is_retryable_mutation();
+        let retryable = durable_mutation;
         let slot = if retryable {
             match self.backend.request_slot(request_id) {
                 Ok(slot) => Some(slot),
@@ -1457,7 +1448,11 @@ impl InProcessConnection {
                         return ResponseEnvelope::failure(request_id, error);
                     }
                 }
-                self.backend.persist_state().map(|()| response)
+                if durable_mutation {
+                    self.backend.persist_state().map(|()| response)
+                } else {
+                    Ok(response)
+                }
             }
             Err(error) => Err(error),
         };
@@ -3235,7 +3230,7 @@ mod tests {
     fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         let root = workspace();
         let persistence =
-            std::env::temp_dir().join(format!("loom-server-state-{}.json", ProjectId::new()));
+            std::env::temp_dir().join(format!("loom-server-state-{}.db", ProjectId::new()));
         let project_id = ProjectId::new();
         let (session_id, run_id, approval_id) = {
             let backend = InProcessBackend::new_persistent(&persistence).unwrap();
@@ -3571,15 +3566,16 @@ mod tests {
     }
 
     #[test]
-    fn malformed_persisted_backend_state_is_rejected_without_fallback() {
+    fn non_sqlite_persistence_file_is_rejected_without_fallback() {
         let path =
-            std::env::temp_dir().join(format!("loom-server-malformed-{}.json", ProjectId::new()));
+            std::env::temp_dir().join(format!("loom-server-malformed-{}.db", ProjectId::new()));
         fs::write(&path, br#"{"schema_version":1,"state":{"broken":true}}"#).unwrap();
         let error = match InProcessBackend::new_persistent(&path) {
-            Ok(_) => panic!("malformed backend state unexpectedly loaded"),
+            Ok(_) => panic!("non-SQLite persistence unexpectedly loaded"),
             Err(error) => error,
         };
-        assert_eq!(error.code, ErrorCode::MalformedPayload);
+        assert_eq!(error.code, ErrorCode::Persistence);
+        assert!(!path.with_extension("json.legacy").exists());
         fs::remove_file(path).unwrap();
     }
 
@@ -3858,7 +3854,7 @@ mod tests {
     #[test]
     fn retryable_mutation_idempotency_survives_backend_restart() {
         let path =
-            std::env::temp_dir().join(format!("loom-server-idempotency-{}.json", ProjectId::new()));
+            std::env::temp_dir().join(format!("loom-server-idempotency-{}.db", ProjectId::new()));
         let request_id = loom_core::RequestId::new();
         let request = RequestEnvelope::with_request_id(
             request_id,

@@ -22,7 +22,7 @@ implicitly trusted.
 - Durable state contains credential references and provider metadata only;
   raw API keys are resolved in memory for a provider call and are not
   serialized in the event journal, health errors, or protocol responses.
-- The M3 JSON state file is an atomic application snapshot, not an encrypted
+- The SQLite state database is durable application state, not an encrypted
   secret vault. Deployments must place it and any credential store under the
   backend user's protected data directory and use filesystem permissions
   appropriate to the deployment.

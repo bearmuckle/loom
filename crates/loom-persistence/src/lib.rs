@@ -1,6 +1,5 @@
 use std::{
     fs,
-    io::ErrorKind,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -41,96 +40,12 @@ impl FilePersistence {
         self.path.is_file()
     }
 
-    pub fn load<T: DeserializeOwned>(&self) -> Result<Option<T>> {
-        if self.is_database()? {
-            return self.load_section("state", CURRENT_SCHEMA_VERSION);
-        }
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(LoomError::new(
-                    ErrorCode::Persistence,
-                    format!(
-                        "could not read persistence file '{}': {error}",
-                        self.path.display()
-                    ),
-                    true,
-                ));
-            }
-        };
-        if bytes.is_empty() {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!("persistence file '{}' is empty", self.path.display()),
-                false,
-            ));
-        }
-        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-            LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!(
-                    "persistence file '{}' contains malformed JSON: {error}",
-                    self.path.display()
-                ),
-                false,
-            )
-        })
-    }
-
-    pub fn save<T: Serialize>(&self, value: &T) -> Result<()> {
-        let value = serde_json::to_value(value).map_err(|error| {
-            LoomError::new(
-                ErrorCode::Persistence,
-                format!("could not serialize durable state: {error}"),
-                false,
-            )
-        })?;
-        self.save_sections(CURRENT_SCHEMA_VERSION, &[("state", value)])
-    }
-
-    pub fn load_versioned<T: DeserializeOwned>(&self, expected_version: u32) -> Result<Option<T>> {
-        if self.is_database()? {
-            return self.load_section("state", expected_version);
-        }
-        let Some(value) = self.load::<VersionedState<T>>()? else {
-            return Ok(None);
-        };
-        if value.schema_version != expected_version {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!(
-                    "unsupported persistence schema version {} (expected {expected_version})",
-                    value.schema_version
-                ),
-                false,
-            ));
-        }
-        Ok(Some(value.state))
-    }
-
-    pub fn save_versioned<T: Serialize>(&self, schema_version: u32, state: &T) -> Result<()> {
-        self.save_sections(
-            schema_version,
-            &[(
-                "state",
-                serde_json::to_value(state).map_err(|error| {
-                    LoomError::new(
-                        ErrorCode::Persistence,
-                        format!("could not serialize durable state: {error}"),
-                        false,
-                    )
-                })?,
-            )],
-        )
-    }
-
     pub fn load_section<T: DeserializeOwned>(
         &self,
         section: &str,
         expected_version: u32,
     ) -> Result<Option<T>> {
-        if !self.is_database()? {
+        if !self.path.exists() {
             return Ok(None);
         }
         let connection = self.connection()?;
@@ -194,17 +109,6 @@ impl FilePersistence {
         })
     }
 
-    fn is_database(&self) -> Result<bool> {
-        match fs::read(&self.path) {
-            Ok(bytes) => Ok(bytes.starts_with(b"SQLite format 3\0")),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(persistence_error(
-                format!("could not inspect persistence file: {error}"),
-                true,
-            )),
-        }
-    }
-
     fn connection(&self) -> Result<Connection> {
         Connection::open(&self.path).map_err(|error| {
             persistence_error(
@@ -215,15 +119,6 @@ impl FilePersistence {
     }
 
     fn connection_for_write(&self) -> Result<Connection> {
-        if self.path.exists() && !self.is_database()? {
-            let legacy = self.path.with_extension("json.legacy");
-            fs::rename(&self.path, legacy).map_err(|error| {
-                persistence_error(
-                    format!("could not preserve legacy persistence file: {error}"),
-                    true,
-                )
-            })?;
-        }
         if let Some(parent) = self
             .path
             .parent()
@@ -265,18 +160,6 @@ fn persistence_error(message: String, retryable: bool) -> LoomError {
 }
 
 pub type DurableStore = FilePersistence;
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct VersionedState<T> {
-    schema_version: u32,
-    state: T,
-}
-
-#[derive(serde::Serialize)]
-struct VersionedStateRef<'a, T> {
-    schema_version: u32,
-    state: &'a T,
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryPersistence {
@@ -327,30 +210,6 @@ impl MemoryPersistence {
         Ok(())
     }
 
-    pub fn load_versioned<T: DeserializeOwned>(&self, expected_version: u32) -> Result<Option<T>> {
-        let Some(value) = self.load::<VersionedState<T>>()? else {
-            return Ok(None);
-        };
-        if value.schema_version != expected_version {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!(
-                    "unsupported persistence schema version {} (expected {expected_version})",
-                    value.schema_version
-                ),
-                false,
-            ));
-        }
-        Ok(Some(value.state))
-    }
-
-    pub fn save_versioned<T: Serialize>(&self, schema_version: u32, state: &T) -> Result<()> {
-        self.save(&VersionedStateRef {
-            schema_version,
-            state,
-        })
-    }
-
     pub fn set_raw(&self, value: Value) -> Result<()> {
         *self.value.lock().map_err(|_| {
             LoomError::new(
@@ -375,20 +234,18 @@ mod tests {
     }
 
     #[test]
-    fn file_store_round_trips_versioned_data_atomically() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.json", Uuid::new_v4()));
+    fn file_store_round_trips_section_data_atomically() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let store = FilePersistence::open(&path).unwrap();
         store
-            .save_versioned(
+            .save_sections(
                 CURRENT_SCHEMA_VERSION,
-                &Fixture {
-                    value: "durable".to_owned(),
-                },
+                &[("state", serde_json::json!({"value": "durable"}))],
             )
             .unwrap();
         assert_eq!(
             store
-                .load_versioned::<Fixture>(CURRENT_SCHEMA_VERSION)
+                .load_section::<Fixture>("state", CURRENT_SCHEMA_VERSION)
                 .unwrap()
                 .unwrap(),
             Fixture {
@@ -399,14 +256,15 @@ mod tests {
     }
 
     #[test]
-    fn malformed_data_is_a_structured_error() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.json", Uuid::new_v4()));
+    fn non_sqlite_file_is_rejected_without_migration() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         fs::write(&path, b"{not json").unwrap();
-        let error = FilePersistence::open(&path)
-            .unwrap()
-            .load::<Fixture>()
+        let store = FilePersistence::open(&path).unwrap();
+        let error = store
+            .save_sections(CURRENT_SCHEMA_VERSION, &[("state", serde_json::json!({}))])
             .unwrap_err();
-        assert_eq!(error.code, ErrorCode::MalformedPayload);
+        assert_eq!(error.code, ErrorCode::Persistence);
+        assert!(!path.with_extension("json.legacy").exists());
         fs::remove_file(path).unwrap();
     }
 

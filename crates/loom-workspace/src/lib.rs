@@ -26,7 +26,7 @@ const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
 fn is_ignored_directory(name: &std::ffi::OsStr) -> bool {
     matches!(
         name.to_str(),
-        Some(".git" | "target" | "node_modules" | ".venv" | "vendor")
+        Some(".git" | "target" | "dist" | "node_modules" | ".venv" | "vendor")
     )
 }
 
@@ -104,26 +104,7 @@ pub struct WorkspaceWatcher {
 impl Workspace {
     pub fn open(project_id: ProjectId, root: impl Into<PathBuf>) -> Result<Self> {
         let requested = root.into();
-        if !requested.is_dir() {
-            return Err(LoomError::new(
-                ErrorCode::WorkspaceAccessDenied,
-                format!(
-                    "workspace root '{}' is not a directory",
-                    requested.display()
-                ),
-                false,
-            ));
-        }
-        let root = fs::canonicalize(&requested).map_err(|error| {
-            LoomError::new(
-                ErrorCode::WorkspaceAccessDenied,
-                format!(
-                    "could not resolve workspace root '{}': {error}",
-                    requested.display()
-                ),
-                false,
-            )
-        })?;
+        let root = Self::canonical_root(&requested)?;
         let workspace = Self {
             inner: Arc::new(WorkspaceInner {
                 project_id,
@@ -141,6 +122,30 @@ impl Workspace {
         let snapshot = workspace.snapshot()?;
         workspace.lock_state()?.watcher_snapshot = Some(snapshot);
         Ok(workspace)
+    }
+
+    pub fn canonical_root(root: impl AsRef<Path>) -> Result<PathBuf> {
+        let requested = root.as_ref();
+        if !requested.is_dir() {
+            return Err(LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!(
+                    "workspace root '{}' is not a directory",
+                    requested.display()
+                ),
+                false,
+            ));
+        }
+        fs::canonicalize(requested).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!(
+                    "could not resolve workspace root '{}': {error}",
+                    requested.display()
+                ),
+                false,
+            )
+        })
     }
 
     pub fn project_id(&self) -> ProjectId {
@@ -1041,12 +1046,20 @@ mod tests {
     #[test]
     fn snapshots_and_reads_are_workspace_scoped() {
         let (workspace, root) = workspace();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("dist/generated.wasm"), [0_u8; 1024]).unwrap();
         let snapshot = workspace.snapshot().unwrap();
         assert!(
             snapshot
                 .entries
                 .iter()
                 .any(|entry| entry.path == "README.md")
+        );
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|entry| !entry.path.starts_with("dist"))
         );
         assert_eq!(workspace.read_file("README.md").unwrap().content, "hello\n");
         let error = workspace.read_file("../outside").unwrap_err();

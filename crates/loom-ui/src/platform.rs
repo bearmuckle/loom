@@ -211,7 +211,7 @@ pub(crate) fn backend_persistence_path(root: &Path) -> Result<PathBuf, LoomError
     Ok(state_root
         .join("loom")
         .join("projects")
-        .join(format!("{project_key}.json")))
+        .join(format!("{project_key}.db")))
 }
 
 pub(crate) fn stable_project_id(root: &Path) -> ProjectId {

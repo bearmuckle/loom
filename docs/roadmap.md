@@ -66,10 +66,10 @@ Implementation notes for the first vertical slice:
   configurations with normalized discovery, capability intersection,
   credential references, usage records, rate-limit/error normalization, and
   health state.
-- `loom-persistence` stores a versioned JSON snapshot atomically. The
-  snapshot covers the session/event journal, serializable runtime state,
-  checkpoints, policies, provider health, and usage. Recovery pauses
-  unfinished runs for explicit resume.
+- `loom-persistence` stores sectioned SQLite state atomically. The sections
+  cover the session/event journal, serializable runtime state, checkpoints,
+  policies, provider health, and usage. Recovery pauses unfinished runs for
+  explicit resume.
 - `loom-context` reports assembly decisions, compaction summaries, omissions,
   and budgets. Runtime limits are represented by typed usage/limit events.
 

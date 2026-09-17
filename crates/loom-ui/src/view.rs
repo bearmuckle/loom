@@ -73,6 +73,7 @@ use crate::{
     },
     platform::{UiOptions, backend_persistence_path, prepare_workspace, stable_project_id},
 };
+use log::info;
 
 /// Opens a URL in a new tab/window. Natively this shells out to the OS's
 /// "open" handler; in the browser it's just `window.open`.
@@ -446,14 +447,18 @@ impl LoomView {
         focus_handle: FocusHandle,
         rename_focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
+        info!("bootstrapping backend connection");
         let (connection, workspace_root, project_id, demo_workspace) =
             if let Some(remote_url) = &options.remote {
+                info!("connecting to remote backend at {remote_url}");
                 let token = options.token.as_deref().ok_or_else(|| {
                     LoomError::invalid_request("remote connections require LOOM_TOKEN to be set")
                 })?;
                 let connection = ClientConnection::remote(remote_url.clone(), token.to_owned())?;
+                info!("remote transport connected; negotiating protocol");
                 negotiate(&connection)?;
                 let projects = list_projects(&connection)?;
+                info!("remote backend returned {} project(s)", projects.len());
                 let project = select_remote_project(
                     &projects,
                     options.workspace.as_deref().and_then(|path| path.to_str()),
@@ -465,27 +470,42 @@ impl LoomView {
                         false,
                     )
                 })?;
+                info!("selected remote project {}", project.id);
                 (connection, workspace_root, project.id, false)
             } else {
                 let (workspace_root, demo_workspace) = prepare_workspace(options)?;
+                info!(
+                    "using workspace '{}'{}",
+                    workspace_root.display(),
+                    if demo_workspace { " (demo)" } else { "" }
+                );
                 let project_id = if demo_workspace {
                     ProjectId::new()
                 } else {
                     stable_project_id(&workspace_root)
                 };
                 let backend = if demo_workspace {
+                    info!("starting demo backend");
                     InProcessBackend::demo_with_github_copilot()?
                 } else if let Some(endpoint) = &options.endpoint {
+                    let persistence_path = backend_persistence_path(&workspace_root)?;
+                    info!(
+                        "starting local backend with OpenAI-compatible endpoint; state '{}'",
+                        persistence_path.display()
+                    );
                     InProcessBackend::with_openai_compatible_persistent_with_github_copilot(
                         endpoint,
                         options.api_key.as_deref().unwrap_or_default(),
                         options.model.clone(),
-                        backend_persistence_path(&workspace_root)?,
+                        persistence_path,
                     )?
                 } else {
-                    InProcessBackend::new_persistent_with_github_copilot(backend_persistence_path(
-                        &workspace_root,
-                    )?)?
+                    let persistence_path = backend_persistence_path(&workspace_root)?;
+                    info!(
+                        "starting local backend with GitHub Copilot; state '{}'",
+                        persistence_path.display()
+                    );
+                    InProcessBackend::new_persistent_with_github_copilot(persistence_path)?
                 };
                 (
                     ClientConnection::InProcess(backend.connect()),
@@ -495,13 +515,21 @@ impl LoomView {
                 )
             };
         if options.remote.is_none() {
+            info!("negotiating protocol and opening workspace");
             negotiate(&connection)?;
             open_workspace(&connection, project_id, &workspace_root)?;
         }
         let sessions = list_sessions(&connection, project_id)?;
+        info!("loaded {} session(s)", sessions.len());
         let session = sessions.into_iter().next().map_or_else(
-            || create_session(&connection, project_id, "New session"),
-            Ok,
+            || {
+                info!("creating a new session");
+                create_session(&connection, project_id, "New session")
+            },
+            |session| {
+                info!("resuming session {}", session.id);
+                Ok(session)
+            },
         )?;
         let models = list_models(&connection)?;
         let model = if models.contains(&options.model) {
@@ -514,7 +542,13 @@ impl LoomView {
                 .or_else(|| models.first().cloned())
                 .unwrap_or_else(|| options.model.clone())
         };
+        info!(
+            "loaded {} model(s); selected '{}'",
+            models.len(),
+            model.as_str()
+        );
         let run = if demo_workspace {
+            info!("starting demo agent run");
             Some(start_run(
                 &connection,
                 &session,
@@ -585,6 +619,7 @@ impl LoomView {
         view.refresh_sessions()?;
         let active_session = view.active_session.clone();
         view.load_session(active_session);
+        info!("initial session state loaded");
         Ok(view)
     }
 
