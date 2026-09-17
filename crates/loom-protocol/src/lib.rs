@@ -575,6 +575,7 @@ pub enum ClientFrame {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ServerFrame {
     Response(Box<ResponseEnvelope>),
     Event(ServerEventEnvelope),
@@ -590,6 +591,7 @@ pub struct ServerEventEnvelope {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ServerEvent {
     AgentSessionCreated {
         snapshot: AgentSessionSnapshot,

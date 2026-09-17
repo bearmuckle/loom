@@ -136,10 +136,13 @@ impl ToolExecutor {
     /// Executes independent tool calls concurrently and returns results in request order.
     pub fn execute_many(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
         std::thread::scope(|scope| {
-            calls
+            let workers = calls
                 .iter()
                 .map(|call| scope.spawn(move || self.execute(call)))
-                .map(|handle| handle.join().expect("tool worker panicked"))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("tool worker panicked"))
                 .collect()
         })
     }
@@ -462,7 +465,11 @@ impl ToolExecutor {
 
     fn limit_output(&self, mut output: String) -> String {
         if output.len() > self.max_output_bytes {
-            output.truncate(self.max_output_bytes);
+            let mut boundary = self.max_output_bytes;
+            while boundary > 0 && !output.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            output.truncate(boundary);
             output.push_str("\n[output truncated]");
         }
         output
@@ -734,6 +741,16 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.output.contains("inside the workspace root"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn truncates_unicode_without_panicking() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        let output = executor.limit_output(format!("{}x", "😀".repeat(20_000)));
+        assert!(output.ends_with("[output truncated]"));
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -56,6 +56,7 @@ pub enum ApprovalDecision {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum AgentEvent {
     RunStarted {
         snapshot: AgentRunSnapshot,
