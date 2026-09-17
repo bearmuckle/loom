@@ -665,13 +665,8 @@ impl AgentRuntime {
             decision: ApprovalDecision::Approved,
         }];
         events.extend(self.set_state(AgentRunState::Executing));
-        let (tool_events, result) = self.execute_tool(&pending.call);
+        let (tool_events, _result) = self.execute_tool(&pending.call);
         events.extend(tool_events);
-        if !result.success {
-            self.last_failed_call = Some(pending.call);
-            events.extend(self.finish_failed(result.output));
-            return Ok(RunProgress::blocked(events));
-        }
         self.last_failed_call = None;
         Ok(RunProgress::running(events))
     }
@@ -928,14 +923,10 @@ impl AgentRuntime {
         self.run.summary = None;
         let mut events = self.set_state(AgentRunState::Executing);
         events.push(self.start_tool_activity(&call, None));
-        let (tool_events, result) = self.execute_tool(&call);
+        let (tool_events, _result) = self.execute_tool(&call);
         events.extend(tool_events);
-        if result.success {
-            self.last_failed_call = None;
-            return Ok(RunProgress::running(events));
-        }
-        events.extend(self.finish_failed(result.output));
-        Ok(RunProgress::blocked(events))
+        self.last_failed_call = None;
+        Ok(RunProgress::running(events))
     }
 
     pub fn retry_from_checkpoint(&mut self) -> Result<Vec<AgentEvent>> {
@@ -1256,7 +1247,6 @@ impl AgentRuntime {
                         tool_call_id: Some(result.tool_call_id),
                         tool_calls: Vec::new(),
                     });
-                    self.last_failed_call = Some(call);
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
                     ctx.events.push(AgentEvent::StepCompleted {
@@ -1264,8 +1254,6 @@ impl AgentRuntime {
                         step_id: ctx.step_id,
                         index: ctx.step_index,
                     });
-                    ctx.events.extend(self.finish_failed(output));
-                    ctx.finished = true;
                     return Ok(StreamFlow::Stop);
                 };
                 let evaluation = self
@@ -1303,9 +1291,13 @@ impl AgentRuntime {
                         step_id: ctx.step_id,
                         index: ctx.step_index,
                     });
-                    ctx.events
-                        .extend(self.finish_failed("tool call denied by the workspace policy"));
-                    ctx.finished = true;
+                    self.messages.push(ModelMessage {
+                        role: MessageRole::Tool,
+                        content: result.output,
+                        name: Some(result.name),
+                        tool_call_id: Some(result.tool_call_id),
+                        tool_calls: Vec::new(),
+                    });
                     return Ok(StreamFlow::Stop);
                 }
                 if matches!(
@@ -1374,8 +1366,13 @@ impl AgentRuntime {
                             step_id: ctx.step_id,
                             index: ctx.step_index,
                         });
-                        ctx.events.extend(self.finish_failed(output));
-                        ctx.finished = true;
+                        self.messages.push(ModelMessage {
+                            role: MessageRole::Tool,
+                            content: output,
+                            name: Some(call.name.clone()),
+                            tool_call_id: Some(call.id),
+                            tool_calls: Vec::new(),
+                        });
                         return Ok(StreamFlow::Stop);
                     }
                     self.plan = AgentPlan {
@@ -1436,8 +1433,13 @@ impl AgentRuntime {
                             step_id: ctx.step_id,
                             index: ctx.step_index,
                         });
-                        ctx.events.extend(self.finish_failed(output));
-                        ctx.finished = true;
+                        self.messages.push(ModelMessage {
+                            role: MessageRole::Tool,
+                            content: output,
+                            name: Some(call.name.clone()),
+                            tool_call_id: Some(call.id),
+                            tool_calls: Vec::new(),
+                        });
                         return Ok(StreamFlow::Stop);
                     };
                     self.pending_input = Some(prompt.to_owned());
@@ -1471,9 +1473,7 @@ impl AgentRuntime {
                 if result.success {
                     self.last_failed_call = None;
                 } else {
-                    self.last_failed_call = Some(call);
-                    ctx.events.extend(self.finish_failed(result.output));
-                    ctx.finished = true;
+                    self.last_failed_call = None;
                     return Ok(StreamFlow::Stop);
                 }
             }
@@ -2603,12 +2603,11 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        runtime.approve(patch_approval).unwrap();
-        assert_eq!(runtime.snapshot().state, AgentRunState::Failed);
+        let recovery_events = runtime.approve(patch_approval).unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
 
         fs::remove_file(root.join("loom-m1-demo.txt")).unwrap();
-        let retry_events = runtime.retry().unwrap();
-        let command_approval = retry_events
+        let command_approval = recovery_events
             .iter()
             .find_map(|event| match event {
                 AgentEvent::ToolApprovalRequired { call, .. } if call.name == "run_command" => {

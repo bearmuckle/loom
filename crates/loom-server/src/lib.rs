@@ -3165,7 +3165,7 @@ mod tests {
         let ServerResponse::AgentRun(snapshot) = run.result.unwrap() else {
             panic!("unexpected run response");
         };
-        assert_eq!(snapshot.state, AgentRunState::Failed);
+        assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
         fs::remove_dir_all(root).unwrap();
     }
 

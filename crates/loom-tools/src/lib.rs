@@ -71,6 +71,7 @@ impl ToolKind {
     }
 }
 
+#[derive(Clone)]
 pub struct ToolExecutor {
     root: PathBuf,
     max_output_bytes: usize,
@@ -132,6 +133,20 @@ impl ToolExecutor {
         }
     }
 
+    /// Executes independent tool calls concurrently and returns results in request order.
+    pub fn execute_many(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
+        std::thread::scope(|scope| {
+            let workers = calls
+                .iter()
+                .map(|call| scope.spawn(move || self.execute(call)))
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("tool worker panicked"))
+                .collect()
+        })
+    }
+
     fn list_files(&self, call: &ToolCall) -> ToolResult {
         let arguments: ListFilesArguments = match parse_arguments(call) {
             Ok(arguments) => arguments,
@@ -160,7 +175,21 @@ impl ToolExecutor {
             Err(error) => return ToolResult::failure(call, error),
         };
         match fs::read_to_string(&path) {
-            Ok(contents) => ToolResult::success(call, self.limit_output(contents)),
+            Ok(contents) => {
+                if arguments.line_start.is_none() && arguments.line_end.is_none() {
+                    return ToolResult::success(call, self.limit_output(contents));
+                }
+                let start = arguments.line_start.unwrap_or(1).max(1) as usize;
+                let end = arguments.line_end.unwrap_or(u64::MAX) as usize;
+                let ranged = contents
+                    .lines()
+                    .enumerate()
+                    .filter(|(index, _)| *index + 1 >= start && *index < end)
+                    .map(|(index, line)| format!("{}:{}", index + 1, line))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ToolResult::success(call, self.limit_output(ranged))
+            }
             Err(error) => ToolResult::failure(
                 call,
                 format!("could not read '{}': {error}", arguments.path),
@@ -182,9 +211,13 @@ impl ToolExecutor {
             Err(error) => return ToolResult::failure(call, error),
         };
         let mut matches = Vec::new();
-        if let Err(error) =
-            self.collect_matches(&path, Path::new(relative), &arguments.query, &mut matches)
-        {
+        if let Err(error) = self.collect_matches(
+            &path,
+            Path::new(relative),
+            &arguments.query,
+            arguments.glob.as_deref(),
+            &mut matches,
+        ) {
             return ToolResult::failure(call, error);
         }
         ToolResult::success(call, self.limit_output(matches.join("\n")))
@@ -334,10 +367,10 @@ impl ToolExecutor {
             let entry =
                 entry.map_err(|error| format!("could not read directory entry: {error}"))?;
             let name = entry.file_name();
-            if is_ignored_directory(&name) {
+            let child_relative = relative.join(&name);
+            if is_ignored_directory(&name) || self.is_ignored(&child_relative) {
                 continue;
             }
-            let child_relative = relative.join(&name);
             let child = entry.path();
             let file_type = entry
                 .file_type()
@@ -359,6 +392,7 @@ impl ToolExecutor {
         path: &Path,
         relative: &Path,
         query: &str,
+        glob: Option<&str>,
         matches: &mut Vec<String>,
     ) -> std::result::Result<(), String> {
         if path.is_dir() {
@@ -368,7 +402,8 @@ impl ToolExecutor {
                 let entry =
                     entry.map_err(|error| format!("could not read directory entry: {error}"))?;
                 let name = entry.file_name();
-                if is_ignored_directory(&name) {
+                let child_relative = relative.join(&name);
+                if is_ignored_directory(&name) || self.is_ignored(&child_relative) {
                     continue;
                 }
                 if entry
@@ -378,11 +413,14 @@ impl ToolExecutor {
                 {
                     continue;
                 }
-                self.collect_matches(&entry.path(), &relative.join(name), query, matches)?;
+                self.collect_matches(&entry.path(), &child_relative, query, glob, matches)?;
             }
             return Ok(());
         }
 
+        if glob.is_some_and(|pattern| !glob_matches(pattern, relative)) {
+            return Ok(());
+        }
         let contents = match fs::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(()),
@@ -403,9 +441,35 @@ impl ToolExecutor {
         Ok(())
     }
 
+    fn is_ignored(&self, relative: &Path) -> bool {
+        let Ok(contents) = fs::read_to_string(self.root.join(".gitignore")) else {
+            return false;
+        };
+        contents
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                (!line.is_empty() && !line.starts_with('#')).then_some(line.trim_end_matches('/'))
+            })
+            .any(|pattern| {
+                let path = relative.to_string_lossy();
+                let pattern = pattern.trim_start_matches('/');
+                path == pattern
+                    || path.starts_with(&format!("{pattern}/"))
+                    || (!pattern.contains('/')
+                        && relative
+                            .components()
+                            .any(|component| component.as_os_str() == pattern))
+            })
+    }
+
     fn limit_output(&self, mut output: String) -> String {
         if output.len() > self.max_output_bytes {
-            output.truncate(self.max_output_bytes);
+            let mut boundary = self.max_output_bytes;
+            while boundary > 0 && !output.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            output.truncate(boundary);
             output.push_str("\n[output truncated]");
         }
         output
@@ -435,7 +499,11 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             description: "Read a UTF-8 text file inside the workspace.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "line_start": {"type": "integer", "minimum": 1},
+                    "line_end": {"type": "integer", "minimum": 1}
+                },
                 "required": ["path"],
                 "additionalProperties": false
             }),
@@ -447,7 +515,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "path": {"type": "string"}
+                    "path": {"type": "string"},
+                    "glob": {"type": "string"}
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -518,12 +587,40 @@ struct ListFilesArguments {
 #[derive(Debug, Deserialize)]
 struct ReadFileArguments {
     path: String,
+    #[serde(default)]
+    line_start: Option<u64>,
+    #[serde(default)]
+    line_end: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SearchTextArguments {
     query: String,
     path: Option<String>,
+    glob: Option<String>,
+}
+
+fn glob_matches(pattern: &str, path: &Path) -> bool {
+    let pattern = pattern.replace('\\', "/");
+    let path = path.to_string_lossy().replace('\\', "/");
+    let mut parts = pattern.split('*');
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    if !path.starts_with(first) {
+        return false;
+    }
+    let mut offset = first.len();
+    for part in parts {
+        if part.is_empty() {
+            continue;
+        }
+        let Some(found) = path[offset..].find(part) else {
+            return false;
+        };
+        offset += found + part.len();
+    }
+    pattern.ends_with('*') || offset == path.len()
 }
 
 #[derive(Debug, Deserialize)]
@@ -553,6 +650,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("loom-tools-{}", ProjectId::new()));
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("README.md"), "Loom workspace\n").unwrap();
+        fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        fs::create_dir_all(root.join("ignored")).unwrap();
+        fs::write(root.join("ignored/generated.txt"), "hidden\n").unwrap();
         fs::write(
             root.join("src/main.rs"),
             "fn main() { println!(\"hello\"); }\n",
@@ -578,6 +678,7 @@ mod tests {
         assert!(files.success);
         assert!(files.output.contains("README.md"));
         assert!(files.output.contains("src/main.rs"));
+        assert!(!files.output.contains("ignored/generated.txt"));
 
         let read = executor.execute(&call("read_file", serde_json::json!({"path": "README.md"})));
         assert_eq!(read.output, "Loom workspace\n");
@@ -602,6 +703,12 @@ mod tests {
             fs::read_to_string(root.join("README.md")).unwrap(),
             "Loom M1 workspace\n"
         );
+        fs::write(root.join("README.md"), "one\ntwo\nthree\n").unwrap();
+        let ranged = executor.execute(&call(
+            "read_file",
+            serde_json::json!({"path": "README.md", "line_start": 2, "line_end": 3}),
+        ));
+        assert_eq!(ranged.output, "2:two\n3:three");
 
         let command = if cfg!(windows) {
             ("cmd", vec!["/C", "echo", "ok"])
@@ -634,6 +741,16 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.output.contains("inside the workspace root"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn truncates_unicode_without_panicking() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        let output = executor.limit_output(format!("{}x", "😀".repeat(20_000)));
+        assert!(output.ends_with("[output truncated]"));
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
 }
