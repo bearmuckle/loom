@@ -30,10 +30,31 @@ use loom_session::SessionManager;
 use loom_tools::ToolExecutor;
 use loom_vcs::GitService;
 use loom_workspace::Workspace;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
 mod auth;
 mod remote;
+
+fn json_value<T: Serialize>(value: T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            format!("could not serialize persistence section: {error}"),
+            false,
+        )
+    })
+}
+
+fn from_json<T: DeserializeOwned>(value: Value) -> Result<T> {
+    serde_json::from_value(value).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted state contains malformed JSON: {error}"),
+            false,
+        )
+    })
+}
 
 pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
 pub use remote::{
@@ -800,10 +821,41 @@ impl InProcessBackend {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
         };
-        let Some(state) =
-            persistence.load_versioned::<PersistedBackendState>(CURRENT_SCHEMA_VERSION)?
-        else {
-            return Ok(());
+        let state = if let Some(sessions) = persistence
+            .load_section::<loom_session::SessionManagerState>("sessions", CURRENT_SCHEMA_VERSION)?
+        {
+            let required = |name: &str| -> Result<Value> {
+                persistence
+                    .load_section(name, CURRENT_SCHEMA_VERSION)?
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            format!("persistence section '{name}' is missing"),
+                            false,
+                        )
+                    })
+            };
+            PersistedBackendState {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions,
+                journal: from_json(required("journal")?)?,
+                runs: from_json(required("runs")?)?,
+                workspaces: from_json(required("workspaces")?)?,
+                policies: from_json(required("policies")?)?,
+                terminal_projects: from_json(required("terminal_projects")?)?,
+                provider_configs: from_json(required("provider_configs")?)?,
+                provider_health: from_json(required("provider_health")?)?,
+                provider_usage: from_json(required("provider_usage")?)?,
+                models: from_json(required("models")?)?,
+                idempotency: from_json(required("idempotency")?)?,
+            }
+        } else {
+            let Some(state) =
+                persistence.load_versioned::<PersistedBackendState>(CURRENT_SCHEMA_VERSION)?
+            else {
+                return Ok(());
+            };
+            state
         };
         if state.schema_version != CURRENT_SCHEMA_VERSION {
             return Err(LoomError::new(
@@ -931,7 +983,7 @@ impl InProcessBackend {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
-        let runs = self
+        let runs: BTreeMap<loom_core::RunId, AgentRuntimeState> = self
             .runs()?
             .iter()
             .map(|(run_id, handle)| (*run_id, handle.state()))
@@ -941,21 +993,31 @@ impl InProcessBackend {
             .iter()
             .map(|(project_id, workspace)| Ok((*project_id, workspace.export_state()?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let state = PersistedBackendState {
-            schema_version: CURRENT_SCHEMA_VERSION,
-            sessions: self.sessions()?.export_state(),
-            journal: self.journal()?.clone(),
-            runs,
-            workspaces,
-            policies: self.policies()?.clone(),
-            terminal_projects: self.terminal_projects()?.clone(),
-            provider_configs: self.providers.export_configs()?,
-            provider_health: self.providers.export_health()?,
-            provider_usage: self.providers.usage()?,
-            models: self.models.clone(),
-            idempotency: self.idempotency()?.clone(),
-        };
-        persistence.save_versioned(CURRENT_SCHEMA_VERSION, &state)
+        persistence.save_sections(
+            CURRENT_SCHEMA_VERSION,
+            &[
+                ("sessions", json_value(self.sessions()?.export_state())?),
+                ("journal", json_value(self.journal()?.clone())?),
+                ("runs", json_value(runs)?),
+                ("workspaces", json_value(workspaces)?),
+                ("policies", json_value(self.policies()?.clone())?),
+                (
+                    "terminal_projects",
+                    json_value(self.terminal_projects()?.clone())?,
+                ),
+                (
+                    "provider_configs",
+                    json_value(self.providers.export_configs()?)?,
+                ),
+                (
+                    "provider_health",
+                    json_value(self.providers.export_health()?)?,
+                ),
+                ("provider_usage", json_value(self.providers.usage()?)?),
+                ("models", json_value(self.models.clone())?),
+                ("idempotency", json_value(self.idempotency()?.clone())?),
+            ],
+        )
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -3273,36 +3335,60 @@ mod tests {
                 tool_call_id: approval_id,
             }));
         assert!(response.result.is_ok());
-        let events = match connection
-            .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-                session_id: Some(session_id),
-                after_sequence: None,
-            }))
-            .result
-            .unwrap()
-        {
-            ServerResponse::SessionEvents { events } => events,
-            response => panic!("unexpected events response: {response:?}"),
-        };
-        let command_approval = events
-            .iter()
-            .find_map(|event| match &event.event {
-                ServerEvent::Agent {
-                    event: AgentEvent::ToolApprovalRequired { call, .. },
-                } if call.name == "run_command" => Some(call.id),
-                _ => None,
+        await_settled_run(&connection, run_id);
+        let command_approval = (0..1_000)
+            .find_map(|_| {
+                let events = match connection
+                    .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                        session_id: Some(session_id),
+                        after_sequence: None,
+                    }))
+                    .result
+                    .unwrap()
+                {
+                    ServerResponse::SessionEvents { events } => events,
+                    response => panic!("unexpected events response: {response:?}"),
+                };
+                let approval = events.iter().find_map(|event| match &event.event {
+                    ServerEvent::Agent {
+                        event: AgentEvent::ToolApprovalRequired { call, .. },
+                    } if call.name == "run_command" => Some(call.id),
+                    _ => None,
+                });
+                approval.or_else(|| {
+                    thread::sleep(Duration::from_millis(5));
+                    None
+                })
             })
-            .unwrap();
+            .expect("run_command approval did not arrive");
         let response =
             connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                 run_id,
                 tool_call_id: command_approval,
             }));
         assert!(response.result.is_ok());
-        let usage = connection.request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }));
-        let ServerResponse::RunUsage { usage, .. } = usage.result.unwrap() else {
-            panic!("unexpected usage response");
+        let mut usage = match connection
+            .request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::RunUsage { usage, .. } => usage,
+            response => panic!("unexpected usage response: {response:?}"),
         };
+        for _ in 0..1_000 {
+            if usage.input_tokens > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+            usage = match connection
+                .request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }))
+                .result
+                .unwrap()
+            {
+                ServerResponse::RunUsage { usage, .. } => usage,
+                response => panic!("unexpected usage response: {response:?}"),
+            };
+        }
         assert_eq!(usage.input_tokens, 240);
         assert_eq!(usage.output_tokens, 52);
         assert_eq!(usage.tool_calls, 3);

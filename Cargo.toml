@@ -69,3 +69,4 @@ web-sys = { version = "0.3", features = [
 ] }
 getrandom = { version = "0.2", features = ["js"] }
 futures-channel = "0.3"
+rusqlite = { version = "0.32.1", features = ["bundled"] }

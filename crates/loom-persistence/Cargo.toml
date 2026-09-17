@@ -11,3 +11,4 @@ loom-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+rusqlite.workspace = true
