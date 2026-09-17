@@ -258,6 +258,17 @@ impl RunHandle {
                 state.pending_input = Some(prompt.clone());
             }
             AgentEvent::UserMessage { .. } => state.pending_input = None,
+            AgentEvent::ActivityRecorded { activity, .. } => {
+                if let Some(existing) = state
+                    .activities
+                    .iter_mut()
+                    .find(|existing| existing.id == activity.id)
+                {
+                    *existing = activity.clone();
+                } else {
+                    state.activities.push(activity.clone());
+                }
+            }
             _ => {}
         }
     }
@@ -290,7 +301,15 @@ impl RunHandle {
     /// Locks the runtime for an operation that responds to a state the run has
     /// already reached, allowing the worker a moment to finish its last step.
     fn runtime_for_entry(&self) -> Result<MutexGuard<'_, AgentRuntime>> {
-        if self.is_running() && self.wait_until_idle_for(ENTRY_SETTLE_TIMEOUT).is_err() {
+        // Approval events are journaled before the worker releases the runtime
+        // lock. Give that transition the same settle time as other control
+        // operations so a client can approve as soon as the prompt appears.
+        let settle_timeout = if self.state().run.state == AgentRunState::AwaitingApproval {
+            CONTROL_SETTLE_TIMEOUT
+        } else {
+            ENTRY_SETTLE_TIMEOUT
+        };
+        if self.is_running() && self.wait_until_idle_for(settle_timeout).is_err() {
             return Err(LoomError::new(
                 ErrorCode::Conflict,
                 format!("agent run {} is executing a step", self.run_id),
@@ -1490,11 +1509,7 @@ impl InProcessConnection {
                 self.backend.journal()?.append_session(record);
                 Ok(ServerResponse::AgentSessionRenamed(snapshot))
             }
-            ClientRequest::ArchiveAgentSession { session_id } => {
-                let (snapshot, record) = self.backend.sessions()?.archive(session_id)?;
-                self.backend.journal()?.append_session(record);
-                Ok(ServerResponse::AgentSessionArchived(snapshot))
-            }
+            ClientRequest::ArchiveAgentSession { session_id } => self.archive_session(session_id),
             ClientRequest::GetSessionEvents {
                 session_id,
                 after_sequence,
@@ -2337,6 +2352,45 @@ impl InProcessConnection {
         Ok(ServerResponse::AgentRun(handle.snapshot()))
     }
 
+    fn archive_session(&self, session_id: AgentSessionId) -> Result<ServerResponse> {
+        let session = self.backend.sessions()?.get(session_id)?;
+        if matches!(
+            session.state,
+            AgentSessionState::Queued
+                | AgentSessionState::Planning
+                | AgentSessionState::AwaitingApproval
+                | AgentSessionState::Paused
+                | AgentSessionState::Executing
+                | AgentSessionState::Evaluating
+                | AgentSessionState::NeedsInput
+        ) {
+            let run_id = self
+                .backend
+                .runs()?
+                .iter()
+                .filter(|(_, handle)| handle.session_id == session_id)
+                .map(|(run_id, handle)| (*run_id, handle.snapshot()))
+                .filter(|(_, snapshot)| {
+                    !matches!(
+                        snapshot.state,
+                        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                    )
+                })
+                .max_by_key(|(_, snapshot)| snapshot.updated_at)
+                .map(|(run_id, _)| run_id)
+                .ok_or_else(|| {
+                    LoomError::invalid_state(
+                        "running agent sessions must be stopped before archiving",
+                    )
+                })?;
+            self.stop_run(run_id, RunStop::Interrupt)?;
+        }
+
+        let (snapshot, record) = self.backend.sessions()?.archive(session_id)?;
+        self.backend.journal()?.append_session(record);
+        Ok(ServerResponse::AgentSessionArchived(snapshot))
+    }
+
     fn retry_from_checkpoint(
         &self,
         run_id: loom_core::RunId,
@@ -2417,6 +2471,7 @@ fn run_snapshot_projection(state: &AgentRuntimeState) -> AgentRunSnapshotProject
         pending_approval: state.pending_approval.clone(),
         pending_input: state.pending_input.clone(),
         usage: state.usage.clone(),
+        activities: state.activities.clone(),
     }
 }
 
@@ -2460,7 +2515,9 @@ mod tests {
     use loom_context::ContextAssemblyOptions;
     use loom_core::{CapabilitySet, PolicyDecision, ProjectId, ToolCallId};
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
-    use loom_protocol::{ClientRequest, RequestEnvelope, ServerEvent, ServerResponse};
+    use loom_protocol::{
+        AgentActivityStatus, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
+    };
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
     use super::*;
@@ -2685,14 +2742,6 @@ mod tests {
             Ok(ServerResponse::WorkspaceChanges { .. })
         ));
 
-        let interrupted =
-            connection.request(RequestEnvelope::new(ClientRequest::InterruptAgentRun {
-                run_id,
-            }));
-        assert!(matches!(
-            interrupted.result,
-            Ok(ServerResponse::AgentRun(_))
-        ));
         let archived =
             connection.request(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
                 session_id: session.id,
@@ -2814,6 +2863,21 @@ mod tests {
             panic!("unexpected response");
         };
         assert_eq!(snapshot.state, AgentRunState::Completed);
+        let history = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            after_sequence: None,
+        }));
+        let ServerResponse::SessionEvents { events } = history.result.unwrap() else {
+            panic!("unexpected history response");
+        };
+        assert!(events.iter().any(|event| {
+            matches!(
+                &event.event,
+                ServerEvent::Agent {
+                    event: AgentEvent::ActivityRecorded { activity, .. }
+                } if activity.run_id == run_id && activity.completed_at.is_some()
+            )
+        }));
         assert!(root.join("loom-m1-demo.txt").is_file());
         fs::remove_dir_all(root).unwrap();
     }
@@ -3171,6 +3235,21 @@ mod tests {
             panic!("unexpected run response");
         };
         assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
+        let recovered_snapshot =
+            connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+                run_id,
+            }));
+        let ServerResponse::AgentRunSnapshot(projection) = recovered_snapshot.result.unwrap()
+        else {
+            panic!("unexpected run snapshot response");
+        };
+        assert!(!projection.activities.is_empty());
+        assert!(
+            projection
+                .activities
+                .iter()
+                .any(|activity| activity.status == AgentActivityStatus::AwaitingApproval)
+        );
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: None,

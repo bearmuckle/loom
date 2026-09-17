@@ -54,6 +54,7 @@ macro_rules! uuid_id {
 }
 
 uuid_id!(AgentSessionId);
+uuid_id!(ActivityId);
 uuid_id!(CheckpointId);
 uuid_id!(ProjectId);
 uuid_id!(RequestId);

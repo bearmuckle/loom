@@ -274,10 +274,20 @@ impl ToolExecutor {
 
     fn resolve_relative(&self, relative: &str) -> std::result::Result<PathBuf, String> {
         let path = Path::new(relative);
-        if path.is_absolute()
-            || path
-                .components()
-                .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+        if path.is_absolute() {
+            let resolved = fs::canonicalize(path)
+                .map_err(|error| format!("could not resolve '{}': {error}", relative))?;
+            if !resolved.starts_with(&self.root) {
+                return Err(format!(
+                    "path '{}' must stay inside the workspace root",
+                    relative
+                ));
+            }
+            return Ok(resolved);
+        }
+        if path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
         {
             return Err(format!(
                 "path '{}' must stay inside the workspace root",
@@ -600,7 +610,11 @@ mod tests {
         };
         let command_result = executor.execute(&call(
             "run_command",
-            serde_json::json!({"command": command.0, "args": command.1}),
+            serde_json::json!({
+                "command": command.0,
+                "args": command.1,
+                "cwd": root.display().to_string()
+            }),
         ));
         assert!(command_result.success);
         assert!(command_result.output.contains("ok"));

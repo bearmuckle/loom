@@ -3,8 +3,13 @@
 //! Everything here is derived from protocol responses and events; the backend
 //! stays authoritative.
 
-use loom_core::{AgentSessionSnapshot, AgentSessionState, LoomError};
-use loom_protocol::{AgentRunState, GitDiff, GitRepositoryStatus, WorkspaceChange, WorkspaceFile};
+use std::collections::BTreeSet;
+
+use loom_core::{AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError};
+use loom_protocol::{
+    AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitRepositoryStatus,
+    WorkspaceChange, WorkspaceFile,
+};
 
 use crate::{MAX_TIMELINE_OUTPUT, text_input::TextBufferState};
 
@@ -20,6 +25,7 @@ pub(crate) enum AgentMode {
     Ask,
     Edit,
     Agent,
+    AutoApprove,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,13 +48,21 @@ impl ThemeChoice {
 }
 
 impl AgentMode {
-    pub(crate) const ALL: [Self; 3] = [Self::Ask, Self::Edit, Self::Agent];
+    pub(crate) const ALL: [Self; 4] = [Self::Ask, Self::Edit, Self::Agent, Self::AutoApprove];
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Ask => "Ask",
             Self::Edit => "Edit",
             Self::Agent => "Agent",
+            Self::AutoApprove => "Auto approve",
+        }
+    }
+
+    pub(crate) fn approval_policy(self) -> ApprovalPolicy {
+        match self {
+            Self::AutoApprove => ApprovalPolicy::auto_approve(),
+            Self::Ask | Self::Edit | Self::Agent => ApprovalPolicy::default(),
         }
     }
 }
@@ -109,18 +123,78 @@ impl Default for ReviewState {
 pub(crate) enum TimelineItem {
     User(String),
     Assistant(String),
-    Plan(Vec<String>),
-    StepStarted { index: u32 },
-    StepCompleted { index: u32 },
-    ToolRequested { name: String, arguments: String },
-    Approval { name: String, active: bool },
+    ActivitySection {
+        activities: Vec<AgentActivityRecord>,
+    },
+    Plan {
+        steps: Vec<String>,
+        completed: BTreeSet<u32>,
+        active: Option<u32>,
+    },
+    ToolRequested {
+        name: String,
+        arguments: String,
+    },
+    Approval {
+        name: String,
+        active: bool,
+    },
     ToolStarted(String),
     ToolOutput(String),
-    ToolCompleted { name: String, success: bool },
+    ToolCompleted {
+        name: String,
+        success: bool,
+    },
     Status(String),
-    Error { operation: String, error: LoomError },
+    Error {
+        operation: String,
+        error: LoomError,
+    },
     NeedsInput(String),
-    Summary { text: String, evidence: Vec<String> },
+    Summary {
+        text: String,
+        evidence: Vec<String>,
+    },
+}
+
+pub(crate) fn upsert_activity(timeline: &mut Vec<TimelineItem>, activity: AgentActivityRecord) {
+    if let Some((_, section)) = timeline.iter_mut().enumerate().find_map(|(index, item)| {
+        let TimelineItem::ActivitySection { activities } = item else {
+            return None;
+        };
+        if let Some(existing) = activities
+            .iter_mut()
+            .find(|existing| existing.id == activity.id)
+        {
+            *existing = activity.clone();
+            return Some((index, activities));
+        }
+        if activity
+            .parent_id
+            .is_some_and(|parent_id| activities.iter().any(|existing| existing.id == parent_id))
+        {
+            activities.push(activity.clone());
+            return Some((index, activities));
+        }
+        None
+    }) {
+        let _ = section;
+        return;
+    }
+    timeline.push(TimelineItem::ActivitySection {
+        activities: vec![activity],
+    });
+}
+
+pub(crate) fn activity_status_label(status: AgentActivityStatus) -> &'static str {
+    match status {
+        AgentActivityStatus::Started => "running",
+        AgentActivityStatus::Completed => "done",
+        AgentActivityStatus::Failed => "failed",
+        AgentActivityStatus::AwaitingApproval => "approval required",
+        AgentActivityStatus::AwaitingInput => "waiting for input",
+        AgentActivityStatus::Cancelled => "cancelled",
+    }
 }
 
 pub(crate) fn bounded(value: &str) -> String {
@@ -204,11 +278,80 @@ pub(crate) const fn run_state_name(state: AgentRunState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loom_core::{ActivityId, RunId, Timestamp, ToolCallId};
+    use loom_model::{ModelId, ToolCall};
+    use loom_protocol::{AgentActivityData, AgentActivityKind, AgentActivityStatus};
 
     #[test]
     fn bounded_projection_is_explicit() {
         let value = bounded_to("abcdef", 3);
         assert_eq!(value, "abc\n...[output truncated]");
         assert!(bounded_to("😀😀", 4).starts_with('😀'));
+    }
+
+    #[test]
+    fn activity_updates_are_grouped_by_parent_and_id() {
+        let run_id = RunId::new();
+        let turn_id = ActivityId::new();
+        let turn = AgentActivityRecord {
+            id: turn_id,
+            run_id,
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::ModelTurn,
+            status: AgentActivityStatus::Started,
+            started_at: Timestamp::from_unix_millis(1),
+            completed_at: None,
+            elapsed_ms: None,
+            data: AgentActivityData::ModelTurn {
+                model: ModelId::new("test/model"),
+            },
+        };
+        let mut timeline = Vec::new();
+        upsert_activity(&mut timeline, turn.clone());
+        upsert_activity(
+            &mut timeline,
+            AgentActivityRecord {
+                id: ActivityId::new(),
+                run_id,
+                parent_id: Some(turn_id),
+                step_id: None,
+                kind: AgentActivityKind::ToolCall,
+                status: AgentActivityStatus::Completed,
+                started_at: Timestamp::from_unix_millis(2),
+                completed_at: Some(Timestamp::from_unix_millis(3)),
+                elapsed_ms: Some(1),
+                data: AgentActivityData::ToolCall {
+                    call: ToolCall {
+                        id: ToolCallId::new(),
+                        name: "read_file".to_owned(),
+                        arguments: serde_json::json!({"path": "README.md"}),
+                    },
+                    result: None,
+                },
+            },
+        );
+        upsert_activity(
+            &mut timeline,
+            AgentActivityRecord {
+                status: AgentActivityStatus::Completed,
+                completed_at: Some(Timestamp::from_unix_millis(4)),
+                elapsed_ms: Some(3),
+                ..turn
+            },
+        );
+
+        assert_eq!(
+            timeline
+                .iter()
+                .filter(|item| matches!(item, TimelineItem::ActivitySection { .. }))
+                .count(),
+            1
+        );
+        let TimelineItem::ActivitySection { activities } = &timeline[0] else {
+            panic!("expected activity section");
+        };
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities[0].status, AgentActivityStatus::Completed);
     }
 }

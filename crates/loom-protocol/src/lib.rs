@@ -10,6 +10,7 @@ use loom_model::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod activity;
 mod agent;
 mod context;
 mod process;
@@ -17,6 +18,10 @@ mod tool;
 mod vcs;
 mod workspace;
 
+pub use activity::{
+    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+    FileActivityOperation,
+};
 pub use agent::{
     AgentEvent, AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState, ApprovalDecision,
 };
@@ -56,6 +61,8 @@ pub struct AgentRunSnapshotProjection {
     pub pending_approval: Option<ToolCall>,
     pub pending_input: Option<String>,
     pub usage: UsageSnapshot,
+    #[serde(default)]
+    pub activities: Vec<AgentActivityRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -5,7 +5,7 @@ use loom_core::{
 use loom_model::{ModelId, TokenUsage, ToolCall};
 use serde::{Deserialize, Serialize};
 
-use crate::{ContextInspection, ToolResult};
+use crate::{AgentActivityRecord, ContextInspection, ToolResult};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -129,6 +129,10 @@ pub enum AgentEvent {
     ToolCallCompleted {
         run_id: RunId,
         result: ToolResult,
+    },
+    ActivityRecorded {
+        run_id: RunId,
+        activity: AgentActivityRecord,
     },
     RunUsage {
         run_id: RunId,
