@@ -40,6 +40,20 @@ impl Default for ApprovalPolicy {
 }
 
 impl ApprovalPolicy {
+    /// Allows all non-destructive actions without prompting.
+    ///
+    /// Destructive actions remain denied even in automatic mode so enabling
+    /// automatic approvals cannot authorize irreversible workspace operations.
+    pub const fn auto_approve() -> Self {
+        Self {
+            read: PolicyDecision::Allow,
+            write: PolicyDecision::Allow,
+            command: PolicyDecision::Allow,
+            network: PolicyDecision::Allow,
+            destructive: PolicyDecision::Deny,
+        }
+    }
+
     pub const fn decision(&self, action: ActionKind) -> PolicyDecision {
         match action {
             ActionKind::Read => self.read,
@@ -100,5 +114,18 @@ mod tests {
         let evaluation = PolicyEvaluation::evaluate(&policy, ActionKind::Command, "cargo test");
         assert_eq!(evaluation.decision, PolicyDecision::RequireApproval);
         assert!(evaluation.reason.contains("approval"));
+    }
+
+    #[test]
+    fn auto_approve_allows_non_destructive_actions_only() {
+        let policy = ApprovalPolicy::auto_approve();
+        assert_eq!(policy.decision(ActionKind::Read), PolicyDecision::Allow);
+        assert_eq!(policy.decision(ActionKind::Write), PolicyDecision::Allow);
+        assert_eq!(policy.decision(ActionKind::Command), PolicyDecision::Allow);
+        assert_eq!(policy.decision(ActionKind::Network), PolicyDecision::Allow);
+        assert_eq!(
+            policy.decision(ActionKind::Destructive),
+            PolicyDecision::Deny
+        );
     }
 }

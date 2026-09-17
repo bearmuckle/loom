@@ -22,12 +22,13 @@ use gpui_component::{
     text::TextView,
 };
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence, LoomError,
-    ProjectId, RunId,
+    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence,
+    LoomError, ProjectId, RunId,
 };
 use loom_model::{MessageRole, ModelId, ToolCall};
 use loom_protocol::{
-    AgentEvent, AgentRunSnapshot, AgentRunSnapshotProjection, AgentRunState, ClientRequest,
+    AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
+    AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
     ProjectSnapshot, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse, TaskSnapshot,
     TaskStatus,
 };
@@ -44,8 +45,8 @@ use crate::{
     connection::{BackendWorker, ClientConnection, select_remote_project, unexpected_response},
     state::{
         AgentMode, BackendStatus, GitHubLoginState, RenameDialogState, ReviewPanel, ReviewState,
-        ThemeChoice, TimelineItem, bounded, bounded_to, run_state_name, session_state_for_run,
-        session_state_name, session_title_from_task,
+        ThemeChoice, TimelineItem, activity_status_label, bounded, bounded_to, run_state_name,
+        session_state_for_run, session_state_name, session_title_from_task, upsert_activity,
     },
     text_input::{
         Backspace, Copy, Delete, End, Home, InputField, Left, LoomTooltip, Paste, Right, SelectAll,
@@ -92,6 +93,158 @@ fn open_external_url(url: &str) -> Result<(), std::io::Error> {
     }
 }
 
+fn format_duration(elapsed_ms: u64) -> String {
+    if elapsed_ms < 1_000 {
+        format!("{elapsed_ms}ms")
+    } else if elapsed_ms < 60_000 {
+        format!("{:.1}s", elapsed_ms as f64 / 1_000.0)
+    } else {
+        format!(
+            "{}m {}s",
+            elapsed_ms / 60_000,
+            (elapsed_ms % 60_000) / 1_000
+        )
+    }
+}
+
+fn activity_marker(status: AgentActivityStatus) -> &'static str {
+    match status {
+        AgentActivityStatus::Started => "›",
+        AgentActivityStatus::Completed => "✓",
+        AgentActivityStatus::Failed => "×",
+        AgentActivityStatus::AwaitingApproval => "!",
+        AgentActivityStatus::AwaitingInput => "?",
+        AgentActivityStatus::Cancelled => "–",
+    }
+}
+
+fn activity_label(activity: &AgentActivityRecord) -> (String, Option<String>) {
+    let compact_arguments = |call: &loom_model::ToolCall| {
+        bounded_to(
+            &serde_json::to_string(&call.arguments).unwrap_or_default(),
+            180,
+        )
+    };
+    match &activity.data {
+        AgentActivityData::ModelTurn { model } => {
+            (format!("Agent turn · {}", model.as_str()), None)
+        }
+        AgentActivityData::ToolCall { call, .. } => {
+            (call.name.clone(), Some(compact_arguments(call)))
+        }
+        AgentActivityData::File {
+            call,
+            operation,
+            path,
+            ..
+        } => {
+            let operation = match operation {
+                FileActivityOperation::List => "List files",
+                FileActivityOperation::Read => "Read file",
+                FileActivityOperation::Write => "Write file",
+            };
+            (
+                operation.to_owned(),
+                Some(format!(
+                    "{} · {}",
+                    path.as_deref().unwrap_or("."),
+                    compact_arguments(call)
+                )),
+            )
+        }
+        AgentActivityData::Search {
+            call, query, path, ..
+        } => (
+            "Search".to_owned(),
+            Some(format!(
+                "\"{}\"{} · {}",
+                bounded_to(query, 120),
+                path.as_deref()
+                    .map_or_else(String::new, |path| format!(" in {path}")),
+                compact_arguments(call)
+            )),
+        ),
+        AgentActivityData::Command {
+            call,
+            command,
+            args,
+            cwd,
+            ..
+        } => {
+            let command_line = std::iter::once(command.as_str())
+                .chain(args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (
+                "Run command".to_owned(),
+                Some(format!(
+                    "{}{} · {}",
+                    bounded_to(&command_line, 180),
+                    cwd.as_deref()
+                        .map_or_else(String::new, |cwd| format!(" in {cwd}")),
+                    compact_arguments(call)
+                )),
+            )
+        }
+    }
+}
+
+fn activity_output(activity: &AgentActivityRecord) -> Option<&str> {
+    match &activity.data {
+        AgentActivityData::ModelTurn { .. } => None,
+        AgentActivityData::ToolCall { result, .. }
+        | AgentActivityData::File { result, .. }
+        | AgentActivityData::Search { result, .. }
+        | AgentActivityData::Command { result, .. } => result
+            .as_ref()
+            .map(|result| result.output.as_str())
+            .filter(|output| !output.is_empty()),
+    }
+}
+
+fn activity_turn_title(activities: &[AgentActivityRecord]) -> &'static str {
+    if activities.iter().any(|activity| {
+        matches!(
+            &activity.data,
+            AgentActivityData::File {
+                operation: FileActivityOperation::Write,
+                ..
+            }
+        ) || matches!(
+            &activity.data,
+            AgentActivityData::ToolCall { call, .. } if call.name == "apply_patch"
+        )
+    }) {
+        "Making changes"
+    } else if activities
+        .iter()
+        .any(|activity| matches!(&activity.data, AgentActivityData::Command { .. }))
+    {
+        "Running commands"
+    } else if activities
+        .iter()
+        .any(|activity| matches!(&activity.data, AgentActivityData::Search { .. }))
+    {
+        "Searching the codebase"
+    } else if activities
+        .iter()
+        .any(|activity| matches!(&activity.data, AgentActivityData::File { .. }))
+    {
+        "Inspecting the workspace"
+    } else if activities
+        .iter()
+        .any(|activity| matches!(&activity.data, AgentActivityData::ToolCall { .. }))
+    {
+        "Using tools"
+    } else {
+        "Working on the task"
+    }
+}
+
+fn is_redundant_completion_summary(summary: &str) -> bool {
+    summary.starts_with("Completed task:")
+}
+
 pub(crate) struct LoomView {
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
@@ -120,6 +273,10 @@ pub(crate) struct LoomView {
     pub(crate) dark_theme: bool,
     pub(crate) after_sequence: Option<EventSequence>,
     pub(crate) timeline: Vec<TimelineItem>,
+    pub(crate) activity_records_seen: bool,
+    pub(crate) expanded_activities: BTreeSet<ActivityId>,
+    pub(crate) approval_request_in_flight: bool,
+    pub(crate) archive_request_in_flight: bool,
     pub(crate) pending_approval: Option<ToolCall>,
     pub(crate) pending_input: Option<String>,
     pub(crate) composer: TextBufferState,
@@ -394,6 +551,10 @@ impl LoomView {
             dark_theme: true,
             after_sequence: None,
             timeline: Vec::new(),
+            activity_records_seen: false,
+            expanded_activities: BTreeSet::new(),
+            approval_request_in_flight: false,
+            archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
             composer: TextBufferState::new(""),
@@ -509,6 +670,10 @@ impl LoomView {
             dark_theme: true,
             after_sequence: None,
             timeline: Vec::new(),
+            activity_records_seen: false,
+            expanded_activities: BTreeSet::new(),
+            approval_request_in_flight: false,
+            archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
             composer: TextBufferState::new(""),
@@ -764,6 +929,9 @@ impl LoomView {
 
     pub(crate) fn reset_projection(&mut self) {
         self.timeline.clear();
+        self.activity_records_seen = false;
+        self.expanded_activities.clear();
+        self.approval_request_in_flight = false;
         self.pending_approval = None;
         self.pending_input = None;
         self.active_run = None;
@@ -771,6 +939,23 @@ impl LoomView {
         self.run_state = None;
         self.summary = None;
         self.after_sequence = None;
+    }
+
+    fn enable_activity_projection(&mut self) {
+        if self.activity_records_seen {
+            return;
+        }
+        self.activity_records_seen = true;
+        self.timeline.retain(|item| {
+            !matches!(
+                item,
+                TimelineItem::ToolRequested { .. }
+                    | TimelineItem::ToolStarted(_)
+                    | TimelineItem::ToolOutput(_)
+                    | TimelineItem::ToolCompleted { .. }
+                    | TimelineItem::Approval { .. }
+            )
+        });
     }
 
     pub(crate) fn activate_session(&mut self, session: AgentSessionSnapshot) {
@@ -798,7 +983,7 @@ impl LoomView {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn load_session(&mut self, session: AgentSessionSnapshot) {
         self.activate_session(session);
-        let projection_sequence = match self
+        let fallback_projection = match self
             .connection
             .request(RequestEnvelope::new(
                 ClientRequest::GetAgentSessionSnapshot {
@@ -808,15 +993,14 @@ impl LoomView {
             .result
         {
             Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
-                self.active_session = projection.session;
+                self.active_session = projection.session.clone();
                 self.session_state = self.active_session.state;
-                if let Some(run) = projection.active_run {
+                if let Some(run) = &projection.active_run {
                     self.model = run.run.model.clone();
                     self.session_task_cache
                         .insert(self.active_session.id, run.run.task.clone());
-                    self.apply_run_projection(run);
                 }
-                Some(projection.latest_sequence)
+                Some(projection)
             }
             Err(error) => {
                 self.record_backend_error("load session snapshot", error);
@@ -830,7 +1014,10 @@ impl LoomView {
                 None
             }
         };
-        if let Err(error) = self.collect_events_since(projection_sequence) {
+        if let Err(error) = self.collect_events_since(
+            None,
+            fallback_projection.and_then(|projection| projection.active_run),
+        ) {
             self.record_backend_error("load session events", error);
         }
         self.ensure_session_task_message(self.active_session.id);
@@ -847,6 +1034,7 @@ impl LoomView {
     fn collect_events_since(
         &mut self,
         after_sequence: Option<EventSequence>,
+        fallback: Option<AgentRunSnapshotProjection>,
     ) -> Result<(), LoomError> {
         let response =
             self.connection
@@ -856,9 +1044,15 @@ impl LoomView {
                 }));
         match response.result? {
             ServerResponse::SessionEvents { events } => {
+                self.reset_projection();
                 for event in events {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
+                }
+                if self.timeline.is_empty()
+                    && let Some(projection) = fallback
+                {
+                    self.apply_run_projection(projection);
                 }
             }
             ServerResponse::SessionEventsSnapshot {
@@ -873,6 +1067,11 @@ impl LoomView {
                 for event in events {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
+                }
+                if self.timeline.is_empty()
+                    && let Some(projection) = fallback
+                {
+                    self.apply_run_projection(projection);
                 }
             }
             response => return Err(unexpected_response("session event stream", response)),
@@ -1006,15 +1205,16 @@ impl LoomView {
                 self.active_run = Some(snapshot.clone());
                 self.active_run_id = Some(snapshot.id);
                 self.run_state = Some(snapshot.state);
-                self.timeline
-                    .push(TimelineItem::Status("Agent run started".to_owned()));
             }
-            AgentEvent::PlanProposed { plan, .. } => self.timeline.push(TimelineItem::Plan(
-                plan.steps
+            AgentEvent::PlanProposed { plan, .. } => self.timeline.push(TimelineItem::Plan {
+                steps: plan
+                    .steps
                     .iter()
                     .map(|step| step.description.clone())
                     .collect(),
-            )),
+                completed: BTreeSet::new(),
+                active: None,
+            }),
             AgentEvent::UserMessage { text, .. } => {
                 if self
                     .optimistic_messages
@@ -1037,17 +1237,31 @@ impl LoomView {
                 }
             }
             AgentEvent::StepStarted { index, .. } => {
-                self.timeline
-                    .push(TimelineItem::StepStarted { index: *index });
+                if let Some(TimelineItem::Plan { active, .. }) = self
+                    .timeline
+                    .iter_mut()
+                    .rev()
+                    .find(|item| matches!(item, TimelineItem::Plan { .. }))
+                {
+                    *active = Some(*index);
+                }
             }
             AgentEvent::StepCompleted { index, .. } => {
-                self.timeline
-                    .push(TimelineItem::StepCompleted { index: *index });
+                if let Some(TimelineItem::Plan {
+                    completed, active, ..
+                }) = self
+                    .timeline
+                    .iter_mut()
+                    .rev()
+                    .find(|item| matches!(item, TimelineItem::Plan { .. }))
+                {
+                    completed.insert(*index);
+                    if active == &Some(*index) {
+                        *active = None;
+                    }
+                }
             }
-            AgentEvent::ContextInspected { inspection, .. } => self.record_status(format!(
-                "Context: {} input tokens, {} omitted",
-                inspection.included_tokens, inspection.omitted_tokens
-            )),
+            AgentEvent::ContextInspected { .. } => {}
             AgentEvent::ProviderError { error, .. } | AgentEvent::ContextError { error, .. } => {
                 self.timeline.push(TimelineItem::Error {
                     operation: "agent".to_owned(),
@@ -1055,10 +1269,14 @@ impl LoomView {
                 });
             }
             AgentEvent::ToolCallRequested { call, .. } => {
-                self.timeline.push(TimelineItem::ToolRequested {
-                    name: call.name.clone(),
-                    arguments: bounded(&serde_json::to_string(&call.arguments).unwrap_or_default()),
-                });
+                if !self.activity_records_seen {
+                    self.timeline.push(TimelineItem::ToolRequested {
+                        name: call.name.clone(),
+                        arguments: bounded(
+                            &serde_json::to_string(&call.arguments).unwrap_or_default(),
+                        ),
+                    });
+                }
             }
             AgentEvent::ToolApprovalRequired { call, .. } => {
                 for item in &mut self.timeline {
@@ -1067,54 +1285,56 @@ impl LoomView {
                     }
                 }
                 self.pending_approval = Some(call.clone());
-                self.timeline.push(TimelineItem::Approval {
-                    name: call.name.clone(),
-                    active: true,
-                });
+                if !self.activity_records_seen {
+                    self.timeline.push(TimelineItem::Approval {
+                        name: call.name.clone(),
+                        active: true,
+                    });
+                }
             }
-            AgentEvent::ToolPolicyEvaluated { evaluation, .. } => self.record_status(format!(
-                "Policy {:?}: {}",
-                evaluation.decision, evaluation.reason
-            )),
-            AgentEvent::ToolApprovalDecided { decision, .. } => {
+            AgentEvent::ToolPolicyEvaluated { .. } => {}
+            AgentEvent::ToolApprovalDecided { .. } => {
                 self.pending_approval = None;
+                self.approval_request_in_flight = false;
                 for item in &mut self.timeline {
                     if let TimelineItem::Approval { active, .. } = item {
                         *active = false;
                     }
                 }
-                self.record_status(format!("Approval: {decision:?}"));
             }
             AgentEvent::ToolCallStarted { call, .. } => {
-                self.timeline
-                    .push(TimelineItem::ToolStarted(call.name.clone()));
+                if !self.activity_records_seen {
+                    self.timeline
+                        .push(TimelineItem::ToolStarted(call.name.clone()));
+                }
             }
             AgentEvent::ToolOutputChunk { chunk, .. } => {
-                if let Some(TimelineItem::ToolOutput(output)) = self.timeline.last_mut() {
-                    output.push_str(chunk);
-                    *output = bounded(output);
-                } else {
-                    self.timeline.push(TimelineItem::ToolOutput(bounded(chunk)));
+                if !self.activity_records_seen {
+                    if let Some(TimelineItem::ToolOutput(output)) = self.timeline.last_mut() {
+                        output.push_str(chunk);
+                        *output = bounded(output);
+                    } else {
+                        self.timeline.push(TimelineItem::ToolOutput(bounded(chunk)));
+                    }
                 }
             }
             AgentEvent::ToolCallCompleted { result, .. } => {
-                self.timeline.push(TimelineItem::ToolCompleted {
-                    name: result.name.clone(),
-                    success: result.success,
-                });
+                if !self.activity_records_seen {
+                    self.timeline.push(TimelineItem::ToolCompleted {
+                        name: result.name.clone(),
+                        success: result.success,
+                    });
+                }
+            }
+            AgentEvent::ActivityRecorded { activity, .. } => {
+                self.enable_activity_projection();
+                upsert_activity(&mut self.timeline, activity.clone());
             }
             AgentEvent::NeedsInput { prompt, .. } => {
                 self.pending_input = Some(prompt.clone());
                 self.timeline.push(TimelineItem::NeedsInput(prompt.clone()));
             }
-            AgentEvent::RunUsage { usage, .. } => self.record_status(format!(
-                "Usage: {} input / {} output tokens",
-                usage.input_tokens, usage.output_tokens
-            )),
-            AgentEvent::RunUsageUpdated { usage, .. } => self.record_status(format!(
-                "Total usage: {} input / {} output / {} tool calls",
-                usage.input_tokens, usage.output_tokens, usage.tool_calls
-            )),
+            AgentEvent::RunUsage { .. } | AgentEvent::RunUsageUpdated { .. } => {}
             AgentEvent::RunLimitReached { status, .. } => {
                 self.record_status(format!("Limit reached: {:?}", status.exceeded));
             }
@@ -1133,7 +1353,9 @@ impl LoomView {
                 self.session_state = session_state_for_run(snapshot.state);
                 self.active_session.state = self.session_state;
                 self.summary = snapshot.summary.clone();
-                if let Some(summary) = &snapshot.summary {
+                if let Some(summary) = &snapshot.summary
+                    && !is_redundant_completion_summary(summary)
+                {
                     self.timeline.push(TimelineItem::Summary {
                         text: summary.clone(),
                         evidence: snapshot
@@ -1154,6 +1376,10 @@ impl LoomView {
         self.summary = projection.run.summary.clone();
         self.pending_approval = projection.pending_approval;
         self.pending_input = projection.pending_input;
+        let activity_records = projection.activities;
+        if !activity_records.is_empty() {
+            self.enable_activity_projection();
+        }
         if self.timeline.is_empty() {
             let mut timeline = Vec::new();
             for message in projection.messages {
@@ -1172,27 +1398,34 @@ impl LoomView {
                             timeline.push(TimelineItem::Assistant(message.content));
                         }
                     }
-                    MessageRole::Tool => {
+                    MessageRole::Tool if activity_records.is_empty() => {
                         timeline.push(TimelineItem::ToolOutput(bounded(&message.content)))
                     }
+                    MessageRole::Tool => {}
                     MessageRole::System => {}
                 }
             }
             if !projection.plan.is_empty() {
-                self.timeline.insert(
+                timeline.insert(
                     0,
-                    TimelineItem::Plan(
-                        projection
+                    TimelineItem::Plan {
+                        steps: projection
                             .plan
                             .into_iter()
                             .map(|step| step.description)
                             .collect(),
-                    ),
+                        completed: BTreeSet::new(),
+                        active: None,
+                    },
                 );
             }
             self.timeline = timeline;
         }
+        for activity in activity_records {
+            upsert_activity(&mut self.timeline, activity);
+        }
         if let Some(summary) = &projection.run.summary
+            && !is_redundant_completion_summary(summary)
             && !self
                 .timeline
                 .iter()
@@ -1293,42 +1526,33 @@ impl LoomView {
     }
 
     pub(crate) fn archive_active(&mut self, cx: &mut Context<Self>) {
+        if self.archive_request_in_flight {
+            return;
+        }
+        self.archive_request_in_flight = true;
+        self.record_status("Archiving session...");
+        let session_id = self.active_session.id;
         self.dispatch(
             cx,
-            ClientRequest::ArchiveAgentSession {
-                session_id: self.active_session.id,
-            },
-            |view, response, cx| match response.result {
-                Ok(ServerResponse::AgentSessionArchived(_)) => {
-                    view.dispatch(
-                        cx,
-                        ClientRequest::ListAgentSessions {
-                            project_id: Some(view.project_id),
-                            include_archived: false,
-                        },
-                        |view, response, cx| match response.result {
-                            Ok(ServerResponse::AgentSessions { sessions }) => {
-                                view.sessions = sessions;
-                                if let Some(session) = view.sessions.first().cloned() {
-                                    view.select_session(session, cx);
-                                } else {
-                                    view.create_session_async("New session".to_owned(), cx);
-                                }
-                                view.reload_sessions(cx);
-                            }
-                            Err(error) => view.record_backend_error("session list refresh", error),
-                            Ok(response) => view.record_backend_error(
-                                "session list refresh",
-                                unexpected_response("session list", response),
-                            ),
-                        },
-                    );
+            ClientRequest::ArchiveAgentSession { session_id },
+            move |view, response, cx| {
+                view.archive_request_in_flight = false;
+                match response.result {
+                    Ok(ServerResponse::AgentSessionArchived(snapshot)) => {
+                        view.sessions.retain(|session| session.id != snapshot.id);
+                        if let Some(session) = view.sessions.first().cloned() {
+                            view.select_session(session, cx);
+                        } else {
+                            view.reset_projection();
+                            view.create_session_async("New session".to_owned(), cx);
+                        }
+                    }
+                    Err(error) => view.record_backend_error("archive session", error),
+                    Ok(response) => view.record_backend_error(
+                        "archive session",
+                        unexpected_response("session archive", response),
+                    ),
                 }
-                Err(error) => view.record_backend_error("archive session", error),
-                Ok(response) => view.record_backend_error(
-                    "archive session",
-                    unexpected_response("session archive", response),
-                ),
             },
         );
     }
@@ -1449,6 +1673,65 @@ impl LoomView {
                 "send message",
                 unexpected_response("send message", response),
             ),
+        }
+        cx.notify();
+    }
+
+    fn approve_pending_action(&mut self, cx: &mut Context<Self>) {
+        if self.approval_request_in_flight {
+            return;
+        }
+        let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
+            return;
+        };
+        self.approval_request_in_flight = true;
+        self.dispatch(
+            cx,
+            ClientRequest::ApproveAgentAction {
+                run_id,
+                tool_call_id: call.id,
+            },
+            |view, response, cx| view.finish_approval_response(response, cx),
+        );
+    }
+
+    fn reject_pending_action(&mut self, cx: &mut Context<Self>) {
+        if self.approval_request_in_flight {
+            return;
+        }
+        let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
+            return;
+        };
+        self.approval_request_in_flight = true;
+        self.dispatch(
+            cx,
+            ClientRequest::RejectAgentAction {
+                run_id,
+                tool_call_id: call.id,
+                reason: None,
+            },
+            |view, response, cx| view.finish_approval_response(response, cx),
+        );
+    }
+
+    fn finish_approval_response(&mut self, response: ResponseEnvelope, cx: &mut Context<Self>) {
+        match response.result {
+            Ok(ServerResponse::AgentRun(run)) | Ok(ServerResponse::AgentRunStarted(run)) => {
+                self.active_run = Some(run.clone());
+                self.active_run_id = Some(run.id);
+                self.run_state = Some(run.state);
+                self.session_state = session_state_for_run(run.state);
+                self.active_session.state = self.session_state;
+                self.start_run_polling(cx);
+            }
+            Err(error) => {
+                self.approval_request_in_flight = false;
+                self.record_backend_error("approval", error);
+            }
+            Ok(response) => {
+                self.approval_request_in_flight = false;
+                self.record_backend_error("approval", unexpected_response("approval", response))
+            }
         }
         cx.notify();
     }
@@ -1592,16 +1875,10 @@ impl LoomView {
             let snapshot = cx
                 .background_spawn(async move { snapshot_request.wait().await })
                 .await;
-            let after_sequence = match &snapshot.result {
-                Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
-                    Some(projection.latest_sequence)
-                }
-                _ => None,
-            };
             let events_request =
                 backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
-                    after_sequence,
+                    after_sequence: None,
                 }));
             let events = cx
                 .background_spawn(async move { events_request.wait().await })
@@ -1625,21 +1902,20 @@ impl LoomView {
         if self.active_session.id != session_id {
             return;
         }
-        match snapshot_response.result {
+        let fallback_projection = match snapshot_response.result {
             Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
-                self.active_session = projection.session;
-                self.reset_projection();
-                self.after_sequence = Some(projection.latest_sequence);
-                if let Some(run) = projection.active_run {
+                self.active_session = projection.session.clone();
+                if let Some(run) = &projection.active_run {
                     self.session_task_cache
                         .insert(session_id, run.run.task.clone());
                     self.model = run.run.model.clone();
-                    self.apply_run_projection(run);
                 }
+                Some(projection)
             }
             Err(error) => {
                 self.record_backend_error("load session snapshot", error);
                 self.reset_projection();
+                None
             }
             Ok(response) => {
                 self.record_backend_error(
@@ -1647,13 +1923,22 @@ impl LoomView {
                     unexpected_response("session snapshot", response),
                 );
                 self.reset_projection();
+                None
             }
-        }
+        };
+        self.reset_projection();
         match events_response.result {
             Ok(ServerResponse::SessionEvents { events }) => {
                 for event in events {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
+                }
+                if self.timeline.is_empty()
+                    && let Some(projection) = fallback_projection
+                        .as_ref()
+                        .and_then(|projection| projection.active_run.clone())
+                {
+                    self.apply_run_projection(projection);
                 }
             }
             Ok(ServerResponse::SessionEventsSnapshot {
@@ -1669,8 +1954,23 @@ impl LoomView {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
                 }
+                if self.timeline.is_empty()
+                    && let Some(projection) = fallback_projection
+                        .as_ref()
+                        .and_then(|projection| projection.active_run.clone())
+                {
+                    self.apply_run_projection(projection);
+                }
             }
-            Err(error) => self.record_backend_error("load session events", error),
+            Err(error) => {
+                if let Some(projection) = fallback_projection
+                    .as_ref()
+                    .and_then(|projection| projection.active_run.clone())
+                {
+                    self.apply_run_projection(projection);
+                }
+                self.record_backend_error("load session events", error);
+            }
             Ok(response) => self.record_backend_error(
                 "load session events",
                 unexpected_response("session event stream", response),
@@ -1858,8 +2158,26 @@ impl LoomView {
     }
 
     pub(crate) fn select_agent_mode(&mut self, mode: AgentMode, cx: &mut Context<Self>) {
-        self.agent_mode = mode;
         self.agent_mode_picker_open = false;
+        let policy = mode.approval_policy();
+        self.dispatch(
+            cx,
+            ClientRequest::SetApprovalPolicy {
+                project_id: self.project_id,
+                policy,
+            },
+            move |view, response, _| match response.result {
+                Ok(ServerResponse::ApprovalPolicy(_)) => {
+                    view.agent_mode = mode;
+                    view.record_status(format!("{} mode enabled", mode.label()));
+                }
+                Err(error) => view.record_backend_error("set approval mode", error),
+                Ok(response) => view.record_backend_error(
+                    "set approval mode",
+                    unexpected_response("approval policy", response),
+                ),
+            },
+        );
         cx.notify();
     }
 
@@ -2156,11 +2474,209 @@ impl LoomView {
         picker.into_any()
     }
 
+    fn render_activity_section(
+        &self,
+        activities: &[AgentActivityRecord],
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let model = activities.iter().find_map(|activity| match &activity.data {
+            AgentActivityData::ModelTurn { model } => Some(model.as_str().to_owned()),
+            _ => None,
+        });
+        let turn = activities
+            .iter()
+            .find(|activity| matches!(activity.data, AgentActivityData::ModelTurn { .. }));
+        let title = activity_turn_title(activities);
+        let turn_status = turn.map(|activity| {
+            let duration = activity
+                .elapsed_ms
+                .map_or_else(String::new, format_duration);
+            if duration.is_empty() {
+                activity_status_label(activity.status).to_owned()
+            } else {
+                format!("{} · {duration}", activity_status_label(activity.status))
+            }
+        });
+        let mut section = div()
+            .id(("activity-section", index))
+            .mx_2()
+            .my_1()
+            .pl_3()
+            .border_l_1()
+            .border_color(rgb(0x3b4555))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(rgb(0x93c5fd))
+                    .child("●")
+                    .child(title)
+                    .when_some(model, |element, model| {
+                        element
+                            .child("·")
+                            .child(div().text_color(rgb(0x64748b)).child(model))
+                    })
+                    .when_some(turn_status, |element, status| {
+                        element
+                            .child("·")
+                            .child(div().text_color(rgb(0x94a3b8)).child(status))
+                    }),
+            );
+        for (activity_index, activity) in activities.iter().enumerate() {
+            if matches!(activity.data, AgentActivityData::ModelTurn { .. }) {
+                continue;
+            }
+            let (label, detail) = activity_label(activity);
+            let duration = activity.elapsed_ms.map(format_duration);
+            let output = activity_output(activity);
+            let expanded = self.expanded_activities.contains(&activity.id);
+            let status_color = match activity.status {
+                AgentActivityStatus::Failed => rgb(0xfca5a5),
+                AgentActivityStatus::Completed => rgb(0x9ad7bd),
+                AgentActivityStatus::AwaitingApproval | AgentActivityStatus::AwaitingInput => {
+                    rgb(0xfef3c7)
+                }
+                AgentActivityStatus::Started => rgb(0x93c5fd),
+                AgentActivityStatus::Cancelled => rgb(0x94a3b8),
+            };
+            let activity_id = activity.id;
+            let mut row = div()
+                .id(("activity", ((index as u64) << 32) | activity_index as u64))
+                .flex()
+                .flex_col()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(rgb(0xcbd5e1))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_activity(activity_id, cx);
+                }))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .text_color(status_color)
+                                .child(activity_marker(activity.status)),
+                        )
+                        .child(if expanded { "⌄" } else { "›" })
+                        .child(label)
+                        .flex_1()
+                        .child(
+                            div()
+                                .text_color(status_color)
+                                .child(activity_status_label(activity.status)),
+                        )
+                        .when_some(duration, |element, duration| {
+                            element
+                                .text_color(rgb(0x64748b))
+                                .child(format!(" · {duration}"))
+                        }),
+                );
+            if expanded {
+                if let Some(detail) = detail {
+                    row = row.child(
+                        div()
+                            .ml(px(26.))
+                            .max_w(px(560.))
+                            .text_color(rgb(0x94a3b8))
+                            .child(detail),
+                    );
+                }
+                if let Some(output) = output {
+                    row = row.child(
+                        div()
+                            .ml(px(26.))
+                            .max_w(px(560.))
+                            .border_l_1()
+                            .border_color(rgb(0x30343f))
+                            .pl_2()
+                            .text_color(rgb(0x8f98a6))
+                            .child(bounded_to(output, 420)),
+                    );
+                }
+            }
+            if activity.status == AgentActivityStatus::AwaitingApproval
+                && self.pending_approval.is_some()
+                && !self.approval_request_in_flight
+            {
+                row = row.child(
+                    div()
+                        .ml(px(26.))
+                        .mt_1()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id((
+                                    "approve-activity",
+                                    ((index as u64) << 32) | activity_index as u64,
+                                ))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x24543d))
+                                .text_color(rgb(0xbbf7d0))
+                                .cursor_pointer()
+                                .child("Approve")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.approve_pending_action(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id((
+                                    "reject-activity",
+                                    ((index as u64) << 32) | activity_index as u64,
+                                ))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x542936))
+                                .text_color(rgb(0xfecdd3))
+                                .cursor_pointer()
+                                .child("Reject")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reject_pending_action(cx);
+                                })),
+                        ),
+                );
+            } else if activity.status == AgentActivityStatus::AwaitingApproval
+                && self.approval_request_in_flight
+            {
+                row = row.child(
+                    div()
+                        .ml(px(26.))
+                        .mt_1()
+                        .text_color(rgb(0x94a3b8))
+                        .child("Submitting approval..."),
+                );
+            }
+            section = section.child(row);
+        }
+        section.into_any()
+    }
+
+    fn toggle_activity(&mut self, activity_id: ActivityId, cx: &mut Context<Self>) {
+        if !self.expanded_activities.remove(&activity_id) {
+            self.expanded_activities.insert(activity_id);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn render_timeline_item(
         &self,
         item: &TimelineItem,
         index: usize,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let user_background = if self.dark_theme {
             gpui::rgb(0x1f4f78)
@@ -2195,14 +2711,13 @@ impl LoomView {
                 )
                 .into_any(),
             TimelineItem::Assistant(text) => div()
-                .p_3()
-                .rounded_lg()
-                .bg(rgb(0x17191f))
+                .px_3()
+                .py_2()
                 .text_color(rgb(0xf3f4f6))
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x9ad7bd))
+                        .text_color(rgb(0x8f98a6))
                         .child("GitHub Copilot"),
                 )
                 .child(
@@ -2212,38 +2727,46 @@ impl LoomView {
                         .text_color(rgb(0xf3f4f6)),
                 )
                 .into_any(),
-            TimelineItem::Plan(steps) => {
+            TimelineItem::ActivitySection { activities } => {
+                self.render_activity_section(activities, index, cx)
+            }
+            TimelineItem::Plan {
+                steps,
+                completed,
+                active,
+            } => {
                 let mut card = div()
-                    .p_2()
-                    .rounded_sm()
-                    .bg(rgb(0x1e293b))
-                    .text_color(rgb(0xdbeafe))
-                    .child(div().text_xs().text_color(rgb(0x93c5fd)).child("PLAN"));
+                    .px_3()
+                    .py_2()
+                    .text_color(rgb(0xb7c0d0))
+                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Plan"));
                 for (index, step) in steps.iter().enumerate() {
-                    card = card.child(div().text_sm().child(format!("{}. {}", index + 1, step)));
+                    let index = index as u32;
+                    let marker = if completed.contains(&index) {
+                        "✓"
+                    } else if active == &Some(index) {
+                        ">"
+                    } else {
+                        "○"
+                    };
+                    card = card.child(
+                        div()
+                            .text_xs()
+                            .text_color(if completed.contains(&index) {
+                                rgb(0x9ad7bd)
+                            } else {
+                                rgb(0xb7c0d0)
+                            })
+                            .child(format!("{marker} {}", step)),
+                    );
                 }
                 card.into_any()
             }
-            TimelineItem::StepStarted { index } => div()
-                .px_2()
-                .py_1()
-                .text_sm()
-                .text_color(rgb(0xfef3c7))
-                .child(format!("Step {} started", index + 1))
-                .into_any(),
-            TimelineItem::StepCompleted { index } => div()
-                .px_2()
-                .py_1()
-                .text_sm()
-                .text_color(rgb(0x9ad7bd))
-                .child(format!("Step {} completed", index + 1))
-                .into_any(),
             TimelineItem::ToolRequested { name, arguments } => div()
-                .p_2()
-                .rounded_sm()
-                .bg(rgb(0x242833))
+                .px_3()
+                .py_1()
                 .text_color(rgb(0xcbd5e1))
-                .child(format!("Tool requested  {name}"))
+                .child(format!(">_  {name}"))
                 .child(
                     div()
                         .text_xs()
@@ -2251,59 +2774,100 @@ impl LoomView {
                         .child(arguments.clone()),
                 )
                 .into_any(),
-            TimelineItem::Approval { name, active } => div()
-                .p_2()
-                .rounded_sm()
-                .bg(if *active {
-                    rgb(0x493b1a)
-                } else {
-                    rgb(0x242833)
-                })
-                .text_color(if *active {
-                    rgb(0xfef3c7)
-                } else {
-                    rgb(0x94a3b8)
-                })
-                .child(if *active {
-                    format!("Approval required  {name}")
-                } else {
-                    format!("Approval resolved  {name}")
-                })
-                .into_any(),
+            TimelineItem::Approval { name, active } => {
+                let mut row = div()
+                    .px_3()
+                    .py_1()
+                    .text_color(if *active {
+                        rgb(0xfef3c7)
+                    } else {
+                        rgb(0x94a3b8)
+                    })
+                    .child(if *active {
+                        format!("Approval required  >_ {name}")
+                    } else {
+                        format!("Approval resolved  >_ {name}")
+                    });
+                if *active && self.pending_approval.is_some() && !self.approval_request_in_flight {
+                    row = row.child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(("approve-legacy", index))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x24543d))
+                                    .text_color(rgb(0xbbf7d0))
+                                    .cursor_pointer()
+                                    .child("Approve")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.approve_pending_action(cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id(("reject-legacy", index))
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(rgb(0x542936))
+                                    .text_color(rgb(0xfecdd3))
+                                    .cursor_pointer()
+                                    .child("Reject")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.reject_pending_action(cx);
+                                    })),
+                            ),
+                    );
+                } else if *active && self.approval_request_in_flight {
+                    row = row.child(
+                        div()
+                            .mt_1()
+                            .text_color(rgb(0x94a3b8))
+                            .child("Submitting approval..."),
+                    );
+                }
+                row.into_any()
+            }
             TimelineItem::ToolStarted(name) => div()
-                .px_2()
+                .px_3()
                 .py_1()
-                .text_sm()
+                .text_xs()
                 .text_color(rgb(0xcbd5e1))
-                .child(format!("Tool started  {name}"))
+                .child(format!(">_  {name}"))
                 .into_any(),
             TimelineItem::ToolOutput(output) => div()
-                .mx_2()
-                .p_2()
-                .rounded_sm()
-                .bg(rgb(0x0f1115))
+                .mx_3()
+                .px_2()
+                .py_1()
+                .border_l_1()
+                .border_color(rgb(0x30343f))
                 .text_xs()
                 .text_color(rgb(0x94a3b8))
                 .child(output.clone())
                 .into_any(),
             TimelineItem::ToolCompleted { name, success } => div()
-                .px_2()
+                .px_3()
                 .py_1()
-                .text_sm()
+                .text_xs()
                 .text_color(if *success {
                     rgb(0x9ad7bd)
                 } else {
                     rgb(0xfca5a5)
                 })
                 .child(format!(
-                    "Tool completed  {name} [{}]",
+                    ">_  {name} [{}]",
                     if *success { "ok" } else { "failed" }
                 ))
                 .into_any(),
             TimelineItem::Status(status) => div()
-                .px_2()
+                .px_3()
                 .py_1()
-                .text_sm()
+                .text_xs()
                 .text_color(rgb(0x94a3b8))
                 .child(status.clone())
                 .into_any(),
@@ -2351,15 +2915,14 @@ impl LoomView {
                 .into_any(),
             TimelineItem::Summary { text, evidence } => {
                 let mut card = div()
-                    .p_2()
-                    .rounded_sm()
-                    .bg(rgb(0x064e3b))
-                    .text_color(rgb(0xd1fae5))
+                    .px_3()
+                    .py_2()
+                    .text_color(rgb(0xf3f4f6))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(0x9ad7bd))
-                            .child("FINAL SUMMARY"),
+                            .text_color(rgb(0x8f98a6))
+                            .child("GitHub Copilot"),
                     )
                     .child(text.clone());
                 for link in evidence {
@@ -2376,7 +2939,13 @@ impl LoomView {
     }
 
     pub(crate) fn render_timeline(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut timeline = div().flex().flex_col().gap_3().p_4();
+        let mut timeline = div()
+            .flex()
+            .flex_col()
+            .gap_0()
+            .p_3()
+            .border_l_1()
+            .border_color(rgb(0x30343f));
         if self.timeline.is_empty() {
             timeline = timeline.child(
                 div()
@@ -2387,16 +2956,7 @@ impl LoomView {
             );
         }
         for (index, item) in self.timeline.iter().enumerate() {
-            if matches!(
-                item,
-                TimelineItem::User(_)
-                    | TimelineItem::Assistant(_)
-                    | TimelineItem::Approval { .. }
-                    | TimelineItem::Error { .. }
-                    | TimelineItem::NeedsInput(_)
-            ) {
-                timeline = timeline.child(self.render_timeline_item(item, index, cx));
-            }
+            timeline = timeline.child(self.render_timeline_item(item, index, cx));
         }
         timeline
     }

@@ -1,19 +1,24 @@
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use loom_context::{ContextAssembler, ContextAssemblyOptions, ContextInput, ContextInspection};
 use loom_core::{
-    AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink, LimitKind, LimitStatus, LoomError,
-    PolicyEvaluation, Result, RunId, SessionLimits, StepId, Timestamp, UsageSnapshot,
+    ActivityId, AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink, LimitKind, LimitStatus,
+    LoomError, PolicyEvaluation, Result, RunId, SessionLimits, StepId, Timestamp, UsageSnapshot,
 };
 use loom_model::{
     CancellationToken, CompletionOptions, MessageRole, ModelId, ModelMessage, ModelProvider,
     ModelRequest, ModelStreamEvent, StreamFlow, ToolCall,
 };
 pub use loom_protocol::{
-    AgentEvent, AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState, ApprovalDecision,
+    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
+    AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState, ApprovalDecision,
+    FileActivityOperation,
 };
 use loom_tools::{ToolExecutor, ToolKind, ToolResult, tool_definitions};
 use serde::{Deserialize, Serialize};
@@ -55,6 +60,8 @@ pub struct AgentRuntimeState {
     pub provider_cursor: usize,
     pub step_id: Option<StepId>,
     pub step_index: u32,
+    #[serde(default)]
+    pub activities: Vec<AgentActivityRecord>,
 }
 
 impl AgentTask {
@@ -190,10 +197,11 @@ struct StepContext {
     saw_tool_call: bool,
     completed: bool,
     finished: bool,
+    activity_id: ActivityId,
 }
 
 impl StepContext {
-    fn new(step_id: StepId, step_index: u32) -> Self {
+    fn new(step_id: StepId, step_index: u32, activity_id: ActivityId) -> Self {
         Self {
             step_id,
             step_index,
@@ -202,6 +210,7 @@ impl StepContext {
             saw_tool_call: false,
             completed: false,
             finished: false,
+            activity_id,
         }
     }
 }
@@ -226,6 +235,7 @@ pub struct AgentRuntime {
     provider_cursor: usize,
     step_id: Option<StepId>,
     step_index: u32,
+    activities: Vec<AgentActivityRecord>,
     control: RunControl,
     observer: Option<AgentEventObserver>,
     flush_offset: usize,
@@ -291,6 +301,7 @@ impl AgentRuntime {
             provider_cursor: 0,
             step_id: None,
             step_index: 0,
+            activities: Vec::new(),
             control: RunControl::new(),
             observer: None,
             flush_offset: 0,
@@ -507,11 +518,12 @@ impl AgentRuntime {
             provider_cursor: self.provider_cursor,
             step_id: self.step_id,
             step_index: self.step_index,
+            activities: self.activities.clone(),
         }
     }
 
     pub fn from_state(
-        state: AgentRuntimeState,
+        mut state: AgentRuntimeState,
         provider: Box<dyn ModelProvider>,
         tools: ToolExecutor,
     ) -> Result<Self> {
@@ -528,11 +540,7 @@ impl AgentRuntime {
                 AgentRunState::AwaitingApproval | AgentRunState::Paused
             )
         {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted approval is attached to a run that is neither awaiting approval nor paused",
-                false,
-            ));
+            state.pending_approval = None;
         }
         if state.pending_input.is_some()
             && !matches!(
@@ -540,11 +548,7 @@ impl AgentRuntime {
                 AgentRunState::NeedsInput | AgentRunState::Paused
             )
         {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted input is attached to a run that is neither waiting for input nor paused",
-                false,
-            ));
+            state.pending_input = None;
         }
         if provider.descriptor().id != state.task.model {
             return Err(LoomError::new(
@@ -577,6 +581,7 @@ impl AgentRuntime {
             provider_cursor: state.provider_cursor,
             step_id: state.step_id,
             step_index: state.step_index,
+            activities: state.activities,
             control: RunControl::new(),
             observer: None,
             flush_offset: 0,
@@ -698,8 +703,9 @@ impl AgentRuntime {
         };
         events.push(AgentEvent::ToolCallCompleted {
             run_id: self.run.id,
-            result,
+            result: result.clone(),
         });
+        events.push(self.complete_tool_activity(&result, AgentActivityStatus::Failed));
         events.extend(self.finish_failed(output));
         self.publish(Ok(events))
     }
@@ -921,6 +927,7 @@ impl AgentRuntime {
         self.run.completed_at = None;
         self.run.summary = None;
         let mut events = self.set_state(AgentRunState::Executing);
+        events.push(self.start_tool_activity(&call, None));
         let (tool_events, result) = self.execute_tool(&call);
         events.extend(tool_events);
         if result.success {
@@ -1088,8 +1095,24 @@ impl AgentRuntime {
             step_id,
             index: step_index,
         });
+        let model_activity_id = ActivityId::new();
+        let model_started_at = Timestamp::now();
+        events.push(self.start_activity(AgentActivityRecord {
+            id: model_activity_id,
+            run_id: self.run.id,
+            parent_id: None,
+            step_id: Some(step_id),
+            kind: AgentActivityKind::ModelTurn,
+            status: AgentActivityStatus::Started,
+            started_at: model_started_at,
+            completed_at: None,
+            elapsed_ms: None,
+            data: AgentActivityData::ModelTurn {
+                model: self.task.model.clone(),
+            },
+        }));
         self.provider_cursor = self.provider_cursor.saturating_add(1);
-        let mut ctx = StepContext::new(step_id, self.step_index);
+        let mut ctx = StepContext::new(step_id, self.step_index, model_activity_id);
         self.flush_prefix(events);
         let base = self.flush_offset;
         let token = self.control.stream_token();
@@ -1108,6 +1131,13 @@ impl AgentRuntime {
         } = ctx;
         events.extend(step_events);
         self.flush_offset = base.saturating_add(published);
+        let model_status = match &stream_result {
+            Err(_) if self.control.is_stopping() => AgentActivityStatus::Cancelled,
+            Err(_) => AgentActivityStatus::Failed,
+            Ok(()) if !saw_tool_call && !completed => AgentActivityStatus::Failed,
+            Ok(()) => AgentActivityStatus::Completed,
+        };
+        events.push(self.complete_activity(model_activity_id, model_status, model_started_at));
         match stream_result {
             Ok(()) => {}
             Err(error) if self.control.is_stopping() => {
@@ -1199,6 +1229,8 @@ impl AgentRuntime {
                     usage: self.usage.clone(),
                 });
                 ctx.saw_tool_call = true;
+                ctx.events
+                    .push(self.start_tool_activity(&call, Some(ctx.activity_id)));
                 ctx.events.push(AgentEvent::ToolCallRequested {
                     run_id: self.run.id,
                     call: call.clone(),
@@ -1215,6 +1247,8 @@ impl AgentRuntime {
                         run_id: self.run.id,
                         result: result.clone(),
                     });
+                    ctx.events
+                        .push(self.complete_tool_activity(&result, AgentActivityStatus::Failed));
                     self.messages.push(ModelMessage {
                         role: MessageRole::Tool,
                         content: output.clone(),
@@ -1258,8 +1292,10 @@ impl AgentRuntime {
                     };
                     ctx.events.push(AgentEvent::ToolCallCompleted {
                         run_id: self.run.id,
-                        result,
+                        result: result.clone(),
                     });
+                    ctx.events
+                        .push(self.complete_tool_activity(&result, AgentActivityStatus::Failed));
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
                     ctx.events.push(AgentEvent::StepCompleted {
@@ -1286,6 +1322,9 @@ impl AgentRuntime {
                     });
                     ctx.events
                         .extend(self.set_state(AgentRunState::AwaitingApproval));
+                    ctx.events.push(
+                        self.update_activity_status(call.id, AgentActivityStatus::AwaitingApproval),
+                    );
                     ctx.events.push(AgentEvent::ToolApprovalRequired {
                         run_id: self.run.id,
                         call,
@@ -1323,8 +1362,11 @@ impl AgentRuntime {
                         };
                         ctx.events.push(AgentEvent::ToolCallCompleted {
                             run_id: self.run.id,
-                            result,
+                            result: result.clone(),
                         });
+                        ctx.events.push(
+                            self.complete_tool_activity(&result, AgentActivityStatus::Failed),
+                        );
                         self.step_id = None;
                         self.step_index = self.step_index.saturating_add(1);
                         ctx.events.push(AgentEvent::StepCompleted {
@@ -1343,6 +1385,20 @@ impl AgentRuntime {
                         run_id: self.run.id,
                         plan: self.plan.clone(),
                     });
+                    let result = ToolResult::success(&call, "plan proposed".to_owned());
+                    ctx.events.push(AgentEvent::ToolCallCompleted {
+                        run_id: self.run.id,
+                        result: result.clone(),
+                    });
+                    ctx.events
+                        .push(self.complete_tool_activity(&result, AgentActivityStatus::Completed));
+                    self.messages.push(ModelMessage {
+                        role: MessageRole::Tool,
+                        content: result.output.clone(),
+                        name: Some(result.name.clone()),
+                        tool_call_id: Some(result.tool_call_id),
+                        tool_calls: Vec::new(),
+                    });
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
                     ctx.events.push(AgentEvent::StepCompleted {
@@ -1350,7 +1406,6 @@ impl AgentRuntime {
                         step_id: ctx.step_id,
                         index: ctx.step_index,
                     });
-                    ctx.finished = true;
                     return Ok(StreamFlow::Stop);
                 }
                 if kind == ToolKind::AskUser {
@@ -1369,8 +1424,11 @@ impl AgentRuntime {
                         };
                         ctx.events.push(AgentEvent::ToolCallCompleted {
                             run_id: self.run.id,
-                            result,
+                            result: result.clone(),
                         });
+                        ctx.events.push(
+                            self.complete_tool_activity(&result, AgentActivityStatus::Failed),
+                        );
                         self.step_id = None;
                         self.step_index = self.step_index.saturating_add(1);
                         ctx.events.push(AgentEvent::StepCompleted {
@@ -1383,6 +1441,13 @@ impl AgentRuntime {
                         return Ok(StreamFlow::Stop);
                     };
                     self.pending_input = Some(prompt.to_owned());
+                    self.messages.push(ModelMessage {
+                        role: MessageRole::Tool,
+                        content: format!("Waiting for user input: {prompt}"),
+                        name: Some(call.name.clone()),
+                        tool_call_id: Some(call.id),
+                        tool_calls: Vec::new(),
+                    });
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
                     ctx.events.push(AgentEvent::StepCompleted {
@@ -1391,6 +1456,9 @@ impl AgentRuntime {
                         index: ctx.step_index,
                     });
                     ctx.events.extend(self.set_state(AgentRunState::NeedsInput));
+                    ctx.events.push(
+                        self.update_activity_status(call.id, AgentActivityStatus::AwaitingInput),
+                    );
                     ctx.events.push(AgentEvent::NeedsInput {
                         run_id: self.run.id,
                         prompt: prompt.to_owned(),
@@ -1499,6 +1567,14 @@ impl AgentRuntime {
             run_id: self.run.id,
             result: result.clone(),
         });
+        events.push(self.complete_tool_activity(
+            &result,
+            if result.success {
+                AgentActivityStatus::Completed
+            } else {
+                AgentActivityStatus::Failed
+            },
+        ));
         self.messages.push(ModelMessage {
             role: MessageRole::Tool,
             content: result.output.clone(),
@@ -1507,6 +1583,123 @@ impl AgentRuntime {
             tool_calls: Vec::new(),
         });
         (events, result)
+    }
+
+    fn start_activity(&mut self, activity: AgentActivityRecord) -> AgentEvent {
+        let run_id = activity.run_id;
+        self.activities.push(activity.clone());
+        AgentEvent::ActivityRecorded { run_id, activity }
+    }
+
+    fn start_tool_activity(
+        &mut self,
+        call: &ToolCall,
+        parent_id: Option<ActivityId>,
+    ) -> AgentEvent {
+        let (kind, data) = activity_data_for_call(call, None);
+        self.start_activity(AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id: self.run.id,
+            parent_id,
+            step_id: self.step_id,
+            kind,
+            status: AgentActivityStatus::Started,
+            started_at: Timestamp::now(),
+            completed_at: None,
+            elapsed_ms: None,
+            data,
+        })
+    }
+
+    fn update_activity_status(
+        &mut self,
+        tool_call_id: loom_core::ToolCallId,
+        status: AgentActivityStatus,
+    ) -> AgentEvent {
+        let index = self
+            .activities
+            .iter()
+            .rposition(|activity| activity_contains_call(activity, tool_call_id))
+            .expect("tool activity must be started before its status changes");
+        let mut activity = self.activities[index].clone();
+        activity.status = status;
+        self.activities[index] = activity.clone();
+        AgentEvent::ActivityRecorded {
+            run_id: self.run.id,
+            activity,
+        }
+    }
+
+    fn complete_tool_activity(
+        &mut self,
+        result: &ToolResult,
+        status: AgentActivityStatus,
+    ) -> AgentEvent {
+        let index = self
+            .activities
+            .iter()
+            .rposition(|activity| activity_contains_call(activity, result.tool_call_id));
+        let Some(index) = index else {
+            return self.start_activity(AgentActivityRecord {
+                id: ActivityId::new(),
+                run_id: self.run.id,
+                parent_id: None,
+                step_id: self.step_id,
+                kind: AgentActivityKind::ToolCall,
+                status,
+                started_at: Timestamp::now(),
+                completed_at: Some(Timestamp::now()),
+                elapsed_ms: Some(0),
+                data: AgentActivityData::ToolCall {
+                    call: ToolCall {
+                        id: result.tool_call_id,
+                        name: result.name.clone(),
+                        arguments: serde_json::Value::Null,
+                    },
+                    result: Some(result.clone()),
+                },
+            });
+        };
+        let mut activity = self.activities[index].clone();
+        let completed_at = Timestamp::now();
+        activity.status = status;
+        activity.completed_at = Some(completed_at);
+        activity.elapsed_ms = Some(
+            completed_at
+                .as_unix_millis()
+                .saturating_sub(activity.started_at.as_unix_millis()),
+        );
+        activity.data = activity_data_with_result(activity.data, result.clone());
+        self.activities[index] = activity.clone();
+        AgentEvent::ActivityRecorded {
+            run_id: self.run.id,
+            activity,
+        }
+    }
+
+    fn complete_activity(
+        &mut self,
+        activity_id: ActivityId,
+        status: AgentActivityStatus,
+        started_at: Timestamp,
+    ) -> AgentEvent {
+        let completed_at = Timestamp::now();
+        let activity = self
+            .activities
+            .iter_mut()
+            .find(|activity| activity.id == activity_id)
+            .expect("started activity must be present");
+        activity.status = status;
+        activity.completed_at = Some(completed_at);
+        activity.elapsed_ms = Some(
+            completed_at
+                .as_unix_millis()
+                .saturating_sub(started_at.as_unix_millis()),
+        );
+        AgentEvent::ActivityRecorded {
+            run_id: self.run.id,
+            activity: activity.clone(),
+        }
     }
 
     fn take_pending(&mut self, tool_call_id: loom_core::ToolCallId) -> Result<PendingApproval> {
@@ -1542,6 +1735,23 @@ impl AgentRuntime {
         if context_options.max_input_tokens.is_none() {
             context_options.max_input_tokens = self.options.limits.max_input_tokens;
         }
+        let tools = if self.provider()?.descriptor().capabilities.tool_calling {
+            tool_definitions()
+        } else {
+            Vec::new()
+        };
+        let tool_tokens = self.provider()?.count_tokens(&ModelRequest {
+            model: self.task.model.clone(),
+            messages: Vec::new(),
+            tools: tools.clone(),
+            options: CompletionOptions::default(),
+        });
+        if let Some(context_window) = context_options.context_window {
+            context_options.context_window = Some(context_window.saturating_sub(tool_tokens));
+        }
+        if let Some(max_input_tokens) = context_options.max_input_tokens {
+            context_options.max_input_tokens = Some(max_input_tokens.saturating_sub(tool_tokens));
+        }
         let assembly = ContextAssembler::assemble(
             &ContextInput {
                 system_instructions: self.task.system_instructions.clone(),
@@ -1556,14 +1766,10 @@ impl AgentRuntime {
             },
             &context_options,
         )?;
-        let tools = if self.provider()?.descriptor().capabilities.tool_calling {
-            tool_definitions()
-        } else {
-            Vec::new()
-        };
+        let messages = repair_tool_transcript(assembly.messages, &self.messages);
         let request = ModelRequest {
             model: self.task.model.clone(),
-            messages: assembly.messages,
+            messages,
             tools,
             options: CompletionOptions::default(),
         };
@@ -1634,6 +1840,13 @@ impl AgentRuntime {
     }
 
     fn set_state(&mut self, state: AgentRunState) -> Vec<AgentEvent> {
+        if matches!(
+            state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        ) {
+            self.pending_approval = None;
+            self.pending_input = None;
+        }
         if self.run.state == state {
             return Vec::new();
         }
@@ -1677,6 +1890,138 @@ impl AgentRuntime {
     }
 }
 
+fn activity_data_for_call(
+    call: &ToolCall,
+    result: Option<ToolResult>,
+) -> (AgentActivityKind, AgentActivityData) {
+    let string_argument = |name: &str| {
+        call.arguments
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    match call.name.as_str() {
+        "list_files" => (
+            AgentActivityKind::File,
+            AgentActivityData::File {
+                call: call.clone(),
+                operation: FileActivityOperation::List,
+                path: string_argument("path").or_else(|| Some(".".to_owned())),
+                result,
+            },
+        ),
+        "read_file" => (
+            AgentActivityKind::File,
+            AgentActivityData::File {
+                call: call.clone(),
+                operation: FileActivityOperation::Read,
+                path: string_argument("path"),
+                result,
+            },
+        ),
+        "apply_patch" => (
+            AgentActivityKind::File,
+            AgentActivityData::File {
+                call: call.clone(),
+                operation: FileActivityOperation::Write,
+                path: string_argument("path"),
+                result,
+            },
+        ),
+        "search_text" => (
+            AgentActivityKind::Search,
+            AgentActivityData::Search {
+                call: call.clone(),
+                query: string_argument("query").unwrap_or_default(),
+                path: string_argument("path"),
+                result,
+            },
+        ),
+        "run_command" => (
+            AgentActivityKind::Command,
+            AgentActivityData::Command {
+                call: call.clone(),
+                command: string_argument("command").unwrap_or_default(),
+                args: call
+                    .arguments
+                    .get("args")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|args| {
+                        args.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                cwd: string_argument("cwd"),
+                result,
+            },
+        ),
+        _ => (
+            AgentActivityKind::ToolCall,
+            AgentActivityData::ToolCall {
+                call: call.clone(),
+                result,
+            },
+        ),
+    }
+}
+
+fn activity_data_with_result(data: AgentActivityData, result: ToolResult) -> AgentActivityData {
+    match data {
+        AgentActivityData::ModelTurn { model } => AgentActivityData::ModelTurn { model },
+        AgentActivityData::ToolCall { call, .. } => AgentActivityData::ToolCall {
+            call,
+            result: Some(result),
+        },
+        AgentActivityData::File {
+            call,
+            operation,
+            path,
+            ..
+        } => AgentActivityData::File {
+            call,
+            operation,
+            path,
+            result: Some(result),
+        },
+        AgentActivityData::Search {
+            call, query, path, ..
+        } => AgentActivityData::Search {
+            call,
+            query,
+            path,
+            result: Some(result),
+        },
+        AgentActivityData::Command {
+            call,
+            command,
+            args,
+            cwd,
+            ..
+        } => AgentActivityData::Command {
+            call,
+            command,
+            args,
+            cwd,
+            result: Some(result),
+        },
+    }
+}
+
+fn activity_contains_call(
+    activity: &AgentActivityRecord,
+    tool_call_id: loom_core::ToolCallId,
+) -> bool {
+    match &activity.data {
+        AgentActivityData::ToolCall { call, .. } => call.id == tool_call_id,
+        AgentActivityData::File { call, .. }
+        | AgentActivityData::Search { call, .. }
+        | AgentActivityData::Command { call, .. } => call.id == tool_call_id,
+        AgentActivityData::ModelTurn { .. } => false,
+    }
+}
+
 fn initial_messages(task: &AgentTask) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
     messages.push(ModelMessage::new(
@@ -1694,6 +2039,68 @@ fn initial_messages(task: &AgentTask) -> Vec<ModelMessage> {
     }
     messages.push(ModelMessage::new(MessageRole::User, &task.task));
     messages
+}
+
+/// Keeps Responses API function calls paired with their tool outputs after
+/// context assembly or recovery from an older persisted runtime state.
+fn repair_tool_transcript(
+    messages: Vec<ModelMessage>,
+    source_messages: &[ModelMessage],
+) -> Vec<ModelMessage> {
+    let source_outputs: BTreeMap<_, _> = source_messages
+        .iter()
+        .filter_map(|message| {
+            (message.role == MessageRole::Tool)
+                .then_some(message.tool_call_id)
+                .flatten()
+                .map(|id| (id, message.clone()))
+        })
+        .collect();
+    let call_ids: BTreeSet<_> = messages
+        .iter()
+        .flat_map(|message| message.tool_calls.iter().map(|call| call.id))
+        .collect();
+    let output_ids: BTreeSet<_> = messages
+        .iter()
+        .filter_map(|message| {
+            (message.role == MessageRole::Tool)
+                .then_some(message.tool_call_id)
+                .flatten()
+        })
+        .collect();
+    let mut repaired = Vec::with_capacity(messages.len());
+    for message in messages {
+        if message.role == MessageRole::Tool {
+            if message
+                .tool_call_id
+                .is_some_and(|tool_call_id| call_ids.contains(&tool_call_id))
+            {
+                repaired.push(message);
+            }
+            continue;
+        }
+        let tool_calls = message.tool_calls.clone();
+        repaired.push(message);
+        for call in tool_calls {
+            if output_ids.contains(&call.id) {
+                continue;
+            }
+            repaired.push(
+                source_outputs
+                    .get(&call.id)
+                    .cloned()
+                    .unwrap_or_else(|| ModelMessage {
+                        role: MessageRole::Tool,
+                        content: "No tool output was recorded; continue from the current state."
+                            .to_owned(),
+                        name: Some(call.name.clone()),
+                        tool_call_id: Some(call.id),
+                        tool_calls: Vec::new(),
+                    }),
+            );
+        }
+    }
+    repaired
 }
 
 /// Sends the events that the observer has not seen yet and advances `cursor`.
@@ -1723,6 +2130,47 @@ mod tests {
         let root = std::env::temp_dir().join(format!("loom-agent-{}", ProjectId::new()));
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn repairs_unpaired_tool_messages_for_provider_requests() {
+        let call = ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "archive.rs"}),
+        };
+        let assistant = ModelMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: vec![call.clone()],
+        };
+        let source_output = ModelMessage {
+            role: MessageRole::Tool,
+            content: "archive implementation".to_owned(),
+            name: Some(call.name.clone()),
+            tool_call_id: Some(call.id),
+            tool_calls: Vec::new(),
+        };
+        let repaired = repair_tool_transcript(
+            vec![
+                assistant,
+                ModelMessage {
+                    role: MessageRole::Tool,
+                    content: "orphan".to_owned(),
+                    name: None,
+                    tool_call_id: Some(loom_core::ToolCallId::new()),
+                    tool_calls: Vec::new(),
+                },
+            ],
+            &[source_output],
+        );
+
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[1].role, MessageRole::Tool);
+        assert_eq!(repaired[1].tool_call_id, Some(call.id));
+        assert_eq!(repaired[1].content, "archive implementation");
     }
 
     /// Provider that blocks in the middle of a completion until it is released
@@ -1759,6 +2207,108 @@ mod tests {
                 reason: loom_model::FinishReason::Stop,
             })?;
             Ok(())
+        }
+    }
+
+    struct PlanThenCompleteProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+    }
+
+    impl ModelProvider for PlanThenCompleteProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                vec![ModelStreamEvent::ToolCallDelta {
+                    call: ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: "propose_plan".to_owned(),
+                        arguments: serde_json::json!({
+                            "steps": ["Inspect the workspace", "Complete the requested task"]
+                        }),
+                    },
+                }]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "The requested task is complete.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
+    struct AskThenCompleteProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+    }
+
+    impl ModelProvider for AskThenCompleteProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                vec![ModelStreamEvent::ToolCallDelta {
+                    call: ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: "ask_user".to_owned(),
+                        arguments: serde_json::json!({
+                            "prompt": "Which archive behavior should I preserve?"
+                        }),
+                    },
+                }]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "The archive behavior is fixed.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
         }
     }
 
@@ -1892,6 +2442,115 @@ mod tests {
             fs::read_to_string(root.join("loom-m1-demo.txt")).unwrap(),
             "Loom M1 deterministic demo\n"
         );
+        let activities = runtime.export_state().activities;
+        assert!(activities.iter().any(|activity| {
+            activity.kind == AgentActivityKind::ModelTurn
+                && activity.status == AgentActivityStatus::Completed
+                && activity.completed_at.is_some()
+        }));
+        assert!(activities.iter().any(|activity| {
+            activity.kind == AgentActivityKind::File
+                && activity.parent_id.is_some()
+                && matches!(
+                    &activity.data,
+                    AgentActivityData::File {
+                        operation: FileActivityOperation::Write,
+                        result: Some(result),
+                        ..
+                    } if result.success
+                )
+        }));
+        assert!(
+            activities
+                .iter()
+                .filter(|activity| activity.kind == AgentActivityKind::ToolCall)
+                .all(|activity| activity.parent_id.is_some())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plan_proposal_continues_to_the_next_model_step() {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task = AgentTask::new("finish the task", ModelId::new("deterministic/plan")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(PlanThenCompleteProvider {
+                descriptor: loom_providers::deterministic_descriptor(),
+                cursor: 0,
+            }),
+            tools,
+        );
+
+        let events = runtime.start().unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::PlanProposed { plan, .. } if plan.steps.len() == 2
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::RunCompleted { snapshot }
+                if snapshot.state == AgentRunState::Completed
+        )));
+        assert!(
+            runtime
+                .export_state()
+                .messages
+                .iter()
+                .any(|message| message.role == MessageRole::Tool
+                    && message.content == "plan proposed")
+        );
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ask_user_records_tool_output_before_follow_up_message() {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task =
+            AgentTask::new("fix archive behavior", ModelId::new("deterministic/ask")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(AskThenCompleteProvider {
+                descriptor: loom_providers::deterministic_descriptor(),
+                cursor: 0,
+            }),
+            tools,
+        );
+
+        runtime.start().unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::NeedsInput);
+        let state = runtime.export_state();
+        let call_id = state
+            .messages
+            .iter()
+            .find_map(|message| {
+                message
+                    .tool_calls
+                    .iter()
+                    .find(|call| call.name == "ask_user")
+                    .map(|call| call.id)
+            })
+            .unwrap();
+        assert!(state.messages.iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.tool_call_id == Some(call_id)
+                && message.content.starts_with("Waiting for user input:")
+        }));
+
+        let events = runtime
+            .send_message("Preserve the current archive semantics.")
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::RunCompleted { snapshot }
+                if snapshot.state == AgentRunState::Completed
+        )));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2063,6 +2722,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(restored.messages(), runtime.messages());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_discards_waiting_state_from_finished_runs() {
+        let root = workspace();
+        let task = AgentTask::new(
+            "recover stale waiting state",
+            ModelId::new("deterministic/demo"),
+        )
+        .unwrap();
+        let runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        let mut state = runtime.export_state();
+        state.run.state = AgentRunState::Completed;
+        state.pending_approval = Some(ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "README.md"}),
+        });
+        state.pending_input = Some("stale input".to_owned());
+
+        let restored = AgentRuntime::from_state(
+            state,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap();
+
+        assert!(restored.pending_approval().is_none());
+        assert!(restored.export_state().pending_input.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -76,7 +76,9 @@ working directories, and project ownership checks for terminal/task control
 requests. Its default `ApprovalPolicy` allows reads, pauses writes and
 commands for approval, requests approval for network actions, and denies
 destructive actions. The policy evaluation is included in the agent event
-stream before a tool executes.
+stream before a tool executes. The UI's optional Auto approve mode allows
+non-destructive writes, commands, and network actions, but destructive actions
+remain denied.
 
 M3 makes context and resource boundaries visible as structured state. Input
 context is assembled from system instructions, repository instructions, task,
