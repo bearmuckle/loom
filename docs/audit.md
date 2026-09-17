@@ -11,9 +11,10 @@ was removed once addressed. This audit uses a `B` prefix and covers a different
 question: why the agent loop feels slow and unreliable in use compared to
 comparable tools.
 
-**Audited revision:** `01165c3` (shared LoomView browser client).
+**Audited revision:** `52a7f2e` (squashed merge of PR #5, after the agent
+activity and approval improvements).
 
-**Scope:** 24,744 lines across 15 crates.
+**Scope:** 26,455 lines across 15 crates.
 
 ## Summary
 
@@ -22,11 +23,12 @@ direction runs leaf-ward, the protocol and persistence layers are real
 implementations, and the reconnect/resume machinery works. None of the findings
 below are about those layers.
 
-The problem is that agent *execution quality* was never the subject of a
-milestone. M0-M4 built durable orchestration, transport, and provider
-plumbing; M5 built the client. The agent loop and tool surface were written
-once during M1 and have not been revisited since, and they are where the
-user-visible slowness and unreliability come from.
+PR #5 materially improved the activity timeline, approval controls,
+continuation/retry handling, transcript repair, and session UX. Those changes
+make the state easier to observe and control, but they do not change the
+underlying model/tool execution contract. Agent *execution quality* still has
+not been an explicit milestone exit condition, and the remaining loop and tool
+limitations are where the user-visible slowness and unreliability come from.
 
 | ID | Severity | Area | Finding |
 | --- | --- | --- | --- |
@@ -41,7 +43,7 @@ user-visible slowness and unreliability come from.
 ### B1 - Any failed tool result terminates the entire run
 
 In `handle_stream_event`, a tool call is executed and its result inspected
-(`crates/loom-agent/src/lib.rs:1401-1410`):
+(`crates/loom-agent/src/lib.rs:1469-1477`):
 
 ```rust
 let (tool_events, result) = self.execute_tool(&call);
@@ -57,8 +59,8 @@ if result.success {
 ```
 
 A tool returning `success: false` fails the run. The same pattern is repeated
-on the approval path (`crates/loom-agent/src/lib.rs:663-668`, in
-`approve_entry_inner`) and on the retry path (`:924-931`, in
+on the approval path (`crates/loom-agent/src/lib.rs:668-673`, in
+`approve_entry_inner`) and on the retry path (`:931-938`, in
 `retry_entry_inner`) — so retrying a failed tool call cannot recover the run
 either, which removes the one obvious escape hatch a user would reach for.
 `retry_entry_inner` replays `last_failed_call` with identical arguments and no
@@ -90,11 +92,11 @@ agent does on purpose — cannot complete by construction.
 
 Three adjacent paths terminate the run for equally recoverable reasons:
 
-- An unrecognised tool name (`:1205-1234`) fails the run rather than returning
+- An unrecognised tool name (`:1238-1269`) fails the run rather than returning
   "unknown tool" to the model.
-- A policy `Deny` decision (`:1252-1272`) fails the run rather than telling the
+- A policy `Deny` decision (`:1288-1309`) fails the run rather than telling the
   model the action is not permitted so it can choose another route.
-- A model stream that yields no tool call and no completion (`:1134-1137`)
+- A model stream that yields no tool call and no completion (`:1164-1167`)
   fails the run with "model returned an empty stream".
 
 Comparable agents treat all of these as observations to feed back into the
@@ -107,7 +109,7 @@ source of perceived unreliability and it is a small, contained fix.
 
 For the chat-completions path, the stream decoder accumulates tool calls and
 emits them only once the response body is fully read, in `finish()`
-(`crates/loom-providers/src/lib.rs:2281-2300`). It loops over them, emitting one
+(`crates/loom-providers/src/lib.rs:2295-2315`). It loops over them, emitting one
 at a time, and each `emit` synchronously runs the tool to completion before the
 next is emitted.
 
@@ -126,7 +128,7 @@ cost is wall-clock latency within the turn rather than extra completions.
 ### B3 - Blocking IO throughout precludes concurrency
 
 Every provider uses `ureq`, a blocking HTTP client, and the SSE loop is a
-blocking line iterator (`crates/loom-providers/src/lib.rs:2075`):
+blocking line iterator (`crates/loom-providers/src/lib.rs:2087`):
 
 ```rust
 for line in reader.lines() {
@@ -141,7 +143,7 @@ provider layer to an async client does not add a new runtime to the project.
 
 ### B4 - The tool surface is minimal and naively implemented
 
-`loom-tools` is 625 lines and exposes seven tools, two of which
+`loom-tools` is 639 lines and exposes seven tools, two of which
 (`propose_plan`, `ask_user`) are control tools handled by the runtime rather
 than workspace capabilities (`crates/loom-tools/src/lib.rs:45-55`). The five
 real tools are `list_files`, `read_file`, `search_text`, `apply_patch`, and
@@ -149,18 +151,18 @@ real tools are `list_files`, `read_file`, `search_text`, `apply_patch`, and
 
 The implementations are literal:
 
-- `search_text` (`:347-395`) recursively walks the tree, `read_to_string`s
+- `search_text` (`:357-405`) recursively walks the tree, `read_to_string`s
   every file, and tests each line with `line.contains(query)`. There is no
   regex, no file-type or glob filter, no line-range output, and no parallelism.
-- `collect_files` (`:315-345`) walks the entire tree with no depth limit,
+- `collect_files` (`:325-355`) walks the entire tree with no depth limit,
   pagination, or glob filter.
 - Ignored directories are a hardcoded five-entry denylist —
   `.git`, `target`, `node_modules`, `.venv`, `vendor` (`:13-19`). `.gitignore`
   is not consulted, so generated output such as `crates/loom-ui/dist/` is
   walked and searched.
 - `read_file` reads whole files with no line-range parameter.
-- Output is truncated by byte count at 64 KiB (`:90`, `:396-400`), which can
-  cut a file mid-token with no indication of what was elided.
+- Output is truncated by byte count at 64 KiB (`:90`, `:406-410`), which can
+  cut a file mid-token, although PR #5 did add an explicit truncation marker.
 
 The practical effect is that exploration is slow on any real repository and
 low-signal, so the model needs more turns to orient itself. Every extra turn
@@ -171,13 +173,13 @@ matching, and return ranged reads with structured truncation markers.
 
 ### B5 - Effort is concentrated away from agent quality
 
-By line count, `loom-server` (5,337), `loom-providers` (3,219), and `loom-ui`
-(5,785) account for 14,341 of 24,744 lines — transport, reconnect, resume
+By line count, `loom-server` (5,416), `loom-providers` (3,231), and `loom-ui`
+(6,490) account for 15,137 of 26,455 lines — transport, reconnect, resume
 cursors, request deduplication, capability negotiation, device-flow
 authentication, and rendering.
 
 The surface that determines whether the agent is actually good — `loom-tools`
-(625) plus `loom-context` (334) — is 959 lines, under 4% of the workspace.
+(639) plus `loom-context` (355) — is 994 lines, under 4% of the workspace.
 
 This is a milestone-ordering consequence rather than a coding mistake. M2-M4
 specify durable orchestration, provider health, and remote control; none of
