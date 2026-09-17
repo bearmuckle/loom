@@ -11,121 +11,76 @@ was removed once addressed. This audit uses a `B` prefix and covers a different
 question: why the agent loop feels slow and unreliable in use compared to
 comparable tools.
 
-**Audited revision:** `52a7f2e` (squashed merge of PR #5, after the agent
-activity and approval improvements).
+**Audited revision:** `c384f64` (current PR head, after PR #5 and the follow-up
+tool-recovery and workspace-tool changes).
 
-**Scope:** 26,455 lines across 15 crates.
+**Scope:** 26,554 lines across 15 crates.
 
 ## Summary
 
-The infrastructure is sound. Crate boundaries are sensible, the dependency
-direction runs leaf-ward, the protocol and persistence layers are real
-implementations, and the reconnect/resume machinery works. None of the findings
-below are about those layers.
+PR #5 improved the activity timeline, approval controls, continuation/retry
+handling, transcript repair, and session UX. The follow-up implementation also
+changed the most visible reliability failure: ordinary tool errors now become
+tool messages for the next model turn instead of failing the run.
 
-PR #5 materially improved the activity timeline, approval controls,
-continuation/retry handling, transcript repair, and session UX. Those changes
-make the state easier to observe and control, but they do not change the
-underlying model/tool execution contract. Agent *execution quality* still has
-not been an explicit milestone exit condition, and the remaining loop and tool
-limitations are where the user-visible slowness and unreliability come from.
+The remaining problem is execution quality. There is still no explicit
+milestone gate for task completion, tool latency, or recovery rate. Tool calls
+are still emitted and executed one at a time; workspace tools still perform
+naive repository walks; provider streaming is blocking; and the current
+concurrency helper is unused and does not actually overlap work.
 
-| ID | Severity | Area | Finding |
+## Resolved since the previous audit
+
+### B1 - Tool failures no longer terminate the run
+
+This finding is resolved at the audited revision and is not included in the
+remaining-findings table below.
+
+`execute_tool` appends every result, including failures, as a model tool
+message (`crates/loom-agent/src/lib.rs:1553-1585`). The event handler now stops
+the current model stream without calling `finish_failed` when a tool fails
+(`:1471-1477`), allowing the runtime to start the next model turn with the
+error in context. Unknown tools and policy denials follow the same pattern by
+writing tool messages before stopping the current stream
+(`:1229-1257`, `:1274-1301`).
+
+This is the right recovery shape for a failing test, a bad patch context, a
+missing path, or an invalid tool argument. Provider failures, cancellation,
+limits, and an empty model stream remain genuine run-level failures.
+
+| ID | Severity | Area | Remaining finding |
 | --- | --- | --- | --- |
-| B1 | Critical | Agent | Any failed tool result terminates the entire run |
 | B2 | High | Agent, tools | Tool calls execute strictly sequentially |
-| B3 | High | Providers, tools | Blocking IO throughout precludes concurrency |
-| B4 | High | Tools | The tool surface is minimal and naively implemented |
-| B5 | Medium | Project | Effort is concentrated away from agent quality |
+| B3 | Medium | Providers | Blocking provider IO limits scalability |
+| B4 | High | Tools | Workspace tools remain naive and truncation can panic |
+| B5 | Medium | Project | No measurable task-completion quality gate |
 
 ## Findings
-
-### B1 - Any failed tool result terminates the entire run
-
-In `handle_stream_event`, a tool call is executed and its result inspected
-(`crates/loom-agent/src/lib.rs:1469-1477`):
-
-```rust
-let (tool_events, result) = self.execute_tool(&call);
-ctx.events.extend(tool_events);
-if result.success {
-    self.last_failed_call = None;
-} else {
-    self.last_failed_call = Some(call);
-    ctx.events.extend(self.finish_failed(result.output));
-    ctx.finished = true;
-    return Ok(StreamFlow::Stop);
-}
-```
-
-A tool returning `success: false` fails the run. The same pattern is repeated
-on the approval path (`crates/loom-agent/src/lib.rs:668-673`, in
-`approve_entry_inner`) and on the retry path (`:931-938`, in
-`retry_entry_inner`) — so retrying a failed tool call cannot recover the run
-either, which removes the one obvious escape hatch a user would reach for.
-`retry_entry_inner` replays `last_failed_call` with identical arguments and no
-intervening model turn, so for a deterministic failure — a path that does not
-exist, a patch whose context does not match, a test that genuinely fails — the
-retry is guaranteed to fail again.
-
-`ToolResult::failure` is returned for entirely ordinary conditions: a
-`read_file` on a path that does not exist, an `apply_patch` whose context does
-not match, a `run_command` that exits non-zero, a malformed argument object.
-These are the normal texture of agent work.
-
-The `run_command` case is worth stating explicitly, because it is the most
-damaging. `run_command` maps process exit status straight onto tool success
-(`crates/loom-tools/src/lib.rs:268-272`):
-
-```rust
-if output.status.success() {
-    ToolResult::success(call, text)
-} else {
-    ToolResult::failure(call, text)
-}
-```
-
-Combined with B1, a failing test suite, a compile error, a non-zero linter, or
-a `grep` that finds no matches terminates the agent run. Running a test in
-order to read its failure output and fix it — the single most common thing an
-agent does on purpose — cannot complete by construction.
-
-Three adjacent paths terminate the run for equally recoverable reasons:
-
-- An unrecognised tool name (`:1238-1269`) fails the run rather than returning
-  "unknown tool" to the model.
-- A policy `Deny` decision (`:1288-1309`) fails the run rather than telling the
-  model the action is not permitted so it can choose another route.
-- A model stream that yields no tool call and no completion (`:1164-1167`)
-  fails the run with "model returned an empty stream".
-
-Comparable agents treat all of these as observations to feed back into the
-conversation. The model reads the error and adapts, which is most of what makes
-an agent appear competent. Loom instead surfaces them as run failures, so the
-user must restart and re-establish context by hand. This is the dominant
-source of perceived unreliability and it is a small, contained fix.
 
 ### B2 - Tool calls execute strictly sequentially
 
 For the chat-completions path, the stream decoder accumulates tool calls and
 emits them only once the response body is fully read, in `finish()`
-(`crates/loom-providers/src/lib.rs:2295-2315`). It loops over them, emitting one
-at a time, and each `emit` synchronously runs the tool to completion before the
-next is emitted.
+(`crates/loom-providers/src/lib.rs:2295-2315`). It emits one call, waits for
+the callback to finish, then emits the next.
 
-Multiple tool calls in a single assistant message are therefore executed one
-after another, never concurrently. The executor signature makes this
-structural rather than incidental — `ToolExecutor::execute(&self, call:
-&ToolCall) -> ToolResult` (`crates/loom-tools/src/lib.rs:117`) is synchronous
-and returns a finished result, so there is no representation of an in-flight
-tool.
+The executor itself has a synchronous API:
+`ToolExecutor::execute(&self, call: &ToolCall) -> ToolResult`
+(`crates/loom-tools/src/lib.rs:117`). An `execute_many` helper was added at
+`crates/loom-tools/src/lib.rs:136-144`, but it is unused by the agent and its
+lazy iterator spawns one worker and immediately joins it before spawning the
+next. It therefore preserves request order but does not overlap execution.
 
-A model that requests five file reads in one turn, which is the normal way
-these models explore a repository, gets five serialised disk walks. The
-round-trip count is correct — one model request per turn, not per tool — so the
-cost is wall-clock latency within the turn rather than extra completions.
+A model that requests five independent file reads in one turn gets five
+serialized operations. The round-trip count is correct — one model request per
+turn, not per tool — but wall-clock latency scales with the sum of tool times.
 
-### B3 - Blocking IO throughout precludes concurrency
+Concurrency also needs a safety policy. Read-only operations can usually
+overlap; patches, commands, approvals, and operations whose inputs depend on a
+previous result must remain serialized. Preserving result order alone is not a
+sufficient correctness rule.
+
+### B3 - Blocking provider IO limits scalability
 
 Every provider uses `ureq`, a blocking HTTP client, and the SSE loop is a
 blocking line iterator (`crates/loom-providers/src/lib.rs:2087`):
@@ -134,83 +89,83 @@ blocking line iterator (`crates/loom-providers/src/lib.rs:2087`):
 for line in reader.lines() {
 ```
 
-Combined with the synchronous `ToolExecutor` in B2, there is no point in the
-stack where concurrency could be introduced without changing signatures. B2
-cannot be fixed without addressing this first.
+This ties a run worker to a blocking provider call and makes cancellation,
+resource accounting, and many simultaneous sessions less efficient. It does
+not, by itself, prevent safe read-only tool concurrency: Loom already runs
+each agent run on a worker thread, and tools can use additional bounded worker
+threads.
 
-`tokio` is already a workspace dependency used by `loom-server`, so moving the
-provider layer to an async client does not add a new runtime to the project.
+Async provider transport is therefore not a prerequisite for B2. It should
+follow measurements showing that blocked provider workers or connection
+scalability are material bottlenecks. `tokio` is already a workspace dependency
+used by `loom-server`, so an eventual async migration would fit the existing
+runtime model.
 
-### B4 - The tool surface is minimal and naively implemented
+### B4 - Workspace tools remain naive and truncation can panic
 
-`loom-tools` is 639 lines and exposes seven tools, two of which
+`loom-tools` is 739 lines and exposes seven tools, two of which
 (`propose_plan`, `ask_user`) are control tools handled by the runtime rather
-than workspace capabilities (`crates/loom-tools/src/lib.rs:45-55`). The five
-real tools are `list_files`, `read_file`, `search_text`, `apply_patch`, and
-`run_command`.
+than workspace capabilities. The five workspace tools are `list_files`,
+`read_file`, `search_text`, `apply_patch`, and `run_command`.
 
-The implementations are literal:
+The follow-up implementation improved the surface:
 
-- `search_text` (`:357-405`) recursively walks the tree, `read_to_string`s
-  every file, and tests each line with `line.contains(query)`. There is no
-  regex, no file-type or glob filter, no line-range output, and no parallelism.
-- `collect_files` (`:325-355`) walks the entire tree with no depth limit,
-  pagination, or glob filter.
-- Ignored directories are a hardcoded five-entry denylist —
-  `.git`, `target`, `node_modules`, `.venv`, `vendor` (`:13-19`). `.gitignore`
-  is not consulted, so generated output such as `crates/loom-ui/dist/` is
-  walked and searched.
-- `read_file` reads whole files with no line-range parameter.
-- Output is truncated by byte count at 64 KiB (`:90`, `:406-410`), which can
-  cut a file mid-token, although PR #5 did add an explicit truncation marker.
+- `read_file` supports line ranges (`crates/loom-tools/src/lib.rs:165-189`).
+- `search_text` supports a glob filter (`:197-220`, `:418-420`).
+- File walks consult the repository-root `.gitignore`
+  (`:355-369`, `:387-461`).
 
-The practical effect is that exploration is slow on any real repository and
-low-signal, so the model needs more turns to orient itself. Every extra turn
-costs a full completion. B4 and B2 compound: slow tools, run serially.
+The remaining limitations are significant:
 
-Comparable tools delegate search to `ripgrep` or an index, expose glob
-matching, and return ranged reads with structured truncation markers.
+- `search_text` still recursively reads every candidate file and performs
+  exact `line.contains(query)` matching (`:421-437`). It has no regex engine,
+  index, or ripgrep-backed search.
+- The glob and ignore implementations cover only simplified patterns; they do
+  not implement full gitignore semantics.
+- `list_files` still walks the entire tree without depth, pagination, or a
+  structured result limit.
+- `read_file` and all other output paths use a 64 KiB byte limit
+  (`:90`, `:463-468`). The truncation marker is useful, but
+  `String::truncate` is called at an arbitrary byte offset. If that offset
+  falls inside a multibyte UTF-8 character, the worker panics instead of
+  returning a tool error.
 
-### B5 - Effort is concentrated away from agent quality
+The practical effect is still slow, low-signal repository exploration plus a
+potential process-level failure on sufficiently large Unicode output.
 
-By line count, `loom-server` (5,416), `loom-providers` (3,231), and `loom-ui`
-(6,490) account for 15,137 of 26,455 lines — transport, reconnect, resume
-cursors, request deduplication, capability negotiation, device-flow
-authentication, and rendering.
+### B5 - No measurable task-completion quality gate
 
-The surface that determines whether the agent is actually good — `loom-tools`
-(639) plus `loom-context` (355) — is 994 lines, under 4% of the workspace.
+The project has a substantial and useful transport, persistence, provider, and
+UI implementation, but no implemented acceptance benchmark for the behavior
+users feel. The roadmap names time to first streamed output, search latency,
+terminal throughput, reconnect time, and resource use; there are no task-level
+measurements for turns per task, tool-error recovery rate, or successful
+completion.
 
-This is a milestone-ordering consequence rather than a coding mistake. M2-M4
-specify durable orchestration, provider health, and remote control; none of
-M0-M6 has an exit condition phrased in terms of task success rate, turns per
-task, or latency. The roadmap's own guidance is "avoid building an entire layer
-in isolation before proving the end-to-end path", and the quality bar already
-lists "time to first streamed model output" and "search latency on
-representative repositories" as things to measure. Neither is currently
-measured.
+This is a milestone-ordering problem, not evidence that the infrastructure
+should be discarded. Without a representative task fixture and latency
+thresholds, further optimization risks improving internal metrics while
+leaving the agent experience unchanged.
 
 ## Recommended order
 
-These are ordered by user-visible benefit per unit of work, not by layer.
+These are ordered by user-visible benefit and confidence, not by layer:
 
-1. **B1.** Return failed tool results to the model as tool messages and
-   continue the run. Reserve `finish_failed` for genuine aborts — provider
-   errors, limits, cancellation. Contained to `loom-agent`, and the single
-   largest reliability improvement available.
-2. **B4.** Rewrite `loom-tools`: `ripgrep`-backed search with regex and glob
-   filters, `.gitignore` awareness, ranged reads, structured truncation, and an
-   exact-string edit tool. Contained to one crate.
-3. **B3.** Move providers to an async client on the existing `tokio` runtime
-   and make `ToolExecutor::execute` async.
-4. **B2.** Execute the tool calls of a turn concurrently, preserving result
-   order. Depends on B3.
-5. Add a task-completion benchmark before further milestone work — turns per
-   task, wall-clock to first token, tool-error recovery rate — so the quality
-   bar's performance section has something behind it.
+1. Add an agent-level batching acceptance test and implementation. Issue two
+   deliberately slow read-only calls in one model turn, prove they overlap
+   while results retain model order, and serialize writes, commands, approvals,
+   and dependent calls.
+2. Fix UTF-8-safe truncation at `loom-tools/src/lib.rs:463-468` and add a test
+   with a multibyte character crossing the 64 KiB boundary.
+3. Replace the remaining repository walks with ripgrep-backed search or an
+   index, implement full ignore/glob semantics, and retain ranged reads with
+   structured limits.
+4. Add representative task fixtures and measure turns per task, time to first
+   token, search latency, tool-error recovery rate, and successful completion.
+5. Consider an async provider client only if those measurements show blocked
+   provider workers or connection scalability are limiting factors.
 
-A full rewrite is not indicated. Findings B1-B4 are confined to `loom-agent`,
-`loom-tools`, and the provider transport. `loom-core`, `loom-protocol`,
-`loom-workspace`, `loom-vcs`, `loom-process`, and `loom-persistence` are not
-implicated by any finding here, and a restart would most likely reproduce them
-before reaching the same defect.
+A full rewrite is not indicated. The remaining work is concentrated in
+`loom-agent`, `loom-tools`, and provider execution. The existing protocol,
+workspace, VCS, process, persistence, server, and UI foundations can support
+these changes without introducing a second orchestration model.
