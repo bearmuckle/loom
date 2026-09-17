@@ -50,7 +50,7 @@ fn main() -> Result<(), LoomError> {
     let persistence_path = options.persistence.clone().or_else(|| {
         options
             .m3_demo
-            .then(|| env::temp_dir().join(format!("loom-m3-demo-{}.json", ProjectId::new())))
+            .then(|| env::temp_dir().join(format!("loom-m3-demo-{}.db", ProjectId::new())))
     });
     let backend = match persistence_path.as_deref() {
         Some(path) if options.model.as_str() != "deterministic/demo" => {

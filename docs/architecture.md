@@ -79,9 +79,9 @@ Suggested backend boundaries:
   local model servers, authentication, rate limits, and provider health.
 - `loom-context`: context inspection and assembly, repository/system
   instructions, summaries, compaction, and explicit token budgets.
-- `loom-persistence`: atomic versioned state storage used by the in-process
-  backend. Its JSON file format is an implementation detail; domain and
-  protocol types remain provider-neutral.
+- `loom-persistence`: atomic, sectioned SQLite state storage used by the
+  in-process backend. Its JSON section payloads are an implementation detail;
+  domain and protocol types remain provider-neutral.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
   result normalization, and tool adapters.
 - `loom-workspace`: file tree, file contents, watches, edits, and snapshots.

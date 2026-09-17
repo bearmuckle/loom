@@ -1,15 +1,13 @@
 use std::{
     fs,
-    fs::File,
-    io::ErrorKind,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use loom_core::{ErrorCode, LoomError, Result};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use uuid::Uuid;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
@@ -42,56 +40,92 @@ impl FilePersistence {
         self.path.is_file()
     }
 
-    pub fn load<T: DeserializeOwned>(&self) -> Result<Option<T>> {
-        let bytes = match fs::read(&self.path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(LoomError::new(
-                    ErrorCode::Persistence,
-                    format!(
-                        "could not read persistence file '{}': {error}",
-                        self.path.display()
-                    ),
-                    true,
-                ));
-            }
+    pub fn load_section<T: DeserializeOwned>(
+        &self,
+        section: &str,
+        expected_version: u32,
+    ) -> Result<Option<T>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT schema_version, payload FROM sections WHERE name = ?1",
+                [section],
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not read section '{section}': {error}"), true)
+            })?;
+        let Some((schema_version, payload)) = row else {
+            return Ok(None);
         };
-        if bytes.is_empty() {
+        if schema_version != expected_version {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                format!("persistence file '{}' is empty", self.path.display()),
+                format!(
+                    "unsupported persistence schema version {schema_version} (expected {expected_version})"
+                ),
                 false,
             ));
         }
-        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+        serde_json::from_slice(&payload).map(Some).map_err(|error| {
             LoomError::new(
                 ErrorCode::MalformedPayload,
-                format!(
-                    "persistence file '{}' contains malformed JSON: {error}",
-                    self.path.display()
-                ),
+                format!("persistence section '{section}' contains malformed JSON: {error}"),
                 false,
             )
         })
     }
 
-    pub fn save<T: Serialize>(&self, value: &T) -> Result<()> {
-        let bytes = serde_json::to_vec(value).map_err(|error| {
-            LoomError::new(
-                ErrorCode::Persistence,
-                format!("could not serialize durable state: {error}"),
-                false,
+    pub fn save_sections(&self, schema_version: u32, sections: &[(&str, Value)]) -> Result<()> {
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin persistence transaction: {error}"),
+                true,
             )
         })?;
+        for (name, value) in sections {
+            let payload = serde_json::to_vec(value).map_err(|error| {
+                persistence_error(
+                    format!("could not serialize persistence section '{name}': {error}"),
+                    false,
+                )
+            })?;
+            transaction.execute(
+                "INSERT INTO sections (name, schema_version, payload) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(name) DO UPDATE SET schema_version = excluded.schema_version, payload = excluded.payload",
+                params![name, schema_version, payload],
+            ).map_err(|error| persistence_error(format!("could not write persistence section '{name}': {error}"), true))?;
+        }
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit persistence transaction: {error}"),
+                true,
+            )
+        })
+    }
+
+    fn connection(&self) -> Result<Connection> {
+        Connection::open(&self.path).map_err(|error| {
+            persistence_error(
+                format!("could not open persistence database: {error}"),
+                true,
+            )
+        })
+    }
+
+    fn connection_for_write(&self) -> Result<Connection> {
         if let Some(parent) = self
             .path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
             fs::create_dir_all(parent).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Persistence,
+                persistence_error(
                     format!(
                         "could not create persistence directory '{}': {error}",
                         parent.display()
@@ -100,99 +134,32 @@ impl FilePersistence {
                 )
             })?;
         }
-        let temporary = self
-            .path
-            .with_extension(format!("tmp-{}", Uuid::new_v4().simple()));
-        if let Err(error) = fs::write(&temporary, bytes) {
-            let _ = fs::remove_file(&temporary);
-            return Err(LoomError::new(
-                ErrorCode::Persistence,
-                format!("could not write temporary persistence file: {error}"),
-                true,
-            ));
-        }
-        if let Err(error) = File::open(&temporary).and_then(|file| file.sync_all()) {
-            let _ = fs::remove_file(&temporary);
-            return Err(LoomError::new(
-                ErrorCode::Persistence,
-                format!("could not flush temporary persistence file: {error}"),
-                true,
-            ));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut permissions = fs::metadata(&temporary)
-                .map_err(|error| {
-                    LoomError::new(
-                        ErrorCode::Persistence,
-                        format!("could not inspect temporary persistence file: {error}"),
-                        true,
-                    )
-                })?
-                .permissions();
-            permissions.set_mode(0o600);
-            fs::set_permissions(&temporary, permissions).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Persistence,
-                    format!("could not protect temporary persistence file: {error}"),
+        let connection = self.connection()?;
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;
+             CREATE TABLE IF NOT EXISTS sections (
+                 name TEXT PRIMARY KEY NOT NULL,
+                 schema_version INTEGER NOT NULL,
+                 payload BLOB NOT NULL
+             );",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not initialize persistence database: {error}"),
                     true,
                 )
             })?;
-        }
-        if let Err(error) = fs::rename(&temporary, &self.path) {
-            let _ = fs::remove_file(&temporary);
-            return Err(LoomError::new(
-                ErrorCode::Persistence,
-                format!(
-                    "could not atomically replace persistence file '{}': {error}",
-                    self.path.display()
-                ),
-                true,
-            ));
-        }
-        Ok(())
+        Ok(connection)
     }
+}
 
-    pub fn load_versioned<T: DeserializeOwned>(&self, expected_version: u32) -> Result<Option<T>> {
-        let Some(value) = self.load::<VersionedState<T>>()? else {
-            return Ok(None);
-        };
-        if value.schema_version != expected_version {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!(
-                    "unsupported persistence schema version {} (expected {expected_version})",
-                    value.schema_version
-                ),
-                false,
-            ));
-        }
-        Ok(Some(value.state))
-    }
-
-    pub fn save_versioned<T: Serialize>(&self, schema_version: u32, state: &T) -> Result<()> {
-        self.save(&VersionedStateRef {
-            schema_version,
-            state,
-        })
-    }
+fn persistence_error(message: String, retryable: bool) -> LoomError {
+    LoomError::new(ErrorCode::Persistence, message, retryable)
 }
 
 pub type DurableStore = FilePersistence;
-
-#[derive(Clone, Debug, serde::Deserialize)]
-struct VersionedState<T> {
-    schema_version: u32,
-    state: T,
-}
-
-#[derive(serde::Serialize)]
-struct VersionedStateRef<'a, T> {
-    schema_version: u32,
-    state: &'a T,
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct MemoryPersistence {
@@ -243,30 +210,6 @@ impl MemoryPersistence {
         Ok(())
     }
 
-    pub fn load_versioned<T: DeserializeOwned>(&self, expected_version: u32) -> Result<Option<T>> {
-        let Some(value) = self.load::<VersionedState<T>>()? else {
-            return Ok(None);
-        };
-        if value.schema_version != expected_version {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!(
-                    "unsupported persistence schema version {} (expected {expected_version})",
-                    value.schema_version
-                ),
-                false,
-            ));
-        }
-        Ok(Some(value.state))
-    }
-
-    pub fn save_versioned<T: Serialize>(&self, schema_version: u32, state: &T) -> Result<()> {
-        self.save(&VersionedStateRef {
-            schema_version,
-            state,
-        })
-    }
-
     pub fn set_raw(&self, value: Value) -> Result<()> {
         *self.value.lock().map_err(|_| {
             LoomError::new(
@@ -283,6 +226,7 @@ impl MemoryPersistence {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+    use uuid::Uuid;
 
     #[derive(Debug, Deserialize, PartialEq, Serialize)]
     struct Fixture {
@@ -290,20 +234,18 @@ mod tests {
     }
 
     #[test]
-    fn file_store_round_trips_versioned_data_atomically() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.json", Uuid::new_v4()));
+    fn file_store_round_trips_section_data_atomically() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let store = FilePersistence::open(&path).unwrap();
         store
-            .save_versioned(
+            .save_sections(
                 CURRENT_SCHEMA_VERSION,
-                &Fixture {
-                    value: "durable".to_owned(),
-                },
+                &[("state", serde_json::json!({"value": "durable"}))],
             )
             .unwrap();
         assert_eq!(
             store
-                .load_versioned::<Fixture>(CURRENT_SCHEMA_VERSION)
+                .load_section::<Fixture>("state", CURRENT_SCHEMA_VERSION)
                 .unwrap()
                 .unwrap(),
             Fixture {
@@ -314,14 +256,50 @@ mod tests {
     }
 
     #[test]
-    fn malformed_data_is_a_structured_error() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.json", Uuid::new_v4()));
+    fn non_sqlite_file_is_rejected_without_migration() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         fs::write(&path, b"{not json").unwrap();
-        let error = FilePersistence::open(&path)
-            .unwrap()
-            .load::<Fixture>()
+        let store = FilePersistence::open(&path).unwrap();
+        let error = store
+            .save_sections(CURRENT_SCHEMA_VERSION, &[("state", serde_json::json!({}))])
             .unwrap_err();
-        assert_eq!(error.code, ErrorCode::MalformedPayload);
+        assert_eq!(error.code, ErrorCode::Persistence);
+        assert!(!path.with_extension("json.legacy").exists());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sections_are_updated_without_rewriting_other_sections() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        store
+            .save_sections(
+                CURRENT_SCHEMA_VERSION,
+                &[
+                    ("sessions", serde_json::json!({"count": 1})),
+                    ("journal", serde_json::json!({"events": 3})),
+                ],
+            )
+            .unwrap();
+        store
+            .save_sections(
+                CURRENT_SCHEMA_VERSION,
+                &[("sessions", serde_json::json!({"count": 2}))],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load_section::<serde_json::Value>("journal", CURRENT_SCHEMA_VERSION)
+                .unwrap(),
+            Some(serde_json::json!({"events": 3}))
+        );
+        assert_eq!(
+            store
+                .load_section::<serde_json::Value>("sessions", CURRENT_SCHEMA_VERSION)
+                .unwrap()
+                .unwrap()["count"],
+            2
+        );
         fs::remove_file(path).unwrap();
     }
 }

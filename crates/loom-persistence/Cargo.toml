@@ -1,6 +1,6 @@
 [package]
 name = "loom-persistence"
-description = "Provider-neutral durable JSON persistence primitives for Loom."
+description = "Provider-neutral durable SQLite persistence primitives for Loom."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +11,4 @@ loom-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+rusqlite.workspace = true

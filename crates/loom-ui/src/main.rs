@@ -25,12 +25,25 @@ use gpui::{
     Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
     WindowOptions, point, px, size,
 };
+use log::{error, info};
 
 use crate::text_input::{
     Backspace, Copy, Delete, End, Home, Left, Paste, Right, SelectAll, Submit,
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::{platform::UiOptions, state::ThemeChoice, view::LoomView};
+
+#[cfg(not(target_family = "wasm"))]
+fn init_logging() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("loom_ui=info"))
+        .format_timestamp_millis()
+        .init();
+}
+
+#[cfg(target_family = "wasm")]
+fn init_logging() {
+    console_log::init_with_level(log::Level::Info).expect("could not initialize browser logger");
+}
 
 pub(crate) const MAX_TIMELINE_OUTPUT: usize = 32 * 1024;
 pub(crate) const MAX_REVIEW_CHANGES: usize = 80;
@@ -59,27 +72,41 @@ fn bind_composer_keys(cx: &mut App) {
 
 #[cfg(not(target_family = "wasm"))]
 fn main() {
+    init_logging();
     let options = match UiOptions::parse(std::env::args()) {
         Ok(options) => options,
         Err(error) => {
-            eprintln!("could not parse Loom UI arguments: {error}");
+            error!("could not parse Loom UI arguments: {error}");
             std::process::exit(1);
         }
     };
+    info!(
+        "starting with {} backend, model '{}'",
+        if options.remote.is_some() {
+            "remote"
+        } else if options.demo {
+            "demo"
+        } else {
+            "local"
+        },
+        options.model.as_str()
+    );
     gpui_platform::application()
         .with_assets(gpui_kit_assets::AllAssets)
         .run(move |cx: &mut App| {
+            info!("initializing GPUI components");
             gpui_component::init(cx);
             gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
             bind_composer_keys(cx);
             let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
                 Ok(view) => view,
                 Err(error) => {
-                    eprintln!("could not initialize Loom UI: {error}");
+                    error!("could not initialize Loom UI: {error}");
                     cx.quit();
                     return;
                 }
             };
+            info!("Loom view initialized");
 
             let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
             let window = match cx.open_window(
@@ -104,18 +131,21 @@ fn main() {
             ) {
                 Ok(window) => window,
                 Err(error) => {
-                    eprintln!("failed to open Loom window: {error}");
+                    error!("failed to open Loom window: {error}");
                     cx.quit();
                     return;
                 }
             };
+            info!("Loom window opened");
             if let Err(error) = window.update(cx, |view, window, cx| {
                 view.composer_focus_handle.focus(window, cx);
                 view.select_theme(ThemeChoice::System, window, cx);
                 cx.activate(true);
             }) {
-                eprintln!("failed to focus Loom composer: {error}");
+                error!("failed to focus Loom composer: {error}");
                 cx.quit();
+            } else {
+                info!("startup complete");
             }
         });
 }
@@ -134,7 +164,7 @@ thread_local! {
 
 #[cfg(target_family = "wasm")]
 fn log_error(context: &str, error: impl std::fmt::Display) {
-    web_sys::console::error_1(&format!("Loom UI: {context}: {error}").into());
+    log::error!("{context}: {error}");
 }
 
 /// Connects to the remote backend and opens the same `LoomView` the native
@@ -175,6 +205,7 @@ async fn start_browser_client(cx: &mut gpui::AsyncApp) {
 #[cfg(target_family = "wasm")]
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn start() {
+    init_logging();
     gpui_platform::web_init();
     let application =
         gpui_platform::application_with_web_backend(gpui_platform::WebBackendPreference::WebGl)

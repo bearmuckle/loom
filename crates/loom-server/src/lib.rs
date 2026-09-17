@@ -30,10 +30,31 @@ use loom_session::SessionManager;
 use loom_tools::ToolExecutor;
 use loom_vcs::GitService;
 use loom_workspace::Workspace;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 
 mod auth;
 mod remote;
+
+fn json_value<T: Serialize>(value: T) -> Result<Value> {
+    serde_json::to_value(value).map_err(|error| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            format!("could not serialize persistence section: {error}"),
+            false,
+        )
+    })
+}
+
+fn from_json<T: DeserializeOwned>(value: Value) -> Result<T> {
+    serde_json::from_value(value).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted state contains malformed JSON: {error}"),
+            false,
+        )
+    })
+}
 
 pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
 pub use remote::{
@@ -156,20 +177,16 @@ struct IdempotencyRecord {
     response: ResponseEnvelope,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 struct PersistedBackendState {
-    schema_version: u32,
     sessions: loom_session::SessionManagerState,
     journal: EventJournal,
     runs: BTreeMap<loom_core::RunId, AgentRuntimeState>,
     workspaces: BTreeMap<ProjectId, loom_workspace::WorkspaceStateSnapshot>,
     policies: BTreeMap<ProjectId, ApprovalPolicy>,
-    terminal_projects: BTreeMap<loom_core::TerminalId, ProjectId>,
     provider_configs: Vec<ProviderConfig>,
     provider_health: BTreeMap<ProviderId, ProviderHealth>,
     provider_usage: UsageLedger,
-    models: Vec<ModelDescriptor>,
-    #[serde(default)]
     idempotency: BTreeMap<loom_core::RequestId, IdempotencyRecord>,
 }
 
@@ -800,18 +817,39 @@ impl InProcessBackend {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
         };
-        let Some(state) =
-            persistence.load_versioned::<PersistedBackendState>(CURRENT_SCHEMA_VERSION)?
+        let mut needs_persist = false;
+        let Some(sessions) = persistence.load_section::<loom_session::SessionManagerState>(
+            "sessions",
+            CURRENT_SCHEMA_VERSION,
+        )?
         else {
             return Ok(());
         };
-        if state.schema_version != CURRENT_SCHEMA_VERSION {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted backend state has an unsupported schema version",
-                false,
-            ));
-        }
+        let required = |name: &str| -> Result<Value> {
+            persistence
+                .load_section(name, CURRENT_SCHEMA_VERSION)?
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persistence section '{name}' is missing"),
+                        false,
+                    )
+                })
+        };
+        let state = PersistedBackendState {
+            sessions,
+            journal: from_json(required("journal")?)?,
+            runs: from_json(required("runs")?)?,
+            workspaces: from_json(required("workspaces")?)?,
+            policies: from_json(required("policies")?)?,
+            provider_configs: from_json(required("provider_configs")?)?,
+            provider_health: from_json(required("provider_health")?)?,
+            provider_usage: from_json(required("provider_usage")?)?,
+            idempotency: from_json(required("idempotency")?)?,
+        };
+        let _: BTreeMap<loom_core::TerminalId, ProjectId> =
+            from_json(required("terminal_projects")?)?;
+        let _: Vec<ModelDescriptor> = from_json(required("models")?)?;
         let sessions = SessionManager::from_state(state.sessions)?;
         {
             let mut target = self.sessions()?;
@@ -920,10 +958,13 @@ impl InProcessBackend {
             restored_runs.insert(run_id, self.register_runtime(runtime));
             if !recovery_events.is_empty() {
                 self.append_recovery_events(session.id, recovery_events)?;
+                needs_persist = true;
             }
         }
         *self.runs()? = restored_runs;
-        self.persist_state()?;
+        if needs_persist {
+            self.persist_state()?;
+        }
         Ok(())
     }
 
@@ -931,7 +972,7 @@ impl InProcessBackend {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
-        let runs = self
+        let runs: BTreeMap<loom_core::RunId, AgentRuntimeState> = self
             .runs()?
             .iter()
             .map(|(run_id, handle)| (*run_id, handle.state()))
@@ -941,21 +982,31 @@ impl InProcessBackend {
             .iter()
             .map(|(project_id, workspace)| Ok((*project_id, workspace.export_state()?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let state = PersistedBackendState {
-            schema_version: CURRENT_SCHEMA_VERSION,
-            sessions: self.sessions()?.export_state(),
-            journal: self.journal()?.clone(),
-            runs,
-            workspaces,
-            policies: self.policies()?.clone(),
-            terminal_projects: self.terminal_projects()?.clone(),
-            provider_configs: self.providers.export_configs()?,
-            provider_health: self.providers.export_health()?,
-            provider_usage: self.providers.usage()?,
-            models: self.models.clone(),
-            idempotency: self.idempotency()?.clone(),
-        };
-        persistence.save_versioned(CURRENT_SCHEMA_VERSION, &state)
+        persistence.save_sections(
+            CURRENT_SCHEMA_VERSION,
+            &[
+                ("sessions", json_value(self.sessions()?.export_state())?),
+                ("journal", json_value(self.journal()?.clone())?),
+                ("runs", json_value(runs)?),
+                ("workspaces", json_value(workspaces)?),
+                ("policies", json_value(self.policies()?.clone())?),
+                (
+                    "terminal_projects",
+                    json_value(self.terminal_projects()?.clone())?,
+                ),
+                (
+                    "provider_configs",
+                    json_value(self.providers.export_configs()?)?,
+                ),
+                (
+                    "provider_health",
+                    json_value(self.providers.export_health()?)?,
+                ),
+                ("provider_usage", json_value(self.providers.usage()?)?),
+                ("models", json_value(self.models.clone())?),
+                ("idempotency", json_value(self.idempotency()?.clone())?),
+            ],
+        )
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -1264,10 +1315,10 @@ impl InProcessConnection {
     }
 
     fn open_workspace(&self, project_id: ProjectId, root: String) -> Result<Workspace> {
-        let candidate = Workspace::open(project_id, PathBuf::from(root))?;
+        let requested_root = Workspace::canonical_root(&root)?;
         let mut workspaces = self.backend.workspaces()?;
         if let Some(existing) = workspaces.get(&project_id) {
-            if existing.root() != candidate.root() {
+            if existing.root() != requested_root {
                 return Err(LoomError::conflict(format!(
                     "project {project_id} is already configured for workspace '{}'",
                     existing.root().display()
@@ -1275,6 +1326,7 @@ impl InProcessConnection {
             }
             return Ok(existing.clone());
         }
+        let candidate = Workspace::open(project_id, requested_root)?;
         workspaces.insert(project_id, candidate.clone());
         Ok(candidate)
     }
@@ -1354,7 +1406,8 @@ impl InProcessConnection {
             );
         }
 
-        let retryable = request.request.is_retryable_mutation();
+        let durable_mutation = request.request.is_retryable_mutation();
+        let retryable = durable_mutation;
         let slot = if retryable {
             match self.backend.request_slot(request_id) {
                 Ok(slot) => Some(slot),
@@ -1395,7 +1448,11 @@ impl InProcessConnection {
                         return ResponseEnvelope::failure(request_id, error);
                     }
                 }
-                self.backend.persist_state().map(|()| response)
+                if durable_mutation {
+                    self.backend.persist_state().map(|()| response)
+                } else {
+                    Ok(response)
+                }
             }
             Err(error) => Err(error),
         };
@@ -3173,7 +3230,7 @@ mod tests {
     fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         let root = workspace();
         let persistence =
-            std::env::temp_dir().join(format!("loom-server-state-{}.json", ProjectId::new()));
+            std::env::temp_dir().join(format!("loom-server-state-{}.db", ProjectId::new()));
         let project_id = ProjectId::new();
         let (session_id, run_id, approval_id) = {
             let backend = InProcessBackend::new_persistent(&persistence).unwrap();
@@ -3273,36 +3330,60 @@ mod tests {
                 tool_call_id: approval_id,
             }));
         assert!(response.result.is_ok());
-        let events = match connection
-            .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-                session_id: Some(session_id),
-                after_sequence: None,
-            }))
-            .result
-            .unwrap()
-        {
-            ServerResponse::SessionEvents { events } => events,
-            response => panic!("unexpected events response: {response:?}"),
-        };
-        let command_approval = events
-            .iter()
-            .find_map(|event| match &event.event {
-                ServerEvent::Agent {
-                    event: AgentEvent::ToolApprovalRequired { call, .. },
-                } if call.name == "run_command" => Some(call.id),
-                _ => None,
+        await_settled_run(&connection, run_id);
+        let command_approval = (0..1_000)
+            .find_map(|_| {
+                let events = match connection
+                    .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                        session_id: Some(session_id),
+                        after_sequence: None,
+                    }))
+                    .result
+                    .unwrap()
+                {
+                    ServerResponse::SessionEvents { events } => events,
+                    response => panic!("unexpected events response: {response:?}"),
+                };
+                let approval = events.iter().find_map(|event| match &event.event {
+                    ServerEvent::Agent {
+                        event: AgentEvent::ToolApprovalRequired { call, .. },
+                    } if call.name == "run_command" => Some(call.id),
+                    _ => None,
+                });
+                approval.or_else(|| {
+                    thread::sleep(Duration::from_millis(5));
+                    None
+                })
             })
-            .unwrap();
+            .expect("run_command approval did not arrive");
         let response =
             connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                 run_id,
                 tool_call_id: command_approval,
             }));
         assert!(response.result.is_ok());
-        let usage = connection.request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }));
-        let ServerResponse::RunUsage { usage, .. } = usage.result.unwrap() else {
-            panic!("unexpected usage response");
+        let mut usage = match connection
+            .request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::RunUsage { usage, .. } => usage,
+            response => panic!("unexpected usage response: {response:?}"),
         };
+        for _ in 0..1_000 {
+            if usage.input_tokens > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+            usage = match connection
+                .request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }))
+                .result
+                .unwrap()
+            {
+                ServerResponse::RunUsage { usage, .. } => usage,
+                response => panic!("unexpected usage response: {response:?}"),
+            };
+        }
         assert_eq!(usage.input_tokens, 240);
         assert_eq!(usage.output_tokens, 52);
         assert_eq!(usage.tool_calls, 3);
@@ -3485,15 +3566,16 @@ mod tests {
     }
 
     #[test]
-    fn malformed_persisted_backend_state_is_rejected_without_fallback() {
+    fn non_sqlite_persistence_file_is_rejected_without_fallback() {
         let path =
-            std::env::temp_dir().join(format!("loom-server-malformed-{}.json", ProjectId::new()));
+            std::env::temp_dir().join(format!("loom-server-malformed-{}.db", ProjectId::new()));
         fs::write(&path, br#"{"schema_version":1,"state":{"broken":true}}"#).unwrap();
         let error = match InProcessBackend::new_persistent(&path) {
-            Ok(_) => panic!("malformed backend state unexpectedly loaded"),
+            Ok(_) => panic!("non-SQLite persistence unexpectedly loaded"),
             Err(error) => error,
         };
-        assert_eq!(error.code, ErrorCode::MalformedPayload);
+        assert_eq!(error.code, ErrorCode::Persistence);
+        assert!(!path.with_extension("json.legacy").exists());
         fs::remove_file(path).unwrap();
     }
 
@@ -3772,7 +3854,7 @@ mod tests {
     #[test]
     fn retryable_mutation_idempotency_survives_backend_restart() {
         let path =
-            std::env::temp_dir().join(format!("loom-server-idempotency-{}.json", ProjectId::new()));
+            std::env::temp_dir().join(format!("loom-server-idempotency-{}.db", ProjectId::new()));
         let request_id = loom_core::RequestId::new();
         let request = RequestEnvelope::with_request_id(
             request_id,
