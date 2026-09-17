@@ -751,25 +751,17 @@ impl ProviderRegistry {
             .transpose()?
             .unwrap_or_default();
         // Credentials are attached only to the backend request.
-        let request = ureq::get(&health_endpoint(endpoint));
+        let request = configure_request(ureq::get(&health_endpoint(endpoint)));
         let request = if credential.is_empty() {
             request
         } else {
-            request.set("Authorization", &format!("Bearer {credential}"))
+            request.header("Authorization", format!("Bearer {credential}"))
         };
-        let response =
-            request
-                .timeout(PROVIDER_REQUEST_TIMEOUT)
-                .call()
-                .map_err(|error| match error {
-                    ureq::Error::Status(status, _) => {
-                        normalize_provider_error(provider_id.as_str(), status)
-                    }
-                    ureq::Error::Transport(error) => {
-                        normalize_transport_error(provider_id.as_str(), &error.to_string())
-                    }
-                })?;
-        let body: serde_json::Value = response.into_json().map_err(|error| {
+        let response = request
+            .call()
+            .map_err(|error| normalize_provider_request_error(provider_id.as_str(), error))?;
+        let mut response = ensure_success(provider_id.as_str(), response)?;
+        let body: serde_json::Value = response.body_mut().read_json().map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
                 format!(
@@ -1381,16 +1373,16 @@ impl Default for GitHubCopilotAuthenticator {
 
 impl GitHubCopilotAuthenticator {
     pub fn begin(&self) -> Result<GitHubDeviceCode> {
-        let response = ureq::post(GITHUB_DEVICE_CODE_URL)
-            .timeout(PROVIDER_REQUEST_TIMEOUT)
-            .set("Accept", "application/json")
-            .set("Content-Type", "application/json")
+        let response = configure_request(ureq::post(GITHUB_DEVICE_CODE_URL))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
             .send_json(serde_json::json!({
                 "client_id": self.client_id.as_str(),
                 "scope": "read:user"
             }))
             .map_err(|error| normalize_oauth_error("GitHub device authorization", error))?;
-        response.into_json().map_err(|error| {
+        let mut response = ensure_success("GitHub device authorization", response)?;
+        response.body_mut().read_json().map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
                 format!("GitHub device authorization returned invalid JSON: {error}"),
@@ -1410,24 +1402,36 @@ impl GitHubCopilotAuthenticator {
                     false,
                 ));
             }
-            let response = ureq::post(GITHUB_ACCESS_TOKEN_URL)
-                .timeout(PROVIDER_REQUEST_TIMEOUT)
-                .set("Accept", "application/json")
-                .set("Content-Type", "application/json")
+            let response = configure_request(ureq::post(GITHUB_ACCESS_TOKEN_URL))
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
                 .send_json(serde_json::json!({
                     "client_id": self.client_id.as_str(),
                     "device_code": device.device_code.as_str(),
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
                 }));
             match response {
-                Ok(response) => {
-                    let body: OAuthTokenResponse = response.into_json().map_err(|error| {
-                        LoomError::new(
-                            ErrorCode::ProviderInvalidResponse,
-                            format!("GitHub token response was invalid JSON: {error}"),
-                            false,
-                        )
-                    })?;
+                Ok(mut response) if response.status().as_u16() == 400 => {
+                    let body: OAuthTokenResponse =
+                        response.body_mut().read_json().unwrap_or_default();
+                    match body.error.as_deref() {
+                        Some("authorization_pending") => thread::sleep(interval),
+                        Some("slow_down") => {
+                            interval = interval.saturating_add(Duration::from_secs(5));
+                            thread::sleep(interval);
+                        }
+                        _ => return Err(oauth_response_error(body)),
+                    }
+                }
+                Ok(mut response) => {
+                    let body: OAuthTokenResponse =
+                        response.body_mut().read_json().map_err(|error| {
+                            LoomError::new(
+                                ErrorCode::ProviderInvalidResponse,
+                                format!("GitHub token response was invalid JSON: {error}"),
+                                false,
+                            )
+                        })?;
                     if let Some(token) =
                         body.access_token.as_ref().filter(|token| !token.is_empty())
                     {
@@ -1441,20 +1445,6 @@ impl GitHubCopilotAuthenticator {
                         }
                         _ => return Err(oauth_response_error(body)),
                     }
-                }
-                Err(ureq::Error::Status(400, response)) => {
-                    let body: OAuthTokenResponse = response.into_json().unwrap_or_default();
-                    match body.error.as_deref() {
-                        Some("authorization_pending") => thread::sleep(interval),
-                        Some("slow_down") => {
-                            interval = interval.saturating_add(Duration::from_secs(5));
-                            thread::sleep(interval);
-                        }
-                        _ => return Err(oauth_response_error(body)),
-                    }
-                }
-                Err(error @ ureq::Error::Status(_, _)) => {
-                    return Err(normalize_oauth_error("GitHub token exchange", error));
                 }
                 Err(error) => {
                     return Err(normalize_oauth_error("GitHub token exchange", error));
@@ -1528,22 +1518,25 @@ impl GitHubCopilotProvider {
 
     pub fn discover_models(&self) -> Result<Vec<ModelDescriptor>> {
         let token = self.fetch_copilot_token()?;
-        let response = ureq::get(&format!("{}/models", trim_endpoint(&token.api_endpoint)))
-            .timeout(PROVIDER_REQUEST_TIMEOUT)
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("Bearer {}", token.value))
-            .set("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
-            .set("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION)
-            .set("Copilot-Integration-Id", "vscode-chat")
-            .set("Openai-Intent", "conversation-panel")
-            .set("X-GitHub-Api-Version", GITHUB_API_VERSION)
-            .set("X-Vscode-User-Agent-Library-Version", "electron-fetch")
-            .set("User-Agent", GITHUB_COPILOT_USER_AGENT)
-            .call()
-            .map_err(|error| {
-                normalize_provider_request_error("github-copilot model discovery", error)
-            })?;
-        let body: serde_json::Value = response.into_json().map_err(|error| {
+        let response = configure_request(ureq::get(&format!(
+            "{}/models",
+            trim_endpoint(&token.api_endpoint)
+        )))
+        .header("Accept", "application/json")
+        .header("Authorization", &format!("Bearer {}", token.value))
+        .header("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
+        .header("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION)
+        .header("Copilot-Integration-Id", "vscode-chat")
+        .header("Openai-Intent", "conversation-panel")
+        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+        .header("X-Vscode-User-Agent-Library-Version", "electron-fetch")
+        .header("User-Agent", GITHUB_COPILOT_USER_AGENT)
+        .call()
+        .map_err(|error| {
+            normalize_provider_request_error("github-copilot model discovery", error)
+        })?;
+        let mut response = ensure_success("github-copilot model discovery", response)?;
+        let body: serde_json::Value = response.body_mut().read_json().map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
                 format!("GitHub Copilot model discovery returned invalid JSON: {error}"),
@@ -1592,21 +1585,21 @@ impl GitHubCopilotProvider {
     }
 
     fn fetch_copilot_token(&self) -> Result<CopilotAccessToken> {
-        let response = ureq::get(&self.token_endpoint)
-            .timeout(PROVIDER_REQUEST_TIMEOUT)
-            .set("Accept", "application/json")
-            .set("Authorization", &format!("token {}", self.github_token))
-            .set("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
-            .set("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION)
-            .set("Copilot-Integration-Id", "vscode-chat")
-            .set("X-GitHub-Api-Version", GITHUB_API_VERSION)
-            .set("X-Vscode-User-Agent-Library-Version", "electron-fetch")
-            .set("User-Agent", GITHUB_COPILOT_USER_AGENT)
+        let response = configure_request(ureq::get(&self.token_endpoint))
+            .header("Accept", "application/json")
+            .header("Authorization", format!("token {}", self.github_token))
+            .header("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
+            .header("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION)
+            .header("Copilot-Integration-Id", "vscode-chat")
+            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
+            .header("X-Vscode-User-Agent-Library-Version", "electron-fetch")
+            .header("User-Agent", GITHUB_COPILOT_USER_AGENT)
             .call()
             .map_err(|error| {
                 normalize_provider_request_error("github-copilot token exchange", error)
             })?;
-        let body: serde_json::Value = response.into_json().map_err(|error| {
+        let mut response = ensure_success("github-copilot token exchange", response)?;
+        let body: serde_json::Value = response.body_mut().read_json().map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
                 format!("GitHub Copilot token response was invalid JSON: {error}"),
@@ -1823,18 +1816,12 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 
     fn health_check(&mut self) -> Result<()> {
-        let response = ureq::get(&health_endpoint(&self.endpoint))
-            .timeout(PROVIDER_REQUEST_TIMEOUT)
-            .call();
+        let response = configure_request(ureq::get(&health_endpoint(&self.endpoint))).call();
         match response {
-            Ok(_) => Ok(()),
-            Err(ureq::Error::Status(status, _)) => Err(normalize_provider_error(
+            Ok(response) => ensure_success(self.descriptor.provider.as_str(), response).map(|_| ()),
+            Err(error) => Err(normalize_provider_request_error(
                 self.descriptor.provider.as_str(),
-                status,
-            )),
-            Err(ureq::Error::Transport(error)) => Err(normalize_transport_error(
-                self.descriptor.provider.as_str(),
-                &error.to_string(),
+                error,
             )),
         }
     }
@@ -2036,29 +2023,32 @@ fn send_openai_request(
     if !responses_api {
         payload["stream_options"] = serde_json::json!({"include_usage": true});
     }
-    let request = ureq::post(endpoint)
-        .timeout(PROVIDER_REQUEST_TIMEOUT)
-        .set("Content-Type", "application/json")
-        .set("Accept", "text/event-stream");
+    let request = configure_request(ureq::post(endpoint))
+        .header("Content-Type", "application/json")
+        .header("Accept", "text/event-stream");
     let request = if authorization.is_empty() {
         request
     } else {
-        request.set("Authorization", authorization)
+        request.header("Authorization", authorization)
     };
-    let request = headers
-        .iter()
-        .fold(request, |request, (name, value)| request.set(name, value));
+    let request = headers.iter().fold(request, |request, (name, value)| {
+        request.header(*name, *value)
+    });
     cancel.check()?;
     let response = request
         .send_json(payload)
         .map_err(|error| normalize_provider_request_error(provider, error))?;
+    let mut response = ensure_success(provider, response)?;
     let event_stream = response
-        .header("content-type")
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
     let mut own_call_ids = BTreeMap::new();
     let call_ids = call_ids.unwrap_or(&mut own_call_ids);
     if !event_stream {
-        let body: serde_json::Value = response.into_json().map_err(|error| {
+        let mut response = response;
+        let body: serde_json::Value = response.body_mut().read_json().map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
                 format!("{provider} returned a response that was not valid JSON: {error}"),
@@ -2078,7 +2068,7 @@ fn send_openai_request(
         }
         return Ok(());
     }
-    let reader = BufReader::new(response.into_reader());
+    let reader = BufReader::new(response.body_mut().as_reader());
     let mut decoder = if responses_api {
         StreamDecoder::responses(provider.to_owned())
     } else {
@@ -2535,36 +2525,53 @@ fn trim_endpoint(endpoint: &str) -> String {
     endpoint.trim_end_matches('/').to_owned()
 }
 
+fn configure_request<B>(request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
+    request
+        .config()
+        .timeout_global(Some(PROVIDER_REQUEST_TIMEOUT))
+        .http_status_as_error(false)
+        .build()
+}
+
+fn ensure_success(
+    provider: &str,
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<ureq::http::Response<ureq::Body>> {
+    let status = response.status().as_u16();
+    if status < 400 {
+        return Ok(response);
+    }
+    let detail = response.body_mut().read_to_string().unwrap_or_default();
+    let detail = detail
+        .replace("Bearer ", "****** ")
+        .replace("token ", "token [redacted] ");
+    let detail = detail.chars().take(512).collect::<String>();
+    if detail.trim().is_empty() {
+        Err(normalize_provider_error(provider, status))
+    } else {
+        Err(LoomError::new(
+            ErrorCode::ProviderInvalidResponse,
+            format!("{provider} rejected the request (HTTP {status}): {detail}"),
+            false,
+        ))
+    }
+}
+
 fn normalize_provider_request_error(provider: &str, error: ureq::Error) -> LoomError {
     match error {
-        ureq::Error::Status(status, response) => {
-            let detail = response.into_string().unwrap_or_default();
-            let detail = detail
-                .replace("Bearer ", "Bearer [redacted] ")
-                .replace("token ", "token [redacted] ");
-            let detail = detail.chars().take(512).collect::<String>();
-            if detail.trim().is_empty() {
-                normalize_provider_error(provider, status)
-            } else {
-                LoomError::new(
-                    ErrorCode::ProviderInvalidResponse,
-                    format!("{provider} rejected the request (HTTP {status}): {detail}"),
-                    false,
-                )
-            }
-        }
-        ureq::Error::Transport(error) => normalize_transport_error(provider, &error.to_string()),
+        ureq::Error::StatusCode(status) => normalize_provider_error(provider, status),
+        error => normalize_transport_error(provider, &error.to_string()),
     }
 }
 
 fn normalize_oauth_error(operation: &str, error: ureq::Error) -> LoomError {
     match error {
-        ureq::Error::Status(status, _) => LoomError::new(
+        ureq::Error::StatusCode(status) => LoomError::new(
             ErrorCode::ProviderAuthentication,
             format!("{operation} failed (HTTP {status})"),
             false,
         ),
-        ureq::Error::Transport(error) => normalize_transport_error(operation, &error.to_string()),
+        error => normalize_transport_error(operation, &error.to_string()),
     }
 }
 
@@ -3164,11 +3171,10 @@ mod tests {
             let mut request = [0_u8; 4096];
             let read = token_stream.read(&mut request).unwrap();
             let token_request = String::from_utf8_lossy(&request[..read]);
-            assert!(
-                token_request
-                    .lines()
-                    .any(|line| line.starts_with("Authorization: token "))
-            );
+            assert!(token_request.lines().any(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("authorization: token ")
+            }));
             let token_body =
                 format!(r#"{{"token":"copilot-token","endpoints":{{"api":"http://{address}"}}}}"#);
             write!(
