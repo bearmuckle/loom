@@ -2824,8 +2824,9 @@ mod tests {
     use std::{
         fs,
         io::{Read, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         thread,
+        time::Duration,
     };
 
     use loom_model::CollectingSink;
@@ -2843,21 +2844,50 @@ mod tests {
     fn serve_once(
         body: &'static str,
         content_type: &'static str,
-    ) -> (String, thread::JoinHandle<()>) {
+    ) -> (String, thread::JoinHandle<std::result::Result<(), String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 8192];
-            let _ = stream.read(&mut request).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            read_request_headers(&mut stream)?;
+            write_response(&mut stream, content_type, body)?;
+            Ok(())
         });
         (format!("http://{address}/v1/chat/completions"), server)
+    }
+
+    fn read_request_headers(stream: &mut TcpStream) -> std::result::Result<String, String> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| error.to_string())?;
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.len() > 64 * 1024 {
+                return Err("request headers exceeded fixture limit".to_owned());
+            }
+        }
+        Ok(String::from_utf8_lossy(&request).into_owned())
+    }
+
+    fn write_response(
+        stream: &mut TcpStream,
+        content_type: &str,
+        body: &str,
+    ) -> std::result::Result<(), String> {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .map_err(|error| error.to_string())?;
+        stream.flush().map_err(|error| error.to_string())
     }
 
     #[test]
@@ -2887,8 +2917,11 @@ mod tests {
                 seen.push(event);
                 Ok(StreamFlow::Continue)
             })
-            .unwrap();
-        server.join().unwrap();
+            .unwrap_or_else(|error| panic!("provider stream failed: {error:?}"));
+        server
+            .join()
+            .expect("fixture server thread panicked")
+            .expect("fixture server failed");
         assert!(matches!(
             seen.first(),
             Some(ModelStreamEvent::TextDelta { text }) if text == "par"
@@ -3031,20 +3064,14 @@ mod tests {
     fn openai_compatible_provider_works_against_a_local_fixture() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let read = stream.read(&mut request).unwrap();
-            let request_text = String::from_utf8_lossy(&request[..read]);
-            assert!(request_text.contains("raw-key-never-in-events"));
+        let server = thread::spawn(move || -> std::result::Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request_text = read_request_headers(&mut stream)?;
+            if !request_text.contains("raw-key-never-in-events") {
+                return Err("fixture request did not contain the expected API key".to_owned());
+            }
             let body = r#"{"choices":[{"message":{"content":"fixture response"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+            write_response(&mut stream, "application/json", body)
         });
         let mut provider = OpenAiCompatibleProvider::new(
             format!("http://{address}/v1/chat/completions"),
@@ -3073,7 +3100,10 @@ mod tests {
                     if usage.input_tokens == 3 && usage.output_tokens == 2
             )
         }));
-        server.join().unwrap();
+        server
+            .join()
+            .expect("fixture server thread panicked")
+            .expect("fixture server failed");
         let redacted_error = normalize_transport_error("fixture", "Bearer raw-key-never-in-events");
         assert!(!redacted_error.message.contains("raw-key-never-in-events"));
     }
@@ -3082,19 +3112,14 @@ mod tests {
     fn registry_discovers_models_with_a_credential_reference() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 2048];
-            let read = stream.read(&mut request).unwrap();
-            assert!(String::from_utf8_lossy(&request[..read]).contains("discovery-key"));
+        let server = thread::spawn(move || -> std::result::Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request_text = read_request_headers(&mut stream)?;
+            if !request_text.contains("discovery-key") {
+                return Err("fixture request did not contain the expected discovery key".to_owned());
+            }
             let body = r#"{"data":[{"id":"discovered/model"}]}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            )
-            .unwrap();
+            write_response(&mut stream, "application/json", body)
         });
         let credentials = Arc::new(InMemoryCredentialStore::default());
         credentials.insert(CredentialRef::new("gateway-key"), "discovery-key");
@@ -3130,7 +3155,10 @@ mod tests {
             registry.pricing(&ModelId::new("discovered/model")).unwrap(),
             (100, 200)
         );
-        server.join().unwrap();
+        server
+            .join()
+            .expect("fixture server thread panicked")
+            .expect("fixture server failed");
     }
 
     #[test]
