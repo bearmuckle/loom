@@ -15,3 +15,5 @@ serde.workspace = true
 serde_json.workspace = true
 ignore.workspace = true
 globset.workspace = true
+ureq.workspace = true
+url.workspace = true

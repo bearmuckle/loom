@@ -75,3 +75,4 @@ futures-channel = "0.3.34"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 ignore = "0.4.33"
 globset = "0.4.20"
+url = "2.5.8"
