@@ -44,23 +44,23 @@ log = "0.4"
 env_logger = "0.11"
 console_log = "1.0"
 thiserror = "2.0"
-gpui = { package = "gpui-pre", version = "0.3.1" }
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.1", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui = { package = "gpui-pre", version = "0.3.5" }
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
 gpui-base = "0.6.1"
 gpui-component = "0.6.1"
 gpui-kit-assets = "0.6.1"
-open = "5.4"
-ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
-uuid = { version = "1.16", features = ["serde", "v4"] }
-axum = { version = "0.8", features = ["ws"] }
-futures-util = "0.3"
-sha2 = "0.10"
+open = "5.4.4"
+ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
+uuid = { version = "1.26.1", features = ["serde", "v4"] }
+axum = { version = "0.8.9", features = ["ws"] }
+futures-util = "0.3.34"
+sha2 = "0.11.0"
 tokio = { version = "1.53", features = ["full"] }
-tokio-tungstenite = "0.27"
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
-web-sys = { version = "0.3", features = [
+tokio-tungstenite = "0.30.0"
+wasm-bindgen = "0.2.128"
+wasm-bindgen-futures = "0.4.78"
+js-sys = "0.3.105"
+web-sys = { version = "0.3.105", features = [
     "Location",
     "Window",
     "WebSocket",
@@ -70,6 +70,6 @@ web-sys = { version = "0.3", features = [
     "Event",
     "UrlSearchParams",
 ] }
-getrandom = { version = "0.2", features = ["js"] }
-futures-channel = "0.3"
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+futures-channel = "0.3.34"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
