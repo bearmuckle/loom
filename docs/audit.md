@@ -25,9 +25,8 @@ tool messages for the next model turn instead of failing the run.
 
 The remaining problem is execution quality. There is still no explicit
 milestone gate for task completion, tool latency, or recovery rate. Tool calls
-are still emitted and executed one at a time; workspace tools still perform
-naive repository walks; provider streaming is blocking; and the current
-concurrency helper is unused and does not actually overlap work.
+are still emitted and executed one at a time; provider streaming is blocking;
+and the current tool surface still lacks structured limits and diagnostics.
 
 ## Resolved since the previous audit
 
@@ -52,7 +51,7 @@ limits, and an empty model stream remain genuine run-level failures.
 | --- | --- | --- | --- |
 | B2 | High | Agent, tools | Tool calls execute strictly sequentially |
 | B3 | Medium | Providers | Blocking provider IO limits scalability |
-| B4 | High | Tools | Workspace tools remain naive and truncation can panic |
+| B4 | Medium | Tools | Workspace tools retain bounded exact-search limitations |
 | B5 | Medium | Project | No measurable task-completion quality gate |
 
 ## Findings
@@ -101,7 +100,7 @@ scalability are material bottlenecks. `tokio` is already a workspace dependency
 used by `loom-server`, so an eventual async migration would fit the existing
 runtime model.
 
-### B4 - Workspace tools remain naive and truncation can panic
+### B4 - Workspace tools retain bounded exact-search limitations
 
 `loom-tools` is 739 lines and exposes seven tools, two of which
 (`propose_plan`, `ask_user`) are control tools handled by the runtime rather
@@ -112,26 +111,22 @@ The follow-up implementation improved the surface:
 
 - `read_file` supports line ranges (`crates/loom-tools/src/lib.rs:165-189`).
 - `search_text` supports a glob filter (`:197-220`, `:418-420`).
-- File walks consult the repository-root `.gitignore`
-  (`:355-369`, `:387-461`).
+- File walks use the ripgrep `ignore` and `globset` crates for repository
+  ignore rules and glob matching (`:359-451`).
+- Output truncation preserves UTF-8 boundaries and has regression coverage
+  (`:463-468`, `:757-764`).
 
-The remaining limitations are significant:
+The remaining limitations are:
 
-- `search_text` still recursively reads every candidate file and performs
-  exact `line.contains(query)` matching (`:421-437`). It has no regex engine,
-  index, or ripgrep-backed search.
-- The glob and ignore implementations cover only simplified patterns; they do
-  not implement full gitignore semantics.
-- `list_files` still walks the entire tree without depth, pagination, or a
-  structured result limit.
-- `read_file` and all other output paths use a 64 KiB byte limit
-  (`:90`, `:463-468`). The truncation marker is useful, but
-  `String::truncate` is called at an arbitrary byte offset. If that offset
-  falls inside a multibyte UTF-8 character, the worker panics instead of
-  returning a tool error.
+- `search_text` performs exact `line.contains(query)` matching
+  (`:421-437`); it has no regex mode, index, or structured match records.
+- `list_files` still walks the entire selected workspace without depth,
+  pagination, or a structured result limit.
+- `read_file` and other output paths retain a fixed 64 KiB output limit
+  (`:90`, `:463-468`), with only a textual truncation marker.
 
-The practical effect is still slow, low-signal repository exploration plus a
-potential process-level failure on sufficiently large Unicode output.
+The practical effect is bounded but still lower-signal repository exploration
+than a full ripgrep-style search API.
 
 ### B5 - No measurable task-completion quality gate
 
@@ -155,14 +150,11 @@ These are ordered by user-visible benefit and confidence, not by layer:
    deliberately slow read-only calls in one model turn, prove they overlap
    while results retain model order, and serialize writes, commands, approvals,
    and dependent calls.
-2. Fix UTF-8-safe truncation at `loom-tools/src/lib.rs:463-468` and add a test
-   with a multibyte character crossing the 64 KiB boundary.
-3. Replace the remaining repository walks with ripgrep-backed search or an
-   index, implement full ignore/glob semantics, and retain ranged reads with
-   structured limits.
-4. Add representative task fixtures and measure turns per task, time to first
+2. Add regex or indexed search, depth/pagination controls, and structured
+   result limits while retaining ranged reads.
+3. Add representative task fixtures and measure turns per task, time to first
    token, search latency, tool-error recovery rate, and successful completion.
-5. Consider an async provider client only if those measurements show blocked
+4. Consider an async provider client only if those measurements show blocked
    provider workers or connection scalability are limiting factors.
 
 A full rewrite is not indicated. The remaining work is concentrated in

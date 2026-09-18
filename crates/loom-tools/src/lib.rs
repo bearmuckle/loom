@@ -4,6 +4,8 @@ use std::{
     process::Command,
 };
 
+use globset::Glob;
+use ignore::WalkBuilder;
 use loom_core::{ActionKind, ApprovalPolicy, ProjectId, Result};
 use loom_model::{ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
@@ -357,30 +359,24 @@ impl ToolExecutor {
 
     fn collect_files(
         &self,
-        path: &Path,
+        requested_path: &Path,
         relative: &Path,
         files: &mut Vec<String>,
     ) -> std::result::Result<(), String> {
-        let entries = fs::read_dir(path)
-            .map_err(|error| format!("could not list '{}': {error}", relative.display()))?;
-        for entry in entries {
-            let entry =
-                entry.map_err(|error| format!("could not read directory entry: {error}"))?;
-            let name = entry.file_name();
-            let child_relative = relative.join(&name);
-            if is_ignored_directory(&name) || self.is_ignored(&child_relative) {
-                continue;
-            }
+        for entry in self.walk_workspace() {
+            let entry = entry
+                .map_err(|error| format!("could not list '{}': {error}", relative.display()))?;
             let child = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|error| format!("could not inspect '{}': {error}", child.display()))?;
-            if file_type.is_symlink() {
+            if !child.starts_with(requested_path) {
                 continue;
             }
-            if file_type.is_dir() {
-                self.collect_files(&child, &child_relative, files)?;
-            } else if file_type.is_file() {
+            if entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                let child_relative = child.strip_prefix(&self.root).map_err(|error| {
+                    format!("could not relativize '{}': {error}", child.display())
+                })?;
                 files.push(child_relative.display().to_string());
             }
         }
@@ -389,78 +385,78 @@ impl ToolExecutor {
 
     fn collect_matches(
         &self,
-        path: &Path,
+        requested_path: &Path,
         relative: &Path,
         query: &str,
         glob: Option<&str>,
         matches: &mut Vec<String>,
     ) -> std::result::Result<(), String> {
-        if path.is_dir() {
-            let entries = fs::read_dir(path)
+        let matcher = glob
+            .map(|pattern| {
+                Glob::new(pattern)
+                    .map(|glob| glob.compile_matcher())
+                    .map_err(|error| format!("invalid glob '{pattern}': {error}"))
+            })
+            .transpose()?;
+        for entry in self.walk_workspace() {
+            let entry = entry
                 .map_err(|error| format!("could not search '{}': {error}", relative.display()))?;
-            for entry in entries {
-                let entry =
-                    entry.map_err(|error| format!("could not read directory entry: {error}"))?;
-                let name = entry.file_name();
-                let child_relative = relative.join(&name);
-                if is_ignored_directory(&name) || self.is_ignored(&child_relative) {
-                    continue;
-                }
-                if entry
-                    .file_type()
-                    .map_err(|error| format!("could not inspect search entry: {error}"))?
-                    .is_symlink()
-                {
-                    continue;
-                }
-                self.collect_matches(&entry.path(), &child_relative, query, glob, matches)?;
+            let path = entry.path();
+            let is_file = entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file());
+            if !path.starts_with(requested_path) || !is_file {
+                continue;
             }
-            return Ok(());
-        }
 
-        if glob.is_some_and(|pattern| !glob_matches(pattern, relative)) {
-            return Ok(());
-        }
-        let contents = match fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(()),
-            Err(error) => {
-                return Err(format!("could not read '{}': {error}", relative.display()));
+            let child_relative = path
+                .strip_prefix(&self.root)
+                .map_err(|error| format!("could not relativize '{}': {error}", path.display()))?;
+            if matcher
+                .as_ref()
+                .is_some_and(|matcher| !matcher.is_match(child_relative))
+            {
+                continue;
             }
-        };
-        for (line_number, line) in contents.lines().enumerate() {
-            if line.contains(query) {
-                matches.push(format!(
-                    "{}:{}:{}",
-                    relative.display(),
-                    line_number + 1,
-                    line
-                ));
+            let contents = match fs::read_to_string(path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "could not read '{}': {error}",
+                        child_relative.display()
+                    ));
+                }
+            };
+            for (line_number, line) in contents.lines().enumerate() {
+                if line.contains(query) {
+                    matches.push(format!(
+                        "{}:{}:{}",
+                        child_relative.display(),
+                        line_number + 1,
+                        line
+                    ));
+                }
             }
         }
         Ok(())
     }
 
-    fn is_ignored(&self, relative: &Path) -> bool {
-        let Ok(contents) = fs::read_to_string(self.root.join(".gitignore")) else {
-            return false;
-        };
-        contents
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                (!line.is_empty() && !line.starts_with('#')).then_some(line.trim_end_matches('/'))
-            })
-            .any(|pattern| {
-                let path = relative.to_string_lossy();
-                let pattern = pattern.trim_start_matches('/');
-                path == pattern
-                    || path.starts_with(&format!("{pattern}/"))
-                    || (!pattern.contains('/')
-                        && relative
-                            .components()
-                            .any(|component| component.as_os_str() == pattern))
-            })
+    fn walk_workspace(&self) -> ignore::Walk {
+        let mut builder = WalkBuilder::new(&self.root);
+        builder
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(false)
+            .git_exclude(false)
+            .parents(false)
+            .ignore(false)
+            .filter_entry(|entry| !is_ignored_directory(entry.file_name()));
+        let gitignore = self.root.join(".gitignore");
+        if gitignore.is_file() {
+            builder.add_ignore(gitignore);
+        }
+        builder.build()
     }
 
     fn limit_output(&self, mut output: String) -> String {
@@ -600,29 +596,6 @@ struct SearchTextArguments {
     glob: Option<String>,
 }
 
-fn glob_matches(pattern: &str, path: &Path) -> bool {
-    let pattern = pattern.replace('\\', "/");
-    let path = path.to_string_lossy().replace('\\', "/");
-    let mut parts = pattern.split('*');
-    let Some(first) = parts.next() else {
-        return false;
-    };
-    if !path.starts_with(first) {
-        return false;
-    }
-    let mut offset = first.len();
-    for part in parts {
-        if part.is_empty() {
-            continue;
-        }
-        let Some(found) = path[offset..].find(part) else {
-            return false;
-        };
-        offset += found + part.len();
-    }
-    pattern.ends_with('*') || offset == path.len()
-}
-
 #[derive(Debug, Deserialize)]
 struct ApplyPatchArguments {
     path: String,
@@ -689,6 +662,14 @@ mod tests {
         ));
         assert!(search.success);
         assert!(search.output.contains("src/main.rs:1"));
+
+        let rust_search = executor.execute(&call(
+            "search_text",
+            serde_json::json!({"query": "println", "glob": "**/*.rs"}),
+        ));
+        assert!(rust_search.success);
+        assert!(rust_search.output.contains("src/main.rs:1"));
+        assert!(!rust_search.output.contains("README.md"));
 
         let patch = executor.execute(&call(
             "apply_patch",

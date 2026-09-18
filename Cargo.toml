@@ -73,3 +73,5 @@ web-sys = { version = "0.3.105", features = [
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 futures-channel = "0.3.34"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+ignore = "0.4.33"
+globset = "0.4.20"

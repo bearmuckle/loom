@@ -4118,6 +4118,8 @@ dependencies = [
 name = "loom-tools"
 version = "0.1.0"
 dependencies = [
+ "globset",
+ "ignore",
  "loom-core",
  "loom-model",
  "loom-protocol",
