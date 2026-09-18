@@ -26,7 +26,7 @@ use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence,
     LoomError, ProjectId, RunId,
 };
-use loom_model::{MessageRole, ModelId, ToolCall};
+use loom_model::{MessageRole, ModelId, ProviderKind, ProviderSummary, ToolCall};
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
@@ -45,9 +45,9 @@ use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
     connection::{BackendWorker, ClientConnection, select_remote_project, unexpected_response},
     state::{
-        AgentMode, BackendStatus, GitHubLoginState, RenameDialogState, ReviewPanel, ReviewState,
-        ThemeChoice, TimelineItem, activity_status_label, bounded, bounded_to, run_state_name,
-        session_state_for_run, session_state_name, session_title_from_task, upsert_activity,
+        AgentMode, GitHubLoginState, RenameDialogState, ReviewPanel, ReviewState, ThemeChoice,
+        TimelineItem, activity_status_label, bounded, bounded_to, session_state_for_run,
+        session_title_from_task, upsert_activity,
     },
     text_input::{
         Backspace, Copy, Delete, End, Home, InputField, Left, LoomTooltip, Paste, Right, SelectAll,
@@ -106,6 +106,46 @@ fn format_duration(elapsed_ms: u64) -> String {
             elapsed_ms / 60_000,
             (elapsed_ms % 60_000) / 1_000
         )
+    }
+}
+
+fn session_state_label(state: AgentSessionState) -> &'static str {
+    match state {
+        AgentSessionState::Idle => "Ready",
+        AgentSessionState::Queued => "Queued",
+        AgentSessionState::Planning => "Planning",
+        AgentSessionState::AwaitingApproval => "Needs approval",
+        AgentSessionState::Paused => "Paused",
+        AgentSessionState::Executing => "Working",
+        AgentSessionState::Evaluating => "Reviewing",
+        AgentSessionState::NeedsInput => "Needs your input",
+        AgentSessionState::Completed => "Complete",
+        AgentSessionState::Failed => "Something went wrong",
+        AgentSessionState::Cancelled => "Cancelled",
+        AgentSessionState::Archived => "Archived",
+    }
+}
+
+fn run_state_label(state: Option<AgentRunState>) -> &'static str {
+    match state {
+        None => "Ready",
+        Some(AgentRunState::Planning) => "Planning",
+        Some(AgentRunState::Executing) => "Working",
+        Some(AgentRunState::AwaitingApproval) => "Needs approval",
+        Some(AgentRunState::Paused) => "Paused",
+        Some(AgentRunState::NeedsInput) => "Needs your input",
+        Some(AgentRunState::Evaluating) => "Reviewing",
+        Some(AgentRunState::Completed) => "Complete",
+        Some(AgentRunState::Failed) => "Something went wrong",
+        Some(AgentRunState::Cancelled) => "Cancelled",
+    }
+}
+
+fn change_kind_label(kind: loom_workspace::WorkspaceChangeKind) -> &'static str {
+    match kind {
+        loom_workspace::WorkspaceChangeKind::Created => "New",
+        loom_workspace::WorkspaceChangeKind::Deleted => "Removed",
+        loom_workspace::WorkspaceChangeKind::Modified => "Updated",
     }
 }
 
@@ -307,6 +347,8 @@ pub(crate) struct LoomView {
     pub(crate) models: Vec<ModelId>,
     pub(crate) model_picker_open: bool,
     pub(crate) settings_open: bool,
+    pub(crate) providers_open: bool,
+    pub(crate) providers: Vec<ProviderSummary>,
     pub(crate) theme_choice: ThemeChoice,
     pub(crate) dark_theme: bool,
     appearance_subscription: Option<Subscription>,
@@ -329,7 +371,6 @@ pub(crate) struct LoomView {
     pub(crate) tasks: Vec<TaskSnapshot>,
     pub(crate) rename_dialog: Option<RenameDialogState>,
     pub(crate) rename_focus_handle: FocusHandle,
-    pub(crate) backend_status: BackendStatus,
     pub(crate) demo_workspace: bool,
     pub(crate) login_enabled: bool,
     pub(crate) github_connected: bool,
@@ -342,6 +383,7 @@ struct TimelineView {
     list_state: ListState,
     parent_subscription: Option<Subscription>,
     session_id: Option<AgentSessionId>,
+    timeline_revision: (usize, usize),
 }
 
 impl TimelineView {
@@ -351,12 +393,20 @@ impl TimelineView {
             list_state: ListState::new(0, ListAlignment::Top, px(120.)),
             parent_subscription: None,
             session_id: None,
+            timeline_revision: (0, 0),
         }
     }
 
-    fn sync_list(&mut self, item_count: usize, session_changed: bool) {
+    fn sync_list(
+        &mut self,
+        item_count: usize,
+        timeline_revision: (usize, usize),
+        session_changed: bool,
+    ) {
+        let content_changed = self.timeline_revision != timeline_revision;
+        self.timeline_revision = timeline_revision;
         if self.list_state.item_count() == item_count {
-            if session_changed {
+            if session_changed || content_changed {
                 self.list_state.scroll_to_end();
             }
             return;
@@ -381,19 +431,42 @@ impl Render for TimelineView {
         if session_changed {
             self.session_id = Some(session_id);
         }
-        self.sync_list(item_count, session_changed);
+        let timeline_revision = (
+            item_count,
+            parent_state
+                .timeline
+                .last()
+                .map(|item| format!("{item:?}").len())
+                .unwrap_or_default(),
+        );
+        self.sync_list(item_count, timeline_revision, session_changed);
         if item_count == 0 {
             return div()
                 .size_full()
-                .p_3()
-                .border_l_1()
-                .border_color(rgb(0x30343f))
+                .p_6()
                 .child(
                     div()
-                        .p_3()
+                        .w_full()
+                        .p_5()
+                        .rounded_lg()
+                        .bg(rgb(0x171c25))
+                        .border_1()
+                        .border_color(rgb(0x293244))
                         .text_sm()
-                        .text_color(rgb(0x8f98a6))
-                        .child("Start a task to see the agent run here."),
+                        .text_color(rgb(0xb7c0d0))
+                        .child(
+                            div()
+                                .text_base()
+                                .text_color(rgb(0xf3f4f6))
+                                .child("Ready when you are"),
+                        )
+                        .child(
+                            div()
+                                .mt_1()
+                                .text_sm()
+                                .text_color(rgb(0x8f98a6))
+                                .child("Describe a task below and Loom will keep the work, decisions, and results together."),
+                        ),
                 );
         }
 
@@ -405,12 +478,7 @@ impl Render for TimelineView {
         })
         .size_full();
 
-        div()
-            .size_full()
-            .p_3()
-            .border_l_1()
-            .border_color(rgb(0x30343f))
-            .child(timeline)
+        div().size_full().p_3().child(timeline)
     }
 }
 
@@ -697,6 +765,8 @@ impl LoomView {
             models,
             model_picker_open: false,
             settings_open: false,
+            providers_open: false,
+            providers: Vec::new(),
             theme_choice: ThemeChoice::System,
             dark_theme: true,
             appearance_subscription: None,
@@ -719,7 +789,6 @@ impl LoomView {
             tasks: Vec::new(),
             rename_dialog: None,
             rename_focus_handle,
-            backend_status: BackendStatus::Connected,
             demo_workspace,
             login_enabled: options.remote.is_none(),
             github_connected: FileCredentialStore::open(FileCredentialStore::default_path())
@@ -819,6 +888,8 @@ impl LoomView {
             models,
             model_picker_open: false,
             settings_open: false,
+            providers_open: false,
+            providers: Vec::new(),
             theme_choice: ThemeChoice::System,
             dark_theme: true,
             appearance_subscription: None,
@@ -841,7 +912,6 @@ impl LoomView {
             tasks: Vec::new(),
             rename_dialog: None,
             rename_focus_handle,
-            backend_status: BackendStatus::Connected,
             demo_workspace: false,
             login_enabled: false,
             github_connected: false,
@@ -877,7 +947,6 @@ impl LoomView {
     }
 
     pub(crate) fn record_backend_error(&mut self, operation: &str, error: LoomError) {
-        self.backend_status = BackendStatus::Error(error.clone());
         self.timeline.push(TimelineItem::Error {
             operation: operation.to_owned(),
             error,
@@ -1027,7 +1096,6 @@ impl LoomView {
             }
             response => return Err(unexpected_response("project list", response)),
         }
-        self.backend_status = BackendStatus::Connected;
         Ok(())
     }
 
@@ -1051,7 +1119,6 @@ impl LoomView {
                             view.active_session = active.clone();
                             view.session_state = active.state;
                         }
-                        view.backend_status = BackendStatus::Connected;
                     }
                     Err(error) => view.record_backend_error("session list refresh", error),
                     Ok(response) => view.record_backend_error(
@@ -1231,7 +1298,6 @@ impl LoomView {
             }
             response => return Err(unexpected_response("session event stream", response)),
         }
-        self.backend_status = BackendStatus::Connected;
         Ok(())
     }
 
@@ -1250,7 +1316,6 @@ impl LoomView {
                             view.after_sequence = Some(event.sequence);
                             view.consume_event(&event.event);
                         }
-                        view.backend_status = BackendStatus::Connected;
                     }
                     Ok(ServerResponse::SessionEventsSnapshot {
                         session,
@@ -1265,7 +1330,6 @@ impl LoomView {
                             view.after_sequence = Some(event.sequence);
                             view.consume_event(&event.event);
                         }
-                        view.backend_status = BackendStatus::Connected;
                     }
                     Err(error) => view.record_backend_error("session event stream", error),
                     Ok(response) => view.record_backend_error(
@@ -1320,23 +1384,37 @@ impl LoomView {
         self.poll_run_once(cx);
     }
 
+    fn update_session_list(&mut self) {
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == self.active_session.id)
+        {
+            *session = self.active_session.clone();
+        }
+    }
+
     pub(crate) fn consume_event(&mut self, event: &ServerEvent) {
         match event {
             ServerEvent::AgentSessionCreated { snapshot } => {
                 self.active_session = snapshot.clone();
                 self.session_state = snapshot.state;
+                self.update_session_list();
             }
             ServerEvent::AgentSessionStateChanged { current, .. } => {
                 self.session_state = *current;
                 self.active_session.state = *current;
+                self.update_session_list();
             }
             ServerEvent::AgentSessionForked { .. } => {}
             ServerEvent::AgentSessionRenamed { name, .. } => {
                 self.active_session.name = name.clone();
+                self.update_session_list();
             }
             ServerEvent::AgentSessionArchived { .. } => {
                 self.session_state = AgentSessionState::Archived;
                 self.active_session.state = AgentSessionState::Archived;
+                self.update_session_list();
             }
             ServerEvent::Agent { event } => self.consume_agent_event(event),
             ServerEvent::WorkspaceChanged { change } => {
@@ -1500,6 +1578,7 @@ impl LoomView {
                 self.run_state = Some(*state);
                 self.session_state = session_state_for_run(*state);
                 self.active_session.state = self.session_state;
+                self.update_session_list();
             }
             AgentEvent::RunCompleted { snapshot } => {
                 self.active_run = Some(snapshot.clone());
@@ -1507,6 +1586,7 @@ impl LoomView {
                 self.run_state = Some(snapshot.state);
                 self.session_state = session_state_for_run(snapshot.state);
                 self.active_session.state = self.session_state;
+                self.update_session_list();
                 self.summary = snapshot.summary.clone();
                 if let Some(summary) = &snapshot.summary
                     && !is_redundant_completion_summary(summary)
@@ -2018,6 +2098,7 @@ impl LoomView {
     pub(crate) fn select_session(&mut self, session: AgentSessionSnapshot, cx: &mut Context<Self>) {
         self.github_login = None;
         self.settings_open = false;
+        self.providers_open = false;
         self.review.open = false;
         self.activate_session(session.clone());
         self.ensure_session_task_message(session.id);
@@ -2345,7 +2426,40 @@ impl LoomView {
     pub(crate) fn open_settings_from_menu(&mut self, cx: &mut Context<Self>) {
         self.github_login = None;
         self.review.open = false;
+        self.providers_open = false;
         self.settings_open = true;
+        cx.notify();
+    }
+
+    pub(crate) fn open_providers_from_menu(&mut self, cx: &mut Context<Self>) {
+        self.github_login = None;
+        self.review.open = false;
+        self.settings_open = false;
+        self.providers_open = true;
+        self.dispatch(
+            cx,
+            ClientRequest::ListProviders,
+            |view, response, _| match response.result {
+                Ok(ServerResponse::Providers { providers }) => {
+                    view.providers = providers;
+                }
+                Err(error) => view.record_backend_error("list providers", error),
+                Ok(response) => view.record_backend_error(
+                    "list providers",
+                    unexpected_response("provider list", response),
+                ),
+            },
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn close_providers(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.providers_open = false;
         cx.notify();
     }
 
@@ -2429,7 +2543,6 @@ impl LoomView {
             |view, response, cx| match response.result {
                 Ok(ServerResponse::AgentSessionCreated(snapshot)) => {
                     view.sessions.push(snapshot.clone());
-                    view.backend_status = BackendStatus::Connected;
                     view.select_session(snapshot, cx);
                 }
                 Err(error) => view.record_backend_error("create session", error),
@@ -2475,6 +2588,7 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         self.settings_open = false;
+        self.providers_open = false;
         self.github_login = None;
         self.toggle_changes_sidebar(event, window, cx);
     }
@@ -2520,11 +2634,14 @@ impl LoomView {
                 .relative()
                 .w_full()
                 .px_2()
-                .py_2()
-                .rounded_sm()
-                .bg(if active { rgb(0x293244) } else { rgb(0x1b1d24) })
+                .py_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(if active { rgb(0x3b5d85) } else { rgb(0x242833) })
+                .bg(if active { rgb(0x25334a) } else { rgb(0x1b1d24) })
                 .text_color(if active { rgb(0xf3f4f6) } else { rgb(0xb7c0d0) })
                 .cursor_pointer()
+                .hover(|style| style.bg(if active { rgb(0x293b56) } else { rgb(0x20242c) }))
                 .child(
                     div()
                         .text_sm()
@@ -2537,7 +2654,7 @@ impl LoomView {
                     div()
                         .text_xs()
                         .text_color(state_color(session.state))
-                        .child(session_state_name(session.state)),
+                        .child(session_state_label(session.state)),
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.select_session(selected_session.clone(), cx);
@@ -2691,7 +2808,7 @@ impl LoomView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_3()
                     .text_xs()
                     .text_color(rgb(0x93c5fd))
                     .child("●")
@@ -2863,7 +2980,7 @@ impl LoomView {
         parent: &Entity<LoomView>,
     ) -> gpui::AnyElement {
         let user_background = if self.dark_theme {
-            gpui::rgb(0x1f4f78)
+            gpui::rgb(0x20242c)
         } else {
             gpui::rgb(0xdbeafe)
         };
@@ -3134,9 +3251,9 @@ impl LoomView {
 
     pub(crate) fn render_review(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = match self.review.panel {
-            ReviewPanel::Changes => "CHANGED FILES",
-            ReviewPanel::Diff => "READ-ONLY DIFF",
-            ReviewPanel::Evidence => "TASK EVIDENCE",
+            ReviewPanel::Changes => "Changed files",
+            ReviewPanel::Diff => "Diff",
+            ReviewPanel::Evidence => "Evidence",
         };
         let mut body = div()
             .flex_1()
@@ -3164,7 +3281,11 @@ impl LoomView {
                             .text_sm()
                             .text_color(change_color(change.kind))
                             .cursor_pointer()
-                            .child(format!("{:?}  {}", change.kind, change.path))
+                            .child(format!(
+                                "{}  {}",
+                                change_kind_label(change.kind),
+                                change.path
+                            ))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_review_file(path.clone(), cx);
                                 cx.notify();
@@ -3180,7 +3301,7 @@ impl LoomView {
                                 .text_sm()
                                 .text_color(rgb(0xfef3c7))
                                 .cursor_pointer()
-                                .child(format!("Git  {:?}  {}", file.worktree, file.path))
+                                .child(format!("Git · {:?}  {}", file.worktree, file.path))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_review_file(path.clone(), cx);
                                     cx.notify();
@@ -3211,7 +3332,7 @@ impl LoomView {
                     div()
                         .text_xs()
                         .text_color(rgb(0x8f98a6))
-                        .child("Projection only; editing and staging are not available in M5."),
+                        .child("A read-only view of the changes in this session."),
                 );
                 body = body.child(
                     div()
@@ -3234,7 +3355,7 @@ impl LoomView {
                     div()
                         .text_xs()
                         .text_color(rgb(0x8f98a6))
-                        .child("TASK RESULT AND EVIDENCE"),
+                        .child("What was completed and how it was checked."),
                 );
                 if let Some(summary) = &self.summary {
                     body = body.child(
@@ -3316,10 +3437,12 @@ impl LoomView {
                 div()
                     .w_full()
                     .px_2()
-                    .py_1()
+                    .py_2()
                     .flex()
                     .items_center()
                     .justify_between()
+                    .border_b_1()
+                    .border_color(rgb(0x293244))
                     .child(div().text_xs().text_color(rgb(0x93c5fd)).child(title))
                     .child(
                         div()
@@ -3375,17 +3498,17 @@ impl LoomView {
         };
         div()
             .w_full()
-            .p_2()
+            .p_3()
             .bg(rgb(0x17191f))
             .border_t_1()
             .border_color(rgb(0x30343f))
             .child(
                 div()
                     .w_full()
-                    .min_h(px(42.))
-                    .p_2()
-                    .rounded_sm()
-                    .bg(rgb(0x0f1115))
+                    .min_h(px(46.))
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(0x10141b))
                     .border_1()
                     .border_color(rgb(0x3b4555))
                     .text_color(rgb(0xe5e7eb))
@@ -3412,18 +3535,18 @@ impl LoomView {
                     }),
             )
             .child(
-                div().mt_1().flex().items_center().justify_between().child(
+                div().mt_2().flex().items_center().justify_between().child(
                     div()
                         .flex()
                         .relative()
                         .items_center()
-                        .gap_2()
+                        .gap_1()
                         .child(
                             div()
                                 .id("composer-agent-mode")
                                 .px_2()
                                 .py_1()
-                                .rounded_sm()
+                                .rounded_lg()
                                 .bg(rgb(0x20242c))
                                 .hover(|style| style.bg(rgb(0x293244)))
                                 .text_xs()
@@ -3440,7 +3563,7 @@ impl LoomView {
                                 .id("composer-model-picker")
                                 .px_2()
                                 .py_1()
-                                .rounded_sm()
+                                .rounded_lg()
                                 .bg(rgb(0x20242c))
                                 .hover(|style| style.bg(rgb(0x293244)))
                                 .text_xs()
@@ -3704,33 +3827,44 @@ impl LoomView {
             .p_6()
             .flex()
             .flex_col()
-            .bg(transparent_black())
+            .bg(rgb(0x111318))
             .text_color(rgb(0xe5e7eb))
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(0xf3f4f6))
-                    .child("Log in to GitHub Copilot"),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(24.))
-                    .right(px(24.))
-                    .id("close-github-login")
-                    .px_3()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x20242c))
-                    .hover(|style| style.bg(rgb(0x293244)))
-                    .text_xs()
-                    .text_color(rgb(0xb7c0d0))
-                    .cursor_pointer()
-                    .child("Back to session")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.github_login = None;
-                        cx.notify();
-                    })),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xf3f4f6))
+                            .child("Connect GitHub Copilot"),
+                    )
+                    .child(
+                        div()
+                            .id("close-github-login")
+                            .w(px(28.))
+                            .h(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(rgb(0x20242c))
+                            .hover(|style| style.bg(rgb(0x293244)))
+                            .text_color(rgb(0xb7c0d0))
+                            .cursor_pointer()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| LoomTooltip {
+                                    text: "Close GitHub connection".into(),
+                                })
+                                .into()
+                            })
+                            .child(Icon::new(IconName::Close).size_4())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.github_login = None;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(div().mt_4().child(body))
             .into_any()
@@ -3794,15 +3928,23 @@ impl LoomView {
                     .child(
                         div()
                             .id("close-settings")
-                            .px_3()
-                            .py_1()
-                            .rounded_sm()
+                            .w(px(28.))
+                            .h(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
                             .bg(rgb(0x20242c))
                             .hover(|style| style.bg(rgb(0x293244)))
-                            .text_xs()
                             .text_color(rgb(0xb7c0d0))
                             .cursor_pointer()
-                            .child("Back to session")
+                            .tooltip(|_, cx| {
+                                cx.new(|_| LoomTooltip {
+                                    text: "Close settings".into(),
+                                })
+                                .into()
+                            })
+                            .child(Icon::new(IconName::Close).size_4())
                             .on_click(cx.listener(Self::close_settings)),
                     ),
             )
@@ -3873,37 +4015,191 @@ impl LoomView {
             .child(div().mt_2().child(body))
             .into_any()
     }
+
+    pub(crate) fn render_providers_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let github_provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.kind == ProviderKind::GitHubCopilot);
+        let local_providers = self
+            .providers
+            .iter()
+            .filter(|provider| provider.kind != ProviderKind::GitHubCopilot)
+            .collect::<Vec<_>>();
+        let github_status = if self.github_connected {
+            "Connected"
+        } else {
+            "Not connected"
+        };
+        let github_models = github_provider.map_or(0, |provider| provider.models.len());
+
+        let mut local_body = div().flex().flex_col().gap_1();
+        if local_providers.is_empty() {
+            local_body = local_body.child(
+                div()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(0x171c25))
+                    .border_1()
+                    .border_color(rgb(0x293244))
+                    .text_sm()
+                    .text_color(rgb(0x8f98a6))
+                    .child("No local providers are configured."),
+            );
+        } else {
+            for provider in local_providers {
+                local_body =
+                    local_body.child(
+                        div()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(0x171c25))
+                            .border_1()
+                            .border_color(rgb(0x293244))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0xf3f4f6))
+                                    .child(provider.display_name.clone()),
+                            )
+                            .child(div().mt_1().text_xs().text_color(rgb(0x8f98a6)).child(
+                                format!(
+                                    "{} model{} available",
+                                    provider.models.len(),
+                                    if provider.models.len() == 1 { "" } else { "s" }
+                                ),
+                            )),
+                    );
+            }
+        }
+
+        let mut github_card =
+            div()
+                .p_3()
+                .rounded_lg()
+                .bg(rgb(0x171c25))
+                .border_1()
+                .border_color(rgb(0x293244))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0xf3f4f6))
+                                .child("GitHub Copilot"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if self.github_connected {
+                                    rgb(0x9ad7bd)
+                                } else {
+                                    rgb(0xfef3c7)
+                                })
+                                .child(github_status),
+                        ),
+                )
+                .child(div().mt_1().text_xs().text_color(rgb(0x8f98a6)).child(
+                    if github_models == 0 {
+                        "Connect your GitHub account to use Copilot models.".to_owned()
+                    } else {
+                        format!(
+                            "{} model{} available",
+                            github_models,
+                            if github_models == 1 { "" } else { "s" }
+                        )
+                    },
+                ));
+        if self.login_enabled && !self.github_connected {
+            github_card = github_card.child(
+                div()
+                    .id("connect-github-provider")
+                    .mt_3()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(0x2563eb))
+                    .hover(|style| style.bg(rgb(0x1d4ed8)))
+                    .text_xs()
+                    .text_color(rgb(0xffffff))
+                    .cursor_pointer()
+                    .child("Connect GitHub Copilot")
+                    .on_click(cx.listener(Self::toggle_github_login)),
+            );
+        }
+
+        div()
+            .id("providers-dialog")
+            .size_full()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .p_6()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x111318))
+            .text_color(rgb(0xe5e7eb))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().text_color(rgb(0xf3f4f6)).child("Providers"))
+                    .child(
+                        div()
+                            .id("close-providers")
+                            .w(px(28.))
+                            .h(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(rgb(0x20242c))
+                            .hover(|style| style.bg(rgb(0x293244)))
+                            .text_color(rgb(0xb7c0d0))
+                            .cursor_pointer()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| LoomTooltip {
+                                    text: "Close providers".into(),
+                                })
+                                .into()
+                            })
+                            .child(Icon::new(IconName::Close).size_4())
+                            .on_click(cx.listener(Self::close_providers)),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_5()
+                    .text_xs()
+                    .text_color(rgb(0x93c5fd))
+                    .child("GITHUB COPILOT"),
+            )
+            .child(div().mt_2().child(github_card))
+            .child(
+                div()
+                    .mt_5()
+                    .text_xs()
+                    .text_color(rgb(0x93c5fd))
+                    .child("LOCAL PROVIDER"),
+            )
+            .child(div().mt_2().child(local_body))
+            .into_any()
+    }
 }
 
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.schedule_run_poll(cx);
         let view = cx.entity();
-        let (backend_label, backend_color) = match &self.backend_status {
-            BackendStatus::Connected => (
-                format!("{} / connected", self.connection.description()),
-                rgb(0x9ad7bd),
-            ),
-            BackendStatus::Error(error) => (
-                if error.retryable {
-                    format!("{} / retryable error", self.connection.description())
-                } else {
-                    format!("{} / backend error", self.connection.description())
-                },
-                rgb(0xfca5a5),
-            ),
-        };
         let project_name = self
             .project
             .as_ref()
             .map(|project| project.name.as_str())
             .unwrap_or("Project");
-        let login_label = match (&self.github_login, self.github_connected) {
-            (_, true) => "GitHub connected",
-            (None, false) => "Log in",
-            (Some(GitHubLoginState::Success), false) => "GitHub connected",
-            (Some(_), false) => "GitHub login...",
-        };
         let decorations = window.window_decorations();
         let client_decorated = matches!(decorations, Decorations::Client { .. });
         let shadow_size = CLIENT_DECORATION_SHADOW;
@@ -3959,9 +4255,8 @@ impl Render for LoomView {
                                     window.start_window_move();
                                 }
                             })
-                            .child("Loom")
-                            .child(div().text_sm().text_color(rgb(0x8f98a6)).child(format!(
-                                "{}  /  {}",
+                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(format!(
+                                "{}  ·  {}",
                                 project_name, self.active_session.name
                             ))),
                     )
@@ -3970,28 +4265,35 @@ impl Render for LoomView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .text_sm()
-                            .text_color(backend_color)
-                            .child(format!(
-                                "{}  {}",
-                                session_state_name(self.session_state),
-                                backend_label
-                            ))
-                            .when(self.login_enabled, |element| {
-                                element.child(
-                                    div()
-                                        .id("github-login")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .bg(rgb(0x20242c))
-                                        .hover(|style| style.bg(rgb(0x293244)))
-                                        .text_xs()
-                                        .cursor_pointer()
-                                        .child(login_label)
-                                        .on_click(cx.listener(Self::toggle_github_login)),
-                                )
-                            })
+                            .child(
+                                Button::new("account-menu")
+                                    .icon(Icon::new(IconName::User))
+                                    .ghost()
+                                    .xsmall()
+                                    .dropdown_menu({
+                                        let view = view.clone();
+                                        move |menu, _, _| {
+                                            let providers_view = view.clone();
+                                            let settings_view = view.clone();
+                                            menu.item(PopupMenuItem::new("Providers").on_click(
+                                                move |_, _, cx| {
+                                                    providers_view.update(cx, |view, cx| {
+                                                        view.open_providers_from_menu(cx);
+                                                    });
+                                                },
+                                            ))
+                                            .item(
+                                                PopupMenuItem::new("Settings").on_click(
+                                                    move |_, _, cx| {
+                                                        settings_view.update(cx, |view, cx| {
+                                                            view.open_settings_from_menu(cx);
+                                                        });
+                                                    },
+                                                ),
+                                            )
+                                        }
+                                    }),
+                            )
                             .child(
                                 div().flex().items_center().gap_1().ml_2().child(
                                     div()
@@ -4012,8 +4314,14 @@ impl Render for LoomView {
                                             })
                                             .into()
                                         })
+                                        .window_control_area(WindowControlArea::Close)
                                         .child(Icon::new(IconName::Close).size_4())
-                                        .on_click(|_, window, _| {
+                                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                            window.prevent_default();
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(|_, window, cx| {
+                                            cx.stop_propagation();
                                             window.remove_window();
                                         }),
                                 ),
@@ -4043,7 +4351,10 @@ impl Render for LoomView {
                                     .items_center()
                                     .justify_between()
                                     .child(
-                                        div().text_xs().text_color(rgb(0x93c5fd)).child("SESSIONS"),
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0xf3f4f6))
+                                            .child("Workspace"),
                                     )
                                     .child(
                                         Button::new("top-menu-button")
@@ -4074,25 +4385,25 @@ impl Render for LoomView {
                                     .items_center()
                                     .justify_between()
                                     .child(
-                                        div().text_xs().text_color(rgb(0x93c5fd)).child("SESSIONS"),
+                                        div().text_xs().text_color(rgb(0x8f98a6)).child("Sessions"),
                                     )
                                     .child(
                                         div()
                                             .id("new-session")
-                                            .w(px(26.))
-                                            .h(px(26.))
+                                            .w(px(28.))
+                                            .h(px(28.))
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .rounded_sm()
-                                            .bg(rgb(0x20242c))
-                                            .hover(|style| style.bg(rgb(0x293244)))
+                                            .rounded_lg()
+                                            .bg(rgb(0x202b3b))
+                                            .hover(|style| style.bg(rgb(0x293b56)))
                                             .text_sm()
-                                            .text_color(rgb(0x94a3b8))
+                                            .text_color(rgb(0x93c5fd))
                                             .cursor_pointer()
                                             .tooltip(|_, cx| {
                                                 cx.new(|_| LoomTooltip {
-                                                    text: "Create session".into(),
+                                                    text: "Create a new session".into(),
                                                 })
                                                 .into()
                                             })
@@ -4115,7 +4426,7 @@ impl Render for LoomView {
                                     .text_xs()
                                     .text_color(rgb(0x64748b))
                                     .child(format!(
-                                        "{} sessions  |  {}",
+                                        "{} sessions  ·  {}",
                                         self.sessions.len(),
                                         self.workspace_root.display()
                                     )),
@@ -4148,10 +4459,8 @@ impl Render for LoomView {
                                             .child(
                                                 div().text_xs().text_color(rgb(0x8f98a6)).child(
                                                     format!(
-                                                        "{}  |  {}  |  {} model{}",
-                                                        self.run_state
-                                                            .map(run_state_name)
-                                                            .unwrap_or("idle"),
+                                                        "{}  ·  {}  ·  {} model{}",
+                                                        run_state_label(self.run_state),
                                                         self.model.as_str(),
                                                         self.models.len(),
                                                         if self.models.len() == 1 {
@@ -4411,12 +4720,19 @@ impl Render for LoomView {
                             .when(self.settings_open, |element| {
                                 element.child(self.render_settings_dialog(cx))
                             })
+                            .when(
+                                self.providers_open && self.github_login.is_none(),
+                                |element| element.child(self.render_providers_dialog(cx)),
+                            )
                             .when(self.github_login.is_some(), |element| {
                                 element.child(self.render_github_login_dialog(cx))
                             }),
                     )
                     .when(
-                        self.review.open && !self.settings_open && self.github_login.is_none(),
+                        self.review.open
+                            && !self.settings_open
+                            && !self.providers_open
+                            && self.github_login.is_none(),
                         |element| element.child(self.render_review(cx)),
                     ),
             )
@@ -4434,13 +4750,13 @@ impl Render for LoomView {
                     .text_xs()
                     .text_color(rgb(0x8f98a6))
                     .child(format!(
-                        "{}  |  {} timeline items  |  {}",
-                        session_state_name(self.session_state),
+                        "{}  ·  {} updates  ·  {}",
+                        session_state_label(self.session_state),
                         self.timeline.len(),
                         if self.demo_workspace {
-                            "demo workspace"
+                            "Demo workspace"
                         } else {
-                            "workspace"
+                            "Workspace"
                         }
                     )),
             );
@@ -4459,16 +4775,15 @@ impl Render for LoomView {
                         .size_full()
                         .rounded_client_corners(true, tiling)
                         .when(!tiling.is_tiled(), |element| {
-                            element
-                                .border_1()
-                                .border_color(rgb(0x30343f))
-                                .shadow(vec![gpui::BoxShadow {
+                            element.border_1().border_color(rgb(0x30343f)).shadow(vec![
+                                gpui::BoxShadow {
                                     color: gpui::hsla(0., 0., 0., 0.4),
                                     blur_radius: shadow_size / 2.,
                                     spread_radius: px(0.),
                                     offset: point(px(0.), px(0.)),
                                     inset: false,
-                                }])
+                                },
+                            ])
                         })
                         .child(content),
                 )

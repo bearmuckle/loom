@@ -68,12 +68,6 @@ impl AgentMode {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum BackendStatus {
-    Connected,
-    Error(LoomError),
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct ReviewState {
     pub(crate) open: bool,
     pub(crate) panel: ReviewPanel,
@@ -241,37 +235,6 @@ pub(crate) fn session_state_for_run(state: AgentRunState) -> AgentSessionState {
         AgentRunState::Completed => AgentSessionState::Completed,
         AgentRunState::Failed => AgentSessionState::Failed,
         AgentRunState::Cancelled => AgentSessionState::Cancelled,
-    }
-}
-
-pub(crate) const fn session_state_name(state: AgentSessionState) -> &'static str {
-    match state {
-        AgentSessionState::Idle => "idle",
-        AgentSessionState::Queued => "queued",
-        AgentSessionState::Planning => "planning",
-        AgentSessionState::AwaitingApproval => "awaiting approval",
-        AgentSessionState::Paused => "paused",
-        AgentSessionState::Executing => "executing",
-        AgentSessionState::Evaluating => "evaluating",
-        AgentSessionState::NeedsInput => "needs input",
-        AgentSessionState::Completed => "completed",
-        AgentSessionState::Failed => "failed",
-        AgentSessionState::Cancelled => "cancelled",
-        AgentSessionState::Archived => "archived",
-    }
-}
-
-pub(crate) const fn run_state_name(state: AgentRunState) -> &'static str {
-    match state {
-        AgentRunState::Planning => "planning",
-        AgentRunState::Executing => "executing",
-        AgentRunState::AwaitingApproval => "awaiting approval",
-        AgentRunState::Paused => "paused",
-        AgentRunState::NeedsInput => "needs input",
-        AgentRunState::Evaluating => "evaluating",
-        AgentRunState::Completed => "completed",
-        AgentRunState::Failed => "failed",
-        AgentRunState::Cancelled => "cancelled",
     }
 }
 

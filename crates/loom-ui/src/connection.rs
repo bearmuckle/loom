@@ -117,17 +117,6 @@ impl ClientConnection {
             Self::Browser(connection) => connection.request(request).await,
         }
     }
-
-    pub(crate) fn description(&self) -> &'static str {
-        match self {
-            #[cfg(not(target_family = "wasm"))]
-            Self::InProcess(_) => "local",
-            #[cfg(not(target_family = "wasm"))]
-            Self::Remote { .. } => "remote",
-            #[cfg(target_family = "wasm")]
-            Self::Browser(_) => "remote",
-        }
-    }
 }
 
 #[cfg(not(target_family = "wasm"))]
