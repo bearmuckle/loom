@@ -4,9 +4,9 @@
 > it is not yet suitable for production or sensitive workloads.
 
 Loom is a cross-platform, remote-first agentic development environment. It
-combines a native or browser-based interface with a Rust backend that
-orchestrates persistent coding-agent sessions, workspace state, tool
-execution, and integrations.
+combines a native or browser-based interface built on [GPUI](https://www.gpui.rs/)
+with a Rust backend that orchestrates persistent coding-agent sessions,
+workspace state, tool execution, and integrations.
 
 The backend can run locally, as a child process, or remotely. Hosted model
 providers, OpenAI-compatible endpoints, and local model runtimes should be
@@ -15,8 +15,8 @@ should be interchangeable views of the same durable backend session.
 
 ## Why Loom
 
-- **Cross-platform performance:** A native Rust stack can stay lightweight
-  across platforms instead of depending on a heavy desktop runtime.
+- **Cross-platform performance:** A GPUI-based Rust interface can run as a
+  desktop or browser runtime instead of depending on a Chromium-based desktop runtime such as Electron.
 - **Remote-first workflows:** Agents can run near repositories and services,
   without tying development work to a single computer.
 - **User-controlled trust:** Loom can run on infrastructure you control, with
