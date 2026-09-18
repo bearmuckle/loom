@@ -337,6 +337,7 @@ struct TimelineView {
     parent: Entity<LoomView>,
     list_state: ListState,
     parent_subscription: Option<Subscription>,
+    session_id: Option<AgentSessionId>,
 }
 
 impl TimelineView {
@@ -345,20 +346,20 @@ impl TimelineView {
             parent,
             list_state: ListState::new(0, ListAlignment::Top, px(120.)),
             parent_subscription: None,
+            session_id: None,
         }
     }
 
-    fn sync_list(&mut self, item_count: usize) {
+    fn sync_list(&mut self, item_count: usize, session_changed: bool) {
         if self.list_state.item_count() == item_count {
+            if session_changed {
+                self.list_state.scroll_to_end();
+            }
             return;
         }
 
-        let scroll_top = self.list_state.logical_scroll_top();
         self.list_state.reset(item_count);
-        self.list_state.scroll_to(gpui::ListOffset {
-            item_ix: scroll_top.item_ix.min(item_count),
-            offset_in_item: scroll_top.offset_in_item,
-        });
+        self.list_state.scroll_to_end();
     }
 }
 
@@ -369,8 +370,14 @@ impl Render for TimelineView {
             self.parent_subscription = Some(cx.observe(&parent, |_, _, cx| cx.notify()));
         }
 
-        let item_count = self.parent.read(cx).timeline.len();
-        self.sync_list(item_count);
+        let parent_state = self.parent.read(cx);
+        let item_count = parent_state.timeline.len();
+        let session_id = parent_state.active_session.id;
+        let session_changed = self.session_id != Some(session_id);
+        if session_changed {
+            self.session_id = Some(session_id);
+        }
+        self.sync_list(item_count, session_changed);
         if item_count == 0 {
             return div()
                 .size_full()
