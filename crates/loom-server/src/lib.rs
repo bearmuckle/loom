@@ -3392,6 +3392,7 @@ mod tests {
                 project_id,
             }));
         assert!(workspace_snapshot.result.is_ok());
+        backend.flush().unwrap();
         drop(connection);
         drop(backend);
         let reopened = InProcessBackend::new_persistent(&persistence).unwrap();
