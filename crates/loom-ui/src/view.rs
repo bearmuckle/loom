@@ -15,7 +15,7 @@ use gpui::{
     UTF16Selection, Window, WindowAppearance, WindowControlArea, canvas, div, list, point,
     prelude::*, px, transparent_black,
 };
-use gpui_base::TextSelectionLayer;
+use gpui_base::{SelectableText, TextSelectionLayer};
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{
     Icon, IconName, Sizable,
@@ -142,10 +142,14 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui::AnyElemen
         || text.contains("](");
 
     if !has_markdown {
-        div().w_full().text_color(rgb(color)).child(text).into_any()
+        div()
+            .w_full()
+            .text_color(rgb(color))
+            .child(SelectableText::new(id, text))
+            .into_any()
     } else {
         TextView::markdown(id, text)
-            .selectable(false)
+            .selectable(true)
             .w_full()
             .text_color(rgb(color))
             .into_any()
