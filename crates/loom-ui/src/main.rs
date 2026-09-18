@@ -31,7 +31,7 @@ use crate::text_input::{
     Backspace, Copy, Delete, End, Home, Left, Paste, Right, SelectAll, Submit,
 };
 #[cfg(not(target_family = "wasm"))]
-use crate::{platform::UiOptions, state::ThemeChoice, view::LoomView};
+use crate::{platform::UiOptions, view::LoomView};
 
 #[cfg(not(target_family = "wasm"))]
 fn init_logging() {
@@ -138,8 +138,8 @@ fn main() {
             };
             info!("Loom window opened");
             if let Err(error) = window.update(cx, |view, window, cx| {
+                view.observe_system_appearance(window, cx);
                 view.composer_focus_handle.focus(window, cx);
-                view.select_theme(ThemeChoice::System, window, cx);
                 cx.activate(true);
             }) {
                 error!("failed to focus Loom composer: {error}");
@@ -191,7 +191,9 @@ async fn start_browser_client(cx: &mut gpui::AsyncApp) {
         Err(error) => return log_error("failed to open Loom window", error),
     };
     let updated = window.update(cx, |view, window, cx| {
+        view.observe_system_appearance(window, cx);
         view.composer_focus_handle.focus(window, cx);
+        view.select_theme(crate::state::ThemeChoice::System, window, cx);
         view.reload_sessions(cx);
         view.refresh_models_async(cx);
         view.select_session(active_session, cx);
