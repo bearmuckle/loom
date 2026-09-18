@@ -9,10 +9,11 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Decorations, Element,
-    EntityInputHandler, FocusHandle, Focusable, HitboxBehavior, MouseButton, MouseDownEvent,
-    Pixels, Point, Render, ResizeEdge, Tiling, UTF16Selection, Window, WindowAppearance,
-    WindowControlArea, canvas, div, point, prelude::*, px, transparent_black,
+    App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Decorations, Element, Entity,
+    EntityInputHandler, FocusHandle, Focusable, HitboxBehavior, ListAlignment, ListState,
+    MouseButton, MouseDownEvent, Pixels, Point, Render, ResizeEdge, Subscription, Tiling,
+    UTF16Selection, Window, WindowAppearance, WindowControlArea, canvas, div, list, point,
+    prelude::*, px, transparent_black,
 };
 use gpui_base::TextSelectionLayer;
 use gpui_component::button::{Button, ButtonVariants};
@@ -116,6 +117,38 @@ fn activity_marker(status: AgentActivityStatus) -> &'static str {
         AgentActivityStatus::AwaitingApproval => "!",
         AgentActivityStatus::AwaitingInput => "?",
         AgentActivityStatus::Cancelled => "–",
+    }
+}
+
+fn render_timeline_text(id: String, text: String, color: u32) -> gpui::AnyElement {
+    let has_markdown = text.lines().any(|line| {
+        let line = line.trim_start();
+        (line.starts_with('#')
+            && line
+                .strip_prefix('#')
+                .is_some_and(|rest| rest.trim_start_matches('#').starts_with(' ')))
+            || line.starts_with("- ")
+            || line.starts_with("* ")
+            || line.starts_with("+ ")
+            || line.starts_with("> ")
+            || line.starts_with("```")
+            || line.starts_with("~~~")
+            || line.starts_with("1. ")
+    }) || text.contains("**")
+        || text.contains("__")
+        || text.contains('`')
+        || text.contains("~~")
+        || text.contains("![")
+        || text.contains("](");
+
+    if !has_markdown {
+        div().w_full().text_color(rgb(color)).child(text).into_any()
+    } else {
+        TextView::markdown(id, text)
+            .selectable(false)
+            .w_full()
+            .text_color(rgb(color))
+            .into_any()
     }
 }
 
@@ -272,8 +305,10 @@ pub(crate) struct LoomView {
     pub(crate) settings_open: bool,
     pub(crate) theme_choice: ThemeChoice,
     pub(crate) dark_theme: bool,
+    appearance_subscription: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
     pub(crate) timeline: Vec<TimelineItem>,
+    timeline_view: Option<Entity<TimelineView>>,
     pub(crate) activity_records_seen: bool,
     pub(crate) expanded_activities: BTreeSet<ActivityId>,
     pub(crate) approval_request_in_flight: bool,
@@ -296,6 +331,76 @@ pub(crate) struct LoomView {
     pub(crate) github_connected: bool,
     pub(crate) github_login: Option<GitHubLoginState>,
     pub(crate) run_poll_scheduled: bool,
+}
+
+struct TimelineView {
+    parent: Entity<LoomView>,
+    list_state: ListState,
+    parent_subscription: Option<Subscription>,
+}
+
+impl TimelineView {
+    fn new(parent: Entity<LoomView>) -> Self {
+        Self {
+            parent,
+            list_state: ListState::new(0, ListAlignment::Top, px(120.)),
+            parent_subscription: None,
+        }
+    }
+
+    fn sync_list(&mut self, item_count: usize) {
+        if self.list_state.item_count() == item_count {
+            return;
+        }
+
+        let scroll_top = self.list_state.logical_scroll_top();
+        self.list_state.reset(item_count);
+        self.list_state.scroll_to(gpui::ListOffset {
+            item_ix: scroll_top.item_ix.min(item_count),
+            offset_in_item: scroll_top.offset_in_item,
+        });
+    }
+}
+
+impl Render for TimelineView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.parent_subscription.is_none() {
+            let parent = self.parent.clone();
+            self.parent_subscription = Some(cx.observe(&parent, |_, _, cx| cx.notify()));
+        }
+
+        let item_count = self.parent.read(cx).timeline.len();
+        self.sync_list(item_count);
+        if item_count == 0 {
+            return div()
+                .size_full()
+                .p_3()
+                .border_l_1()
+                .border_color(rgb(0x30343f))
+                .child(
+                    div()
+                        .p_3()
+                        .text_sm()
+                        .text_color(rgb(0x8f98a6))
+                        .child("Start a task to see the agent run here."),
+                );
+        }
+
+        let parent = self.parent.clone();
+        let timeline = list(self.list_state.clone(), move |index, _window, cx| {
+            let view = parent.read(cx);
+            let item = &view.timeline[index];
+            view.render_timeline_item(item, index, &parent)
+        })
+        .size_full();
+
+        div()
+            .size_full()
+            .p_3()
+            .border_l_1()
+            .border_color(rgb(0x30343f))
+            .child(timeline)
+    }
 }
 
 impl LoomView {
@@ -583,8 +688,10 @@ impl LoomView {
             settings_open: false,
             theme_choice: ThemeChoice::System,
             dark_theme: true,
+            appearance_subscription: None,
             after_sequence: None,
             timeline: Vec::new(),
+            timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
             approval_request_in_flight: false,
@@ -703,8 +810,10 @@ impl LoomView {
             settings_open: false,
             theme_choice: ThemeChoice::System,
             dark_theme: true,
+            appearance_subscription: None,
             after_sequence: None,
             timeline: Vec::new(),
+            timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
             approval_request_in_flight: false,
@@ -2260,6 +2369,30 @@ impl LoomView {
                 WindowAppearance::Dark
             }
         };
+        self.apply_appearance(appearance, window, cx);
+    }
+
+    pub(crate) fn observe_system_appearance(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.appearance_subscription.is_none() {
+            self.appearance_subscription =
+                Some(cx.observe_window_appearance(window, |view, window, cx| {
+                    if view.theme_choice == ThemeChoice::System {
+                        view.apply_appearance(window.appearance(), window, cx);
+                    }
+                }));
+        }
+    }
+
+    fn apply_appearance(
+        &mut self,
+        appearance: WindowAppearance,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.dark_theme = matches!(
             appearance,
             WindowAppearance::Dark | WindowAppearance::VibrantDark
@@ -2513,7 +2646,7 @@ impl LoomView {
         &self,
         activities: &[AgentActivityRecord],
         index: usize,
-        cx: &mut Context<Self>,
+        parent: &Entity<LoomView>,
     ) -> gpui::AnyElement {
         let model = activities.iter().find_map(|activity| match &activity.data {
             AgentActivityData::ModelTurn { model } => Some(model.as_str().to_owned()),
@@ -2581,6 +2714,7 @@ impl LoomView {
                 AgentActivityStatus::Cancelled => rgb(0x94a3b8),
             };
             let activity_id = activity.id;
+            let parent_for_toggle = parent.clone();
             let mut row = div()
                 .id(("activity", ((index as u64) << 32) | activity_index as u64))
                 .flex()
@@ -2588,9 +2722,9 @@ impl LoomView {
                 .cursor_pointer()
                 .text_xs()
                 .text_color(rgb(0xcbd5e1))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.toggle_activity(activity_id, cx);
-                }))
+                .on_click(move |_, _, cx| {
+                    parent_for_toggle.update(cx, |this, cx| this.toggle_activity(activity_id, cx));
+                })
                 .child(
                     div()
                         .flex()
@@ -2643,6 +2777,8 @@ impl LoomView {
                 && self.pending_approval.is_some()
                 && !self.approval_request_in_flight
             {
+                let parent_for_approve = parent.clone();
+                let parent_for_reject = parent.clone();
                 row = row.child(
                     div()
                         .ml(px(26.))
@@ -2662,9 +2798,10 @@ impl LoomView {
                                 .text_color(rgb(0xbbf7d0))
                                 .cursor_pointer()
                                 .child("Approve")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.approve_pending_action(cx);
-                                })),
+                                .on_click(move |_, _, cx| {
+                                    parent_for_approve
+                                        .update(cx, |this, cx| this.approve_pending_action(cx));
+                                }),
                         )
                         .child(
                             div()
@@ -2679,9 +2816,10 @@ impl LoomView {
                                 .text_color(rgb(0xfecdd3))
                                 .cursor_pointer()
                                 .child("Reject")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.reject_pending_action(cx);
-                                })),
+                                .on_click(move |_, _, cx| {
+                                    parent_for_reject
+                                        .update(cx, |this, cx| this.reject_pending_action(cx));
+                                }),
                         ),
                 );
             } else if activity.status == AgentActivityStatus::AwaitingApproval
@@ -2711,7 +2849,7 @@ impl LoomView {
         &self,
         item: &TimelineItem,
         index: usize,
-        cx: &mut Context<Self>,
+        parent: &Entity<LoomView>,
     ) -> gpui::AnyElement {
         let user_background = if self.dark_theme {
             gpui::rgb(0x1f4f78)
@@ -2737,12 +2875,11 @@ impl LoomView {
                         .bg(user_background)
                         .text_color(user_foreground)
                         .child(div().text_xs().text_color(user_foreground).child("You"))
-                        .child(
-                            TextView::markdown(format!("transcript-user-{index}"), text.clone())
-                                .selectable(true)
-                                .w_full()
-                                .text_color(user_foreground),
-                        ),
+                        .child(render_timeline_text(
+                            format!("transcript-user-{index}"),
+                            text.clone(),
+                            if self.dark_theme { 0xdbeafe } else { 0x1e3a8a },
+                        )),
                 )
                 .into_any(),
             TimelineItem::Assistant(text) => div()
@@ -2755,15 +2892,14 @@ impl LoomView {
                         .text_color(rgb(0x8f98a6))
                         .child("GitHub Copilot"),
                 )
-                .child(
-                    TextView::markdown(format!("transcript-assistant-{index}"), text.clone())
-                        .selectable(true)
-                        .w_full()
-                        .text_color(rgb(0xf3f4f6)),
-                )
+                .child(render_timeline_text(
+                    format!("transcript-assistant-{index}"),
+                    text.clone(),
+                    0xf3f4f6,
+                ))
                 .into_any(),
             TimelineItem::ActivitySection { activities } => {
-                self.render_activity_section(activities, index, cx)
+                self.render_activity_section(activities, index, parent)
             }
             TimelineItem::Plan {
                 steps,
@@ -2824,6 +2960,8 @@ impl LoomView {
                         format!("Approval resolved  >_ {name}")
                     });
                 if *active && self.pending_approval.is_some() && !self.approval_request_in_flight {
+                    let parent_for_approve = parent.clone();
+                    let parent_for_reject = parent.clone();
                     row = row.child(
                         div()
                             .mt_1()
@@ -2839,9 +2977,10 @@ impl LoomView {
                                     .text_color(rgb(0xbbf7d0))
                                     .cursor_pointer()
                                     .child("Approve")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.approve_pending_action(cx);
-                                    })),
+                                    .on_click(move |_, _, cx| {
+                                        parent_for_approve
+                                            .update(cx, |this, cx| this.approve_pending_action(cx));
+                                    }),
                             )
                             .child(
                                 div()
@@ -2853,9 +2992,10 @@ impl LoomView {
                                     .text_color(rgb(0xfecdd3))
                                     .cursor_pointer()
                                     .child("Reject")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.reject_pending_action(cx);
-                                    })),
+                                    .on_click(move |_, _, cx| {
+                                        parent_for_reject
+                                            .update(cx, |this, cx| this.reject_pending_action(cx));
+                                    }),
                             ),
                     );
                 } else if *active && self.approval_request_in_flight {
@@ -2918,15 +3058,11 @@ impl LoomView {
                         .text_color(rgb(0xfda4af))
                         .child(format!("{} · {}", operation, error.code)),
                 )
-                .child(
-                    div().mt_1().child(
-                        TextView::markdown(
-                            format!("timeline-error-{index}"),
-                            error.message.clone(),
-                        )
-                        .selectable(true),
-                    ),
-                )
+                .child(div().mt_1().child(render_timeline_text(
+                    format!("timeline-error-{index}"),
+                    error.message.clone(),
+                    0xfca5a5,
+                )))
                 .when(error.retryable, |element| {
                     element.child(
                         div()
@@ -2943,10 +3079,11 @@ impl LoomView {
                 .bg(rgb(0x3b2f66))
                 .text_color(rgb(0xe9d5ff))
                 .child(div().text_xs().child("Agent needs input"))
-                .child(
-                    TextView::markdown(format!("timeline-input-{index}"), prompt.clone())
-                        .selectable(true),
-                )
+                .child(render_timeline_text(
+                    format!("timeline-input-{index}"),
+                    prompt.clone(),
+                    0xe9d5ff,
+                ))
                 .into_any(),
             TimelineItem::Summary { text, evidence } => {
                 let mut card = div()
@@ -2973,27 +3110,15 @@ impl LoomView {
         }
     }
 
-    pub(crate) fn render_timeline(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut timeline = div()
-            .flex()
-            .flex_col()
-            .gap_0()
-            .p_3()
-            .border_l_1()
-            .border_color(rgb(0x30343f));
-        if self.timeline.is_empty() {
-            timeline = timeline.child(
-                div()
-                    .p_3()
-                    .text_sm()
-                    .text_color(rgb(0x8f98a6))
-                    .child("Start a task to see the agent run here."),
-            );
+    fn timeline_entity(&mut self, cx: &mut Context<Self>) -> Entity<TimelineView> {
+        if let Some(timeline_view) = &self.timeline_view {
+            return timeline_view.clone();
         }
-        for (index, item) in self.timeline.iter().enumerate() {
-            timeline = timeline.child(self.render_timeline_item(item, index, cx));
-        }
-        timeline
+
+        let parent = cx.entity();
+        let timeline_view = cx.new(|_| TimelineView::new(parent));
+        self.timeline_view = Some(timeline_view.clone());
+        timeline_view
     }
 
     pub(crate) fn render_review(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4265,8 +4390,8 @@ impl Render for LoomView {
                                 div()
                                     .flex_1()
                                     .id("timeline-scroll")
-                                    .overflow_y_scroll()
-                                    .child(self.render_timeline(cx)),
+                                    .overflow_hidden()
+                                    .child(self.timeline_entity(cx)),
                             )
                             .child(self.render_composer(cx))
                             .when(self.rename_dialog.is_some(), |element| {
