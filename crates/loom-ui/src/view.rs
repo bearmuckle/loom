@@ -4459,13 +4459,16 @@ impl Render for LoomView {
                         .size_full()
                         .rounded_client_corners(true, tiling)
                         .when(!tiling.is_tiled(), |element| {
-                            element.shadow(vec![gpui::BoxShadow {
-                                color: gpui::hsla(0., 0., 0., 0.4),
-                                blur_radius: shadow_size / 2.,
-                                spread_radius: px(0.),
-                                offset: point(px(0.), px(0.)),
-                                inset: false,
-                            }])
+                            element
+                                .border_1()
+                                .border_color(rgb(0x30343f))
+                                .shadow(vec![gpui::BoxShadow {
+                                    color: gpui::hsla(0., 0., 0., 0.4),
+                                    blur_radius: shadow_size / 2.,
+                                    spread_radius: px(0.),
+                                    offset: point(px(0.), px(0.)),
+                                    inset: false,
+                                }])
                         })
                         .child(content),
                 )
