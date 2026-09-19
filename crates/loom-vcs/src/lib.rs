@@ -240,7 +240,7 @@ fn status_kind(status: Status, index: bool) -> GitFileStatusKind {
     if status.is_ignored() {
         return GitFileStatusKind::Ignored;
     }
-    let kind = if index {
+    if index {
         if status.is_index_renamed() {
             GitFileStatusKind::Renamed
         } else if status.is_index_new() {
@@ -262,8 +262,7 @@ fn status_kind(status: Status, index: bool) -> GitFileStatusKind {
         GitFileStatusKind::Deleted
     } else {
         GitFileStatusKind::Unknown
-    };
-    kind
+    }
 }
 
 fn git_error(operation: &str, error: git2::Error) -> LoomError {
