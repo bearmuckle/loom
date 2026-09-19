@@ -191,16 +191,16 @@ impl ContextAssembler {
                 });
             }
         }
-        if let Some(limit) = limit {
-            if included_tokens > limit {
-                return Err(LoomError::new(
-                    ErrorCode::ContextLimitExceeded,
-                    format!(
-                        "assembled context uses {included_tokens} tokens but the budget is {limit}"
-                    ),
-                    false,
-                ));
-            }
+        if let Some(limit) = limit
+            && included_tokens > limit
+        {
+            return Err(LoomError::new(
+                ErrorCode::ContextLimitExceeded,
+                format!(
+                    "assembled context uses {included_tokens} tokens but the budget is {limit}"
+                ),
+                false,
+            ));
         }
         Ok(ContextAssembly {
             messages,

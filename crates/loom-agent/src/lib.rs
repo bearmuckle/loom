@@ -1803,11 +1803,11 @@ impl AgentRuntime {
     }
 
     fn append_assistant_text(&mut self, text: &str) {
-        if let Some(last) = self.messages.last_mut() {
-            if last.role == MessageRole::Assistant {
-                last.content.push_str(text);
-                return;
-            }
+        if let Some(last) = self.messages.last_mut()
+            && last.role == MessageRole::Assistant
+        {
+            last.content.push_str(text);
+            return;
         }
         self.messages
             .push(ModelMessage::new(MessageRole::Assistant, text));

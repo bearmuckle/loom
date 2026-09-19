@@ -484,13 +484,13 @@ impl Workspace {
         };
         let before_content = before.clone().unwrap_or_default();
         let before_revision = revision(&before_content);
-        if let Some(expected) = edit.expected_revision.as_deref() {
-            if expected != before_revision {
-                return Err(LoomError::conflict(format!(
-                    "workspace file '{}' changed before the edit (expected {expected}, found {before_revision})",
-                    edit.path
-                )));
-            }
+        if let Some(expected) = edit.expected_revision.as_deref()
+            && expected != before_revision
+        {
+            return Err(LoomError::conflict(format!(
+                "workspace file '{}' changed before the edit (expected {expected}, found {before_revision})",
+                edit.path
+            )));
         }
         let next = if edit.old_text.is_empty() {
             if before.is_some() && !before_content.is_empty() {
