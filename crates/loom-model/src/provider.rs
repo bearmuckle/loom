@@ -7,8 +7,8 @@ use loom_core::{LoomError, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ModelCapabilities, ModelDescriptor, ModelId, ModelRequest, ModelStreamEvent, ProviderId,
-    TokenUsage,
+    ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ModelRequest, ModelStreamEvent,
+    ProviderId, TokenUsage,
 };
 
 /// Cooperative cancellation shared between a run and the provider serving it.
@@ -170,41 +170,52 @@ impl ModelProvider for UnavailableProvider {
 }
 
 pub fn estimate_tokens(request: &ModelRequest) -> u64 {
-    let message_chars = request
+    let message_tokens = request
         .messages
         .iter()
-        .map(|message| {
-            let metadata_chars = message.name.as_deref().map_or(0, str::len).saturating_add(
-                message
-                    .tool_call_id
-                    .map_or(0, |tool_call_id| tool_call_id.to_string().len()),
-            );
-            let tool_call_chars = message
-                .tool_calls
-                .iter()
-                .map(|call| {
-                    call.name
-                        .len()
-                        .saturating_add(call.arguments.to_string().len())
-                        .saturating_add(32)
-                })
-                .sum::<usize>();
-            message
-                .content
-                .chars()
-                .count()
-                .saturating_add(metadata_chars)
-                .saturating_add(tool_call_chars)
-        })
-        .sum::<usize>();
-    let tool_chars = request
+        .map(|message| estimate_message_tokens_with_model(&request.model, message))
+        .sum::<u64>();
+    let tool_tokens = request
         .tools
         .iter()
         .map(|tool| {
-            tool.description.chars().count() + tool.input_schema.to_string().chars().count()
+            estimate_text_tokens(&request.model, &tool.description)
+                + estimate_text_tokens(&request.model, &tool.input_schema.to_string())
+                + 1
         })
-        .sum::<usize>();
-    ((message_chars.saturating_add(tool_chars) as u64).saturating_add(3)) / 4
+        .sum::<u64>();
+    message_tokens.saturating_add(tool_tokens)
+}
+
+pub fn estimate_message_tokens(message: &ModelMessage) -> u64 {
+    estimate_message_tokens_with_model(&ModelId::new("gpt-4"), message)
+}
+
+fn estimate_message_tokens_with_model(model: &ModelId, message: &ModelMessage) -> u64 {
+    let mut tokens = estimate_text_tokens(model, &message.content) + 3;
+    if let Some(name) = &message.name {
+        tokens = tokens.saturating_add(estimate_text_tokens(model, name) + 1);
+    }
+    if let Some(tool_call_id) = message.tool_call_id {
+        tokens = tokens.saturating_add(estimate_text_tokens(model, &tool_call_id.to_string()));
+    }
+    tokens.saturating_add(
+        message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                estimate_text_tokens(model, &call.name)
+                    + estimate_text_tokens(model, &call.arguments.to_string())
+                    + 1
+            })
+            .sum::<u64>(),
+    )
+}
+
+fn estimate_text_tokens(model: &ModelId, text: &str) -> u64 {
+    let tokenizer = tiktoken_rs::bpe_for_model(model.as_str())
+        .unwrap_or_else(|_| tiktoken_rs::cl100k_base_singleton());
+    tokenizer.count_with_special_tokens(text) as u64
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

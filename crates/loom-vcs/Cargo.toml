@@ -10,4 +10,4 @@ rust-version.workspace = true
 loom-core.workspace = true
 loom-protocol.workspace = true
 serde.workspace = true
-
+git2.workspace = true

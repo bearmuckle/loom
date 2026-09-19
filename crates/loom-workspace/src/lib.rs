@@ -7,10 +7,13 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+use ignore::WalkBuilder;
 use loom_core::{
     AgentSessionId, CheckpointId, ErrorCode, EventSequence, LoomError, ProjectId, Result, Timestamp,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use similar::TextDiff;
 
 mod instructions;
 
@@ -802,25 +805,21 @@ impl Workspace {
 
     fn collect_entries(
         &self,
-        path: &Path,
-        relative: &Path,
+        _path: &Path,
+        _relative: &Path,
         entries: &mut Vec<WorkspaceEntry>,
     ) -> Result<()> {
-        if entries.len() >= MAX_SNAPSHOT_ENTRIES {
-            return Err(LoomError::new(
-                ErrorCode::ToolExecution,
-                format!("workspace snapshot exceeds {MAX_SNAPSHOT_ENTRIES} entries"),
-                false,
-            ));
-        }
-        let directory = fs::read_dir(path).map_err(|error| {
-            LoomError::new(
-                ErrorCode::ToolExecution,
-                format!("could not list '{}': {error}", relative.display()),
-                false,
-            )
-        })?;
-        for entry in directory {
+        let mut walker = WalkBuilder::new(&self.inner.root);
+        walker
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(false)
+            .git_exclude(false)
+            .parents(false)
+            .ignore(false)
+            .filter_entry(|entry| !is_ignored_directory(entry.file_name()));
+
+        for entry in walker.build() {
             let entry = entry.map_err(|error| {
                 LoomError::new(
                     ErrorCode::ToolExecution,
@@ -828,33 +827,45 @@ impl Workspace {
                     false,
                 )
             })?;
-            let name = entry.file_name();
-            if is_ignored_directory(&name) {
+            let child_path = entry.path();
+            if child_path == self.inner.root {
                 continue;
             }
-            let child_relative = relative.join(&name);
-            let child_path = entry.path();
-            let file_type = entry.file_type().map_err(|error| {
+            if entries.len() >= MAX_SNAPSHOT_ENTRIES {
+                return Err(LoomError::new(
+                    ErrorCode::ToolExecution,
+                    format!("workspace snapshot exceeds {MAX_SNAPSHOT_ENTRIES} entries"),
+                    false,
+                ));
+            }
+            let child_relative = child_path.strip_prefix(&self.inner.root).map_err(|error| {
                 LoomError::new(
                     ErrorCode::ToolExecution,
-                    format!("could not inspect '{}': {error}", child_relative.display()),
+                    format!("could not relativize '{}': {error}", child_path.display()),
+                    false,
+                )
+            })?;
+            let file_type = entry.file_type().ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::ToolExecution,
+                    format!("could not inspect '{}'", child_relative.display()),
                     false,
                 )
             })?;
             if file_type.is_symlink() {
                 continue;
             }
+            let path = display_relative(child_relative);
             if file_type.is_dir() {
                 entries.push(WorkspaceEntry {
-                    path: display_relative(&child_relative),
+                    path,
                     kind: WorkspaceEntryKind::Directory,
                     size: 0,
-                    modified_at: modified_at(&child_path),
+                    modified_at: modified_at(child_path),
                     revision: "directory".to_owned(),
                 });
-                self.collect_entries(&child_path, &child_relative, entries)?;
             } else if file_type.is_file() {
-                let content = fs::read(&child_path).map_err(|error| {
+                let content = fs::read(child_path).map_err(|error| {
                     LoomError::new(
                         ErrorCode::ToolExecution,
                         format!("could not read '{}': {error}", child_relative.display()),
@@ -862,10 +873,10 @@ impl Workspace {
                     )
                 })?;
                 entries.push(WorkspaceEntry {
-                    path: display_relative(&child_relative),
+                    path,
                     kind: WorkspaceEntryKind::File,
                     size: content.len() as u64,
-                    modified_at: modified_at(&child_path),
+                    modified_at: modified_at(child_path),
                     revision: revision_bytes(&content),
                 });
             }
@@ -1004,27 +1015,15 @@ fn revision(content: &str) -> String {
 }
 
 fn revision_bytes(content: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in content {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    let digest = Sha256::digest(content);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn unified_diff(path: &str, before: &str, after: &str) -> String {
-    let mut diff = format!("--- {path}\n+++ {path}\n");
-    for line in before.lines() {
-        diff.push('-');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    for line in after.lines() {
-        diff.push('+');
-        diff.push_str(line);
-        diff.push('\n');
-    }
-    diff
+    TextDiff::from_lines(before, after)
+        .unified_diff()
+        .header(path, path)
+        .to_string()
 }
 
 #[cfg(test)]

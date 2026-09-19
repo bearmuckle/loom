@@ -10,3 +10,6 @@ rust-version.workspace = true
 loom-core.workspace = true
 loom-protocol.workspace = true
 serde.workspace = true
+ignore.workspace = true
+sha2.workspace = true
+similar.workspace = true
