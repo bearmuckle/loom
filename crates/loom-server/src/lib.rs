@@ -896,8 +896,10 @@ impl InProcessBackend {
 
         let mut workspaces = self.workspaces()?;
         for (project_id, persisted) in state.workspaces {
+            let original = persisted.clone();
             let workspace = Workspace::open(project_id, PathBuf::from(&persisted.root))?;
             workspace.restore_state(persisted)?;
+            needs_persist |= workspace.export_state()? != original;
             workspaces.insert(project_id, workspace);
         }
         drop(workspaces);

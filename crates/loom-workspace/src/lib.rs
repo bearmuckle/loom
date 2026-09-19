@@ -246,20 +246,38 @@ impl Workspace {
                 false,
             ));
         }
-        for checkpoint in &persisted.checkpoints {
-            for (path, file) in &checkpoint.files {
-                self.resolve_relative(path, true)?;
-                if file.revision != revision(&file.content) {
+        let mut persisted = persisted;
+        for checkpoint in &mut persisted.checkpoints {
+            for (path, file) in &mut checkpoint.files {
+                let current_path = self.resolve_relative(path, true)?;
+                let expected_revision = revision(&file.content);
+                if file.revision == legacy_revision(&file.content) {
+                    file.revision = expected_revision.clone();
+                } else if file.revision != expected_revision {
                     return Err(LoomError::new(
                         ErrorCode::MalformedPayload,
                         format!("persisted checkpoint revision for '{path}' is invalid"),
                         false,
                     ));
                 }
+                if file.expected_revision == legacy_revision(&file.content) {
+                    file.expected_revision = expected_revision;
+                    continue;
+                }
+                if let Ok(current) = fs::read_to_string(current_path)
+                    && file.expected_revision == legacy_revision(&current)
+                {
+                    file.expected_revision = revision(&current);
+                }
             }
         }
-        for edit in &persisted.edits {
+        for edit in &mut persisted.edits {
             self.resolve_relative(&edit.path, true)?;
+            if let Ok(current) = fs::read_to_string(self.resolve_relative(&edit.path, true)?)
+                && edit.after_revision == legacy_revision(&current)
+            {
+                edit.after_revision = revision(&current);
+            }
         }
         if persisted
             .changes
@@ -1019,6 +1037,15 @@ fn revision_bytes(content: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn legacy_revision(content: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
 fn unified_diff(path: &str, before: &str, after: &str) -> String {
     TextDiff::from_lines(before, after)
         .unified_diff()
@@ -1158,6 +1185,32 @@ mod tests {
 
         assert_eq!(restored.control().unwrap(), WorkspaceControl::User);
         assert_eq!(restored.checkpoint(checkpoint.id).unwrap(), checkpoint);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn workspace_state_upgrades_legacy_checkpoint_revisions() {
+        let (workspace, root) = workspace();
+        let checkpoint = workspace
+            .create_checkpoint(None, "legacy checkpoint")
+            .unwrap();
+        let mut state = workspace.export_state().unwrap();
+        let file = state
+            .checkpoints
+            .first_mut()
+            .unwrap()
+            .files
+            .get_mut("README.md")
+            .unwrap();
+        file.revision = legacy_revision(&file.content);
+        file.expected_revision = file.revision.clone();
+
+        let restored = Workspace::open(workspace.project_id(), &root).unwrap();
+        restored.restore_state(state).unwrap();
+
+        let restored_file = &restored.checkpoint(checkpoint.id).unwrap().files["README.md"];
+        assert_eq!(restored_file.revision, revision("hello\n"));
+        assert_eq!(restored_file.expected_revision, revision("hello\n"));
         fs::remove_dir_all(root).unwrap();
     }
 
