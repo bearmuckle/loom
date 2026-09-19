@@ -279,7 +279,7 @@ mod tests {
 
     fn repository() -> (GitService, PathBuf) {
         let root = std::env::temp_dir().join(format!("loom-git-{}", ProjectId::new()));
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&root).unwrap();
         run(&root, &["init", "-q"]);
         run(&root, &["config", "user.email", "loom@example.test"]);
         run(&root, &["config", "user.name", "Loom Test"]);

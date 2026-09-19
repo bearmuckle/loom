@@ -2706,7 +2706,7 @@ mod tests {
 
     fn workspace() -> PathBuf {
         let root = std::env::temp_dir().join(format!("loom-server-{}", ProjectId::new()));
-        fs::create_dir_all(&root).unwrap();
+        fs::create_dir(&root).unwrap();
         root
     }
 
