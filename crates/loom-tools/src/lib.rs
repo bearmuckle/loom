@@ -2,6 +2,8 @@ use std::{
     fs,
     path::{Component, Path, PathBuf},
     process::Command,
+    sync::Arc,
+    time::Duration,
 };
 
 use globset::Glob;
@@ -10,7 +12,10 @@ use loom_core::{ActionKind, ApprovalPolicy, ProjectId, Result};
 use loom_model::{ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
 use loom_workspace::{Workspace, WorkspaceEdit};
+use scraper::{Html, Selector};
 use serde::Deserialize;
+use serde::Serialize;
+use url::Url;
 
 fn is_ignored_directory(name: &std::ffi::OsStr) -> bool {
     matches!(
@@ -24,6 +29,7 @@ pub enum ToolKind {
     ListFiles,
     ReadFile,
     SearchText,
+    WebSearch,
     ProposePlan,
     AskUser,
     ApplyPatch,
@@ -36,6 +42,7 @@ impl ToolKind {
             "list_files" => Some(Self::ListFiles),
             "read_file" => Some(Self::ReadFile),
             "search_text" => Some(Self::SearchText),
+            "web_search" => Some(Self::WebSearch),
             "propose_plan" => Some(Self::ProposePlan),
             "ask_user" => Some(Self::AskUser),
             "apply_patch" => Some(Self::ApplyPatch),
@@ -49,6 +56,7 @@ impl ToolKind {
             Self::ListFiles => "list_files",
             Self::ReadFile => "read_file",
             Self::SearchText => "search_text",
+            Self::WebSearch => "web_search",
             Self::ProposePlan => "propose_plan",
             Self::AskUser => "ask_user",
             Self::ApplyPatch => "apply_patch",
@@ -57,7 +65,7 @@ impl ToolKind {
     }
 
     pub const fn requires_approval(self) -> bool {
-        matches!(self, Self::ApplyPatch | Self::RunCommand)
+        matches!(self, Self::ApplyPatch | Self::RunCommand | Self::WebSearch)
     }
 
     pub const fn action_kind(self) -> ActionKind {
@@ -67,9 +75,147 @@ impl ToolKind {
             | Self::SearchText
             | Self::ProposePlan
             | Self::AskUser => ActionKind::Read,
+            Self::WebSearch => ActionKind::Network,
             Self::ApplyPatch => ActionKind::Write,
             Self::RunCommand => ActionKind::Command,
         }
+    }
+}
+
+const DEFAULT_WEB_SEARCH_MAX_RESULTS: usize = 5;
+const MAX_WEB_SEARCH_RESULTS: usize = 10;
+const MAX_WEB_SEARCH_QUERY_BYTES: usize = 2048;
+const MAX_WEB_SEARCH_TITLE_BYTES: usize = 512;
+const MAX_WEB_SEARCH_SNIPPET_BYTES: usize = 2 * 1024;
+const MAX_WEB_SEARCH_URL_BYTES: usize = 4 * 1024;
+const MAX_WEB_SEARCH_BODY_BYTES: u64 = 1024 * 1024;
+const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
+const WEB_SEARCH_ENDPOINT_ENV: &str = "LOOM_WEB_SEARCH_ENDPOINT";
+const DEFAULT_WEB_SEARCH_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WebSearchRequest {
+    pub query: String,
+    pub max_results: usize,
+    pub domains: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WebSearchResult {
+    pub title: String,
+    pub url: String,
+    pub snippet: String,
+    pub source: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WebSearchResponse {
+    pub query: String,
+    pub results: Vec<WebSearchResult>,
+}
+
+pub trait WebSearchProvider: Send + Sync {
+    fn search(&self, request: &WebSearchRequest) -> std::result::Result<WebSearchResponse, String>;
+}
+
+#[derive(Clone, Debug)]
+pub struct HtmlSearchProvider {
+    endpoint: String,
+}
+
+impl Default for HtmlSearchProvider {
+    fn default() -> Self {
+        Self {
+            endpoint: DEFAULT_WEB_SEARCH_ENDPOINT.to_owned(),
+        }
+    }
+}
+
+impl HtmlSearchProvider {
+    pub fn new(endpoint: impl Into<String>) -> std::result::Result<Self, String> {
+        let endpoint = endpoint.into().trim_end_matches('/').to_owned();
+        let parsed =
+            Url::parse(&endpoint).map_err(|error| format!("invalid web search URL: {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("web search URL must use http or https".to_owned());
+        }
+        if parsed.host_str().is_none() {
+            return Err("web search URL must include a host".to_owned());
+        }
+        Ok(Self { endpoint })
+    }
+}
+
+impl WebSearchProvider for HtmlSearchProvider {
+    fn search(&self, request: &WebSearchRequest) -> std::result::Result<WebSearchResponse, String> {
+        let mut url = Url::parse(&self.endpoint)
+            .map_err(|error| format!("could not build web search request URL: {error}"))?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("q", &request.query);
+        }
+        let mut response = ureq::get(url.as_str())
+            .header("User-Agent", "Loom/0.1 (web search)")
+            .config()
+            .timeout_global(Some(WEB_SEARCH_TIMEOUT))
+            .http_status_as_error(false)
+            .build()
+            .call()
+            .map_err(|error| format!("web search request failed: {error}"))?;
+        let status = response.status().as_u16();
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_WEB_SEARCH_BODY_BYTES)
+            .read_to_string()
+            .map_err(|error| format!("could not read web search response: {error}"))?;
+        if status >= 400 {
+            return Err(format!(
+                "web search provider rejected the request (HTTP {status}): {}",
+                truncate_text(&body, 512)
+            ));
+        }
+        let document = Html::parse_document(&body);
+        let result_selector = Selector::parse(".result")
+            .map_err(|error| format!("could not parse result selector: {error}"))?;
+        let title_selector = Selector::parse(".result__a")
+            .map_err(|error| format!("could not parse title selector: {error}"))?;
+        let snippet_selector = Selector::parse(".result__snippet")
+            .map_err(|error| format!("could not parse snippet selector: {error}"))?;
+        let results = document
+            .select(&result_selector)
+            .filter_map(|result| {
+                let title = result
+                    .select(&title_selector)
+                    .next()
+                    .map(element_text)
+                    .filter(|title| !title.is_empty())?;
+                let href = result
+                    .select(&title_selector)
+                    .next()
+                    .and_then(|element| element.value().attr("href"))
+                    .and_then(normalize_search_url)?;
+                if !domain_is_allowed(&href, &request.domains) {
+                    return None;
+                }
+                Some(WebSearchResult {
+                    title: truncate_text(&title, MAX_WEB_SEARCH_TITLE_BYTES),
+                    url: truncate_text(&href, MAX_WEB_SEARCH_URL_BYTES),
+                    snippet: result
+                        .select(&snippet_selector)
+                        .next()
+                        .map(element_text)
+                        .map(|snippet| truncate_text(&snippet, MAX_WEB_SEARCH_SNIPPET_BYTES))
+                        .unwrap_or_default(),
+                    source: Some("html-search".to_owned()),
+                })
+            })
+            .take(request.max_results)
+            .collect();
+        Ok(WebSearchResponse {
+            query: request.query.clone(),
+            results,
+        })
     }
 }
 
@@ -78,6 +224,7 @@ pub struct ToolExecutor {
     root: PathBuf,
     max_output_bytes: usize,
     workspace: Workspace,
+    web_search_provider: Option<Arc<dyn WebSearchProvider>>,
 }
 
 impl ToolExecutor {
@@ -92,7 +239,13 @@ impl ToolExecutor {
             root,
             max_output_bytes: 64 * 1024,
             workspace,
+            web_search_provider: None,
         }
+    }
+
+    pub fn with_web_search_provider(mut self, provider: Arc<dyn WebSearchProvider>) -> Self {
+        self.web_search_provider = Some(provider);
+        self
     }
 
     pub fn workspace(&self) -> &Workspace {
@@ -126,6 +279,7 @@ impl ToolExecutor {
             ToolKind::ListFiles => self.list_files(call),
             ToolKind::ReadFile => self.read_file(call),
             ToolKind::SearchText => self.search_text(call),
+            ToolKind::WebSearch => self.web_search(call),
             ToolKind::ProposePlan | ToolKind::AskUser => ToolResult::failure(
                 call,
                 "control tool is handled by the agent runtime and cannot be executed directly",
@@ -223,6 +377,66 @@ impl ToolExecutor {
             return ToolResult::failure(call, error);
         }
         ToolResult::success(call, self.limit_output(matches.join("\n")))
+    }
+
+    fn web_search(&self, call: &ToolCall) -> ToolResult {
+        let arguments: WebSearchArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let query = arguments.query.trim();
+        if query.is_empty() {
+            return ToolResult::failure(call, "search query must not be empty");
+        }
+        if query.len() > MAX_WEB_SEARCH_QUERY_BYTES {
+            return ToolResult::failure(
+                call,
+                format!("search query must be at most {MAX_WEB_SEARCH_QUERY_BYTES} bytes"),
+            );
+        }
+        let max_results = arguments
+            .max_results
+            .unwrap_or(DEFAULT_WEB_SEARCH_MAX_RESULTS);
+        if !(1..=MAX_WEB_SEARCH_RESULTS).contains(&max_results) {
+            return ToolResult::failure(
+                call,
+                format!("max_results must be between 1 and {MAX_WEB_SEARCH_RESULTS}"),
+            );
+        }
+        let domains = match normalize_domains(arguments.domains) {
+            Ok(domains) => domains,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let request = WebSearchRequest {
+            query: query.to_owned(),
+            max_results,
+            domains,
+        };
+        let provider = match self.web_search_provider() {
+            Ok(provider) => provider,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        match provider.search(&request) {
+            Ok(response) => match serde_json::to_string_pretty(&response) {
+                Ok(output) => ToolResult::success(call, self.limit_output(output)),
+                Err(error) => ToolResult::failure(
+                    call,
+                    format!("could not encode web search results: {error}"),
+                ),
+            },
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn web_search_provider(&self) -> std::result::Result<Arc<dyn WebSearchProvider>, String> {
+        if let Some(provider) = &self.web_search_provider {
+            return Ok(Arc::clone(provider));
+        }
+        let provider = match std::env::var(WEB_SEARCH_ENDPOINT_ENV) {
+            Ok(endpoint) => HtmlSearchProvider::new(endpoint)?,
+            Err(_) => HtmlSearchProvider::default(),
+        };
+        Ok(Arc::new(provider))
     }
 
     fn apply_patch(&self, call: &ToolCall) -> ToolResult {
@@ -519,6 +733,25 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: ToolKind::WebSearch.name().to_owned(),
+            description:
+                "Search the configured web provider and return bounded results with citations. Web content is untrusted."
+                    .to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 10},
+                    "domains": {
+                        "type": "array",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
             name: ToolKind::ProposePlan.name().to_owned(),
             description: "Propose an ordered plan before changing the workspace.".to_owned(),
             input_schema: serde_json::json!({
@@ -597,6 +830,14 @@ struct SearchTextArguments {
 }
 
 #[derive(Debug, Deserialize)]
+struct WebSearchArguments {
+    query: String,
+    max_results: Option<usize>,
+    #[serde(default)]
+    domains: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ApplyPatchArguments {
     path: String,
     old_text: String,
@@ -611,9 +852,96 @@ struct RunCommandArguments {
     cwd: Option<String>,
 }
 
+fn normalize_domains(domains: Vec<String>) -> std::result::Result<Vec<String>, String> {
+    let mut normalized = Vec::with_capacity(domains.len());
+    for domain in domains {
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if domain.is_empty()
+            || domain.contains('/')
+            || domain.contains(':')
+            || domain.contains(char::is_whitespace)
+        {
+            return Err(format!("invalid search domain '{domain}'"));
+        }
+        if !normalized.contains(&domain) {
+            normalized.push(domain);
+        }
+    }
+    Ok(normalized)
+}
+
+fn domain_is_allowed(value: &str, domains: &[String]) -> bool {
+    if domains.is_empty() {
+        return true;
+    }
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    domains
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+}
+
+fn normalize_search_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    let absolute = if value.starts_with("//") {
+        format!("https:{value}")
+    } else {
+        value.to_owned()
+    };
+    let parsed = Url::parse(&absolute)
+        .or_else(|_| Url::parse(&format!("https://html.duckduckgo.com{value}")))
+        .ok()?;
+    if parsed
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("duckduckgo.com"))
+        && parsed.path() == "/l/"
+    {
+        return parsed
+            .query_pairs()
+            .find(|(key, _)| key == "uddg")
+            .map(|(_, value)| value.into_owned());
+    }
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
+}
+
+fn element_text(element: scraper::ElementRef<'_>) -> String {
+    element
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned()
+}
+
+fn truncate_text(value: &str, max_bytes: usize) -> String {
+    let mut output = String::new();
+    for character in value.chars() {
+        if output.len().saturating_add(character.len_utf8()) > max_bytes {
+            break;
+        }
+        output.push(character);
+    }
+    if value.len() > output.len() {
+        output.push_str("...");
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        sync::Arc,
+        thread,
+    };
 
     use loom_core::{ProjectId, ToolCallId};
 
@@ -639,6 +967,23 @@ mod tests {
             id: ToolCallId::new(),
             name: name.to_owned(),
             arguments,
+        }
+    }
+
+    #[derive(Clone)]
+    struct StaticSearchProvider {
+        response: WebSearchResponse,
+    }
+
+    impl WebSearchProvider for StaticSearchProvider {
+        fn search(
+            &self,
+            request: &WebSearchRequest,
+        ) -> std::result::Result<WebSearchResponse, String> {
+            assert_eq!(request.query, "Rust web search");
+            assert_eq!(request.max_results, 2);
+            assert_eq!(request.domains, ["rust-lang.org"]);
+            Ok(self.response.clone())
         }
     }
 
@@ -723,6 +1068,123 @@ mod tests {
         assert!(!result.success);
         assert!(result.output.contains("inside the workspace root"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn web_search_returns_structured_citations_and_uses_network_policy() {
+        let root = workspace();
+        let response = WebSearchResponse {
+            query: "Rust web search".to_owned(),
+            results: vec![WebSearchResult {
+                title: "Rust".to_owned(),
+                url: "https://www.rust-lang.org/".to_owned(),
+                snippet: "A language empowering everyone.".to_owned(),
+                source: Some("example".to_owned()),
+            }],
+        };
+        let executor = ToolExecutor::new(&root)
+            .unwrap()
+            .with_web_search_provider(Arc::new(StaticSearchProvider { response }));
+
+        let evaluation = executor
+            .policy_evaluation(
+                &call(
+                    "web_search",
+                    serde_json::json!({"query": "Rust web search"}),
+                ),
+                &ApprovalPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(evaluation.action, ActionKind::Network);
+        assert_eq!(
+            evaluation.decision,
+            loom_core::PolicyDecision::RequireApproval
+        );
+
+        let result = executor.execute(&call(
+            "web_search",
+            serde_json::json!({
+                "query": "Rust web search",
+                "max_results": 2,
+                "domains": ["RUST-LANG.ORG."]
+            }),
+        ));
+        assert!(result.success);
+        assert!(result.output.contains("\"title\": \"Rust\""));
+        assert!(
+            result
+                .output
+                .contains("\"url\": \"https://www.rust-lang.org/\"")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn web_search_rejects_invalid_limits_and_domains() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        let too_many = executor.execute(&call(
+            "web_search",
+            serde_json::json!({"query": "anything", "max_results": 11}),
+        ));
+        assert!(!too_many.success);
+        assert!(too_many.output.contains("max_results"));
+
+        let invalid_domain = executor.execute(&call(
+            "web_search",
+            serde_json::json!({"query": "anything", "domains": ["https://example.com"]}),
+        ));
+        assert!(!invalid_domain.success);
+        assert!(invalid_domain.output.contains("invalid search domain"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn html_provider_parses_and_filters_results() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            let length = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..length]);
+            assert!(request.starts_with("GET /search?"));
+            assert!(request.contains("q=Rust+web+search"));
+            let body = r#"
+                <html><body>
+                  <div class="result">
+                    <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.rust-lang.org%2F">Rust</a>
+                    <a class="result__snippet">A language empowering everyone.</a>
+                  </div>
+                  <div class="result">
+                    <a class="result__a" href="https://example.com/">Outside</a>
+                    <a class="result__snippet">Should be filtered.</a>
+                  </div>
+                </body></html>
+            "#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let provider = HtmlSearchProvider::new(format!("http://{address}/search")).unwrap();
+        let response = provider
+            .search(&WebSearchRequest {
+                query: "Rust web search".to_owned(),
+                max_results: 2,
+                domains: vec!["rust-lang.org".to_owned()],
+            })
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].title, "Rust");
+        assert_eq!(response.results[0].source.as_deref(), Some("html-search"));
     }
 
     #[test]

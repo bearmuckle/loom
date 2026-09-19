@@ -88,6 +88,15 @@ Session time, token, tool-call, and cost budgets emit limit events and end a
 run rather than silently truncating output, switching providers, or bypassing
 approval policy.
 
+The `web_search` tool is a network action and therefore follows the same
+default approval requirement. It fetches a bounded server-rendered search page
+from the built-in HTML search endpoint, or from an operator-configured
+`LOOM_WEB_SEARCH_ENDPOINT`; the endpoint is deployment configuration rather
+than model-controlled input. Search results are untrusted remote content, are
+returned as bounded structured citations, and may be restricted to explicit
+hostnames by the tool request. Page retrieval and arbitrary URL fetching are
+not implied by this tool.
+
 Workspace roots remain backend-owned after the first `OpenWorkspace` for a
 project and canonical workspace checks from M2 still reject traversal and
 outside-root symlinks. M4 project/session authorization prevents a token from
