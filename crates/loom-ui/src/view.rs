@@ -4302,8 +4302,10 @@ impl Render for LoomView {
                                         .justify_center()
                                         .rounded_sm()
                                         .text_sm()
-                                        .text_color(rgb(0xfca5a5))
-                                        .hover(|style| style.bg(rgb(0x7f1d1d)))
+                                        .text_color(rgb(0xb7c0d0))
+                                        .hover(|style| {
+                                            style.bg(rgb(0x7f1d1d)).text_color(rgb(0xffffff))
+                                        })
                                         .cursor_pointer()
                                         .tooltip(|_, cx| {
                                             cx.new(|_| LoomTooltip {
