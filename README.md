@@ -38,6 +38,19 @@ Demo mode:
 cargo run -p loom-ui -- --demo
 ```
 
+Run the same checks used by CI:
+
+```text
+./scripts/ci-check.sh
+```
+
+To run those checks automatically before every push, enable the repository
+hook once:
+
+```text
+git config core.hooksPath .githooks
+```
+
 Browser target (GPUI currently requires a nightly compiler for wasm atomics):
 
 ```text

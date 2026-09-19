@@ -32,11 +32,5 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Run tests
-        run: cargo test --workspace --all-features --locked
-      - name: Build workspace
-        run: cargo build --workspace --locked
+      - name: Run Rust checks
+        run: ./scripts/ci-check.sh
