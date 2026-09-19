@@ -12,6 +12,7 @@ use loom_core::{ActionKind, ApprovalPolicy, ProjectId, Result};
 use loom_model::{ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
 use loom_workspace::{Workspace, WorkspaceEdit};
+use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
 use url::Url;
@@ -87,8 +88,10 @@ const MAX_WEB_SEARCH_QUERY_BYTES: usize = 2048;
 const MAX_WEB_SEARCH_TITLE_BYTES: usize = 512;
 const MAX_WEB_SEARCH_SNIPPET_BYTES: usize = 2 * 1024;
 const MAX_WEB_SEARCH_URL_BYTES: usize = 4 * 1024;
+const MAX_WEB_SEARCH_BODY_BYTES: u64 = 1024 * 1024;
 const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
-const WEB_SEARCH_ENDPOINT_ENV: &str = "LOOM_SEARXNG_URL";
+const WEB_SEARCH_ENDPOINT_ENV: &str = "LOOM_WEB_SEARCH_ENDPOINT";
+const DEFAULT_WEB_SEARCH_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WebSearchRequest {
@@ -116,71 +119,95 @@ pub trait WebSearchProvider: Send + Sync {
 }
 
 #[derive(Clone, Debug)]
-pub struct SearxngSearchProvider {
+pub struct HtmlSearchProvider {
     endpoint: String,
 }
 
-impl SearxngSearchProvider {
+impl Default for HtmlSearchProvider {
+    fn default() -> Self {
+        Self {
+            endpoint: DEFAULT_WEB_SEARCH_ENDPOINT.to_owned(),
+        }
+    }
+}
+
+impl HtmlSearchProvider {
     pub fn new(endpoint: impl Into<String>) -> std::result::Result<Self, String> {
         let endpoint = endpoint.into().trim_end_matches('/').to_owned();
         let parsed =
-            Url::parse(&endpoint).map_err(|error| format!("invalid SearXNG URL: {error}"))?;
+            Url::parse(&endpoint).map_err(|error| format!("invalid web search URL: {error}"))?;
         if !matches!(parsed.scheme(), "http" | "https") {
-            return Err("SearXNG URL must use http or https".to_owned());
+            return Err("web search URL must use http or https".to_owned());
         }
         if parsed.host_str().is_none() {
-            return Err("SearXNG URL must include a host".to_owned());
+            return Err("web search URL must include a host".to_owned());
         }
         Ok(Self { endpoint })
     }
 }
 
-impl WebSearchProvider for SearxngSearchProvider {
+impl WebSearchProvider for HtmlSearchProvider {
     fn search(&self, request: &WebSearchRequest) -> std::result::Result<WebSearchResponse, String> {
-        let mut url = Url::parse(&format!("{}/search", self.endpoint))
-            .map_err(|error| format!("could not build SearXNG request URL: {error}"))?;
+        let mut url = Url::parse(&self.endpoint)
+            .map_err(|error| format!("could not build web search request URL: {error}"))?;
         {
             let mut query = url.query_pairs_mut();
             query.append_pair("q", &request.query);
-            query.append_pair("format", "json");
-            query.append_pair("categories", "general");
-            query.append_pair("safesearch", "1");
         }
         let mut response = ureq::get(url.as_str())
+            .header("User-Agent", "Loom/0.1 (web search)")
             .config()
             .timeout_global(Some(WEB_SEARCH_TIMEOUT))
             .http_status_as_error(false)
             .build()
             .call()
-            .map_err(|error| format!("SearXNG request failed: {error}"))?;
+            .map_err(|error| format!("web search request failed: {error}"))?;
         let status = response.status().as_u16();
         let body = response
             .body_mut()
+            .with_config()
+            .limit(MAX_WEB_SEARCH_BODY_BYTES)
             .read_to_string()
-            .map_err(|error| format!("could not read SearXNG response: {error}"))?;
+            .map_err(|error| format!("could not read web search response: {error}"))?;
         if status >= 400 {
             return Err(format!(
-                "SearXNG rejected the request (HTTP {status}): {}",
+                "web search provider rejected the request (HTTP {status}): {}",
                 truncate_text(&body, 512)
             ));
         }
-        let payload: SearxngResponse = serde_json::from_str(&body)
-            .map_err(|error| format!("SearXNG returned invalid JSON: {error}"))?;
-        let results = payload
-            .results
-            .into_iter()
+        let document = Html::parse_document(&body);
+        let result_selector = Selector::parse(".result")
+            .map_err(|error| format!("could not parse result selector: {error}"))?;
+        let title_selector = Selector::parse(".result__a")
+            .map_err(|error| format!("could not parse title selector: {error}"))?;
+        let snippet_selector = Selector::parse(".result__snippet")
+            .map_err(|error| format!("could not parse snippet selector: {error}"))?;
+        let results = document
+            .select(&result_selector)
             .filter_map(|result| {
-                let url = result.url.trim().to_owned();
-                if url.is_empty() || !domain_is_allowed(&url, &request.domains) {
+                let title = result
+                    .select(&title_selector)
+                    .next()
+                    .map(element_text)
+                    .filter(|title| !title.is_empty())?;
+                let href = result
+                    .select(&title_selector)
+                    .next()
+                    .and_then(|element| element.value().attr("href"))
+                    .and_then(normalize_search_url)?;
+                if !domain_is_allowed(&href, &request.domains) {
                     return None;
                 }
                 Some(WebSearchResult {
-                    title: truncate_text(&result.title, MAX_WEB_SEARCH_TITLE_BYTES),
-                    url: truncate_text(&url, MAX_WEB_SEARCH_URL_BYTES),
-                    snippet: truncate_text(&result.content, MAX_WEB_SEARCH_SNIPPET_BYTES),
-                    source: result
-                        .engine_name
-                        .filter(|source| !source.trim().is_empty()),
+                    title: truncate_text(&title, MAX_WEB_SEARCH_TITLE_BYTES),
+                    url: truncate_text(&href, MAX_WEB_SEARCH_URL_BYTES),
+                    snippet: result
+                        .select(&snippet_selector)
+                        .next()
+                        .map(element_text)
+                        .map(|snippet| truncate_text(&snippet, MAX_WEB_SEARCH_SNIPPET_BYTES))
+                        .unwrap_or_default(),
+                    source: Some("html-search".to_owned()),
                 })
             })
             .take(request.max_results)
@@ -190,24 +217,6 @@ impl WebSearchProvider for SearxngSearchProvider {
             results,
         })
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct SearxngResponse {
-    #[serde(default)]
-    results: Vec<SearxngResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SearxngResult {
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    url: String,
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    engine_name: Option<String>,
 }
 
 #[derive(Clone)]
@@ -423,12 +432,11 @@ impl ToolExecutor {
         if let Some(provider) = &self.web_search_provider {
             return Ok(Arc::clone(provider));
         }
-        let endpoint = std::env::var(WEB_SEARCH_ENDPOINT_ENV).map_err(|_| {
-            format!(
-                "web search is not configured; set {WEB_SEARCH_ENDPOINT_ENV} to a SearXNG endpoint"
-            )
-        })?;
-        Ok(Arc::new(SearxngSearchProvider::new(endpoint)?))
+        let provider = match std::env::var(WEB_SEARCH_ENDPOINT_ENV) {
+            Ok(endpoint) => HtmlSearchProvider::new(endpoint)?,
+            Err(_) => HtmlSearchProvider::default(),
+        };
+        Ok(Arc::new(provider))
     }
 
     fn apply_patch(&self, call: &ToolCall) -> ToolResult {
@@ -878,6 +886,38 @@ fn domain_is_allowed(value: &str, domains: &[String]) -> bool {
         .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
 }
 
+fn normalize_search_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    let absolute = if value.starts_with("//") {
+        format!("https:{value}")
+    } else {
+        value.to_owned()
+    };
+    let parsed = Url::parse(&absolute)
+        .or_else(|_| Url::parse(&format!("https://html.duckduckgo.com{value}")))
+        .ok()?;
+    if parsed
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("duckduckgo.com"))
+        && parsed.path() == "/l/"
+    {
+        return parsed
+            .query_pairs()
+            .find(|(key, _)| key == "uddg")
+            .map(|(_, value)| value.into_owned());
+    }
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.to_string())
+}
+
+fn element_text(element: scraper::ElementRef<'_>) -> String {
+    element
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_owned()
+}
+
 fn truncate_text(value: &str, max_bytes: usize) -> String {
     let mut output = String::new();
     for character in value.chars() {
@@ -1101,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn searxng_provider_parses_and_filters_results() {
+    fn html_provider_parses_and_filters_results() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1110,32 +1150,29 @@ mod tests {
             let length = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..length]);
             assert!(request.starts_with("GET /search?"));
-            assert!(request.contains("format=json"));
-            let body = r#"{
-                "results": [
-                    {
-                        "title": "Rust",
-                        "url": "https://www.rust-lang.org/",
-                        "content": "A language empowering everyone.",
-                        "engine_name": "example"
-                    },
-                    {
-                        "title": "Outside",
-                        "url": "https://example.com/",
-                        "content": "Should be filtered."
-                    }
-                ]
-            }"#;
+            assert!(request.contains("q=Rust+web+search"));
+            let body = r#"
+                <html><body>
+                  <div class="result">
+                    <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.rust-lang.org%2F">Rust</a>
+                    <a class="result__snippet">A language empowering everyone.</a>
+                  </div>
+                  <div class="result">
+                    <a class="result__a" href="https://example.com/">Outside</a>
+                    <a class="result__snippet">Should be filtered.</a>
+                  </div>
+                </body></html>
+            "#;
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             )
             .unwrap();
         });
 
-        let provider = SearxngSearchProvider::new(format!("http://{address}")).unwrap();
+        let provider = HtmlSearchProvider::new(format!("http://{address}/search")).unwrap();
         let response = provider
             .search(&WebSearchRequest {
                 query: "Rust web search".to_owned(),
@@ -1147,7 +1184,7 @@ mod tests {
 
         assert_eq!(response.results.len(), 1);
         assert_eq!(response.results[0].title, "Rust");
-        assert_eq!(response.results[0].source.as_deref(), Some("example"));
+        assert_eq!(response.results[0].source.as_deref(), Some("html-search"));
     }
 
     #[test]

@@ -115,10 +115,10 @@ The follow-up implementation improved the surface:
   ignore rules and glob matching (`:359-451`).
 - Output truncation preserves UTF-8 boundaries and has regression coverage
   (`:463-468`, `:757-764`).
-- `web_search` uses a provider interface with a SearXNG adapter, bounded result
-  counts and fields, optional hostname filtering, and structured citation
-  output. It is classified as a network action so the default policy requires
-  approval.
+- `web_search` uses a provider interface with a bounded HTML adapter, bounded
+  result counts and fields, optional hostname filtering, and structured
+  citation output. It is classified as a network action so the default policy
+  requires approval.
 
 The remaining limitations are:
 
@@ -128,8 +128,11 @@ The remaining limitations are:
   pagination, or a structured result limit.
 - `read_file` and other output paths retain a fixed 64 KiB output limit
   (`:90`, `:463-468`), with only a textual truncation marker.
-- `web_search` requires an operator-configured `LOOM_SEARXNG_URL`; it does not
-  provide arbitrary URL fetching or page content retrieval.
+- `web_search` defaults to a public server-rendered search endpoint and accepts
+  an operator-configured `LOOM_WEB_SEARCH_ENDPOINT`; it does not provide
+  arbitrary URL fetching or page content retrieval. HTML markup and bot
+  protection can change independently of Loom, so parser fixtures and explicit
+  provider errors are preferred over silent fallback.
 
 The practical effect is bounded but still lower-signal repository exploration
 than a full ripgrep-style search API.

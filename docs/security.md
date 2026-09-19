@@ -89,9 +89,10 @@ run rather than silently truncating output, switching providers, or bypassing
 approval policy.
 
 The `web_search` tool is a network action and therefore follows the same
-default approval requirement. It uses a configured SearXNG endpoint from
-`LOOM_SEARXNG_URL`; the endpoint is deployment configuration rather than
-model-controlled input. Search results are untrusted remote content, are
+default approval requirement. It fetches a bounded server-rendered search page
+from the built-in HTML search endpoint, or from an operator-configured
+`LOOM_WEB_SEARCH_ENDPOINT`; the endpoint is deployment configuration rather
+than model-controlled input. Search results are untrusted remote content, are
 returned as bounded structured citations, and may be restricted to explicit
 hostnames by the tool request. Page retrieval and arbitrary URL fetching are
 not implied by this tool.
