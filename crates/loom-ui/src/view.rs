@@ -2472,6 +2472,18 @@ impl LoomView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let ThemeChoice::Preset(name, _) = theme {
+            let appearance = window.appearance();
+            cx.set_window_appearance(Some(appearance));
+            if let Err(error) = crate::theme::apply_preset_theme(name, appearance, cx) {
+                self.record_status(format!("could not load theme: {error}"));
+                return;
+            }
+            self.theme_choice = theme;
+            cx.notify();
+            return;
+        }
+
         self.theme_choice = theme;
         let appearance = match theme {
             ThemeChoice::System => {
@@ -2486,6 +2498,7 @@ impl LoomView {
                 cx.set_window_appearance(Some(WindowAppearance::Dark));
                 WindowAppearance::Dark
             }
+            ThemeChoice::Preset(_, _) => unreachable!("preset themes return early"),
         };
         self.apply_appearance(appearance, window, cx);
     }
@@ -3963,39 +3976,35 @@ impl LoomView {
                     .child("THEME"),
             )
             .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .gap_1()
-                    .children(
-                        ThemeChoice::ALL
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, choice)| {
-                                let selected = choice == self.theme_choice;
-                                div()
-                                    .id(("theme-choice", index))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(if selected {
-                                        rgb(0x293244)
-                                    } else {
-                                        rgb(0x20242c)
-                                    })
-                                    .text_xs()
-                                    .text_color(if selected {
-                                        rgb(0xf3f4f6)
-                                    } else {
-                                        rgb(0xb7c0d0)
-                                    })
-                                    .cursor_pointer()
-                                    .child(choice.label())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select_theme(choice, window, cx);
-                                    }))
-                            }),
-                    ),
+                div().mt_2().flex().flex_wrap().gap_1().children(
+                    ThemeChoice::ALL
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, choice)| {
+                            let selected = choice == self.theme_choice;
+                            div()
+                                .id(("theme-choice", index))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(if selected {
+                                    rgb(0x293244)
+                                } else {
+                                    rgb(0x20242c)
+                                })
+                                .text_xs()
+                                .text_color(if selected {
+                                    rgb(0xf3f4f6)
+                                } else {
+                                    rgb(0xb7c0d0)
+                                })
+                                .cursor_pointer()
+                                .child(choice.label())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_theme(choice, window, cx);
+                                }))
+                        }),
+                ),
             )
             .child(div().mt_2().child(body))
             .into_any()

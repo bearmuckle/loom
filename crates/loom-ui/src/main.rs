@@ -22,8 +22,8 @@ use crate::{browser::BrowserOptions, view::LoomView};
 use gpui::{App, KeyBinding, prelude::*};
 #[cfg(not(target_family = "wasm"))]
 use gpui::{
-    Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowOptions, point, px, size,
+    Bounds, TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, point, px, size,
 };
 use log::{error, info};
 
@@ -98,8 +98,13 @@ fn main() {
             gpui_component::init(cx);
             if let Err(error) = crate::theme::apply_native_theme(cx) {
                 log::warn!("could not load the native theme: {error}");
-                gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-                crate::theme::sync_palette(cx);
+                if let Err(error) =
+                    crate::theme::apply_preset_theme("catppuccin-mocha", WindowAppearance::Dark, cx)
+                {
+                    log::warn!("could not load the fallback theme: {error}");
+                    gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+                    crate::theme::sync_palette(cx);
+                }
             }
             bind_composer_keys(cx);
             let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {

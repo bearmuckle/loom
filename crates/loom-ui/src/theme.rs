@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 
-use gpui::{App, Pixels, Point, ResizeEdge, Rgba, Styled, Tiling, px};
+use gpui::{App, Pixels, Point, ResizeEdge, Rgba, Styled, Tiling, WindowAppearance, px};
 use gpui_component::Theme;
 use loom_core::AgentSessionState;
 
@@ -153,6 +153,21 @@ pub(crate) fn selection() -> Rgba {
 pub(crate) fn apply_native_theme(cx: &mut App) -> native_theme_gpui::Result<()> {
     let system = native_theme_gpui::SystemTheme::from_system()?;
     native_theme_gpui::apply_system_theme(&system, cx);
+    sync_palette(cx);
+    Ok(())
+}
+
+pub(crate) fn apply_preset_theme(
+    name: &str,
+    appearance: WindowAppearance,
+    cx: &mut App,
+) -> native_theme_gpui::Result<()> {
+    let prefs = native_theme_gpui::AccessibilityPreferences::from_system();
+    let (light_theme, light_resolved) = native_theme_gpui::from_preset(name, false, &prefs)?;
+    let (dark_theme, dark_resolved) = native_theme_gpui::from_preset(name, true, &prefs)?;
+    native_theme_gpui::apply(light_theme, &light_resolved, &prefs, cx);
+    native_theme_gpui::apply(dark_theme, &dark_resolved, &prefs, cx);
+    gpui_component::Theme::change(appearance, None, cx);
     sync_palette(cx);
     Ok(())
 }
