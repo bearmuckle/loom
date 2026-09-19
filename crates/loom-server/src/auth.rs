@@ -9,6 +9,7 @@ use loom_core::{
     AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError, ProjectId, Result,
 };
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -103,7 +104,7 @@ impl AuthorizationScope {
 pub struct AuthSession {
     store: Arc<AuthTokenStore>,
     token_id: String,
-    digest: String,
+    digest: [u8; 32],
     scope: AuthorizationScope,
 }
 
@@ -134,7 +135,9 @@ impl AuthSession {
             .map_err(|_| auth_internal_error())?
             .get(&self.token_id)
             .is_some_and(|record| {
-                !record.revoked && record.digest == self.digest && record.scope == self.scope
+                !record.revoked
+                    && bool::from(record.digest.ct_eq(&self.digest))
+                    && record.scope == self.scope
             });
         if active {
             Ok(())
@@ -180,7 +183,7 @@ impl IssuedToken {
 
 #[derive(Clone, Debug)]
 struct TokenRecord {
-    digest: String,
+    digest: [u8; 32],
     scope: AuthorizationScope,
     revoked: bool,
 }
@@ -255,7 +258,7 @@ impl AuthTokenStore {
         let tokens = self.tokens.lock().map_err(|_| auth_internal_error())?;
         let Some((token_id, record)) = tokens
             .iter()
-            .find(|(_, record)| !record.revoked && record.digest == digest)
+            .find(|(_, record)| !record.revoked && bool::from(record.digest.ct_eq(&digest)))
         else {
             return Err(LoomError::new(
                 ErrorCode::AuthenticationFailed,
@@ -272,11 +275,8 @@ impl AuthTokenStore {
     }
 }
 
-fn digest(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let bytes = hasher.finalize();
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+fn digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 fn auth_internal_error() -> LoomError {

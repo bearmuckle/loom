@@ -1,9 +1,9 @@
 use std::{
     fs,
     path::{Component, Path, PathBuf},
-    process::Command,
 };
 
+use git2::{BranchType, DiffFormat, DiffOptions, Repository, Status, StatusOptions};
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
 pub use loom_protocol::{
     GitBranch, GitDiff, GitFileStatus, GitFileStatusKind, GitRepositoryStatus,
@@ -31,27 +31,7 @@ impl GitService {
                 false,
             )
         })?;
-        let output = Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&root)
-            .output()
-            .map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Vcs,
-                    format!("could not initialize Git: {error}"),
-                    true,
-                )
-            })?;
-        if !output.status.success() {
-            return Err(LoomError::new(
-                ErrorCode::Vcs,
-                format!(
-                    "could not initialize Git: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-                false,
-            ));
-        }
+        Repository::init(&root).map_err(|error| git_error("could not initialize Git", error))?;
         Self::open(root)
     }
 
@@ -74,9 +54,9 @@ impl GitService {
                 false,
             )
         })?;
-        let service = Self { root };
-        service.run(&["rev-parse", "--show-toplevel"])?;
-        Ok(service)
+        Repository::open(&root)
+            .map_err(|error| git_error("could not open Git repository", error))?;
+        Ok(Self { root })
     }
 
     pub fn root(&self) -> &Path {
@@ -84,58 +64,46 @@ impl GitService {
     }
 
     pub fn status(&self) -> Result<GitRepositoryStatus> {
-        let output = self.run_bytes(&["status", "--porcelain=v1", "-z", "--branch"])?;
-        let records = output
-            .split(|byte| *byte == 0)
-            .filter(|record| !record.is_empty());
-        let mut branch = None;
+        let repository = self.repository()?;
+        let branch = repository
+            .head()
+            .ok()
+            .and_then(|head| head.shorthand().ok().map(str::to_owned));
+        let head = repository
+            .head()
+            .ok()
+            .and_then(|head| head.target())
+            .map(|oid| oid.to_string());
+        let mut options = StatusOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .renames_head_to_index(true)
+            .renames_index_to_workdir(true);
+        let statuses = repository
+            .statuses(Some(&mut options))
+            .map_err(|error| git_error("could not read Git status", error))?;
         let mut files = Vec::new();
-        for record in records {
-            let record = String::from_utf8(record.to_vec()).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Vcs,
-                    format!("Git status contained invalid UTF-8: {error}"),
-                    false,
-                )
-            })?;
-            if let Some(header) = record.strip_prefix("## ") {
-                branch = Some(
-                    header
-                        .split("...")
-                        .next()
-                        .unwrap_or(header)
-                        .trim_end_matches(" (no branch)")
-                        .to_owned(),
-                );
-                continue;
-            }
-            if record.len() < 3 {
-                continue;
-            }
-            let bytes = record.as_bytes();
-            let index = status_kind(bytes[0]);
-            let worktree = status_kind(bytes[1]);
-            let raw_path = record[3..].to_owned();
-            let original_path = raw_path
-                .split_once(" -> ")
-                .map(|(original, _)| original.to_owned());
-            let path = raw_path
-                .split_once(" -> ")
-                .map_or(raw_path.clone(), |(_, current)| current.to_owned());
-            let conflicted = is_conflict(bytes[0], bytes[1]);
+        for entry in &statuses {
+            let status = entry.status();
+            let path = entry
+                .path()
+                .map_err(|error| git_error("Git status contained invalid UTF-8", error))?
+                .to_owned();
+            let original_path = entry
+                .head_to_index()
+                .or_else(|| entry.index_to_workdir())
+                .and_then(|delta| delta.old_file().path())
+                .filter(|old_path| *old_path != Path::new(&path))
+                .map(|old_path| old_path.to_string_lossy().replace('\\', "/"));
             files.push(GitFileStatus {
                 path,
                 original_path,
-                index,
-                worktree,
-                conflicted,
+                index: status_kind(status, true),
+                worktree: status_kind(status, false),
+                conflicted: status.is_conflicted(),
             });
         }
-        let head = self
-            .run(&["rev-parse", "HEAD"])
-            .ok()
-            .map(|head| head.trim().to_owned())
-            .filter(|head| !head.is_empty());
         let conflicts = files
             .iter()
             .filter(|file| file.conflicted)
@@ -153,46 +121,89 @@ impl GitService {
     }
 
     pub fn diff(&self, path: Option<&str>, staged: bool) -> Result<GitDiff> {
-        let mut arguments = vec!["diff"];
-        if staged {
-            arguments.push("--cached");
-        }
         let normalized = path.map(|path| self.validate_path(path)).transpose()?;
+        let repository = self.repository()?;
+        let mut options = DiffOptions::new();
         if let Some(path) = normalized.as_deref() {
-            arguments.extend(["--", path]);
+            options.pathspec(path);
         }
-        let patch = self.run(&arguments)?;
+        let diff = if staged {
+            let head = repository
+                .head()
+                .ok()
+                .and_then(|head| head.peel_to_tree().ok());
+            repository
+                .diff_tree_to_index(head.as_ref(), None, Some(&mut options))
+                .map_err(|error| git_error("could not create staged Git diff", error))?
+        } else {
+            repository
+                .diff_index_to_workdir(None, Some(&mut options))
+                .map_err(|error| git_error("could not create Git diff", error))?
+        };
+        let binary = diff
+            .deltas()
+            .any(|delta| delta.old_file().is_binary() || delta.new_file().is_binary());
+        let mut patch = Vec::new();
+        diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+            if matches!(line.origin(), ' ' | '+' | '-') {
+                patch.push(line.origin() as u8);
+            }
+            patch.extend_from_slice(line.content());
+            true
+        })
+        .map_err(|error| git_error("could not render Git diff", error))?;
+        let patch = String::from_utf8(patch).map_err(|error| {
+            LoomError::new(
+                ErrorCode::Vcs,
+                format!("Git diff contained invalid UTF-8: {error}"),
+                false,
+            )
+        })?;
         Ok(GitDiff {
             path: normalized,
             staged,
-            binary: patch.contains("Binary files"),
+            binary,
             patch,
         })
     }
 
     pub fn branches(&self) -> Result<Vec<GitBranch>> {
-        let current = self.run(&["branch", "--show-current"])?.trim().to_owned();
-        let output = self.run(&[
-            "for-each-ref",
-            "--format=%(refname:short)\t%(upstream:short)",
-            "refs/heads",
-        ])?;
-        Ok(output
-            .lines()
-            .filter_map(|line| {
-                let (name, upstream) = line.split_once('\t').unwrap_or((line, ""));
-                (!name.is_empty()).then(|| GitBranch {
-                    name: name.to_owned(),
-                    current: name == current,
-                    upstream: (!upstream.is_empty()).then(|| upstream.to_owned()),
-                })
-            })
-            .collect())
+        let repository = self.repository()?;
+        let branches = repository
+            .branches(Some(BranchType::Local))
+            .map_err(|error| git_error("could not list Git branches", error))?;
+        let mut result = Vec::new();
+        for branch in branches {
+            let (branch, _) =
+                branch.map_err(|error| git_error("could not read Git branch", error))?;
+            let name = branch
+                .name()
+                .map_err(|error| git_error("Git branch contained invalid UTF-8", error))?
+                .unwrap_or_default()
+                .to_owned();
+            if name.is_empty() {
+                continue;
+            }
+            let upstream = branch
+                .upstream()
+                .ok()
+                .and_then(|upstream| upstream.name().ok().flatten().map(str::to_owned));
+            result.push(GitBranch {
+                name,
+                current: branch.is_head(),
+                upstream,
+            });
+        }
+        Ok(result)
     }
 
     pub fn current_branch(&self) -> Result<Option<String>> {
-        let branch = self.run(&["branch", "--show-current"])?;
-        Ok((!branch.trim().is_empty()).then(|| branch.trim().to_owned()))
+        Ok(self
+            .repository()?
+            .head()
+            .ok()
+            .filter(|head| head.is_branch())
+            .and_then(|head| head.shorthand().ok().map(str::to_owned)))
     }
 
     pub fn conflicts(&self) -> Result<Vec<String>> {
@@ -216,67 +227,52 @@ impl GitService {
         Ok(candidate.to_string_lossy().replace('\\', "/"))
     }
 
-    fn run(&self, arguments: &[&str]) -> Result<String> {
-        let bytes = self.run_bytes(arguments)?;
-        String::from_utf8(bytes).map_err(|error| {
-            LoomError::new(
-                ErrorCode::Vcs,
-                format!("Git command returned invalid UTF-8: {error}"),
-                false,
-            )
-        })
+    fn repository(&self) -> Result<Repository> {
+        Repository::open(&self.root)
+            .map_err(|error| git_error("could not open Git repository", error))
     }
+}
 
-    fn run_bytes(&self, arguments: &[&str]) -> Result<Vec<u8>> {
-        let output = Command::new("git")
-            .args(arguments)
-            .current_dir(&self.root)
-            .output()
-            .map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Vcs,
-                    format!("could not execute Git: {error}"),
-                    true,
-                )
-            })?;
-        if !output.status.success() {
-            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            return Err(LoomError::new(
-                ErrorCode::Vcs,
-                if detail.is_empty() {
-                    format!("Git command failed with status {}", output.status)
-                } else {
-                    format!("Git command failed: {detail}")
-                },
-                false,
-            ));
+fn status_kind(status: Status, index: bool) -> GitFileStatusKind {
+    if status.is_conflicted() {
+        return GitFileStatusKind::Conflicted;
+    }
+    if status.is_ignored() {
+        return GitFileStatusKind::Ignored;
+    }
+    let kind = if index {
+        if status.is_index_renamed() {
+            GitFileStatusKind::Renamed
+        } else if status.is_index_new() {
+            GitFileStatusKind::Added
+        } else if status.is_index_modified() {
+            GitFileStatusKind::Modified
+        } else if status.is_index_deleted() {
+            GitFileStatusKind::Deleted
+        } else {
+            GitFileStatusKind::Unknown
         }
-        Ok(output.stdout)
-    }
+    } else if status.is_wt_renamed() {
+        GitFileStatusKind::Renamed
+    } else if status.is_wt_new() {
+        GitFileStatusKind::Untracked
+    } else if status.is_wt_modified() {
+        GitFileStatusKind::Modified
+    } else if status.is_wt_deleted() {
+        GitFileStatusKind::Deleted
+    } else {
+        GitFileStatusKind::Unknown
+    };
+    kind
 }
 
-fn status_kind(value: u8) -> GitFileStatusKind {
-    match value {
-        b'A' => GitFileStatusKind::Added,
-        b'M' => GitFileStatusKind::Modified,
-        b'D' => GitFileStatusKind::Deleted,
-        b'R' => GitFileStatusKind::Renamed,
-        b'C' => GitFileStatusKind::Copied,
-        b'?' => GitFileStatusKind::Untracked,
-        b'!' => GitFileStatusKind::Ignored,
-        b'U' => GitFileStatusKind::Conflicted,
-        b' ' => GitFileStatusKind::Unknown,
-        _ => GitFileStatusKind::Unknown,
-    }
-}
-
-fn is_conflict(index: u8, worktree: u8) -> bool {
-    index == b'U' || worktree == b'U' || matches!((index, worktree), (b'A', b'A') | (b'D', b'D'))
+fn git_error(operation: &str, error: git2::Error) -> LoomError {
+    LoomError::new(ErrorCode::Vcs, format!("{operation}: {error}"), false)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, process::Command};
 
     use loom_core::ProjectId;
 

@@ -3,7 +3,8 @@ mod provider;
 pub use provider::{
     CancellationToken, CollectingSink, ModelProvider, ModelStreamSink, ProviderDescriptor,
     ProviderHealth, ProviderHealthState, ProviderKind, ProviderSummary, ProviderUsageRecord,
-    ProviderUsageSummary, StreamFlow, UnavailableProvider, cancelled_error, estimate_tokens,
+    ProviderUsageSummary, StreamFlow, UnavailableProvider, cancelled_error,
+    estimate_message_tokens, estimate_tokens,
 };
 
 use loom_core::ToolCallId;

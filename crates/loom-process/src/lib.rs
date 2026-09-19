@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{BufReader, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -18,6 +18,9 @@ pub use loom_protocol::{
     TaskStatus, TerminalEvent, TerminalEventRecord, TerminalSnapshot, TerminalStatus,
     TerminalStream,
 };
+use portable_pty::{
+    Child as PtyChild, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system,
+};
 
 const DEFAULT_EVENT_LIMIT: usize = 1024;
 const DEFAULT_TASK_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -30,12 +33,23 @@ struct TerminalState {
     next_sequence: EventSequence,
 }
 
-#[derive(Debug)]
 struct TerminalHandle {
     state: Mutex<TerminalState>,
-    child: Mutex<Option<Child>>,
-    stdin: Mutex<Option<ChildStdin>>,
+    child: Mutex<Option<Box<dyn PtyChild + Send + Sync>>>,
+    killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
+    stdin: Mutex<Option<Box<dyn Write + Send>>>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
     cancel_requested: AtomicBool,
+}
+
+impl std::fmt::Debug for TerminalHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TerminalHandle")
+            .field("state", &self.state)
+            .field("cancel_requested", &self.cancel_requested)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -78,35 +92,45 @@ impl TerminalManager {
                 false,
             ));
         }
-        let mut child = Command::new(&command)
-            .args(&args)
-            .current_dir(&cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|error| {
                 LoomError::new(
                     ErrorCode::ToolExecution,
-                    format!("could not start terminal '{command}': {error}"),
+                    format!("could not allocate terminal: {error}"),
                     false,
                 )
             })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
+        let mut builder = CommandBuilder::new(&command);
+        builder.args(&args);
+        builder.cwd(&cwd);
+        let child = pty.slave.spawn_command(builder).map_err(|error| {
             LoomError::new(
-                ErrorCode::Internal,
-                "terminal stdout pipe was not available",
+                ErrorCode::ToolExecution,
+                format!("could not start terminal '{command}': {error}"),
                 false,
             )
         })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
+        let killer = child.clone_killer();
+        let stdout = pty.master.try_clone_reader().map_err(|error| {
             LoomError::new(
                 ErrorCode::Internal,
-                "terminal stderr pipe was not available",
+                format!("terminal output reader was not available: {error}"),
                 false,
             )
         })?;
-        let stdin = child.stdin.take();
+        let stdin = pty.master.take_writer().map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("terminal input writer was not available: {error}"),
+                false,
+            )
+        })?;
         let id = TerminalId::new();
         let now = Timestamp::now();
         let snapshot = TerminalSnapshot {
@@ -129,7 +153,9 @@ impl TerminalManager {
                 next_sequence: EventSequence::default(),
             }),
             child: Mutex::new(Some(child)),
-            stdin: Mutex::new(stdin),
+            killer: Mutex::new(Some(killer)),
+            stdin: Mutex::new(Some(stdin)),
+            master: Mutex::new(pty.master),
             cancel_requested: AtomicBool::new(false),
         });
         self.sessions
@@ -150,12 +176,6 @@ impl TerminalManager {
             self.event_limit,
             stdout,
             TerminalStream::Stdout,
-        );
-        spawn_reader(
-            Arc::clone(&handle),
-            self.event_limit,
-            stderr,
-            TerminalStream::Stderr,
         );
         let event_limit = self.event_limit;
         thread::spawn({
@@ -206,6 +226,23 @@ impl TerminalManager {
             ));
         }
         let handle = self.handle(id)?;
+        handle
+            .master
+            .lock()
+            .map_err(|_| internal_lock_error("terminal master"))?
+            .resize(PtySize {
+                rows,
+                cols: columns,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::ToolExecution,
+                    format!("could not resize terminal: {error}"),
+                    false,
+                )
+            })?;
         append_terminal_event(
             &handle,
             self.event_limit,
@@ -232,12 +269,12 @@ impl TerminalManager {
             ));
         }
         handle.cancel_requested.store(true, Ordering::SeqCst);
-        let mut child = handle
-            .child
+        let mut killer = handle
+            .killer
             .lock()
-            .map_err(|_| internal_lock_error("terminal child"))?;
-        if let Some(child) = child.as_mut() {
-            child.kill().map_err(|error| {
+            .map_err(|_| internal_lock_error("terminal killer"))?;
+        if let Some(killer) = killer.as_mut() {
+            killer.kill().map_err(|error| {
                 LoomError::new(
                     ErrorCode::ToolExecution,
                     format!("could not cancel terminal: {error}"),
@@ -313,22 +350,14 @@ fn spawn_reader<R: Read + Send + 'static>(
 }
 
 fn wait_for_terminal(handle: Arc<TerminalHandle>, event_limit: usize) {
-    let status = loop {
-        let mut child = match handle.child.lock() {
-            Ok(child) => child,
-            Err(_) => return,
-        };
-        let result = child.as_mut().map(Child::try_wait);
-        drop(child);
-        match result {
-            Some(Ok(Some(status))) => break Some(status),
-            Some(Ok(None)) => {}
-            Some(Err(_)) | None => break None,
-        }
-        thread::sleep(Duration::from_millis(10));
+    let status = match handle.child.lock() {
+        Ok(mut child) => child.as_mut().and_then(|child| child.wait().ok()),
+        Err(_) => None,
     };
     let cancelled = handle.cancel_requested.load(Ordering::SeqCst);
-    let exit_code = status.and_then(|status| status.code());
+    let exit_code = status
+        .as_ref()
+        .map(|status| status.exit_code().min(i32::MAX as u32) as i32);
     let terminal_status = if cancelled {
         TerminalStatus::Cancelled
     } else if status.is_some_and(|status| status.success()) {
