@@ -5,10 +5,13 @@ use std::ops::Range;
 use gpui::{
     App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, GlobalElementId,
     LayoutId, PaintQuad, Pixels, Render, ShapedLine, SharedString, Style, TextAlign, TextRun,
-    Window, actions, div, fill, point, prelude::*, px, relative, rgba, size,
+    Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
 
-use crate::{theme::rgb, view::LoomView};
+use crate::{
+    theme::{rgb, selection},
+    view::LoomView,
+};
 
 actions!(
     loom_composer,
@@ -310,7 +313,7 @@ impl Element for TextInputElement {
                                     bounds.top() + line_height * (index + 1),
                                 ),
                             ),
-                            rgba(0x335b8def),
+                            selection(),
                         )
                     })
                 })

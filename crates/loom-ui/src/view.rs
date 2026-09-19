@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
     path::PathBuf,
-    sync::atomic::Ordering,
     time::Duration,
 };
 
@@ -53,10 +52,7 @@ use crate::{
         Backspace, Copy, Delete, End, Home, InputField, Left, LoomTooltip, Paste, Right, SelectAll,
         Submit, TextBufferState, TextInputElement,
     },
-    theme::{
-        CLIENT_DECORATION_SHADOW, ClientCorners, DARK_THEME_ACTIVE, change_color, resize_edge, rgb,
-        state_color,
-    },
+    theme::{CLIENT_DECORATION_SHADOW, ClientCorners, change_color, resize_edge, rgb, state_color},
 };
 #[cfg(target_family = "wasm")]
 use crate::{
@@ -350,7 +346,6 @@ pub(crate) struct LoomView {
     pub(crate) providers_open: bool,
     pub(crate) providers: Vec<ProviderSummary>,
     pub(crate) theme_choice: ThemeChoice,
-    pub(crate) dark_theme: bool,
     appearance_subscription: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
     pub(crate) timeline: Vec<TimelineItem>,
@@ -768,7 +763,6 @@ impl LoomView {
             providers_open: false,
             providers: Vec::new(),
             theme_choice: ThemeChoice::System,
-            dark_theme: true,
             appearance_subscription: None,
             after_sequence: None,
             timeline: Vec::new(),
@@ -891,7 +885,6 @@ impl LoomView {
             providers_open: false,
             providers: Vec::new(),
             theme_choice: ThemeChoice::System,
-            dark_theme: true,
             appearance_subscription: None,
             after_sequence: None,
             timeline: Vec::new(),
@@ -2518,12 +2511,12 @@ impl LoomView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dark_theme = matches!(
-            appearance,
-            WindowAppearance::Dark | WindowAppearance::VibrantDark
-        );
-        DARK_THEME_ACTIVE.store(self.dark_theme, Ordering::Relaxed);
+        #[cfg(not(target_family = "wasm"))]
+        if let Err(error) = crate::theme::apply_native_theme(cx) {
+            log::warn!("could not refresh the native theme: {error}");
+        }
         gpui_component::Theme::change(appearance, Some(window), cx);
+        crate::theme::sync_palette(cx);
         cx.notify();
     }
 
@@ -2979,16 +2972,8 @@ impl LoomView {
         index: usize,
         parent: &Entity<LoomView>,
     ) -> gpui::AnyElement {
-        let user_background = if self.dark_theme {
-            gpui::rgb(0x20242c)
-        } else {
-            gpui::rgb(0xdbeafe)
-        };
-        let user_foreground = if self.dark_theme {
-            gpui::rgb(0xdbeafe)
-        } else {
-            gpui::rgb(0x1e3a8a)
-        };
+        let user_background = rgb(0x20242c);
+        let user_foreground = rgb(0xdbeafe);
         match item {
             TimelineItem::User(text) => div()
                 .w_full()
@@ -3006,7 +2991,7 @@ impl LoomView {
                         .child(render_timeline_text(
                             format!("transcript-user-{index}"),
                             text.clone(),
-                            if self.dark_theme { 0xdbeafe } else { 0x1e3a8a },
+                            0xdbeafe,
                         )),
                 )
                 .into_any(),

@@ -96,7 +96,11 @@ fn main() {
         .run(move |cx: &mut App| {
             info!("initializing GPUI components");
             gpui_component::init(cx);
-            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            if let Err(error) = crate::theme::apply_native_theme(cx) {
+                log::warn!("could not load the native theme: {error}");
+                gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+                crate::theme::sync_palette(cx);
+            }
             bind_composer_keys(cx);
             let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
                 Ok(view) => view,
@@ -222,6 +226,7 @@ pub fn start() {
                     .expect("failed to load embedded font");
                 gpui_component::init(cx);
                 gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+                crate::theme::sync_palette(cx);
                 bind_composer_keys(cx);
                 cx.spawn(async move |cx| start_browser_client(cx).await)
                     .detach();

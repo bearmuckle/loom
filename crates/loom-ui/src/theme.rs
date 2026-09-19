@@ -1,8 +1,9 @@
-//! Window chrome, colour, and decoration helpers for the native shell.
+//! Theme integration and window decoration helpers.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::RefCell;
 
-use gpui::{Pixels, Point, ResizeEdge, Styled, Tiling, px};
+use gpui::{App, Pixels, Point, ResizeEdge, Rgba, Styled, Tiling, px};
+use gpui_component::Theme;
 use loom_core::AgentSessionState;
 
 pub(crate) const CLIENT_DECORATION_ROUNDING: Pixels = px(10.);
@@ -40,7 +41,123 @@ pub(crate) trait ClientCorners: Styled + Sized {
 
 impl<T: Styled + Sized> ClientCorners for T {}
 
-pub(crate) fn state_color(state: AgentSessionState) -> gpui::Rgba {
+#[derive(Clone, Copy)]
+struct ThemePalette {
+    background: Rgba,
+    surface: Rgba,
+    control: Rgba,
+    control_hover: Rgba,
+    active: Rgba,
+    border: Rgba,
+    border_strong: Rgba,
+    foreground: Rgba,
+    muted_foreground: Rgba,
+    accent: Rgba,
+    accent_hover: Rgba,
+    success: Rgba,
+    success_foreground: Rgba,
+    danger: Rgba,
+    danger_foreground: Rgba,
+    warning: Rgba,
+    warning_foreground: Rgba,
+    info: Rgba,
+    info_foreground: Rgba,
+    selection: Rgba,
+}
+
+impl ThemePalette {
+    fn from_theme(theme: &Theme) -> Self {
+        let colors = &theme.colors;
+        Self {
+            background: colors.background.into(),
+            surface: colors.sidebar.into(),
+            control: colors.secondary.into(),
+            control_hover: colors.secondary_hover.into(),
+            active: colors.list_active.into(),
+            border: colors.border.into(),
+            border_strong: colors.input.into(),
+            foreground: colors.foreground.into(),
+            muted_foreground: colors.muted_foreground.into(),
+            accent: colors.primary.into(),
+            accent_hover: colors.primary_hover.into(),
+            success: colors.success.into(),
+            success_foreground: colors.success_foreground.into(),
+            danger: colors.danger.into(),
+            danger_foreground: colors.danger_foreground.into(),
+            warning: colors.warning.into(),
+            warning_foreground: colors.warning_foreground.into(),
+            info: colors.info.into(),
+            info_foreground: colors.info_foreground.into(),
+            selection: colors.selection.into(),
+        }
+    }
+
+    fn color(self, value: u32) -> Rgba {
+        match value {
+            0x111318 | 0x10141b | 0x0f1115 => self.background,
+            0x14161a | 0x17191f | 0x171c25 => self.surface,
+            0x1b1d24 | 0x20242c => self.control,
+            0x202b3b | 0x25334a | 0x293244 => self.active,
+            0x293b56 => self.control_hover,
+            0x242833 | 0x30343f => self.border,
+            0x3b4555 | 0x3b5d85 => self.border_strong,
+            0xe5e7eb | 0xf3f4f6 | 0xcbd5e1 | 0xdbeafe | 0xffffff => self.foreground,
+            0x64748b | 0x8f98a6 | 0x94a3b8 | 0xb7c0d0 => self.muted_foreground,
+            0x93c5fd | 0xbfdbfe | 0x60a5fa | 0x2563eb => self.accent,
+            0x1d4ed8 => self.accent_hover,
+            0x9ad7bd | 0xd1fae5 | 0xbbf7d0 => self.success_foreground,
+            0x24543d | 0x064e3b => self.success,
+            0xfca5a5 | 0xfda4af | 0xfecaca | 0xfecdd3 => self.danger_foreground,
+            0x3a1f24 | 0x542936 | 0x7f1d1d => self.danger,
+            0xfef3c7 => self.warning_foreground,
+            0x493b1a => self.warning,
+            0xe9d5ff => self.info_foreground,
+            0x3b2f66 => self.info,
+            _ => gpui::rgb(value),
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_THEME: RefCell<Option<ThemePalette>> = const { RefCell::new(None) };
+}
+
+/// Synchronizes the app-local color helper with gpui-component's active theme.
+pub(crate) fn sync_palette(cx: &App) {
+    let palette = ThemePalette::from_theme(Theme::global(cx));
+    ACTIVE_THEME.with(|active| *active.borrow_mut() = Some(palette));
+}
+
+/// Resolves a legacy color role through the active native theme.
+///
+/// The numeric values are retained at call sites to keep the dense view code
+/// readable; they are aliases for semantic native-theme roles, not a second
+/// light/dark palette.
+pub(crate) fn rgb(value: u32) -> Rgba {
+    ACTIVE_THEME.with(|active| {
+        active
+            .borrow()
+            .map_or_else(|| gpui::rgb(value), |palette| palette.color(value))
+    })
+}
+
+pub(crate) fn selection() -> Rgba {
+    ACTIVE_THEME.with(|active| {
+        active
+            .borrow()
+            .map_or_else(|| gpui::rgba(0x335b8def), |palette| palette.selection)
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn apply_native_theme(cx: &mut App) -> native_theme_gpui::Result<()> {
+    let system = native_theme_gpui::SystemTheme::from_system()?;
+    native_theme_gpui::apply_system_theme(&system, cx);
+    sync_palette(cx);
+    Ok(())
+}
+
+pub(crate) fn state_color(state: AgentSessionState) -> Rgba {
     match state {
         AgentSessionState::Completed => rgb(0x9ad7bd),
         AgentSessionState::Failed | AgentSessionState::Cancelled => rgb(0xfca5a5),
@@ -50,49 +167,7 @@ pub(crate) fn state_color(state: AgentSessionState) -> gpui::Rgba {
     }
 }
 
-pub(crate) static DARK_THEME_ACTIVE: AtomicBool = AtomicBool::new(true);
-
-pub(crate) fn rgb(value: u32) -> gpui::Rgba {
-    let value = if DARK_THEME_ACTIVE.load(Ordering::Relaxed) {
-        value
-    } else {
-        match value {
-            0x111318 => 0xf8fafc,
-            0x14161a | 0x17191f => 0xf1f5f9,
-            0x1b1d24 | 0x20242c => 0xe2e8f0,
-            0x202b3b => 0xe5efff,
-            0x242833 => 0xcbd5e1,
-            0x293244 => 0xbfdbfe,
-            0x293b56 => 0xcfe1ff,
-            0x3b5d85 => 0x93c5fd,
-            0x25334a => 0xdbeafe,
-            0x30343f | 0x3b4555 => 0xcbd5e1,
-            0x10141b => 0xffffff,
-            0x0f1115 => 0xffffff,
-            0xe5e7eb | 0xf3f4f6 => 0x0f172a,
-            0xb7c0d0 | 0x8f98a6 | 0x94a3b8 => 0x475569,
-            0x93c5fd | 0xbfdbfe => 0x1d4ed8,
-            0x1d4ed8 => 0x1e40af,
-            0x1e293b | 0x1f4f78 => 0xdbeafe,
-            0x3a1f24 => 0xfee2e2,
-            0x3b2f66 => 0xf3e8ff,
-            0x493b1a => 0xfef3c7,
-            0x60a5fa => 0x2563eb,
-            0x7f1d1d => 0xfecaca,
-            0x9ad7bd => 0x047857,
-            0xfca5a5 => 0xb91c1c,
-            0xfda4af => 0x9f1239,
-            0xfef3c7 => 0x92400e,
-            0xcbd5e1 | 0xdbeafe => 0x1e3a8a,
-            0xd1fae5 => 0x065f46,
-            0xe9d5ff => 0x6b21a8,
-            _ => value,
-        }
-    };
-    gpui::rgb(value)
-}
-
-pub(crate) fn change_color(kind: loom_workspace::WorkspaceChangeKind) -> gpui::Rgba {
+pub(crate) fn change_color(kind: loom_workspace::WorkspaceChangeKind) -> Rgba {
     match kind {
         loom_workspace::WorkspaceChangeKind::Created => rgb(0x9ad7bd),
         loom_workspace::WorkspaceChangeKind::Deleted => rgb(0xfca5a5),
