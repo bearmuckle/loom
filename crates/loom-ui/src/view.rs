@@ -4223,7 +4223,7 @@ impl Render for LoomView {
             .child(TextSelectionLayer)
             .child(
                 div()
-                    .h(px(40.))
+                    .h(px(30.))
                     .w_full()
                     .px_3()
                     .flex()

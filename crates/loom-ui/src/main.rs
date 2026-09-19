@@ -99,7 +99,7 @@ fn main() {
             if let Err(error) = crate::theme::apply_native_theme(cx) {
                 log::warn!("could not load the native theme: {error}");
                 if let Err(error) =
-                    crate::theme::apply_preset_theme("catppuccin-mocha", WindowAppearance::Dark, cx)
+                    crate::theme::apply_preset_theme("catppuccin-latte", WindowAppearance::Dark, cx)
                 {
                     log::warn!("could not load the fallback theme: {error}");
                     gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
