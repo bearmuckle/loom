@@ -3589,6 +3589,10 @@ mod tests {
         let git = |arguments: &[&str]| {
             assert!(
                 Command::new("git")
+                    .env_remove("GIT_DIR")
+                    .env_remove("GIT_WORK_TREE")
+                    .env_remove("GIT_INDEX_FILE")
+                    .env_remove("GIT_COMMON_DIR")
                     .args(arguments)
                     .current_dir(&root)
                     .status()
