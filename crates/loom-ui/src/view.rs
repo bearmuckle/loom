@@ -2521,15 +2521,18 @@ impl LoomView {
     fn apply_appearance(
         &mut self,
         appearance: WindowAppearance,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        #[cfg(not(target_family = "wasm"))]
-        if let Err(error) = crate::theme::apply_native_theme(cx) {
-            log::warn!("could not refresh the native theme: {error}");
+        let preset = match appearance {
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => "catppuccin-mocha",
+            WindowAppearance::Light | WindowAppearance::VibrantLight => "catppuccin-latte",
+        };
+        if let Err(error) = crate::theme::apply_preset_theme(preset, appearance, cx) {
+            log::warn!("could not apply the default theme: {error}");
+            gpui_component::Theme::change(appearance, None, cx);
+            crate::theme::sync_palette(cx);
         }
-        gpui_component::Theme::change(appearance, Some(window), cx);
-        crate::theme::sync_palette(cx);
         cx.notify();
     }
 

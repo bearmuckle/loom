@@ -96,15 +96,12 @@ fn main() {
         .run(move |cx: &mut App| {
             info!("initializing GPUI components");
             gpui_component::init(cx);
-            if let Err(error) = crate::theme::apply_native_theme(cx) {
-                log::warn!("could not load the native theme: {error}");
-                if let Err(error) =
-                    crate::theme::apply_preset_theme("catppuccin-latte", WindowAppearance::Dark, cx)
-                {
-                    log::warn!("could not load the fallback theme: {error}");
-                    gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-                    crate::theme::sync_palette(cx);
-                }
+            if let Err(error) =
+                crate::theme::apply_preset_theme("catppuccin-mocha", WindowAppearance::Dark, cx)
+            {
+                log::warn!("could not load the default theme: {error}");
+                gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+                crate::theme::sync_palette(cx);
             }
             bind_composer_keys(cx);
             let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
@@ -148,6 +145,7 @@ fn main() {
             info!("Loom window opened");
             if let Err(error) = window.update(cx, |view, window, cx| {
                 view.observe_system_appearance(window, cx);
+                view.select_theme(crate::state::ThemeChoice::System, window, cx);
                 view.composer_focus_handle.focus(window, cx);
                 cx.activate(true);
             }) {

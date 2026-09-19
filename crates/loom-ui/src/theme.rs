@@ -55,13 +55,9 @@ struct ThemePalette {
     accent: Rgba,
     accent_hover: Rgba,
     success: Rgba,
-    success_foreground: Rgba,
     danger: Rgba,
-    danger_foreground: Rgba,
     warning: Rgba,
-    warning_foreground: Rgba,
     info: Rgba,
-    info_foreground: Rgba,
     selection: Rgba,
 }
 
@@ -81,13 +77,9 @@ impl ThemePalette {
             accent: colors.primary.into(),
             accent_hover: colors.primary_hover.into(),
             success: colors.success.into(),
-            success_foreground: colors.success_foreground.into(),
             danger: colors.danger.into(),
-            danger_foreground: colors.danger_foreground.into(),
             warning: colors.warning.into(),
-            warning_foreground: colors.warning_foreground.into(),
             info: colors.info.into(),
-            info_foreground: colors.info_foreground.into(),
             selection: colors.selection.into(),
         }
     }
@@ -105,13 +97,13 @@ impl ThemePalette {
             0x64748b | 0x8f98a6 | 0x94a3b8 | 0xb7c0d0 => self.muted_foreground,
             0x93c5fd | 0xbfdbfe | 0x60a5fa | 0x2563eb => self.accent,
             0x1d4ed8 => self.accent_hover,
-            0x9ad7bd | 0xd1fae5 | 0xbbf7d0 => self.success_foreground,
+            0x9ad7bd | 0xd1fae5 | 0xbbf7d0 => self.success,
             0x24543d | 0x064e3b => self.success,
-            0xfca5a5 | 0xfda4af | 0xfecaca | 0xfecdd3 => self.danger_foreground,
+            0xfca5a5 | 0xfda4af | 0xfecaca | 0xfecdd3 => self.danger,
             0x3a1f24 | 0x542936 | 0x7f1d1d => self.danger,
-            0xfef3c7 => self.warning_foreground,
+            0xfef3c7 => self.warning,
             0x493b1a => self.warning,
-            0xe9d5ff => self.info_foreground,
+            0xe9d5ff => self.info,
             0x3b2f66 => self.info,
             _ => gpui::rgb(value),
         }
@@ -149,20 +141,12 @@ pub(crate) fn selection() -> Rgba {
     })
 }
 
-#[cfg(not(target_family = "wasm"))]
-pub(crate) fn apply_native_theme(cx: &mut App) -> native_theme_gpui::Result<()> {
-    let system = native_theme_gpui::SystemTheme::from_system()?;
-    native_theme_gpui::apply_system_theme(&system, cx);
-    sync_palette(cx);
-    Ok(())
-}
-
 pub(crate) fn apply_preset_theme(
     name: &str,
     appearance: WindowAppearance,
     cx: &mut App,
 ) -> native_theme_gpui::Result<()> {
-    let prefs = native_theme_gpui::AccessibilityPreferences::from_system();
+    let prefs = native_theme_gpui::AccessibilityPreferences::default();
     let (light_theme, light_resolved) = native_theme_gpui::from_preset(name, false, &prefs)?;
     let (dark_theme, dark_resolved) = native_theme_gpui::from_preset(name, true, &prefs)?;
     native_theme_gpui::apply(light_theme, &light_resolved, &prefs, cx);
