@@ -72,10 +72,10 @@ fn github_copilot_credentials() -> Result<Arc<FileCredentialStore>> {
     let credentials = Arc::new(FileCredentialStore::open(
         FileCredentialStore::default_path(),
     )?);
-    if let Ok(token) = std::env::var("LOOM_GITHUB_TOKEN") {
-        if !token.trim().is_empty() {
-            credentials.insert(CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF), token)?;
-        }
+    if let Ok(token) = std::env::var("LOOM_GITHUB_TOKEN")
+        && !token.trim().is_empty()
+    {
+        credentials.insert(CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF), token)?;
     }
     Ok(credentials)
 }
@@ -1393,10 +1393,10 @@ impl InProcessConnection {
 
     pub fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
         let request_id = request.request_id;
-        if let Some(auth) = &self.auth {
-            if let Err(error) = auth.verify() {
-                return ResponseEnvelope::failure(request_id, error);
-            }
+        if let Some(auth) = &self.auth
+            && let Err(error) = auth.verify()
+        {
+            return ResponseEnvelope::failure(request_id, error);
         }
         if !request
             .protocol_version
@@ -1507,14 +1507,14 @@ impl InProcessConnection {
             .negotiated_capabilities()?
             .clone()
             .ok_or_else(|| LoomError::invalid_request("connection must negotiate first"))?;
-        if let Some(required) = request.required_capability() {
-            if !capabilities.contains(required) {
-                return Err(LoomError::new(
-                    ErrorCode::CapabilityDenied,
-                    format!("connection did not negotiate capability {required:?}"),
-                    false,
-                ));
-            }
+        if let Some(required) = request.required_capability()
+            && !capabilities.contains(required)
+        {
+            return Err(LoomError::new(
+                ErrorCode::CapabilityDenied,
+                format!("connection did not negotiate capability {required:?}"),
+                false,
+            ));
         }
 
         match request {
@@ -3660,23 +3660,23 @@ mod tests {
                 project_id,
                 task_id,
             }));
-            if let Ok(ServerResponse::Task(snapshot)) = current.result {
-                if matches!(
+            if let Ok(ServerResponse::Task(snapshot)) = current.result
+                && matches!(
                     snapshot.status,
                     TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
-                ) {
-                    let evidence =
-                        connection.request(RequestEnvelope::new(ClientRequest::GetTaskEvidence {
-                            project_id,
-                            task_id,
-                        }));
-                    assert!(matches!(
-                        evidence.result,
-                        Ok(ServerResponse::TaskEvidence { .. })
-                    ));
-                    fs::remove_dir_all(root).unwrap();
-                    return;
-                }
+                )
+            {
+                let evidence =
+                    connection.request(RequestEnvelope::new(ClientRequest::GetTaskEvidence {
+                        project_id,
+                        task_id,
+                    }));
+                assert!(matches!(
+                    evidence.result,
+                    Ok(ServerResponse::TaskEvidence { .. })
+                ));
+                fs::remove_dir_all(root).unwrap();
+                return;
             }
             thread::sleep(Duration::from_millis(10));
         }

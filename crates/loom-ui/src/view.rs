@@ -4,7 +4,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
     path::PathBuf,
-    sync::atomic::Ordering,
     time::Duration,
 };
 
@@ -53,10 +52,7 @@ use crate::{
         Backspace, Copy, Delete, End, Home, InputField, Left, LoomTooltip, Paste, Right, SelectAll,
         Submit, TextBufferState, TextInputElement,
     },
-    theme::{
-        CLIENT_DECORATION_SHADOW, ClientCorners, DARK_THEME_ACTIVE, change_color, resize_edge, rgb,
-        state_color,
-    },
+    theme::{CLIENT_DECORATION_SHADOW, ClientCorners, change_color, resize_edge, rgb, state_color},
 };
 #[cfg(target_family = "wasm")]
 use crate::{
@@ -350,7 +346,6 @@ pub(crate) struct LoomView {
     pub(crate) providers_open: bool,
     pub(crate) providers: Vec<ProviderSummary>,
     pub(crate) theme_choice: ThemeChoice,
-    pub(crate) dark_theme: bool,
     appearance_subscription: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
     pub(crate) timeline: Vec<TimelineItem>,
@@ -768,7 +763,6 @@ impl LoomView {
             providers_open: false,
             providers: Vec::new(),
             theme_choice: ThemeChoice::System,
-            dark_theme: true,
             appearance_subscription: None,
             after_sequence: None,
             timeline: Vec::new(),
@@ -891,7 +885,6 @@ impl LoomView {
             providers_open: false,
             providers: Vec::new(),
             theme_choice: ThemeChoice::System,
-            dark_theme: true,
             appearance_subscription: None,
             after_sequence: None,
             timeline: Vec::new(),
@@ -2479,6 +2472,18 @@ impl LoomView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let ThemeChoice::Preset(name, _) = theme {
+            let appearance = window.appearance();
+            cx.set_window_appearance(Some(appearance));
+            if let Err(error) = crate::theme::apply_preset_theme(name, appearance, cx) {
+                self.record_status(format!("could not load theme: {error}"));
+                return;
+            }
+            self.theme_choice = theme;
+            cx.notify();
+            return;
+        }
+
         self.theme_choice = theme;
         let appearance = match theme {
             ThemeChoice::System => {
@@ -2493,6 +2498,7 @@ impl LoomView {
                 cx.set_window_appearance(Some(WindowAppearance::Dark));
                 WindowAppearance::Dark
             }
+            ThemeChoice::Preset(_, _) => unreachable!("preset themes return early"),
         };
         self.apply_appearance(appearance, window, cx);
     }
@@ -2515,15 +2521,18 @@ impl LoomView {
     fn apply_appearance(
         &mut self,
         appearance: WindowAppearance,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dark_theme = matches!(
-            appearance,
-            WindowAppearance::Dark | WindowAppearance::VibrantDark
-        );
-        DARK_THEME_ACTIVE.store(self.dark_theme, Ordering::Relaxed);
-        gpui_component::Theme::change(appearance, Some(window), cx);
+        let preset = match appearance {
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => "catppuccin-mocha",
+            WindowAppearance::Light | WindowAppearance::VibrantLight => "catppuccin-latte",
+        };
+        if let Err(error) = crate::theme::apply_preset_theme(preset, appearance, cx) {
+            log::warn!("could not apply the default theme: {error}");
+            gpui_component::Theme::change(appearance, None, cx);
+            crate::theme::sync_palette(cx);
+        }
         cx.notify();
     }
 
@@ -2979,16 +2988,8 @@ impl LoomView {
         index: usize,
         parent: &Entity<LoomView>,
     ) -> gpui::AnyElement {
-        let user_background = if self.dark_theme {
-            gpui::rgb(0x20242c)
-        } else {
-            gpui::rgb(0xdbeafe)
-        };
-        let user_foreground = if self.dark_theme {
-            gpui::rgb(0xdbeafe)
-        } else {
-            gpui::rgb(0x1e3a8a)
-        };
+        let user_background = rgb(0x20242c);
+        let user_foreground = rgb(0xdbeafe);
         match item {
             TimelineItem::User(text) => div()
                 .w_full()
@@ -3006,7 +3007,7 @@ impl LoomView {
                         .child(render_timeline_text(
                             format!("transcript-user-{index}"),
                             text.clone(),
-                            if self.dark_theme { 0xdbeafe } else { 0x1e3a8a },
+                            0xdbeafe,
                         )),
                 )
                 .into_any(),
@@ -3978,39 +3979,35 @@ impl LoomView {
                     .child("THEME"),
             )
             .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .gap_1()
-                    .children(
-                        ThemeChoice::ALL
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, choice)| {
-                                let selected = choice == self.theme_choice;
-                                div()
-                                    .id(("theme-choice", index))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(if selected {
-                                        rgb(0x293244)
-                                    } else {
-                                        rgb(0x20242c)
-                                    })
-                                    .text_xs()
-                                    .text_color(if selected {
-                                        rgb(0xf3f4f6)
-                                    } else {
-                                        rgb(0xb7c0d0)
-                                    })
-                                    .cursor_pointer()
-                                    .child(choice.label())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select_theme(choice, window, cx);
-                                    }))
-                            }),
-                    ),
+                div().mt_2().flex().flex_wrap().gap_1().children(
+                    ThemeChoice::ALL
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, choice)| {
+                            let selected = choice == self.theme_choice;
+                            div()
+                                .id(("theme-choice", index))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(if selected {
+                                    rgb(0x293244)
+                                } else {
+                                    rgb(0x20242c)
+                                })
+                                .text_xs()
+                                .text_color(if selected {
+                                    rgb(0xf3f4f6)
+                                } else {
+                                    rgb(0xb7c0d0)
+                                })
+                                .cursor_pointer()
+                                .child(choice.label())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.select_theme(choice, window, cx);
+                                }))
+                        }),
+                ),
             )
             .child(div().mt_2().child(body))
             .into_any()
@@ -4229,7 +4226,7 @@ impl Render for LoomView {
             .child(TextSelectionLayer)
             .child(
                 div()
-                    .h(px(40.))
+                    .h(px(30.))
                     .w_full()
                     .px_3()
                     .flex()
@@ -4305,8 +4302,10 @@ impl Render for LoomView {
                                         .justify_center()
                                         .rounded_sm()
                                         .text_sm()
-                                        .text_color(rgb(0xfca5a5))
-                                        .hover(|style| style.bg(rgb(0x7f1d1d)))
+                                        .text_color(rgb(0xb7c0d0))
+                                        .hover(|style| {
+                                            style.bg(rgb(0x7f1d1d)).text_color(rgb(0xffffff))
+                                        })
                                         .cursor_pointer()
                                         .tooltip(|_, cx| {
                                             cx.new(|_| LoomTooltip {

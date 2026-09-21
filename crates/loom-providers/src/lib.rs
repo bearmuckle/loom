@@ -2202,12 +2202,12 @@ impl StreamDecoder {
                 }
             }
         }
-        if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str) {
-            if !text.is_empty() {
-                return sink.emit(ModelStreamEvent::TextDelta {
-                    text: text.to_owned(),
-                });
-            }
+        if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str)
+            && !text.is_empty()
+        {
+            return sink.emit(ModelStreamEvent::TextDelta {
+                text: text.to_owned(),
+            });
         }
         Ok(StreamFlow::Continue)
     }
@@ -2303,10 +2303,10 @@ impl StreamDecoder {
                 return Ok(());
             }
         }
-        if let Some(usage) = self.usage {
-            if sink.emit(ModelStreamEvent::Usage { usage })? == StreamFlow::Stop {
-                return Ok(());
-            }
+        if let Some(usage) = self.usage
+            && sink.emit(ModelStreamEvent::Usage { usage })? == StreamFlow::Stop
+        {
+            return Ok(());
         }
         let reason = self.finish_reason.unwrap_or(if saw_tool_call {
             FinishReason::ToolCall
@@ -2715,12 +2715,12 @@ pub fn normalize_openai_response(body: &serde_json::Value) -> Result<Vec<ModelSt
         )
     })?;
     let mut events = Vec::new();
-    if let Some(content) = message.get("content").and_then(serde_json::Value::as_str) {
-        if !content.is_empty() {
-            events.push(ModelStreamEvent::TextDelta {
-                text: content.to_owned(),
-            });
-        }
+    if let Some(content) = message.get("content").and_then(serde_json::Value::as_str)
+        && !content.is_empty()
+    {
+        events.push(ModelStreamEvent::TextDelta {
+            text: content.to_owned(),
+        });
     }
     if let Some(tool_calls) = message
         .get("tool_calls")

@@ -25,7 +25,7 @@ should be interchangeable views of the same durable backend session.
 
 ## Build and run
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.95 or newer.
 
 ```text
 cargo build

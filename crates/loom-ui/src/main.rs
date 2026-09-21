@@ -22,8 +22,8 @@ use crate::{browser::BrowserOptions, view::LoomView};
 use gpui::{App, KeyBinding, prelude::*};
 #[cfg(not(target_family = "wasm"))]
 use gpui::{
-    Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowOptions, point, px, size,
+    Bounds, TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowOptions, point, px, size,
 };
 use log::{error, info};
 
@@ -96,7 +96,13 @@ fn main() {
         .run(move |cx: &mut App| {
             info!("initializing GPUI components");
             gpui_component::init(cx);
-            gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+            if let Err(error) =
+                crate::theme::apply_preset_theme("catppuccin-mocha", WindowAppearance::Dark, cx)
+            {
+                log::warn!("could not load the default theme: {error}");
+                gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+                crate::theme::sync_palette(cx);
+            }
             bind_composer_keys(cx);
             let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
                 Ok(view) => view,
@@ -139,6 +145,7 @@ fn main() {
             info!("Loom window opened");
             if let Err(error) = window.update(cx, |view, window, cx| {
                 view.observe_system_appearance(window, cx);
+                view.select_theme(crate::state::ThemeChoice::System, window, cx);
                 view.composer_focus_handle.focus(window, cx);
                 cx.activate(true);
             }) {
@@ -222,6 +229,7 @@ pub fn start() {
                     .expect("failed to load embedded font");
                 gpui_component::init(cx);
                 gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+                crate::theme::sync_palette(cx);
                 bind_composer_keys(cx);
                 cx.spawn(async move |cx| start_browser_client(cx).await)
                     .detach();
