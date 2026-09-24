@@ -18,6 +18,8 @@ mod state;
 mod text_input;
 mod theme;
 mod view;
+#[cfg(not(target_family = "wasm"))]
+mod zed_git;
 
 #[cfg(target_family = "wasm")]
 use crate::{browser::BrowserOptions, view::LoomView};
@@ -27,6 +29,7 @@ use gpui_kit::{
     Bounds, TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowDecorations, WindowOptions, point, px, size,
 };
+#[cfg(not(target_family = "wasm"))]
 use log::{error, info};
 
 use crate::connection::describe_startup_connection_error;
@@ -52,6 +55,7 @@ fn init_logging() {
 
 pub(crate) const MAX_TIMELINE_OUTPUT: usize = 32 * 1024;
 pub(crate) const MAX_REVIEW_CHANGES: usize = 80;
+#[cfg(target_family = "wasm")]
 pub(crate) const MAX_REVIEW_DIFF: usize = 48 * 1024;
 
 /// Registers the composer's key bindings. Shared by native `main` and the
@@ -103,7 +107,7 @@ fn main() {
             gpui_kit::init(cx);
             crate::theme::apply_theme(WindowAppearance::Dark, cx);
             bind_composer_keys(cx);
-            let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
+            let mut view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
                 Ok(view) => view,
                 Err(error) => {
                     error!(
@@ -117,6 +121,22 @@ fn main() {
                     return;
                 }
             };
+            if options.remote.is_some() {
+                view.set_zed_git_error(
+                    "The Zed Git workspace is available only for local workspaces.".to_owned(),
+                );
+            } else {
+                match zed_git::ZedGitHost::initialize(&view.workspace_root, cx) {
+                    Ok(host) => view.set_zed_git_host(host),
+                    Err(error) => {
+                        error!("could not initialize Zed Git UI: {error}");
+                        view.set_zed_git_error(
+                            "The Zed Git workspace could not access this local workspace."
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
             info!("Loom view initialized");
 
             let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
@@ -138,7 +158,12 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| view),
+                |window, cx| {
+                    cx.new(|view_cx| {
+                        view.mount_zed_git(window, view_cx);
+                        view
+                    })
+                },
             ) {
                 Ok(window) => window,
                 Err(error) => {

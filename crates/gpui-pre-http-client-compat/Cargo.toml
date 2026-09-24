@@ -1,0 +1,15 @@
+[package]
+name = "gpui-pre-http-client"
+version = "0.3.6"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "http_client"
+
+[features]
+test-support = ["zed_http_client/test-support"]
+
+[dependencies]
+zed_http_client.workspace = true

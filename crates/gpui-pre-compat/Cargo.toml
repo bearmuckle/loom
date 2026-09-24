@@ -1,0 +1,27 @@
+[package]
+name = "gpui-pre"
+version = "0.3.6"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "gpui"
+
+[features]
+default = ["font-kit", "wayland", "x11", "windows-manifest"]
+bench = ["bench-support"]
+bench-support = ["profiler", "zed_gpui/bench-support"]
+font-kit = ["zed_gpui/font-kit"]
+inspector = ["zed_gpui/inspector"]
+leak-detection = ["zed_gpui/leak-detection"]
+profiler = ["zed_gpui/profiler"]
+screen-capture = ["zed_gpui/screen-capture"]
+stacker = ["zed_gpui/stacker"]
+test-support = ["zed_gpui/test-support"]
+wayland = ["zed_gpui/wayland"]
+windows-manifest = ["zed_gpui/windows-manifest"]
+x11 = ["zed_gpui/x11"]
+
+[dependencies]
+zed_gpui = { package = "gpui", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6", default-features = false }

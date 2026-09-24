@@ -6,9 +6,11 @@
 use std::collections::BTreeSet;
 
 use loom_core::{AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError};
+#[cfg(target_family = "wasm")]
+use loom_protocol::WorkspaceFile;
 use loom_protocol::{
     AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitRepositoryStatus,
-    WorkspaceChange, WorkspaceFile,
+    WorkspaceChange,
 };
 
 use crate::{MAX_TIMELINE_OUTPUT, text_input::TextBufferState};
@@ -73,9 +75,11 @@ pub(crate) struct ReviewState {
     pub(crate) panel: ReviewPanel,
     pub(crate) changes: Vec<WorkspaceChange>,
     pub(crate) diff: Option<GitDiff>,
-    pub(crate) diff_path: Option<String>,
     pub(crate) vcs: Option<GitRepositoryStatus>,
     pub(crate) evidence: Vec<String>,
+    #[cfg(target_family = "wasm")]
+    pub(crate) diff_path: Option<String>,
+    #[cfg(target_family = "wasm")]
     pub(crate) selected_file: Option<WorkspaceFile>,
 }
 
@@ -105,9 +109,11 @@ impl Default for ReviewState {
             panel: ReviewPanel::Changes,
             changes: Vec::new(),
             diff: None,
-            diff_path: None,
             vcs: None,
             evidence: Vec::new(),
+            #[cfg(target_family = "wasm")]
+            diff_path: None,
+            #[cfg(target_family = "wasm")]
             selected_file: None,
         }
     }

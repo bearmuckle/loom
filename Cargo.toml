@@ -13,6 +13,8 @@ members = [
     "crates/loom-context",
     "crates/loom-persistence",
     "crates/loom-server",
+    "crates/gpui-pre-compat",
+    "crates/gpui-pre-http-client-compat",
     "crates/loom-cli",
     "crates/loom-ui",
 ]
@@ -59,6 +61,23 @@ portable-pty = "0.9.0"
 subtle = "2.6.1"
 tiktoken-rs = "0.12.0"
 gpui-kit = "0.6.6"
+gpui = { git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6", default-features = false }
+zed_client = { package = "client", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_component = { package = "component", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_editor = { package = "editor", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_fs = { package = "fs", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_http_client = { package = "http_client", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_language = { package = "language", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_language_model = { package = "language_model", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_languages = { package = "languages", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6", features = ["load-grammars"] }
+zed_node_runtime = { package = "node_runtime", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_project = { package = "project", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_session = { package = "session", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6", features = ["test-support"] }
+zed_settings = { package = "settings", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_theme = { package = "theme", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_theme_settings = { package = "theme_settings", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
+zed_util = { package = "util", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6", features = ["debug-embed"] }
+zed_workspace = { package = "workspace", git = "https://github.com/zed-industries/zed", rev = "bcf6582ce3500df93a8a39366640173e6786cea6" }
 open = "5.4.4"
 ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
 uuid = { version = "1.26.1", features = ["serde", "v4"] }
@@ -83,7 +102,7 @@ web-sys = { version = "0.3.105", features = [
 ] }
 getrandom = { version = "0.4.3", features = ["wasm_js"] }
 futures-channel = "0.3.34"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
 ignore = "0.4.33"
 globset = "0.4.20"
 scraper = "0.24.0"
@@ -95,3 +114,8 @@ keyring = { version = "3.6.3", default-features = false, features = [
     "sync-secret-service",
     "crypto-rust",
 ] }
+
+[patch.crates-io]
+gpui-pre = { path = "crates/gpui-pre-compat" }
+gpui-pre-http-client = { path = "crates/gpui-pre-http-client-compat" }
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }

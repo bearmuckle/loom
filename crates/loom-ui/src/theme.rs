@@ -159,11 +159,12 @@ pub(crate) fn state_color(state: AgentSessionState) -> Rgba {
     }
 }
 
+#[cfg(target_family = "wasm")]
 pub(crate) fn change_color(kind: loom_workspace::WorkspaceChangeKind) -> Rgba {
     match kind {
         loom_workspace::WorkspaceChangeKind::Created => rgb(0x9ad7bd),
-        loom_workspace::WorkspaceChangeKind::Deleted => rgb(0xfca5a5),
         loom_workspace::WorkspaceChangeKind::Modified => rgb(0xfef3c7),
+        loom_workspace::WorkspaceChangeKind::Deleted => rgb(0xfca5a5),
     }
 }
 

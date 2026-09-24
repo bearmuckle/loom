@@ -38,8 +38,10 @@ use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, G
 #[cfg(not(target_family = "wasm"))]
 use loom_server::InProcessBackend;
 
+#[cfg(target_family = "wasm")]
+use crate::MAX_REVIEW_DIFF;
 use crate::{
-    MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
+    MAX_REVIEW_CHANGES,
     connection::{
         BackendWorker, ClientConnection, ConnectionCleanupGuard, list_models_from_backend,
         redact_secret, select_remote_project, unexpected_response,
@@ -55,7 +57,7 @@ use crate::{
     },
     theme::{
         CLIENT_DECORATION_SHADOW, ClientCorners, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
-        ERROR_CARD_SURFACE, change_color, resize_edge, rgb, state_color,
+        ERROR_CARD_SURFACE, resize_edge, rgb, state_color,
     },
 };
 #[cfg(target_family = "wasm")]
@@ -78,7 +80,13 @@ use crate::{
         stable_project_id,
     },
 };
+#[cfg(not(target_family = "wasm"))]
 use log::info;
+#[cfg(not(target_family = "wasm"))]
+use zed_workspace::Workspace as ZedWorkspace;
+
+#[cfg(not(target_family = "wasm"))]
+use crate::zed_git::ZedGitHost;
 
 type ModelSelectState = SelectState<SearchableVec<String>>;
 
@@ -398,14 +406,6 @@ fn run_state_label(state: Option<AgentRunState>) -> &'static str {
     }
 }
 
-fn change_kind_label(kind: loom_workspace::WorkspaceChangeKind) -> &'static str {
-    match kind {
-        loom_workspace::WorkspaceChangeKind::Created => "New",
-        loom_workspace::WorkspaceChangeKind::Deleted => "Removed",
-        loom_workspace::WorkspaceChangeKind::Modified => "Updated",
-    }
-}
-
 fn activity_marker(status: AgentActivityStatus) -> &'static str {
     match status {
         AgentActivityStatus::Started => "›",
@@ -414,6 +414,15 @@ fn activity_marker(status: AgentActivityStatus) -> &'static str {
         AgentActivityStatus::AwaitingApproval => "!",
         AgentActivityStatus::AwaitingInput => "?",
         AgentActivityStatus::Cancelled => "–",
+    }
+}
+
+#[cfg(target_family = "wasm")]
+fn change_kind_label(kind: loom_workspace::WorkspaceChangeKind) -> &'static str {
+    match kind {
+        loom_workspace::WorkspaceChangeKind::Created => "Added",
+        loom_workspace::WorkspaceChangeKind::Modified => "Modified",
+        loom_workspace::WorkspaceChangeKind::Deleted => "Deleted",
     }
 }
 
@@ -944,6 +953,12 @@ pub(crate) struct LoomView {
     workspace_config: WorkspaceConfig,
     pub(crate) node_input: TextBufferState,
     pub(crate) run_poll_scheduled: bool,
+    #[cfg(not(target_family = "wasm"))]
+    zed_git_host: Option<ZedGitHost>,
+    #[cfg(not(target_family = "wasm"))]
+    zed_git_workspace: Option<Entity<ZedWorkspace>>,
+    #[cfg(not(target_family = "wasm"))]
+    zed_git_error: Option<String>,
 }
 
 struct TimelineView {
@@ -1051,6 +1066,105 @@ impl Render for TimelineView {
 }
 
 impl LoomView {
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn set_zed_git_host(&mut self, host: ZedGitHost) {
+        self.zed_git_host = Some(host);
+        self.zed_git_error = None;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn set_zed_git_error(&mut self, error: String) {
+        self.zed_git_error = Some(error);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn mount_zed_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = self.zed_git_host.take() else {
+            return;
+        };
+
+        let worktree_task = host.project.update(cx, |project, cx| {
+            project.create_worktree(&host.workspace_root, true, cx)
+        });
+        let app_state = host.app_state;
+        let project = host.project;
+        let view = cx.entity().downgrade();
+
+        cx.spawn_in(window, async move |_, cx| {
+            if let Err(error) = worktree_task.await {
+                log::error!("could not open workspace in Zed Git UI: {error:#}");
+                if let Err(update_error) = view.update_in(cx, |view, _, cx| {
+                    view.zed_git_error =
+                        Some("The Zed Git workspace could not scan this directory.".to_owned());
+                    cx.notify();
+                }) {
+                    log::debug!(
+                        "could not update the Loom view after Zed Git workspace scan failure: {update_error}"
+                    );
+                }
+                return;
+            }
+
+            let view_handle = view.clone();
+            if let Err(error) = view.update_in(cx, move |view, window, cx| {
+                let workspace = cx.new(|workspace_cx| {
+                    ZedWorkspace::new(None, project, app_state, window, workspace_cx)
+                });
+                view.zed_git_workspace = Some(workspace.clone());
+                cx.notify();
+
+                let workspace_handle = workspace.downgrade();
+                let view_handle = view_handle.clone();
+                cx.spawn_in(
+                    window,
+                    async move |_, cx| match git_ui::git_panel::GitPanel::load(
+                        workspace_handle.clone(),
+                        cx.clone(),
+                    )
+                    .await
+                    {
+                        Ok(panel) => {
+                            if let Err(error) =
+                                workspace_handle.update_in(cx, |workspace, window, cx| {
+                                    workspace.add_panel(panel, window, cx);
+                                    workspace.open_panel::<git_ui::git_panel::GitPanel>(window, cx);
+                                })
+                            {
+                                log::error!("could not mount Zed Git panel: {error}");
+                                if let Err(update_error) = view_handle.update_in(cx, |view, _, cx| {
+                                        view.zed_git_error = Some(
+                                            "The Zed Git panel could not be mounted.".to_owned(),
+                                        );
+                                        cx.notify();
+                                    }) {
+                                    log::debug!(
+                                        "could not update the Loom view after mounting the Zed Git panel failed: {update_error}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("could not load Zed Git panel: {error:#}");
+                            if let Err(update_error) = view_handle.update_in(cx, |view, _, cx| {
+                                    view.zed_git_error =
+                                        Some("The Zed Git panel could not be loaded.".to_owned());
+                                    cx.notify();
+                                }) {
+                                log::debug!(
+                                    "could not update the Loom view after loading the Zed Git panel failed: {update_error}"
+                                );
+                            }
+                        }
+                    },
+                )
+                .detach();
+            }) {
+                log::error!("could not create Zed Git workspace view: {error}");
+            }
+        })
+        .detach();
+    }
+
     pub(crate) fn input_state(&self, field: InputField) -> Option<&TextBufferState> {
         match field {
             InputField::Composer => Some(&self.composer),
@@ -1413,6 +1527,12 @@ impl LoomView {
             workspace_config,
             node_input: TextBufferState::new(""),
             run_poll_scheduled: false,
+            #[cfg(not(target_family = "wasm"))]
+            zed_git_host: None,
+            #[cfg(not(target_family = "wasm"))]
+            zed_git_workspace: None,
+            #[cfg(not(target_family = "wasm"))]
+            zed_git_error: None,
         };
         view.refresh_models();
         view.refresh_sessions()?;
@@ -1732,6 +1852,11 @@ impl LoomView {
         self.apply_models(models);
     }
 
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn refresh_models_async(&mut self, cx: &mut Context<Self>) {
+        self.refresh_models_for_node_async(self.default_backend_node_id.clone(), cx);
+    }
+
     fn refresh_models_for_node_async(&mut self, node_id: String, cx: &mut Context<Self>) {
         let Some(backend) = self.node_backends.get(&node_id).cloned() else {
             self.record_backend_error(
@@ -1997,10 +2122,13 @@ impl LoomView {
             .cloned()
             .unwrap_or_else(|| self.default_model.clone());
         self.reset_projection();
-        self.review.selected_file = None;
+        #[cfg(target_family = "wasm")]
+        {
+            self.review.selected_file = None;
+            self.review.diff_path = None;
+        }
         self.review.changes.clear();
         self.review.diff = None;
-        self.review.diff_path = None;
         self.review.evidence.clear();
         self.tasks.clear();
     }
@@ -4623,6 +4751,7 @@ impl LoomView {
         cx.notify();
     }
 
+    #[cfg(target_family = "wasm")]
     pub(crate) fn open_review_file(&mut self, path: String, cx: &mut Context<Self>) {
         self.dispatch(
             cx,
@@ -5284,7 +5413,7 @@ impl LoomView {
 
     pub(crate) fn render_review(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = match self.review.panel {
-            ReviewPanel::Changes => "Changed files",
+            ReviewPanel::Changes => "Git",
             ReviewPanel::Diff => "Diff",
             ReviewPanel::Evidence => "Evidence",
         };
@@ -5298,66 +5427,85 @@ impl LoomView {
             .p_2();
         match self.review.panel {
             ReviewPanel::Changes => {
-                if self.review.changes.is_empty() {
-                    body = body.child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8f98a6))
-                            .child("No workspace changes recorded"),
-                    );
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    if let Some(workspace) = &self.zed_git_workspace {
+                        body =
+                            body.child(div().flex_1().min_h_0().w_full().child(workspace.clone()));
+                    } else {
+                        body = body.child(
+                            div().text_sm().text_color(rgb(0x8f98a6)).child(
+                                self.zed_git_error
+                                    .as_deref()
+                                    .unwrap_or("Loading the Zed Git workspace...")
+                                    .to_owned(),
+                            ),
+                        );
+                    }
                 }
-                for (index, change) in self.review.changes.iter().take(24).enumerate() {
-                    let path = change.path.clone();
-                    body = body.child(
-                        div()
-                            .id(("review-file", index))
-                            .text_sm()
-                            .text_color(change_color(change.kind))
-                            .cursor_pointer()
-                            .child(format!(
-                                "{}  {}",
-                                change_kind_label(change.kind),
-                                change.path
-                            ))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_review_file(path.clone(), cx);
-                                cx.notify();
-                            })),
-                    );
-                }
-                if let Some(status) = &self.review.vcs {
-                    for (index, file) in status.files.iter().take(24).enumerate() {
-                        let path = file.path.clone();
+                #[cfg(target_family = "wasm")]
+                {
+                    if self.review.changes.is_empty() {
                         body = body.child(
                             div()
-                                .id(("git-file", index))
                                 .text_sm()
-                                .text_color(rgb(0xfef3c7))
+                                .text_color(rgb(0x8f98a6))
+                                .child("No workspace changes recorded"),
+                        );
+                    }
+                    for (index, change) in self.review.changes.iter().take(24).enumerate() {
+                        let path = change.path.clone();
+                        body = body.child(
+                            div()
+                                .id(("review-file", index))
+                                .text_sm()
+                                .text_color(crate::theme::change_color(change.kind))
                                 .cursor_pointer()
-                                .child(format!("Git · {:?}  {}", file.worktree, file.path))
+                                .child(format!(
+                                    "{}  {}",
+                                    change_kind_label(change.kind),
+                                    change.path
+                                ))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_review_file(path.clone(), cx);
                                     cx.notify();
                                 })),
                         );
                     }
-                }
-                if let Some(file) = &self.review.selected_file {
-                    body = body.child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(rgb(0x93c5fd))
-                            .child(format!("READ-ONLY FILE  {}", file.path)),
-                    );
-                    body = body.child(
-                        div()
-                            .p_2()
-                            .bg(rgb(0x0f1115))
-                            .text_xs()
-                            .text_color(rgb(0xcbd5e1))
-                            .child(file.content.clone()),
-                    );
+                    if let Some(status) = &self.review.vcs {
+                        for (index, file) in status.files.iter().take(24).enumerate() {
+                            let path = file.path.clone();
+                            body = body.child(
+                                div()
+                                    .id(("git-file", index))
+                                    .text_sm()
+                                    .text_color(rgb(0xfef3c7))
+                                    .cursor_pointer()
+                                    .child(format!("Git · {:?}  {}", file.worktree, file.path))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_review_file(path.clone(), cx);
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                    }
+                    if let Some(file) = &self.review.selected_file {
+                        body = body.child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(0x93c5fd))
+                                .child(format!("READ-ONLY FILE  {}", file.path)),
+                        );
+                        body = body.child(
+                            div()
+                                .p_2()
+                                .bg(rgb(0x0f1115))
+                                .text_xs()
+                                .text_color(rgb(0xcbd5e1))
+                                .child(file.content.clone()),
+                        );
+                    }
                 }
             }
             ReviewPanel::Diff => {
@@ -5459,7 +5607,7 @@ impl LoomView {
             }
         }
         div()
-            .w(px(340.))
+            .w(px(700.))
             .h_full()
             .flex()
             .flex_col()
