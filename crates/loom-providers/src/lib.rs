@@ -65,6 +65,14 @@ impl From<String> for CredentialRef {
 
 pub trait CredentialStore: Send + Sync {
     fn resolve(&self, reference: &CredentialRef) -> Result<String>;
+
+    fn store(&self, _reference: &CredentialRef, _secret: String) -> Result<()> {
+        Err(LoomError::new(
+            ErrorCode::InvalidState,
+            "credential store does not support updates",
+            false,
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -214,6 +222,10 @@ impl CredentialStore for FileCredentialStore {
             )
         })
     }
+
+    fn store(&self, reference: &CredentialRef, secret: String) -> Result<()> {
+        self.insert(reference.clone(), secret)
+    }
 }
 
 fn credential_store_error(path: &Path, error: impl fmt::Display) -> LoomError {
@@ -292,6 +304,20 @@ impl CredentialStore for InMemoryCredentialStore {
                     false,
                 )
             })
+    }
+
+    fn store(&self, reference: &CredentialRef, secret: String) -> Result<()> {
+        self.values
+            .lock()
+            .map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    "credential store lock was poisoned",
+                    true,
+                )
+            })?
+            .insert(reference.as_str().to_owned(), secret);
+        Ok(())
     }
 }
 
@@ -640,6 +666,17 @@ impl ProviderRegistry {
     }
 
     pub fn register_github_copilot(&self, credential: impl Into<CredentialRef>) -> Result<()> {
+        self.register(ProviderConfig::github_copilot(credential))
+    }
+
+    pub fn configure_github_copilot(&self, access_token: String) -> Result<()> {
+        if access_token.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "GitHub Copilot access token must not be empty",
+            ));
+        }
+        let credential = CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF);
+        self.credentials.store(&credential, access_token)?;
         self.register(ProviderConfig::github_copilot(credential))
     }
 
@@ -3176,7 +3213,9 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("loom-credentials-test-{}.json", std::process::id()));
         let store = FileCredentialStore::open(&path).unwrap();
-        store.insert("test", "secret-value").unwrap();
+        store
+            .store(&CredentialRef::new("test"), "secret-value".to_owned())
+            .unwrap();
         assert_eq!(
             store.resolve(&CredentialRef::new("test")).unwrap(),
             "secret-value"

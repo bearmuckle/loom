@@ -54,6 +54,26 @@ pub(crate) fn redact_secret(value: &str, secret: &str) -> String {
         .replace(&encoded.to_ascii_lowercase(), "[redacted]")
 }
 
+fn remote_url_is_secure_for_secrets(url: &str) -> bool {
+    if url.starts_with("wss://") {
+        return true;
+    }
+    let Some(authority) = url
+        .strip_prefix("ws://")
+        .map(|url| url.split(['/', '?', '#']).next().unwrap_or_default())
+    else {
+        return false;
+    };
+    let host = if let Some(bracketed_host) = authority.strip_prefix('[') {
+        bracketed_host.split(']').next().unwrap_or_default()
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _)| host)
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 pub(crate) fn describe_startup_connection_error(error: &LoomError, secret: &str) -> String {
     match error.code {
         ErrorCode::AuthenticationFailed
@@ -106,6 +126,7 @@ pub(crate) enum ClientConnection {
     Remote {
         runtime: Arc<tokio::runtime::Runtime>,
         connection: Arc<Mutex<WebSocketConnection>>,
+        secure_for_secrets: bool,
     },
     #[cfg(target_family = "wasm")]
     Browser(BrowserConnection),
@@ -140,6 +161,7 @@ impl Drop for ConnectionCleanupGuard {
 impl ClientConnection {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn remote(url: String, token: String) -> Result<Self, LoomError> {
+        let secure_for_secrets = remote_url_is_secure_for_secrets(&url);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -170,6 +192,7 @@ impl ClientConnection {
         Ok(Self::Remote {
             runtime: Arc::new(runtime),
             connection: Arc::new(Mutex::new(connection)),
+            secure_for_secrets,
         })
     }
 
@@ -186,6 +209,7 @@ impl ClientConnection {
                 Self::Remote {
                     runtime,
                     connection,
+                    ..
                 } => {
                     let mut connection = connection.lock().map_err(|_| {
                         LoomError::new(
@@ -203,6 +227,19 @@ impl ClientConnection {
             match self {
                 Self::Browser(connection) => connection.close(),
             }
+        }
+    }
+
+    pub(crate) fn secure_for_secrets(&self) -> bool {
+        match self {
+            #[cfg(not(target_family = "wasm"))]
+            Self::InProcess(_) => true,
+            #[cfg(not(target_family = "wasm"))]
+            Self::Remote {
+                secure_for_secrets, ..
+            } => *secure_for_secrets,
+            #[cfg(target_family = "wasm")]
+            Self::Browser(_) => false,
         }
     }
 
@@ -251,6 +288,7 @@ impl ClientConnection {
             Self::Remote {
                 runtime,
                 connection,
+                ..
             } => {
                 let result = connection
                     .lock()
@@ -306,6 +344,7 @@ pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> 
                 Capability::ResumeAgentRun,
                 Capability::ApproveAgentAction,
                 Capability::ListProviders,
+                Capability::ConfigureProviders,
                 Capability::ConfigureApprovalPolicy,
                 Capability::OpenWorkspace,
                 Capability::ReadWorkspace,
@@ -341,6 +380,7 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::ResumeAgentRun,
         Capability::ApproveAgentAction,
         Capability::ListProviders,
+        Capability::ConfigureProviders,
         Capability::ConfigureApprovalPolicy,
         Capability::OpenWorkspace,
         Capability::ReadWorkspace,
@@ -814,6 +854,7 @@ pub(crate) struct BackendWorker {
     jobs: Sender<Job>,
     #[cfg(target_family = "wasm")]
     connection: ClientConnection,
+    secure_for_secrets: bool,
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -825,6 +866,7 @@ struct Job {
 impl BackendWorker {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn spawn(connection: ClientConnection) -> Self {
+        let secure_for_secrets = connection.secure_for_secrets();
         let (jobs, incoming) = mpsc::channel::<Job>();
         thread::spawn(move || {
             while let Ok(job) = incoming.recv() {
@@ -834,12 +876,23 @@ impl BackendWorker {
                 let _ = job.reply.send(response);
             }
         });
-        Self { jobs }
+        Self {
+            jobs,
+            secure_for_secrets,
+        }
     }
 
     #[cfg(target_family = "wasm")]
     pub(crate) fn spawn(connection: ClientConnection) -> Self {
-        Self { connection }
+        let secure_for_secrets = connection.secure_for_secrets();
+        Self {
+            connection,
+            secure_for_secrets,
+        }
+    }
+
+    pub(crate) fn secure_for_secrets(&self) -> bool {
+        self.secure_for_secrets
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -879,12 +932,24 @@ impl BackendWorker {
 
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::{ClientConnection, LoomError, negotiate, worker_node_status};
+    use super::{
+        ClientConnection, LoomError, negotiate, remote_url_is_secure_for_secrets,
+        worker_node_status,
+    };
     use loom_core::ErrorCode;
     use loom_server::{
         AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn provider_secrets_require_tls_or_loopback_transport() {
+        assert!(remote_url_is_secure_for_secrets("wss://worker.example/ws"));
+        assert!(remote_url_is_secure_for_secrets("ws://localhost:8080/ws"));
+        assert!(remote_url_is_secure_for_secrets("ws://127.0.0.1:8080/ws"));
+        assert!(remote_url_is_secure_for_secrets("ws://[::1]:8080/ws"));
+        assert!(!remote_url_is_secure_for_secrets("ws://worker.example/ws"));
+    }
 
     #[gpui_kit::test]
     async fn native_remote_connection_works_on_the_gpui_background_executor(

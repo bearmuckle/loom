@@ -18,6 +18,7 @@ pub enum Capability {
     RetryFromCheckpoint,
     ApproveAgentAction,
     ListProviders,
+    ConfigureProviders,
     ReadProviderHealth,
     ReadUsage,
     InspectContext,

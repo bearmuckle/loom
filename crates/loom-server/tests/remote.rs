@@ -29,7 +29,9 @@ fn capabilities() -> CapabilitySet {
         Capability::ReadAgentRun,
         Capability::ControlAgentRun,
         Capability::ApproveAgentAction,
+        Capability::ListProviders,
         Capability::OpenWorkspace,
+        Capability::ConfigureProviders,
         Capability::ReadWorkspace,
         Capability::WriteWorkspace,
         Capability::ReadWorkspaceInstructions,
@@ -205,6 +207,76 @@ async fn authorized_client_can_discover_and_revoke_access() {
     assert_eq!(
         response.result.unwrap_err().code,
         ErrorCode::AuthenticationFailed
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn authorized_client_can_configure_copilot_on_remote_worker() {
+    let (_backend, _auth, token, server) = server().await;
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut connection).await;
+
+    let response = connection
+        .request(RequestEnvelope::new(
+            ClientRequest::ConfigureGitHubCopilot {
+                access_token: "github-device-flow-token".to_owned(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.result,
+        Ok(ServerResponse::ProviderConfigured)
+    ));
+
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::ListProviders))
+        .await
+        .unwrap();
+    let Ok(ServerResponse::Providers { providers }) = response.result else {
+        panic!("unexpected provider response: {:?}", response.result);
+    };
+    assert!(
+        providers
+            .iter()
+            .any(|provider| provider.kind == loom_model::ProviderKind::GitHubCopilot)
+    );
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn provider_configuration_requires_its_dedicated_capability() {
+    let (_backend, auth, _token, server) = server().await;
+    let token = auth
+        .insert(
+            "provider-read-only-token",
+            AuthorizationScope {
+                capabilities: Some(CapabilitySet::new([Capability::ListProviders])),
+                ..AuthorizationScope::default()
+            },
+        )
+        .unwrap();
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut connection).await;
+
+    let response = connection
+        .request(RequestEnvelope::new(
+            ClientRequest::ConfigureGitHubCopilot {
+                access_token: "github-device-flow-token".to_owned(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.result.unwrap_err().code,
+        ErrorCode::AuthorizationDenied
     );
     server.stop().await.unwrap();
 }
