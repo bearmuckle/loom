@@ -17,7 +17,9 @@ use loom_protocol::{
     RequestEnvelope, ResponseEnvelope, decode_event, decode_response, encode_request,
 };
 use wasm_bindgen::{JsCast, prelude::*};
-use web_sys::{CloseEvent, MessageEvent, UrlSearchParams, WebSocket};
+use web_sys::{CloseEvent, MessageEvent, Storage, UrlSearchParams, WebSocket};
+
+const SAVED_CONNECTION_KEY: &str = "loom.bootstrap_connection";
 
 /// Configuration read from the page's URL query string.
 ///
@@ -36,9 +38,28 @@ impl BrowserOptions {
         let search = window.location().search().unwrap_or_default();
         let params = UrlSearchParams::new_with_str(&search)
             .map_err(|_| LoomError::invalid_request("could not parse the page's query string"))?;
+        let query_remote = params.get("remote").unwrap_or_default();
+        let query_token = params.get("token").unwrap_or_default();
+        let (saved_remote, saved_token) = if query_remote.is_empty() || query_token.is_empty() {
+            saved_connection(&browser_storage()?)?
+        } else {
+            (None, None)
+        };
+        let reuse_saved_token =
+            query_remote.is_empty() || saved_remote.as_deref() == Some(query_remote.as_str());
         Ok(Self {
-            remote: params.get("remote").unwrap_or_default(),
-            token: params.get("token").unwrap_or_default(),
+            remote: if query_remote.is_empty() {
+                saved_remote.unwrap_or_default()
+            } else {
+                query_remote
+            },
+            token: if query_token.is_empty() && reuse_saved_token {
+                saved_token.unwrap_or_default()
+            } else if query_token.is_empty() {
+                String::new()
+            } else {
+                query_token
+            },
             workspace: params.get("workspace"),
             model: params.get("model").map(ModelId::new),
         })
@@ -82,6 +103,92 @@ impl BrowserOptions {
         }
         Ok(())
     }
+
+    pub(crate) fn persist_connection(&self) -> Result<(), LoomError> {
+        let storage = browser_storage()?;
+        let value = serde_json::json!({
+            "remote": self.remote,
+            "token": self.token,
+        });
+        let serialized = serde_json::to_string(&value).map_err(|error| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                format!("could not encode the bootstrap worker config: {error}"),
+                false,
+            )
+        })?;
+        storage
+            .set_item(SAVED_CONNECTION_KEY, &serialized)
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    format!(
+                        "could not save the bootstrap worker config in browser storage: {}",
+                        describe_js(&error)
+                    ),
+                    false,
+                )
+            })
+    }
+}
+
+fn saved_connection(storage: &Storage) -> Result<(Option<String>, Option<String>), LoomError> {
+    let serialized = storage.get_item(SAVED_CONNECTION_KEY).map_err(|error| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            format!(
+                "could not read the saved bootstrap worker config: {}",
+                describe_js(&error)
+            ),
+            false,
+        )
+    })?;
+    let Some(serialized) = serialized else {
+        return Ok((None, None));
+    };
+    let value: serde_json::Value = serde_json::from_str(&serialized).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("saved bootstrap worker config is malformed: {error}"),
+            false,
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "saved bootstrap worker config must be a JSON object",
+            false,
+        )
+    })?;
+    let remote = object
+        .get("remote")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let token = object
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Ok((remote, token))
+}
+
+fn browser_storage() -> Result<Storage, LoomError> {
+    web_sys::window()
+        .ok_or_else(|| LoomError::invalid_request("no browser window is available"))?
+        .local_storage()
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                format!("could not access browser storage: {}", describe_js(&error)),
+                false,
+            )
+        })?
+        .ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "browser local storage is unavailable",
+                false,
+            )
+        })
 }
 
 /// Appends the bearer token as a query parameter, since a browser
@@ -106,6 +213,7 @@ fn fail_all(state: &Rc<RefCell<SocketState>>, reason: &str) {
     let mut state = state.borrow_mut();
     state.ready = false;
     state.closed = Some(reason.to_owned());
+    state.outbox.clear();
     for (request_id, sender) in state.pending.drain() {
         let _ = sender.send(ResponseEnvelope::failure(
             request_id,
@@ -129,13 +237,10 @@ pub(crate) struct BrowserConnection {
 
 impl BrowserConnection {
     pub(crate) fn connect(remote: &str, token: &str) -> Result<Self, LoomError> {
-        let socket = WebSocket::new(&websocket_url(remote, token)).map_err(|error| {
+        let socket = WebSocket::new(&websocket_url(remote, token)).map_err(|_| {
             LoomError::new(
-                ErrorCode::Internal,
-                format!(
-                    "could not open a WebSocket to '{remote}': {}",
-                    describe_js(&error)
-                ),
+                ErrorCode::InvalidRequest,
+                "could not open a worker WebSocket; check the ws:// or wss:// URL and path",
                 false,
             )
         })?;
@@ -260,6 +365,30 @@ impl BrowserConnection {
                     "the browser connection closed before answering",
                     true,
                 ),
+            )
+        })
+    }
+
+    pub(crate) fn close(&self) -> Result<(), LoomError> {
+        let state = self.state.borrow_mut();
+        state.socket.set_onopen(None);
+        state.socket.set_onmessage(None);
+        state.socket.set_onerror(None);
+        state.socket.set_onclose(None);
+        let result = state.socket.close();
+        drop(state);
+        fail_all(
+            &self.state,
+            "the browser connection was closed by the client",
+        );
+        result.map_err(|error| {
+            LoomError::new(
+                ErrorCode::RequestCancelled,
+                format!(
+                    "could not close the browser connection: {}",
+                    describe_js(&error)
+                ),
+                true,
             )
         })
     }

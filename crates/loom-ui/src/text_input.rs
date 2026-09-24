@@ -207,7 +207,13 @@ impl Render for LoomTooltip {
             .border_color(rgb(0x3b4555))
             .text_sm()
             .text_color(rgb(0xe5e7eb))
-            .child(self.text.clone())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(self.text.split('\n').map(|line| line.to_owned())),
+            )
     }
 }
 

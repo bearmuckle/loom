@@ -3,6 +3,39 @@ use std::collections::BTreeMap;
 use loom_core::{AgentSessionId, CheckpointId, EventSequence, ProjectId, Timestamp};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceConfig {
+    /// Monotonically increasing per-project version used to ignore stale
+    /// config updates arriving after newer node-membership changes.
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub worker_nodes: Vec<WorkerNodeConfig>,
+    /// CPU usage above which session-card node indicators begin pulsing.
+    #[serde(default = "default_cpu_pulse_threshold_percent")]
+    pub cpu_pulse_threshold_percent: u8,
+}
+
+const fn default_cpu_pulse_threshold_percent() -> u8 {
+    5
+}
+
+impl Default for WorkspaceConfig {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            worker_nodes: Vec::new(),
+            cpu_pulse_threshold_percent: default_cpu_pulse_threshold_percent(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerNodeConfig {
+    /// WebSocket endpoint only. Access tokens are never part of distributed workspace config.
+    pub url: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceEntryKind {

@@ -21,6 +21,9 @@ log.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["test-support"] }
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 env_logger.workspace = true
 open.workspace = true
@@ -31,6 +34,7 @@ loom-server.workspace = true
 loom-vcs.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+keyring.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 console_log.workspace = true

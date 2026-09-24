@@ -193,6 +193,36 @@ GetWorkspaceChanges / ReadWorkspaceFile / GetVcsDiff
 ListTasks / GetTask / GetTaskEvidence
 ```
 
+Worker-node management adds project-scoped `GetWorkspaceConfig` and
+`SetWorkspaceConfig` requests. The persisted config contains a revision,
+worker WebSocket URLs, and a CPU pulse threshold for session-card node
+indicators (default 5%); credentials, workspace files, and session state are
+not included. Connected peers receive the updated config when nodes join or
+are removed. Sessions remain owned by the node that created them; config
+distribution does not migrate sessions.
+
+The UI aggregates sessions from connected nodes and offers a node choice when
+creating a session on a multi-node setup, defaulting to the startup backend.
+Session and run requests are sent to the recorded owner. If that node becomes
+unavailable or is removed, the session remains pinned there and is never
+silently moved to another backend.
+
+`GetWorkerNodeStatus` reports CPU utilization and RAM usage as integer
+percentages when available. CPU utilization is sampled by the host system
+monitor between status requests (rather than inferred from CPU count or load
+average); the first sample and unsupported measurements are unavailable.
+Memory usage is calculated from total memory minus the operating system's
+available memory. Each backend instance uses a UUID node ID that remains
+stable for that instance, and its display name includes the host name plus a
+short ID suffix so separate backend processes on one host remain distinguishable.
+Clients should render unavailable values as `n/a`.
+
+Session-card indicators pulse smoothly only while CPU usage is above the
+workspace-configured threshold. The online color changes to red only after
+three consecutive 10-second status polls report both CPU and RAM above 90%;
+either metric at or below 90%, unavailable metrics, or a failed poll resets
+the severe-load streak.
+
 The existing M1-M4 mutations remain the control surface:
 
 ```text

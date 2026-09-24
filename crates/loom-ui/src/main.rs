@@ -29,6 +29,9 @@ use gpui_kit::{
 };
 use log::{error, info};
 
+use crate::connection::describe_startup_connection_error;
+#[cfg(target_family = "wasm")]
+use crate::connection::redact_secret;
 use crate::text_input::{
     Backspace, Copy, Delete, End, Home, Left, Paste, Right, SelectAll, Submit,
 };
@@ -103,7 +106,13 @@ fn main() {
             let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
                 Ok(view) => view,
                 Err(error) => {
-                    error!("could not initialize Loom UI: {error}");
+                    error!(
+                        "could not initialize Loom UI: {}",
+                        describe_startup_connection_error(
+                            &error,
+                            options.token.as_deref().unwrap_or_default()
+                        )
+                    );
                     cx.quit();
                     return;
                 }
@@ -140,6 +149,7 @@ fn main() {
             };
             info!("Loom window opened");
             if let Err(error) = window.update(cx, |view, window, cx| {
+                view.reconnect_configured_worker_nodes(cx);
                 view.observe_system_appearance(window, cx);
                 view.select_theme(crate::state::ThemeChoice::System, window, cx);
                 view.composer_focus_handle.focus(window, cx);
@@ -181,7 +191,10 @@ async fn start_browser_client(cx: &mut gpui_kit::AsyncApp) {
         Err(error) => return log_error("could not read startup options", error),
     };
     if let Err(error) = options.connect_interactively() {
-        return log_error("could not connect to a worker", error);
+        return log_error(
+            "could not connect to a worker",
+            redact_secret(&error.to_string(), options.token()),
+        );
     }
     let (composer_focus_handle, rename_focus_handle) =
         cx.update(|cx| (cx.focus_handle(), cx.focus_handle()));
@@ -189,7 +202,12 @@ async fn start_browser_client(cx: &mut gpui_kit::AsyncApp) {
         .await
     {
         Ok(view) => view,
-        Err(error) => return log_error("could not connect to the backend", error),
+        Err(error) => {
+            return log_error(
+                "could not connect to the backend",
+                describe_startup_connection_error(&error, options.token()),
+            );
+        }
     };
     let active_session = view.active_session.clone();
     let window = match cx.open_window(Default::default(), |_, cx| cx.new(|_| view)) {

@@ -16,6 +16,7 @@ use std::{
     path::Path,
     sync::mpsc::{self, Sender},
     thread,
+    time::Duration,
 };
 
 use futures_channel::oneshot;
@@ -29,13 +30,73 @@ use loom_model::ProviderId;
 use loom_protocol::AgentRunSnapshot;
 use loom_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientRequest, ProjectSnapshot, RequestEnvelope, ResponseEnvelope,
-    ServerResponse, WorkerNodeStatus,
+    ServerResponse, WorkerNodeStatus, WorkspaceConfig,
 };
+#[cfg(target_family = "wasm")]
+use std::task::Poll;
+
+pub(crate) fn redact_secret(value: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return value.to_owned();
+    }
+    let mut encoded = String::new();
+    for byte in secret.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    value
+        .replace(secret, "[redacted]")
+        .replace(&encoded, "[redacted]")
+        .replace(&encoded.to_ascii_lowercase(), "[redacted]")
+}
+
+pub(crate) fn describe_startup_connection_error(error: &LoomError, secret: &str) -> String {
+    match error.code {
+        ErrorCode::AuthenticationFailed
+        | ErrorCode::AuthenticationRequired
+        | ErrorCode::AuthorizationDenied => {
+            "worker authentication was denied; verify the access token and worker authentication configuration".to_owned()
+        }
+        ErrorCode::InvalidRequest
+            if error
+                .message
+                .to_ascii_lowercase()
+                .contains("bearer token") =>
+        {
+            "worker access token contains unsupported characters; verify the token value".to_owned()
+        }
+        ErrorCode::InvalidRequest => {
+            "invalid worker WebSocket URL; use a ws:// or wss:// URL with the correct endpoint path".to_owned()
+        }
+        ErrorCode::DeadlineExceeded => {
+            "worker connection timed out; check that it is reachable and retry".to_owned()
+        }
+        ErrorCode::ProviderUnavailable
+            if error.message.to_ascii_lowercase().contains("refused") =>
+        {
+            "connection refused; check that the worker is running and the URL and port are correct".to_owned()
+        }
+        ErrorCode::UnsupportedProtocol | ErrorCode::UnsupportedCapability => {
+            "worker protocol negotiation failed; update the worker and UI to compatible versions".to_owned()
+        }
+        ErrorCode::RequestCancelled => {
+            "worker closed the connection during startup; check the URL, worker availability, and access token".to_owned()
+        }
+        _ => redact_secret(&error.to_string(), secret),
+    }
+}
+
 #[cfg(not(target_family = "wasm"))]
 use loom_server::{InProcessConnection, WebSocketConnection, WebSocketTransport};
 
 #[cfg(target_family = "wasm")]
 use crate::browser::BrowserConnection;
+#[cfg(target_family = "wasm")]
+use wasm_bindgen::{JsCast, closure::Closure};
 
 #[derive(Clone)]
 pub(crate) enum ClientConnection {
@@ -48,6 +109,32 @@ pub(crate) enum ClientConnection {
     },
     #[cfg(target_family = "wasm")]
     Browser(BrowserConnection),
+}
+
+pub(crate) struct ConnectionCleanupGuard {
+    connection: ClientConnection,
+    armed: bool,
+}
+
+impl ConnectionCleanupGuard {
+    pub(crate) fn new(connection: ClientConnection) -> Self {
+        Self {
+            connection,
+            armed: true,
+        }
+    }
+
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ConnectionCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed && self.connection.close().is_err() {
+            log::warn!("failed to close a partially initialized worker transport");
+        }
+    }
 }
 
 impl ClientConnection {
@@ -63,7 +150,23 @@ impl ClientConnection {
                     false,
                 )
             })?;
-        let connection = runtime.block_on(WebSocketTransport::new(&url, &token).connect())?;
+        let connection = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                WebSocketTransport::new(&url, &token).connect(),
+            )
+            .await
+        });
+        let connection = match connection {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(LoomError::new(
+                    ErrorCode::DeadlineExceeded,
+                    "worker connection timed out",
+                    true,
+                ));
+            }
+        };
         Ok(Self::Remote {
             runtime: Arc::new(runtime),
             connection: Arc::new(Mutex::new(connection)),
@@ -73,6 +176,34 @@ impl ClientConnection {
     #[cfg(target_family = "wasm")]
     pub(crate) fn browser(url: &str, token: &str) -> Result<Self, LoomError> {
         Ok(Self::Browser(BrowserConnection::connect(url, token)?))
+    }
+
+    pub(crate) fn close(&self) -> Result<(), LoomError> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            match self {
+                Self::InProcess(_) => Ok(()),
+                Self::Remote {
+                    runtime,
+                    connection,
+                } => {
+                    let mut connection = connection.lock().map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "remote connection lock was poisoned",
+                            true,
+                        )
+                    })?;
+                    runtime.block_on(connection.close())
+                }
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            match self {
+                Self::Browser(connection) => connection.close(),
+            }
+        }
     }
 
     /// Sends a request and blocks the calling thread for its response.
@@ -108,6 +239,45 @@ impl ClientConnection {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn request_with_timeout(
+        &self,
+        request: RequestEnvelope,
+        timeout: Duration,
+    ) -> ResponseEnvelope {
+        let request_id = request.request_id;
+        match self {
+            Self::InProcess(connection) => connection.request(request),
+            Self::Remote {
+                runtime,
+                connection,
+            } => {
+                let result = connection
+                    .lock()
+                    .map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "remote connection lock was poisoned",
+                            true,
+                        )
+                    })
+                    .and_then(|mut connection| {
+                        runtime.block_on(async {
+                            match tokio::time::timeout(timeout, connection.request(request)).await {
+                                Ok(result) => result,
+                                Err(_) => Err(LoomError::new(
+                                    ErrorCode::DeadlineExceeded,
+                                    "worker request timed out",
+                                    true,
+                                )),
+                            }
+                        })
+                    });
+                result.unwrap_or_else(|error| ResponseEnvelope::failure(request_id, error))
+            }
+        }
+    }
+
     /// Sends a request and awaits its response. Only used in the browser,
     /// where nothing can block the page's single JS thread; the WebSocket
     /// transport resolves this asynchronously as frames arrive.
@@ -121,33 +291,36 @@ impl ClientConnection {
 
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-        client_version: CURRENT_PROTOCOL_VERSION,
-        capabilities: CapabilitySet::new([
-            Capability::CreateAgentSession,
-            Capability::ReadAgentSession,
-            Capability::ControlAgentSession,
-            Capability::SubscribeSessionEvents,
-            Capability::StartAgentRun,
-            Capability::ReadAgentRun,
-            Capability::ControlAgentRun,
-            Capability::PauseAgentRun,
-            Capability::ResumeAgentRun,
-            Capability::ApproveAgentAction,
-            Capability::ListProviders,
-            Capability::ConfigureApprovalPolicy,
-            Capability::OpenWorkspace,
-            Capability::ReadWorkspace,
-            Capability::ReadVcsStatus,
-            Capability::ReadVcsDiff,
-            Capability::ReadTask,
-            Capability::StartTask,
-            Capability::ControlTask,
-            Capability::ReadTaskEvidence,
-            Capability::ReadWorkerNodeStatus,
-            Capability::JsonProtocol,
-        ]),
-    }));
+    let response = connection.request_with_timeout(
+        RequestEnvelope::new(ClientRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities: CapabilitySet::new([
+                Capability::CreateAgentSession,
+                Capability::ReadAgentSession,
+                Capability::ControlAgentSession,
+                Capability::SubscribeSessionEvents,
+                Capability::StartAgentRun,
+                Capability::ReadAgentRun,
+                Capability::ControlAgentRun,
+                Capability::PauseAgentRun,
+                Capability::ResumeAgentRun,
+                Capability::ApproveAgentAction,
+                Capability::ListProviders,
+                Capability::ConfigureApprovalPolicy,
+                Capability::OpenWorkspace,
+                Capability::ReadWorkspace,
+                Capability::ReadVcsStatus,
+                Capability::ReadVcsDiff,
+                Capability::ReadTask,
+                Capability::StartTask,
+                Capability::ControlTask,
+                Capability::ReadTaskEvidence,
+                Capability::ReadWorkerNodeStatus,
+                Capability::JsonProtocol,
+            ]),
+        }),
+        Duration::from_secs(15),
+    );
     match response.result? {
         ServerResponse::Negotiated(_) => Ok(()),
         response => Err(unexpected_response("negotiation", response)),
@@ -186,7 +359,10 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
 pub(crate) fn worker_node_status(
     connection: &ClientConnection,
 ) -> Result<WorkerNodeStatus, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus));
+    let response = connection.request_with_timeout(
+        RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus),
+        Duration::from_secs(15),
+    );
     match response.result? {
         ServerResponse::WorkerNodeStatus(status) => Ok(status),
         response => Err(unexpected_response("worker node status", response)),
@@ -197,9 +373,11 @@ pub(crate) fn worker_node_status(
 pub(crate) async fn worker_node_status_async(
     connection: &ClientConnection,
 ) -> Result<WorkerNodeStatus, LoomError> {
-    let response = connection
-        .request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus))
-        .await;
+    let response = request_with_timeout(
+        connection,
+        RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus),
+    )
+    .await?;
     match response.result? {
         ServerResponse::WorkerNodeStatus(status) => Ok(status),
         response => Err(unexpected_response("worker node status", response)),
@@ -207,13 +385,130 @@ pub(crate) async fn worker_node_status_async(
 }
 
 #[cfg(target_family = "wasm")]
-pub(crate) async fn negotiate_async(connection: &ClientConnection) -> Result<(), LoomError> {
+async fn request_with_timeout(
+    connection: &ClientConnection,
+    request: RequestEnvelope,
+) -> Result<ResponseEnvelope, LoomError> {
+    let request = Box::pin(connection.request(request));
+    let (timeout_sender, timeout_receiver) = oneshot::channel::<()>();
+    let timeout_callback = Closure::once(move || {
+        let _ = timeout_sender.send(());
+    });
+    let window = web_sys::window().ok_or_else(|| {
+        LoomError::new(
+            ErrorCode::Internal,
+            "could not schedule a browser worker-request timeout",
+            false,
+        )
+    })?;
+    window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            timeout_callback.as_ref().unchecked_ref(),
+            15_000,
+        )
+        .map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "could not schedule a browser worker-request timeout",
+                false,
+            )
+        })?;
+    timeout_callback.forget();
+    let mut request = request;
+    let mut timeout_receiver = Box::pin(timeout_receiver);
+    let result = std::future::poll_fn(|cx| {
+        if let Poll::Ready(response) = request.as_mut().poll(cx) {
+            return Poll::Ready(Some(response));
+        }
+        if timeout_receiver.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
+        Poll::Pending
+    })
+    .await;
+    result.ok_or_else(|| {
+        LoomError::new(
+            ErrorCode::DeadlineExceeded,
+            "worker request timed out",
+            true,
+        )
+    })
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn workspace_config(
+    connection: &ClientConnection,
+    project_id: ProjectId,
+) -> Result<WorkspaceConfig, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceConfig {
+        project_id,
+    }));
+    match response.result? {
+        ServerResponse::WorkspaceConfig(config) => Ok(config),
+        response => Err(unexpected_response("workspace config", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn workspace_config_async(
+    connection: &ClientConnection,
+    project_id: ProjectId,
+) -> Result<WorkspaceConfig, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: negotiation_capabilities(),
+        .request(RequestEnvelope::new(ClientRequest::GetWorkspaceConfig {
+            project_id,
         }))
         .await;
+    match response.result? {
+        ServerResponse::WorkspaceConfig(config) => Ok(config),
+        response => Err(unexpected_response("workspace config", response)),
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn set_workspace_config(
+    connection: &ClientConnection,
+    project_id: ProjectId,
+    config: WorkspaceConfig,
+) -> Result<(), LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
+        project_id,
+        config,
+    }));
+    match response.result? {
+        ServerResponse::WorkspaceConfigUpdated => Ok(()),
+        response => Err(unexpected_response("workspace config update", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn set_workspace_config_async(
+    connection: &ClientConnection,
+    project_id: ProjectId,
+    config: WorkspaceConfig,
+) -> Result<(), LoomError> {
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
+            project_id,
+            config,
+        }))
+        .await;
+    match response.result? {
+        ServerResponse::WorkspaceConfigUpdated => Ok(()),
+        response => Err(unexpected_response("workspace config update", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn negotiate_async(connection: &ClientConnection) -> Result<(), LoomError> {
+    let response = request_with_timeout(
+        connection,
+        RequestEnvelope::new(ClientRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities: negotiation_capabilities(),
+        }),
+    )
+    .await?;
     match response.result? {
         ServerResponse::Negotiated(_) => Ok(()),
         response => Err(unexpected_response("negotiation", response)),
@@ -391,6 +686,42 @@ pub(crate) async fn list_models_async(
     }
 }
 
+pub(crate) async fn list_models_from_backend(
+    backend: &BackendWorker,
+) -> Result<Vec<ModelId>, LoomError> {
+    let response = backend
+        .submit(RequestEnvelope::new(ClientRequest::ListProviders))
+        .wait()
+        .await;
+    let providers = match response.result? {
+        ServerResponse::Providers { providers } => providers,
+        response => return Err(unexpected_response("provider list", response)),
+    };
+    let mut models = providers
+        .iter()
+        .flat_map(|provider| provider.models.iter().map(|model| model.id.clone()))
+        .collect::<Vec<_>>();
+    for provider in providers {
+        let response = backend
+            .submit(RequestEnvelope::new(
+                ClientRequest::DiscoverProviderModels {
+                    provider_id: provider.id.clone(),
+                },
+            ))
+            .wait()
+            .await;
+        match response.result? {
+            ServerResponse::Models { models: discovered } => {
+                models.extend(discovered.into_iter().map(|model| model.id))
+            }
+            response => return Err(unexpected_response("model list", response)),
+        }
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn list_provider_ids(
     connection: &ClientConnection,
@@ -543,5 +874,65 @@ impl BackendWorker {
             request_id,
             reply: receiver,
         }
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use super::{ClientConnection, LoomError, negotiate, worker_node_status};
+    use loom_core::ErrorCode;
+    use loom_server::{
+        AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
+    };
+    use std::sync::Arc;
+
+    #[gpui_kit::test]
+    async fn native_remote_connection_works_on_the_gpui_background_executor(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test server runtime should start");
+        let backend = InProcessBackend::new();
+        let auth = Arc::new(AuthTokenStore::new());
+        let token = auth
+            .insert("gpui-background-test", AuthorizationScope::all())
+            .expect("test credential should be issued");
+        let server = runtime
+            .block_on(
+                RemoteServer::new(backend, auth, RemoteServerConfig::local_ephemeral()).bind(),
+            )
+            .expect("test server should bind");
+        let url = server.websocket_url().to_owned();
+
+        let invalid_url = cx
+            .background_executor
+            .spawn(async {
+                ClientConnection::remote("not a websocket URL".to_owned(), "test-token".to_owned())
+            })
+            .await;
+        assert!(matches!(
+            invalid_url,
+            Err(error) if error.code == ErrorCode::InvalidRequest
+        ));
+
+        let connected_status = cx
+            .background_executor
+            .spawn(async move {
+                let connection = ClientConnection::remote(url, token.token)?;
+                negotiate(&connection)?;
+                let status = worker_node_status(&connection)?;
+                connection.close()?;
+                Ok::<_, LoomError>(status)
+            })
+            .await
+            .expect("remote connect, negotiation, and status should succeed");
+        assert!(connected_status.online);
+
+        runtime
+            .block_on(server.stop())
+            .expect("test server should stop cleanly");
     }
 }

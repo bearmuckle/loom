@@ -568,8 +568,10 @@ impl WebSocketTransport {
     }
 
     pub async fn connect(&self) -> Result<WebSocketConnection> {
-        let mut request = self.url.clone().into_client_request().map_err(|error| {
-            LoomError::invalid_request(format!("invalid WebSocket URL: {error}"))
+        let mut request = self.url.clone().into_client_request().map_err(|_| {
+            LoomError::invalid_request(
+                "invalid WebSocket URL; provide a valid ws:// or wss:// endpoint",
+            )
         })?;
         let value = format!("Bearer {}", self.bearer_token)
             .parse()
@@ -789,10 +791,26 @@ fn websocket_connect_error(error: TungsteniteError) -> LoomError {
             "WebSocket authentication was rejected",
             false,
         )
+    } else if error.to_string().to_ascii_lowercase().contains("timed out") {
+        LoomError::new(
+            ErrorCode::DeadlineExceeded,
+            "worker connection timed out",
+            true,
+        )
+    } else if error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("connection refused")
+    {
+        LoomError::new(
+            ErrorCode::ProviderUnavailable,
+            "connection refused by remote worker",
+            true,
+        )
     } else {
         LoomError::new(
             ErrorCode::Internal,
-            format!("could not connect to Loom WebSocket service: {error}"),
+            "could not open the worker WebSocket; check the URL and network access",
             true,
         )
     }

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak},
     time::{Duration, Instant},
@@ -19,7 +19,7 @@ use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
     ClientRequest, NegotiationResult, ProjectSnapshot, RequestEnvelope, ResponseEnvelope,
-    ServerEventEnvelope, ServerResponse, WorkerNodeResources, WorkerNodeStatus,
+    ServerEventEnvelope, ServerResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
     unsupported_version_error,
 };
 use loom_providers::{
@@ -33,6 +33,7 @@ use loom_vcs::GitService;
 use loom_workspace::Workspace;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sysinfo::System;
 
 mod auth;
 mod remote;
@@ -53,6 +54,34 @@ fn from_json<T: DeserializeOwned>(value: Value) -> Result<T> {
             ErrorCode::MalformedPayload,
             format!("persisted state contains malformed JSON: {error}"),
             false,
+        )
+    })
+}
+
+fn worker_node_url_is_safe(url: &str) -> bool {
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "ws" | "wss")
+        || url.host_str().is_none_or(str::is_empty)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    !url.query_pairs().any(|(key, _)| {
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "token"
+                | "access_token"
+                | "auth"
+                | "authorization"
+                | "password"
+                | "api_key"
+                | "secret"
+                | "credential"
+                | "bearer"
         )
     })
 }
@@ -187,6 +216,7 @@ struct PersistedBackendState {
     policies: BTreeMap<ProjectId, ApprovalPolicy>,
     provider_configs: Vec<ProviderConfig>,
     provider_health: BTreeMap<ProviderId, ProviderHealth>,
+    workspace_configs: BTreeMap<ProjectId, WorkspaceConfig>,
     provider_usage: UsageLedger,
     idempotency: BTreeMap<loom_core::RequestId, IdempotencyRecord>,
 }
@@ -395,6 +425,8 @@ struct StartRunInput {
 }
 
 pub struct InProcessBackend {
+    node_id: String,
+    node_name: String,
     sessions: Mutex<SessionManager>,
     runs: Mutex<BTreeMap<loom_core::RunId, Arc<RunHandle>>>,
     journal: Mutex<EventJournal>,
@@ -402,8 +434,10 @@ pub struct InProcessBackend {
     vcs: Mutex<BTreeMap<ProjectId, GitService>>,
     task_supervisors: Mutex<BTreeMap<ProjectId, TaskSupervisor>>,
     policies: Mutex<BTreeMap<ProjectId, ApprovalPolicy>>,
+    workspace_configs: Mutex<BTreeMap<ProjectId, WorkspaceConfig>>,
     terminal_projects: Mutex<BTreeMap<loom_core::TerminalId, ProjectId>>,
     terminals: TerminalManager,
+    resource_monitor: Mutex<ResourceMonitor>,
     supported_capabilities: CapabilitySet,
     models: Vec<ModelDescriptor>,
     providers: ProviderRegistry,
@@ -412,6 +446,75 @@ pub struct InProcessBackend {
     in_flight_requests: Mutex<BTreeMap<loom_core::RequestId, Arc<Mutex<()>>>>,
     session_admissions: Mutex<BTreeMap<AgentSessionId, Arc<Mutex<()>>>>,
     self_reference: Mutex<Weak<InProcessBackend>>,
+}
+
+#[derive(Default)]
+struct ResourceMonitor {
+    system: System,
+    has_cpu_baseline: bool,
+}
+
+impl ResourceMonitor {
+    fn sample(
+        &mut self,
+        disk_total_bytes: Option<u64>,
+        disk_available_bytes: Option<u64>,
+    ) -> WorkerNodeResources {
+        self.system.refresh_cpu_all();
+        self.system.refresh_memory();
+
+        let cpu_usage_percent = if self.has_cpu_baseline {
+            cpu_usage_percent(self.system.global_cpu_usage())
+        } else {
+            None
+        };
+        self.has_cpu_baseline = true;
+
+        let memory_total = self.system.total_memory();
+        let memory_available = self.system.available_memory();
+        let memory_total_bytes = (memory_total > 0).then_some(memory_total);
+        let memory_available_bytes = memory_total_bytes.map(|_| memory_available.min(memory_total));
+
+        WorkerNodeResources {
+            cpu_count: std::thread::available_parallelism()
+                .map(|count| count.get())
+                .unwrap_or(1),
+            cpu_usage_percent,
+            memory_usage_percent: memory_usage_percent(memory_total_bytes, memory_available_bytes),
+            memory_total_bytes,
+            memory_available_bytes,
+            disk_total_bytes,
+            disk_available_bytes,
+        }
+    }
+}
+
+fn cpu_usage_percent(usage: f32) -> Option<u8> {
+    usage
+        .is_finite()
+        .then(|| usage.clamp(0.0, 100.0).round() as u8)
+}
+
+fn memory_usage_percent(total: Option<u64>, available: Option<u64>) -> Option<u8> {
+    let (Some(total), Some(available)) = (total.filter(|total| *total > 0), available) else {
+        return None;
+    };
+    let usage = total.saturating_sub(available.min(total)) as f64 / total as f64 * 100.0;
+    Some(usage.round() as u8)
+}
+
+fn worker_node_identity() -> (String, String) {
+    let node_id = uuid::Uuid::new_v4().to_string();
+    let hostname = ["HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "Loom backend".to_owned());
+    let node_name = format!("{hostname} · {}", &node_id[..8]);
+    (node_id, node_name)
 }
 
 impl InProcessBackend {
@@ -651,7 +754,10 @@ impl InProcessBackend {
         } else {
             models
         };
+        let (node_id, node_name) = worker_node_identity();
         let backend = Arc::new(Self {
+            node_id,
+            node_name,
             sessions: Mutex::new(SessionManager::default()),
             runs: Mutex::new(BTreeMap::new()),
             journal: Mutex::new(EventJournal::default()),
@@ -659,8 +765,10 @@ impl InProcessBackend {
             vcs: Mutex::new(BTreeMap::new()),
             task_supervisors: Mutex::new(BTreeMap::new()),
             policies: Mutex::new(BTreeMap::new()),
+            workspace_configs: Mutex::new(BTreeMap::new()),
             terminal_projects: Mutex::new(BTreeMap::new()),
             terminals: TerminalManager::new(),
+            resource_monitor: Mutex::new(ResourceMonitor::default()),
             supported_capabilities: CapabilitySet::new([
                 Capability::CreateAgentSession,
                 Capability::ReadAgentSession,
@@ -803,6 +911,63 @@ impl InProcessBackend {
         })
     }
 
+    fn workspace_configs(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, WorkspaceConfig>>> {
+        self.workspace_configs.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "workspace config lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn resource_monitor(&self) -> Result<MutexGuard<'_, ResourceMonitor>> {
+        self.resource_monitor.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "worker resource monitor lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn set_workspace_config(&self, project_id: ProjectId, config: WorkspaceConfig) -> Result<()> {
+        let unique_urls = config
+            .worker_nodes
+            .iter()
+            .map(|node| node.url.as_str())
+            .collect::<BTreeSet<_>>();
+        if config.worker_nodes.len() > 64
+            || unique_urls.len() != config.worker_nodes.len()
+            || config
+                .worker_nodes
+                .iter()
+                .any(|node| node.url.trim() != node.url || !worker_node_url_is_safe(&node.url))
+        {
+            return Err(LoomError::invalid_request(
+                "workspace worker-node configuration must contain at most 64 WebSocket URLs without access tokens",
+            ));
+        }
+        let current_revision = self
+            .workspace_configs()?
+            .get(&project_id)
+            .map(|config| config.revision);
+        if current_revision.is_some_and(|revision| revision > config.revision) {
+            return Ok(());
+        }
+        let previous = self.workspace_configs()?.insert(project_id, config);
+        if let Err(error) = self.persist_state() {
+            let mut configs = self.workspace_configs()?;
+            if let Some(previous) = previous {
+                configs.insert(project_id, previous);
+            } else {
+                configs.remove(&project_id);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn terminal_projects(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<loom_core::TerminalId, ProjectId>>> {
@@ -846,6 +1011,11 @@ impl InProcessBackend {
             policies: from_json(required("policies")?)?,
             provider_configs: from_json(required("provider_configs")?)?,
             provider_health: from_json(required("provider_health")?)?,
+            workspace_configs: persistence
+                .load_section("workspace_configs", CURRENT_SCHEMA_VERSION)?
+                .map(from_json)
+                .transpose()?
+                .unwrap_or_default(),
             provider_usage: from_json(required("provider_usage")?)?,
             idempotency: from_json(required("idempotency")?)?,
         };
@@ -895,6 +1065,7 @@ impl InProcessBackend {
         self.providers.restore_configs(state.provider_configs)?;
         self.providers.restore_health(state.provider_health)?;
         self.providers.restore_usage(state.provider_usage)?;
+        *self.workspace_configs()? = state.workspace_configs;
 
         let mut workspaces = self.workspaces()?;
         for (project_id, persisted) in state.workspaces {
@@ -994,6 +1165,10 @@ impl InProcessBackend {
                 ("runs", json_value(runs)?),
                 ("workspaces", json_value(workspaces)?),
                 ("policies", json_value(self.policies()?.clone())?),
+                (
+                    "workspace_configs",
+                    json_value(self.workspace_configs()?.clone())?,
+                ),
                 (
                     "terminal_projects",
                     json_value(self.terminal_projects()?.clone())?,
@@ -1228,32 +1403,6 @@ impl InProcessConnection {
         run_id: loom_core::RunId,
     ) -> Result<AgentRunSnapshotProjection> {
         Ok(run_snapshot_projection(&self.run_handle(run_id)?.state()))
-    }
-
-    fn memory_resources() -> (Option<u64>, Option<u64>) {
-        #[cfg(target_os = "linux")]
-        {
-            let values = std::fs::read_to_string("/proc/meminfo")
-                .ok()
-                .into_iter()
-                .flat_map(|contents| {
-                    contents
-                        .lines()
-                        .filter_map(|line| {
-                            let (key, value) = line.split_once(':')?;
-                            let value = value.split_whitespace().next()?.parse::<u64>().ok()?;
-                            Some((key.to_owned(), value.saturating_mul(1024)))
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .collect::<BTreeMap<_, _>>();
-            return (
-                values.get("MemTotal").copied(),
-                values.get("MemAvailable").copied(),
-            );
-        }
-        #[allow(unreachable_code)]
-        (None, None)
     }
 
     fn disk_resources(root: &Path) -> (Option<u64>, Option<u64>) {
@@ -1856,6 +2005,19 @@ impl InProcessConnection {
                 let workspace = self.open_workspace(project_id, root)?;
                 Ok(ServerResponse::WorkspaceOpened(workspace.snapshot()?))
             }
+            ClientRequest::GetWorkspaceConfig { project_id } => {
+                Ok(ServerResponse::WorkspaceConfig(
+                    self.backend
+                        .workspace_configs()?
+                        .get(&project_id)
+                        .cloned()
+                        .unwrap_or_default(),
+                ))
+            }
+            ClientRequest::SetWorkspaceConfig { project_id, config } => {
+                self.backend.set_workspace_config(project_id, config)?;
+                Ok(ServerResponse::WorkspaceConfigUpdated)
+            }
             ClientRequest::GetWorkspaceSnapshot { project_id } => Ok(
                 ServerResponse::WorkspaceSnapshot(self.workspace(project_id)?.snapshot()?),
             ),
@@ -2041,10 +2203,6 @@ impl InProcessConnection {
     }
 
     fn worker_node_status(&self) -> Result<WorkerNodeStatus> {
-        let node_id = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("COMPUTERNAME"))
-            .unwrap_or_else(|_| "local".to_owned());
-        let (memory_total_bytes, memory_available_bytes) = Self::memory_resources();
         let (disk_total_bytes, disk_available_bytes) = self
             .backend
             .workspaces()
@@ -2056,20 +2214,16 @@ impl InProcessConnection {
                     .map(|workspace| Self::disk_resources(workspace.root()))
             })
             .unwrap_or((None, None));
+        let resources = self
+            .backend
+            .resource_monitor()?
+            .sample(disk_total_bytes, disk_available_bytes);
         Ok(WorkerNodeStatus {
-            name: node_id.clone(),
-            node_id,
+            name: self.backend.node_name.clone(),
+            node_id: self.backend.node_id.clone(),
             online: true,
             capabilities: self.backend.supported_capabilities.clone(),
-            resources: WorkerNodeResources {
-                cpu_count: std::thread::available_parallelism()
-                    .map(|count| count.get())
-                    .unwrap_or(1),
-                memory_total_bytes,
-                memory_available_bytes,
-                disk_total_bytes,
-                disk_available_bytes,
-            },
+            resources,
         })
     }
 
@@ -2112,6 +2266,13 @@ impl InProcessConnection {
                 ..
             }
             | ClientRequest::CreateAgentSession {
+                project_id: requested_project,
+                ..
+            }
+            | ClientRequest::GetWorkspaceConfig {
+                project_id: requested_project,
+            }
+            | ClientRequest::SetWorkspaceConfig {
                 project_id: requested_project,
                 ..
             }
@@ -2671,6 +2832,7 @@ mod tests {
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
     use loom_protocol::{
         AgentActivityStatus, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
+        WorkerNodeConfig, WorkspaceConfig,
     };
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
@@ -2782,13 +2944,200 @@ mod tests {
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate_m5(&connection);
+        #[cfg(unix)]
+        let project_id = ProjectId::new();
+        #[cfg(unix)]
+        let disk_root = {
+            let root = workspace();
+            let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+                project_id,
+                root: root.display().to_string(),
+            }));
+            assert!(matches!(
+                opened.result,
+                Ok(ServerResponse::WorkspaceOpened(_))
+            ));
+            root
+        };
         let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus));
+        let response =
+            loom_protocol::decode_response(&loom_protocol::encode_response(&response).unwrap())
+                .unwrap();
         let ServerResponse::WorkerNodeStatus(status) = response.result.unwrap() else {
             panic!("expected worker node status");
         };
         assert!(status.online);
         assert!(status.resources.cpu_count > 0);
+        assert_eq!(status.resources.cpu_usage_percent, None);
+        assert!(
+            status
+                .resources
+                .memory_total_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(status.resources.memory_available_bytes.is_some());
+        assert!(
+            status
+                .resources
+                .memory_usage_percent
+                .is_some_and(|value| value <= 100)
+        );
+        #[cfg(unix)]
+        {
+            assert!(status.resources.disk_total_bytes.is_some());
+            assert!(status.resources.disk_available_bytes.is_some());
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+        let refreshed =
+            connection.request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus));
+        let refreshed =
+            loom_protocol::decode_response(&loom_protocol::encode_response(&refreshed).unwrap())
+                .unwrap();
+        let ServerResponse::WorkerNodeStatus(refreshed) = refreshed.result.unwrap() else {
+            panic!("expected refreshed worker node status");
+        };
+        assert!(
+            refreshed
+                .resources
+                .cpu_usage_percent
+                .is_some_and(|value| value <= 100)
+        );
+        assert!(
+            refreshed
+                .resources
+                .memory_total_bytes
+                .is_some_and(|bytes| bytes > 0)
+        );
+        assert!(
+            refreshed
+                .resources
+                .memory_usage_percent
+                .is_some_and(|value| value <= 100)
+        );
+        assert_eq!(refreshed.resources.cpu_count, status.resources.cpu_count);
+        assert_eq!(refreshed.node_id, status.node_id);
+        assert_eq!(refreshed.name, status.name);
+        assert_eq!(
+            refreshed.resources.memory_total_bytes,
+            status.resources.memory_total_bytes
+        );
+        #[cfg(unix)]
+        {
+            assert!(refreshed.resources.disk_total_bytes.is_some());
+            assert!(refreshed.resources.disk_available_bytes.is_some());
+            fs::remove_dir_all(disk_root).unwrap();
+        }
         assert!(status.capabilities.contains(Capability::ReadAgentSession));
+    }
+
+    #[test]
+    fn worker_resource_percentages_handle_unavailable_and_out_of_range_samples() {
+        assert_eq!(cpu_usage_percent(f32::NAN), None);
+        assert_eq!(cpu_usage_percent(-1.0), Some(0));
+        assert_eq!(cpu_usage_percent(47.6), Some(48));
+        assert_eq!(cpu_usage_percent(120.0), Some(100));
+        assert_eq!(memory_usage_percent(None, Some(5)), None);
+        assert_eq!(memory_usage_percent(Some(0), Some(0)), None);
+        assert_eq!(memory_usage_percent(Some(100), Some(25)), Some(75));
+        assert_eq!(memory_usage_percent(Some(100), Some(150)), Some(0));
+    }
+
+    #[test]
+    fn worker_resource_monitor_measures_cpu_utilization_after_a_baseline_sample() {
+        let mut monitor = ResourceMonitor::default();
+
+        assert_eq!(monitor.sample(None, None).cpu_usage_percent, None);
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            monitor
+                .sample(None, None)
+                .cpu_usage_percent
+                .is_some_and(|value| value <= 100)
+        );
+    }
+
+    #[test]
+    fn workspace_config_is_persisted_and_excludes_access_tokens() {
+        let path =
+            std::env::temp_dir().join(format!("loom-workspace-config-{}.db", ProjectId::new()));
+        let project_id = ProjectId::new();
+        let config = WorkspaceConfig {
+            revision: 1,
+            cpu_pulse_threshold_percent: 37,
+            worker_nodes: vec![WorkerNodeConfig {
+                url: "wss://worker.example/ws".to_owned(),
+            }],
+        };
+        {
+            let backend = InProcessBackend::new_persistent(&path).unwrap();
+            let connection = backend.connect();
+            negotiate_m5(&connection);
+            let response =
+                connection.request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
+                    project_id,
+                    config: config.clone(),
+                }));
+            assert!(matches!(
+                response.result,
+                Ok(ServerResponse::WorkspaceConfigUpdated)
+            ));
+        }
+
+        {
+            let backend = InProcessBackend::new_persistent(&path).unwrap();
+            let connection = backend.connect();
+            negotiate_m5(&connection);
+            let response =
+                connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceConfig {
+                    project_id,
+                }));
+            assert!(matches!(
+                response.result,
+                Ok(ServerResponse::WorkspaceConfig(saved)) if saved == config
+            ));
+            let response =
+                connection.request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
+                    project_id,
+                    config: WorkspaceConfig {
+                        revision: 0,
+                        cpu_pulse_threshold_percent: 5,
+                        worker_nodes: vec![WorkerNodeConfig {
+                            url: "wss://stale.example/ws".to_owned(),
+                        }],
+                    },
+                }));
+            assert!(matches!(
+                response.result,
+                Ok(ServerResponse::WorkspaceConfigUpdated)
+            ));
+            let response =
+                connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceConfig {
+                    project_id,
+                }));
+            assert!(matches!(
+                response.result,
+                Ok(ServerResponse::WorkspaceConfig(saved)) if saved == config
+            ));
+            for url in [
+                "wss://worker.example/ws?%61ccess_token=secret",
+                "wss://user:secret@worker.example/ws",
+            ] {
+                let response =
+                    connection.request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
+                        project_id,
+                        config: WorkspaceConfig {
+                            revision: 2,
+                            cpu_pulse_threshold_percent: 5,
+                            worker_nodes: vec![WorkerNodeConfig {
+                                url: url.to_owned(),
+                            }],
+                        },
+                    }));
+                assert!(response.result.is_err());
+            }
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     /// Waits until a run stops needing the model, because a run is now driven by
