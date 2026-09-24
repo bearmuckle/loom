@@ -10,24 +10,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: pages
+  group: vercel-production
   cancel-in-progress: true
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-        with:
-          enablement: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -41,11 +31,28 @@ jobs:
         working-directory: crates/loom-ui
         env:
           RUSTC_BOOTSTRAP: "1"
-          PUBLIC_URL: /${{ github.event.repository.name }}/
+          PUBLIC_URL: /
         run: trunk build --release --public-url "$PUBLIC_URL"
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: crates/loom-ui/dist
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - name: Prepare Vercel deployment
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          if [[ -z "$VERCEL_ORG_ID" || -z "$VERCEL_PROJECT_ID" ]]; then
+            echo "::error::Set the VERCEL_ORG_ID and VERCEL_PROJECT_ID repository secrets."
+            exit 1
+          fi
+          mkdir -p .vercel/output/static
+          cp -R crates/loom-ui/dist/. .vercel/output/static/
+          printf '{"version":3,"routes":[{"handle":"filesystem"}]}\n' > .vercel/output/config.json
+          printf '{"orgId":"%s","projectId":"%s"}\n' \
+            "$VERCEL_ORG_ID" "$VERCEL_PROJECT_ID" > .vercel/project.json
+      - name: Deploy to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [[ -z "$VERCEL_TOKEN" ]]; then
+            echo "::error::Set the VERCEL_TOKEN repository secret."
+            exit 1
+          fi
+          npx --yes vercel@latest deploy --prebuilt --prod --archive=tgz --token="$VERCEL_TOKEN"
