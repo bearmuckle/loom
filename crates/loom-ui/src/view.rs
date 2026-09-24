@@ -78,6 +78,7 @@ use crate::{
         stable_project_id,
     },
 };
+#[cfg(not(target_family = "wasm"))]
 use log::info;
 
 type ModelSelectState = SelectState<SearchableVec<String>>;
@@ -602,6 +603,8 @@ enum WorkerConnectionState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WorkerConnectionStage {
+    #[cfg(target_family = "wasm")]
+    Bootstrap,
     InputValidation,
     Transport,
     Negotiation,
@@ -692,6 +695,18 @@ fn worker_connection_failure_detail(
         return "The worker refused the connection. Check that its server is running and the URL and port are correct.".to_owned();
     }
     match stage {
+        #[cfg(target_family = "wasm")]
+        WorkerConnectionStage::Bootstrap => {
+            let detail = redact_secret(&error.message, secret.unwrap_or_default());
+            format!(
+                "Connected to the worker, but could not open its workspace: {}",
+                detail
+                    .chars()
+                    .filter(|character| !character.is_control())
+                    .take(240)
+                    .collect::<String>()
+            )
+        }
         WorkerConnectionStage::Transport => {
             "Could not connect to the worker. Check the WebSocket URL, network access, and firewall, then retry.".to_owned()
         }
@@ -866,6 +881,8 @@ fn initial_worker_nodes(
 }
 
 pub(crate) struct LoomView {
+    #[cfg(target_family = "wasm")]
+    connected: bool,
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
     /// Used for every request made once the view is interactive.
@@ -944,6 +961,13 @@ pub(crate) struct LoomView {
     workspace_config: WorkspaceConfig,
     pub(crate) node_input: TextBufferState,
     pub(crate) run_poll_scheduled: bool,
+    #[cfg(target_family = "wasm")]
+    browser_workspace: Option<String>,
+    #[cfg(target_family = "wasm")]
+    browser_model: Option<ModelId>,
+    #[cfg(target_family = "wasm")]
+    browser_window_initialized: bool,
+    browser_startup_error: Option<String>,
 }
 
 struct TimelineView {
@@ -1051,6 +1075,17 @@ impl Render for TimelineView {
 }
 
 impl LoomView {
+    fn is_connected(&self) -> bool {
+        #[cfg(target_family = "wasm")]
+        {
+            self.connected
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            true
+        }
+    }
+
     pub(crate) fn input_state(&self, field: InputField) -> Option<&TextBufferState> {
         match field {
             InputField::Composer => Some(&self.composer),
@@ -1413,6 +1448,7 @@ impl LoomView {
             workspace_config,
             node_input: TextBufferState::new(""),
             run_poll_scheduled: false,
+            browser_startup_error: None,
         };
         view.refresh_models();
         view.refresh_sessions()?;
@@ -1425,6 +1461,112 @@ impl LoomView {
         Ok(view)
     }
 
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn new_browser_disconnected(
+        options: &BrowserOptions,
+        startup_error: Option<String>,
+        focus_handle: FocusHandle,
+        rename_focus_handle: FocusHandle,
+    ) -> Self {
+        let connection = ClientConnection::Disconnected;
+        let backend = BackendWorker::spawn(connection.clone());
+        let project_id = ProjectId::new();
+        let timestamp = loom_core::Timestamp::from_unix_millis(0);
+        let active_session = AgentSessionSnapshot {
+            id: AgentSessionId::new(),
+            project_id,
+            name: "No worker connected".to_owned(),
+            state: AgentSessionState::Idle,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let node_input = TextBufferState::new(
+            format!("{} {}", options.remote(), options.token())
+                .trim()
+                .to_owned(),
+        );
+
+        Self {
+            connected: false,
+            backend,
+            connection,
+            default_backend_node_id: String::new(),
+            node_backends: BTreeMap::new(),
+            node_names: BTreeMap::new(),
+            session_node_ids: BTreeMap::new(),
+            project_id,
+            project: None,
+            workspace_root: PathBuf::new(),
+            projects: Vec::new(),
+            sessions: Vec::new(),
+            active_session,
+            active_run: None,
+            active_run_id: None,
+            default_model: ModelId::new("default"),
+            session_models: BTreeMap::new(),
+            agent_mode: AgentMode::Agent,
+            session_task_cache: BTreeMap::new(),
+            optimistic_messages: Vec::new(),
+            sending_message: false,
+            model: ModelId::new("default"),
+            models: Vec::new(),
+            default_models: Vec::new(),
+            node_model_catalogs: BTreeMap::new(),
+            model_catalog_node_id: None,
+            model_refreshes_in_flight: BTreeSet::new(),
+            model_select: None,
+            default_model_select: None,
+            model_select_subscription: None,
+            default_model_select_subscription: None,
+            model_select_items: Vec::new(),
+            default_model_select_items: Vec::new(),
+            model_select_value: None,
+            default_model_select_value: None,
+            agent_mode_select: None,
+            agent_mode_select_subscription: None,
+            settings_open: options.is_configured(),
+            providers_open: false,
+            about_open: false,
+            providers: Vec::new(),
+            providers_node_id: None,
+            theme_choice: ThemeChoice::System,
+            appearance_subscription: None,
+            after_sequence: None,
+            timeline: Vec::new(),
+            timeline_view: None,
+            activity_records_seen: false,
+            expanded_activities: BTreeSet::new(),
+            approval_request_in_flight: false,
+            archive_request_in_flight: false,
+            pending_approval: None,
+            pending_input: None,
+            composer: TextBufferState::new(""),
+            composer_focus_handle: focus_handle,
+            input_field: InputField::Composer,
+            session_state: AgentSessionState::Idle,
+            run_state: None,
+            summary: None,
+            review: ReviewState::default(),
+            tasks: Vec::new(),
+            rename_dialog: None,
+            rename_focus_handle,
+            demo_workspace: false,
+            login_enabled: false,
+            github_connected: false,
+            github_login: None,
+            next_worker_node_id: 0,
+            worker_nodes: Vec::new(),
+            worker_node_polls_scheduled: BTreeSet::new(),
+            workspace_config: WorkspaceConfig::default(),
+            node_input,
+            run_poll_scheduled: false,
+            browser_workspace: options.workspace().map(str::to_owned),
+            browser_model: options.model().cloned(),
+            browser_window_initialized: true,
+            browser_startup_error: startup_error,
+        }
+    }
+
     /// Builds the view for the browser client: connects to a remote backend
     /// over the in-page WebSocket transport and resolves the same project /
     /// session / model state that native's remote-mode bootstrap resolves,
@@ -1432,8 +1574,7 @@ impl LoomView {
     /// single JS thread. Unlike [`Self::try_new`], this does not load the
     /// active session's snapshot/events itself (that requires a `Context`,
     /// which does not exist yet); the caller finishes bootstrapping once the
-    /// view is mounted, via [`Self::select_session`], [`Self::reload_sessions`]
-    /// and [`Self::refresh_models_async`].
+    /// view is mounted, via [`Self::select_session`] and [`Self::reload_sessions`].
     #[cfg(target_family = "wasm")]
     pub(crate) async fn try_new_browser(
         options: &BrowserOptions,
@@ -1513,6 +1654,7 @@ impl LoomView {
             .collect();
 
         let view = Self {
+            connected: true,
             backend,
             connection: connection.clone(),
             default_backend_node_id: default_backend_node_id.clone(),
@@ -1585,6 +1727,10 @@ impl LoomView {
             workspace_config,
             node_input: TextBufferState::new(""),
             run_poll_scheduled: false,
+            browser_workspace: options.workspace().map(str::to_owned),
+            browser_model: options.model().cloned(),
+            browser_window_initialized: false,
+            browser_startup_error: None,
         };
         cleanup_guard.disarm();
         Ok(view)
@@ -4218,6 +4364,11 @@ impl LoomView {
             return;
         };
         let submitted_value = value;
+        if !self.connected {
+            self.browser_startup_error = None;
+            self.connect_browser_bootstrap(id, url, token, submitted_value, cx);
+            return;
+        }
         let node_url = url.clone();
         cx.notify();
         let view = cx.entity();
@@ -4281,6 +4432,69 @@ impl LoomView {
                             &error,
                             Some(&token),
                             cleanup_failed,
+                        );
+                    }
+                    Err(_) => {}
+                }
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn connect_browser_bootstrap(
+        &mut self,
+        id: u64,
+        url: String,
+        token: String,
+        submitted_value: String,
+        cx: &mut Context<Self>,
+    ) {
+        let options = BrowserOptions::from_connection(
+            url.clone(),
+            token.clone(),
+            self.browser_workspace.clone(),
+            self.browser_model.clone(),
+        );
+        let focus_handle = self.composer_focus_handle.clone();
+        let rename_focus_handle = self.rename_focus_handle.clone();
+        let view = cx.entity();
+        cx.notify();
+        cx.spawn(async move |_, cx| {
+            let result =
+                LoomView::try_new_browser(&options, focus_handle, rename_focus_handle).await;
+            view.update(cx, |view, cx| {
+                let is_pending = view.worker_nodes.iter().any(|node| {
+                    node.id == id
+                        && node.url.as_deref() == Some(url.as_str())
+                        && node.connection_state == WorkerConnectionState::Connecting
+                });
+                match result {
+                    Ok(mut initialized) if is_pending => {
+                        let active_session = initialized.active_session.clone();
+                        initialized.settings_open = false;
+                        initialized.browser_window_initialized = false;
+                        *view = initialized;
+                        view.reload_sessions(cx);
+                        view.select_session(active_session, cx);
+                        if view.node_input.text.trim() == submitted_value {
+                            view.node_input.set_text("");
+                        }
+                    }
+                    Ok(initialized) => {
+                        if let Err(error) = initialized.connection.close() {
+                            log::error!("could not close a stale bootstrap connection: {error}");
+                        }
+                    }
+                    Err(error) if is_pending => {
+                        view.fail_worker_node_connection(
+                            id,
+                            &url,
+                            WorkerConnectionStage::Bootstrap,
+                            &error,
+                            Some(&token),
+                            false,
                         );
                     }
                     Err(_) => {}
@@ -5940,6 +6154,15 @@ impl LoomView {
                     .text_color(rgb(0x93c5fd))
                     .child("WORKER NODES"),
             )
+            .when_some(self.browser_startup_error.as_deref(), |element, error| {
+                element.child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(rgb(0xfca5a5))
+                        .child(error.to_owned()),
+                )
+            })
             .child(
                 div()
                     .mt_2()
@@ -5961,7 +6184,10 @@ impl LoomView {
                         Button::new("cpu-pulse-threshold-decrease")
                             .label("-")
                             .small()
-                            .disabled(self.workspace_config.cpu_pulse_threshold_percent == 0)
+                            .disabled(
+                                !self.is_connected()
+                                    || self.workspace_config.cpu_pulse_threshold_percent == 0,
+                            )
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.adjust_cpu_pulse_threshold(-1, cx);
                             })),
@@ -5974,7 +6200,10 @@ impl LoomView {
                         Button::new("cpu-pulse-threshold-increase")
                             .label("+")
                             .small()
-                            .disabled(self.workspace_config.cpu_pulse_threshold_percent >= 100)
+                            .disabled(
+                                !self.is_connected()
+                                    || self.workspace_config.cpu_pulse_threshold_percent >= 100,
+                            )
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.adjust_cpu_pulse_threshold(1, cx);
                             })),
@@ -5986,6 +6215,21 @@ impl LoomView {
                     .flex()
                     .flex_col()
                     .gap_1()
+                    .when(self.worker_nodes.is_empty(), |element| {
+                        element.child(
+                            div()
+                                .p_2()
+                                .rounded_lg()
+                                .bg(rgb(0x171c25))
+                                .border_1()
+                                .border_color(rgb(0x293244))
+                                .text_xs()
+                                .text_color(rgb(0x8f98a6))
+                                .child(
+                                    "No worker connected. Add one below to load your workspace.",
+                                ),
+                        )
+                    })
                     .children(self.worker_nodes.iter().map(|node| {
                         let id = node.id;
                         let status = &node.status;
@@ -6402,10 +6646,226 @@ impl LoomView {
             .child(div().mt_2().child(local_body))
             .into_any()
     }
+
+    #[cfg(target_family = "wasm")]
+    fn render_disconnected(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x111318))
+            .text_color(rgb(0xe5e7eb))
+            .child(
+                div()
+                    .h(px(30.))
+                    .w_full()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .bg(rgb(0x1b1d24))
+                    .border_b_1()
+                    .border_color(rgb(0x30343f))
+                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Loom")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .w(px(250.))
+                            .h_full()
+                            .p_2()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .bg(rgb(0x17191f))
+                            .border_r_1()
+                            .border_color(rgb(0x30343f))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(rgb(0xf3f4f6))
+                                            .child("Workspace"),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child("Sessions"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .p_3()
+                                    .rounded_lg()
+                                    .bg(rgb(0x111318))
+                                    .border_1()
+                                    .border_color(rgb(0x293244))
+                                    .text_sm()
+                                    .text_color(rgb(0x64748b))
+                                    .child("Connect a worker to load sessions."),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_end()
+                                    .border_t_1()
+                                    .border_color(rgb(0x30343f))
+                                    .pt_2()
+                                    .child(
+                                        Button::new("disconnected-settings")
+                                            .icon(Icon::new(IconName::Settings))
+                                            .ghost()
+                                            .xsmall()
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.open_settings_from_menu(cx);
+                                            })),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .px_3()
+                                    .py_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .bg(rgb(0x14161a))
+                                    .border_b_1()
+                                    .border_color(rgb(0x30343f))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .child("No worker connected")
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(0x8f98a6))
+                                                    .child("Connect a worker in Settings to begin."),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("disconnected-open-settings")
+                                            .icon(Icon::new(IconName::Settings))
+                                            .ghost()
+                                            .xsmall()
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.open_settings_from_menu(cx);
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .max_w(px(460.))
+                                            .p_6()
+                                            .rounded_lg()
+                                            .bg(rgb(0x171c25))
+                                            .border_1()
+                                            .border_color(rgb(0x293244))
+                                            .child(
+                                                div()
+                                                    .text_base()
+                                                    .text_color(rgb(0xf3f4f6))
+                                                    .child("Your workspace is ready"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .mt_2()
+                                                    .text_sm()
+                                                    .text_color(rgb(0x8f98a6))
+                                                    .child("Connect a Loom worker from Settings to load your sessions, models, and workspace."),
+                                            )
+                                            .child(
+                                                Button::new("disconnected-connect-worker")
+                                                    .label("Open Settings")
+                                                    .small()
+                                                    .on_click(cx.listener(
+                                                        |view, _, _, cx| {
+                                                            view.open_settings_from_menu(cx);
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .px_4()
+                                    .py_3()
+                                    .border_t_1()
+                                    .border_color(rgb(0x30343f))
+                                    .child(
+                                        div()
+                                            .p_3()
+                                            .rounded_lg()
+                                            .bg(rgb(0x171c25))
+                                            .border_1()
+                                            .border_color(rgb(0x293244))
+                                            .text_sm()
+                                            .text_color(rgb(0x64748b))
+                                            .child("Connect a worker to start a session."),
+                                    ),
+                            )
+                            .when(self.settings_open, |element| {
+                                element.child(self.render_settings_dialog(cx))
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(24.))
+                    .w_full()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .bg(rgb(0x1b1d24))
+                    .border_t_1()
+                    .border_color(rgb(0x30343f))
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child("Not connected  ·  Connect a worker in Settings"),
+            )
+            .into_any()
+    }
 }
 
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(target_family = "wasm")]
+        if !self.connected {
+            return self.render_disconnected(cx);
+        }
+        #[cfg(target_family = "wasm")]
+        if !self.browser_window_initialized {
+            self.browser_window_initialized = true;
+            self.observe_system_appearance(window, cx);
+            self.composer_focus_handle.focus(window, cx);
+            self.select_theme(ThemeChoice::System, window, cx);
+        }
         self.schedule_worker_node_poll(cx);
         self.sync_model_select_states(window, cx);
         self.sync_agent_mode_select_state(window, cx);
@@ -7024,6 +7484,7 @@ impl Render for LoomView {
                     }
                 }),
         }
+        .into_any()
     }
 }
 

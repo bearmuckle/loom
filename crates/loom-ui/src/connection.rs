@@ -54,6 +54,7 @@ pub(crate) fn redact_secret(value: &str, secret: &str) -> String {
         .replace(&encoded.to_ascii_lowercase(), "[redacted]")
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn remote_url_is_secure_for_secrets(url: &str) -> bool {
     if url.starts_with("wss://") {
         return true;
@@ -74,6 +75,7 @@ fn remote_url_is_secure_for_secrets(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn describe_startup_connection_error(error: &LoomError, secret: &str) -> String {
     match error.code {
         ErrorCode::AuthenticationFailed
@@ -128,6 +130,8 @@ pub(crate) enum ClientConnection {
         connection: Arc<Mutex<WebSocketConnection>>,
         secure_for_secrets: bool,
     },
+    #[cfg(target_family = "wasm")]
+    Disconnected,
     #[cfg(target_family = "wasm")]
     Browser(BrowserConnection),
 }
@@ -225,6 +229,7 @@ impl ClientConnection {
         #[cfg(target_family = "wasm")]
         {
             match self {
+                Self::Disconnected => Ok(()),
                 Self::Browser(connection) => connection.close(),
             }
         }
@@ -238,6 +243,8 @@ impl ClientConnection {
             Self::Remote {
                 secure_for_secrets, ..
             } => *secure_for_secrets,
+            #[cfg(target_family = "wasm")]
+            Self::Disconnected => false,
             #[cfg(target_family = "wasm")]
             Self::Browser(_) => false,
         }
@@ -321,7 +328,12 @@ impl ClientConnection {
     /// transport resolves this asynchronously as frames arrive.
     #[cfg(target_family = "wasm")]
     pub(crate) async fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
+        let request_id = request.request_id;
         match self {
+            Self::Disconnected => ResponseEnvelope::failure(
+                request_id,
+                LoomError::new(ErrorCode::RequestCancelled, "no worker is connected", true),
+            ),
             Self::Browser(connection) => connection.request(request).await,
         }
     }
