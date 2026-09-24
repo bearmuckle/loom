@@ -2,4 +2,6 @@
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel)"
-exec "$ROOT/scripts/ci-check.sh"
+cd "$ROOT"
+
+cargo fmt --all -- --check
