@@ -74,6 +74,10 @@ workspace path; open that URL in a browser. Press `Ctrl-C` to stop both
 processes. Set `LOOM_MODEL`, `LOOM_TOKEN`, `LOOM_BACKEND_BIND`,
 `LOOM_FRONTEND_PORT`, or `LOOM_WORKSPACE` to override the local defaults.
 
+The browser client is published to GitHub Pages on pushes to `main` and can
+also be published manually from the Actions tab. It is a client only: connect
+it to a separately running Loom backend to use it.
+
 Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
 `LOOM_MODEL`, or connect to a remote backend with `LOOM_REMOTE_URL` and
 `LOOM_TOKEN`. GitHub Copilot login is available in the UI.
