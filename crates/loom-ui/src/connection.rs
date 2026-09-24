@@ -29,7 +29,7 @@ use loom_model::ProviderId;
 use loom_protocol::AgentRunSnapshot;
 use loom_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientRequest, ProjectSnapshot, RequestEnvelope, ResponseEnvelope,
-    ServerResponse,
+    ServerResponse, WorkerNodeStatus,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_server::{InProcessConnection, WebSocketConnection, WebSocketTransport};
@@ -144,6 +144,7 @@ pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> 
             Capability::StartTask,
             Capability::ControlTask,
             Capability::ReadTaskEvidence,
+            Capability::ReadWorkerNodeStatus,
             Capability::JsonProtocol,
         ]),
     }));
@@ -176,8 +177,33 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::StartTask,
         Capability::ControlTask,
         Capability::ReadTaskEvidence,
+        Capability::ReadWorkerNodeStatus,
         Capability::JsonProtocol,
     ])
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn worker_node_status(
+    connection: &ClientConnection,
+) -> Result<WorkerNodeStatus, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus));
+    match response.result? {
+        ServerResponse::WorkerNodeStatus(status) => Ok(status),
+        response => Err(unexpected_response("worker node status", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn worker_node_status_async(
+    connection: &ClientConnection,
+) -> Result<WorkerNodeStatus, LoomError> {
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus))
+        .await;
+    match response.result? {
+        ServerResponse::WorkerNodeStatus(status) => Ok(status),
+        response => Err(unexpected_response("worker node status", response)),
+    }
 }
 
 #[cfg(target_family = "wasm")]

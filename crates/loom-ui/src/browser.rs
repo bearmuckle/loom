@@ -36,17 +36,9 @@ impl BrowserOptions {
         let search = window.location().search().unwrap_or_default();
         let params = UrlSearchParams::new_with_str(&search)
             .map_err(|_| LoomError::invalid_request("could not parse the page's query string"))?;
-        let remote = params.get("remote").ok_or_else(|| {
-            LoomError::invalid_request(
-                "the page URL must include ?remote=ws://host:port/ws for the browser client to connect",
-            )
-        })?;
-        let token = params.get("token").ok_or_else(|| {
-            LoomError::invalid_request("the page URL must include &token=<bearer token>")
-        })?;
         Ok(Self {
-            remote,
-            token,
+            remote: params.get("remote").unwrap_or_default(),
+            token: params.get("token").unwrap_or_default(),
             workspace: params.get("workspace"),
             model: params.get("model").map(ModelId::new),
         })
@@ -66,6 +58,29 @@ impl BrowserOptions {
 
     pub(crate) fn model(&self) -> Option<&ModelId> {
         self.model.as_ref()
+    }
+
+    pub(crate) fn connect_interactively(&mut self) -> Result<(), LoomError> {
+        if self.remote.is_empty() {
+            self.remote = web_sys::window()
+                .ok_or_else(|| LoomError::invalid_request("no browser window is available"))?
+                .prompt_with_message("Loom worker WebSocket URL")
+                .map_err(|_| LoomError::invalid_request("could not open the connection prompt"))?
+                .ok_or_else(|| LoomError::invalid_request("worker connection was cancelled"))?;
+        }
+        if self.token.is_empty() {
+            self.token = web_sys::window()
+                .ok_or_else(|| LoomError::invalid_request("no browser window is available"))?
+                .prompt_with_message("Loom worker access token")
+                .map_err(|_| LoomError::invalid_request("could not open the token prompt"))?
+                .ok_or_else(|| LoomError::invalid_request("worker connection was cancelled"))?;
+        }
+        if self.remote.trim().is_empty() || self.token.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "worker URL and access token must not be empty",
+            ));
+        }
+        Ok(())
     }
 }
 

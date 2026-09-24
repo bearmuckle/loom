@@ -19,7 +19,8 @@ use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
     ClientRequest, NegotiationResult, ProjectSnapshot, RequestEnvelope, ResponseEnvelope,
-    ServerEventEnvelope, ServerResponse, unsupported_version_error,
+    ServerEventEnvelope, ServerResponse, WorkerNodeResources, WorkerNodeStatus,
+    unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, ModelProvider,
@@ -693,6 +694,7 @@ impl InProcessBackend {
                 Capability::ReadVcsStatus,
                 Capability::ReadVcsDiff,
                 Capability::ReadTaskEvidence,
+                Capability::ReadWorkerNodeStatus,
                 Capability::JsonProtocol,
             ]),
             models,
@@ -1228,6 +1230,62 @@ impl InProcessConnection {
         Ok(run_snapshot_projection(&self.run_handle(run_id)?.state()))
     }
 
+    fn memory_resources() -> (Option<u64>, Option<u64>) {
+        #[cfg(target_os = "linux")]
+        {
+            let values = std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .into_iter()
+                .flat_map(|contents| {
+                    contents
+                        .lines()
+                        .filter_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            let value = value.split_whitespace().next()?.parse::<u64>().ok()?;
+                            Some((key.to_owned(), value.saturating_mul(1024)))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<BTreeMap<_, _>>();
+            return (
+                values.get("MemTotal").copied(),
+                values.get("MemAvailable").copied(),
+            );
+        }
+        #[allow(unreachable_code)]
+        (None, None)
+    }
+
+    fn disk_resources(root: &Path) -> (Option<u64>, Option<u64>) {
+        let Some(output) = std::process::Command::new("df")
+            .args(["-kP", &root.to_string_lossy()])
+            .output()
+            .ok()
+        else {
+            return (None, None);
+        };
+        let output = String::from_utf8_lossy(&output.stdout).into_owned();
+        let Some(line) = output.lines().nth(1) else {
+            return (None, None);
+        };
+        let columns = line.split_whitespace().collect::<Vec<_>>();
+        let Some(total) = columns
+            .get(1)
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.saturating_mul(1024))
+        else {
+            return (None, None);
+        };
+        let Some(available) = columns
+            .get(3)
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.saturating_mul(1024))
+        else {
+            return (None, None);
+        };
+        (Some(total), Some(available))
+    }
+
     /// Looks a run up without touching its runtime lock.
     fn run_handle(&self, run_id: loom_core::RunId) -> Result<Arc<RunHandle>> {
         let handle = self
@@ -1520,6 +1578,9 @@ impl InProcessConnection {
         match request {
             ClientRequest::Negotiate { .. } | ClientRequest::DiscoverCapabilities => {
                 unreachable!("capability requests are handled above")
+            }
+            ClientRequest::GetWorkerNodeStatus => {
+                Ok(ServerResponse::WorkerNodeStatus(self.worker_node_status()?))
             }
             ClientRequest::ListProjects => {
                 let projects = self
@@ -1979,6 +2040,39 @@ impl InProcessConnection {
         }
     }
 
+    fn worker_node_status(&self) -> Result<WorkerNodeStatus> {
+        let node_id = std::env::var("HOSTNAME")
+            .or_else(|_| std::env::var("COMPUTERNAME"))
+            .unwrap_or_else(|_| "local".to_owned());
+        let (memory_total_bytes, memory_available_bytes) = Self::memory_resources();
+        let (disk_total_bytes, disk_available_bytes) = self
+            .backend
+            .workspaces()
+            .ok()
+            .and_then(|workspaces| {
+                workspaces
+                    .values()
+                    .next()
+                    .map(|workspace| Self::disk_resources(workspace.root()))
+            })
+            .unwrap_or((None, None));
+        Ok(WorkerNodeStatus {
+            name: node_id.clone(),
+            node_id,
+            online: true,
+            capabilities: self.backend.supported_capabilities.clone(),
+            resources: WorkerNodeResources {
+                cpu_count: std::thread::available_parallelism()
+                    .map(|count| count.get())
+                    .unwrap_or(1),
+                memory_total_bytes,
+                memory_available_bytes,
+                disk_total_bytes,
+                disk_available_bytes,
+            },
+        })
+    }
+
     fn authorize_request(&self, request: &ClientRequest) -> Result<()> {
         let Some(auth) = &self.auth else {
             return Ok(());
@@ -2212,6 +2306,7 @@ impl InProcessConnection {
                 project_id: None, ..
             }
             | ClientRequest::ListModels
+            | ClientRequest::GetWorkerNodeStatus
             | ClientRequest::ListProviders
             | ClientRequest::DiscoverProviderModels { .. }
             | ClientRequest::GetProviderHealth { .. } => {}
@@ -2676,9 +2771,24 @@ mod tests {
                 Capability::ReadTask,
                 Capability::StartTask,
                 Capability::ReadTaskEvidence,
+                Capability::ReadWorkerNodeStatus,
             ]),
         }));
         assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
+    }
+
+    #[test]
+    fn worker_node_status_reports_capabilities_and_resources() {
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        negotiate_m5(&connection);
+        let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus));
+        let ServerResponse::WorkerNodeStatus(status) = response.result.unwrap() else {
+            panic!("expected worker node status");
+        };
+        assert!(status.online);
+        assert!(status.resources.cpu_count > 0);
+        assert!(status.capabilities.contains(Capability::ReadAgentSession));
     }
 
     /// Waits until a run stops needing the model, because a run is now driven by

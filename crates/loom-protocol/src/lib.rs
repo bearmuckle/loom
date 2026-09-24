@@ -54,6 +54,24 @@ pub struct ProjectSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerNodeResources {
+    pub cpu_count: usize,
+    pub memory_total_bytes: Option<u64>,
+    pub memory_available_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    pub disk_available_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerNodeStatus {
+    pub node_id: String,
+    pub name: String,
+    pub online: bool,
+    pub capabilities: CapabilitySet,
+    pub resources: WorkerNodeResources,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentRunSnapshotProjection {
     pub run: AgentRunSnapshot,
     pub plan: Vec<AgentPlanStep>,
@@ -113,6 +131,7 @@ pub enum ClientRequest {
         capabilities: CapabilitySet,
     },
     DiscoverCapabilities,
+    GetWorkerNodeStatus,
     ListProjects,
     ListAgentSessions {
         project_id: Option<ProjectId>,
@@ -340,6 +359,7 @@ impl ClientRequest {
     pub const fn required_capability(&self) -> Option<Capability> {
         match self {
             Self::Negotiate { .. } | Self::DiscoverCapabilities => None,
+            Self::GetWorkerNodeStatus => Some(Capability::ReadWorkerNodeStatus),
             Self::ListProjects | Self::ListAgentSessions { .. } => {
                 Some(Capability::ReadAgentSession)
             }
@@ -474,6 +494,7 @@ impl ResponseEnvelope {
 pub enum ServerResponse {
     Negotiated(NegotiationResult),
     Capabilities(NegotiationResult),
+    WorkerNodeStatus(WorkerNodeStatus),
     Projects {
         projects: Vec<ProjectSnapshot>,
     },

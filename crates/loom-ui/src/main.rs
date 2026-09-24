@@ -176,10 +176,13 @@ fn log_error(context: &str, error: impl std::fmt::Display) {
 /// `!Send` browser WebSocket transport directly.
 #[cfg(target_family = "wasm")]
 async fn start_browser_client(cx: &mut gpui_kit::AsyncApp) {
-    let options = match BrowserOptions::from_location() {
+    let mut options = match BrowserOptions::from_location() {
         Ok(options) => options,
         Err(error) => return log_error("could not read startup options", error),
     };
+    if let Err(error) = options.connect_interactively() {
+        return log_error("could not connect to a worker", error);
+    }
     let (composer_focus_handle, rename_focus_handle) =
         cx.update(|cx| (cx.focus_handle(), cx.focus_handle()));
     let view = match LoomView::try_new_browser(&options, composer_focus_handle, rename_focus_handle)

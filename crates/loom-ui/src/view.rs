@@ -32,7 +32,7 @@ use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
     ProjectSnapshot, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse, TaskSnapshot,
-    TaskStatus,
+    TaskStatus, WorkerNodeStatus,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_providers::{
@@ -61,20 +61,34 @@ use crate::{
     browser::BrowserOptions,
     connection::{
         create_session_async, list_models_async, list_projects_async, list_sessions_async,
-        negotiate_async, open_workspace_async,
+        negotiate_async, open_workspace_async, worker_node_status_async,
     },
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::{
     connection::{
         create_session, list_models, list_projects, list_provider_ids, list_sessions, negotiate,
-        open_workspace, start_run,
+        open_workspace, start_run, worker_node_status,
     },
     platform::{UiOptions, backend_persistence_path, prepare_workspace, stable_project_id},
 };
 use log::info;
 
 type ModelSelectState = SelectState<SearchableVec<String>>;
+
+fn format_bytes(value: Option<u64>) -> String {
+    let Some(value) = value else {
+        return "n/a".to_owned();
+    };
+    let (value, suffix) = if value >= 1 << 30 {
+        (value as f64 / (1 << 30) as f64, "GiB")
+    } else if value >= 1 << 20 {
+        (value as f64 / (1 << 20) as f64, "MiB")
+    } else {
+        (value as f64 / (1 << 10) as f64, "KiB")
+    };
+    format!("{value:.1} {suffix}")
+}
 
 /// Opens a URL in a new tab/window. Natively this shells out to the OS's
 /// "open" handler; in the browser it's just `window.open`.
@@ -383,6 +397,9 @@ pub(crate) struct LoomView {
     pub(crate) login_enabled: bool,
     pub(crate) github_connected: bool,
     pub(crate) github_login: Option<GitHubLoginState>,
+    pub(crate) worker_nodes: Vec<WorkerNodeStatus>,
+    pub(crate) node_connections: Vec<ClientConnection>,
+    pub(crate) node_input: TextBufferState,
     pub(crate) run_poll_scheduled: bool,
 }
 
@@ -495,6 +512,7 @@ impl LoomView {
         match field {
             InputField::Composer => Some(&self.composer),
             InputField::Rename => self.rename_dialog.as_ref().map(|dialog| &dialog.input),
+            InputField::Node => Some(&self.node_input),
         }
     }
 
@@ -502,6 +520,7 @@ impl LoomView {
         match field {
             InputField::Composer => Some(&mut self.composer),
             InputField::Rename => self.rename_dialog.as_mut().map(|dialog| &mut dialog.input),
+            InputField::Node => Some(&mut self.node_input),
         }
     }
 
@@ -509,6 +528,7 @@ impl LoomView {
         match field {
             InputField::Composer => self.composer_focus_handle.clone(),
             InputField::Rename => self.rename_focus_handle.clone(),
+            InputField::Node => self.composer_focus_handle.clone(),
         }
     }
 
@@ -711,6 +731,7 @@ impl LoomView {
             negotiate(&connection)?;
             open_workspace(&connection, project_id, &workspace_root)?;
         }
+        let node_status = worker_node_status(&connection)?;
         let sessions = list_sessions(&connection, project_id)?;
         info!("loaded {} session(s)", sessions.len());
         let session = sessions.into_iter().next().map_or_else(
@@ -816,6 +837,9 @@ impl LoomView {
                 })
                 .is_some(),
             github_login: None,
+            worker_nodes: vec![node_status],
+            node_connections: Vec::new(),
+            node_input: TextBufferState::new(""),
             run_poll_scheduled: false,
         };
         view.refresh_models();
@@ -843,6 +867,7 @@ impl LoomView {
     ) -> Result<Self, LoomError> {
         let connection = ClientConnection::browser(options.remote(), options.token())?;
         negotiate_async(&connection).await?;
+        let node_status = worker_node_status_async(&connection).await?;
         let projects = list_projects_async(&connection).await?;
         // A freshly started `--serve` backend has no projects open yet; if
         // none match (or none exist), open the requested workspace as a new
@@ -940,6 +965,9 @@ impl LoomView {
             login_enabled: false,
             github_connected: false,
             github_login: None,
+            worker_nodes: vec![node_status],
+            node_connections: Vec::new(),
+            node_input: TextBufferState::new(""),
             run_poll_scheduled: false,
         })
     }
@@ -2148,6 +2176,8 @@ impl LoomView {
     pub(crate) fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         if self.rename_dialog.is_some() {
             self.confirm_rename(cx);
+        } else if self.input_field == InputField::Node {
+            self.connect_worker_node(cx);
         } else {
             self.submit_composer(cx);
         }
@@ -2572,6 +2602,85 @@ impl LoomView {
         self.about_open = false;
         self.settings_open = true;
         cx.notify();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn connect_worker_node(&mut self, cx: &mut Context<Self>) {
+        let value = self.node_input.text.trim().to_owned();
+        let mut parts = value.split_whitespace();
+        let (Some(url), Some(token)) = (parts.next(), parts.next()) else {
+            self.record_status("Enter a node URL followed by its access token");
+            return;
+        };
+        let url = url.to_owned();
+        let token = token.to_owned();
+        if url.is_empty() || token.is_empty() {
+            self.record_status("Enter a node URL followed by its access token");
+            return;
+        }
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let result = (|| {
+                        let connection = ClientConnection::remote(url, token)?;
+                        negotiate(&connection)?;
+                        let status = worker_node_status(&connection)?;
+                        Ok::<_, LoomError>((connection, status))
+                    })();
+                    result
+                })
+                .await;
+            view.update(cx, |view, cx| {
+                match result {
+                    Ok((connection, status)) => {
+                        view.node_connections.push(connection);
+                        view.worker_nodes.push(status);
+                        view.record_status("Connected to worker node");
+                    }
+                    Err(error) => view.record_backend_error("connect worker node", error),
+                }
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn connect_worker_node(&mut self, cx: &mut Context<Self>) {
+        let value = self.node_input.text.trim().to_owned();
+        let mut parts = value.split_whitespace();
+        let (Some(url), Some(token)) = (parts.next(), parts.next()) else {
+            self.record_status("Enter a node URL followed by its access token");
+            return;
+        };
+        let url = url.to_owned();
+        let token = token.to_owned();
+        if url.is_empty() || token.is_empty() {
+            self.record_status("Enter a node URL followed by its access token");
+            return;
+        }
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = async {
+                let connection = ClientConnection::browser(&url, &token)?;
+                negotiate_async(&connection).await?;
+                let status = worker_node_status_async(&connection).await?;
+                Ok::<_, LoomError>((connection, status))
+            }
+            .await;
+            view.update(cx, |view, cx| {
+                match result {
+                    Ok((connection, status)) => {
+                        view.node_connections.push(connection);
+                        view.worker_nodes.push(status);
+                        view.record_status("Connected to worker node");
+                    }
+                    Err(error) => view.record_backend_error("connect worker node", error),
+                }
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
     pub(crate) fn open_about_from_menu(&mut self, cx: &mut Context<Self>) {
@@ -4001,6 +4110,77 @@ impl LoomView {
                     .child("DEFAULT MODEL FOR NEW SESSIONS"),
             )
             .child(div().mt_2().child(body))
+            .child(
+                div()
+                    .mt_4()
+                    .text_xs()
+                    .text_color(rgb(0x93c5fd))
+                    .child("WORKER NODES"),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(self.worker_nodes.iter().map(|node| {
+                        let resources = &node.resources;
+                        div()
+                            .p_2()
+                            .rounded_lg()
+                            .bg(rgb(0x171c25))
+                            .border_1()
+                            .border_color(rgb(0x293244))
+                            .text_xs()
+                            .child(format!(
+                                "{} · {} · {} CPU · {} RAM · {} disk",
+                                node.name,
+                                if node.online { "online" } else { "offline" },
+                                resources.cpu_count,
+                                format_bytes(resources.memory_available_bytes),
+                                format_bytes(resources.disk_available_bytes),
+                            ))
+                            .child(format!("{} capabilities", node.capabilities.iter().count()))
+                    })),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(30.))
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x171c25))
+                            .border_1()
+                            .border_color(rgb(0x293244))
+                            .text_xs()
+                            .text_color(rgb(0xb7c0d0))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_composer))
+                            .child(TextInputElement {
+                                view: cx.entity(),
+                                field: InputField::Node,
+                            }),
+                    )
+                    .child(
+                        Button::new("connect-worker-node")
+                            .label("Connect")
+                            .small()
+                            .on_click(cx.listener(|view, _, _, cx| view.connect_worker_node(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child("Use: ws://host:port/ws token"),
+            )
             .child(
                 div()
                     .mt_3()

@@ -182,6 +182,7 @@ pub(crate) struct TextInputElement {
 pub(crate) enum InputField {
     Composer,
     Rename,
+    Node,
 }
 
 pub(crate) struct TextInputPrepaint {
