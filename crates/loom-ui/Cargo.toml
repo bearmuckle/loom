@@ -11,12 +11,7 @@ name = "loom-ui"
 path = "src/main.rs"
 
 [dependencies]
-gpui.workspace = true
-gpui_platform.workspace = true
-gpui-base.workspace = true
-gpui-component.workspace = true
-gpui-kit-assets.workspace = true
-native-theme-gpui.workspace = true
+gpui-kit.workspace = true
 loom-core.workspace = true
 loom-model.workspace = true
 loom-protocol.workspace = true

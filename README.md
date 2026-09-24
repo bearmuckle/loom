@@ -61,6 +61,19 @@ The wasm binary is a browser-hosted GPUI client; native-only workspace,
 process, and credential integrations remain available through the remote
 backend boundary.
 
+Run the backend and browser client together for local WASM development:
+
+```text
+./scripts/dev-wasm.sh
+```
+
+The launcher starts a deterministic/demo backend on `127.0.0.1:8765`, waits
+for its health endpoint, then starts Trunk from `crates/loom-ui` on
+`127.0.0.1:8080`. It prints a complete URL containing the WebSocket token and
+workspace path; open that URL in a browser. Press `Ctrl-C` to stop both
+processes. Set `LOOM_MODEL`, `LOOM_TOKEN`, `LOOM_BACKEND_BIND`,
+`LOOM_FRONTEND_PORT`, or `LOOM_WORKSPACE` to override the local defaults.
+
 Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
 `LOOM_MODEL`, or connect to a remote backend with `LOOM_REMOTE_URL` and
 `LOOM_TOKEN`. GitHub Copilot login is available in the UI.

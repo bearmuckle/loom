@@ -18,6 +18,15 @@ members = [
 ]
 resolver = "2"
 
+# CI builds the full GPUI/wgpu stack in debug mode, which produces very large
+# incremental artifacts and can exhaust the CI runner's disk. Line-tables-only
+# debug info keeps panic backtraces useful while cutting target/ size sharply.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [workspace.package]
 edition = "2024"
 license = "MIT"
@@ -49,12 +58,7 @@ git2 = "0.21.0"
 portable-pty = "0.9.0"
 subtle = "2.6.1"
 tiktoken-rs = "0.12.0"
-gpui = { package = "gpui-pre", version = "0.3.5" }
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
-gpui-base = "0.6.1"
-gpui-component = "0.6.1"
-gpui-kit-assets = "0.6.1"
-native-theme-gpui = "0.5.8"
+gpui-kit = "0.6.6"
 open = "5.4.4"
 ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
 uuid = { version = "1.26.1", features = ["serde", "v4"] }

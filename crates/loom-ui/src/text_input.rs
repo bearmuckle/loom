@@ -2,7 +2,7 @@
 
 use std::ops::Range;
 
-use gpui::{
+use gpui_kit::{
     App, Bounds, Context, Element, ElementId, ElementInputHandler, Entity, GlobalElementId,
     LayoutId, PaintQuad, Pixels, Render, ShapedLine, SharedString, Style, TextAlign, TextRun,
     Window, actions, div, fill, point, prelude::*, px, relative, size,
@@ -233,7 +233,7 @@ impl Element for TextInputElement {
     fn request_layout(
         &mut self,
         _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
+        _inspector_id: Option<&gpui_kit::InspectorElementId>,
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
@@ -251,7 +251,7 @@ impl Element for TextInputElement {
     fn prepaint(
         &mut self,
         _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
+        _inspector_id: Option<&gpui_kit::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         window: &mut Window,
@@ -348,7 +348,7 @@ impl Element for TextInputElement {
     fn paint(
         &mut self,
         _id: Option<&GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
+        _inspector_id: Option<&gpui_kit::InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         prepaint: &mut Self::PrepaintState,
