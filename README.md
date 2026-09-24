@@ -38,18 +38,22 @@ Demo mode:
 cargo run -p loom-ui -- --demo
 ```
 
-Run the same checks used by CI:
+Run the full Rust check suite locally:
 
 ```text
 ./scripts/ci-check.sh
 ```
 
-To run those checks automatically before every push, enable the repository
+To check formatting automatically before every commit, enable the repository
 hook once:
 
 ```text
 git config core.hooksPath .githooks
 ```
+
+The commit hook runs `cargo fmt --all -- --check` without compiling Rust. The
+full Clippy, test, and build checks run in CI and can be run locally with
+`./scripts/ci-check.sh`.
 
 Browser target (GPUI currently requires a nightly compiler for wasm atomics):
 

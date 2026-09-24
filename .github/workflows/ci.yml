@@ -15,6 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # Incremental artifacts are never reused in a one-shot CI build and
+      # roughly double target/ size; disabling them avoids exhausting the
+      # runner's disk on this dependency-heavy (GPUI/wgpu) workspace.
+      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v4
       - name: Install native UI dependencies
@@ -34,10 +39,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - name: Run Rust checks
-        env:
-          # Incremental artifacts are never reused in a one-shot CI build and
-          # roughly double target/ size; disabling them avoids exhausting the
-          # runner's disk on this dependency-heavy (GPUI/wgpu) workspace.
-          CARGO_INCREMENTAL: "0"
-        run: ./scripts/ci-check.sh
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --all-features --locked
+      - name: Build application binaries
+        if: github.event_name == 'pull_request'
+        run: cargo build -p loom-ui -p loom-cli --locked
+      - name: Build workspace
+        if: github.event_name == 'push'
+        run: cargo build --workspace --locked
