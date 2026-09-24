@@ -33,4 +33,9 @@ jobs:
         with:
           cache-on-failure: true
       - name: Run Rust checks
+        env:
+          # Incremental artifacts are never reused in a one-shot CI build and
+          # roughly double target/ size; disabling them avoids exhausting the
+          # runner's disk on this dependency-heavy (GPUI/wgpu) workspace.
+          CARGO_INCREMENTAL: "0"
         run: ./scripts/ci-check.sh

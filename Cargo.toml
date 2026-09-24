@@ -18,6 +18,15 @@ members = [
 ]
 resolver = "2"
 
+# CI builds the full GPUI/wgpu stack in debug mode, which produces very large
+# incremental artifacts and can exhaust the CI runner's disk. Line-tables-only
+# debug info keeps panic backtraces useful while cutting target/ size sharply.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [workspace.package]
 edition = "2024"
 license = "MIT"
