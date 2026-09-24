@@ -77,6 +77,8 @@ for its health endpoint, then starts Trunk from `crates/loom-ui` on
 workspace path; open that URL in a browser. Press `Ctrl-C` to stop both
 processes. Set `LOOM_MODEL`, `LOOM_TOKEN`, `LOOM_BACKEND_BIND`,
 `LOOM_FRONTEND_PORT`, or `LOOM_WORKSPACE` to override the local defaults.
+Without a URL or saved worker connection, the full client opens disconnected;
+connect a worker from Settings. Worker settings are saved in browser storage.
 
 The browser client is deployed to Vercel on pushes to `main` and can also be
 published manually from the Actions tab. Configure a Vercel project and the

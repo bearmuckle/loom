@@ -32,6 +32,29 @@ pub(crate) struct BrowserOptions {
 }
 
 impl BrowserOptions {
+    pub(crate) fn empty() -> Self {
+        Self {
+            remote: String::new(),
+            token: String::new(),
+            workspace: None,
+            model: None,
+        }
+    }
+
+    pub(crate) fn from_connection(
+        remote: String,
+        token: String,
+        workspace: Option<String>,
+        model: Option<ModelId>,
+    ) -> Self {
+        Self {
+            remote,
+            token,
+            workspace,
+            model,
+        }
+    }
+
     pub(crate) fn from_location() -> Result<Self, LoomError> {
         let window = web_sys::window()
             .ok_or_else(|| LoomError::invalid_request("no browser window is available"))?;
@@ -81,27 +104,8 @@ impl BrowserOptions {
         self.model.as_ref()
     }
 
-    pub(crate) fn connect_interactively(&mut self) -> Result<(), LoomError> {
-        if self.remote.is_empty() {
-            self.remote = web_sys::window()
-                .ok_or_else(|| LoomError::invalid_request("no browser window is available"))?
-                .prompt_with_message("Loom worker WebSocket URL")
-                .map_err(|_| LoomError::invalid_request("could not open the connection prompt"))?
-                .ok_or_else(|| LoomError::invalid_request("worker connection was cancelled"))?;
-        }
-        if self.token.is_empty() {
-            self.token = web_sys::window()
-                .ok_or_else(|| LoomError::invalid_request("no browser window is available"))?
-                .prompt_with_message("Loom worker access token")
-                .map_err(|_| LoomError::invalid_request("could not open the token prompt"))?
-                .ok_or_else(|| LoomError::invalid_request("worker connection was cancelled"))?;
-        }
-        if self.remote.trim().is_empty() || self.token.trim().is_empty() {
-            return Err(LoomError::invalid_request(
-                "worker URL and access token must not be empty",
-            ));
-        }
-        Ok(())
+    pub(crate) fn is_configured(&self) -> bool {
+        !self.remote.trim().is_empty() && !self.token.trim().is_empty()
     }
 
     pub(crate) fn persist_connection(&self) -> Result<(), LoomError> {

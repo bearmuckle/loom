@@ -27,11 +27,11 @@ use gpui_kit::{
     Bounds, TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowDecorations, WindowOptions, point, px, size,
 };
+#[cfg(not(target_family = "wasm"))]
 use log::{error, info};
 
+#[cfg(not(target_family = "wasm"))]
 use crate::connection::describe_startup_connection_error;
-#[cfg(target_family = "wasm")]
-use crate::connection::redact_secret;
 use crate::text_input::{
     Backspace, Copy, Delete, End, Home, Left, Paste, Right, SelectAll, Submit,
 };
@@ -180,50 +180,41 @@ fn log_error(context: &str, error: impl std::fmt::Display) {
     log::error!("{context}: {error}");
 }
 
-/// Connects to the remote backend and opens the same `LoomView` the native
-/// client uses, once bootstrap has resolved a project/session/model. This
-/// runs as a foreground task (not `background_spawn`) since it drives the
-/// `!Send` browser WebSocket transport directly.
+/// Opens the browser workspace before any worker is connected. Initial
+/// connection settings are submitted through the app's regular Settings UI.
 #[cfg(target_family = "wasm")]
-async fn start_browser_client(cx: &mut gpui_kit::AsyncApp) {
-    let mut options = match BrowserOptions::from_location() {
-        Ok(options) => options,
-        Err(error) => return log_error("could not read startup options", error),
-    };
-    if let Err(error) = options.connect_interactively() {
-        return log_error(
-            "could not connect to a worker",
-            redact_secret(&error.to_string(), options.token()),
-        );
-    }
-    let (composer_focus_handle, rename_focus_handle) =
-        cx.update(|cx| (cx.focus_handle(), cx.focus_handle()));
-    let view = match LoomView::try_new_browser(&options, composer_focus_handle, rename_focus_handle)
-        .await
-    {
-        Ok(view) => view,
+fn start_browser_client(cx: &mut App) {
+    let (options, startup_error) = match BrowserOptions::from_location() {
+        Ok(options) => (options, None),
         Err(error) => {
-            return log_error(
-                "could not connect to the backend",
-                describe_startup_connection_error(&error, options.token()),
-            );
+            log_error("could not read saved worker settings", &error);
+            (BrowserOptions::empty(), Some(error.to_string()))
         }
     };
-    let active_session = view.active_session.clone();
+    let focus_handle = cx.focus_handle();
+    let rename_focus_handle = cx.focus_handle();
+    let auto_connect = options.is_configured();
+    let view = LoomView::new_browser_disconnected(
+        &options,
+        startup_error,
+        focus_handle,
+        rename_focus_handle,
+    );
     let window = match cx.open_window(Default::default(), |_, cx| cx.new(|_| view)) {
         Ok(window) => window,
-        Err(error) => return log_error("failed to open Loom window", error),
+        Err(error) => {
+            return log_error("failed to open Loom window", error);
+        }
     };
-    let updated = window.update(cx, |view, window, cx| {
+    if let Err(error) = window.update(cx, |view, window, cx| {
         view.observe_system_appearance(window, cx);
         view.composer_focus_handle.focus(window, cx);
         view.select_theme(crate::state::ThemeChoice::System, window, cx);
-        view.reload_sessions(cx);
-        view.refresh_models_async(cx);
-        view.select_session(active_session, cx);
         cx.activate(true);
-    });
-    if let Err(error) = updated {
+        if auto_connect {
+            view.connect_worker_node(cx);
+        }
+    }) {
         log_error("failed to finish initializing the Loom window", error);
     }
 }
@@ -249,8 +240,7 @@ pub fn start() {
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
         crate::theme::sync_palette(cx);
         bind_composer_keys(cx);
-        cx.spawn(async move |cx| start_browser_client(cx).await)
-            .detach();
+        start_browser_client(cx);
     });
     APPLICATION.with(|slot| *slot.borrow_mut() = Some(application));
 }
