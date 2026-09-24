@@ -15,6 +15,10 @@ const SUCCESS_SURFACE: u32 = 0x263d36;
 const DANGER_SURFACE: u32 = 0x452b36;
 const WARNING_SURFACE: u32 = 0x433a2d;
 const INFO_SURFACE: u32 = 0x392f4b;
+const SUCCESS_SURFACE_LATTE: u32 = 0xdcebd8;
+const DANGER_SURFACE_LATTE: u32 = 0xf5dce1;
+const WARNING_SURFACE_LATTE: u32 = 0xf6e8ce;
+const INFO_SURFACE_LATTE: u32 = 0xe9defa;
 
 /// GPUI content masks are axis-aligned rectangles, so a rounded parent cannot clip a
 /// square child. Every element that paints a background into a window corner therefore
@@ -60,6 +64,7 @@ struct ThemePalette {
     foreground: Rgba,
     muted_foreground: Rgba,
     accent: Rgba,
+    accent_foreground: Rgba,
     accent_hover: Rgba,
     success: Rgba,
     danger: Rgba,
@@ -86,6 +91,7 @@ impl ThemePalette {
             foreground: colors.foreground.into(),
             muted_foreground: colors.muted_foreground.into(),
             accent: colors.primary.into(),
+            accent_foreground: colors.primary_foreground.into(),
             accent_hover: colors.primary_hover.into(),
             success: colors.success.into(),
             danger: colors.danger.into(),
@@ -94,22 +100,22 @@ impl ThemePalette {
             success_surface: if theme.is_dark() {
                 gpui_kit::rgb(SUCCESS_SURFACE)
             } else {
-                colors.success.into()
+                gpui_kit::rgb(SUCCESS_SURFACE_LATTE)
             },
             danger_surface: if theme.is_dark() {
                 gpui_kit::rgb(DANGER_SURFACE)
             } else {
-                colors.danger.into()
+                gpui_kit::rgb(DANGER_SURFACE_LATTE)
             },
             warning_surface: if theme.is_dark() {
                 gpui_kit::rgb(WARNING_SURFACE)
             } else {
-                colors.warning.into()
+                gpui_kit::rgb(WARNING_SURFACE_LATTE)
             },
             info_surface: if theme.is_dark() {
                 gpui_kit::rgb(INFO_SURFACE)
             } else {
-                colors.info.into()
+                gpui_kit::rgb(INFO_SURFACE_LATTE)
             },
             selection: colors.selection.into(),
         }
@@ -124,7 +130,8 @@ impl ThemePalette {
             0x293b56 => self.control_hover,
             0x242833 | 0x30343f => self.border,
             0x3b4555 | 0x3b5d85 => self.border_strong,
-            0xe5e7eb | 0xf3f4f6 | 0xcbd5e1 | 0xdbeafe | 0xffffff => self.foreground,
+            0xe5e7eb | 0xf3f4f6 | 0xcbd5e1 | 0xdbeafe => self.foreground,
+            0xffffff => self.accent_foreground,
             0x64748b | 0x8f98a6 | 0x94a3b8 | 0xb7c0d0 => self.muted_foreground,
             0x93c5fd | 0xbfdbfe | 0x60a5fa | 0x2563eb => self.accent,
             0x1d4ed8 => self.accent_hover,
@@ -240,6 +247,103 @@ fn mocha_theme() -> Rc<ThemeConfig> {
     })
 }
 
+fn latte_theme() -> Rc<ThemeConfig> {
+    let mut colors = ThemeConfigColors::default();
+    colors.accent = Some("#1e66f5".into());
+    colors.accent_foreground = Some("#ffffff".into());
+    colors.background = Some("#eff1f5".into());
+    colors.border = Some("#ccd0da".into());
+    colors.button = Some("#e6e9ef".into());
+    colors.button_active = Some("#bcc0cc".into());
+    colors.button_foreground = Some("#4c4f69".into());
+    colors.button_hover = Some("#ccd0da".into());
+    colors.button_danger = Some("#f5dce1".into());
+    colors.button_danger_active = Some("#edc8d0".into());
+    colors.button_danger_foreground = Some("#4c4f69".into());
+    colors.button_danger_hover = Some("#edc8d0".into());
+    colors.button_info = Some("#e9defa".into());
+    colors.button_info_active = Some("#dfcff7".into());
+    colors.button_info_foreground = Some("#4c4f69".into());
+    colors.button_info_hover = Some("#dfcff7".into());
+    colors.button_primary = Some("#1e66f5".into());
+    colors.button_primary_active = Some("#1e5fcc".into());
+    colors.button_primary_foreground = Some("#ffffff".into());
+    colors.button_primary_hover = Some("#1e5fcc".into());
+    colors.button_secondary = Some("#e6e9ef".into());
+    colors.button_secondary_active = Some("#bcc0cc".into());
+    colors.button_secondary_foreground = Some("#4c4f69".into());
+    colors.button_secondary_hover = Some("#ccd0da".into());
+    colors.button_success = Some("#dcebd8".into());
+    colors.button_success_active = Some("#c8dfc3".into());
+    colors.button_success_foreground = Some("#4c4f69".into());
+    colors.button_success_hover = Some("#c8dfc3".into());
+    colors.button_warning = Some("#f6e8ce".into());
+    colors.button_warning_active = Some("#efddb8".into());
+    colors.button_warning_foreground = Some("#4c4f69".into());
+    colors.button_warning_hover = Some("#efddb8".into());
+    colors.danger = Some("#b01234".into());
+    colors.danger_active = Some("#a70f30".into());
+    colors.danger_foreground = Some("#ffffff".into());
+    colors.danger_hover = Some("#b01234".into());
+    colors.foreground = Some("#4c4f69".into());
+    colors.info = Some("#7733d1".into());
+    colors.info_active = Some("#6d2fc1".into());
+    colors.info_foreground = Some("#ffffff".into());
+    colors.info_hover = Some("#7733d1".into());
+    colors.input = Some("#bcc0cc".into());
+    colors.link = Some("#1e66f5".into());
+    colors.link_active = Some("#1e5fcc".into());
+    colors.link_hover = Some("#7287fd".into());
+    colors.list = Some("#eff1f5".into());
+    colors.list_active = Some("#dce0e8".into());
+    colors.list_active_border = Some("#1e66f5".into());
+    colors.list_hover = Some("#e6e9ef".into());
+    colors.muted = Some("#e6e9ef".into());
+    colors.muted_foreground = Some("#6c6f85".into());
+    colors.popover = Some("#eff1f5".into());
+    colors.popover_foreground = Some("#4c4f69".into());
+    colors.primary = Some("#1e66f5".into());
+    colors.primary_active = Some("#1e5fcc".into());
+    colors.primary_foreground = Some("#ffffff".into());
+    colors.primary_hover = Some("#1e5fcc".into());
+    colors.ring = Some("#1e66f5".into());
+    colors.scrollbar = Some("#e6e9ef".into());
+    colors.scrollbar_thumb = Some("#bcc0cc".into());
+    colors.scrollbar_thumb_hover = Some("#acb0be".into());
+    colors.secondary = Some("#e6e9ef".into());
+    colors.secondary_active = Some("#bcc0cc".into());
+    colors.secondary_foreground = Some("#4c4f69".into());
+    colors.secondary_hover = Some("#ccd0da".into());
+    colors.selection = Some("#bcc0cc".into());
+    colors.sidebar = Some("#e6e9ef".into());
+    colors.sidebar_accent = Some("#dce0e8".into());
+    colors.sidebar_accent_foreground = Some("#4c4f69".into());
+    colors.sidebar_border = Some("#ccd0da".into());
+    colors.sidebar_foreground = Some("#4c4f69".into());
+    colors.sidebar_primary = Some("#1e66f5".into());
+    colors.sidebar_primary_foreground = Some("#ffffff".into());
+    colors.success = Some("#2c7025".into());
+    colors.success_active = Some("#24621e".into());
+    colors.success_foreground = Some("#ffffff".into());
+    colors.success_hover = Some("#327a2b".into());
+    colors.warning = Some("#8a5a00".into());
+    colors.warning_active = Some("#784e00".into());
+    colors.warning_foreground = Some("#ffffff".into());
+    colors.warning_hover = Some("#9a6700".into());
+    colors.title_bar = Some("#e6e9ef".into());
+    colors.title_bar_border = Some("#ccd0da".into());
+    colors.status_bar = Some("#e6e9ef".into());
+    colors.status_bar_border = Some("#ccd0da".into());
+    colors.window_border = Some("#ccd0da".into());
+
+    Rc::new(ThemeConfig {
+        name: "Loom Latte".into(),
+        mode: ThemeMode::Light,
+        colors,
+        ..Default::default()
+    })
+}
+
 thread_local! {
     static ACTIVE_THEME: RefCell<Option<ThemePalette>> = const { RefCell::new(None) };
 }
@@ -273,11 +377,15 @@ pub(crate) fn selection() -> Rgba {
 
 pub(crate) fn apply_theme(appearance: WindowAppearance, cx: &mut App) {
     gpui_kit::component::Theme::change(appearance, None, cx);
-    if Theme::global(cx).is_dark() {
-        let theme = mocha_theme();
-        Theme::global_mut(cx).apply_config(&theme);
-        Theme::change(ThemeMode::Dark, None, cx);
-    }
+    let dark = Theme::global(cx).is_dark();
+    let theme = if dark { mocha_theme() } else { latte_theme() };
+    let mode = if dark {
+        ThemeMode::Dark
+    } else {
+        ThemeMode::Light
+    };
+    Theme::global_mut(cx).apply_config(&theme);
+    Theme::change(mode, None, cx);
     sync_palette(cx);
 }
 
@@ -329,8 +437,9 @@ pub(crate) fn resize_edge(
 #[cfg(test)]
 mod tests {
     use super::{
-        DANGER_SURFACE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND, ERROR_CARD_SURFACE, INFO_SURFACE,
-        SUCCESS_SURFACE, WARNING_SURFACE,
+        DANGER_SURFACE, DANGER_SURFACE_LATTE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
+        ERROR_CARD_SURFACE, INFO_SURFACE, INFO_SURFACE_LATTE, SUCCESS_SURFACE,
+        SUCCESS_SURFACE_LATTE, WARNING_SURFACE, WARNING_SURFACE_LATTE,
     };
 
     fn luminance(value: f32) -> f32 {
@@ -369,5 +478,9 @@ mod tests {
         assert!(contrast_ratio(0xf38ba8, DANGER_SURFACE) >= 4.5);
         assert!(contrast_ratio(0xf9e2af, WARNING_SURFACE) >= 4.5);
         assert!(contrast_ratio(0xcba6f7, INFO_SURFACE) >= 4.5);
+        assert!(contrast_ratio(0x2c7025, SUCCESS_SURFACE_LATTE) >= 4.5);
+        assert!(contrast_ratio(0xb01234, DANGER_SURFACE_LATTE) >= 4.5);
+        assert!(contrast_ratio(0x8a5a00, WARNING_SURFACE_LATTE) >= 4.5);
+        assert!(contrast_ratio(0x7733d1, INFO_SURFACE_LATTE) >= 4.5);
     }
 }
