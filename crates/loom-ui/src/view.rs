@@ -60,6 +60,33 @@ use crate::{
         ERROR_CARD_SURFACE, change_color, resize_edge, rgb, state_color,
     },
 };
+
+const COMPACT_LAYOUT_WIDTH: Pixels = px(960.);
+const COMPACT_SIDEBAR_WIDTH: Pixels = px(200.);
+const FULL_SIDEBAR_WIDTH: Pixels = px(250.);
+const COMPACT_REVIEW_WIDTH: Pixels = px(280.);
+const FULL_REVIEW_WIDTH: Pixels = px(340.);
+
+#[derive(Clone, Copy, Debug)]
+struct ResponsiveLayout {
+    sidebar_width: Pixels,
+    review_width: Pixels,
+}
+
+fn responsive_layout(width: Pixels) -> ResponsiveLayout {
+    if width < COMPACT_LAYOUT_WIDTH {
+        ResponsiveLayout {
+            sidebar_width: COMPACT_SIDEBAR_WIDTH,
+            review_width: COMPACT_REVIEW_WIDTH,
+        }
+    } else {
+        ResponsiveLayout {
+            sidebar_width: FULL_SIDEBAR_WIDTH,
+            review_width: FULL_REVIEW_WIDTH,
+        }
+    }
+}
+
 #[cfg(target_family = "wasm")]
 use crate::{
     browser::BrowserOptions,
@@ -5181,7 +5208,7 @@ impl LoomView {
     }
 
     pub(crate) fn render_model_picker(&self) -> impl IntoElement {
-        let mut picker = div().w_full();
+        let mut picker = div().flex_1().min_w(px(120.)).w_full();
         if let Some(state) = &self.model_select {
             picker = picker.child(
                 Select::new(state)
@@ -5664,7 +5691,12 @@ impl LoomView {
         timeline_view
     }
 
-    pub(crate) fn render_review(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_review(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let layout = responsive_layout(window.bounds().size.width);
         let title = match self.review.panel {
             ReviewPanel::Changes => "Changed files",
             ReviewPanel::Diff => "Diff",
@@ -5841,7 +5873,7 @@ impl LoomView {
             }
         }
         div()
-            .w(px(340.))
+            .w(layout.review_width)
             .h_full()
             .flex()
             .flex_col()
@@ -5950,19 +5982,27 @@ impl LoomView {
                     }),
             )
             .child(
-                div().mt_2().flex().items_center().justify_between().child(
-                    div()
-                        .flex()
-                        .relative()
-                        .items_center()
-                        .gap_1()
-                        .child(self.render_agent_mode_picker())
-                        .child(self.render_model_picker())
-                        .when(self.sending_message, |element| {
-                            element
-                                .child(div().text_xs().text_color(rgb(0x64748b)).child("Working…"))
-                        }),
-                ),
+                div()
+                    .mt_2()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .relative()
+                            .items_center()
+                            .gap_1()
+                            .child(self.render_agent_mode_picker())
+                            .child(self.render_model_picker())
+                            .when(self.sending_message, |element| {
+                                element.child(
+                                    div().text_xs().text_color(rgb(0x64748b)).child("Working…"),
+                                )
+                            }),
+                    ),
             )
     }
 
@@ -6817,7 +6857,8 @@ impl LoomView {
     }
 
     #[cfg(target_family = "wasm")]
-    fn render_disconnected(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_disconnected(&self, window: &Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let layout = responsive_layout(window.bounds().size.width);
         div()
             .size_full()
             .relative()
@@ -6844,7 +6885,7 @@ impl LoomView {
                     .overflow_hidden()
                     .child(
                         div()
-                            .w(px(250.))
+                            .w(layout.sidebar_width)
                             .h_full()
                             .p_2()
                             .flex()
@@ -7026,7 +7067,7 @@ impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(target_family = "wasm")]
         if !self.connected {
-            return self.render_disconnected(cx);
+            return self.render_disconnected(window, cx);
         }
         #[cfg(target_family = "wasm")]
         if !self.browser_window_initialized {
@@ -7040,6 +7081,7 @@ impl Render for LoomView {
         self.sync_agent_mode_select_state(window, cx);
         self.schedule_run_poll(cx);
         let view = cx.entity();
+        let layout = responsive_layout(window.bounds().size.width);
         let project_name = self
             .project
             .as_ref()
@@ -7149,7 +7191,7 @@ impl Render for LoomView {
                     .overflow_hidden()
                     .child(
                         div()
-                            .w(px(250.))
+                            .w(layout.sidebar_width)
                             .h_full()
                             .relative()
                             .p_2()
@@ -7551,7 +7593,7 @@ impl Render for LoomView {
                             && !self.about_open
                             && !self.providers_open
                             && self.github_login.is_none(),
-                        |element| element.child(self.render_review(cx)),
+                        |element| element.child(self.render_review(window, cx)),
                     ),
             )
             .child(
@@ -7654,6 +7696,29 @@ impl Render for LoomView {
                 }),
         }
         .into_any()
+    }
+}
+
+#[cfg(test)]
+mod responsive_layout_tests {
+    use super::{
+        COMPACT_REVIEW_WIDTH, COMPACT_SIDEBAR_WIDTH, FULL_REVIEW_WIDTH, FULL_SIDEBAR_WIDTH,
+        responsive_layout,
+    };
+    use gpui_kit::px;
+
+    #[test]
+    fn compact_windows_use_narrower_navigation_panels() {
+        let layout = responsive_layout(px(959.));
+        assert_eq!(layout.sidebar_width, COMPACT_SIDEBAR_WIDTH);
+        assert_eq!(layout.review_width, COMPACT_REVIEW_WIDTH);
+    }
+
+    #[test]
+    fn wide_windows_keep_full_navigation_panels() {
+        let layout = responsive_layout(px(960.));
+        assert_eq!(layout.sidebar_width, FULL_SIDEBAR_WIDTH);
+        assert_eq!(layout.review_width, FULL_REVIEW_WIDTH);
     }
 }
 
