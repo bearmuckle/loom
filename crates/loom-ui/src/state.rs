@@ -33,38 +33,16 @@ pub(crate) enum ThemeChoice {
     System,
     Light,
     Dark,
-    Preset(&'static str, &'static str),
 }
 
 impl ThemeChoice {
-    pub(crate) const ALL: [Self; 19] = [
-        Self::System,
-        Self::Light,
-        Self::Dark,
-        Self::Preset("kde-breeze", "KDE Breeze"),
-        Self::Preset("adwaita", "Adwaita"),
-        Self::Preset("windows-11", "Windows 11"),
-        Self::Preset("macos-sonoma", "macOS Sonoma"),
-        Self::Preset("material", "Material"),
-        Self::Preset("ios", "iOS"),
-        Self::Preset("catppuccin-latte", "Catppuccin Latte"),
-        Self::Preset("catppuccin-frappe", "Catppuccin Frappe"),
-        Self::Preset("catppuccin-macchiato", "Catppuccin Macchiato"),
-        Self::Preset("catppuccin-mocha", "Catppuccin Mocha"),
-        Self::Preset("nord", "Nord"),
-        Self::Preset("dracula", "Dracula"),
-        Self::Preset("gruvbox", "Gruvbox"),
-        Self::Preset("solarized", "Solarized"),
-        Self::Preset("tokyo-night", "Tokyo Night"),
-        Self::Preset("one-dark", "One Dark"),
-    ];
+    pub(crate) const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::System => "System",
             Self::Light => "Light",
             Self::Dark => "Dark",
-            Self::Preset(_, label) => label,
         }
     }
 }

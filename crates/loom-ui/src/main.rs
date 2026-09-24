@@ -8,6 +8,8 @@
 //! (`platform`).
 
 #[cfg(target_family = "wasm")]
+mod assets;
+#[cfg(target_family = "wasm")]
 mod browser;
 mod connection;
 #[cfg(not(target_family = "wasm"))]
@@ -19,9 +21,9 @@ mod view;
 
 #[cfg(target_family = "wasm")]
 use crate::{browser::BrowserOptions, view::LoomView};
-use gpui::{App, KeyBinding, prelude::*};
+use gpui_kit::{App, KeyBinding, prelude::*};
 #[cfg(not(target_family = "wasm"))]
-use gpui::{
+use gpui_kit::{
     Bounds, TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowDecorations, WindowOptions, point, px, size,
 };
@@ -91,18 +93,12 @@ fn main() {
         },
         options.model.as_str()
     );
-    gpui_platform::application()
-        .with_assets(gpui_kit_assets::AllAssets)
+    gpui_kit::platform::application()
+        .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx: &mut App| {
             info!("initializing GPUI components");
-            gpui_component::init(cx);
-            if let Err(error) =
-                crate::theme::apply_preset_theme("catppuccin-mocha", WindowAppearance::Dark, cx)
-            {
-                log::warn!("could not load the default theme: {error}");
-                gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-                crate::theme::sync_palette(cx);
-            }
+            gpui_kit::init(cx);
+            crate::theme::apply_theme(WindowAppearance::Dark, cx);
             bind_composer_keys(cx);
             let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
                 Ok(view) => view,
@@ -165,7 +161,7 @@ fn main() {
 // since the wasm module lives as long as the page does.
 #[cfg(target_family = "wasm")]
 thread_local! {
-    static APPLICATION: std::cell::RefCell<Option<gpui::ApplicationHandle>> =
+    static APPLICATION: std::cell::RefCell<Option<gpui_kit::ApplicationHandle>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -179,7 +175,7 @@ fn log_error(context: &str, error: impl std::fmt::Display) {
 /// runs as a foreground task (not `background_spawn`) since it drives the
 /// `!Send` browser WebSocket transport directly.
 #[cfg(target_family = "wasm")]
-async fn start_browser_client(cx: &mut gpui::AsyncApp) {
+async fn start_browser_client(cx: &mut gpui_kit::AsyncApp) {
     let options = match BrowserOptions::from_location() {
         Ok(options) => options,
         Err(error) => return log_error("could not read startup options", error),
@@ -215,24 +211,25 @@ async fn start_browser_client(cx: &mut gpui::AsyncApp) {
 #[wasm_bindgen::prelude::wasm_bindgen(start)]
 pub fn start() {
     init_logging();
-    gpui_platform::web_init();
-    let application =
-        gpui_platform::application_with_web_backend(gpui_platform::WebBackendPreference::WebGl)
-            .with_assets(gpui_kit_assets::Assets::default())
-            .run_embedded(|cx: &mut App| {
-                // The web platform starts with an empty font database; without this the
-                // text system panics as soon as it tries to shape any text.
-                cx.text_system()
-                    .add_fonts(vec![std::borrow::Cow::Borrowed(
-                        include_bytes!("../assets/fonts/DejaVuSans.ttf").as_slice(),
-                    )])
-                    .expect("failed to load embedded font");
-                gpui_component::init(cx);
-                gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-                crate::theme::sync_palette(cx);
-                bind_composer_keys(cx);
-                cx.spawn(async move |cx| start_browser_client(cx).await)
-                    .detach();
-            });
+    gpui_kit::platform::web_init();
+    let application = gpui_kit::platform::application_with_web_backend(
+        gpui_kit::platform::WebBackendPreference::WebGl,
+    )
+    .with_assets(crate::assets::LoomAssets)
+    .run_embedded(|cx: &mut App| {
+        // The web platform starts with an empty font database; without this the
+        // text system panics as soon as it tries to shape any text.
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(
+                include_bytes!("../assets/fonts/DejaVuSans.ttf").as_slice(),
+            )])
+            .expect("failed to load embedded font");
+        gpui_kit::init(cx);
+        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+        crate::theme::sync_palette(cx);
+        bind_composer_keys(cx);
+        cx.spawn(async move |cx| start_browser_client(cx).await)
+            .detach();
+    });
     APPLICATION.with(|slot| *slot.borrow_mut() = Some(application));
 }

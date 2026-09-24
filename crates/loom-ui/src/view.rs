@@ -1,25 +1,27 @@
 //! The GPUI view: session navigator, run canvas, composer, and review drawer.
 
+#[cfg(not(target_family = "wasm"))]
+use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
     path::PathBuf,
-    time::Duration,
 };
 
-use gpui::{
+use gpui_kit::base::{SelectableText, TextSelectionLayer};
+use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::{
+    Icon, IconName, IndexPath, Sizable,
+    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
+    select::{SearchableVec, Select, SelectEvent, SelectState},
+    text::TextView,
+};
+use gpui_kit::{
     App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Decorations, Element, Entity,
     EntityInputHandler, FocusHandle, Focusable, HitboxBehavior, ListAlignment, ListState,
     MouseButton, MouseDownEvent, Pixels, Point, Render, ResizeEdge, Subscription, Tiling,
     UTF16Selection, Window, WindowAppearance, WindowControlArea, canvas, div, list, point,
     prelude::*, px, transparent_black,
-};
-use gpui_base::{SelectableText, TextSelectionLayer};
-use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::{
-    Icon, IconName, Sizable,
-    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
-    text::TextView,
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence,
@@ -71,6 +73,8 @@ use crate::{
     platform::{UiOptions, backend_persistence_path, prepare_workspace, stable_project_id},
 };
 use log::info;
+
+type ModelSelectState = SelectState<SearchableVec<String>>;
 
 /// Opens a URL in a new tab/window. Natively this shells out to the OS's
 /// "open" handler; in the browser it's just `window.open`.
@@ -156,7 +160,7 @@ fn activity_marker(status: AgentActivityStatus) -> &'static str {
     }
 }
 
-fn render_timeline_text(id: String, text: String, color: u32) -> gpui::AnyElement {
+fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyElement {
     let has_markdown = text.lines().any(|line| {
         let line = line.trim_start();
         (line.starts_with('#')
@@ -336,14 +340,23 @@ pub(crate) struct LoomView {
     pub(crate) default_model: ModelId,
     pub(crate) session_models: BTreeMap<AgentSessionId, ModelId>,
     pub(crate) agent_mode: AgentMode,
-    pub(crate) agent_mode_picker_open: bool,
     pub(crate) session_task_cache: BTreeMap<AgentSessionId, String>,
     pub(crate) optimistic_messages: Vec<String>,
     pub(crate) sending_message: bool,
     pub(crate) models: Vec<ModelId>,
-    pub(crate) model_picker_open: bool,
+    model_select: Option<Entity<ModelSelectState>>,
+    default_model_select: Option<Entity<ModelSelectState>>,
+    model_select_subscription: Option<Subscription>,
+    default_model_select_subscription: Option<Subscription>,
+    model_select_items: Vec<String>,
+    default_model_select_items: Vec<String>,
+    model_select_value: Option<String>,
+    default_model_select_value: Option<String>,
+    agent_mode_select: Option<Entity<ModelSelectState>>,
+    agent_mode_select_subscription: Option<Subscription>,
     pub(crate) settings_open: bool,
     pub(crate) providers_open: bool,
+    pub(crate) about_open: bool,
     pub(crate) providers: Vec<ProviderSummary>,
     pub(crate) theme_choice: ThemeChoice,
     appearance_subscription: Option<Subscription>,
@@ -752,15 +765,24 @@ impl LoomView {
             default_model: model.clone(),
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
-            agent_mode_picker_open: false,
             session_task_cache: BTreeMap::new(),
             optimistic_messages: Vec::new(),
             sending_message: false,
             model,
             models,
-            model_picker_open: false,
+            model_select: None,
+            default_model_select: None,
+            model_select_subscription: None,
+            default_model_select_subscription: None,
+            model_select_items: Vec::new(),
+            default_model_select_items: Vec::new(),
+            model_select_value: None,
+            default_model_select_value: None,
+            agent_mode_select: None,
+            agent_mode_select_subscription: None,
             settings_open: false,
             providers_open: false,
+            about_open: false,
             providers: Vec::new(),
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
@@ -874,15 +896,24 @@ impl LoomView {
             default_model: model.clone(),
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
-            agent_mode_picker_open: false,
             session_task_cache: BTreeMap::new(),
             optimistic_messages: Vec::new(),
             sending_message: false,
             model,
             models,
-            model_picker_open: false,
+            model_select: None,
+            default_model_select: None,
+            model_select_subscription: None,
+            default_model_select_subscription: None,
+            model_select_items: Vec::new(),
+            default_model_select_items: Vec::new(),
+            model_select_value: None,
+            default_model_select_value: None,
+            agent_mode_select: None,
+            agent_mode_select_subscription: None,
             settings_open: false,
             providers_open: false,
+            about_open: false,
             providers: Vec::new(),
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
@@ -959,24 +990,37 @@ impl LoomView {
                 return;
             }
         };
+        let mut models = match list_models(&self.connection) {
+            Ok(models) => models,
+            Err(error) => {
+                self.record_status(format!("Could not load available models: {error}"));
+                return;
+            }
+        };
         for provider_id in provider_ids {
             let response = self.connection.request(RequestEnvelope::new(
                 ClientRequest::DiscoverProviderModels {
                     provider_id: provider_id.clone(),
                 },
             ));
-            if let Err(error) = response.result {
-                self.record_status(format!(
-                    "Model refresh unavailable for {}: {}",
+            match response.result {
+                Ok(ServerResponse::Models { models: discovered }) => {
+                    models.extend(discovered.into_iter().map(|model| model.id));
+                }
+                Err(error) => self.record_status(format!(
+                    "Model discovery unavailable for {}: {}",
                     provider_id.as_str(),
                     error.message
-                ));
+                )),
+                Ok(response) => self.record_backend_error(
+                    "model discovery",
+                    unexpected_response("model list", response),
+                ),
             }
         }
-        match list_models(&self.connection) {
-            Ok(models) => self.apply_models(models),
-            Err(error) => self.record_status(format!("Could not refresh models: {error}")),
-        }
+        models.sort();
+        models.dedup();
+        self.apply_models(models);
     }
 
     /// Refreshes the model list from a UI handler, one request at a time, on the
@@ -987,40 +1031,11 @@ impl LoomView {
             ClientRequest::ListProviders,
             |view, response, cx| match response.result {
                 Ok(ServerResponse::Providers { providers }) => {
-                    for provider in providers {
-                        let provider_id = provider.id.clone();
-                        view.dispatch(
-                            cx,
-                            ClientRequest::DiscoverProviderModels {
-                                provider_id: provider_id.clone(),
-                            },
-                            move |view, response, cx| {
-                                if let Err(error) = response.result {
-                                    view.record_status(format!(
-                                        "Model refresh unavailable for {}: {}",
-                                        provider_id.as_str(),
-                                        error.message
-                                    ));
-                                }
-                                view.dispatch(
-                                    cx,
-                                    ClientRequest::ListModels,
-                                    |view, response, _| match response.result {
-                                        Ok(ServerResponse::Models { models }) => view.apply_models(
-                                            models.into_iter().map(|model| model.id).collect(),
-                                        ),
-                                        Err(error) => view.record_status(format!(
-                                            "Could not refresh models: {error}"
-                                        )),
-                                        Ok(response) => view.record_backend_error(
-                                            "model refresh",
-                                            unexpected_response("model list", response),
-                                        ),
-                                    },
-                                );
-                            },
-                        );
-                    }
+                    let models = providers
+                        .iter()
+                        .flat_map(|provider| provider.models.iter().map(|model| model.id.clone()))
+                        .collect();
+                    view.discover_provider_models_async(providers, 0, models, cx);
                 }
                 Err(error) => view.record_status(format!(
                     "Could not list providers for model refresh: {error}"
@@ -1029,6 +1044,45 @@ impl LoomView {
                     "model refresh",
                     unexpected_response("provider list", response),
                 ),
+            },
+        );
+    }
+
+    fn discover_provider_models_async(
+        &mut self,
+        providers: Vec<ProviderSummary>,
+        index: usize,
+        mut models: Vec<ModelId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider) = providers.get(index) else {
+            models.sort();
+            models.dedup();
+            self.apply_models(models);
+            return;
+        };
+        let provider_id = provider.id.clone();
+        self.dispatch(
+            cx,
+            ClientRequest::DiscoverProviderModels {
+                provider_id: provider_id.clone(),
+            },
+            move |view, response, cx| {
+                match response.result {
+                    Ok(ServerResponse::Models { models: discovered }) => {
+                        models.extend(discovered.into_iter().map(|model| model.id));
+                    }
+                    Err(error) => view.record_status(format!(
+                        "Model discovery unavailable for {}: {}",
+                        provider_id.as_str(),
+                        error.message
+                    )),
+                    Ok(response) => view.record_backend_error(
+                        "model discovery",
+                        unexpected_response("model list", response),
+                    ),
+                }
+                view.discover_provider_models_async(providers, index + 1, models, cx);
             },
         );
     }
@@ -1045,8 +1099,9 @@ impl LoomView {
         }
         self.models = models;
         self.record_status(format!(
-            "Model list refreshed ({} available)",
-            self.models.len()
+            "Loaded {} available model{}",
+            self.models.len(),
+            if self.models.len() == 1 { "" } else { "s" }
         ));
     }
 
@@ -1353,6 +1408,17 @@ impl LoomView {
         }
         self.run_poll_scheduled = true;
         cx.spawn(async move |view, cx| {
+            #[cfg(target_family = "wasm")]
+            {
+                let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window
+                            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 250);
+                    }
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            }
+            #[cfg(not(target_family = "wasm"))]
             cx.background_spawn(async {
                 std::thread::sleep(Duration::from_millis(250));
             })
@@ -2092,6 +2158,7 @@ impl LoomView {
         self.github_login = None;
         self.settings_open = false;
         self.providers_open = false;
+        self.about_open = false;
         self.review.open = false;
         self.activate_session(session.clone());
         self.ensure_session_task_message(session.id);
@@ -2348,46 +2415,129 @@ impl LoomView {
         cx.notify();
     }
 
-    pub(crate) fn toggle_model_picker(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.model_picker_open = !self.model_picker_open;
-        cx.notify();
+    fn sync_model_select_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = self
+            .models
+            .iter()
+            .map(|model| model.as_str().to_owned())
+            .collect::<Vec<_>>();
+        let model_value = self.model.as_str().to_owned();
+        let default_model_value = self.default_model.as_str().to_owned();
+        let model_needs_sync = self.model_select_items != items
+            || self.model_select_value.as_deref() != Some(model_value.as_str());
+        let default_model_needs_sync = self.default_model_select_items != items
+            || self.default_model_select_value.as_deref() != Some(default_model_value.as_str());
+
+        if let Some(state) = &self.model_select {
+            if model_needs_sync {
+                state.update(cx, |state, cx| {
+                    state.set_items(SearchableVec::new(items.clone()), window, cx);
+                    state.set_selected_value(&model_value, window, cx);
+                });
+            }
+        } else {
+            let selected_index = items
+                .iter()
+                .position(|item| item == &model_value)
+                .map(|row| IndexPath::default().row(row));
+            let state = cx.new(|cx| {
+                SelectState::new(
+                    SearchableVec::new(items.clone()),
+                    selected_index,
+                    window,
+                    cx,
+                )
+                .searchable(true)
+            });
+            self.model_select_subscription = Some(cx.subscribe(
+                &state,
+                |view, _, event: &SelectEvent<SearchableVec<String>>, cx| {
+                    if let SelectEvent::Confirm(Some(model)) = event {
+                        view.select_model(ModelId::new(model.clone()), cx);
+                    }
+                },
+            ));
+            self.model_select = Some(state);
+        }
+        if model_needs_sync {
+            self.model_select_items = items.clone();
+            self.model_select_value = Some(model_value);
+        }
+
+        if let Some(state) = &self.default_model_select {
+            if default_model_needs_sync {
+                state.update(cx, |state, cx| {
+                    state.set_items(SearchableVec::new(items.clone()), window, cx);
+                    state.set_selected_value(&default_model_value, window, cx);
+                });
+            }
+        } else {
+            let selected_index = items
+                .iter()
+                .position(|item| item == &default_model_value)
+                .map(|row| IndexPath::default().row(row));
+            let state = cx.new(|cx| {
+                SelectState::new(
+                    SearchableVec::new(items.clone()),
+                    selected_index,
+                    window,
+                    cx,
+                )
+                .searchable(true)
+            });
+            self.default_model_select_subscription = Some(cx.subscribe(
+                &state,
+                |view, _, event: &SelectEvent<SearchableVec<String>>, cx| {
+                    if let SelectEvent::Confirm(Some(model)) = event {
+                        view.select_default_model(ModelId::new(model.clone()), cx);
+                    }
+                },
+            ));
+            self.default_model_select = Some(state);
+        }
+        if default_model_needs_sync {
+            self.default_model_select_items = items;
+            self.default_model_select_value = Some(default_model_value);
+        }
     }
 
-    pub(crate) fn refresh_models_button(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.refresh_models_async(cx);
-        cx.notify();
+    fn sync_agent_mode_select_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent_mode_select.is_some() {
+            return;
+        }
+        let items = AgentMode::ALL
+            .into_iter()
+            .map(|mode| mode.label().to_owned())
+            .collect::<Vec<_>>();
+        let selected_index = items
+            .iter()
+            .position(|item| item == self.agent_mode.label())
+            .map(|row| IndexPath::default().row(row));
+        let state =
+            cx.new(|cx| SelectState::new(SearchableVec::new(items), selected_index, window, cx));
+        self.agent_mode_select_subscription = Some(cx.subscribe(
+            &state,
+            |view, _, event: &SelectEvent<SearchableVec<String>>, cx| {
+                if let SelectEvent::Confirm(Some(label)) = event
+                    && let Some(mode) = AgentMode::ALL
+                        .into_iter()
+                        .find(|mode| mode.label() == label)
+                {
+                    view.select_agent_mode(mode, cx);
+                }
+            },
+        ));
+        self.agent_mode_select = Some(state);
     }
 
     pub(crate) fn select_model(&mut self, model: ModelId, cx: &mut Context<Self>) {
         self.session_models
             .insert(self.active_session.id, model.clone());
         self.model = model;
-        self.model_picker_open = false;
-        cx.notify();
-    }
-
-    pub(crate) fn toggle_agent_mode_picker(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.agent_mode_picker_open = !self.agent_mode_picker_open;
         cx.notify();
     }
 
     pub(crate) fn select_agent_mode(&mut self, mode: AgentMode, cx: &mut Context<Self>) {
-        self.agent_mode_picker_open = false;
         let policy = mode.approval_policy();
         self.dispatch(
             cx,
@@ -2412,7 +2562,6 @@ impl LoomView {
 
     pub(crate) fn select_default_model(&mut self, model: ModelId, cx: &mut Context<Self>) {
         self.default_model = model;
-        self.settings_open = false;
         cx.notify();
     }
 
@@ -2420,7 +2569,17 @@ impl LoomView {
         self.github_login = None;
         self.review.open = false;
         self.providers_open = false;
+        self.about_open = false;
         self.settings_open = true;
+        cx.notify();
+    }
+
+    pub(crate) fn open_about_from_menu(&mut self, cx: &mut Context<Self>) {
+        self.github_login = None;
+        self.review.open = false;
+        self.settings_open = false;
+        self.providers_open = false;
+        self.about_open = true;
         cx.notify();
     }
 
@@ -2428,6 +2587,7 @@ impl LoomView {
         self.github_login = None;
         self.review.open = false;
         self.settings_open = false;
+        self.about_open = false;
         self.providers_open = true;
         self.dispatch(
             cx,
@@ -2466,24 +2626,17 @@ impl LoomView {
         cx.notify();
     }
 
+    pub(crate) fn close_about(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.about_open = false;
+        cx.notify();
+    }
+
     pub(crate) fn select_theme(
         &mut self,
         theme: ThemeChoice,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let ThemeChoice::Preset(name, _) = theme {
-            let appearance = window.appearance();
-            cx.set_window_appearance(Some(appearance));
-            if let Err(error) = crate::theme::apply_preset_theme(name, appearance, cx) {
-                self.record_status(format!("could not load theme: {error}"));
-                return;
-            }
-            self.theme_choice = theme;
-            cx.notify();
-            return;
-        }
-
         self.theme_choice = theme;
         let appearance = match theme {
             ThemeChoice::System => {
@@ -2498,7 +2651,6 @@ impl LoomView {
                 cx.set_window_appearance(Some(WindowAppearance::Dark));
                 WindowAppearance::Dark
             }
-            ThemeChoice::Preset(_, _) => unreachable!("preset themes return early"),
         };
         self.apply_appearance(appearance, window, cx);
     }
@@ -2524,15 +2676,7 @@ impl LoomView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let preset = match appearance {
-            WindowAppearance::Dark | WindowAppearance::VibrantDark => "catppuccin-mocha",
-            WindowAppearance::Light | WindowAppearance::VibrantLight => "catppuccin-latte",
-        };
-        if let Err(error) = crate::theme::apply_preset_theme(preset, appearance, cx) {
-            log::warn!("could not apply the default theme: {error}");
-            gpui_component::Theme::change(appearance, None, cx);
-            crate::theme::sync_palette(cx);
-        }
+        crate::theme::apply_theme(appearance, cx);
         cx.notify();
     }
 
@@ -2598,6 +2742,7 @@ impl LoomView {
     ) {
         self.settings_open = false;
         self.providers_open = false;
+        self.about_open = false;
         self.github_login = None;
         self.toggle_changes_sidebar(event, window, cx);
     }
@@ -2703,80 +2848,35 @@ impl LoomView {
         list
     }
 
-    pub(crate) fn render_model_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut picker = div()
-            .w_full()
-            .p_2()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .bg(rgb(0x20242c))
-            .border_1()
-            .border_color(rgb(0x3b4555));
-        for (index, model) in self.models.iter().enumerate() {
-            let model = model.clone();
-            let active = model == self.model;
+    pub(crate) fn render_model_picker(&self) -> impl IntoElement {
+        let mut picker = div().w_full();
+        if let Some(state) = &self.model_select {
             picker = picker.child(
-                div()
-                    .id(("model-option", index))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(if active { rgb(0x293244) } else { rgb(0x1b1d24) })
-                    .text_sm()
-                    .text_color(if active { rgb(0xe5e7eb) } else { rgb(0xb7c0d0) })
-                    .cursor_pointer()
-                    .child(model.as_str().to_owned())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_model(model.clone(), cx);
-                    })),
-            );
-        }
-        if self.models.is_empty() {
-            picker = picker.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0xfca5a5))
-                    .child("No model is configured"),
+                Select::new(state)
+                    .id("session-model-select")
+                    .w_full()
+                    .small()
+                    .accessibility_label("Model for this session")
+                    .placeholder("No model is configured")
+                    .search_placeholder("Search models"),
             );
         }
         picker
     }
 
-    pub(crate) fn render_agent_mode_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut picker = div()
-            .absolute()
-            .bottom(px(34.))
-            .left(px(8.))
-            .w(px(140.))
-            .p_1()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .rounded_sm()
-            .bg(rgb(0x20242c))
-            .border_1()
-            .border_color(rgb(0x3b4555))
-            .shadow_lg();
-        for (index, mode) in AgentMode::ALL.into_iter().enumerate() {
-            let active = mode == self.agent_mode;
+    pub(crate) fn render_agent_mode_picker(&self) -> impl IntoElement {
+        let mut picker = div().w(px(140.));
+        if let Some(state) = &self.agent_mode_select {
             picker = picker.child(
-                div()
-                    .id(("agent-mode", index))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(if active { rgb(0x293244) } else { rgb(0x20242c) })
-                    .text_xs()
-                    .text_color(if active { rgb(0xf3f4f6) } else { rgb(0xb7c0d0) })
-                    .cursor_pointer()
-                    .child(mode.label())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_agent_mode(mode, cx);
-                    })),
+                Select::new(state)
+                    .id("agent-mode-select")
+                    .w_full()
+                    .small()
+                    .accessibility_label("Agent mode")
+                    .placeholder("Select agent mode"),
             );
         }
-        picker.into_any()
+        picker
     }
 
     fn render_activity_section(
@@ -2784,7 +2884,7 @@ impl LoomView {
         activities: &[AgentActivityRecord],
         index: usize,
         parent: &Entity<LoomView>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let model = activities.iter().find_map(|activity| match &activity.data {
             AgentActivityData::ModelTurn { model } => Some(model.as_str().to_owned()),
             _ => None,
@@ -2987,7 +3087,7 @@ impl LoomView {
         item: &TimelineItem,
         index: usize,
         parent: &Entity<LoomView>,
-    ) -> gpui::AnyElement {
+    ) -> gpui_kit::AnyElement {
         let user_background = rgb(0x20242c);
         let user_foreground = rgb(0xdbeafe);
         match item {
@@ -3542,40 +3642,8 @@ impl LoomView {
                         .relative()
                         .items_center()
                         .gap_1()
-                        .child(
-                            div()
-                                .id("composer-agent-mode")
-                                .px_2()
-                                .py_1()
-                                .rounded_lg()
-                                .bg(rgb(0x20242c))
-                                .hover(|style| style.bg(rgb(0x293244)))
-                                .text_xs()
-                                .text_color(rgb(0xb7c0d0))
-                                .cursor_pointer()
-                                .child(self.agent_mode.label())
-                                .on_click(cx.listener(Self::toggle_agent_mode_picker)),
-                        )
-                        .when(self.agent_mode_picker_open, |element| {
-                            element.child(self.render_agent_mode_picker(cx))
-                        })
-                        .child(
-                            div()
-                                .id("composer-model-picker")
-                                .px_2()
-                                .py_1()
-                                .rounded_lg()
-                                .bg(rgb(0x20242c))
-                                .hover(|style| style.bg(rgb(0x293244)))
-                                .text_xs()
-                                .text_color(rgb(0xb7c0d0))
-                                .cursor_pointer()
-                                .child(format!("Model  {}", self.model.as_str()))
-                                .on_click(cx.listener(Self::toggle_model_picker)),
-                        )
-                        .when(self.model_picker_open, |element| {
-                            element.child(self.render_model_picker(cx))
-                        })
+                        .child(self.render_agent_mode_picker())
+                        .child(self.render_model_picker())
                         .when(self.sending_message, |element| {
                             element
                                 .child(div().text_xs().text_color(rgb(0x64748b)).child("Working…"))
@@ -3872,43 +3940,19 @@ impl LoomView {
     }
 
     pub(crate) fn render_settings_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut body = div().flex().flex_col().gap_1();
-        if self.models.is_empty() {
-            body = body.child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(0x8f98a6))
-                    .child("No configured models are available."),
-            );
-        } else {
-            for (index, model) in self.models.iter().enumerate() {
-                let model = model.clone();
-                let selected = model == self.default_model;
-                body = body.child(
-                    div()
-                        .id(("default-model", index))
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(if selected {
-                            rgb(0x293244)
-                        } else {
-                            rgb(0x20242c)
-                        })
-                        .text_sm()
-                        .text_color(if selected {
-                            rgb(0xf3f4f6)
-                        } else {
-                            rgb(0xb7c0d0)
-                        })
-                        .cursor_pointer()
-                        .child(model.as_str().to_owned())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_default_model(model.clone(), cx);
-                        })),
-                );
-            }
-        }
+        let body = self.default_model_select.as_ref().map_or_else(
+            || div().into_any_element(),
+            |state| {
+                Select::new(state)
+                    .id("default-model-select")
+                    .w_full()
+                    .small()
+                    .accessibility_label("Default model for new sessions")
+                    .placeholder("No configured models are available")
+                    .search_placeholder("Search models")
+                    .into_any_element()
+            },
+        );
         div()
             .id("settings-dialog")
             .size_full()
@@ -3956,24 +4000,10 @@ impl LoomView {
                     .text_color(rgb(0x93c5fd))
                     .child("DEFAULT MODEL FOR NEW SESSIONS"),
             )
+            .child(div().mt_2().child(body))
             .child(
                 div()
-                    .id("settings-refresh-models")
                     .mt_3()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x20242c))
-                    .hover(|style| style.bg(rgb(0x293244)))
-                    .text_xs()
-                    .text_color(rgb(0xb7c0d0))
-                    .cursor_pointer()
-                    .child("Refresh available models")
-                    .on_click(cx.listener(Self::refresh_models_button)),
-            )
-            .child(
-                div()
-                    .mt_5()
                     .text_xs()
                     .text_color(rgb(0x93c5fd))
                     .child("THEME"),
@@ -4009,7 +4039,77 @@ impl LoomView {
                         }),
                 ),
             )
-            .child(div().mt_2().child(body))
+            .into_any()
+    }
+
+    pub(crate) fn render_about_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("about-dialog")
+            .size_full()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .p_6()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x111318))
+            .text_color(rgb(0xe5e7eb))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xf3f4f6))
+                            .child("About Loom"),
+                    )
+                    .child(
+                        div()
+                            .id("close-about")
+                            .w(px(28.))
+                            .h(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(rgb(0x20242c))
+                            .hover(|style| style.bg(rgb(0x293244)))
+                            .text_color(rgb(0xb7c0d0))
+                            .cursor_pointer()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| LoomTooltip {
+                                    text: "Close about".into(),
+                                })
+                                .into()
+                            })
+                            .child(Icon::new(IconName::Close).size_4())
+                            .on_click(cx.listener(Self::close_about)),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_8()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_lg().text_color(rgb(0xf3f4f6)).child("Loom"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8f98a6))
+                            .child("Local agent workspace"),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(rgb(0x64748b))
+                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                    ),
+            )
             .into_any()
     }
 
@@ -4190,6 +4290,8 @@ impl LoomView {
 
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_model_select_states(window, cx);
+        self.sync_agent_mode_select_state(window, cx);
         self.schedule_run_poll(cx);
         let view = cx.entity();
         let project_name = self
@@ -4257,75 +4359,42 @@ impl Render for LoomView {
                                 project_name, self.active_session.name
                             ))),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("account-menu")
-                                    .icon(Icon::new(IconName::User))
-                                    .ghost()
-                                    .xsmall()
-                                    .dropdown_menu({
-                                        let view = view.clone();
-                                        move |menu, _, _| {
-                                            let providers_view = view.clone();
-                                            let settings_view = view.clone();
-                                            menu.item(PopupMenuItem::new("Providers").on_click(
-                                                move |_, _, cx| {
-                                                    providers_view.update(cx, |view, cx| {
-                                                        view.open_providers_from_menu(cx);
-                                                    });
-                                                },
-                                            ))
-                                            .item(
-                                                PopupMenuItem::new("Settings").on_click(
-                                                    move |_, _, cx| {
-                                                        settings_view.update(cx, |view, cx| {
-                                                            view.open_settings_from_menu(cx);
-                                                        });
-                                                    },
-                                                ),
-                                            )
-                                        }
+                    .when(!cfg!(target_family = "wasm"), |element| {
+                        element.child(
+                            div().flex().items_center().gap_1().ml_2().child(
+                                div()
+                                    .id("window-close")
+                                    .w(px(22.))
+                                    .h(px(22.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_sm()
+                                    .text_sm()
+                                    .text_color(rgb(0xb7c0d0))
+                                    .hover(|style| {
+                                        style.bg(rgb(0x7f1d1d)).text_color(rgb(0xffffff))
+                                    })
+                                    .cursor_pointer()
+                                    .tooltip(|_, cx| {
+                                        cx.new(|_| LoomTooltip {
+                                            text: "Close window".into(),
+                                        })
+                                        .into()
+                                    })
+                                    .window_control_area(WindowControlArea::Close)
+                                    .child(Icon::new(IconName::Close).size_4())
+                                    .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(|_, window, cx| {
+                                        cx.stop_propagation();
+                                        window.remove_window();
                                     }),
-                            )
-                            .child(
-                                div().flex().items_center().gap_1().ml_2().child(
-                                    div()
-                                        .id("window-close")
-                                        .w(px(22.))
-                                        .h(px(22.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_sm()
-                                        .text_sm()
-                                        .text_color(rgb(0xb7c0d0))
-                                        .hover(|style| {
-                                            style.bg(rgb(0x7f1d1d)).text_color(rgb(0xffffff))
-                                        })
-                                        .cursor_pointer()
-                                        .tooltip(|_, cx| {
-                                            cx.new(|_| LoomTooltip {
-                                                text: "Close window".into(),
-                                            })
-                                            .into()
-                                        })
-                                        .window_control_area(WindowControlArea::Close)
-                                        .child(Icon::new(IconName::Close).size_4())
-                                        .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                                            window.prevent_default();
-                                            cx.stop_propagation();
-                                        })
-                                        .on_click(|_, window, cx| {
-                                            cx.stop_propagation();
-                                            window.remove_window();
-                                        }),
-                                ),
                             ),
-                    ),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -4354,28 +4423,6 @@ impl Render for LoomView {
                                             .text_sm()
                                             .text_color(rgb(0xf3f4f6))
                                             .child("Workspace"),
-                                    )
-                                    .child(
-                                        Button::new("top-menu-button")
-                                            .icon(Icon::new(IconName::Ellipsis))
-                                            .ghost()
-                                            .dropdown_menu({
-                                                let view = view.clone();
-                                                move |menu, _, _| {
-                                                    menu.item(
-                                                        PopupMenuItem::new("Settings").on_click({
-                                                            let view = view.clone();
-                                                            move |_, _, cx| {
-                                                                view.update(cx, |view, cx| {
-                                                                    view.open_settings_from_menu(
-                                                                        cx,
-                                                                    );
-                                                                });
-                                                            }
-                                                        }),
-                                                    )
-                                                }
-                                            }),
                                     ),
                             )
                             .child(
@@ -4419,17 +4466,61 @@ impl Render for LoomView {
                             )
                             .child(
                                 div()
-                                    .pt_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
                                     .border_t_1()
                                     .border_color(rgb(0x30343f))
-                                    .text_xs()
-                                    .text_color(rgb(0x64748b))
-                                    .child(format!(
-                                        "{} sessions  ·  {}",
-                                        self.sessions.len(),
-                                        self.workspace_root.display()
-                                    )),
-                            ),
+                                    .pt_2()
+                                    .child(
+                                        Button::new("account-menu")
+                                            .icon(Icon::new(IconName::User))
+                                            .ghost()
+                                            .xsmall()
+                                            .dropdown_menu({
+                                                let view = view.clone();
+                                                move |menu, _, _| {
+                                                    let providers_view = view.clone();
+                                                    let about_view = view.clone();
+                                                    menu.item(
+                                                        PopupMenuItem::new("Providers").on_click(
+                                                            move |_, _, cx| {
+                                                                providers_view.update(
+                                                                    cx,
+                                                                    |view, cx| {
+                                                                        view.open_providers_from_menu(
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                );
+                                                            },
+                                                        ),
+                                                    )
+                                                    .item(PopupMenuItem::new("About Loom").on_click(
+                                                        move |_, _, cx| {
+                                                            about_view.update(cx, |view, cx| {
+                                                                view.open_about_from_menu(cx);
+                                                            });
+                                                        },
+                                                    ))
+                                                }
+                                            }),
+                                    )
+                                    .child(
+                                        Button::new("settings-button")
+                                            .icon(Icon::new(IconName::Settings))
+                                            .ghost()
+                                            .xsmall()
+                                            .on_click({
+                                                let view = view.clone();
+                                                move |_, _, cx| {
+                                                    view.update(cx, |view, cx| {
+                                                        view.open_settings_from_menu(cx);
+                                                    });
+                                                }
+                                            }),
+                                    ),
+                            )
                     )
                     .child(
                         div()
@@ -4719,6 +4810,9 @@ impl Render for LoomView {
                             .when(self.settings_open, |element| {
                                 element.child(self.render_settings_dialog(cx))
                             })
+                            .when(self.about_open, |element| {
+                                element.child(self.render_about_dialog(cx))
+                            })
                             .when(
                                 self.providers_open && self.github_login.is_none(),
                                 |element| element.child(self.render_providers_dialog(cx)),
@@ -4730,6 +4824,7 @@ impl Render for LoomView {
                     .when(
                         self.review.open
                             && !self.settings_open
+                            && !self.about_open
                             && !self.providers_open
                             && self.github_login.is_none(),
                         |element| element.child(self.render_review(cx)),
@@ -4775,8 +4870,8 @@ impl Render for LoomView {
                         .rounded_client_corners(true, tiling)
                         .when(!tiling.is_tiled(), |element| {
                             element.border_1().border_color(rgb(0x30343f)).shadow(vec![
-                                gpui::BoxShadow {
-                                    color: gpui::hsla(0., 0., 0., 0.4),
+                                gpui_kit::BoxShadow {
+                                    color: gpui_kit::hsla(0., 0., 0., 0.4),
                                     blur_radius: shadow_size / 2.,
                                     spread_radius: px(0.),
                                     offset: point(px(0.), px(0.)),

@@ -2,8 +2,8 @@
 
 use std::cell::RefCell;
 
-use gpui::{App, Pixels, Point, ResizeEdge, Rgba, Styled, Tiling, WindowAppearance, px};
-use gpui_component::Theme;
+use gpui_kit::component::Theme;
+use gpui_kit::{App, Pixels, Point, ResizeEdge, Rgba, Styled, Tiling, WindowAppearance, px};
 use loom_core::AgentSessionState;
 
 pub(crate) const CLIENT_DECORATION_ROUNDING: Pixels = px(10.);
@@ -105,7 +105,7 @@ impl ThemePalette {
             0x493b1a => self.warning,
             0xe9d5ff => self.info,
             0x3b2f66 => self.info,
-            _ => gpui::rgb(value),
+            _ => gpui_kit::rgb(value),
         }
     }
 }
@@ -120,16 +120,16 @@ pub(crate) fn sync_palette(cx: &App) {
     ACTIVE_THEME.with(|active| *active.borrow_mut() = Some(palette));
 }
 
-/// Resolves a legacy color role through the active native theme.
+/// Resolves a legacy color role through the active component theme.
 ///
 /// The numeric values are retained at call sites to keep the dense view code
-/// readable; they are aliases for semantic native-theme roles, not a second
+/// readable; they are aliases for semantic component-theme roles, not a second
 /// light/dark palette.
 pub(crate) fn rgb(value: u32) -> Rgba {
     ACTIVE_THEME.with(|active| {
         active
             .borrow()
-            .map_or_else(|| gpui::rgb(value), |palette| palette.color(value))
+            .map_or_else(|| gpui_kit::rgb(value), |palette| palette.color(value))
     })
 }
 
@@ -137,23 +137,13 @@ pub(crate) fn selection() -> Rgba {
     ACTIVE_THEME.with(|active| {
         active
             .borrow()
-            .map_or_else(|| gpui::rgba(0x335b8def), |palette| palette.selection)
+            .map_or_else(|| gpui_kit::rgba(0x335b8def), |palette| palette.selection)
     })
 }
 
-pub(crate) fn apply_preset_theme(
-    name: &str,
-    appearance: WindowAppearance,
-    cx: &mut App,
-) -> native_theme_gpui::Result<()> {
-    let prefs = native_theme_gpui::AccessibilityPreferences::default();
-    let (light_theme, light_resolved) = native_theme_gpui::from_preset(name, false, &prefs)?;
-    let (dark_theme, dark_resolved) = native_theme_gpui::from_preset(name, true, &prefs)?;
-    native_theme_gpui::apply(light_theme, &light_resolved, &prefs, cx);
-    native_theme_gpui::apply(dark_theme, &dark_resolved, &prefs, cx);
-    gpui_component::Theme::change(appearance, None, cx);
+pub(crate) fn apply_theme(appearance: WindowAppearance, cx: &mut App) {
+    gpui_kit::component::Theme::change(appearance, None, cx);
     sync_palette(cx);
-    Ok(())
 }
 
 pub(crate) fn state_color(state: AgentSessionState) -> Rgba {
@@ -177,7 +167,7 @@ pub(crate) fn change_color(kind: loom_workspace::WorkspaceChangeKind) -> Rgba {
 pub(crate) fn resize_edge(
     position: Point<Pixels>,
     inset: Pixels,
-    size: gpui::Size<Pixels>,
+    size: gpui_kit::Size<Pixels>,
 ) -> Option<ResizeEdge> {
     let edge = if position.y < inset && position.x < inset {
         ResizeEdge::TopLeft
