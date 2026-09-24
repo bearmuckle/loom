@@ -93,6 +93,7 @@ pub(crate) enum GitHubLoginState {
         user_code: String,
         expires_in: u64,
     },
+    #[cfg(not(target_family = "wasm"))]
     Completing,
     Success,
     Error(String),

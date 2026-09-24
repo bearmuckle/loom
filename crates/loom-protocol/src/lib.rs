@@ -249,6 +249,10 @@ pub enum ClientRequest {
     ConfigureGitHubCopilot {
         access_token: String,
     },
+    StartGitHubCopilotLogin,
+    GetGitHubCopilotLoginStatus {
+        login_id: String,
+    },
     DiscoverProviderModels {
         provider_id: ProviderId,
     },
@@ -424,7 +428,9 @@ impl ClientRequest {
             Self::ForkAgentSession { .. } => Some(Capability::ForkAgentSession),
             Self::ListModels => None,
             Self::ListProviders => Some(Capability::ListProviders),
-            Self::ConfigureGitHubCopilot { .. } => Some(Capability::ConfigureProviders),
+            Self::ConfigureGitHubCopilot { .. }
+            | Self::StartGitHubCopilotLogin
+            | Self::GetGitHubCopilotLoginStatus { .. } => Some(Capability::ConfigureProviders),
             Self::DiscoverProviderModels { .. } => Some(Capability::ListProviders),
             Self::GetProviderHealth { .. } => Some(Capability::ReadProviderHealth),
             Self::GetRunUsage { .. } => Some(Capability::ReadUsage),
@@ -564,6 +570,16 @@ pub enum ServerResponse {
         providers: Vec<ProviderSummary>,
     },
     ProviderConfigured,
+    GitHubCopilotLoginStarted {
+        login_id: String,
+        user_code: String,
+        verification_uri: String,
+        expires_in: u64,
+        interval: u64,
+    },
+    GitHubCopilotLoginStatus {
+        status: GitHubCopilotLoginStatus,
+    },
     ProviderHealth(ProviderHealth),
     RunUsage {
         usage: UsageSnapshot,
@@ -619,6 +635,14 @@ pub enum ServerResponse {
     TaskEvidence {
         evidence: Vec<TaskEvidenceLink>,
     },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum GitHubCopilotLoginStatus {
+    Pending,
+    Configured,
+    Failed { message: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -245,6 +245,16 @@ async fn authorized_client_can_configure_copilot_on_remote_worker() {
             .iter()
             .any(|provider| provider.kind == loom_model::ProviderKind::GitHubCopilot)
     );
+
+    let response = connection
+        .request(RequestEnvelope::new(
+            ClientRequest::GetGitHubCopilotLoginStatus {
+                login_id: "missing-login".to_owned(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.result.unwrap_err().code, ErrorCode::NotFound);
     server.stop().await.unwrap();
 }
 
@@ -278,6 +288,22 @@ async fn provider_configuration_requires_its_dedicated_capability() {
         response.result.unwrap_err().code,
         ErrorCode::AuthorizationDenied
     );
+
+    for request in [
+        ClientRequest::StartGitHubCopilotLogin,
+        ClientRequest::GetGitHubCopilotLoginStatus {
+            login_id: "unknown".to_owned(),
+        },
+    ] {
+        let response = connection
+            .request(RequestEnvelope::new(request))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.result.unwrap_err().code,
+            ErrorCode::AuthorizationDenied
+        );
+    }
     server.stop().await.unwrap();
 }
 

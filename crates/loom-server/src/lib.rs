@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -18,14 +19,14 @@ use loom_persistence::{CURRENT_SCHEMA_VERSION, FilePersistence};
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
-    ClientRequest, NegotiationResult, ProjectSnapshot, RequestEnvelope, ResponseEnvelope,
-    ServerEventEnvelope, ServerResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
-    unsupported_version_error,
+    ClientRequest, GitHubCopilotLoginStatus, NegotiationResult, ProjectSnapshot, RequestEnvelope,
+    ResponseEnvelope, ServerEventEnvelope, ServerResponse, WorkerNodeResources, WorkerNodeStatus,
+    WorkspaceConfig, unsupported_version_error,
 };
 use loom_providers::{
-    CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, ModelProvider,
-    ProviderConfig, ProviderHealth, ProviderRegistry, UnavailableProvider, UsageLedger,
-    deterministic_descriptor,
+    CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
+    ModelProvider, ProviderConfig, ProviderHealth, ProviderRegistry, UnavailableProvider,
+    UsageLedger, deterministic_descriptor,
 };
 use loom_session::SessionManager;
 use loom_tools::ToolExecutor;
@@ -424,6 +425,11 @@ struct StartRunInput {
     options: AgentRuntimeOptions,
 }
 
+struct GitHubCopilotLoginRecord {
+    status: GitHubCopilotLoginStatus,
+    expires_at: Instant,
+}
+
 pub struct InProcessBackend {
     node_id: String,
     node_name: String,
@@ -441,6 +447,7 @@ pub struct InProcessBackend {
     supported_capabilities: CapabilitySet,
     models: Vec<ModelDescriptor>,
     providers: ProviderRegistry,
+    github_copilot_logins: Mutex<BTreeMap<String, GitHubCopilotLoginRecord>>,
     persistence: Option<FilePersistence>,
     idempotency: Mutex<BTreeMap<loom_core::RequestId, IdempotencyRecord>>,
     in_flight_requests: Mutex<BTreeMap<loom_core::RequestId, Arc<Mutex<()>>>>,
@@ -808,6 +815,7 @@ impl InProcessBackend {
             ]),
             models,
             providers,
+            github_copilot_logins: Mutex::new(BTreeMap::new()),
             persistence,
             idempotency: Mutex::new(BTreeMap::new()),
             in_flight_requests: Mutex::new(BTreeMap::new()),
@@ -1952,6 +1960,10 @@ impl InProcessConnection {
                     .configure_github_copilot(access_token)?;
                 Ok(ServerResponse::ProviderConfigured)
             }
+            ClientRequest::StartGitHubCopilotLogin => self.start_github_copilot_login(),
+            ClientRequest::GetGitHubCopilotLoginStatus { login_id } => {
+                self.github_copilot_login_status(&login_id)
+            }
             ClientRequest::DiscoverProviderModels { provider_id } => Ok(ServerResponse::Models {
                 models: self.backend.providers.discover_models(&provider_id)?,
             }),
@@ -2234,6 +2246,130 @@ impl InProcessConnection {
         })
     }
 
+    fn start_github_copilot_login(&self) -> Result<ServerResponse> {
+        const MAX_PENDING_LOGINS: usize = 8;
+        const COMPLETED_LOGIN_RETENTION: Duration = Duration::from_secs(300);
+
+        let now = Instant::now();
+        let login_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut logins = self
+                .backend
+                .github_copilot_logins
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            logins.retain(|_, login| login.expires_at + COMPLETED_LOGIN_RETENTION > now);
+            if logins
+                .values()
+                .filter(|login| matches!(login.status, GitHubCopilotLoginStatus::Pending))
+                .count()
+                >= MAX_PENDING_LOGINS
+            {
+                return Err(LoomError::new(
+                    ErrorCode::Conflict,
+                    "too many GitHub Copilot sign-ins are already pending on this worker",
+                    true,
+                ));
+            }
+            logins.insert(
+                login_id.clone(),
+                GitHubCopilotLoginRecord {
+                    status: GitHubCopilotLoginStatus::Pending,
+                    expires_at: now + Duration::from_secs(3600),
+                },
+            );
+        }
+        let device = match GitHubCopilotAuthenticator::default().begin() {
+            Ok(device) => device,
+            Err(error) => {
+                self.backend
+                    .github_copilot_logins
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&login_id);
+                return Err(error);
+            }
+        };
+        if let Some(login) = self
+            .backend
+            .github_copilot_logins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(&login_id)
+        {
+            login.expires_at = now + Duration::from_secs(device.expires_in.min(3600));
+        }
+
+        let backend = self.backend.clone();
+        let device_for_poll = device.clone();
+        let worker_login_id = login_id.clone();
+        let spawn_result = thread::Builder::new()
+            .name("github-copilot-login".to_owned())
+            .spawn(move || {
+                let status = match GitHubCopilotAuthenticator::default()
+                    .poll(&device_for_poll)
+                    .and_then(|token| {
+                        backend.providers.configure_github_copilot(token)?;
+                        backend.persist_state()
+                    }) {
+                    Ok(()) => GitHubCopilotLoginStatus::Configured,
+                    Err(error) => GitHubCopilotLoginStatus::Failed {
+                        message: error.message,
+                    },
+                };
+                let mut logins = backend
+                    .github_copilot_logins
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(login) = logins.get_mut(&worker_login_id)
+                    && matches!(login.status, GitHubCopilotLoginStatus::Pending)
+                {
+                    login.status = status;
+                }
+            });
+        if let Err(error) = spawn_result {
+            self.backend
+                .github_copilot_logins
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&login_id);
+            return Err(LoomError::new(
+                ErrorCode::Internal,
+                format!("could not start GitHub Copilot sign-in: {error}"),
+                false,
+            ));
+        }
+
+        Ok(ServerResponse::GitHubCopilotLoginStarted {
+            login_id,
+            user_code: device.user_code,
+            verification_uri: device.verification_uri,
+            expires_in: device.expires_in,
+            interval: device.interval,
+        })
+    }
+
+    fn github_copilot_login_status(&self, login_id: &str) -> Result<ServerResponse> {
+        let mut logins = self
+            .backend
+            .github_copilot_logins
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let login = logins
+            .get_mut(login_id)
+            .ok_or_else(|| LoomError::not_found("GitHub Copilot sign-in", login_id))?;
+        if matches!(login.status, GitHubCopilotLoginStatus::Pending)
+            && Instant::now() >= login.expires_at
+        {
+            login.status = GitHubCopilotLoginStatus::Failed {
+                message: "GitHub device authorization expired".to_owned(),
+            };
+        }
+        Ok(ServerResponse::GitHubCopilotLoginStatus {
+            status: login.status.clone(),
+        })
+    }
+
     fn authorize_request(&self, request: &ClientRequest) -> Result<()> {
         let Some(auth) = &self.auth else {
             return Ok(());
@@ -2476,6 +2612,8 @@ impl InProcessConnection {
             | ClientRequest::ListModels
             | ClientRequest::GetWorkerNodeStatus
             | ClientRequest::ListProviders
+            | ClientRequest::StartGitHubCopilotLogin
+            | ClientRequest::GetGitHubCopilotLoginStatus { .. }
             | ClientRequest::DiscoverProviderModels { .. }
             | ClientRequest::GetProviderHealth { .. } => {}
             ClientRequest::ConfigureGitHubCopilot { .. } => {}
