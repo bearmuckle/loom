@@ -38,7 +38,7 @@ Demo mode:
 cargo run -p loom-ui -- --demo
 ```
 
-Run the same checks used by CI:
+Run the full Rust check suite locally:
 
 ```text
 ./scripts/ci-check.sh
