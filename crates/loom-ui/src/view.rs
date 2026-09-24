@@ -149,6 +149,49 @@ fn change_kind_label(kind: loom_workspace::WorkspaceChangeKind) -> &'static str 
     }
 }
 
+fn diff_line_style(line: &str) -> (u32, u32) {
+    match line.as_bytes().first().copied() {
+        Some(b'+') if !line.starts_with("+++") => (0x16352b, 0x9ad7bd),
+        Some(b'-') if !line.starts_with("---") => (0x3d2027, 0xfca5a5),
+        Some(b'@') => (0x1d3047, 0x93c5fd),
+        _ => (0x0f1115, 0xcbd5e1),
+    }
+}
+
+fn diff_summary(patch: &str) -> (usize, usize) {
+    patch.lines().fold((0, 0), |(added, removed), line| {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            (added + 1, removed)
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            (added, removed + 1)
+        } else {
+            (added, removed)
+        }
+    })
+}
+
+fn render_diff_patch(patch: &str) -> gpui_kit::AnyElement {
+    let mut lines = div().flex().flex_col().w_full();
+    for (index, line) in patch.lines().enumerate() {
+        let (background, foreground) = diff_line_style(line);
+        lines = lines.child(
+            div()
+                .id(("diff-line", index))
+                .w_full()
+                .px_2()
+                .text_xs()
+                .bg(rgb(background))
+                .text_color(rgb(foreground))
+                .child(if line.is_empty() {
+                    " ".to_owned()
+                } else {
+                    line.to_owned()
+                }),
+        );
+    }
+    lines.into_any()
+}
+
 fn activity_marker(status: AgentActivityStatus) -> &'static str {
     match status {
         AgentActivityStatus::Started => "›",
@@ -1784,6 +1827,22 @@ impl LoomView {
                 ),
             },
         );
+        self.dispatch(
+            cx,
+            ClientRequest::GetVcsDiff {
+                project_id: self.project_id,
+                path: None,
+                staged: false,
+            },
+            |view, response, _| match response.result {
+                Ok(ServerResponse::VcsDiff(diff)) => view.review.diff = Some(diff),
+                Err(error) => view.record_status(format!("VCS diff unavailable: {error}")),
+                Ok(response) => view.record_backend_error(
+                    "VCS diff refresh",
+                    unexpected_response("VCS diff", response),
+                ),
+            },
+        );
     }
 
     pub(crate) fn confirm_rename(&mut self, cx: &mut Context<Self>) {
@@ -2735,7 +2794,7 @@ impl LoomView {
 
     pub(crate) fn show_review(
         &mut self,
-        _panel: ReviewPanel,
+        panel: ReviewPanel,
         event: &ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2744,7 +2803,13 @@ impl LoomView {
         self.providers_open = false;
         self.about_open = false;
         self.github_login = None;
-        self.toggle_changes_sidebar(event, window, cx);
+        self.review.panel = panel;
+        if self.review.open {
+            self.refresh_review(cx);
+            cx.notify();
+        } else {
+            self.toggle_changes_sidebar(event, window, cx);
+        }
     }
 
     pub(crate) fn close_review(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -2753,6 +2818,7 @@ impl LoomView {
     }
 
     pub(crate) fn open_review_file(&mut self, path: String, cx: &mut Context<Self>) {
+        let diff_path = path.clone();
         self.dispatch(
             cx,
             ClientRequest::ReadWorkspaceFile {
@@ -2771,6 +2837,22 @@ impl LoomView {
                 Ok(response) => view.record_backend_error(
                     "read review file",
                     unexpected_response("workspace file", response),
+                ),
+            },
+        );
+        self.dispatch(
+            cx,
+            ClientRequest::GetVcsDiff {
+                project_id: self.project_id,
+                path: Some(diff_path),
+                staged: false,
+            },
+            |view, response, _| match response.result {
+                Ok(ServerResponse::VcsDiff(diff)) => view.review.diff = Some(diff),
+                Err(error) => view.record_status(format!("VCS diff unavailable: {error}")),
+                Ok(response) => view.record_backend_error(
+                    "read review diff",
+                    unexpected_response("VCS diff", response),
                 ),
             },
         );
@@ -3396,13 +3478,30 @@ impl LoomView {
                 if let Some(status) = &self.review.vcs {
                     for (index, file) in status.files.iter().take(24).enumerate() {
                         let path = file.path.clone();
+                        let status_label = if file.conflicted {
+                            "Conflict"
+                        } else if file.worktree != loom_protocol::GitFileStatusKind::Unknown {
+                            match file.worktree {
+                                loom_protocol::GitFileStatusKind::Added
+                                | loom_protocol::GitFileStatusKind::Untracked => "Added",
+                                loom_protocol::GitFileStatusKind::Deleted => "Deleted",
+                                loom_protocol::GitFileStatusKind::Renamed => "Renamed",
+                                _ => "Modified",
+                            }
+                        } else {
+                            "Staged"
+                        };
                         body = body.child(
                             div()
                                 .id(("git-file", index))
                                 .text_sm()
-                                .text_color(rgb(0xfef3c7))
+                                .text_color(if file.conflicted {
+                                    rgb(0xfca5a5)
+                                } else {
+                                    rgb(0xfef3c7)
+                                })
                                 .cursor_pointer()
-                                .child(format!("Git · {:?}  {}", file.worktree, file.path))
+                                .child(format!("{status_label}  {}", file.path))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.open_review_file(path.clone(), cx);
                                     cx.notify();
@@ -3429,27 +3528,31 @@ impl LoomView {
                 }
             }
             ReviewPanel::Diff => {
-                body = body.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8f98a6))
-                        .child("A read-only view of the changes in this session."),
-                );
-                body = body.child(
-                    div()
-                        .mt_1()
-                        .p_2()
-                        .bg(rgb(0x0f1115))
-                        .text_xs()
-                        .text_color(rgb(0xcbd5e1))
-                        .child(
-                            self.review
-                                .diff
-                                .as_ref()
-                                .map(|diff| diff.patch.clone())
-                                .unwrap_or_else(|| "No diff available".to_owned()),
-                        ),
-                );
+                if let Some(diff) = &self.review.diff {
+                    let (added, removed) = diff_summary(&diff.patch);
+                    body = body.child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .text_color(rgb(0x8f98a6))
+                            .child(format!(
+                                "{}  ·  +{}  -{}{}",
+                                diff.path.as_deref().unwrap_or("Working tree"),
+                                added,
+                                removed,
+                                if diff.staged { "  ·  staged" } else { "" }
+                            )),
+                    );
+                    body = body.child(render_diff_patch(&diff.patch));
+                } else {
+                    body = body.child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0x8f98a6))
+                            .child("No diff available"),
+                    );
+                }
             }
             ReviewPanel::Evidence => {
                 body = body.child(
@@ -4562,7 +4665,7 @@ impl Render for LoomView {
                                                 ),
                                             ),
                                     )
-                                    .when(false, |element| {
+                                    .when(true, |element| {
                                         element.child(
                                             div()
                                                 .flex()
@@ -4929,5 +5032,26 @@ impl Render for LoomView {
                     }
                 }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{diff_line_style, diff_summary};
+
+    #[test]
+    fn diff_summary_counts_content_lines_not_headers() {
+        assert_eq!(
+            diff_summary("@@ -1 +1 @@\n-old\n+new\n context\n--- a/file\n+++ b/file\n"),
+            (1, 1)
+        );
+    }
+
+    #[test]
+    fn diff_line_style_highlights_additions_and_removals() {
+        assert_eq!(diff_line_style("+added"), (0x16352b, 0x9ad7bd));
+        assert_eq!(diff_line_style("-removed"), (0x3d2027, 0xfca5a5));
+        assert_eq!(diff_line_style("@@ hunk"), (0x1d3047, 0x93c5fd));
+        assert_eq!(diff_line_style("+++ header"), (0x0f1115, 0xcbd5e1));
     }
 }
