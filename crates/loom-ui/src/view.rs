@@ -27,6 +27,8 @@ use loom_core::{
     EventSequence, LoomError, ProjectId, RunId,
 };
 use loom_model::{MessageRole, ModelId, ProviderKind, ProviderSummary, ToolCall};
+#[cfg(target_family = "wasm")]
+use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
@@ -81,9 +83,49 @@ use crate::{
 #[cfg(not(target_family = "wasm"))]
 use log::info;
 
+#[cfg(target_family = "wasm")]
+use futures_channel::oneshot;
+#[cfg(target_family = "wasm")]
+use wasm_bindgen::{JsCast, closure::Closure};
+
 type ModelSelectState = SelectState<SearchableVec<String>>;
 
 const ACTIVE_BACKEND_NODE_ENTRY_ID: u64 = 0;
+
+#[cfg(target_family = "wasm")]
+async fn browser_delay(duration: Duration) -> Result<(), LoomError> {
+    let window = web_sys::window().ok_or_else(|| {
+        LoomError::new(
+            ErrorCode::Internal,
+            "could not schedule a browser timer",
+            false,
+        )
+    })?;
+    let (sender, receiver) = oneshot::channel();
+    let callback = Closure::once(move || {
+        let _ = sender.send(());
+    });
+    window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback.as_ref().unchecked_ref(),
+            duration.as_millis().min(i32::MAX as u128) as i32,
+        )
+        .map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "could not schedule a browser timer",
+                false,
+            )
+        })?;
+    callback.forget();
+    receiver.await.map_err(|_| {
+        LoomError::new(
+            ErrorCode::Internal,
+            "browser timer ended before it completed",
+            false,
+        )
+    })
+}
 
 fn format_bytes(value: Option<u64>) -> String {
     let Some(value) = value else {
@@ -1718,7 +1760,7 @@ impl LoomView {
             rename_dialog: None,
             rename_focus_handle,
             demo_workspace: false,
-            login_enabled: false,
+            login_enabled: true,
             github_connected: false,
             github_login: None,
             next_worker_node_id: worker_nodes.len() as u64,
@@ -3267,10 +3309,11 @@ impl LoomView {
             .providers_node_id
             .as_ref()
             .unwrap_or(&self.default_backend_node_id);
-        if !self
-            .node_backends
-            .get(node_id)
-            .is_some_and(BackendWorker::secure_for_secrets)
+        if !cfg!(target_family = "wasm")
+            && !self
+                .node_backends
+                .get(node_id)
+                .is_some_and(BackendWorker::secure_for_secrets)
         {
             self.github_login = Some(GitHubLoginState::Error(
                 "GitHub Copilot sign-in requires a secure worker connection (wss:// or loopback ws://)."
@@ -3312,16 +3355,127 @@ impl LoomView {
         .detach();
     }
 
-    /// GitHub Copilot device-code sign-in relies on `loom-providers`'
-    /// credential store and OAuth flow, which have no browser equivalent (no
-    /// OS keychain, no writable local file). The browser client cannot offer
-    /// this login path.
+    /// The worker performs the OAuth exchange and stores its credential;
+    /// browser clients receive only the public device code and login status.
     #[cfg(target_family = "wasm")]
     fn start_github_login_flow(&mut self, cx: &mut Context<Self>) {
-        self.github_login = Some(GitHubLoginState::Error(
-            "GitHub sign-in isn't available in the browser client yet.".to_owned(),
-        ));
-        cx.notify();
+        let node_id = self
+            .providers_node_id
+            .clone()
+            .unwrap_or_else(|| self.default_backend_node_id.clone());
+        let Some(backend) = self.node_backends.get(&node_id).cloned() else {
+            self.github_login = Some(GitHubLoginState::Error(
+                "The selected worker is not connected.".to_owned(),
+            ));
+            cx.notify();
+            return;
+        };
+        let pending = backend.submit(RequestEnvelope::new(ClientRequest::StartGitHubCopilotLogin));
+        cx.spawn(async move |view, cx| {
+            let response = pending.wait().await;
+            let (login_id, user_code, verification_uri, expires_in, interval) =
+                match response.result {
+                    Ok(ServerResponse::GitHubCopilotLoginStarted {
+                        login_id,
+                        user_code,
+                        verification_uri,
+                        expires_in,
+                        interval,
+                    }) => (login_id, user_code, verification_uri, expires_in, interval),
+                    Err(error) => {
+                        view.update(cx, |view, cx| {
+                            view.github_login = Some(GitHubLoginState::Error(error.message));
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                    Ok(response) => {
+                        let error = unexpected_response("GitHub Copilot login start", response);
+                        view.update(cx, |view, cx| {
+                            view.github_login = Some(GitHubLoginState::Error(error.message));
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                };
+            if view
+                .update(cx, |view, cx| {
+                    view.github_login = Some(GitHubLoginState::Awaiting {
+                        verification_uri,
+                        user_code,
+                        expires_in,
+                    });
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+
+            let interval = Duration::from_secs(interval.clamp(1, 10));
+            loop {
+                if let Err(error) = browser_delay(interval).await {
+                    view.update(cx, |view, cx| {
+                        view.github_login = Some(GitHubLoginState::Error(error.message));
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+                let response = backend
+                    .submit(RequestEnvelope::new(
+                        ClientRequest::GetGitHubCopilotLoginStatus {
+                            login_id: login_id.clone(),
+                        },
+                    ))
+                    .wait()
+                    .await;
+                match response.result {
+                    Ok(ServerResponse::GitHubCopilotLoginStatus {
+                        status: GitHubCopilotLoginStatus::Pending,
+                    }) => {}
+                    Ok(ServerResponse::GitHubCopilotLoginStatus {
+                        status: GitHubCopilotLoginStatus::Configured,
+                    }) => {
+                        view.update(cx, |view, cx| {
+                            view.handle_github_provider_configured(node_id, cx);
+                        })
+                        .ok();
+                        return;
+                    }
+                    Ok(ServerResponse::GitHubCopilotLoginStatus {
+                        status: GitHubCopilotLoginStatus::Failed { message },
+                    }) => {
+                        view.update(cx, |view, cx| {
+                            view.github_login = Some(GitHubLoginState::Error(message));
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                    Err(error) => {
+                        view.update(cx, |view, cx| {
+                            view.github_login = Some(GitHubLoginState::Error(error.message));
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                    Ok(response) => {
+                        let error = unexpected_response("GitHub Copilot login status", response);
+                        view.update(cx, |view, cx| {
+                            view.github_login = Some(GitHubLoginState::Error(error.message));
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -3381,43 +3535,7 @@ impl LoomView {
             },
             move |view, response, cx| match response.result {
                 Ok(ServerResponse::ProviderConfigured) => {
-                    view.github_login = Some(GitHubLoginState::Success);
-                    view.github_connected = true;
-                    let active_node_id = view
-                        .session_node_ids
-                        .get(&view.active_session.id)
-                        .map(String::as_str);
-                    if active_node_id == Some(node_id.as_str())
-                        && view.model.as_str() == "deterministic/demo"
-                    {
-                        view.model = ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL);
-                    }
-                    view.record_status(format!(
-                        "GitHub Copilot configured on {}",
-                        view.node_names
-                            .get(&node_id)
-                            .map_or(node_id.as_str(), String::as_str)
-                    ));
-                    let providers_node_id = node_id.clone();
-                    view.dispatch_to_node(
-                        cx,
-                        providers_node_id,
-                        ClientRequest::ListProviders,
-                        |view, response, _| match response.result {
-                            Ok(ServerResponse::Providers { providers }) => {
-                                view.github_connected = providers
-                                    .iter()
-                                    .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
-                                view.providers = providers;
-                            }
-                            Err(error) => view.record_backend_error("list providers", error),
-                            Ok(response) => view.record_backend_error(
-                                "list providers",
-                                unexpected_response("provider list", response),
-                            ),
-                        },
-                    );
-                    view.refresh_models_for_node_async(node_id, cx);
+                    view.handle_github_provider_configured(node_id, cx)
                 }
                 Err(error) => {
                     view.github_login = Some(GitHubLoginState::Error(error.message));
@@ -3428,6 +3546,56 @@ impl LoomView {
                 ),
             },
         );
+        cx.notify();
+    }
+
+    fn handle_github_provider_configured(&mut self, node_id: String, cx: &mut Context<Self>) {
+        self.github_login = Some(GitHubLoginState::Success);
+        self.github_connected = true;
+        let active_node_id = self
+            .session_node_ids
+            .get(&self.active_session.id)
+            .map(String::as_str);
+        let should_select_copilot =
+            active_node_id == Some(node_id.as_str()) && self.model.as_str() == "deterministic/demo";
+        #[cfg(not(target_family = "wasm"))]
+        if should_select_copilot {
+            self.model = ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL);
+        }
+        self.record_status(format!(
+            "GitHub Copilot configured on {}",
+            self.node_names
+                .get(&node_id)
+                .map_or(node_id.as_str(), String::as_str)
+        ));
+        self.dispatch_to_node(
+            cx,
+            node_id.clone(),
+            ClientRequest::ListProviders,
+            move |view, response, _| match response.result {
+                Ok(ServerResponse::Providers { providers }) => {
+                    if should_select_copilot
+                        && view.model.as_str() == "deterministic/demo"
+                        && let Some(model) = providers
+                            .iter()
+                            .find(|provider| provider.kind == ProviderKind::GitHubCopilot)
+                            .and_then(|provider| provider.models.first())
+                    {
+                        view.model = model.id.clone();
+                    }
+                    view.github_connected = providers
+                        .iter()
+                        .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
+                    view.providers = providers;
+                }
+                Err(error) => view.record_backend_error("list providers", error),
+                Ok(response) => view.record_backend_error(
+                    "list providers",
+                    unexpected_response("provider list", response),
+                ),
+            },
+        );
+        self.refresh_models_for_node_async(node_id, cx);
         cx.notify();
     }
 
@@ -6020,6 +6188,7 @@ impl LoomView {
                             "Waiting for authorization (expires in {expires_in}s)"
                         )),
                 ),
+            #[cfg(not(target_family = "wasm"))]
             GitHubLoginState::Completing => div()
                 .text_sm()
                 .text_color(rgb(0x8f98a6))

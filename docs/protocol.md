@@ -138,6 +138,7 @@ ListProviders / ListModels
 DiscoverProviderModels
 GetProviderHealth
 ConfigureGitHubCopilot
+StartGitHubCopilotLogin / GetGitHubCopilotLoginStatus
 GetRunUsage
 InspectAgentContext
 ```
@@ -158,7 +159,10 @@ authenticated connection, stores it in the worker's credential store, and
 returns no credential material. It requires the separate `ConfigureProviders`
 capability; tokens are not included in workspace configuration or provider
 summaries. Clients must use WSS for remote workers (loopback WS is allowed)
-when sending the credential.
+when sending the credential. Browser clients instead use
+`StartGitHubCopilotLogin` and `GetGitHubCopilotLoginStatus`: the worker performs
+the device-code exchange and stores the resulting credential itself, so no
+OAuth access token is sent through or persisted by the browser.
 
 Important event families include `AgentMessageDelta`,
 `AgentPlanProposed`, `AgentStepStarted`, `ToolCallRequested`,

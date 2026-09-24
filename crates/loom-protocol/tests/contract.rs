@@ -6,12 +6,12 @@ use loom_model::{ModelId, ToolCall};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
     AgentPlanStep, AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientFrame,
-    ClientRequest, ContextAssemblyOptions, FileActivityOperation, RequestEnvelope,
-    ResponseEnvelope, ServerEvent, ServerEventEnvelope, ServerFrame, ServerResponse, TaskKind,
-    TaskSpec, ToolResult, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceEdit,
-    WorkspaceSnapshot, decode_client_frame, decode_event, decode_request, decode_response,
-    decode_server_frame, encode_client_frame, encode_event, encode_request, encode_response,
-    encode_server_frame,
+    ClientRequest, ContextAssemblyOptions, FileActivityOperation, GitHubCopilotLoginStatus,
+    RequestEnvelope, ResponseEnvelope, ServerEvent, ServerEventEnvelope, ServerFrame,
+    ServerResponse, TaskKind, TaskSpec, ToolResult, WorkerNodeResources, WorkerNodeStatus,
+    WorkspaceConfig, WorkspaceEdit, WorkspaceSnapshot, decode_client_frame, decode_event,
+    decode_request, decode_response, decode_server_frame, encode_client_frame, encode_event,
+    encode_request, encode_response, encode_server_frame,
 };
 
 #[test]
@@ -41,6 +41,56 @@ fn response_json_round_trip_preserves_structured_errors() {
     let decoded = decode_response(&encoded).unwrap();
 
     assert_eq!(decoded, response);
+}
+
+#[test]
+fn browser_copilot_login_round_trips_without_access_tokens() {
+    let request = RequestEnvelope::new(ClientRequest::StartGitHubCopilotLogin);
+    assert_eq!(
+        request.request.required_capability(),
+        Some(Capability::ConfigureProviders)
+    );
+    assert_eq!(
+        decode_request(&encode_request(&request).unwrap()).unwrap(),
+        request
+    );
+
+    let response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::GitHubCopilotLoginStarted {
+            login_id: "login-1".to_owned(),
+            user_code: "ABCD-EFGH".to_owned(),
+            verification_uri: "https://github.com/login/device".to_owned(),
+            expires_in: 900,
+            interval: 5,
+        },
+    );
+    assert_eq!(
+        decode_response(&encode_response(&response).unwrap()).unwrap(),
+        response
+    );
+
+    let status_request = RequestEnvelope::new(ClientRequest::GetGitHubCopilotLoginStatus {
+        login_id: "login-1".to_owned(),
+    });
+    assert_eq!(
+        status_request.request.required_capability(),
+        Some(Capability::ConfigureProviders)
+    );
+    assert_eq!(
+        decode_request(&encode_request(&status_request).unwrap()).unwrap(),
+        status_request
+    );
+    let status_response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::GitHubCopilotLoginStatus {
+            status: GitHubCopilotLoginStatus::Configured,
+        },
+    );
+    assert_eq!(
+        decode_response(&encode_response(&status_response).unwrap()).unwrap(),
+        status_response
+    );
 }
 
 #[test]
