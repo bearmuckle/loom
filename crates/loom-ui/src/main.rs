@@ -237,8 +237,7 @@ pub fn start() {
             )])
             .expect("failed to load embedded font");
         gpui_kit::init(cx);
-        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-        crate::theme::sync_palette(cx);
+        crate::theme::apply_theme(gpui_kit::WindowAppearance::Dark, cx);
         bind_composer_keys(cx);
         start_browser_client(cx);
     });
