@@ -34,10 +34,7 @@ use loom_protocol::{
     TaskStatus, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
 };
 #[cfg(not(target_family = "wasm"))]
-use loom_providers::{
-    CredentialRef, CredentialStore, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF,
-    GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode,
-};
+use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode};
 #[cfg(not(target_family = "wasm"))]
 use loom_server::InProcessBackend;
 
@@ -915,6 +912,7 @@ pub(crate) struct LoomView {
     pub(crate) providers_open: bool,
     pub(crate) about_open: bool,
     pub(crate) providers: Vec<ProviderSummary>,
+    providers_node_id: Option<String>,
     pub(crate) theme_choice: ThemeChoice,
     appearance_subscription: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
@@ -1383,6 +1381,7 @@ impl LoomView {
             providers_open: false,
             about_open: false,
             providers: Vec::new(),
+            providers_node_id: None,
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -1405,15 +1404,8 @@ impl LoomView {
             rename_dialog: None,
             rename_focus_handle,
             demo_workspace,
-            login_enabled: options.remote.is_none(),
-            github_connected: FileCredentialStore::open(FileCredentialStore::default_path())
-                .ok()
-                .and_then(|credentials| {
-                    credentials
-                        .resolve(&CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF))
-                        .ok()
-                })
-                .is_some(),
+            login_enabled: true,
+            github_connected: false,
             github_login: None,
             next_worker_node_id: worker_nodes.len() as u64,
             worker_nodes,
@@ -1561,6 +1553,7 @@ impl LoomView {
             providers_open: false,
             about_open: false,
             providers: Vec::new(),
+            providers_node_id: None,
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -1609,6 +1602,43 @@ impl LoomView {
         let request_id = request_envelope.request_id;
         let pending = self
             .backend_for_request(&request_envelope.request)
+            .map(|backend| backend.submit(request_envelope));
+        cx.spawn(async move |view, cx| {
+            let response = match pending {
+                Ok(pending) => {
+                    cx.background_spawn(async move { pending.wait().await })
+                        .await
+                }
+                Err(error) => ResponseEnvelope::failure(request_id, error),
+            };
+            view.update(cx, |view, cx| {
+                apply(view, response, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn dispatch_to_node(
+        &self,
+        cx: &mut Context<Self>,
+        node_id: String,
+        request: ClientRequest,
+        apply: impl FnOnce(&mut Self, ResponseEnvelope, &mut Context<Self>) + 'static,
+    ) {
+        let request_envelope = RequestEnvelope::new(request);
+        let request_id = request_envelope.request_id;
+        let pending = self
+            .node_backends
+            .get(&node_id)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::NotFound,
+                    format!("worker node {node_id} is not connected"),
+                    false,
+                )
+            })
             .map(|backend| backend.submit(request_envelope));
         cx.spawn(async move |view, cx| {
             let response = match pending {
@@ -1700,12 +1730,6 @@ impl LoomView {
         models.sort();
         models.dedup();
         self.apply_models(models);
-    }
-
-    /// Refreshes the model list from a UI handler, one request at a time, on the
-    /// connection worker.
-    pub(crate) fn refresh_models_async(&mut self, cx: &mut Context<Self>) {
-        self.refresh_models_for_node_async(self.default_backend_node_id.clone(), cx);
     }
 
     fn refresh_models_for_node_async(&mut self, node_id: String, cx: &mut Context<Self>) {
@@ -3093,6 +3117,22 @@ impl LoomView {
             }
             return;
         }
+        let node_id = self
+            .providers_node_id
+            .as_ref()
+            .unwrap_or(&self.default_backend_node_id);
+        if !self
+            .node_backends
+            .get(node_id)
+            .is_some_and(BackendWorker::secure_for_secrets)
+        {
+            self.github_login = Some(GitHubLoginState::Error(
+                "GitHub Copilot sign-in requires a secure worker connection (wss:// or loopback ws://)."
+                    .to_owned(),
+            ));
+            cx.notify();
+            return;
+        }
         self.settings_open = false;
         self.review.open = false;
         self.start_github_login(cx);
@@ -3183,23 +3223,65 @@ impl LoomView {
                 return;
             }
         };
-        match FileCredentialStore::open(FileCredentialStore::default_path())
-            .and_then(|credentials| credentials.insert(GITHUB_COPILOT_CREDENTIAL_REF, token))
-        {
-            Ok(()) => {}
-            Err(error) => {
-                self.github_login = Some(GitHubLoginState::Error(error.message));
-                cx.notify();
-                return;
-            }
-        };
-        if self.model.as_str() == "deterministic/demo" {
-            self.model = ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL);
-        }
-        self.refresh_models_async(cx);
-        self.github_login = Some(GitHubLoginState::Success);
-        self.github_connected = true;
-        self.record_status("GitHub Copilot login succeeded");
+        let node_id = self
+            .providers_node_id
+            .clone()
+            .unwrap_or_else(|| self.default_backend_node_id.clone());
+        self.dispatch_to_node(
+            cx,
+            node_id.clone(),
+            ClientRequest::ConfigureGitHubCopilot {
+                access_token: token,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::ProviderConfigured) => {
+                    view.github_login = Some(GitHubLoginState::Success);
+                    view.github_connected = true;
+                    let active_node_id = view
+                        .session_node_ids
+                        .get(&view.active_session.id)
+                        .map(String::as_str);
+                    if active_node_id == Some(node_id.as_str())
+                        && view.model.as_str() == "deterministic/demo"
+                    {
+                        view.model = ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL);
+                    }
+                    view.record_status(format!(
+                        "GitHub Copilot configured on {}",
+                        view.node_names
+                            .get(&node_id)
+                            .map_or(node_id.as_str(), String::as_str)
+                    ));
+                    let providers_node_id = node_id.clone();
+                    view.dispatch_to_node(
+                        cx,
+                        providers_node_id,
+                        ClientRequest::ListProviders,
+                        |view, response, _| match response.result {
+                            Ok(ServerResponse::Providers { providers }) => {
+                                view.github_connected = providers
+                                    .iter()
+                                    .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
+                                view.providers = providers;
+                            }
+                            Err(error) => view.record_backend_error("list providers", error),
+                            Ok(response) => view.record_backend_error(
+                                "list providers",
+                                unexpected_response("provider list", response),
+                            ),
+                        },
+                    );
+                    view.refresh_models_for_node_async(node_id, cx);
+                }
+                Err(error) => {
+                    view.github_login = Some(GitHubLoginState::Error(error.message));
+                }
+                Ok(response) => view.record_backend_error(
+                    "configure GitHub Copilot",
+                    unexpected_response("provider configuration", response),
+                ),
+            },
+        );
         cx.notify();
     }
 
@@ -4219,16 +4301,27 @@ impl LoomView {
     }
 
     pub(crate) fn open_providers_from_menu(&mut self, cx: &mut Context<Self>) {
+        self.open_providers_for_node(self.default_backend_node_id.clone(), cx);
+    }
+
+    fn open_providers_for_node(&mut self, node_id: String, cx: &mut Context<Self>) {
         self.github_login = None;
         self.review.open = false;
         self.settings_open = false;
         self.about_open = false;
         self.providers_open = true;
-        self.dispatch(
+        self.providers_node_id = Some(node_id.clone());
+        self.providers.clear();
+        self.github_connected = false;
+        self.dispatch_to_node(
             cx,
+            node_id,
             ClientRequest::ListProviders,
             |view, response, _| match response.result {
                 Ok(ServerResponse::Providers { providers }) => {
+                    view.github_connected = providers
+                        .iter()
+                        .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
                     view.providers = providers;
                 }
                 Err(error) => view.record_backend_error("list providers", error),
@@ -5896,6 +5989,7 @@ impl LoomView {
                     .children(self.worker_nodes.iter().map(|node| {
                         let id = node.id;
                         let status = &node.status;
+                        let node_id = status.node_id.clone();
                         let resources = &status.resources;
                         let connection_label = match node.connection_state {
                             WorkerConnectionState::Disconnected => "not connected",
@@ -5956,6 +6050,19 @@ impl LoomView {
                                         })),
                                 )
                             })
+                            .when(
+                                !node.is_local && self.node_backends.contains_key(&node_id),
+                                |element| {
+                                    element.child(
+                                        Button::new(format!("worker-node-providers-{id}"))
+                                            .label("Providers")
+                                            .small()
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                view.open_providers_for_node(node_id.clone(), cx)
+                                            })),
+                                    )
+                                },
+                            )
                     })),
             )
             .child(
@@ -6109,6 +6216,11 @@ impl LoomView {
     }
 
     pub(crate) fn render_providers_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let node_name = self
+            .providers_node_id
+            .as_ref()
+            .and_then(|node_id| self.node_names.get(node_id))
+            .map_or("worker", String::as_str);
         let github_provider = self
             .providers
             .iter()
@@ -6136,7 +6248,7 @@ impl LoomView {
                     .border_color(rgb(0x293244))
                     .text_sm()
                     .text_color(rgb(0x8f98a6))
-                    .child("No local providers are configured."),
+                    .child("No other providers are configured."),
             );
         } else {
             for provider in local_providers {
@@ -6239,7 +6351,16 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().text_color(rgb(0xf3f4f6)).child("Providers"))
+                    .child(
+                        div()
+                            .child(div().text_sm().text_color(rgb(0xf3f4f6)).child("Providers"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child(format!("Configured on {node_name}")),
+                            ),
+                    )
                     .child(
                         div()
                             .id("close-providers")

@@ -783,6 +783,7 @@ impl InProcessBackend {
                 Capability::RetryFromCheckpoint,
                 Capability::ApproveAgentAction,
                 Capability::ListProviders,
+                Capability::ConfigureProviders,
                 Capability::ReadProviderHealth,
                 Capability::ReadUsage,
                 Capability::InspectContext,
@@ -1945,6 +1946,12 @@ impl InProcessConnection {
             ClientRequest::ListProviders => Ok(ServerResponse::Providers {
                 providers: self.backend.providers.list_providers()?,
             }),
+            ClientRequest::ConfigureGitHubCopilot { access_token } => {
+                self.backend
+                    .providers
+                    .configure_github_copilot(access_token)?;
+                Ok(ServerResponse::ProviderConfigured)
+            }
             ClientRequest::DiscoverProviderModels { provider_id } => Ok(ServerResponse::Models {
                 models: self.backend.providers.discover_models(&provider_id)?,
             }),
@@ -2471,6 +2478,7 @@ impl InProcessConnection {
             | ClientRequest::ListProviders
             | ClientRequest::DiscoverProviderModels { .. }
             | ClientRequest::GetProviderHealth { .. } => {}
+            ClientRequest::ConfigureGitHubCopilot { .. } => {}
             ClientRequest::CreateCheckpoint {
                 session_id: None, ..
             } => {}

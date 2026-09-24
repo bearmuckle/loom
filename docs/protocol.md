@@ -137,6 +137,7 @@ RetryAgentFromCheckpoint
 ListProviders / ListModels
 DiscoverProviderModels
 GetProviderHealth
+ConfigureGitHubCopilot
 GetRunUsage
 InspectAgentContext
 ```
@@ -152,6 +153,12 @@ Provider summaries contain provider/model IDs, capabilities, credential
 reference IDs, and health state, never raw credentials. Normalized provider
 authentication, rate-limit, invalid-response, and unavailable errors retain
 retryability without echoing response bodies or request headers.
+`ConfigureGitHubCopilot` accepts a GitHub device-flow access token only over an
+authenticated connection, stores it in the worker's credential store, and
+returns no credential material. It requires the separate `ConfigureProviders`
+capability; tokens are not included in workspace configuration or provider
+summaries. Clients must use WSS for remote workers (loopback WS is allowed)
+when sending the credential.
 
 Important event families include `AgentMessageDelta`,
 `AgentPlanProposed`, `AgentStepStarted`, `ToolCallRequested`,
@@ -200,6 +207,9 @@ indicators (default 5%); credentials, workspace files, and session state are
 not included. Connected peers receive the updated config when nodes join or
 are removed. Sessions remain owned by the node that created them; config
 distribution does not migrate sessions.
+Provider settings are maintained independently by each worker. The client can
+open provider settings for any connected worker, and signing in configures that
+worker rather than the client host or other workers.
 
 The UI aggregates sessions from connected nodes and offers a node choice when
 creating a session on a multi-node setup, defaulting to the startup backend.

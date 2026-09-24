@@ -246,6 +246,9 @@ pub enum ClientRequest {
     },
     ListModels,
     ListProviders,
+    ConfigureGitHubCopilot {
+        access_token: String,
+    },
     DiscoverProviderModels {
         provider_id: ProviderId,
     },
@@ -421,6 +424,7 @@ impl ClientRequest {
             Self::ForkAgentSession { .. } => Some(Capability::ForkAgentSession),
             Self::ListModels => None,
             Self::ListProviders => Some(Capability::ListProviders),
+            Self::ConfigureGitHubCopilot { .. } => Some(Capability::ConfigureProviders),
             Self::DiscoverProviderModels { .. } => Some(Capability::ListProviders),
             Self::GetProviderHealth { .. } => Some(Capability::ReadProviderHealth),
             Self::GetRunUsage { .. } => Some(Capability::ReadUsage),
@@ -477,6 +481,7 @@ impl ClientRequest {
                 | Self::ResumeAgentRun { .. }
                 | Self::RetryAgentFromCheckpoint { .. }
                 | Self::ForkAgentSession { .. }
+                | Self::ConfigureGitHubCopilot { .. }
                 | Self::OpenWorkspace { .. }
                 | Self::SetWorkspaceConfig { .. }
                 | Self::ApplyWorkspaceEdit { .. }
@@ -558,6 +563,7 @@ pub enum ServerResponse {
     Providers {
         providers: Vec<ProviderSummary>,
     },
+    ProviderConfigured,
     ProviderHealth(ProviderHealth),
     RunUsage {
         usage: UsageSnapshot,
