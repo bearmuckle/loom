@@ -72,6 +72,7 @@ wasm-bindgen-futures = "0.4.78"
 js-sys = "0.3.105"
 web-sys = { version = "0.3.105", features = [
     "Location",
+    "Storage",
     "Window",
     "WebSocket",
     "MessageEvent",
@@ -87,3 +88,10 @@ ignore = "0.4.33"
 globset = "0.4.20"
 scraper = "0.24.0"
 url = "2.5.8"
+sysinfo = "0.31.4"
+keyring = { version = "3.6.3", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "sync-secret-service",
+    "crypto-rust",
+] }

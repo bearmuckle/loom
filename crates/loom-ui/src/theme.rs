@@ -8,6 +8,9 @@ use loom_core::AgentSessionState;
 
 pub(crate) const CLIENT_DECORATION_ROUNDING: Pixels = px(10.);
 pub(crate) const CLIENT_DECORATION_SHADOW: Pixels = px(10.);
+pub(crate) const ERROR_CARD_SURFACE: u32 = 0x171c25;
+pub(crate) const ERROR_CARD_FOREGROUND: u32 = 0xe5e7eb;
+pub(crate) const ERROR_CARD_ACCENT: u32 = 0xfca5a5;
 
 /// GPUI content masks are axis-aligned rectangles, so a rounded parent cannot clip a
 /// square child. Every element that paints a background into a window corner therefore
@@ -189,4 +192,39 @@ pub(crate) fn resize_edge(
         return None;
     };
     Some(edge)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND, ERROR_CARD_SURFACE};
+
+    fn luminance(value: f32) -> f32 {
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn contrast_ratio(foreground: u32, background: u32) -> f32 {
+        let foreground = gpui_kit::rgb(foreground);
+        let background = gpui_kit::rgb(background);
+        let luminance = |color: gpui_kit::Rgba| {
+            0.2126 * luminance(color.r) + 0.7152 * luminance(color.g) + 0.0722 * luminance(color.b)
+        };
+        let foreground = luminance(foreground);
+        let background = luminance(background);
+        let (lighter, darker) = if foreground > background {
+            (foreground, background)
+        } else {
+            (background, foreground)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn error_card_text_and_accent_have_readable_dark_surface_contrast() {
+        assert!(contrast_ratio(ERROR_CARD_FOREGROUND, ERROR_CARD_SURFACE) >= 4.5);
+        assert!(contrast_ratio(ERROR_CARD_ACCENT, ERROR_CARD_SURFACE) >= 4.5);
+    }
 }

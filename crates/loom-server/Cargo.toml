@@ -28,3 +28,5 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 uuid.workspace = true
 subtle.workspace = true
+url.workspace = true
+sysinfo.workspace = true

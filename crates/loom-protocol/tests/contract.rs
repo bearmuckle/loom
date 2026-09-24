@@ -8,9 +8,10 @@ use loom_protocol::{
     AgentPlanStep, AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientFrame,
     ClientRequest, ContextAssemblyOptions, FileActivityOperation, RequestEnvelope,
     ResponseEnvelope, ServerEvent, ServerEventEnvelope, ServerFrame, ServerResponse, TaskKind,
-    TaskSpec, ToolResult, WorkspaceEdit, WorkspaceSnapshot, decode_client_frame, decode_event,
-    decode_request, decode_response, decode_server_frame, encode_client_frame, encode_event,
-    encode_request, encode_response, encode_server_frame,
+    TaskSpec, ToolResult, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceEdit,
+    WorkspaceSnapshot, decode_client_frame, decode_event, decode_request, decode_response,
+    decode_server_frame, encode_client_frame, encode_event, encode_request, encode_response,
+    encode_server_frame,
 };
 
 #[test]
@@ -43,6 +44,21 @@ fn response_json_round_trip_preserves_structured_errors() {
 }
 
 #[test]
+fn workspace_config_defaults_the_pulse_threshold_for_older_saved_configs() {
+    let old_config: WorkspaceConfig =
+        serde_json::from_str(r#"{"revision":7,"worker_nodes":[]}"#).unwrap();
+
+    assert_eq!(old_config.cpu_pulse_threshold_percent, 5);
+
+    let mut config = old_config;
+    config.cpu_pulse_threshold_percent = 23;
+    let encoded = serde_json::to_string(&config).unwrap();
+    let decoded: WorkspaceConfig = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded.cpu_pulse_threshold_percent, 23);
+}
+
+#[test]
 fn event_json_round_trip_preserves_sequence_and_session() {
     let session_id = AgentSessionId::new();
     let snapshot = AgentSessionSnapshot {
@@ -71,6 +87,33 @@ fn response_can_carry_model_list_without_provider_specific_types() {
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
         ServerResponse::Models { models: Vec::new() },
+    );
+
+    let encoded = encode_response(&response).unwrap();
+    let decoded = decode_response(&encoded).unwrap();
+
+    assert_eq!(decoded, response);
+}
+
+#[test]
+fn worker_status_response_round_trip_preserves_resource_samples() {
+    let response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::WorkerNodeStatus(WorkerNodeStatus {
+            node_id: "worker-1".to_owned(),
+            name: "Worker one".to_owned(),
+            online: true,
+            capabilities: CapabilitySet::default(),
+            resources: WorkerNodeResources {
+                cpu_count: 8,
+                cpu_usage_percent: Some(31),
+                memory_usage_percent: Some(50),
+                memory_total_bytes: Some(16 << 30),
+                memory_available_bytes: Some(8 << 30),
+                disk_total_bytes: Some(1 << 40),
+                disk_available_bytes: Some(1 << 39),
+            },
+        }),
     );
 
     let encoded = encode_response(&response).unwrap();

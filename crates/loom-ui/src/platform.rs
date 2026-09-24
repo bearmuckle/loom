@@ -4,17 +4,148 @@
 //! These are the pieces a browser target cannot use unchanged, so they are kept
 //! out of the view and connection modules.
 
+#[cfg(test)]
+use std::{collections::BTreeMap, sync::Mutex};
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use loom_core::{ErrorCode, LoomError, ProjectId};
 use loom_model::ModelId;
-use loom_providers::GITHUB_COPILOT_DEFAULT_MODEL;
+use loom_providers::{CredentialRef, GITHUB_COPILOT_DEFAULT_MODEL};
 use loom_vcs::GitService;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+const PEER_CREDENTIAL_SERVICE: &str = "com.bearmuckle.loom.worker-peer";
+
+type SecretResult<T> = std::result::Result<T, String>;
+
+trait PeerCredentialBackend: Send + Sync {
+    fn get(&self, reference: &str) -> SecretResult<Option<String>>;
+    fn set(&self, reference: &str, token: &str) -> SecretResult<()>;
+    fn delete(&self, reference: &str) -> SecretResult<()>;
+}
+
+struct OsCredentialBackend;
+
+impl PeerCredentialBackend for OsCredentialBackend {
+    fn get(&self, reference: &str) -> SecretResult<Option<String>> {
+        let entry = keyring::Entry::new(PEER_CREDENTIAL_SERVICE, reference)
+            .map_err(|error| error.to_string())?;
+        match entry.get_password() {
+            Ok(token) => Ok(Some(token)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn set(&self, reference: &str, token: &str) -> SecretResult<()> {
+        let entry = keyring::Entry::new(PEER_CREDENTIAL_SERVICE, reference)
+            .map_err(|error| error.to_string())?;
+        entry.set_password(token).map_err(|error| error.to_string())
+    }
+
+    fn delete(&self, reference: &str) -> SecretResult<()> {
+        let entry = keyring::Entry::new(PEER_CREDENTIAL_SERVICE, reference)
+            .map_err(|error| error.to_string())?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+}
+
+pub(crate) struct PeerCredentialStore {
+    backend: Arc<dyn PeerCredentialBackend>,
+}
+
+impl PeerCredentialStore {
+    pub(crate) fn new() -> Self {
+        Self {
+            backend: Arc::new(OsCredentialBackend),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backend(backend: Arc<dyn PeerCredentialBackend>) -> Self {
+        Self { backend }
+    }
+
+    pub(crate) fn get(
+        &self,
+        project_id: ProjectId,
+        url: &str,
+    ) -> Result<Option<String>, LoomError> {
+        self.backend
+            .get(peer_credential_reference(project_id, url).as_str())
+            .map_err(|error| peer_credential_error("read", error))
+    }
+
+    pub(crate) fn set(
+        &self,
+        project_id: ProjectId,
+        url: &str,
+        token: &str,
+    ) -> Result<(), LoomError> {
+        self.backend
+            .set(peer_credential_reference(project_id, url).as_str(), token)
+            .map_err(|error| peer_credential_error("save", error))
+    }
+
+    pub(crate) fn delete(&self, project_id: ProjectId, url: &str) -> Result<(), LoomError> {
+        self.backend
+            .delete(peer_credential_reference(project_id, url).as_str())
+            .map_err(|error| peer_credential_error("remove", error))
+    }
+}
+
+fn peer_credential_reference(project_id: ProjectId, url: &str) -> CredentialRef {
+    let mut digest = Sha256::new();
+    digest.update(project_id.to_string().as_bytes());
+    digest.update([0]);
+    digest.update(url.as_bytes());
+    let key = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    CredentialRef::new(format!("worker-peer-{key}"))
+}
+
+fn peer_credential_error(operation: &str, error: String) -> LoomError {
+    LoomError::new(
+        ErrorCode::Internal,
+        format!("could not {operation} worker-node credential in the OS credential store: {error}"),
+        false,
+    )
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MemoryPeerCredentialBackend(Mutex<BTreeMap<String, String>>);
+
+#[cfg(test)]
+impl PeerCredentialBackend for MemoryPeerCredentialBackend {
+    fn get(&self, reference: &str) -> SecretResult<Option<String>> {
+        Ok(self.0.lock().unwrap().get(reference).cloned())
+    }
+
+    fn set(&self, reference: &str, token: &str) -> SecretResult<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(reference.to_owned(), token.to_owned());
+        Ok(())
+    }
+
+    fn delete(&self, reference: &str) -> SecretResult<()> {
+        self.0.lock().unwrap().remove(reference);
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct UiOptions {
@@ -262,5 +393,30 @@ mod tests {
             backend_persistence_path(first).unwrap(),
             backend_persistence_path(second).unwrap()
         );
+    }
+
+    #[test]
+    fn peer_credentials_are_scoped_by_project_and_url_and_deleted_with_peer() {
+        let backend = Arc::new(MemoryPeerCredentialBackend::default());
+        let store = PeerCredentialStore::with_backend(backend);
+        let project_id = stable_project_id(Path::new("/tmp/loom-project"));
+        let other_project_id = stable_project_id(Path::new("/tmp/other-project"));
+        let first_url = "wss://worker.example/ws";
+        let reference = peer_credential_reference(project_id, first_url);
+        assert!(!reference.as_str().contains(first_url));
+
+        store.set(project_id, first_url, "peer-secret").unwrap();
+
+        assert_eq!(
+            store.get(project_id, first_url).unwrap().as_deref(),
+            Some("peer-secret")
+        );
+        assert_eq!(store.get(other_project_id, first_url).unwrap(), None);
+        assert_eq!(
+            store.get(project_id, "wss://other.example/ws").unwrap(),
+            None
+        );
+        store.delete(project_id, first_url).unwrap();
+        assert_eq!(store.get(project_id, first_url).unwrap(), None);
     }
 }

@@ -38,8 +38,9 @@ pub use tool::ToolResult;
 pub use vcs::{GitBranch, GitDiff, GitFileStatus, GitFileStatusKind, GitRepositoryStatus};
 pub use workspace::{
     Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, RevertResult, UndoResult,
-    WorkspaceChange, WorkspaceChangeKind, WorkspaceControl, WorkspaceEdit, WorkspaceEditResult,
-    WorkspaceEntry, WorkspaceEntryKind, WorkspaceFile, WorkspaceSnapshot,
+    WorkerNodeConfig, WorkspaceChange, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
+    WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFile,
+    WorkspaceSnapshot,
 };
 
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
@@ -51,6 +52,45 @@ pub struct ProjectSnapshot {
     pub root: Option<String>,
     pub session_count: usize,
     pub updated_at: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerNodeResources {
+    pub cpu_count: usize,
+    /// System-wide CPU utilization sampled between status requests.
+    #[serde(default)]
+    pub cpu_usage_percent: Option<u8>,
+    /// Used system memory as a percentage of total memory.
+    #[serde(default)]
+    pub memory_usage_percent: Option<u8>,
+    pub memory_total_bytes: Option<u64>,
+    pub memory_available_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    pub disk_available_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerNodeStatus {
+    pub node_id: String,
+    pub name: String,
+    pub online: bool,
+    pub capabilities: CapabilitySet,
+    pub resources: WorkerNodeResources,
+}
+
+#[cfg(test)]
+mod worker_node_resource_tests {
+    use super::WorkerNodeResources;
+
+    #[test]
+    fn missing_percentage_fields_default_for_older_peers() {
+        let resources: WorkerNodeResources = serde_json::from_str(
+            r#"{"cpu_count":4,"memory_total_bytes":8192,"memory_available_bytes":4096,"disk_total_bytes":null,"disk_available_bytes":null}"#,
+        )
+        .unwrap();
+        assert_eq!(resources.cpu_usage_percent, None);
+        assert_eq!(resources.memory_usage_percent, None);
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -113,6 +153,7 @@ pub enum ClientRequest {
         capabilities: CapabilitySet,
     },
     DiscoverCapabilities,
+    GetWorkerNodeStatus,
     ListProjects,
     ListAgentSessions {
         project_id: Option<ProjectId>,
@@ -223,6 +264,13 @@ pub enum ClientRequest {
     OpenWorkspace {
         project_id: ProjectId,
         root: String,
+    },
+    GetWorkspaceConfig {
+        project_id: ProjectId,
+    },
+    SetWorkspaceConfig {
+        project_id: ProjectId,
+        config: WorkspaceConfig,
     },
     GetWorkspaceSnapshot {
         project_id: ProjectId,
@@ -340,6 +388,7 @@ impl ClientRequest {
     pub const fn required_capability(&self) -> Option<Capability> {
         match self {
             Self::Negotiate { .. } | Self::DiscoverCapabilities => None,
+            Self::GetWorkerNodeStatus => Some(Capability::ReadWorkerNodeStatus),
             Self::ListProjects | Self::ListAgentSessions { .. } => {
                 Some(Capability::ReadAgentSession)
             }
@@ -378,6 +427,8 @@ impl ClientRequest {
             Self::GetSessionUsage { .. } => Some(Capability::ReadUsage),
             Self::InspectAgentContext { .. } => Some(Capability::InspectContext),
             Self::OpenWorkspace { .. } => Some(Capability::OpenWorkspace),
+            Self::GetWorkspaceConfig { .. } => Some(Capability::ReadWorkspace),
+            Self::SetWorkspaceConfig { .. } => Some(Capability::OpenWorkspace),
             Self::GetWorkspaceSnapshot { .. } | Self::ReadWorkspaceFile { .. } => {
                 Some(Capability::ReadWorkspace)
             }
@@ -427,6 +478,7 @@ impl ClientRequest {
                 | Self::RetryAgentFromCheckpoint { .. }
                 | Self::ForkAgentSession { .. }
                 | Self::OpenWorkspace { .. }
+                | Self::SetWorkspaceConfig { .. }
                 | Self::ApplyWorkspaceEdit { .. }
                 | Self::TakeWorkspaceControl { .. }
                 | Self::CreateCheckpoint { .. }
@@ -474,6 +526,7 @@ impl ResponseEnvelope {
 pub enum ServerResponse {
     Negotiated(NegotiationResult),
     Capabilities(NegotiationResult),
+    WorkerNodeStatus(WorkerNodeStatus),
     Projects {
         projects: Vec<ProjectSnapshot>,
     },
@@ -516,6 +569,8 @@ pub enum ServerResponse {
     },
     ContextInspection(ContextInspection),
     WorkspaceOpened(WorkspaceSnapshot),
+    WorkspaceConfig(WorkspaceConfig),
+    WorkspaceConfigUpdated,
     WorkspaceSnapshot(WorkspaceSnapshot),
     WorkspaceEvents {
         events: Vec<WorkspaceChange>,

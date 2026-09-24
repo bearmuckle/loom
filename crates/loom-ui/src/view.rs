@@ -1,14 +1,13 @@
 //! The GPUI view: session navigator, run canvas, composer, and review drawer.
 
-#[cfg(not(target_family = "wasm"))]
-use std::time::Duration;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
     path::PathBuf,
+    time::Duration,
 };
 
-use gpui_kit::base::{SelectableText, TextSelectionLayer};
+use gpui_kit::base::{Disableable, SelectableText, TextSelectionLayer};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::{
     Icon, IconName, IndexPath, Sizable,
@@ -17,22 +16,22 @@ use gpui_kit::component::{
     text::TextView,
 };
 use gpui_kit::{
-    App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, Decorations, Element, Entity,
-    EntityInputHandler, FocusHandle, Focusable, HitboxBehavior, ListAlignment, ListState,
-    MouseButton, MouseDownEvent, Pixels, Point, Render, ResizeEdge, Subscription, Tiling,
-    UTF16Selection, Window, WindowAppearance, WindowControlArea, canvas, div, list, point,
-    prelude::*, px, transparent_black,
+    Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
+    Decorations, Element, Entity, EntityInputHandler, FocusHandle, Focusable, HitboxBehavior,
+    ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Render, ResizeEdge,
+    Subscription, Tiling, UTF16Selection, Window, WindowAppearance, WindowControlArea, canvas, div,
+    list, point, prelude::*, px, transparent_black,
 };
 use loom_core::{
-    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence,
-    LoomError, ProjectId, RunId,
+    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
+    EventSequence, LoomError, ProjectId, RunId,
 };
 use loom_model::{MessageRole, ModelId, ProviderKind, ProviderSummary, ToolCall};
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
     ProjectSnapshot, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse, TaskSnapshot,
-    TaskStatus,
+    TaskStatus, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_providers::{
@@ -44,7 +43,10 @@ use loom_server::InProcessBackend;
 
 use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
-    connection::{BackendWorker, ClientConnection, select_remote_project, unexpected_response},
+    connection::{
+        BackendWorker, ClientConnection, ConnectionCleanupGuard, list_models_from_backend,
+        redact_secret, select_remote_project, unexpected_response,
+    },
     state::{
         AgentMode, GitHubLoginState, RenameDialogState, ReviewPanel, ReviewState, ThemeChoice,
         TimelineItem, activity_status_label, bounded, bounded_to, session_state_for_run,
@@ -54,27 +56,285 @@ use crate::{
         Backspace, Copy, Delete, End, Home, InputField, Left, LoomTooltip, Paste, Right, SelectAll,
         Submit, TextBufferState, TextInputElement,
     },
-    theme::{CLIENT_DECORATION_SHADOW, ClientCorners, change_color, resize_edge, rgb, state_color},
+    theme::{
+        CLIENT_DECORATION_SHADOW, ClientCorners, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
+        ERROR_CARD_SURFACE, change_color, resize_edge, rgb, state_color,
+    },
 };
 #[cfg(target_family = "wasm")]
 use crate::{
     browser::BrowserOptions,
     connection::{
         create_session_async, list_models_async, list_projects_async, list_sessions_async,
-        negotiate_async, open_workspace_async,
+        negotiate_async, open_workspace_async, set_workspace_config_async,
+        worker_node_status_async, workspace_config_async,
     },
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::{
     connection::{
         create_session, list_models, list_projects, list_provider_ids, list_sessions, negotiate,
-        open_workspace, start_run,
+        open_workspace, set_workspace_config, start_run, worker_node_status, workspace_config,
     },
-    platform::{UiOptions, backend_persistence_path, prepare_workspace, stable_project_id},
+    platform::{
+        PeerCredentialStore, UiOptions, backend_persistence_path, prepare_workspace,
+        stable_project_id,
+    },
 };
 use log::info;
 
 type ModelSelectState = SelectState<SearchableVec<String>>;
+
+const ACTIVE_BACKEND_NODE_ENTRY_ID: u64 = 0;
+
+fn format_bytes(value: Option<u64>) -> String {
+    let Some(value) = value else {
+        return "n/a".to_owned();
+    };
+    let (value, suffix) = if value >= 1 << 30 {
+        (value as f64 / (1 << 30) as f64, "GiB")
+    } else if value >= 1 << 20 {
+        (value as f64 / (1 << 20) as f64, "MiB")
+    } else {
+        (value as f64 / (1 << 10) as f64, "KiB")
+    };
+    format!("{value:.1} {suffix}")
+}
+
+fn format_percentage(value: Option<u8>) -> String {
+    value
+        .filter(|value| *value <= 100)
+        .map_or_else(|| "n/a".to_owned(), |value| format!("{value}%"))
+}
+
+fn format_worker_node_resources(resources: &WorkerNodeResources) -> String {
+    let cpu_usage = if resources.cpu_count > 0 {
+        format!(
+            "CPU {} of {} cores",
+            format_percentage(resources.cpu_usage_percent),
+            resources.cpu_count
+        )
+    } else {
+        "CPU n/a".to_owned()
+    };
+    format!(
+        "{cpu_usage} · RAM {} of {} · disk {} available",
+        format_percentage(resources.memory_usage_percent),
+        format_bytes(resources.memory_total_bytes),
+        format_bytes(resources.disk_available_bytes),
+    )
+}
+
+fn worker_node_for_id<'a>(
+    nodes: &'a [WorkerNodeEntry],
+    node_id: Option<&str>,
+) -> Option<&'a WorkerNodeEntry> {
+    let node_id = node_id?;
+    nodes.iter().find(|node| node.status.node_id == node_id)
+}
+
+fn worker_node_name_for_id(
+    nodes: &[WorkerNodeEntry],
+    node_names: &BTreeMap<String, String>,
+    node_id: Option<&str>,
+) -> String {
+    worker_node_for_id(nodes, node_id)
+        .map(worker_node_display_name)
+        .or_else(|| node_id.and_then(|node_id| node_names.get(node_id).cloned()))
+        .unwrap_or_else(|| "Worker node unavailable".to_owned())
+}
+
+fn worker_node_display_name(node: &WorkerNodeEntry) -> String {
+    let role = if node.is_local {
+        "Local backend"
+    } else {
+        "External worker"
+    };
+    format!("{role} · {}", node.status.name)
+}
+
+fn format_session_resource_percentages(status: Option<&WorkerNodeStatus>) -> String {
+    let resources = status.map(|status| &status.resources);
+    format!(
+        "CPU {} · RAM {}",
+        format_percentage(resources.and_then(|resources| resources.cpu_usage_percent)),
+        format_percentage(resources.and_then(|resources| resources.memory_usage_percent)),
+    )
+}
+
+fn session_owner_status<'a>(
+    nodes: &'a [WorkerNodeEntry],
+    session_node_ids: &BTreeMap<AgentSessionId, String>,
+    session_id: AgentSessionId,
+) -> Option<&'a WorkerNodeEntry> {
+    worker_node_for_id(nodes, session_node_ids.get(&session_id).map(String::as_str))
+}
+
+fn session_node_pulse(
+    status: Option<&WorkerNodeStatus>,
+    threshold_percent: u8,
+) -> Option<(Duration, f32)> {
+    let cpu_percent = status
+        .filter(|status| status.online)
+        .and_then(|status| status.resources.cpu_usage_percent)
+        .filter(|percent| *percent <= 100)?;
+    let threshold_percent = threshold_percent.min(100);
+    if cpu_percent <= threshold_percent {
+        return None;
+    }
+    let load_above_threshold = f32::from(cpu_percent - threshold_percent)
+        / f32::from(100_u8.saturating_sub(threshold_percent).max(1));
+    let period_ms = 2_600_u64 - (load_above_threshold * 800.) as u64;
+    let amplitude = 0.35 + load_above_threshold * 0.8;
+    Some((Duration::from_millis(period_ms), amplitude))
+}
+
+fn next_severe_load_streak(current: u8, resources: &WorkerNodeResources) -> u8 {
+    match (resources.cpu_usage_percent, resources.memory_usage_percent) {
+        (Some(cpu), Some(memory)) if cpu > 90 && cpu <= 100 && memory > 90 && memory <= 100 => {
+            current.saturating_add(1)
+        }
+        _ => 0,
+    }
+}
+
+fn adjusted_cpu_pulse_threshold(current: u8, delta: i8) -> u8 {
+    (i16::from(current.min(100)) + i16::from(delta)).clamp(0, 100) as u8
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionNodeIndicatorState {
+    Offline,
+    Online,
+    Severe,
+}
+
+fn session_node_indicator_state(
+    status: Option<&WorkerNodeStatus>,
+    severe_load_streak: u8,
+) -> SessionNodeIndicatorState {
+    match status {
+        Some(status) if status.online && severe_load_streak >= 3 => {
+            SessionNodeIndicatorState::Severe
+        }
+        Some(status) if status.online => SessionNodeIndicatorState::Online,
+        _ => SessionNodeIndicatorState::Offline,
+    }
+}
+
+fn order_session_nodes(
+    mut nodes: Vec<(String, String)>,
+    default_node_id: &str,
+) -> Vec<(String, String)> {
+    nodes.sort_by_key(|(node_id, _)| node_id != default_node_id);
+    nodes
+}
+
+fn merge_node_sessions(
+    current: &[AgentSessionSnapshot],
+    current_owners: &BTreeMap<AgentSessionId, String>,
+    node_results: Vec<(String, Vec<AgentSessionSnapshot>)>,
+) -> (Vec<AgentSessionSnapshot>, BTreeMap<AgentSessionId, String>) {
+    let queried_nodes = node_results
+        .iter()
+        .map(|(node_id, _)| node_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut sessions = current
+        .iter()
+        .filter(|session| {
+            current_owners
+                .get(&session.id)
+                .is_none_or(|owner| !queried_nodes.contains(owner.as_str()))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut owners = current_owners.clone();
+    for (node_id, node_sessions) in node_results {
+        for session in node_sessions {
+            if let Some(existing) = sessions
+                .iter_mut()
+                .find(|existing| existing.id == session.id)
+            {
+                *existing = session.clone();
+            } else {
+                sessions.push(session.clone());
+            }
+            owners.insert(session.id, node_id.clone());
+        }
+    }
+    owners.retain(|session_id, _| sessions.iter().any(|session| session.id == *session_id));
+    (sessions, owners)
+}
+
+fn session_id_for_request(
+    request: &ClientRequest,
+    active_session_id: AgentSessionId,
+) -> Option<AgentSessionId> {
+    match request {
+        ClientRequest::GetAgentSession { session_id }
+        | ClientRequest::GetAgentSessionSnapshot { session_id }
+        | ClientRequest::RenameAgentSession { session_id, .. }
+        | ClientRequest::ArchiveAgentSession { session_id }
+        | ClientRequest::GetRecentSessionEvents { session_id, .. }
+        | ClientRequest::StartAgentRun { session_id, .. }
+        | ClientRequest::StartAgentRunWithOptions { session_id, .. }
+        | ClientRequest::ForkAgentSession { session_id, .. }
+        | ClientRequest::GetSessionUsage { session_id } => Some(*session_id),
+        ClientRequest::CreateCheckpoint {
+            session_id: Some(session_id),
+            ..
+        } => Some(*session_id),
+        ClientRequest::GetSessionEvents { session_id, .. } => {
+            Some(session_id.unwrap_or(active_session_id))
+        }
+        ClientRequest::GetAgentRun { .. }
+        | ClientRequest::GetAgentRunSnapshot { .. }
+        | ClientRequest::GetRunCheckpoint { .. }
+        | ClientRequest::ApproveAgentAction { .. }
+        | ClientRequest::RejectAgentAction { .. }
+        | ClientRequest::SendAgentMessage { .. }
+        | ClientRequest::InterruptAgentRun { .. }
+        | ClientRequest::RetryAgentStep { .. }
+        | ClientRequest::PauseAgentRun { .. }
+        | ClientRequest::ResumeAgentRun { .. }
+        | ClientRequest::RetryAgentFromCheckpoint { .. }
+        | ClientRequest::GetRunUsage { .. }
+        | ClientRequest::InspectAgentContext { .. }
+        | ClientRequest::AttachRunEvidence { .. } => Some(active_session_id),
+        _ => None,
+    }
+}
+
+fn assigned_node_id(
+    session_node_ids: &BTreeMap<AgentSessionId, String>,
+    session_id: AgentSessionId,
+) -> Result<&str, LoomError> {
+    session_node_ids
+        .get(&session_id)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::NotFound,
+                format!("session {session_id} has no assigned worker node"),
+                false,
+            )
+        })
+}
+
+fn validate_model_for_node(
+    node_model_catalogs: &BTreeMap<String, Vec<ModelId>>,
+    node_id: &str,
+    model: &ModelId,
+) -> Result<(), String> {
+    let Some(models) = node_model_catalogs.get(node_id) else {
+        return Err("model availability has not been checked".to_owned());
+    };
+    if models.contains(model) {
+        Ok(())
+    } else {
+        Err(format!("model '{}' is not configured", model.as_str()))
+    }
+}
 
 /// Opens a URL in a new tab/window. Natively this shells out to the OS's
 /// "open" handler; in the browser it's just `window.open`.
@@ -323,11 +583,304 @@ fn is_redundant_completion_summary(summary: &str) -> bool {
     summary.starts_with("Completed task:")
 }
 
+#[derive(Clone)]
+struct WorkerNodeEntry {
+    id: u64,
+    status: WorkerNodeStatus,
+    is_local: bool,
+    url: Option<String>,
+    connection: Option<ClientConnection>,
+    connection_state: WorkerConnectionState,
+    connection_detail: Option<String>,
+    severe_load_streak: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerConnectionState {
+    Disconnected,
+    Connecting,
+    Connected,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerConnectionStage {
+    InputValidation,
+    Transport,
+    Negotiation,
+    Status,
+    CredentialRead,
+    CredentialSave,
+    BootstrapSave,
+}
+
+impl WorkerNodeEntry {
+    fn is_local(&self) -> bool {
+        self.is_local
+    }
+}
+
+fn worker_connection_failure_detail(
+    stage: WorkerConnectionStage,
+    error: &LoomError,
+    secret: Option<&str>,
+) -> String {
+    let lower_message = error.message.to_ascii_lowercase();
+    if stage == WorkerConnectionStage::CredentialSave {
+        let detail = redact_secret(&error.message, secret.unwrap_or_default());
+        return format!(
+            "Connected for this session, but could not save reconnect credentials securely: {}. Re-enter the URL and token after restart.",
+            detail
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(240)
+                .collect::<String>()
+        );
+    }
+    if stage == WorkerConnectionStage::BootstrapSave {
+        let detail = redact_secret(&error.message, secret.unwrap_or_default());
+        return format!(
+            "Connected for this session, but the browser could not save its bootstrap connection: {}. The worker must be opened again manually after restart.",
+            detail
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(240)
+                .collect::<String>()
+        );
+    }
+    if stage == WorkerConnectionStage::CredentialRead {
+        return "Could not read this worker's saved credential from the OS credential store. Re-enter its URL and access token.".to_owned();
+    }
+    if stage == WorkerConnectionStage::InputValidation {
+        return "Enter a worker URL followed by its access token.".to_owned();
+    }
+    if matches!(
+        error.code,
+        ErrorCode::AuthenticationFailed
+            | ErrorCode::AuthenticationRequired
+            | ErrorCode::AuthorizationDenied
+    ) {
+        return "The worker denied authentication. Check the access token and the worker's authentication configuration.".to_owned();
+    }
+    if error.code == ErrorCode::RequestCancelled {
+        return match stage {
+            WorkerConnectionStage::Transport | WorkerConnectionStage::Negotiation => {
+                "The worker closed the connection before negotiation completed. Check that it is running, the URL is correct, and the access token is valid."
+                    .to_owned()
+            }
+            _ => "The worker closed the connection before returning status. Check that it is running and reachable, then retry.".to_owned(),
+        };
+    }
+    if stage == WorkerConnectionStage::Transport
+        && error.code == ErrorCode::InvalidRequest
+        && lower_message.contains("bearer token")
+    {
+        return "The access token contains unsupported characters. Verify the token value and retry."
+            .to_owned();
+    }
+    if stage == WorkerConnectionStage::Transport && error.code == ErrorCode::InvalidRequest {
+        return "Invalid worker URL. Use a ws:// or wss:// WebSocket URL with the worker's WebSocket path.".to_owned();
+    }
+    if error.code == ErrorCode::DeadlineExceeded
+        || lower_message.contains("timed out")
+        || lower_message.contains("timeout")
+    {
+        return "The connection timed out. Check that the worker is reachable and retry."
+            .to_owned();
+    }
+    if lower_message.contains("connection refused")
+        || lower_message.contains("actively refused")
+        || lower_message.contains("os error 111")
+    {
+        return "The worker refused the connection. Check that its server is running and the URL and port are correct.".to_owned();
+    }
+    match stage {
+        WorkerConnectionStage::Transport => {
+            "Could not connect to the worker. Check the WebSocket URL, network access, and firewall, then retry.".to_owned()
+        }
+        WorkerConnectionStage::Negotiation => format!(
+            "The WebSocket opened, but protocol negotiation failed ({}). Update the worker and UI to compatible versions.",
+            error.code
+        ),
+        WorkerConnectionStage::Status => format!(
+            "Protocol negotiation succeeded, but the worker status request failed ({}). Check that a compatible Loom worker is running.",
+            error.code
+        ),
+        WorkerConnectionStage::CredentialRead | WorkerConnectionStage::InputValidation => unreachable!(),
+        WorkerConnectionStage::CredentialSave | WorkerConnectionStage::BootstrapSave => {
+            unreachable!()
+        }
+    }
+}
+
+fn connection_placeholder(
+    id: u64,
+    url: String,
+    connection_state: WorkerConnectionState,
+    connection_detail: Option<String>,
+) -> WorkerNodeEntry {
+    WorkerNodeEntry {
+        id,
+        status: WorkerNodeStatus {
+            node_id: url.clone(),
+            name: safe_worker_url_label(&url),
+            online: false,
+            capabilities: CapabilitySet::default(),
+            resources: WorkerNodeResources {
+                cpu_count: 0,
+                cpu_usage_percent: None,
+                memory_usage_percent: None,
+                memory_total_bytes: None,
+                memory_available_bytes: None,
+                disk_total_bytes: None,
+                disk_available_bytes: None,
+            },
+        },
+        is_local: false,
+        url: Some(url),
+        connection: None,
+        connection_state,
+        connection_detail,
+        severe_load_streak: 0,
+    }
+}
+
+fn transition_worker_connection_to_connecting(
+    state: &mut WorkerConnectionState,
+    has_connection: bool,
+) -> Result<(), &'static str> {
+    match (*state, has_connection) {
+        (WorkerConnectionState::Connecting, _) => {
+            Err("A connection attempt for this worker is already in progress.")
+        }
+        (WorkerConnectionState::Connected, true) => Err("This worker is already connected."),
+        _ => {
+            *state = WorkerConnectionState::Connecting;
+            Ok(())
+        }
+    }
+}
+
+fn mark_worker_connection_failed(node: &mut WorkerNodeEntry, detail: String) -> bool {
+    let cleanup_failed = node
+        .connection
+        .take()
+        .is_some_and(|connection| connection.close().is_err());
+    node.status.online = false;
+    node.connection_state = WorkerConnectionState::Failed;
+    node.connection_detail = Some(detail);
+    cleanup_failed
+}
+
+fn safe_worker_url_label(url: &str) -> String {
+    let without_query = url.split(['?', '#']).next().unwrap_or_default();
+    if let Some((scheme, remainder)) = without_query.split_once("://") {
+        if let Some((authority, path)) = remainder.split_once('/') {
+            let authority = authority.rsplit('@').next().unwrap_or(authority);
+            return format!("{scheme}://{authority}/{path}");
+        }
+        let authority = remainder.rsplit('@').next().unwrap_or(remainder);
+        return format!("{scheme}://{authority}");
+    }
+    without_query
+        .rsplit('@')
+        .next()
+        .unwrap_or(without_query)
+        .to_owned()
+}
+
+fn worker_url_embeds_credential(url: &str) -> bool {
+    let Some((_, remainder)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return true;
+    }
+    let Some(query) = url.split_once('?').map(|(_, query)| query) else {
+        return false;
+    };
+    query.split('&').any(|parameter| {
+        let key = parameter.split('=').next().unwrap_or_default();
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "token"
+                | "access_token"
+                | "auth"
+                | "authorization"
+                | "bearer"
+                | "key"
+                | "api_key"
+                | "password"
+                | "secret"
+                | "client_secret"
+        )
+    })
+}
+
+fn remove_worker_node_entry(nodes: &mut Vec<WorkerNodeEntry>, id: u64) -> Option<WorkerNodeEntry> {
+    let index = nodes.iter().position(|node| node.id == id)?;
+    if nodes[index].is_local() {
+        return None;
+    }
+    Some(nodes.remove(index))
+}
+
+fn update_worker_node_status(
+    nodes: &mut [WorkerNodeEntry],
+    id: u64,
+    status: WorkerNodeStatus,
+) -> Option<String> {
+    let node = nodes.iter_mut().find(|node| node.id == id)?;
+    let recovered = !node.status.online && status.online;
+    let message = recovered.then(|| format!("Worker node {} is online", status.name));
+    node.status = status;
+    message
+}
+
+fn initial_worker_nodes(
+    local_status: WorkerNodeStatus,
+    local_connection: ClientConnection,
+    config: &WorkspaceConfig,
+    local_url: Option<&str>,
+) -> Vec<WorkerNodeEntry> {
+    let mut nodes = vec![WorkerNodeEntry {
+        id: ACTIVE_BACKEND_NODE_ENTRY_ID,
+        status: local_status,
+        is_local: true,
+        url: None,
+        connection: Some(local_connection),
+        connection_state: WorkerConnectionState::Connected,
+        connection_detail: None,
+        severe_load_streak: 0,
+    }];
+    for configured in &config.worker_nodes {
+        if local_url == Some(configured.url.as_str()) {
+            continue;
+        }
+        nodes.push(connection_placeholder(
+            nodes.len() as u64,
+            configured.url.clone(),
+            WorkerConnectionState::Disconnected,
+            None,
+        ));
+    }
+    nodes
+}
+
 pub(crate) struct LoomView {
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
     /// Used for every request made once the view is interactive.
     pub(crate) backend: BackendWorker,
+    /// The startup backend remains the default for project-wide requests and new sessions.
+    default_backend_node_id: String,
+    /// Connections are keyed by the backend's stable node identity.
+    node_backends: BTreeMap<String, BackendWorker>,
+    /// Last known display names remain available for sessions after node removal.
+    node_names: BTreeMap<String, String>,
+    /// Sessions stay pinned to the node that created them.
+    session_node_ids: BTreeMap<AgentSessionId, String>,
     pub(crate) project_id: ProjectId,
     pub(crate) project: Option<ProjectSnapshot>,
     pub(crate) workspace_root: PathBuf,
@@ -344,6 +897,10 @@ pub(crate) struct LoomView {
     pub(crate) optimistic_messages: Vec<String>,
     pub(crate) sending_message: bool,
     pub(crate) models: Vec<ModelId>,
+    default_models: Vec<ModelId>,
+    node_model_catalogs: BTreeMap<String, Vec<ModelId>>,
+    model_catalog_node_id: Option<String>,
+    model_refreshes_in_flight: BTreeSet<String>,
     model_select: Option<Entity<ModelSelectState>>,
     default_model_select: Option<Entity<ModelSelectState>>,
     model_select_subscription: Option<Subscription>,
@@ -383,6 +940,11 @@ pub(crate) struct LoomView {
     pub(crate) login_enabled: bool,
     pub(crate) github_connected: bool,
     pub(crate) github_login: Option<GitHubLoginState>,
+    worker_nodes: Vec<WorkerNodeEntry>,
+    next_worker_node_id: u64,
+    worker_node_polls_scheduled: BTreeSet<u64>,
+    workspace_config: WorkspaceConfig,
+    pub(crate) node_input: TextBufferState,
     pub(crate) run_poll_scheduled: bool,
 }
 
@@ -495,6 +1057,7 @@ impl LoomView {
         match field {
             InputField::Composer => Some(&self.composer),
             InputField::Rename => self.rename_dialog.as_ref().map(|dialog| &dialog.input),
+            InputField::Node => Some(&self.node_input),
         }
     }
 
@@ -502,6 +1065,7 @@ impl LoomView {
         match field {
             InputField::Composer => Some(&mut self.composer),
             InputField::Rename => self.rename_dialog.as_mut().map(|dialog| &mut dialog.input),
+            InputField::Node => Some(&mut self.node_input),
         }
     }
 
@@ -509,6 +1073,7 @@ impl LoomView {
         match field {
             InputField::Composer => self.composer_focus_handle.clone(),
             InputField::Rename => self.rename_focus_handle.clone(),
+            InputField::Node => self.composer_focus_handle.clone(),
         }
     }
 
@@ -640,77 +1205,94 @@ impl LoomView {
         rename_focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
-        let (connection, workspace_root, project_id, demo_workspace) =
-            if let Some(remote_url) = &options.remote {
-                info!("connecting to remote backend at {remote_url}");
-                let token = options.token.as_deref().ok_or_else(|| {
-                    LoomError::invalid_request("remote connections require LOOM_TOKEN to be set")
-                })?;
-                let connection = ClientConnection::remote(remote_url.clone(), token.to_owned())?;
-                info!("remote transport connected; negotiating protocol");
-                negotiate(&connection)?;
-                let projects = list_projects(&connection)?;
-                info!("remote backend returned {} project(s)", projects.len());
-                let project = select_remote_project(
-                    &projects,
-                    options.workspace.as_deref().and_then(|path| path.to_str()),
-                )?;
-                let workspace_root = project.root.clone().map(PathBuf::from).ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::WorkspaceAccessDenied,
-                        "selected remote project has no configured workspace root",
-                        false,
-                    )
-                })?;
-                info!("selected remote project {}", project.id);
-                (connection, workspace_root, project.id, false)
-            } else {
-                let (workspace_root, demo_workspace) = prepare_workspace(options)?;
-                info!(
-                    "using workspace '{}'{}",
-                    workspace_root.display(),
-                    if demo_workspace { " (demo)" } else { "" }
-                );
-                let project_id = if demo_workspace {
-                    ProjectId::new()
-                } else {
-                    stable_project_id(&workspace_root)
-                };
-                let backend = if demo_workspace {
-                    info!("starting demo backend");
-                    InProcessBackend::demo_with_github_copilot()?
-                } else if let Some(endpoint) = &options.endpoint {
-                    let persistence_path = backend_persistence_path(&workspace_root)?;
-                    info!(
-                        "starting local backend with OpenAI-compatible endpoint; state '{}'",
-                        persistence_path.display()
-                    );
-                    InProcessBackend::with_openai_compatible_persistent_with_github_copilot(
-                        endpoint,
-                        options.api_key.as_deref().unwrap_or_default(),
-                        options.model.clone(),
-                        persistence_path,
-                    )?
-                } else {
-                    let persistence_path = backend_persistence_path(&workspace_root)?;
-                    info!(
-                        "starting local backend with GitHub Copilot; state '{}'",
-                        persistence_path.display()
-                    );
-                    InProcessBackend::new_persistent_with_github_copilot(persistence_path)?
-                };
-                (
-                    ClientConnection::InProcess(backend.connect()),
-                    workspace_root,
-                    project_id,
-                    demo_workspace,
+        let mut remote_cleanup_guard = None;
+        let (connection, workspace_root, project_id, demo_workspace) = if let Some(remote_url) =
+            &options.remote
+        {
+            info!("connecting to remote backend");
+            if worker_url_embeds_credential(remote_url) {
+                return Err(LoomError::invalid_request(
+                    "remote URL must not contain credentials; provide the access token separately",
+                ));
+            }
+            let token = options.token.as_deref().ok_or_else(|| {
+                LoomError::invalid_request("remote connections require LOOM_TOKEN to be set")
+            })?;
+            let connection = ClientConnection::remote(remote_url.clone(), token.to_owned())?;
+            remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
+            info!("remote transport connected; negotiating protocol");
+            negotiate(&connection)?;
+            let projects = list_projects(&connection)?;
+            info!("remote backend returned {} project(s)", projects.len());
+            let project = select_remote_project(
+                &projects,
+                options.workspace.as_deref().and_then(|path| path.to_str()),
+            )?;
+            let workspace_root = project.root.clone().map(PathBuf::from).ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    "selected remote project has no configured workspace root",
+                    false,
                 )
+            })?;
+            info!("selected remote project {}", project.id);
+            (connection, workspace_root, project.id, false)
+        } else {
+            let (workspace_root, demo_workspace) = prepare_workspace(options)?;
+            info!(
+                "using workspace '{}'{}",
+                workspace_root.display(),
+                if demo_workspace { " (demo)" } else { "" }
+            );
+            let project_id = if demo_workspace {
+                ProjectId::new()
+            } else {
+                stable_project_id(&workspace_root)
             };
+            let backend = if demo_workspace {
+                info!("starting demo backend");
+                InProcessBackend::demo_with_github_copilot()?
+            } else if let Some(endpoint) = &options.endpoint {
+                let persistence_path = backend_persistence_path(&workspace_root)?;
+                info!(
+                    "starting local backend with OpenAI-compatible endpoint; state '{}'",
+                    persistence_path.display()
+                );
+                InProcessBackend::with_openai_compatible_persistent_with_github_copilot(
+                    endpoint,
+                    options.api_key.as_deref().unwrap_or_default(),
+                    options.model.clone(),
+                    persistence_path,
+                )?
+            } else {
+                let persistence_path = backend_persistence_path(&workspace_root)?;
+                info!(
+                    "starting local backend with GitHub Copilot; state '{}'",
+                    persistence_path.display()
+                );
+                InProcessBackend::new_persistent_with_github_copilot(persistence_path)?
+            };
+            (
+                ClientConnection::InProcess(backend.connect()),
+                workspace_root,
+                project_id,
+                demo_workspace,
+            )
+        };
         if options.remote.is_none() {
             info!("negotiating protocol and opening workspace");
             negotiate(&connection)?;
             open_workspace(&connection, project_id, &workspace_root)?;
         }
+        let node_status = worker_node_status(&connection)?;
+        let default_backend_node_id = node_status.node_id.clone();
+        let workspace_config = workspace_config(&connection, project_id)?;
+        let worker_nodes = initial_worker_nodes(
+            node_status,
+            connection.clone(),
+            &workspace_config,
+            options.remote.as_deref(),
+        );
         let sessions = list_sessions(&connection, project_id)?;
         info!("loaded {} session(s)", sessions.len());
         let session = sessions.into_iter().next().map_or_else(
@@ -734,6 +1316,8 @@ impl LoomView {
                 .or_else(|| models.first().cloned())
                 .unwrap_or_else(|| options.model.clone())
         };
+        let node_model_catalogs =
+            BTreeMap::from([(default_backend_node_id.clone(), models.clone())]);
         info!(
             "loaded {} model(s); selected '{}'",
             models.len(),
@@ -751,9 +1335,20 @@ impl LoomView {
         } else {
             None
         };
+        let backend = BackendWorker::spawn(connection.clone());
+        let node_backends = BTreeMap::from([(default_backend_node_id.clone(), backend.clone())]);
+        let session_node_ids = BTreeMap::from([(session.id, default_backend_node_id.clone())]);
+        let node_names = worker_nodes
+            .iter()
+            .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
+            .collect();
         let mut view = Self {
-            backend: BackendWorker::spawn(connection.clone()),
-            connection,
+            backend,
+            connection: connection.clone(),
+            default_backend_node_id: default_backend_node_id.clone(),
+            node_backends,
+            node_names,
+            session_node_ids,
             project_id,
             project: None,
             workspace_root,
@@ -769,7 +1364,11 @@ impl LoomView {
             optimistic_messages: Vec::new(),
             sending_message: false,
             model,
-            models,
+            models: models.clone(),
+            default_models: models,
+            node_model_catalogs,
+            model_catalog_node_id: Some(default_backend_node_id.clone()),
+            model_refreshes_in_flight: BTreeSet::new(),
             model_select: None,
             default_model_select: None,
             model_select_subscription: None,
@@ -816,6 +1415,11 @@ impl LoomView {
                 })
                 .is_some(),
             github_login: None,
+            next_worker_node_id: worker_nodes.len() as u64,
+            worker_nodes,
+            worker_node_polls_scheduled: BTreeSet::new(),
+            workspace_config,
+            node_input: TextBufferState::new(""),
             run_poll_scheduled: false,
         };
         view.refresh_models();
@@ -823,6 +1427,9 @@ impl LoomView {
         let active_session = view.active_session.clone();
         view.load_session(active_session);
         info!("initial session state loaded");
+        if let Some(guard) = &mut remote_cleanup_guard {
+            guard.disarm();
+        }
         Ok(view)
     }
 
@@ -841,8 +1448,16 @@ impl LoomView {
         focus_handle: FocusHandle,
         rename_focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
+        if worker_url_embeds_credential(options.remote()) {
+            return Err(LoomError::invalid_request(
+                "remote URL must not contain credentials; provide the access token separately",
+            ));
+        }
         let connection = ClientConnection::browser(options.remote(), options.token())?;
+        let mut cleanup_guard = ConnectionCleanupGuard::new(connection.clone());
         negotiate_async(&connection).await?;
+        let node_status = worker_node_status_async(&connection).await?;
+        let default_backend_node_id = node_status.node_id.clone();
         let projects = list_projects_async(&connection).await?;
         // A freshly started `--serve` backend has no projects open yet; if
         // none match (or none exist), open the requested workspace as a new
@@ -870,6 +1485,20 @@ impl LoomView {
                 }
             };
         let sessions = list_sessions_async(&connection, project_id).await?;
+        let workspace_config = workspace_config_async(&connection, project_id).await?;
+        let mut worker_nodes = initial_worker_nodes(
+            node_status,
+            connection.clone(),
+            &workspace_config,
+            Some(options.remote()),
+        );
+        if let Err(error) = options.persist_connection() {
+            worker_nodes[0].connection_detail = Some(worker_connection_failure_detail(
+                WorkerConnectionStage::BootstrapSave,
+                &error,
+                Some(options.token()),
+            ));
+        }
         let session = match sessions.into_iter().next() {
             Some(session) => session,
             None => create_session_async(&connection, project_id, "New session").await?,
@@ -881,10 +1510,23 @@ impl LoomView {
             .filter(|model| models.contains(model))
             .or_else(|| models.first().cloned())
             .unwrap_or_else(|| ModelId::new("default"));
+        let node_model_catalogs =
+            BTreeMap::from([(default_backend_node_id.clone(), models.clone())]);
+        let backend = BackendWorker::spawn(connection.clone());
+        let node_backends = BTreeMap::from([(default_backend_node_id.clone(), backend.clone())]);
+        let session_node_ids = BTreeMap::from([(session.id, default_backend_node_id.clone())]);
+        let node_names = worker_nodes
+            .iter()
+            .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
+            .collect();
 
-        Ok(Self {
-            backend: BackendWorker::spawn(connection.clone()),
-            connection,
+        let view = Self {
+            backend,
+            connection: connection.clone(),
+            default_backend_node_id: default_backend_node_id.clone(),
+            node_backends,
+            node_names,
+            session_node_ids,
             project_id,
             project,
             workspace_root,
@@ -900,7 +1542,11 @@ impl LoomView {
             optimistic_messages: Vec::new(),
             sending_message: false,
             model,
-            models,
+            models: models.clone(),
+            default_models: models,
+            node_model_catalogs,
+            model_catalog_node_id: Some(default_backend_node_id.clone()),
+            model_refreshes_in_flight: BTreeSet::new(),
             model_select: None,
             default_model_select: None,
             model_select_subscription: None,
@@ -940,8 +1586,15 @@ impl LoomView {
             login_enabled: false,
             github_connected: false,
             github_login: None,
+            next_worker_node_id: worker_nodes.len() as u64,
+            worker_nodes,
+            worker_node_polls_scheduled: BTreeSet::new(),
+            workspace_config,
+            node_input: TextBufferState::new(""),
             run_poll_scheduled: false,
-        })
+        };
+        cleanup_guard.disarm();
+        Ok(view)
     }
 
     /// Submits a backend request without blocking the UI thread and applies the
@@ -952,11 +1605,19 @@ impl LoomView {
         request: ClientRequest,
         apply: impl FnOnce(&mut Self, ResponseEnvelope, &mut Context<Self>) + 'static,
     ) {
-        let pending = self.backend.submit(RequestEnvelope::new(request));
+        let request_envelope = RequestEnvelope::new(request);
+        let request_id = request_envelope.request_id;
+        let pending = self
+            .backend_for_request(&request_envelope.request)
+            .map(|backend| backend.submit(request_envelope));
         cx.spawn(async move |view, cx| {
-            let response = cx
-                .background_spawn(async move { pending.wait().await })
-                .await;
+            let response = match pending {
+                Ok(pending) => {
+                    cx.background_spawn(async move { pending.wait().await })
+                        .await
+                }
+                Err(error) => ResponseEnvelope::failure(request_id, error),
+            };
             view.update(cx, |view, cx| {
                 apply(view, response, cx);
                 cx.notify();
@@ -964,6 +1625,24 @@ impl LoomView {
             .ok();
         })
         .detach();
+    }
+
+    fn backend_for_request(&self, request: &ClientRequest) -> Result<BackendWorker, LoomError> {
+        let Some(session_id) = session_id_for_request(request, self.active_session.id) else {
+            return Ok(self.backend.clone());
+        };
+        self.backend_for_session(session_id)
+    }
+
+    fn backend_for_session(&self, session_id: AgentSessionId) -> Result<BackendWorker, LoomError> {
+        let node_id = assigned_node_id(&self.session_node_ids, session_id)?;
+        self.node_backends.get(node_id).cloned().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::NotFound,
+                format!("assigned worker node {node_id} for session {session_id} is unavailable"),
+                false,
+            )
+        })
     }
 
     pub(crate) fn record_status(&mut self, status: impl Into<String>) {
@@ -1026,82 +1705,94 @@ impl LoomView {
     /// Refreshes the model list from a UI handler, one request at a time, on the
     /// connection worker.
     pub(crate) fn refresh_models_async(&mut self, cx: &mut Context<Self>) {
-        self.dispatch(
-            cx,
-            ClientRequest::ListProviders,
-            |view, response, cx| match response.result {
-                Ok(ServerResponse::Providers { providers }) => {
-                    let models = providers
-                        .iter()
-                        .flat_map(|provider| provider.models.iter().map(|model| model.id.clone()))
-                        .collect();
-                    view.discover_provider_models_async(providers, 0, models, cx);
-                }
-                Err(error) => view.record_status(format!(
-                    "Could not list providers for model refresh: {error}"
-                )),
-                Ok(response) => view.record_backend_error(
-                    "model refresh",
-                    unexpected_response("provider list", response),
-                ),
-            },
-        );
+        self.refresh_models_for_node_async(self.default_backend_node_id.clone(), cx);
     }
 
-    fn discover_provider_models_async(
-        &mut self,
-        providers: Vec<ProviderSummary>,
-        index: usize,
-        mut models: Vec<ModelId>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(provider) = providers.get(index) else {
-            models.sort();
-            models.dedup();
-            self.apply_models(models);
+    fn refresh_models_for_node_async(&mut self, node_id: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.node_backends.get(&node_id).cloned() else {
+            self.record_backend_error(
+                "model refresh",
+                LoomError::new(
+                    ErrorCode::NotFound,
+                    format!("worker node {node_id} is not connected"),
+                    false,
+                ),
+            );
+            cx.notify();
             return;
         };
-        let provider_id = provider.id.clone();
-        self.dispatch(
-            cx,
-            ClientRequest::DiscoverProviderModels {
-                provider_id: provider_id.clone(),
-            },
-            move |view, response, cx| {
-                match response.result {
-                    Ok(ServerResponse::Models { models: discovered }) => {
-                        models.extend(discovered.into_iter().map(|model| model.id));
+        if !self.model_refreshes_in_flight.insert(node_id.clone()) {
+            return;
+        }
+        let active_node_id = self
+            .session_node_ids
+            .get(&self.active_session.id)
+            .map(String::as_str);
+        if active_node_id == Some(node_id.as_str()) {
+            self.models.clear();
+            self.model_catalog_node_id = None;
+            cx.notify();
+        }
+        cx.spawn(async move |view, cx| {
+            let result = list_models_from_backend(&backend).await;
+            view.update(cx, |view, cx| {
+                view.model_refreshes_in_flight.remove(&node_id);
+                match result {
+                    Ok(models) => {
+                        view.node_model_catalogs
+                            .insert(node_id.clone(), models.clone());
+                        if view.default_backend_node_id == node_id {
+                            view.default_models = models.clone();
+                        }
+                        let active_node_id = view
+                            .session_node_ids
+                            .get(&view.active_session.id)
+                            .map(String::as_str);
+                        if active_node_id == Some(node_id.as_str()) {
+                            view.models = models;
+                            view.model_catalog_node_id = Some(node_id.clone());
+                            view.record_status(format!(
+                                "Loaded available models for {}",
+                                view.node_names
+                                    .get(&node_id)
+                                    .map(String::as_str)
+                                    .unwrap_or(node_id.as_str())
+                            ));
+                        }
                     }
-                    Err(error) => view.record_status(format!(
-                        "Model discovery unavailable for {}: {}",
-                        provider_id.as_str(),
-                        error.message
-                    )),
-                    Ok(response) => view.record_backend_error(
-                        "model discovery",
-                        unexpected_response("model list", response),
-                    ),
+                    Err(error) => {
+                        view.record_backend_error("model refresh", error);
+                    }
                 }
-                view.discover_provider_models_async(providers, index + 1, models, cx);
-            },
-        );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
+    #[cfg(not(target_family = "wasm"))]
     fn apply_models(&mut self, models: Vec<ModelId>) {
-        if !models.contains(&self.model)
-            && let Some(model) = models
-                .iter()
-                .find(|model| model.as_str() == self.default_model.as_str())
-                .cloned()
-                .or_else(|| models.first().cloned())
-        {
-            self.model = model;
+        let node_id = self.default_backend_node_id.clone();
+        self.node_model_catalogs
+            .insert(node_id.clone(), models.clone());
+        self.default_models = models.clone();
+        let active_node_id = self
+            .session_node_ids
+            .get(&self.active_session.id)
+            .map(String::as_str);
+        if active_node_id == Some(node_id.as_str()) {
+            self.models = models;
+            self.model_catalog_node_id = Some(node_id);
         }
-        self.models = models;
         self.record_status(format!(
             "Loaded {} available model{}",
-            self.models.len(),
-            if self.models.len() == 1 { "" } else { "s" }
+            self.default_models.len(),
+            if self.default_models.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         ));
     }
 
@@ -1117,6 +1808,10 @@ impl LoomView {
                 }));
         match response.result? {
             ServerResponse::AgentSessions { sessions } => {
+                for session in &sessions {
+                    self.session_node_ids
+                        .insert(session.id, self.default_backend_node_id.clone());
+                }
                 self.sessions = sessions;
                 if let Some(active) = self
                     .sessions
@@ -1147,54 +1842,95 @@ impl LoomView {
         Ok(())
     }
 
-    /// Reloads the session and project lists through the connection worker.
+    /// Reloads sessions from every connected node while keeping their owners.
     pub(crate) fn reload_sessions(&mut self, cx: &mut Context<Self>) {
-        self.dispatch(
-            cx,
-            ClientRequest::ListAgentSessions {
-                project_id: Some(self.project_id),
-                include_archived: false,
-            },
-            |view, response, cx| {
-                match response.result {
-                    Ok(ServerResponse::AgentSessions { sessions }) => {
-                        view.sessions = sessions;
-                        if let Some(active) = view
-                            .sessions
-                            .iter()
-                            .find(|session| session.id == view.active_session.id)
-                        {
-                            view.active_session = active.clone();
-                            view.session_state = active.state;
-                        }
+        let project_id = self.project_id;
+        let mut node_requests = BTreeMap::new();
+        for node in self
+            .worker_nodes
+            .iter()
+            .filter(|node| node.connection.is_some() && node.status.online)
+        {
+            if let Some(backend) = self.node_backends.get(&node.status.node_id) {
+                node_requests
+                    .entry(node.status.node_id.clone())
+                    .or_insert_with(|| {
+                        backend.submit(RequestEnvelope::new(ClientRequest::ListAgentSessions {
+                            project_id: Some(project_id),
+                            include_archived: false,
+                        }))
+                    });
+            }
+        }
+        let project_request = self
+            .backend
+            .submit(RequestEnvelope::new(ClientRequest::ListProjects));
+        cx.spawn(async move |view, cx| {
+            let (node_responses, project_response) = cx
+                .background_spawn(async move {
+                    let mut node_responses = Vec::with_capacity(node_requests.len());
+                    for (node_id, pending) in node_requests {
+                        node_responses.push((node_id, pending.wait().await));
                     }
-                    Err(error) => view.record_backend_error("session list refresh", error),
+                    (node_responses, project_request.wait().await)
+                })
+                .await;
+            view.update(cx, |view, cx| {
+                let previous_active_node_id =
+                    view.session_node_ids.get(&view.active_session.id).cloned();
+                let node_results = node_responses
+                    .into_iter()
+                    .filter_map(|(node_id, response)| match response.result {
+                        Ok(ServerResponse::AgentSessions { sessions }) => Some((node_id, sessions)),
+                        Err(error) => {
+                            view.record_backend_error("session list refresh", error);
+                            None
+                        }
+                        Ok(response) => {
+                            view.record_backend_error(
+                                "session list refresh",
+                                unexpected_response("session list", response),
+                            );
+                            None
+                        }
+                    })
+                    .collect();
+                (view.sessions, view.session_node_ids) =
+                    merge_node_sessions(&view.sessions, &view.session_node_ids, node_results);
+                let active_node_id = view.session_node_ids.get(&view.active_session.id).cloned();
+                if active_node_id != previous_active_node_id
+                    && let Some(node_id) = active_node_id
+                {
+                    view.refresh_models_for_node_async(node_id, cx);
+                }
+                if let Some(active) = view
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == view.active_session.id)
+                {
+                    view.active_session = active.clone();
+                    view.session_state = active.state;
+                }
+                match project_response.result {
+                    Ok(ServerResponse::Projects { projects }) => {
+                        view.projects = projects;
+                        view.project = view
+                            .projects
+                            .iter()
+                            .find(|project| project.id == view.project_id)
+                            .cloned();
+                    }
+                    Err(error) => view.record_backend_error("project list refresh", error),
                     Ok(response) => view.record_backend_error(
-                        "session list refresh",
-                        unexpected_response("session list", response),
+                        "project list refresh",
+                        unexpected_response("project list", response),
                     ),
                 }
-                view.dispatch(
-                    cx,
-                    ClientRequest::ListProjects,
-                    |view, response, _| match response.result {
-                        Ok(ServerResponse::Projects { projects }) => {
-                            view.projects = projects;
-                            view.project = view
-                                .projects
-                                .iter()
-                                .find(|project| project.id == view.project_id)
-                                .cloned();
-                        }
-                        Err(error) => view.record_backend_error("project list refresh", error),
-                        Ok(response) => view.record_backend_error(
-                            "project list refresh",
-                            unexpected_response("project list", response),
-                        ),
-                    },
-                );
-            },
-        );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(crate) fn reset_projection(&mut self) {
@@ -1834,6 +2570,7 @@ impl LoomView {
                 match response.result {
                     Ok(ServerResponse::AgentSessionArchived(snapshot)) => {
                         view.sessions.retain(|session| session.id != snapshot.id);
+                        view.session_node_ids.remove(&snapshot.id);
                         if let Some(session) = view.sessions.first().cloned() {
                             view.select_session(session, cx);
                         } else {
@@ -1852,6 +2589,44 @@ impl LoomView {
     }
 
     pub(crate) fn send_message(&mut self, message: String, cx: &mut Context<Self>) {
+        let backend = match self.backend_for_session(self.active_session.id) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.record_backend_error("send message", error);
+                cx.notify();
+                return;
+            }
+        };
+        if self.active_run_id.is_none()
+            && !self.demo_workspace
+            && self.model.as_str() != "deterministic/demo"
+        {
+            let node_id = self
+                .session_node_ids
+                .get(&self.active_session.id)
+                .map(String::as_str)
+                .unwrap_or_default();
+            let validation = if self.model_catalog_node_id.as_deref() != Some(node_id) {
+                Err("model availability has not been refreshed for this worker".to_owned())
+            } else {
+                validate_model_for_node(&self.node_model_catalogs, node_id, &self.model)
+            };
+            if let Err(reason) = validation {
+                let node_name = self
+                    .node_names
+                    .get(node_id)
+                    .map(String::as_str)
+                    .unwrap_or(node_id);
+                self.record_backend_error(
+                    "start run",
+                    LoomError::invalid_state(format!(
+                        "Cannot start a run on {node_name}: {reason}. Choose a model configured on this worker before sending."
+                    )),
+                );
+                cx.notify();
+                return;
+            }
+        }
         self.sending_message = true;
         let session_title = if self.active_run_id.is_none() {
             self.session_task_cache
@@ -1902,13 +2677,12 @@ impl LoomView {
         self.timeline.push(TimelineItem::User(message));
         let session_id = self.active_session.id;
         let rename_request = session_title.map(|title| {
-            self.backend
-                .submit(RequestEnvelope::new(ClientRequest::RenameAgentSession {
-                    session_id,
-                    name: title,
-                }))
+            backend.submit(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                session_id,
+                name: title,
+            }))
         });
-        let run_request = self.backend.submit(RequestEnvelope::new(request));
+        let run_request = backend.submit(RequestEnvelope::new(request));
         cx.spawn(async move |view, cx| {
             let response = cx
                 .background_spawn(async move {
@@ -2148,6 +2922,8 @@ impl LoomView {
     pub(crate) fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         if self.rename_dialog.is_some() {
             self.confirm_rename(cx);
+        } else if self.input_field == InputField::Node {
+            self.connect_worker_node(cx);
         } else {
             self.submit_composer(cx);
         }
@@ -2155,16 +2931,28 @@ impl LoomView {
     }
 
     pub(crate) fn select_session(&mut self, session: AgentSessionSnapshot, cx: &mut Context<Self>) {
+        let backend = match self.backend_for_session(session.id) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.record_backend_error("select session", error);
+                cx.notify();
+                return;
+            }
+        };
         self.github_login = None;
         self.settings_open = false;
         self.providers_open = false;
         self.about_open = false;
         self.review.open = false;
         self.activate_session(session.clone());
+        if let Some(node_id) = self.session_node_ids.get(&session.id).cloned()
+            && self.model_catalog_node_id.as_deref() != Some(node_id.as_str())
+        {
+            self.refresh_models_for_node_async(node_id, cx);
+        }
         self.ensure_session_task_message(session.id);
         let session_id = session.id;
-        let backend = self.backend.clone();
-        let snapshot_request = self.backend.submit(RequestEnvelope::new(
+        let snapshot_request = backend.submit(RequestEnvelope::new(
             ClientRequest::GetAgentSessionSnapshot { session_id },
         ));
         cx.spawn(async move |view, cx| {
@@ -2421,11 +3209,16 @@ impl LoomView {
             .iter()
             .map(|model| model.as_str().to_owned())
             .collect::<Vec<_>>();
+        let default_items = self
+            .default_models
+            .iter()
+            .map(|model| model.as_str().to_owned())
+            .collect::<Vec<_>>();
         let model_value = self.model.as_str().to_owned();
         let default_model_value = self.default_model.as_str().to_owned();
         let model_needs_sync = self.model_select_items != items
             || self.model_select_value.as_deref() != Some(model_value.as_str());
-        let default_model_needs_sync = self.default_model_select_items != items
+        let default_model_needs_sync = self.default_model_select_items != default_items
             || self.default_model_select_value.as_deref() != Some(default_model_value.as_str());
 
         if let Some(state) = &self.model_select {
@@ -2467,18 +3260,18 @@ impl LoomView {
         if let Some(state) = &self.default_model_select {
             if default_model_needs_sync {
                 state.update(cx, |state, cx| {
-                    state.set_items(SearchableVec::new(items.clone()), window, cx);
+                    state.set_items(SearchableVec::new(default_items.clone()), window, cx);
                     state.set_selected_value(&default_model_value, window, cx);
                 });
             }
         } else {
-            let selected_index = items
+            let selected_index = default_items
                 .iter()
                 .position(|item| item == &default_model_value)
                 .map(|row| IndexPath::default().row(row));
             let state = cx.new(|cx| {
                 SelectState::new(
-                    SearchableVec::new(items.clone()),
+                    SearchableVec::new(default_items.clone()),
                     selected_index,
                     window,
                     cx,
@@ -2496,7 +3289,7 @@ impl LoomView {
             self.default_model_select = Some(state);
         }
         if default_model_needs_sync {
-            self.default_model_select_items = items;
+            self.default_model_select_items = default_items;
             self.default_model_select_value = Some(default_model_value);
         }
     }
@@ -2531,6 +3324,32 @@ impl LoomView {
     }
 
     pub(crate) fn select_model(&mut self, model: ModelId, cx: &mut Context<Self>) {
+        let node_id = self
+            .session_node_ids
+            .get(&self.active_session.id)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let validation = if self.model_catalog_node_id.as_deref() != Some(node_id) {
+            Err("worker models are still refreshing".to_owned())
+        } else {
+            validate_model_for_node(&self.node_model_catalogs, node_id, &model)
+        };
+        if let Err(reason) = validation {
+            let node_name = self
+                .node_names
+                .get(node_id)
+                .map(String::as_str)
+                .unwrap_or(node_id);
+            self.record_backend_error(
+                "select model",
+                LoomError::invalid_state(format!(
+                    "Cannot select model '{}' on {node_name}: {reason}",
+                    model.as_str()
+                )),
+            );
+            cx.notify();
+            return;
+        }
         self.session_models
             .insert(self.active_session.id, model.clone());
         self.model = model;
@@ -2561,6 +3380,17 @@ impl LoomView {
     }
 
     pub(crate) fn select_default_model(&mut self, model: ModelId, cx: &mut Context<Self>) {
+        if !self.default_models.contains(&model) {
+            self.record_backend_error(
+                "select default model",
+                LoomError::invalid_state(format!(
+                    "model '{}' is not available in the current worker model list",
+                    model.as_str()
+                )),
+            );
+            cx.notify();
+            return;
+        }
         self.default_model = model;
         cx.notify();
     }
@@ -2572,6 +3402,811 @@ impl LoomView {
         self.about_open = false;
         self.settings_open = true;
         cx.notify();
+    }
+
+    fn add_worker_node(
+        &mut self,
+        connection: ClientConnection,
+        status: WorkerNodeStatus,
+        url: String,
+        connection_detail: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let node_id = status.node_id.clone();
+        let backend = BackendWorker::spawn(connection.clone());
+        if let Some(previous_node_id) = self
+            .worker_nodes
+            .iter()
+            .find(|node| !node.is_local && node.url.as_deref() == Some(&url))
+            .map(|node| node.status.node_id.clone())
+            && previous_node_id != node_id
+        {
+            self.node_backends.remove(&previous_node_id);
+        }
+        if !self
+            .workspace_config
+            .worker_nodes
+            .iter()
+            .any(|node| node.url == url)
+        {
+            self.workspace_config
+                .worker_nodes
+                .push(WorkerNodeConfig { url: url.clone() });
+            self.workspace_config.revision = self.workspace_config.revision.saturating_add(1);
+        }
+        if let Some(node) = self
+            .worker_nodes
+            .iter_mut()
+            .find(|node| !node.is_local && node.url.as_deref() == Some(&url))
+        {
+            node.status = status;
+            node.connection = Some(connection);
+            node.connection_state = WorkerConnectionState::Connected;
+            node.connection_detail = connection_detail;
+        } else {
+            let id = self.next_worker_node_id;
+            self.next_worker_node_id += 1;
+            self.worker_nodes.push(WorkerNodeEntry {
+                id,
+                status,
+                is_local: false,
+                url: Some(url),
+                connection: Some(connection),
+                connection_state: WorkerConnectionState::Connected,
+                connection_detail,
+                severe_load_streak: 0,
+            });
+        }
+        self.node_backends.insert(node_id.clone(), backend);
+        if let Some(node) = self
+            .worker_nodes
+            .iter()
+            .find(|node| node.status.node_id == node_id)
+        {
+            self.node_names
+                .insert(node_id, worker_node_display_name(node));
+        }
+        self.record_status("Connected to worker node");
+        self.schedule_worker_node_poll(cx);
+        self.persist_and_distribute_workspace_config(None, cx);
+        self.reload_sessions(cx);
+    }
+
+    fn begin_worker_node_connection(&mut self, url: &str) -> Result<u64, String> {
+        if let Some(node) = self
+            .worker_nodes
+            .iter_mut()
+            .find(|node| !node.is_local && node.url.as_deref() == Some(url))
+        {
+            if let Err(message) = transition_worker_connection_to_connecting(
+                &mut node.connection_state,
+                node.connection.is_some(),
+            ) {
+                return Err(message.to_owned());
+            }
+            node.connection_detail = None;
+            node.status.online = false;
+            return Ok(node.id);
+        }
+
+        let id = self.next_worker_node_id;
+        self.next_worker_node_id = self.next_worker_node_id.saturating_add(1);
+        self.worker_nodes.push(connection_placeholder(
+            id,
+            url.to_owned(),
+            WorkerConnectionState::Connecting,
+            None,
+        ));
+        Ok(id)
+    }
+
+    fn fail_worker_node_connection(
+        &mut self,
+        id: u64,
+        url: &str,
+        stage: WorkerConnectionStage,
+        error: &LoomError,
+        secret: Option<&str>,
+        cleanup_failed: bool,
+    ) {
+        let Some(node) = self
+            .worker_nodes
+            .iter_mut()
+            .find(|node| node.id == id && !node.is_local && node.url.as_deref() == Some(url))
+        else {
+            return;
+        };
+        let mut detail = worker_connection_failure_detail(stage, error, secret);
+        let node_cleanup_failed = mark_worker_connection_failed(node, String::new());
+        if cleanup_failed || node_cleanup_failed {
+            detail.push_str(
+                " Closing the partial connection also failed; restart the worker and retry.",
+            );
+        }
+        node.connection_detail = Some(detail);
+    }
+
+    fn set_worker_node_connection_failure(&mut self, id: u64, url: &str, detail: String) {
+        if let Some(node) = self
+            .worker_nodes
+            .iter_mut()
+            .find(|node| node.id == id && !node.is_local && node.url.as_deref() == Some(url))
+        {
+            let _ = mark_worker_connection_failed(node, detail);
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn attach_reconnected_worker_node(
+        &mut self,
+        id: u64,
+        url: &str,
+        connection: ClientConnection,
+        status: WorkerNodeStatus,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let node_id = status.node_id.clone();
+        let backend = BackendWorker::spawn(connection.clone());
+        let Some(node) = self.worker_nodes.iter_mut().find(|node| {
+            node.id == id
+                && !node.is_local
+                && node.url.as_deref() == Some(url)
+                && node.connection.is_none()
+        }) else {
+            return false;
+        };
+        let name = status.name.clone();
+        node.status = status;
+        node.connection = Some(connection);
+        node.connection_state = WorkerConnectionState::Connected;
+        node.connection_detail = None;
+        let display_name = worker_node_display_name(node);
+        self.node_backends.insert(node_id, backend);
+        self.node_names
+            .insert(node.status.node_id.clone(), display_name);
+        self.record_status(format!("Reconnected to worker node {name}"));
+        self.schedule_worker_node_poll(cx);
+        self.reload_sessions(cx);
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn remove_worker_node(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(node) = remove_worker_node_entry(&mut self.worker_nodes, id) else {
+            return;
+        };
+        self.worker_node_polls_scheduled.remove(&id);
+        if !self
+            .worker_nodes
+            .iter()
+            .any(|remaining| remaining.status.node_id == node.status.node_id)
+        {
+            self.node_backends.remove(&node.status.node_id);
+        }
+        if let Some(url) = &node.url {
+            let count = self.workspace_config.worker_nodes.len();
+            self.workspace_config
+                .worker_nodes
+                .retain(|configured| configured.url != *url);
+            if self.workspace_config.worker_nodes.len() != count {
+                self.workspace_config.revision = self.workspace_config.revision.saturating_add(1);
+            }
+        }
+        self.record_status(format!("Removed worker node {}", node.status.name));
+        cx.notify();
+
+        let retiring = node
+            .connection
+            .map(|connection| (node.status.name, connection));
+        self.persist_and_distribute_workspace_config(retiring, cx);
+        self.reload_sessions(cx);
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(url) = node.url {
+            let project_id = self.project_id;
+            cx.spawn(async move |view, cx| {
+                let result = cx
+                    .background_spawn(
+                        async move { PeerCredentialStore::new().delete(project_id, &url) },
+                    )
+                    .await;
+                view.update(cx, |view, cx| {
+                    if let Err(error) = result {
+                        view.record_backend_error("remove worker-node credential", error);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn adjust_cpu_pulse_threshold(&mut self, delta: i8, cx: &mut Context<Self>) {
+        let next =
+            adjusted_cpu_pulse_threshold(self.workspace_config.cpu_pulse_threshold_percent, delta);
+        if next == self.workspace_config.cpu_pulse_threshold_percent {
+            return;
+        }
+        self.workspace_config.cpu_pulse_threshold_percent = next;
+        self.workspace_config.revision = self.workspace_config.revision.saturating_add(1);
+        self.persist_and_distribute_workspace_config(None, cx);
+        cx.notify();
+    }
+
+    fn persist_and_distribute_workspace_config(
+        &self,
+        retiring: Option<(String, ClientConnection)>,
+        cx: &mut Context<Self>,
+    ) {
+        let project_id = self.project_id;
+        let config = self.workspace_config.clone();
+        let source = self.connection.clone();
+        let peers = self
+            .worker_nodes
+            .iter()
+            .filter(|node| !node.is_local)
+            .filter_map(|node| {
+                node.connection
+                    .as_ref()
+                    .map(|connection| (node.status.name.clone(), connection.clone()))
+            })
+            .collect::<Vec<_>>();
+        #[cfg(not(target_family = "wasm"))]
+        cx.spawn(async move |view, cx| {
+            let errors = cx
+                .background_spawn(async move {
+                    let mut errors = Vec::new();
+                    if let Err(error) = set_workspace_config(&source, project_id, config.clone()) {
+                        errors.push(("save workspace config".to_owned(), error));
+                    }
+                    for (name, connection) in peers {
+                        if let Err(error) =
+                            set_workspace_config(&connection, project_id, config.clone())
+                        {
+                            errors.push((format!("distribute workspace config to {name}"), error));
+                        }
+                    }
+                    if let Some((name, connection)) = retiring {
+                        if let Err(error) =
+                            set_workspace_config(&connection, project_id, config.clone())
+                        {
+                            errors.push((
+                                format!("remove worker node {name} from its config"),
+                                error,
+                            ));
+                        }
+                        if let Err(error) = connection.close() {
+                            errors.push((format!("close worker node {name} connection"), error));
+                        }
+                    }
+                    errors
+                })
+                .await;
+            view.update(cx, |view, cx| {
+                for (context, error) in errors {
+                    view.record_backend_error(&context, error);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        #[cfg(target_family = "wasm")]
+        cx.spawn(async move |view, cx| {
+            let mut errors = Vec::new();
+            if let Err(error) =
+                set_workspace_config_async(&source, project_id, config.clone()).await
+            {
+                errors.push(("save workspace config".to_owned(), error));
+            } else {
+                for (name, connection) in peers {
+                    if let Err(error) =
+                        set_workspace_config_async(&connection, project_id, config.clone()).await
+                    {
+                        errors.push((format!("distribute workspace config to {name}"), error));
+                    }
+                }
+            }
+            if let Some((name, connection)) = retiring {
+                if let Err(error) =
+                    set_workspace_config_async(&connection, project_id, config.clone()).await
+                {
+                    errors.push((format!("remove worker node {name} from its config"), error));
+                }
+                if let Err(error) = connection.close() {
+                    errors.push((format!("close worker node {name} connection"), error));
+                }
+            }
+            view.update(cx, |view, cx| {
+                for (context, error) in errors {
+                    view.record_backend_error(&context, error);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn schedule_worker_node_poll(&mut self, cx: &mut Context<Self>) {
+        let node_ids = self
+            .worker_nodes
+            .iter()
+            .filter(|node| {
+                node.connection.is_some() && !self.worker_node_polls_scheduled.contains(&node.id)
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        for id in node_ids {
+            self.worker_node_polls_scheduled.insert(id);
+            cx.spawn(async move |view, cx| {
+                #[cfg(target_family = "wasm")]
+                {
+                    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                        if let Some(window) = web_sys::window() {
+                            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                                &resolve, 10_000,
+                            );
+                        }
+                    });
+                    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+                }
+                #[cfg(not(target_family = "wasm"))]
+                cx.background_spawn(async {
+                    std::thread::sleep(Duration::from_secs(10));
+                })
+                .await;
+                view.update(cx, |view, cx| view.poll_worker_node_once(id, cx))
+                    .ok();
+            })
+            .detach();
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn reconnect_configured_worker_nodes(&mut self, cx: &mut Context<Self>) {
+        let candidates = self
+            .worker_nodes
+            .iter()
+            .filter(|node| {
+                !node.is_local
+                    && node.connection.is_none()
+                    && node.connection_state != WorkerConnectionState::Connecting
+            })
+            .filter_map(|node| node.url.as_ref().map(|url| (node.id, url.clone())))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return;
+        }
+        let project_id = self.project_id;
+        for (id, url) in candidates {
+            if worker_url_embeds_credential(&url) {
+                self.set_worker_node_connection_failure(
+                    id,
+                    &url,
+                    "This saved URL contains credentials. Remove them from the URL and reconnect with the token in the separate access-token field.".to_owned(),
+                );
+                continue;
+            }
+            if let Some(node) = self.worker_nodes.iter_mut().find(|node| node.id == id) {
+                node.connection_state = WorkerConnectionState::Connecting;
+                node.connection_detail = None;
+            }
+            let candidate_url = url.clone();
+            cx.spawn(async move |view, cx| {
+                let result = cx
+                    .background_spawn(async move {
+                        let credentials = PeerCredentialStore::new();
+                        let token = match credentials.get(project_id, &candidate_url) {
+                            Ok(Some(token)) => token,
+                            Ok(None) => {
+                                return Err((
+                                    WorkerConnectionStage::CredentialRead,
+                                    LoomError::new(
+                                        ErrorCode::AuthenticationRequired,
+                                        "no saved worker credential was found",
+                                        false,
+                                    ),
+                                    false,
+                                ));
+                            }
+                            Err(error) => {
+                                return Err((WorkerConnectionStage::CredentialRead, error, false));
+                            }
+                        };
+                        let connection = ClientConnection::remote(candidate_url.clone(), token)
+                            .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
+                        if let Err(error) = negotiate(&connection) {
+                            let cleanup_failed = connection.close().is_err();
+                            return Err((
+                                WorkerConnectionStage::Negotiation,
+                                error,
+                                cleanup_failed,
+                            ));
+                        }
+                        let status = match worker_node_status(&connection) {
+                            Ok(status) => status,
+                            Err(error) => {
+                                let cleanup_failed = connection.close().is_err();
+                                return Err((WorkerConnectionStage::Status, error, cleanup_failed));
+                            }
+                        };
+                        Ok::<_, (WorkerConnectionStage, LoomError, bool)>((
+                            connection,
+                            status,
+                            candidate_url,
+                        ))
+                    })
+                    .await;
+                view.update(cx, |view, cx| {
+                    let is_pending = view.worker_nodes.iter().any(|node| {
+                        node.id == id
+                            && !node.is_local
+                            && node.url.as_deref() == Some(url.as_str())
+                            && node.connection.is_none()
+                    });
+                    match result {
+                        Ok((connection, status, connected_url)) if is_pending => {
+                            view.attach_reconnected_worker_node(
+                                id,
+                                &connected_url,
+                                connection,
+                                status,
+                                cx,
+                            );
+                        }
+                        Ok((connection, _, _)) => {
+                            cx.spawn(async move |view, cx| {
+                                let result =
+                                    cx.background_spawn(async move { connection.close() })                                    .await;
+                                        if result.is_err() {
+                                            view.update(cx, |view, cx| {
+                                                view.record_status(
+                                                    "A stale worker connection could not be closed cleanly.",
+                                                );
+                                                cx.notify();
+                                            })
+                                            .ok();
+                                        }
+                            })
+                            .detach();
+                        }
+                        Err((stage, error, cleanup_failed)) if is_pending => {
+                            view.fail_worker_node_connection(
+                                id,
+                                &url,
+                                stage,
+                                &error,
+                                None,
+                                cleanup_failed,
+                            );
+                        }
+                        Err(_) => {}
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    fn poll_worker_node_once(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(connection) = self
+            .worker_nodes
+            .iter()
+            .find(|node| node.id == id)
+            .and_then(|node| node.connection.clone())
+        else {
+            self.worker_node_polls_scheduled.remove(&id);
+            return;
+        };
+
+        cx.spawn(async move |view, cx| {
+            #[cfg(not(target_family = "wasm"))]
+            let results = cx
+                .background_spawn(async move { worker_node_status(&connection) })
+                .await;
+            #[cfg(target_family = "wasm")]
+            let results = worker_node_status_async(&connection).await;
+
+            view.update(cx, |view, cx| {
+                let mut recovered = false;
+                if let Some(node_index) = view.worker_nodes.iter().position(|node| node.id == id) {
+                    let status_message = match results {
+                        Ok(status) => {
+                            recovered =
+                                !view.worker_nodes[node_index].status.online && status.online;
+                            view.worker_nodes[node_index].severe_load_streak =
+                                next_severe_load_streak(
+                                    view.worker_nodes[node_index].severe_load_streak,
+                                    &status.resources,
+                                );
+                            update_worker_node_status(&mut view.worker_nodes, id, status)
+                        }
+                        Err(_) => {
+                            let node = &mut view.worker_nodes[node_index];
+                            node.severe_load_streak = 0;
+                            if node.status.online {
+                                node.status.online = false;
+                                Some(format!("Worker node {} is unavailable", node.status.name))
+                            } else {
+                                None
+                            }
+                        }
+                    };
+                    if let Some(message) = status_message {
+                        view.record_status(message);
+                    }
+                    let node = &view.worker_nodes[node_index];
+                    view.node_names
+                        .insert(node.status.node_id.clone(), worker_node_display_name(node));
+                }
+                view.worker_node_polls_scheduled.remove(&id);
+                view.schedule_worker_node_poll(cx);
+                if recovered {
+                    view.reload_sessions(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn connect_worker_node(&mut self, cx: &mut Context<Self>) {
+        let value = self.node_input.text.trim().to_owned();
+        let mut parts = value.split_whitespace();
+        let Some(url) = parts.next() else {
+            self.record_status("Enter a node URL followed by its access token");
+            cx.notify();
+            return;
+        };
+        let url = url.to_owned();
+        let id = match self.begin_worker_node_connection(&url) {
+            Ok(id) => id,
+            Err(message) => {
+                self.record_status(message);
+                cx.notify();
+                return;
+            }
+        };
+        if worker_url_embeds_credential(&url) {
+            self.set_worker_node_connection_failure(
+                id,
+                &url,
+                "Do not include credentials in the URL. Enter the worker access token after the URL."
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(token) = parts.next().map(str::to_owned) else {
+            self.set_worker_node_connection_failure(
+                id,
+                &url,
+                worker_connection_failure_detail(
+                    WorkerConnectionStage::InputValidation,
+                    &LoomError::invalid_request("missing access token"),
+                    None,
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        let project_id = self.project_id;
+        let submitted_value = value;
+        let node_url = url.clone();
+        let connect_url = url.clone();
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let connection =
+                        ClientConnection::remote(connect_url, token.clone())
+                        .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
+                    if let Err(error) = negotiate(&connection) {
+                        let cleanup_failed = connection.close().is_err();
+                        return Err((
+                            WorkerConnectionStage::Negotiation,
+                            error,
+                            cleanup_failed,
+                        ));
+                    }
+                    let status = match worker_node_status(&connection) {
+                        Ok(status) => status,
+                        Err(error) => {
+                            let cleanup_failed = connection.close().is_err();
+                            return Err((
+                                WorkerConnectionStage::Status,
+                                error,
+                                cleanup_failed,
+                            ));
+                        }
+                    };
+                    let credential_detail = PeerCredentialStore::new()
+                        .set(project_id, &node_url, &token)
+                        .err()
+                        .map(|error| {
+                            worker_connection_failure_detail(
+                                WorkerConnectionStage::CredentialSave,
+                                &error,
+                                Some(&token),
+                            )
+                        });
+                    Ok::<_, (WorkerConnectionStage, LoomError, bool)>((
+                        connection,
+                        status,
+                        node_url,
+                        credential_detail,
+                    ))
+                })
+                .await;
+            view.update(cx, |view, cx| {
+                let is_pending = view.worker_nodes.iter().any(|node| {
+                    node.id == id
+                        && !node.is_local
+                        && node.url.as_deref() == Some(url.as_str())
+                        && node.connection_state == WorkerConnectionState::Connecting
+                });
+                match result {
+                    Ok((connection, status, connected_url, credential_detail)) if is_pending => {
+                        view.add_worker_node(
+                            connection,
+                            status,
+                            connected_url,
+                            credential_detail,
+                            cx,
+                        );
+                        if view.node_input.text.trim() == submitted_value {
+                            view.node_input.set_text("");
+                        }
+                    }
+                    Ok((connection, _, _, _)) => {
+                        if let Err(error) = connection.close() {
+                            view.record_status(format!(
+                                "A completed worker connection was discarded, but the transport could not be closed: {}",
+                                worker_connection_failure_detail(
+                                    WorkerConnectionStage::Transport,
+                                    &error,
+                                    None,
+                                )
+                            ));
+                        }
+                    }
+                    Err((stage, error, cleanup_failed)) if is_pending => {
+                        view.fail_worker_node_connection(
+                            id,
+                            &url,
+                            stage,
+                            &error,
+                            None,
+                            cleanup_failed,
+                        );
+                    }
+                    Err(_) => {}
+                }
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
+    #[cfg(target_family = "wasm")]
+    pub(crate) fn connect_worker_node(&mut self, cx: &mut Context<Self>) {
+        let value = self.node_input.text.trim().to_owned();
+        let mut parts = value.split_whitespace();
+        let Some(url) = parts.next() else {
+            self.record_status("Enter a node URL followed by its access token");
+            cx.notify();
+            return;
+        };
+        let url = url.to_owned();
+        let id = match self.begin_worker_node_connection(&url) {
+            Ok(id) => id,
+            Err(message) => {
+                self.record_status(message);
+                cx.notify();
+                return;
+            }
+        };
+        if worker_url_embeds_credential(&url) {
+            self.set_worker_node_connection_failure(
+                id,
+                &url,
+                "Do not include credentials in the URL. Enter the worker access token after the URL."
+                    .to_owned(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(token) = parts.next().map(str::to_owned) else {
+            self.set_worker_node_connection_failure(
+                id,
+                &url,
+                worker_connection_failure_detail(
+                    WorkerConnectionStage::InputValidation,
+                    &LoomError::invalid_request("missing access token"),
+                    None,
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        let submitted_value = value;
+        let node_url = url.clone();
+        cx.notify();
+        let view = cx.entity();
+        cx.spawn(async move |_, cx| {
+            let result = async {
+                let connection = ClientConnection::browser(&url, &token)
+                    .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
+                if let Err(error) = negotiate_async(&connection).await {
+                    let cleanup_failed = connection.close().is_err();
+                    return Err((
+                        WorkerConnectionStage::Negotiation,
+                        error,
+                        cleanup_failed,
+                    ));
+                }
+                let status = match worker_node_status_async(&connection).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        let cleanup_failed = connection.close().is_err();
+                        return Err((
+                            WorkerConnectionStage::Status,
+                            error,
+                            cleanup_failed,
+                        ));
+                    }
+                };
+                Ok::<_, (WorkerConnectionStage, LoomError, bool)>((connection, status, node_url))
+            }
+            .await;
+            view.update(cx, |view, cx| {
+                let is_pending = view.worker_nodes.iter().any(|node| {
+                    node.id == id
+                        && !node.is_local
+                        && node.url.as_deref() == Some(url.as_str())
+                        && node.connection_state == WorkerConnectionState::Connecting
+                });
+                match result {
+                    Ok((connection, status, connected_url)) if is_pending => {
+                        view.add_worker_node(connection, status, connected_url, None, cx);
+                        if view.node_input.text.trim() == submitted_value {
+                            view.node_input.set_text("");
+                        }
+                    }
+                    Ok((connection, _, _)) => {
+                        if let Err(error) = connection.close() {
+                            view.record_status(format!(
+                                "A completed worker connection was discarded, but the transport could not be closed: {}",
+                                worker_connection_failure_detail(
+                                    WorkerConnectionStage::Transport,
+                                    &error,
+                                    None,
+                                )
+                            ));
+                        }
+                    }
+                    Err((stage, error, cleanup_failed)) if is_pending => {
+                        view.fail_worker_node_connection(
+                            id,
+                            &url,
+                            stage,
+                            &error,
+                            Some(&token),
+                            cleanup_failed,
+                        );
+                    }
+                    Err(_) => {}
+                }
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
     pub(crate) fn open_about_from_menu(&mut self, cx: &mut Context<Self>) {
@@ -2682,29 +4317,172 @@ impl LoomView {
 
     pub(crate) fn new_session(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         let name = format!("Session {}", self.sessions.len().saturating_add(1));
-        self.create_session_async(name, cx);
+        let node_id = self.available_session_nodes().first().map_or_else(
+            || self.default_backend_node_id.clone(),
+            |(id, _)| id.clone(),
+        );
+        self.create_session_on_node(node_id, name, cx);
     }
 
-    /// Creates a session through the connection worker and selects it.
+    fn available_session_nodes(&self) -> Vec<(String, String)> {
+        let nodes = self
+            .worker_nodes
+            .iter()
+            .filter(|node| {
+                node.status.online && self.node_backends.contains_key(&node.status.node_id)
+            })
+            .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
+            .collect::<Vec<_>>();
+        order_session_nodes(nodes, &self.default_backend_node_id)
+    }
+
+    fn render_new_session_button(
+        &self,
+        view: &Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let targets = self.available_session_nodes();
+        let button = Button::new("new-session")
+            .icon(Icon::new(IconName::Plus))
+            .ghost()
+            .xsmall()
+            .tooltip("Create a new session");
+        if targets.len() <= 1 {
+            button
+                .on_click(cx.listener(Self::new_session))
+                .into_any_element()
+        } else {
+            let default_node_id = self.default_backend_node_id.clone();
+            let view = view.clone();
+            button
+                .dropdown_menu(move |mut menu, _, _| {
+                    for (node_id, node_name) in targets.clone() {
+                        let target_view = view.clone();
+                        let is_default = node_id == default_node_id;
+                        let label = if is_default {
+                            format!("{node_name} (default)")
+                        } else {
+                            node_name.clone()
+                        };
+                        let target_node_id = node_id.clone();
+                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                            target_view.update(cx, |view, cx| {
+                                let name =
+                                    format!("Session {}", view.sessions.len().saturating_add(1));
+                                view.create_session_on_node(target_node_id.clone(), name, cx);
+                            });
+                        }));
+                    }
+                    menu
+                })
+                .into_any_element()
+        }
+    }
+
+    /// Creates a session through the selected node and pins it to that node.
     pub(crate) fn create_session_async(&mut self, name: String, cx: &mut Context<Self>) {
-        self.dispatch(
-            cx,
-            ClientRequest::CreateAgentSession {
-                project_id: self.project_id,
-                name,
-            },
-            |view, response, cx| match response.result {
-                Ok(ServerResponse::AgentSessionCreated(snapshot)) => {
+        self.create_session_on_node(self.default_backend_node_id.clone(), name, cx);
+    }
+
+    fn create_session_on_node(&mut self, node_id: String, name: String, cx: &mut Context<Self>) {
+        let Some(backend) = self.node_backends.get(&node_id).cloned() else {
+            self.record_backend_error(
+                "create session",
+                LoomError::new(
+                    ErrorCode::NotFound,
+                    format!("worker node {node_id} is not connected"),
+                    false,
+                ),
+            );
+            cx.notify();
+            return;
+        };
+        let project_id = self.project_id;
+        let workspace_root = self.workspace_root.display().to_string();
+        let open_workspace = node_id != self.default_backend_node_id;
+        let model = self.default_model.clone();
+        let node_name = self
+            .node_names
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_else(|| node_id.clone());
+        cx.spawn(async move |view, cx| {
+            let models = match list_models_from_backend(&backend).await {
+                Ok(models) => models,
+                Err(error) => {
+                    view.update(cx, |view, cx| {
+                        view.record_backend_error("check worker models", error);
+                        cx.notify();
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            view.update(cx, |view, cx| {
+                view.node_model_catalogs
+                    .insert(node_id.clone(), models.clone());
+                view.default_models = models.clone();
+                cx.notify();
+            })
+            .ok();
+            let node_models = BTreeMap::from([(node_id.clone(), models.clone())]);
+            if let Err(reason) = validate_model_for_node(&node_models, &node_id, &model) {
+                view.update(cx, |view, cx| {
+                    view.record_backend_error(
+                        "create session",
+                        LoomError::invalid_state(format!(
+                            "Cannot create a session on {node_name}: {reason}. Choose a model configured on this worker in Settings, then try again."
+                        )),
+                    );
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            let result = async {
+                if open_workspace {
+                    let response = backend
+                        .submit(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+                            project_id,
+                            root: workspace_root,
+                        }))
+                        .wait()
+                        .await;
+                    match response.result? {
+                        ServerResponse::WorkspaceOpened(_) => {}
+                        response => {
+                            return Err(unexpected_response("workspace open", response));
+                        }
+                    }
+                }
+                let response = backend
+                    .submit(RequestEnvelope::new(ClientRequest::CreateAgentSession {
+                        project_id,
+                        name,
+                    }))
+                    .wait()
+                    .await;
+                match response.result? {
+                    ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
+                    response => Err(unexpected_response("session creation", response)),
+                }
+            }
+            .await;
+            view.update(cx, |view, cx| match result {
+                Ok(snapshot) => {
+                    view.node_model_catalogs
+                        .insert(node_id.clone(), models);
+                    view.session_models.insert(snapshot.id, model);
+                    view.session_node_ids
+                        .insert(snapshot.id, node_id.clone());
                     view.sessions.push(snapshot.clone());
                     view.select_session(snapshot, cx);
                 }
                 Err(error) => view.record_backend_error("create session", error),
-                Ok(response) => view.record_backend_error(
-                    "create session",
-                    unexpected_response("session creation", response),
-                ),
-            },
-        );
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(crate) fn begin_session_rename(
@@ -2783,36 +4561,45 @@ impl LoomView {
             let active = session.id == self.active_session.id;
             let session = session.clone();
             let selected_session = session.clone();
-            let card = div()
-                .id(("session", index))
-                .relative()
-                .w_full()
-                .px_2()
-                .py_3()
-                .rounded_lg()
-                .border_1()
-                .border_color(if active { rgb(0x3b5d85) } else { rgb(0x242833) })
-                .bg(if active { rgb(0x25334a) } else { rgb(0x1b1d24) })
-                .text_color(if active { rgb(0xf3f4f6) } else { rgb(0xb7c0d0) })
-                .cursor_pointer()
-                .hover(|style| style.bg(if active { rgb(0x293b56) } else { rgb(0x20242c) }))
-                .child(
-                    div()
-                        .text_sm()
-                        .child(session.name.clone())
-                        .when(session.state == AgentSessionState::Archived, |element| {
-                            element.text_color(rgb(0x64748b))
-                        }),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(state_color(session.state))
-                        .child(session_state_label(session.state)),
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.select_session(selected_session.clone(), cx);
-                }));
+            let node_indicator = self.render_session_node_indicator(session.id, index);
+            let card =
+                div()
+                    .id(("session", index))
+                    .relative()
+                    .w_full()
+                    .px_2()
+                    .py_3()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(if active { rgb(0x3b5d85) } else { rgb(0x242833) })
+                    .bg(if active { rgb(0x25334a) } else { rgb(0x1b1d24) })
+                    .text_color(if active { rgb(0xf3f4f6) } else { rgb(0xb7c0d0) })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(if active { rgb(0x293b56) } else { rgb(0x20242c) }))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
+                            .child(
+                                div().text_sm().child(session.name.clone()).when(
+                                    session.state == AgentSessionState::Archived,
+                                    |element| element.text_color(rgb(0x64748b)),
+                                ),
+                            )
+                            .child(node_indicator),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(state_color(session.state))
+                            .child(session_state_label(session.state)),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_session(selected_session.clone(), cx);
+                    }));
             let rename_session = session.clone();
             let archive_session = session.clone();
             let context_view = view.clone();
@@ -2846,6 +4633,76 @@ impl LoomView {
             );
         }
         list
+    }
+
+    fn render_session_node_indicator(
+        &self,
+        session_id: AgentSessionId,
+        index: usize,
+    ) -> gpui_kit::AnyElement {
+        let node_id = self.session_node_ids.get(&session_id).map(String::as_str);
+        let node = session_owner_status(&self.worker_nodes, &self.session_node_ids, session_id);
+        let status = node.map(|node| &node.status);
+        let indicator_state =
+            session_node_indicator_state(status, node.map_or(0, |node| node.severe_load_streak));
+        let online = indicator_state != SessionNodeIndicatorState::Offline;
+        let pulse = session_node_pulse(status, self.workspace_config.cpu_pulse_threshold_percent);
+        let color = match indicator_state {
+            SessionNodeIndicatorState::Offline => rgb(0x64748b),
+            SessionNodeIndicatorState::Online => rgb(0x4ade80),
+            SessionNodeIndicatorState::Severe => rgb(0xef4444),
+        };
+        let name = worker_node_name_for_id(&self.worker_nodes, &self.node_names, node_id);
+        let metrics = status.filter(|status| status.online).map_or_else(
+            || "CPU n/a · RAM n/a".to_owned(),
+            |status| format_session_resource_percentages(Some(status)),
+        );
+        let tooltip_text = format!(
+            "{}{}\n{}",
+            name,
+            if online { "" } else { " · Offline" },
+            metrics
+        );
+        let dot = if let Some((period, amplitude)) = pulse {
+            div()
+                .w(px(6.))
+                .h(px(6.))
+                .rounded_full()
+                .bg(color)
+                .with_animation(
+                    ("session-node-status-pulse", index),
+                    Animation::new(period).repeat_synced().with_max_fps(24.),
+                    move |element, progress| {
+                        let eased_progress = progress * progress * (3. - 2. * progress);
+                        let pulse = 0.5 - 0.5 * (eased_progress * std::f32::consts::TAU).cos();
+                        let size = 6. + amplitude * pulse;
+                        element.w(px(size)).h(px(size))
+                    },
+                )
+                .into_any_element()
+        } else {
+            div()
+                .w(px(6.))
+                .h(px(6.))
+                .rounded_full()
+                .bg(color)
+                .into_any_element()
+        };
+        div()
+            .id(("session-node-indicator", index))
+            .w(px(12.))
+            .h(px(12.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .tooltip(move |_, cx| {
+                cx.new(|_| LoomTooltip {
+                    text: tooltip_text.clone().into(),
+                })
+                .into()
+            })
+            .child(dot)
+            .into_any_element()
     }
 
     pub(crate) fn render_model_picker(&self) -> impl IntoElement {
@@ -3023,40 +4880,30 @@ impl LoomView {
                         .flex()
                         .gap_2()
                         .child(
-                            div()
-                                .id((
-                                    "approve-activity",
-                                    ((index as u64) << 32) | activity_index as u64,
-                                ))
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x24543d))
-                                .text_color(rgb(0xbbf7d0))
-                                .cursor_pointer()
-                                .child("Approve")
-                                .on_click(move |_, _, cx| {
-                                    parent_for_approve
-                                        .update(cx, |this, cx| this.approve_pending_action(cx));
-                                }),
+                            Button::new((
+                                "approve-activity",
+                                ((index as u64) << 32) | activity_index as u64,
+                            ))
+                            .label("Approve")
+                            .success()
+                            .small()
+                            .on_click(move |_, _, cx| {
+                                parent_for_approve
+                                    .update(cx, |this, cx| this.approve_pending_action(cx));
+                            }),
                         )
                         .child(
-                            div()
-                                .id((
-                                    "reject-activity",
-                                    ((index as u64) << 32) | activity_index as u64,
-                                ))
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x542936))
-                                .text_color(rgb(0xfecdd3))
-                                .cursor_pointer()
-                                .child("Reject")
-                                .on_click(move |_, _, cx| {
-                                    parent_for_reject
-                                        .update(cx, |this, cx| this.reject_pending_action(cx));
-                                }),
+                            Button::new((
+                                "reject-activity",
+                                ((index as u64) << 32) | activity_index as u64,
+                            ))
+                            .label("Reject")
+                            .danger()
+                            .small()
+                            .on_click(move |_, _, cx| {
+                                parent_for_reject
+                                    .update(cx, |this, cx| this.reject_pending_action(cx));
+                            }),
                         ),
                 );
             } else if activity.status == AgentActivityStatus::AwaitingApproval
@@ -3197,30 +5044,20 @@ impl LoomView {
                             .flex()
                             .gap_2()
                             .child(
-                                div()
-                                    .id(("approve-legacy", index))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(0x24543d))
-                                    .text_color(rgb(0xbbf7d0))
-                                    .cursor_pointer()
-                                    .child("Approve")
+                                Button::new(("approve-legacy", index))
+                                    .label("Approve")
+                                    .success()
+                                    .small()
                                     .on_click(move |_, _, cx| {
                                         parent_for_approve
                                             .update(cx, |this, cx| this.approve_pending_action(cx));
                                     }),
                             )
                             .child(
-                                div()
-                                    .id(("reject-legacy", index))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(rgb(0x542936))
-                                    .text_color(rgb(0xfecdd3))
-                                    .cursor_pointer()
-                                    .child("Reject")
+                                Button::new(("reject-legacy", index))
+                                    .label("Reject")
+                                    .danger()
+                                    .small()
                                     .on_click(move |_, _, cx| {
                                         parent_for_reject
                                             .update(cx, |this, cx| this.reject_pending_action(cx));
@@ -3278,26 +5115,28 @@ impl LoomView {
             TimelineItem::Error { operation, error } => div()
                 .p_2()
                 .rounded_lg()
-                .bg(rgb(0x3a1f24))
+                .bg(rgb(ERROR_CARD_SURFACE))
+                .border_1()
+                .border_color(rgb(ERROR_CARD_ACCENT))
                 .text_sm()
-                .text_color(rgb(0xfca5a5))
+                .text_color(rgb(ERROR_CARD_FOREGROUND))
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0xfda4af))
+                        .text_color(rgb(ERROR_CARD_ACCENT))
                         .child(format!("{} · {}", operation, error.code)),
                 )
                 .child(div().mt_1().child(render_timeline_text(
                     format!("timeline-error-{index}"),
                     error.message.clone(),
-                    0xfca5a5,
+                    ERROR_CARD_FOREGROUND,
                 )))
                 .when(error.retryable, |element| {
                     element.child(
                         div()
                             .mt_1()
                             .text_xs()
-                            .text_color(rgb(0xfda4af))
+                            .text_color(rgb(ERROR_CARD_ACCENT))
                             .child("This operation can be retried."),
                     )
                 })
@@ -4003,6 +5842,162 @@ impl LoomView {
             .child(div().mt_2().child(body))
             .child(
                 div()
+                    .mt_4()
+                    .text_xs()
+                    .text_color(rgb(0x93c5fd))
+                    .child("WORKER NODES"),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child("Session indicator pulse threshold")
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child("Pulse when CPU usage is above this value"),
+                            ),
+                    )
+                    .child(
+                        Button::new("cpu-pulse-threshold-decrease")
+                            .label("-")
+                            .small()
+                            .disabled(self.workspace_config.cpu_pulse_threshold_percent == 0)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.adjust_cpu_pulse_threshold(-1, cx);
+                            })),
+                    )
+                    .child(div().w(px(44.)).text_center().text_sm().child(format!(
+                        "{}%",
+                        self.workspace_config.cpu_pulse_threshold_percent.min(100)
+                    )))
+                    .child(
+                        Button::new("cpu-pulse-threshold-increase")
+                            .label("+")
+                            .small()
+                            .disabled(self.workspace_config.cpu_pulse_threshold_percent >= 100)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.adjust_cpu_pulse_threshold(1, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(self.worker_nodes.iter().map(|node| {
+                        let id = node.id;
+                        let status = &node.status;
+                        let resources = &status.resources;
+                        let connection_label = match node.connection_state {
+                            WorkerConnectionState::Disconnected => "not connected",
+                            WorkerConnectionState::Connecting => "connecting",
+                            WorkerConnectionState::Connected if status.online => {
+                                "connected · online"
+                            }
+                            WorkerConnectionState::Connected => "connected · offline",
+                            WorkerConnectionState::Failed => "connection failed",
+                        };
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .p_2()
+                                    .rounded_lg()
+                                    .bg(rgb(0x171c25))
+                                    .border_1()
+                                    .border_color(rgb(0x293244))
+                                    .text_xs()
+                                    .child(div().text_color(rgb(0xe5e7eb)).child(format!(
+                                        "{} · {} · {}",
+                                        worker_node_display_name(node),
+                                        connection_label,
+                                        format_worker_node_resources(resources),
+                                    )))
+                                    .when_some(
+                                        node.connection_detail.as_deref(),
+                                        |element, detail| {
+                                            element.child(
+                                                div()
+                                                    .mt_1()
+                                                    .text_xs()
+                                                    .text_color(
+                                                        if node.connection_state
+                                                            == WorkerConnectionState::Failed
+                                                        {
+                                                            rgb(0xfca5a5)
+                                                        } else {
+                                                            rgb(0xfcd34d)
+                                                        },
+                                                    )
+                                                    .child(detail.to_owned()),
+                                            )
+                                        },
+                                    ),
+                            )
+                            .when(!node.is_local, |element| {
+                                element.child(
+                                    Button::new(format!("remove-worker-node-{id}"))
+                                        .label("Remove")
+                                        .small()
+                                        .on_click(cx.listener(move |view, _, _, cx| {
+                                            view.remove_worker_node(id, cx)
+                                        })),
+                                )
+                            })
+                    })),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(30.))
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x171c25))
+                            .border_1()
+                            .border_color(rgb(0x293244))
+                            .text_xs()
+                            .text_color(rgb(0xb7c0d0))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_composer))
+                            .child(TextInputElement {
+                                view: cx.entity(),
+                                field: InputField::Node,
+                            }),
+                    )
+                    .child(
+                        Button::new("connect-worker-node")
+                            .label("Connect")
+                            .small()
+                            .on_click(cx.listener(|view, _, _, cx| view.connect_worker_node(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0x64748b))
+                    .child("Use: ws://host:port/ws token · URLs are shared; access tokens are not"),
+            )
+            .child(
+                div()
                     .mt_3()
                     .text_xs()
                     .text_color(rgb(0x93c5fd))
@@ -4290,6 +6285,7 @@ impl LoomView {
 
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.schedule_worker_node_poll(cx);
         self.sync_model_select_states(window, cx);
         self.sync_agent_mode_select_state(window, cx);
         self.schedule_run_poll(cx);
@@ -4433,29 +6429,7 @@ impl Render for LoomView {
                                     .child(
                                         div().text_xs().text_color(rgb(0x8f98a6)).child("Sessions"),
                                     )
-                                    .child(
-                                        div()
-                                            .id("new-session")
-                                            .w(px(28.))
-                                            .h(px(28.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded_lg()
-                                            .bg(rgb(0x202b3b))
-                                            .hover(|style| style.bg(rgb(0x293b56)))
-                                            .text_sm()
-                                            .text_color(rgb(0x93c5fd))
-                                            .cursor_pointer()
-                                            .tooltip(|_, cx| {
-                                                cx.new(|_| LoomTooltip {
-                                                    text: "Create a new session".into(),
-                                                })
-                                                .into()
-                                            })
-                                            .child(Icon::new(IconName::Plus).size_4())
-                                            .on_click(cx.listener(Self::new_session)),
-                                    ),
+                                    .child(self.render_new_session_button(&view, cx)),
                             )
                             .child(
                                 div()
@@ -4929,5 +6903,507 @@ impl Render for LoomView {
                     }
                 }),
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_node_tests {
+    use super::{
+        ACTIVE_BACKEND_NODE_ENTRY_ID, SessionNodeIndicatorState, WorkerConnectionStage,
+        WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold, assigned_node_id,
+        format_percentage, format_session_resource_percentages, format_worker_node_resources,
+        mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
+        order_session_nodes, remove_worker_node_entry, safe_worker_url_label,
+        session_id_for_request, session_node_indicator_state, session_node_pulse,
+        session_owner_status, transition_worker_connection_to_connecting,
+        update_worker_node_status, validate_model_for_node, worker_connection_failure_detail,
+        worker_node_display_name, worker_node_name_for_id, worker_url_embeds_credential,
+    };
+    use loom_core::{
+        AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ProjectId, RunId,
+        Timestamp,
+    };
+    use loom_core::{ErrorCode, LoomError};
+    use loom_model::ModelId;
+    use loom_protocol::{ClientRequest, WorkerNodeResources, WorkerNodeStatus};
+    use std::collections::BTreeMap;
+
+    fn node(id: u64, is_local: bool) -> WorkerNodeEntry {
+        WorkerNodeEntry {
+            id,
+            status: WorkerNodeStatus {
+                node_id: format!("node-{id}"),
+                name: format!("Node {id}"),
+                online: true,
+                capabilities: CapabilitySet::default(),
+                resources: WorkerNodeResources {
+                    cpu_count: 0,
+                    cpu_usage_percent: None,
+                    memory_usage_percent: None,
+                    memory_total_bytes: None,
+                    memory_available_bytes: None,
+                    disk_total_bytes: None,
+                    disk_available_bytes: None,
+                },
+            },
+            is_local,
+            url: (!is_local).then(|| format!("ws://worker-{id}/ws")),
+            connection: None,
+            connection_state: if is_local {
+                WorkerConnectionState::Connected
+            } else {
+                WorkerConnectionState::Disconnected
+            },
+            connection_detail: None,
+            severe_load_streak: 0,
+        }
+    }
+
+    #[test]
+    fn connection_error_details_are_actionable_and_do_not_echo_tokens() {
+        let invalid_url = worker_connection_failure_detail(
+            WorkerConnectionStage::Transport,
+            &LoomError::invalid_request("invalid url with secret-token"),
+            Some("secret-token"),
+        );
+        assert!(invalid_url.contains("Invalid worker URL"));
+        assert!(!invalid_url.contains("secret-token"));
+
+        let refused = worker_connection_failure_detail(
+            WorkerConnectionStage::Transport,
+            &LoomError::new(ErrorCode::Internal, "connection refused", true),
+            None,
+        );
+        assert!(refused.contains("server is running"));
+
+        let timeout = worker_connection_failure_detail(
+            WorkerConnectionStage::Transport,
+            &LoomError::new(ErrorCode::DeadlineExceeded, "timeout", true),
+            None,
+        );
+        assert!(timeout.contains("timed out"));
+
+        let authentication = worker_connection_failure_detail(
+            WorkerConnectionStage::Transport,
+            &LoomError::new(ErrorCode::AuthenticationFailed, "denied", false),
+            None,
+        );
+        assert!(authentication.contains("access token"));
+
+        let negotiation = worker_connection_failure_detail(
+            WorkerConnectionStage::Negotiation,
+            &LoomError::new(ErrorCode::UnsupportedProtocol, "mismatch", false),
+            None,
+        );
+        assert!(negotiation.contains("protocol negotiation failed"));
+
+        let status = worker_connection_failure_detail(
+            WorkerConnectionStage::Status,
+            &LoomError::new(ErrorCode::Internal, "bad status", false),
+            None,
+        );
+        assert!(status.contains("status request failed"));
+
+        let credential = worker_connection_failure_detail(
+            WorkerConnectionStage::CredentialSave,
+            &LoomError::new(
+                ErrorCode::Persistence,
+                "could not persist secret%2Fvalue",
+                false,
+            ),
+            Some("secret/value"),
+        );
+        assert!(credential.contains("could not save reconnect credentials"));
+        assert!(!credential.contains("secret/value"));
+        assert!(!credential.contains("secret%2Fvalue"));
+
+        let credential_read = worker_connection_failure_detail(
+            WorkerConnectionStage::CredentialRead,
+            &LoomError::new(ErrorCode::AuthenticationRequired, "missing", false),
+            None,
+        );
+        assert!(credential_read.contains("OS credential store"));
+
+        let bootstrap_save = worker_connection_failure_detail(
+            WorkerConnectionStage::BootstrapSave,
+            &LoomError::new(ErrorCode::Persistence, "failed with secret", false),
+            Some("secret"),
+        );
+        assert!(bootstrap_save.contains("browser could not save"));
+        assert!(!bootstrap_save.contains("secret"));
+    }
+
+    #[test]
+    fn duplicate_connection_attempts_are_blocked_and_url_labels_hide_credentials() {
+        let mut state = WorkerConnectionState::Connecting;
+        assert!(transition_worker_connection_to_connecting(&mut state, false).is_err());
+        assert_eq!(state, WorkerConnectionState::Connecting);
+
+        state = WorkerConnectionState::Failed;
+        assert!(transition_worker_connection_to_connecting(&mut state, false).is_ok());
+        assert_eq!(state, WorkerConnectionState::Connecting);
+
+        state = WorkerConnectionState::Connected;
+        assert!(transition_worker_connection_to_connecting(&mut state, true).is_err());
+        assert_eq!(state, WorkerConnectionState::Connected);
+
+        assert!(worker_url_embeds_credential(
+            "wss://user:password@worker.example/ws?access_token=sample"
+        ));
+        assert_eq!(
+            safe_worker_url_label(
+                "wss://user:password@worker.example/ws?access_token=sample&keep=hidden"
+            ),
+            "wss://worker.example/ws"
+        );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn failed_connection_state_clears_transport_and_keeps_node_url() {
+        let mut node = node(7, false);
+        let backend = loom_server::InProcessBackend::new();
+        node.connection = Some(super::ClientConnection::InProcess(backend.connect()));
+        node.status.online = true;
+        node.connection_state = WorkerConnectionState::Connected;
+
+        let cleanup_failed =
+            mark_worker_connection_failed(&mut node, "protocol negotiation failed".to_owned());
+
+        assert!(!cleanup_failed);
+        assert!(node.connection.is_none());
+        assert_eq!(node.connection_state, WorkerConnectionState::Failed);
+        assert!(!node.status.online);
+        assert_eq!(node.url.as_deref(), Some("ws://worker-7/ws"));
+        assert_eq!(
+            node.connection_detail.as_deref(),
+            Some("protocol negotiation failed")
+        );
+    }
+
+    fn session(id: AgentSessionId, name: &str) -> AgentSessionSnapshot {
+        AgentSessionSnapshot {
+            id,
+            project_id: ProjectId::new(),
+            name: name.to_owned(),
+            state: AgentSessionState::Idle,
+            created_at: Timestamp::from_unix_millis(1),
+            updated_at: Timestamp::from_unix_millis(1),
+        }
+    }
+
+    #[test]
+    fn local_worker_node_cannot_be_removed() {
+        let mut nodes = vec![node(0, true)];
+
+        assert!(remove_worker_node_entry(&mut nodes, 0).is_none());
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].is_local());
+    }
+
+    #[test]
+    fn configured_worker_node_can_be_removed_without_removing_local_node() {
+        let mut nodes = vec![node(0, true), node(1, false)];
+
+        let removed = remove_worker_node_entry(&mut nodes, 1).unwrap();
+
+        assert_eq!(removed.id, 1);
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].is_local());
+    }
+
+    #[test]
+    fn unavailable_and_available_resource_percentages_are_formatted() {
+        assert_eq!(format_percentage(None), "n/a");
+        assert_eq!(format_percentage(Some(0)), "0%");
+        assert_eq!(format_percentage(Some(73)), "73%");
+        assert_eq!(format_percentage(Some(101)), "n/a");
+    }
+
+    #[test]
+    fn resource_summary_keeps_cpu_cores_and_total_ram_across_samples() {
+        let initial = WorkerNodeResources {
+            cpu_count: 8,
+            cpu_usage_percent: None,
+            memory_usage_percent: None,
+            memory_total_bytes: Some(16 << 30),
+            memory_available_bytes: Some(8 << 30),
+            disk_total_bytes: Some(1 << 30),
+            disk_available_bytes: Some(512 << 20),
+        };
+        let initial_summary = format_worker_node_resources(&initial);
+        assert!(initial_summary.contains("CPU n/a of 8 cores"));
+        assert!(initial_summary.contains("RAM n/a of 16.0 GiB"));
+        assert!(initial_summary.contains("disk 512.0 MiB available"));
+
+        let updated = WorkerNodeResources {
+            cpu_usage_percent: Some(31),
+            memory_usage_percent: Some(50),
+            ..initial
+        };
+        let updated_summary = format_worker_node_resources(&updated);
+        assert!(updated_summary.contains("CPU 31% of 8 cores"));
+        assert!(updated_summary.contains("RAM 50% of 16.0 GiB"));
+        assert!(updated_summary.contains("disk 512.0 MiB available"));
+    }
+
+    #[test]
+    fn refreshed_worker_status_replaces_initial_unavailable_percentages() {
+        let mut nodes = vec![node(1, false)];
+        nodes[0].status.resources = WorkerNodeResources {
+            cpu_count: 4,
+            cpu_usage_percent: None,
+            memory_usage_percent: None,
+            memory_total_bytes: Some(8 << 30),
+            memory_available_bytes: Some(4 << 30),
+            disk_total_bytes: Some(100 << 30),
+            disk_available_bytes: Some(50 << 30),
+        };
+        assert!(
+            format_worker_node_resources(&nodes[0].status.resources)
+                .contains("CPU n/a of 4 cores · RAM n/a of 8.0 GiB")
+        );
+
+        let mut refreshed = nodes[0].status.clone();
+        refreshed.resources.cpu_usage_percent = Some(25);
+        refreshed.resources.memory_usage_percent = Some(50);
+        assert_eq!(update_worker_node_status(&mut nodes, 1, refreshed), None);
+
+        let summary = format_worker_node_resources(&nodes[0].status.resources);
+        assert!(summary.contains("CPU 25% of 4 cores · RAM 50% of 8.0 GiB"));
+        assert!(summary.contains("disk 50.0 GiB available"));
+    }
+
+    #[test]
+    fn session_status_uses_the_assigned_node_not_the_active_backend() {
+        let mut active_backend = node(ACTIVE_BACKEND_NODE_ENTRY_ID, true);
+        active_backend.status.resources.cpu_usage_percent = Some(22);
+        active_backend.status.resources.memory_usage_percent = Some(38);
+
+        let mut peer = node(1, false);
+        peer.status.resources.cpu_usage_percent = Some(99);
+        peer.status.resources.memory_usage_percent = Some(97);
+        let nodes = vec![active_backend, peer];
+        let session_id = AgentSessionId::new();
+        let owners = BTreeMap::from([(session_id, "node-1".to_owned())]);
+
+        let owner = session_owner_status(&nodes, &owners, session_id).unwrap();
+        assert_eq!(worker_node_display_name(owner), "External worker · Node 1");
+        assert_eq!(
+            format_session_resource_percentages(Some(&owner.status)),
+            "CPU 99% · RAM 97%"
+        );
+        let node_names =
+            BTreeMap::from([("node-1".to_owned(), "External worker · Node 1".to_owned())]);
+        assert_eq!(
+            worker_node_name_for_id(&nodes[..1], &node_names, Some("node-1")),
+            "External worker · Node 1"
+        );
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::GetAgentSessionSnapshot { session_id },
+                AgentSessionId::new()
+            ),
+            Some(session_id)
+        );
+    }
+
+    #[test]
+    fn run_requests_route_to_the_active_session_owner() {
+        let active_session_id = AgentSessionId::new();
+        let owners = BTreeMap::from([(active_session_id, "peer-node".to_owned())]);
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::SendAgentMessage {
+                    run_id: RunId::new(),
+                    message: "hello".to_owned(),
+                },
+                active_session_id
+            ),
+            Some(active_session_id)
+        );
+        assert_eq!(
+            assigned_node_id(&owners, active_session_id),
+            Ok("peer-node")
+        );
+        assert!(assigned_node_id(&BTreeMap::new(), active_session_id).is_err());
+        assert_eq!(
+            session_id_for_request(&ClientRequest::ListProjects, active_session_id),
+            None
+        );
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::CreateCheckpoint {
+                    project_id: ProjectId::new(),
+                    session_id: Some(active_session_id),
+                    label: "checkpoint".to_owned(),
+                },
+                AgentSessionId::new()
+            ),
+            Some(active_session_id)
+        );
+    }
+
+    #[test]
+    fn session_aggregation_tracks_node_owners_and_preserves_disconnected_sessions() {
+        let primary_id = AgentSessionId::new();
+        let peer_id = AgentSessionId::new();
+        let disconnected_id = AgentSessionId::new();
+        let primary_session = session(primary_id, "Primary");
+        let peer_session = session(peer_id, "Peer");
+        let disconnected_session = session(disconnected_id, "Disconnected");
+        let current = vec![primary_session.clone(), disconnected_session.clone()];
+        let owners = BTreeMap::from([
+            (primary_id, "node-0".to_owned()),
+            (disconnected_id, "removed-node".to_owned()),
+        ]);
+
+        let (sessions, owners) = merge_node_sessions(
+            &current,
+            &owners,
+            vec![
+                ("node-0".to_owned(), vec![primary_session]),
+                ("node-1".to_owned(), vec![peer_session]),
+            ],
+        );
+
+        assert_eq!(sessions.len(), 3);
+        assert_eq!(owners.get(&primary_id).map(String::as_str), Some("node-0"));
+        assert_eq!(owners.get(&peer_id).map(String::as_str), Some("node-1"));
+        assert_eq!(
+            owners.get(&disconnected_id).map(String::as_str),
+            Some("removed-node")
+        );
+    }
+
+    #[test]
+    fn session_aggregation_rebinds_returned_sessions_to_a_restarted_node_identity() {
+        let session_id = AgentSessionId::new();
+        let current = vec![session(session_id, "Existing")];
+        let current_owners = BTreeMap::from([(session_id, "old-node-id".to_owned())]);
+
+        let (sessions, owners) = merge_node_sessions(
+            &current,
+            &current_owners,
+            vec![(
+                "new-node-id".to_owned(),
+                vec![session(session_id, "Existing")],
+            )],
+        );
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            owners.get(&session_id).map(String::as_str),
+            Some("new-node-id")
+        );
+    }
+
+    #[test]
+    fn new_session_node_choices_keep_the_default_backend_first() {
+        let nodes = vec![
+            ("peer".to_owned(), "External worker".to_owned()),
+            ("default".to_owned(), "Local backend".to_owned()),
+        ];
+        let ordered = order_session_nodes(nodes, "default");
+
+        assert_eq!(ordered[0].0, "default");
+        assert_eq!(ordered[1].0, "peer");
+    }
+
+    #[test]
+    fn model_selection_uses_the_chosen_workers_catalog() {
+        let local_model = ModelId::new("local/provider-model");
+        let worker_model = ModelId::new("worker/provider-model");
+        let catalogs = BTreeMap::from([
+            ("local".to_owned(), vec![local_model.clone()]),
+            ("worker".to_owned(), vec![worker_model.clone()]),
+        ]);
+
+        assert!(validate_model_for_node(&catalogs, "local", &local_model).is_ok());
+        assert!(validate_model_for_node(&catalogs, "worker", &local_model).is_err());
+        assert!(validate_model_for_node(&catalogs, "worker", &worker_model).is_ok());
+    }
+
+    #[test]
+    fn assigned_node_status_drives_dot_pulse_speed_and_intensity() {
+        let mut low_load = node(1, false).status;
+        low_load.resources.cpu_usage_percent = Some(6);
+        low_load.resources.memory_usage_percent = Some(10);
+        let mut high_load = low_load.clone();
+        high_load.resources.cpu_usage_percent = Some(80);
+        high_load.resources.memory_usage_percent = Some(60);
+        let unknown_load = node(2, false).status;
+
+        let (low_period, low_amplitude) = session_node_pulse(Some(&low_load), 5).unwrap();
+        let (high_period, high_amplitude) = session_node_pulse(Some(&high_load), 5).unwrap();
+
+        assert!(high_period < low_period);
+        assert!(high_amplitude > low_amplitude);
+        assert_eq!(session_node_pulse(Some(&unknown_load), 5), None);
+        assert_eq!(session_node_pulse(None, 5), None);
+        assert_eq!(session_node_pulse(Some(&low_load), 6), None);
+        high_load.online = false;
+        assert_eq!(session_node_pulse(Some(&high_load), 5), None);
+    }
+
+    #[test]
+    fn pulse_threshold_adjustment_is_bounded_and_uses_five_percent_by_default() {
+        assert_eq!(
+            loom_protocol::WorkspaceConfig::default().cpu_pulse_threshold_percent,
+            5
+        );
+        assert_eq!(adjusted_cpu_pulse_threshold(5, -1), 4);
+        assert_eq!(adjusted_cpu_pulse_threshold(0, -1), 0);
+        assert_eq!(adjusted_cpu_pulse_threshold(100, 1), 100);
+        assert_eq!(adjusted_cpu_pulse_threshold(99, 1), 100);
+    }
+
+    #[test]
+    fn severe_load_red_requires_three_consecutive_dual_threshold_samples() {
+        let mut status = node(1, false).status;
+        status.resources.cpu_usage_percent = Some(91);
+        status.resources.memory_usage_percent = Some(91);
+
+        let first = next_severe_load_streak(0, &status.resources);
+        let second = next_severe_load_streak(first, &status.resources);
+        assert_eq!(
+            session_node_indicator_state(Some(&status), second),
+            SessionNodeIndicatorState::Online
+        );
+        let third = next_severe_load_streak(second, &status.resources);
+        assert_eq!(third, 3);
+        assert_eq!(
+            session_node_indicator_state(Some(&status), third),
+            SessionNodeIndicatorState::Severe
+        );
+
+        status.resources.cpu_usage_percent = Some(90);
+        assert_eq!(next_severe_load_streak(third, &status.resources), 0);
+        status.resources.cpu_usage_percent = Some(91);
+        status.resources.memory_usage_percent = None;
+        assert_eq!(next_severe_load_streak(third, &status.resources), 0);
+        status.resources.memory_usage_percent = Some(91);
+        status.online = false;
+        assert_eq!(
+            session_node_indicator_state(Some(&status), third),
+            SessionNodeIndicatorState::Offline
+        );
+    }
+
+    #[test]
+    fn active_backend_and_external_worker_labels_do_not_collide() {
+        let mut active_backend = node(ACTIVE_BACKEND_NODE_ENTRY_ID, true);
+        active_backend.status.name = "local".to_owned();
+        let mut external_worker = node(1, false);
+        external_worker.status.name = "local".to_owned();
+
+        assert_eq!(
+            worker_node_display_name(&active_backend),
+            "Local backend · local"
+        );
+        assert_eq!(
+            worker_node_display_name(&external_worker),
+            "External worker · local"
+        );
     }
 }

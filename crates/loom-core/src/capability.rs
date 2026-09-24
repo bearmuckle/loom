@@ -37,6 +37,7 @@ pub enum Capability {
     ReadVcsStatus,
     ReadVcsDiff,
     ReadTaskEvidence,
+    ReadWorkerNodeStatus,
     JsonProtocol,
 }
 

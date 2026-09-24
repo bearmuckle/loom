@@ -8,7 +8,7 @@ use loom_core::{
 use loom_model::ModelId;
 use loom_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
-    decode_response,
+    WorkerNodeStatus, decode_response,
 };
 use loom_server::{
     AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
@@ -36,6 +36,7 @@ fn capabilities() -> CapabilitySet {
         Capability::ReadVcsStatus,
         Capability::ReadVcsDiff,
         Capability::ReadTaskEvidence,
+        Capability::ReadWorkerNodeStatus,
         Capability::OpenTerminal,
         Capability::ControlTerminal,
         Capability::JsonProtocol,
@@ -66,6 +67,24 @@ async fn server() -> (
     .await
     .unwrap();
     (backend, auth, token, server)
+}
+
+#[tokio::test]
+async fn invalid_websocket_url_errors_do_not_echo_credentials() {
+    let error = match WebSocketTransport::new(
+        "not-a-websocket-url?access_token=url-secret",
+        "header-secret",
+    )
+    .connect()
+    .await
+    {
+        Ok(_) => panic!("invalid worker URL unexpectedly connected"),
+        Err(error) => error,
+    };
+
+    assert!(error.message.contains("invalid WebSocket URL"));
+    assert!(!error.to_string().contains("url-secret"));
+    assert!(!error.to_string().contains("header-secret"));
 }
 
 async fn negotiate(connection: &mut WebSocketConnection) {
@@ -133,6 +152,19 @@ async fn events(
     }
 }
 
+async fn worker_status(connection: &mut WebSocketConnection) -> WorkerNodeStatus {
+    match connection
+        .request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus))
+        .await
+        .unwrap()
+        .result
+        .unwrap()
+    {
+        ServerResponse::WorkerNodeStatus(status) => status,
+        response => panic!("unexpected worker status response: {response:?}"),
+    }
+}
+
 #[tokio::test]
 async fn rejects_unauthenticated_websocket_clients_before_capability_discovery() {
     let (_backend, _auth, _token, server) = server().await;
@@ -175,6 +207,114 @@ async fn authorized_client_can_discover_and_revoke_access() {
         ErrorCode::AuthenticationFailed
     );
     server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn secondary_local_backend_refreshes_resources_with_distinct_stable_identity() {
+    let first_backend = InProcessBackend::new();
+    let first_auth = Arc::new(AuthTokenStore::new());
+    let first_token = first_auth
+        .insert("first-local-backend", AuthorizationScope::all())
+        .unwrap();
+    let first_server = RemoteServer::new(
+        Arc::clone(&first_backend),
+        Arc::clone(&first_auth),
+        RemoteServerConfig::local_ephemeral(),
+    )
+    .bind()
+    .await
+    .unwrap();
+    let second_backend = InProcessBackend::new();
+    let second_auth = Arc::new(AuthTokenStore::new());
+    let second_token = second_auth
+        .insert("second-local-backend", AuthorizationScope::all())
+        .unwrap();
+    let second_server = RemoteServer::new(
+        Arc::clone(&second_backend),
+        Arc::clone(&second_auth),
+        RemoteServerConfig::local_ephemeral(),
+    )
+    .bind()
+    .await
+    .unwrap();
+    let mut first_connection =
+        WebSocketTransport::new(first_server.websocket_url(), first_token.token)
+            .connect()
+            .await
+            .unwrap();
+    let mut second_connection =
+        WebSocketTransport::new(second_server.websocket_url(), second_token.token)
+            .connect()
+            .await
+            .unwrap();
+    negotiate(&mut first_connection).await;
+    negotiate(&mut second_connection).await;
+
+    #[cfg(unix)]
+    let root = {
+        let root = workspace();
+        let opened = second_connection
+            .request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+                project_id: ProjectId::new(),
+                root: root.display().to_string(),
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(
+            opened.result,
+            Ok(ServerResponse::WorkspaceOpened(_))
+        ));
+        root
+    };
+
+    let first_status = worker_status(&mut first_connection).await;
+    let second_initial = worker_status(&mut second_connection).await;
+    assert_eq!(first_status.resources.cpu_usage_percent, None);
+    assert_eq!(second_initial.resources.cpu_usage_percent, None);
+    assert!(second_initial.resources.cpu_count > 0);
+    assert!(
+        second_initial
+            .resources
+            .memory_total_bytes
+            .is_some_and(|bytes| bytes > 0)
+    );
+    assert!(
+        second_initial
+            .resources
+            .memory_usage_percent
+            .is_some_and(|percent| percent <= 100)
+    );
+    assert_ne!(first_status.node_id, second_initial.node_id);
+    assert_ne!(first_status.name, second_initial.name);
+    #[cfg(unix)]
+    {
+        assert!(second_initial.resources.disk_total_bytes.is_some());
+        assert!(second_initial.resources.disk_available_bytes.is_some());
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second_refreshed = worker_status(&mut second_connection).await;
+    assert!(
+        second_refreshed
+            .resources
+            .cpu_usage_percent
+            .is_some_and(|percent| percent <= 100)
+    );
+    assert!(
+        second_refreshed
+            .resources
+            .memory_usage_percent
+            .is_some_and(|percent| percent <= 100)
+    );
+    assert_eq!(second_refreshed.node_id, second_initial.node_id);
+    assert_eq!(second_refreshed.name, second_initial.name);
+
+    drop(first_connection);
+    drop(second_connection);
+    first_server.stop().await.unwrap();
+    second_server.stop().await.unwrap();
+    #[cfg(unix)]
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
