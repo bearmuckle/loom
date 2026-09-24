@@ -149,13 +149,20 @@ fn change_kind_label(kind: loom_workspace::WorkspaceChangeKind) -> &'static str 
     }
 }
 
-fn diff_line_style(line: &str) -> (u32, u32) {
-    match line.as_bytes().first().copied() {
-        Some(b'+') if !line.starts_with("+++") => (0x16352b, 0x9ad7bd),
-        Some(b'-') if !line.starts_with("---") => (0x3d2027, 0xfca5a5),
-        Some(b'@') => (0x1d3047, 0x93c5fd),
-        _ => (0x0f1115, 0xcbd5e1),
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DiffLineKind {
+    Added,
+    Removed,
+    Context,
+    Header,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DiffLine {
+    kind: DiffLineKind,
+    old_number: Option<usize>,
+    new_number: Option<usize>,
+    text: String,
 }
 
 fn diff_summary(patch: &str) -> (usize, usize) {
@@ -170,23 +177,119 @@ fn diff_summary(patch: &str) -> (usize, usize) {
     })
 }
 
+fn parse_hunk_start(header: &str, marker: char) -> Option<usize> {
+    let start = header.find(marker)? + 1;
+    let range = header[start..]
+        .split_whitespace()
+        .next()?
+        .trim_start_matches('-');
+    range
+        .split(',')
+        .next()
+        .and_then(|number| number.parse().ok())
+}
+
+fn parse_diff_lines(patch: &str) -> Vec<DiffLine> {
+    let mut old_number = 0;
+    let mut new_number = 0;
+    let mut lines = Vec::new();
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            old_number = parse_hunk_start(line, '-').unwrap_or(0);
+            new_number = parse_hunk_start(line, '+').unwrap_or(0);
+            lines.push(DiffLine {
+                kind: DiffLineKind::Header,
+                old_number: None,
+                new_number: None,
+                text: line.to_owned(),
+            });
+            continue;
+        }
+        let (kind, old, new) = match line.as_bytes().first().copied() {
+            Some(b'+') if !line.starts_with("+++") => {
+                let number = new_number;
+                new_number += 1;
+                (DiffLineKind::Added, None, Some(number))
+            }
+            Some(b'-') if !line.starts_with("---") => {
+                let number = old_number;
+                old_number += 1;
+                (DiffLineKind::Removed, Some(number), None)
+            }
+            Some(b' ') => {
+                let old = old_number;
+                let new = new_number;
+                old_number += 1;
+                new_number += 1;
+                (DiffLineKind::Context, Some(old), Some(new))
+            }
+            _ => (DiffLineKind::Header, None, None),
+        };
+        lines.push(DiffLine {
+            kind,
+            old_number: old,
+            new_number: new,
+            text: if kind == DiffLineKind::Header {
+                line.to_owned()
+            } else {
+                line.strip_prefix(['+', '-', ' '])
+                    .unwrap_or(line)
+                    .to_owned()
+            },
+        });
+    }
+    lines
+}
+
+fn diff_line_colors(kind: DiffLineKind) -> (u32, u32) {
+    match kind {
+        DiffLineKind::Added => (0x16352b, 0x9ad7bd),
+        DiffLineKind::Removed => (0x3d2027, 0xfca5a5),
+        DiffLineKind::Header => (0x1d3047, 0x93c5fd),
+        DiffLineKind::Context => (0x0f1115, 0xcbd5e1),
+    }
+}
+
 fn render_diff_patch(patch: &str) -> gpui_kit::AnyElement {
     let mut lines = div().flex().flex_col().w_full();
-    for (index, line) in patch.lines().enumerate() {
-        let (background, foreground) = diff_line_style(line);
+    for (index, line) in parse_diff_lines(patch).into_iter().enumerate() {
+        let (background, foreground) = diff_line_colors(line.kind);
+        if line.kind == DiffLineKind::Header {
+            lines = lines.child(
+                div()
+                    .id(("diff-line", index))
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .text_xs()
+                    .bg(rgb(background))
+                    .text_color(rgb(foreground))
+                    .child(line.text),
+            );
+            continue;
+        }
+        let old_number = line
+            .old_number
+            .map_or_else(String::new, |number| number.to_string());
+        let new_number = line
+            .new_number
+            .map_or_else(String::new, |number| number.to_string());
+        let marker = match line.kind {
+            DiffLineKind::Added => "+",
+            DiffLineKind::Removed => "-",
+            _ => " ",
+        };
         lines = lines.child(
             div()
                 .id(("diff-line", index))
                 .w_full()
-                .px_2()
-                .text_xs()
+                .flex()
                 .bg(rgb(background))
                 .text_color(rgb(foreground))
-                .child(if line.is_empty() {
-                    " ".to_owned()
-                } else {
-                    line.to_owned()
-                }),
+                .child(div().w(px(42.)).px_1().text_xs().child(old_number))
+                .child(div().w(px(42.)).px_1().text_xs().child(new_number))
+                .child(div().w(px(14.)).text_xs().child(marker))
+                .child(div().flex_1().text_xs().child(line.text)),
         );
     }
     lines.into_any()
@@ -3544,7 +3647,17 @@ impl LoomView {
                                 if diff.staged { "  ·  staged" } else { "" }
                             )),
                     );
-                    body = body.child(render_diff_patch(&diff.patch));
+                    if diff.binary {
+                        body = body.child(
+                            div()
+                                .p_2()
+                                .text_sm()
+                                .text_color(rgb(0xfef3c7))
+                                .child("Binary file changed"),
+                        );
+                    } else {
+                        body = body.child(render_diff_patch(&diff.patch));
+                    }
                 } else {
                     body = body.child(
                         div()
@@ -3630,7 +3743,11 @@ impl LoomView {
             }
         }
         div()
-            .w(px(340.))
+            .w(if self.review.panel == ReviewPanel::Diff {
+                px(720.)
+            } else {
+                px(340.)
+            })
             .h_full()
             .flex()
             .flex_col()
@@ -5037,7 +5154,7 @@ impl Render for LoomView {
 
 #[cfg(test)]
 mod tests {
-    use super::{diff_line_style, diff_summary};
+    use super::{DiffLineKind, diff_summary, parse_diff_lines};
 
     #[test]
     fn diff_summary_counts_content_lines_not_headers() {
@@ -5048,10 +5165,14 @@ mod tests {
     }
 
     #[test]
-    fn diff_line_style_highlights_additions_and_removals() {
-        assert_eq!(diff_line_style("+added"), (0x16352b, 0x9ad7bd));
-        assert_eq!(diff_line_style("-removed"), (0x3d2027, 0xfca5a5));
-        assert_eq!(diff_line_style("@@ hunk"), (0x1d3047, 0x93c5fd));
-        assert_eq!(diff_line_style("+++ header"), (0x0f1115, 0xcbd5e1));
+    fn parse_diff_lines_tracks_hunks_and_line_numbers() {
+        let lines = parse_diff_lines("@@ -4,2 +9,2 @@\n-old\n+new\n same");
+        assert_eq!(lines[0].kind, DiffLineKind::Header);
+        assert_eq!((lines[1].old_number, lines[1].new_number), (Some(4), None));
+        assert_eq!((lines[2].old_number, lines[2].new_number), (None, Some(9)));
+        assert_eq!(
+            (lines[3].old_number, lines[3].new_number),
+            (Some(5), Some(10))
+        );
     }
 }
