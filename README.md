@@ -74,6 +74,11 @@ workspace path; open that URL in a browser. Press `Ctrl-C` to stop both
 processes. Set `LOOM_MODEL`, `LOOM_TOKEN`, `LOOM_BACKEND_BIND`,
 `LOOM_FRONTEND_PORT`, or `LOOM_WORKSPACE` to override the local defaults.
 
+The browser client is deployed to Vercel on pushes to `main` and can also be
+published manually from the Actions tab. Configure a Vercel project and the
+`VERCEL_TOKEN`, `VERCEL_ORG_ID`, and `VERCEL_PROJECT_ID` GitHub Actions secrets
+to enable deployment. The client requires a separately running Loom backend.
+
 Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
 `LOOM_MODEL`, or connect to a remote backend with `LOOM_REMOTE_URL` and
 `LOOM_TOKEN`. GitHub Copilot login is available in the UI.

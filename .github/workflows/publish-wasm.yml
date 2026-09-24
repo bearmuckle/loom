@@ -1,0 +1,58 @@
+name: Publish WASM client
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vercel-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: jetli/trunk-action@v0.5.0
+        with:
+          version: v0.21.14
+      - name: Build browser client
+        working-directory: crates/loom-ui
+        env:
+          RUSTC_BOOTSTRAP: "1"
+          PUBLIC_URL: /
+        run: trunk build --release --public-url "$PUBLIC_URL"
+      - name: Prepare Vercel deployment
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+        run: |
+          if [[ -z "$VERCEL_ORG_ID" || -z "$VERCEL_PROJECT_ID" ]]; then
+            echo "::error::Set the VERCEL_ORG_ID and VERCEL_PROJECT_ID repository secrets."
+            exit 1
+          fi
+          mkdir -p .vercel/output/static
+          cp -R crates/loom-ui/dist/. .vercel/output/static/
+          printf '{"version":3,"routes":[{"handle":"filesystem"}]}\n' > .vercel/output/config.json
+          printf '{"orgId":"%s","projectId":"%s"}\n' \
+            "$VERCEL_ORG_ID" "$VERCEL_PROJECT_ID" > .vercel/project.json
+      - name: Deploy to Vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          if [[ -z "$VERCEL_TOKEN" ]]; then
+            echo "::error::Set the VERCEL_TOKEN repository secret."
+            exit 1
+          fi
+          npx --yes vercel@latest deploy --prebuilt --prod --archive=tgz --token="$VERCEL_TOKEN"
