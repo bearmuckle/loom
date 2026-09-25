@@ -20,6 +20,7 @@ use wasm_bindgen::{JsCast, prelude::*};
 use web_sys::{CloseEvent, MessageEvent, Storage, UrlSearchParams, WebSocket};
 
 const SAVED_CONNECTION_KEY: &str = "loom.bootstrap_connection";
+const SAVED_DEFAULT_MODEL_KEY: &str = "loom.default_model";
 
 /// Configuration read from the page's URL query string.
 ///
@@ -63,11 +64,13 @@ impl BrowserOptions {
             .map_err(|_| LoomError::invalid_request("could not parse the page's query string"))?;
         let query_remote = params.get("remote").unwrap_or_default();
         let query_token = params.get("token").unwrap_or_default();
+        let storage = browser_storage()?;
         let (saved_remote, saved_token) = if query_remote.is_empty() || query_token.is_empty() {
-            saved_connection(&browser_storage()?)?
+            saved_connection(&storage)?
         } else {
             (None, None)
         };
+        let saved_model = saved_default_model(&storage)?;
         let reuse_saved_token =
             query_remote.is_empty() || saved_remote.as_deref() == Some(query_remote.as_str());
         Ok(Self {
@@ -83,8 +86,8 @@ impl BrowserOptions {
             } else {
                 query_token
             },
-            workspace: params.get("workspace"),
-            model: params.get("model").map(ModelId::new),
+            workspace: None,
+            model: saved_model,
         })
     }
 
@@ -134,6 +137,37 @@ impl BrowserOptions {
                 )
             })
     }
+
+    pub(crate) fn persist_default_model(model: &ModelId) -> Result<(), LoomError> {
+        browser_storage()?
+            .set_item(SAVED_DEFAULT_MODEL_KEY, model.as_str())
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    format!(
+                        "could not save the default model in browser storage: {}",
+                        describe_js(&error)
+                    ),
+                    false,
+                )
+            })
+    }
+}
+
+fn saved_default_model(storage: &Storage) -> Result<Option<ModelId>, LoomError> {
+    storage
+        .get_item(SAVED_DEFAULT_MODEL_KEY)
+        .map(|model| model.map(ModelId::new))
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                format!(
+                    "could not read the saved default model from browser storage: {}",
+                    describe_js(&error)
+                ),
+                false,
+            )
+        })
 }
 
 fn saved_connection(storage: &Storage) -> Result<(Option<String>, Option<String>), LoomError> {

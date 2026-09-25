@@ -1958,7 +1958,7 @@ fn openai_request_payload(request: &ModelRequest) -> serde_json::Value {
 }
 
 fn uses_responses_endpoint(model: &str) -> bool {
-    model.starts_with("gpt-5")
+    model.starts_with("gpt-5") || model.starts_with("gpt-6")
 }
 
 fn responses_request_payload(request: &ModelRequest) -> serde_json::Value {
@@ -2869,6 +2869,14 @@ mod tests {
     use loom_model::CollectingSink;
 
     use super::*;
+
+    #[test]
+    fn github_copilot_gpt_6_models_use_the_responses_endpoint() {
+        assert!(uses_responses_endpoint("gpt-5.6-luna"));
+        assert!(uses_responses_endpoint("gpt-6-luna"));
+        assert!(uses_responses_endpoint("gpt-6-astra"));
+        assert!(!uses_responses_endpoint("gpt-4o"));
+    }
 
     fn collect(provider: &mut impl ModelProvider, request: &ModelRequest) -> Vec<ModelStreamEvent> {
         let mut sink = CollectingSink::default();

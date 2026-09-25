@@ -8,7 +8,6 @@ HEALTH_URL="${LOOM_HEALTH_URL:-http://${BACKEND_BIND}/health}"
 FRONTEND_HOST="${LOOM_FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${LOOM_FRONTEND_PORT:-8080}"
 TOKEN="${LOOM_TOKEN:-loom-local-dev-token}"
-MODEL="${LOOM_MODEL:-deterministic/demo}"
 WORKSPACE="${LOOM_WORKSPACE:-$ROOT}"
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -58,7 +57,7 @@ cargo run --quiet -p loom-cli -- \
     --serve \
     --bind "$BACKEND_BIND" \
     --token "$TOKEN" \
-    --model "$MODEL" &
+    --root "$WORKSPACE" &
 backend_pid=$!
 
 for _ in {1..300}; do
@@ -80,9 +79,7 @@ fi
 
 REMOTE_QUERY="$(urlencode "$BACKEND_URL")"
 TOKEN_QUERY="$(urlencode "$TOKEN")"
-MODEL_QUERY="$(urlencode "$MODEL")"
-WORKSPACE_QUERY="$(urlencode "$WORKSPACE")"
-FRONTEND_URL="http://${FRONTEND_HOST}:${FRONTEND_PORT}/?remote=${REMOTE_QUERY}&token=${TOKEN_QUERY}&model=${MODEL_QUERY}&workspace=${WORKSPACE_QUERY}"
+FRONTEND_URL="http://${FRONTEND_HOST}:${FRONTEND_PORT}/?remote=${REMOTE_QUERY}&token=${TOKEN_QUERY}"
 
 echo "Starting Loom WASM frontend from crates/loom-ui..."
 echo "Open ${FRONTEND_URL}"
