@@ -1027,6 +1027,7 @@ pub(crate) struct LoomView {
     pub(crate) pending_input: Option<String>,
     pub(crate) composer: TextBufferState,
     pub(crate) composer_focus_handle: FocusHandle,
+    pub(crate) node_focus_handle: FocusHandle,
     pub(crate) input_field: InputField,
     pub(crate) session_state: AgentSessionState,
     pub(crate) run_state: Option<AgentRunState>,
@@ -1191,7 +1192,7 @@ impl LoomView {
         match field {
             InputField::Composer => self.composer_focus_handle.clone(),
             InputField::Rename => self.rename_focus_handle.clone(),
-            InputField::Node => self.composer_focus_handle.clone(),
+            InputField::Node => self.node_focus_handle.clone(),
         }
     }
 
@@ -1320,6 +1321,7 @@ impl LoomView {
     pub(crate) fn try_new(
         options: &UiOptions,
         focus_handle: FocusHandle,
+        node_focus_handle: FocusHandle,
         rename_focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
@@ -1515,6 +1517,7 @@ impl LoomView {
             pending_input: None,
             composer: TextBufferState::new(""),
             composer_focus_handle: focus_handle,
+            node_focus_handle,
             input_field: InputField::Composer,
             session_state: session.state,
             run_state: run.as_ref().map(|run| run.state),
@@ -1552,6 +1555,7 @@ impl LoomView {
         options: &BrowserOptions,
         startup_error: Option<String>,
         focus_handle: FocusHandle,
+        node_focus_handle: FocusHandle,
         rename_focus_handle: FocusHandle,
     ) -> Self {
         let connection = ClientConnection::Disconnected;
@@ -1628,6 +1632,7 @@ impl LoomView {
             pending_input: None,
             composer: TextBufferState::new(""),
             composer_focus_handle: focus_handle,
+            node_focus_handle,
             input_field: InputField::Composer,
             session_state: AgentSessionState::Idle,
             run_state: None,
@@ -1666,6 +1671,7 @@ impl LoomView {
     pub(crate) async fn try_new_browser(
         options: &BrowserOptions,
         focus_handle: FocusHandle,
+        node_focus_handle: FocusHandle,
         rename_focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
         if worker_url_embeds_credential(options.remote()) {
@@ -1766,7 +1772,7 @@ impl LoomView {
             models: models.clone(),
             default_models: models,
             node_model_catalogs,
-            model_catalog_node_id: Some(default_backend_node_id.clone()),
+            model_catalog_node_id: None,
             model_refreshes_in_flight: BTreeSet::new(),
             model_select: None,
             default_model_select: None,
@@ -1796,6 +1802,7 @@ impl LoomView {
             pending_input: None,
             composer: TextBufferState::new(""),
             composer_focus_handle: focus_handle,
+            node_focus_handle,
             input_field: InputField::Composer,
             session_state: session.state,
             run_state: None,
@@ -1996,11 +2003,30 @@ impl LoomView {
             view.update(cx, |view, cx| {
                 view.model_refreshes_in_flight.remove(&node_id);
                 match result {
-                    Ok(models) => {
+                    Ok(catalog) => {
+                        view.record_model_discovery_errors(catalog.discovery_errors);
+                        let models = catalog.models;
                         view.node_model_catalogs
                             .insert(node_id.clone(), models.clone());
                         if view.default_backend_node_id == node_id {
                             view.default_models = models.clone();
+                            #[cfg(target_family = "wasm")]
+                            let preferred_model = view
+                                .browser_model
+                                .as_ref()
+                                .filter(|model| models.contains(model))
+                                .cloned();
+                            #[cfg(not(target_family = "wasm"))]
+                            let preferred_model = None;
+                            if let Some(model) = preferred_model.or_else(|| {
+                                if models.contains(&view.default_model) {
+                                    None
+                                } else {
+                                    models.first().cloned()
+                                }
+                            }) {
+                                view.default_model = model;
+                            }
                         }
                         let active_node_id = view
                             .session_node_ids
@@ -2027,6 +2053,18 @@ impl LoomView {
             .ok();
         })
         .detach();
+    }
+
+    fn record_model_discovery_errors(
+        &mut self,
+        errors: Vec<crate::connection::ModelDiscoveryError>,
+    ) {
+        for discovery_error in errors {
+            self.record_status(format!(
+                "Model discovery unavailable for {}: {}",
+                discovery_error.provider_id, discovery_error.error.message
+            ));
+        }
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -3081,6 +3119,16 @@ impl LoomView {
         cx.notify();
     }
 
+    pub(crate) fn focus_node(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.node_focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn focus_rename(
         &mut self,
         _: &MouseDownEvent,
@@ -3602,8 +3650,8 @@ impl LoomView {
             .session_node_ids
             .get(&self.active_session.id)
             .map(String::as_str);
-        let should_select_copilot =
-            active_node_id == Some(node_id.as_str()) && self.model.as_str() == "deterministic/demo";
+        let should_select_copilot = active_node_id == Some(node_id.as_str())
+            && matches!(self.model.as_str(), "default" | "deterministic/demo");
         #[cfg(not(target_family = "wasm"))]
         if should_select_copilot {
             self.model = ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL);
@@ -3833,7 +3881,14 @@ impl LoomView {
             cx.notify();
             return;
         }
-        self.default_model = model;
+        self.default_model = model.clone();
+        #[cfg(target_family = "wasm")]
+        {
+            self.browser_model = Some(model.clone());
+            if let Err(error) = BrowserOptions::persist_default_model(&model) {
+                self.record_backend_error("save default model", error);
+            }
+        }
         cx.notify();
     }
 
@@ -4673,12 +4728,18 @@ impl LoomView {
             self.browser_model.clone(),
         );
         let focus_handle = self.composer_focus_handle.clone();
+        let node_focus_handle = self.node_focus_handle.clone();
         let rename_focus_handle = self.rename_focus_handle.clone();
         let view = cx.entity();
         cx.notify();
         cx.spawn(async move |_, cx| {
-            let result =
-                LoomView::try_new_browser(&options, focus_handle, rename_focus_handle).await;
+            let result = LoomView::try_new_browser(
+                &options,
+                focus_handle,
+                node_focus_handle,
+                rename_focus_handle,
+            )
+            .await;
             view.update(cx, |view, cx| {
                 let is_pending = view.worker_nodes.iter().any(|node| {
                     node.id == id
@@ -4931,8 +4992,8 @@ impl LoomView {
             .cloned()
             .unwrap_or_else(|| node_id.clone());
         cx.spawn(async move |view, cx| {
-            let models = match list_models_from_backend(&backend).await {
-                Ok(models) => models,
+            let catalog = match list_models_from_backend(&backend).await {
+                Ok(catalog) => catalog,
                 Err(error) => {
                     view.update(cx, |view, cx| {
                         view.record_backend_error("check worker models", error);
@@ -4942,7 +5003,9 @@ impl LoomView {
                     return;
                 }
             };
+            let models = catalog.models;
             view.update(cx, |view, cx| {
+                view.record_model_discovery_errors(catalog.discovery_errors);
                 view.node_model_catalogs
                     .insert(node_id.clone(), models.clone());
                 view.default_models = models.clone();
@@ -6575,7 +6638,20 @@ impl LoomView {
                             .border_color(rgb(0x293244))
                             .text_xs()
                             .text_color(rgb(0xb7c0d0))
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_composer))
+                            .key_context("Composer")
+                            .track_focus(&self.node_focus_handle)
+                            .cursor(CursorStyle::IBeam)
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_node))
+                            .on_action(cx.listener(Self::backspace))
+                            .on_action(cx.listener(Self::delete))
+                            .on_action(cx.listener(Self::left))
+                            .on_action(cx.listener(Self::right))
+                            .on_action(cx.listener(Self::select_all))
+                            .on_action(cx.listener(Self::home))
+                            .on_action(cx.listener(Self::end))
+                            .on_action(cx.listener(Self::paste))
+                            .on_action(cx.listener(Self::copy))
+                            .on_action(cx.listener(Self::submit))
                             .child(TextInputElement {
                                 view: cx.entity(),
                                 field: InputField::Node,

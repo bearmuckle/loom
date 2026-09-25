@@ -363,9 +363,11 @@ impl Element for TextInputElement {
         cx: &mut App,
     ) {
         let focus_handle = self.view.read(cx).input_focus_handle(self.field);
-        self.view.update(cx, |view, _| {
-            view.input_field = self.field;
-        });
+        if focus_handle.is_focused(window) {
+            self.view.update(cx, |view, _| {
+                view.input_field = self.field;
+            });
+        }
         window.handle_input(
             &focus_handle,
             ElementInputHandler::new(prepaint.bounds, self.view.clone()),

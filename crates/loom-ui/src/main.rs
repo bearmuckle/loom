@@ -103,7 +103,12 @@ fn main() {
             gpui_kit::init(cx);
             crate::theme::apply_theme(WindowAppearance::Dark, cx);
             bind_composer_keys(cx);
-            let view = match LoomView::try_new(&options, cx.focus_handle(), cx.focus_handle()) {
+            let view = match LoomView::try_new(
+                &options,
+                cx.focus_handle(),
+                cx.focus_handle(),
+                cx.focus_handle(),
+            ) {
                 Ok(view) => view,
                 Err(error) => {
                     error!(
@@ -192,12 +197,14 @@ fn start_browser_client(cx: &mut App) {
         }
     };
     let focus_handle = cx.focus_handle();
+    let node_focus_handle = cx.focus_handle();
     let rename_focus_handle = cx.focus_handle();
     let auto_connect = options.is_configured();
     let view = LoomView::new_browser_disconnected(
         &options,
         startup_error,
         focus_handle,
+        node_focus_handle,
         rename_focus_handle,
     );
     let window = match cx.open_window(Default::default(), |_, cx| cx.new(|_| view)) {

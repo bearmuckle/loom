@@ -260,16 +260,46 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
         .filter(|token| !token.trim().is_empty())
         .ok_or_else(|| LoomError::invalid_request("--serve requires a non-empty --token"))?;
     let persistence_path = options.persistence;
+    let workspace_root = options.root;
     let backend = match persistence_path {
-        Some(path) if options.model.as_str() != "deterministic/demo" => {
-            InProcessBackend::new_persistent_with_github_copilot(path)?
-        }
-        Some(path) => InProcessBackend::new_persistent(path)?,
-        None if options.model.as_str() != "deterministic/demo" => {
-            InProcessBackend::new_with_github_copilot()?
-        }
-        None => InProcessBackend::new(),
+        Some(path) => InProcessBackend::new_persistent_with_github_copilot(path)?,
+        None => InProcessBackend::new_with_github_copilot()?,
     };
+    if let Some(root) = workspace_root {
+        fs::create_dir_all(&root).map_err(|error| {
+            LoomError::new(
+                ErrorCode::ToolExecution,
+                format!(
+                    "could not create worker workspace '{}': {error}",
+                    root.display()
+                ),
+                false,
+            )
+        })?;
+        let root = fs::canonicalize(&root).map_err(|error| {
+            LoomError::new(
+                ErrorCode::ToolExecution,
+                format!(
+                    "could not resolve worker workspace '{}': {error}",
+                    root.display()
+                ),
+                false,
+            )
+        })?;
+        let connection = backend.connect();
+        negotiate(&connection)?;
+        let project_id = ProjectId::new();
+        let response = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
+            project_id,
+            root: root.display().to_string(),
+        }));
+        match response.result? {
+            ServerResponse::WorkspaceOpened(_) => {
+                println!("Opened worker workspace {}", root.display());
+            }
+            response => return Err(unexpected_response("workspace open", response)),
+        }
+    }
     let auth = Arc::new(AuthTokenStore::new());
     let _issued = auth.insert(token, AuthorizationScope::all())?;
     let config = RemoteServerConfig {

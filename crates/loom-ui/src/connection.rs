@@ -738,9 +738,40 @@ pub(crate) async fn list_models_async(
     }
 }
 
+pub(crate) struct ModelCatalog {
+    pub models: Vec<ModelId>,
+    pub discovery_errors: Vec<ModelDiscoveryError>,
+}
+
+pub(crate) struct ModelDiscoveryError {
+    pub provider_id: String,
+    pub error: LoomError,
+}
+
+fn include_discovered_models(
+    provider_id: &str,
+    result: Result<ServerResponse, LoomError>,
+    models: &mut Vec<ModelId>,
+    discovery_errors: &mut Vec<ModelDiscoveryError>,
+) {
+    match result {
+        Ok(ServerResponse::Models { models: discovered }) => {
+            models.extend(discovered.into_iter().map(|model| model.id))
+        }
+        Err(error) => discovery_errors.push(ModelDiscoveryError {
+            provider_id: provider_id.to_owned(),
+            error,
+        }),
+        Ok(response) => discovery_errors.push(ModelDiscoveryError {
+            provider_id: provider_id.to_owned(),
+            error: unexpected_response("model discovery", response),
+        }),
+    }
+}
+
 pub(crate) async fn list_models_from_backend(
     backend: &BackendWorker,
-) -> Result<Vec<ModelId>, LoomError> {
+) -> Result<ModelCatalog, LoomError> {
     let response = backend
         .submit(RequestEnvelope::new(ClientRequest::ListProviders))
         .wait()
@@ -753,7 +784,9 @@ pub(crate) async fn list_models_from_backend(
         .iter()
         .flat_map(|provider| provider.models.iter().map(|model| model.id.clone()))
         .collect::<Vec<_>>();
+    let mut discovery_errors = Vec::new();
     for provider in providers {
+        let provider_id = provider.id.as_str().to_owned();
         let response = backend
             .submit(RequestEnvelope::new(
                 ClientRequest::DiscoverProviderModels {
@@ -762,16 +795,19 @@ pub(crate) async fn list_models_from_backend(
             ))
             .wait()
             .await;
-        match response.result? {
-            ServerResponse::Models { models: discovered } => {
-                models.extend(discovered.into_iter().map(|model| model.id))
-            }
-            response => return Err(unexpected_response("model list", response)),
-        }
+        include_discovered_models(
+            &provider_id,
+            response.result,
+            &mut models,
+            &mut discovery_errors,
+        );
     }
     models.sort();
     models.dedup();
-    Ok(models)
+    Ok(ModelCatalog {
+        models,
+        discovery_errors,
+    })
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -945,10 +981,11 @@ impl BackendWorker {
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::{
-        ClientConnection, LoomError, negotiate, remote_url_is_secure_for_secrets,
-        worker_node_status,
+        ClientConnection, LoomError, include_discovered_models, negotiate,
+        remote_url_is_secure_for_secrets, worker_node_status,
     };
     use loom_core::ErrorCode;
+    use loom_model::ModelId;
     use loom_server::{
         AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
     };
@@ -961,6 +998,32 @@ mod tests {
         assert!(remote_url_is_secure_for_secrets("ws://127.0.0.1:8080/ws"));
         assert!(remote_url_is_secure_for_secrets("ws://[::1]:8080/ws"));
         assert!(!remote_url_is_secure_for_secrets("ws://worker.example/ws"));
+    }
+
+    #[test]
+    fn provider_discovery_failure_preserves_static_models() {
+        let copilot_model = ModelId::new("github-copilot/gpt-5.6-luna");
+        let mut models = vec![copilot_model.clone()];
+        let mut discovery_errors = Vec::new();
+
+        include_discovered_models(
+            "ollama",
+            Err(LoomError::new(
+                ErrorCode::ProviderUnavailable,
+                "Ollama is unavailable",
+                true,
+            )),
+            &mut models,
+            &mut discovery_errors,
+        );
+
+        assert_eq!(models, vec![copilot_model]);
+        assert_eq!(discovery_errors.len(), 1);
+        assert_eq!(discovery_errors[0].provider_id, "ollama");
+        assert_eq!(
+            discovery_errors[0].error.code,
+            ErrorCode::ProviderUnavailable
+        );
     }
 
     #[gpui_kit::test]

@@ -71,12 +71,17 @@ Run the backend and browser client together for local WASM development:
 ./scripts/dev-wasm.sh
 ```
 
-The launcher starts a deterministic/demo backend on `127.0.0.1:8765`, waits
+The launcher starts a configured worker backend on `127.0.0.1:8765`, waits
 for its health endpoint, then starts Trunk from `crates/loom-ui` on
-`127.0.0.1:8080`. It prints a complete URL containing the WebSocket token and
-workspace path; open that URL in a browser. Press `Ctrl-C` to stop both
-processes. Set `LOOM_MODEL`, `LOOM_TOKEN`, `LOOM_BACKEND_BIND`,
+`127.0.0.1:8080`. GitHub Copilot is the default model preference; local Ollama
+is added only when its endpoint is configured. It prints a complete URL
+containing the WebSocket endpoint and token; the worker opens the workspace
+configured by `LOOM_WORKSPACE`. Open that URL in a browser. Press `Ctrl-C` to
+stop both processes. Set `LOOM_TOKEN`, `LOOM_BACKEND_BIND`,
 `LOOM_FRONTEND_PORT`, or `LOOM_WORKSPACE` to override the local defaults.
+GitHub Copilot models become available after signing in. Configure local
+Ollama models explicitly with `LOOM_OLLAMA_ENDPOINT` and optionally
+`LOOM_OLLAMA_MODEL`; unconfigured local models are not listed.
 Without a URL or saved worker connection, the full client opens disconnected;
 connect a worker from Settings. Worker settings are saved in browser storage.
 
@@ -88,4 +93,3 @@ to enable deployment. The client requires a separately running Loom backend.
 Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
 `LOOM_MODEL`, or connect to a remote backend with `LOOM_REMOTE_URL` and
 `LOOM_TOKEN`. GitHub Copilot login is available in the UI.
-
