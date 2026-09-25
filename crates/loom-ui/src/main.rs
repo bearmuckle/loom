@@ -240,12 +240,24 @@ pub fn start() {
     )
     .with_assets(crate::assets::LoomAssets)
     .run_embedded(|cx: &mut App| {
-        // The web platform starts with an empty font database; without this the
-        // text system panics as soon as it tries to shape any text.
+        // The web platform starts with an empty font database. Bundle the Noto
+        // Sans faces used by the native Linux system-font fallback so browser
+        // text has the same family and weight variants.
         cx.text_system()
-            .add_fonts(vec![std::borrow::Cow::Borrowed(
-                include_bytes!("../assets/fonts/DejaVuSans.ttf").as_slice(),
-            )])
+            .add_fonts(vec![
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../assets/fonts/NotoSans-Regular.ttf").as_slice(),
+                ),
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../assets/fonts/NotoSans-Bold.ttf").as_slice(),
+                ),
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../assets/fonts/NotoSans-Italic.ttf").as_slice(),
+                ),
+                std::borrow::Cow::Borrowed(
+                    include_bytes!("../assets/fonts/NotoSans-BoldItalic.ttf").as_slice(),
+                ),
+            ])
             .expect("failed to load embedded font");
         gpui_kit::init(cx);
         crate::theme::apply_theme(gpui_kit::WindowAppearance::Dark, cx);
