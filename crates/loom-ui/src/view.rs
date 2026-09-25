@@ -17,10 +17,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
-    Decorations, Element, Entity, EntityInputHandler, FocusHandle, Focusable, HitboxBehavior,
-    ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Render, ResizeEdge,
-    Subscription, Tiling, UTF16Selection, Window, WindowAppearance, WindowControlArea, canvas, div,
-    list, point, prelude::*, px, transparent_black,
+    Decorations, Element, Entity, EntityInputHandler, FocusHandle, Focusable, HighlightStyle,
+    HitboxBehavior, ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Render,
+    ResizeEdge, Subscription, Tiling, UTF16Selection, Window, WindowAppearance, WindowControlArea,
+    canvas, div, list, point, prelude::*, px, transparent_black,
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
@@ -531,6 +531,12 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
             .into_any()
     } else {
         TextView::markdown(id, text)
+            .style(
+                gpui_kit::component::text::TextViewStyle::default().inline_code(HighlightStyle {
+                    background_color: Some(rgb(0x1b1d24).into()),
+                    ..Default::default()
+                }),
+            )
             .selectable(true)
             .w_full()
             .text_color(rgb(color))
