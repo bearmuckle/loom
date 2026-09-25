@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use loom_core::{AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError};
 use loom_protocol::{
-    AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitRepositoryStatus,
+    AgentActivityRecord, AgentActivityStatus, AgentRunState, GitRepositoryStatus,
     SessionFilesystemChange, SessionFilesystemFile,
 };
 
@@ -16,8 +16,6 @@ use crate::MAX_TIMELINE_OUTPUT;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewPanel {
     Changes,
-    Diff,
-    Evidence,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,10 +71,7 @@ pub(crate) struct ReviewState {
     pub(crate) open: bool,
     pub(crate) panel: ReviewPanel,
     pub(crate) changes: Vec<SessionFilesystemChange>,
-    pub(crate) diff: Option<GitDiff>,
-    pub(crate) diff_path: Option<String>,
     pub(crate) vcs: Option<GitRepositoryStatus>,
-    pub(crate) evidence: Vec<String>,
     pub(crate) selected_file: Option<SessionFilesystemFile>,
 }
 
@@ -106,10 +101,7 @@ impl Default for ReviewState {
             open: false,
             panel: ReviewPanel::Changes,
             changes: Vec::new(),
-            diff: None,
-            diff_path: None,
             vcs: None,
-            evidence: Vec::new(),
             selected_file: None,
         }
     }

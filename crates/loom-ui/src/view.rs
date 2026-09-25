@@ -40,8 +40,8 @@ use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
     GitHubRepository, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse,
-    SessionDirectory, SessionRepository, TaskSnapshot, TaskStatus, WorkerNodeConfig,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
+    SessionDirectory, SessionRepository, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus,
+    WorkspaceConfig,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode};
@@ -1063,7 +1063,6 @@ pub(crate) struct LoomView {
     pub(crate) workspace_id: WorkspaceId,
     workspace_name: String,
     workspaces: Vec<WorkspaceRecord>,
-    pub(crate) workspace_root: PathBuf,
     local_directory_sources_available: bool,
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
     session_tree: Option<Entity<TreeState>>,
@@ -1124,13 +1123,11 @@ pub(crate) struct LoomView {
     pub(crate) composer_focus_handle: FocusHandle,
     pub(crate) session_state: AgentSessionState,
     pub(crate) run_state: Option<AgentRunState>,
-    pub(crate) summary: Option<String>,
     pub(crate) review: ReviewState,
     session_repositories: Vec<SessionRepository>,
     session_directories: Vec<SessionDirectory>,
     selected_repository_id: Option<RepositoryId>,
     session_drawer_open: bool,
-    pub(crate) tasks: Vec<TaskSnapshot>,
     pub(crate) rename_dialog: Option<RenameDialogState>,
     source_dialog: Option<SessionSourceDialog>,
     pub(crate) demo_workspace: bool,
@@ -1560,7 +1557,6 @@ impl LoomView {
             workspace_id,
             workspace_name: workspace.name,
             workspaces,
-            workspace_root,
             local_directory_sources_available: options.remote.is_none(),
             sessions: if has_session {
                 vec![session.clone()]
@@ -1625,13 +1621,11 @@ impl LoomView {
             composer_focus_handle: focus_handle,
             session_state: session.state,
             run_state: run.as_ref().map(|run| run.state),
-            summary: run.as_ref().and_then(|run| run.summary.clone()),
             review: ReviewState::default(),
             session_repositories: Vec::new(),
             session_directories: Vec::new(),
             selected_repository_id: None,
             session_drawer_open: false,
-            tasks: Vec::new(),
             rename_dialog: None,
             source_dialog: None,
             demo_workspace,
@@ -1693,7 +1687,6 @@ impl LoomView {
             workspace_id,
             workspace_name: "No workspace".to_owned(),
             workspaces: Vec::new(),
-            workspace_root: PathBuf::new(),
             local_directory_sources_available: false,
             sessions: Vec::new(),
             session_tree: None,
@@ -1754,13 +1747,11 @@ impl LoomView {
             composer_focus_handle: focus_handle,
             session_state: AgentSessionState::Idle,
             run_state: None,
-            summary: None,
             review: ReviewState::default(),
             session_repositories: Vec::new(),
             session_directories: Vec::new(),
             selected_repository_id: None,
             session_drawer_open: false,
-            tasks: Vec::new(),
             rename_dialog: None,
             source_dialog: None,
             demo_workspace: false,
@@ -1892,7 +1883,6 @@ impl LoomView {
             workspace_id,
             workspace_name: workspace.name,
             workspaces,
-            workspace_root,
             local_directory_sources_available: false,
             sessions: if has_session {
                 vec![session.clone()]
@@ -1957,13 +1947,11 @@ impl LoomView {
             composer_focus_handle: focus_handle,
             session_state: session.state,
             run_state: None,
-            summary: None,
             review: ReviewState::default(),
             session_repositories: Vec::new(),
             session_directories: Vec::new(),
             selected_repository_id: None,
             session_drawer_open: false,
-            tasks: Vec::new(),
             rename_dialog: None,
             source_dialog: None,
             demo_workspace: false,
@@ -2362,7 +2350,6 @@ impl LoomView {
         self.active_run = None;
         self.active_run_id = None;
         self.run_state = None;
-        self.summary = None;
         self.after_sequence = None;
     }
 
@@ -2403,11 +2390,7 @@ impl LoomView {
         self.reset_projection();
         self.review.selected_file = None;
         self.review.changes.clear();
-        self.review.diff = None;
-        self.review.diff_path = None;
-        self.review.evidence.clear();
         self.review.vcs = None;
-        self.tasks.clear();
     }
 
     /// Loads a session synchronously.
@@ -2842,7 +2825,6 @@ impl LoomView {
                 self.session_state = session_state_for_run(snapshot.state);
                 self.active_session.state = self.session_state;
                 self.update_session_list();
-                self.summary = snapshot.summary.clone();
                 if let Some(summary) = &snapshot.summary
                     && !is_redundant_completion_summary(summary)
                 {
@@ -2863,7 +2845,6 @@ impl LoomView {
         self.active_run_id = Some(projection.run.id);
         self.active_run = Some(projection.run.clone());
         self.run_state = Some(projection.run.state);
-        self.summary = projection.run.summary.clone();
         self.pending_approval = projection.pending_approval;
         self.pending_input = projection.pending_input;
         let activity_records = projection.activities;
@@ -5789,7 +5770,6 @@ impl LoomView {
             |view, response, _| match response.result {
                 Ok(ServerResponse::SessionFilesystemFile(mut file)) => {
                     file.content = bounded_to(&file.content, MAX_REVIEW_DIFF);
-                    view.review.diff_path = Some(file.path.clone());
                     view.review.selected_file = Some(loom_protocol::SessionFilesystemFile {
                         session_id: file.session_id,
                         path: file.path,
@@ -5974,7 +5954,7 @@ impl LoomView {
             .justify_center()
             .tooltip(move |_, cx| {
                 cx.new(|_| LoomTooltip {
-                    text: tooltip_text.clone().into(),
+                    text: tooltip_text.clone(),
                 })
                 .into()
             })
@@ -6472,11 +6452,7 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let layout = responsive_layout(window.bounds().size.width);
-        let title = match self.review.panel {
-            ReviewPanel::Changes => "Changed files",
-            ReviewPanel::Diff => "Diff",
-            ReviewPanel::Evidence => "Evidence",
-        };
+        let title = "Changed files";
         let mut body = div()
             .flex_1()
             .id("changes-sidebar-scroll")
@@ -6552,103 +6528,6 @@ impl LoomView {
                             .text_xs()
                             .text_color(rgb(0xcbd5e1))
                             .child(file.content.clone()),
-                    );
-                }
-            }
-            ReviewPanel::Diff => {
-                body = body.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8f98a6))
-                        .child("A read-only view of the changes in this session."),
-                );
-                body = body.child(
-                    div()
-                        .mt_1()
-                        .p_2()
-                        .bg(rgb(0x0f1115))
-                        .text_xs()
-                        .text_color(rgb(0xcbd5e1))
-                        .child(
-                            self.review
-                                .diff
-                                .as_ref()
-                                .map(|diff| diff.patch.clone())
-                                .unwrap_or_else(|| "No diff available".to_owned()),
-                        ),
-                );
-            }
-            ReviewPanel::Evidence => {
-                body = body.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8f98a6))
-                        .child("What was completed and how it was checked."),
-                );
-                if let Some(summary) = &self.summary {
-                    body = body.child(
-                        div()
-                            .p_2()
-                            .rounded_sm()
-                            .bg(rgb(0x064e3b))
-                            .text_sm()
-                            .text_color(rgb(0xd1fae5))
-                            .child(summary.clone()),
-                    );
-                }
-                if self.tasks.is_empty() {
-                    body = body.child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8f98a6))
-                            .child("No validation tasks have been run"),
-                    );
-                }
-                for task in self.tasks.iter().take(6) {
-                    let status_color = match task.status {
-                        TaskStatus::Completed => rgb(0x9ad7bd),
-                        TaskStatus::Failed | TaskStatus::Cancelled => rgb(0xfca5a5),
-                        TaskStatus::Queued | TaskStatus::Running => rgb(0xfef3c7),
-                    };
-                    body = body.child(
-                        div()
-                            .p_2()
-                            .rounded_sm()
-                            .bg(rgb(0x20242c))
-                            .text_sm()
-                            .text_color(status_color)
-                            .child(format!("{}  {:?}", task.label, task.status))
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(rgb(0x94a3b8))
-                                    .child(bounded(&task.output)),
-                            ),
-                    );
-                    for artifact in task.artifacts.iter().take(3) {
-                        body =
-                            body.child(div().text_xs().text_color(rgb(0x9ad7bd)).child(format!(
-                                "Artifact  {}{}",
-                                artifact.path,
-                                if artifact.exists { "" } else { " (missing)" }
-                            )));
-                    }
-                }
-                if self.review.evidence.is_empty() {
-                    body = body.child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8f98a6))
-                            .child("No evidence links attached"),
-                    );
-                }
-                for evidence in &self.review.evidence {
-                    body = body.child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x9ad7bd))
-                            .child(evidence.clone()),
                     );
                 }
             }
