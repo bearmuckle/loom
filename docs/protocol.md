@@ -43,6 +43,13 @@ Version compatibility is major-version based: a client may negotiate a newer
 minor version within the same major, while an incompatible major returns the
 existing `unsupported_protocol` error.
 
+Protocol 1.1 scopes approval policies to an agent session. Session snapshots
+include the effective approval policy and the session's `auto_approve_actions`
+preference; the session-scoped `SetApprovalPolicy` form updates both for
+subsequent runs. The project-wide request form remains accepted for older
+clients, and existing project policies remain the fallback until a session has
+its own override.
+
 The WebSocket service authenticates during the HTTP upgrade using a bearer
 token, then creates an authenticated view of the existing in-process
 connection. Each request re-checks the token so revocation takes effect
@@ -123,9 +130,10 @@ disconnects. Policy evaluations are agent events before a tool executes, and
 the existing approval request/decision events remain authoritative for
 approval-required actions.
 
-The UI's **Auto approve** mode sets `ApprovalPolicy` to allow read, write,
-command, and network actions without prompting. Destructive actions remain
-denied and are not enabled by this mode.
+Agent and Edit modes allow read, write, command, and network actions without
+prompting by default; the session settings can opt out, which restores explicit
+approval for writes, commands, and network actions. **Auto approve** remains an
+explicit mode. Destructive actions remain denied in every mode.
 
 M3 adds typed provider and durable-orchestration requests:
 

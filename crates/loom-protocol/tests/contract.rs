@@ -28,6 +28,27 @@ fn request_json_round_trip_preserves_typed_envelope() {
     let decoded = decode_request(&encoded).unwrap();
 
     assert_eq!(decoded, request);
+
+    let approval_settings = RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
+        project_id: ProjectId::new(),
+        session_id: Some(AgentSessionId::new()),
+        policy: loom_core::ApprovalPolicy::default(),
+        auto_approve_actions: Some(false),
+    });
+    assert_eq!(
+        decode_request(&encode_request(&approval_settings).unwrap()).unwrap(),
+        approval_settings
+    );
+    let legacy_approval_policy = RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
+        project_id: ProjectId::new(),
+        session_id: None,
+        policy: loom_core::ApprovalPolicy::default(),
+        auto_approve_actions: None,
+    });
+    assert_eq!(
+        decode_request(&encode_request(&legacy_approval_policy).unwrap()).unwrap(),
+        legacy_approval_policy
+    );
 }
 
 #[test]

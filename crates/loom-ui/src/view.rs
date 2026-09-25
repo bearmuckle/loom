@@ -354,6 +354,10 @@ fn session_id_for_request(
     active_session_id: AgentSessionId,
 ) -> Option<AgentSessionId> {
     match request {
+        ClientRequest::SetApprovalPolicy {
+            session_id: Some(session_id),
+            ..
+        } => Some(*session_id),
         ClientRequest::GetAgentSession { session_id }
         | ClientRequest::GetAgentSessionSnapshot { session_id }
         | ClientRequest::RenameAgentSession { session_id, .. }
@@ -998,6 +1002,8 @@ pub(crate) struct LoomView {
     pub(crate) default_model: ModelId,
     pub(crate) session_models: BTreeMap<AgentSessionId, ModelId>,
     pub(crate) agent_mode: AgentMode,
+    pub(crate) auto_approve_actions: bool,
+    session_auto_approve_actions: BTreeMap<AgentSessionId, bool>,
     pub(crate) session_task_cache: BTreeMap<AgentSessionId, String>,
     pub(crate) optimistic_messages: Vec<String>,
     pub(crate) sending_message: bool,
@@ -1029,6 +1035,7 @@ pub(crate) struct LoomView {
     pub(crate) activity_records_seen: bool,
     pub(crate) expanded_activities: BTreeSet<ActivityId>,
     pub(crate) approval_request_in_flight: bool,
+    approval_settings_request_in_flight: bool,
     pub(crate) archive_request_in_flight: bool,
     pub(crate) pending_approval: Option<ToolCall>,
     pub(crate) pending_input: Option<String>,
@@ -1504,6 +1511,8 @@ impl LoomView {
             default_model: model.clone(),
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
+            auto_approve_actions: true,
+            session_auto_approve_actions: BTreeMap::new(),
             session_task_cache: BTreeMap::new(),
             optimistic_messages: Vec::new(),
             sending_message: false,
@@ -1536,6 +1545,7 @@ impl LoomView {
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
             approval_request_in_flight: false,
+            approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
@@ -1619,6 +1629,8 @@ impl LoomView {
             default_model: ModelId::new("default"),
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
+            auto_approve_actions: true,
+            session_auto_approve_actions: BTreeMap::new(),
             session_task_cache: BTreeMap::new(),
             optimistic_messages: Vec::new(),
             sending_message: false,
@@ -1651,6 +1663,7 @@ impl LoomView {
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
             approval_request_in_flight: false,
+            approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
@@ -1789,6 +1802,8 @@ impl LoomView {
             default_model: model.clone(),
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
+            auto_approve_actions: true,
+            session_auto_approve_actions: BTreeMap::new(),
             session_task_cache: BTreeMap::new(),
             optimistic_messages: Vec::new(),
             sending_message: false,
@@ -1821,6 +1836,7 @@ impl LoomView {
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
             approval_request_in_flight: false,
+            approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
@@ -2287,6 +2303,12 @@ impl LoomView {
     pub(crate) fn activate_session(&mut self, session: AgentSessionSnapshot) {
         self.active_session = session;
         self.session_state = self.active_session.state;
+        self.auto_approve_actions = self
+            .session_auto_approve_actions
+            .get(&self.active_session.id)
+            .copied()
+            .unwrap_or(true);
+        self.approval_settings_request_in_flight = false;
         self.model = self
             .session_models
             .get(&self.active_session.id)
@@ -2321,6 +2343,9 @@ impl LoomView {
             Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
                 self.active_session = projection.session.clone();
                 self.session_state = self.active_session.state;
+                self.auto_approve_actions = projection.auto_approve_actions;
+                self.session_auto_approve_actions
+                    .insert(self.active_session.id, projection.auto_approve_actions);
                 if let Some(run) = &projection.active_run {
                     self.model = run.run.model.clone();
                     self.session_task_cache
@@ -3319,6 +3344,9 @@ impl LoomView {
         let fallback_projection = match snapshot_response.result {
             Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
                 self.active_session = projection.session.clone();
+                self.auto_approve_actions = projection.auto_approve_actions;
+                self.session_auto_approve_actions
+                    .insert(session_id, projection.auto_approve_actions);
                 if let Some(run) = &projection.active_run {
                     self.session_task_cache
                         .insert(session_id, run.run.task.clone());
@@ -3871,23 +3899,83 @@ impl LoomView {
     }
 
     pub(crate) fn select_agent_mode(&mut self, mode: AgentMode, cx: &mut Context<Self>) {
-        let policy = mode.approval_policy();
+        if self.approval_settings_request_in_flight {
+            return;
+        }
+        let session_id = self.active_session.id;
+        let policy = mode.approval_policy(self.auto_approve_actions);
+        self.approval_settings_request_in_flight = true;
         self.dispatch(
             cx,
             ClientRequest::SetApprovalPolicy {
-                project_id: self.project_id,
+                project_id: self.active_session.project_id,
+                session_id: Some(session_id),
                 policy,
+                auto_approve_actions: Some(self.auto_approve_actions),
             },
-            move |view, response, _| match response.result {
-                Ok(ServerResponse::ApprovalPolicy(_)) => {
-                    view.agent_mode = mode;
-                    view.record_status(format!("{} mode enabled", mode.label()));
+            move |view, response, _| {
+                if view.active_session.id != session_id {
+                    return;
                 }
-                Err(error) => view.record_backend_error("set approval mode", error),
-                Ok(response) => view.record_backend_error(
-                    "set approval mode",
-                    unexpected_response("approval policy", response),
-                ),
+                view.approval_settings_request_in_flight = false;
+                match response.result {
+                    Ok(ServerResponse::ApprovalPolicy(_)) => {
+                        view.agent_mode = mode;
+                        view.session_auto_approve_actions
+                            .insert(session_id, view.auto_approve_actions);
+                        view.record_status(format!("{} mode enabled", mode.label()));
+                    }
+                    Err(error) => view.record_backend_error("set approval mode", error),
+                    Ok(response) => view.record_backend_error(
+                        "set approval mode",
+                        unexpected_response("approval policy", response),
+                    ),
+                }
+            },
+        );
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_auto_approve_actions(&mut self, cx: &mut Context<Self>) {
+        if self.approval_settings_request_in_flight || !self.is_connected() {
+            return;
+        }
+        let session_id = self.active_session.id;
+        let auto_approve_actions = !self.auto_approve_actions;
+        let policy = self.agent_mode.approval_policy(auto_approve_actions);
+        self.approval_settings_request_in_flight = true;
+        self.dispatch(
+            cx,
+            ClientRequest::SetApprovalPolicy {
+                project_id: self.active_session.project_id,
+                session_id: Some(session_id),
+                policy,
+                auto_approve_actions: Some(auto_approve_actions),
+            },
+            move |view, response, _| {
+                if view.active_session.id != session_id {
+                    return;
+                }
+                view.approval_settings_request_in_flight = false;
+                match response.result {
+                    Ok(ServerResponse::ApprovalPolicy(_)) => {
+                        view.auto_approve_actions = auto_approve_actions;
+                        view.session_auto_approve_actions
+                            .insert(session_id, auto_approve_actions);
+                        view.record_status(if auto_approve_actions {
+                            "Automatic approvals enabled for this session".to_owned()
+                        } else {
+                            "Automatic approvals disabled for this session".to_owned()
+                        });
+                    }
+                    Err(error) => {
+                        view.record_backend_error("update session approval settings", error)
+                    }
+                    Ok(response) => view.record_backend_error(
+                        "update session approval settings",
+                        unexpected_response("approval policy", response),
+                    ),
+                }
             },
         );
         cx.notify();
@@ -6472,6 +6560,43 @@ impl LoomView {
                             })
                             .child(Icon::new(IconName::Close).size_4())
                             .on_click(cx.listener(Self::close_settings)),
+                    ),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .text_xs()
+                    .text_color(rgb(0x93c5fd))
+                    .child("SESSION SETTINGS"),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child("Auto-approve non-destructive actions")
+                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                                "In Agent and Edit, writes, commands, and network won't prompt",
+                            )),
+                    )
+                    .child(
+                        Button::new("session-auto-approve-toggle")
+                            .label(if self.auto_approve_actions {
+                                "On"
+                            } else {
+                                "Off"
+                            })
+                            .small()
+                            .disabled(
+                                !self.is_connected() || self.approval_settings_request_in_flight,
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.toggle_auto_approve_actions(cx);
+                            })),
                     ),
             )
             .child(

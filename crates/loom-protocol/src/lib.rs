@@ -43,7 +43,7 @@ pub use workspace::{
     WorkspaceSnapshot,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 1);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectSnapshot {
@@ -110,6 +110,14 @@ pub struct AgentSessionSnapshotProjection {
     pub session: AgentSessionSnapshot,
     pub active_run: Option<AgentRunSnapshotProjection>,
     pub latest_sequence: EventSequence,
+    #[serde(default)]
+    pub approval_policy: loom_core::ApprovalPolicy,
+    #[serde(default = "default_auto_approve_actions")]
+    pub auto_approve_actions: bool,
+}
+
+fn default_auto_approve_actions() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -316,7 +324,11 @@ pub enum ClientRequest {
     },
     SetApprovalPolicy {
         project_id: ProjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<AgentSessionId>,
         policy: loom_core::ApprovalPolicy,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        auto_approve_actions: Option<bool>,
     },
     OpenTerminal {
         project_id: ProjectId,

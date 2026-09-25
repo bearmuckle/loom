@@ -215,6 +215,8 @@ struct PersistedBackendState {
     runs: BTreeMap<loom_core::RunId, AgentRuntimeState>,
     workspaces: BTreeMap<ProjectId, loom_workspace::WorkspaceStateSnapshot>,
     policies: BTreeMap<ProjectId, ApprovalPolicy>,
+    session_policies: BTreeMap<AgentSessionId, ApprovalPolicy>,
+    auto_approve_actions: BTreeMap<AgentSessionId, bool>,
     provider_configs: Vec<ProviderConfig>,
     provider_health: BTreeMap<ProviderId, ProviderHealth>,
     workspace_configs: BTreeMap<ProjectId, WorkspaceConfig>,
@@ -440,6 +442,8 @@ pub struct InProcessBackend {
     vcs: Mutex<BTreeMap<ProjectId, GitService>>,
     task_supervisors: Mutex<BTreeMap<ProjectId, TaskSupervisor>>,
     policies: Mutex<BTreeMap<ProjectId, ApprovalPolicy>>,
+    session_policies: Mutex<BTreeMap<AgentSessionId, ApprovalPolicy>>,
+    auto_approve_actions: Mutex<BTreeMap<AgentSessionId, bool>>,
     workspace_configs: Mutex<BTreeMap<ProjectId, WorkspaceConfig>>,
     terminal_projects: Mutex<BTreeMap<loom_core::TerminalId, ProjectId>>,
     terminals: TerminalManager,
@@ -751,6 +755,8 @@ impl InProcessBackend {
             vcs: Mutex::new(BTreeMap::new()),
             task_supervisors: Mutex::new(BTreeMap::new()),
             policies: Mutex::new(BTreeMap::new()),
+            session_policies: Mutex::new(BTreeMap::new()),
+            auto_approve_actions: Mutex::new(BTreeMap::new()),
             workspace_configs: Mutex::new(BTreeMap::new()),
             terminal_projects: Mutex::new(BTreeMap::new()),
             terminals: TerminalManager::new(),
@@ -899,6 +905,26 @@ impl InProcessBackend {
         })
     }
 
+    fn session_policies(&self) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, ApprovalPolicy>>> {
+        self.session_policies.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "session approval policy lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn auto_approve_actions(&self) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, bool>>> {
+        self.auto_approve_actions.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "session approval settings lock was poisoned",
+                true,
+            )
+        })
+    }
+
     fn workspace_configs(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, WorkspaceConfig>>> {
         self.workspace_configs.lock().map_err(|_| {
             LoomError::new(
@@ -991,12 +1017,22 @@ impl InProcessBackend {
                     )
                 })
         };
+        let session_policies = persistence
+            .load_section("session_approval_policies", CURRENT_SCHEMA_VERSION)?
+            .map(from_json)
+            .transpose()?;
         let state = PersistedBackendState {
             sessions,
             journal: from_json(required("journal")?)?,
             runs: from_json(required("runs")?)?,
             workspaces: from_json(required("workspaces")?)?,
             policies: from_json(required("policies")?)?,
+            session_policies: session_policies.unwrap_or_default(),
+            auto_approve_actions: persistence
+                .load_section("auto_approve_actions", CURRENT_SCHEMA_VERSION)?
+                .map(from_json)
+                .transpose()?
+                .unwrap_or_default(),
             provider_configs: from_json(required("provider_configs")?)?,
             provider_health: from_json(required("provider_health")?)?,
             workspace_configs: persistence
@@ -1043,6 +1079,14 @@ impl InProcessBackend {
         {
             let mut target = self.policies()?;
             *target = state.policies;
+        }
+        {
+            let mut target = self.session_policies()?;
+            *target = state.session_policies;
+        }
+        {
+            let mut target = self.auto_approve_actions()?;
+            *target = state.auto_approve_actions;
         }
         {
             let mut target = self.terminal_projects()?;
@@ -1153,6 +1197,14 @@ impl InProcessBackend {
                 ("runs", json_value(runs)?),
                 ("workspaces", json_value(workspaces)?),
                 ("policies", json_value(self.policies()?.clone())?),
+                (
+                    "session_approval_policies",
+                    json_value(self.session_policies()?.clone())?,
+                ),
+                (
+                    "auto_approve_actions",
+                    json_value(self.auto_approve_actions()?.clone())?,
+                ),
                 (
                     "workspace_configs",
                     json_value(self.workspace_configs()?.clone())?,
@@ -1460,10 +1512,14 @@ impl InProcessConnection {
             .map(|event| event.sequence)
             .max()
             .unwrap_or_default();
+        let approval_policy = self.policy(session_id, session.project_id)?;
+        let auto_approve_actions = self.auto_approve_actions(session_id, session.project_id)?;
         Ok(AgentSessionSnapshotProjection {
             session,
             active_run,
             latest_sequence,
+            approval_policy,
+            auto_approve_actions,
         })
     }
 
@@ -1546,12 +1602,28 @@ impl InProcessConnection {
         Ok(service)
     }
 
-    fn policy(&self, project_id: ProjectId) -> Result<ApprovalPolicy> {
+    fn policy(&self, session_id: AgentSessionId, project_id: ProjectId) -> Result<ApprovalPolicy> {
+        if let Some(policy) = self.backend.session_policies()?.get(&session_id).cloned() {
+            return Ok(policy);
+        }
         let mut policies = self.backend.policies()?;
         Ok(policies
             .entry(project_id)
-            .or_insert_with(ApprovalPolicy::default)
+            .or_insert_with(ApprovalPolicy::auto_approve)
             .clone())
+    }
+
+    fn auto_approve_actions(
+        &self,
+        session_id: AgentSessionId,
+        project_id: ProjectId,
+    ) -> Result<bool> {
+        let settings = self.backend.auto_approve_actions()?;
+        if let Some(auto_approve_actions) = settings.get(&session_id) {
+            return Ok(*auto_approve_actions);
+        }
+        drop(settings);
+        Ok(self.policy(session_id, project_id)? == ApprovalPolicy::auto_approve())
     }
 
     fn task_supervisor(&self, project_id: ProjectId) -> Result<TaskSupervisor> {
@@ -1897,8 +1969,17 @@ impl InProcessConnection {
                 checkpoint_id,
             } => self.retry_from_checkpoint(run_id, checkpoint_id),
             ClientRequest::ForkAgentSession { session_id, name } => {
+                let project_id = self.backend.sessions()?.get(session_id)?.project_id;
+                let approval_policy = self.policy(session_id, project_id)?;
+                let auto_approve_actions = self.auto_approve_actions(session_id, project_id)?;
                 let (snapshot, record) = self.backend.sessions()?.fork(session_id, name)?;
                 let target_id = snapshot.id;
+                self.backend
+                    .session_policies()?
+                    .insert(target_id, approval_policy);
+                self.backend
+                    .auto_approve_actions()?
+                    .insert(target_id, auto_approve_actions);
                 self.backend.journal()?.append_session(record);
                 let history = self
                     .backend
@@ -2072,8 +2153,32 @@ impl InProcessConnection {
             ClientRequest::UndoWorkspaceEdit { project_id } => Ok(ServerResponse::WorkspaceUndo(
                 self.workspace(project_id)?.undo_last_agent_edit()?,
             )),
-            ClientRequest::SetApprovalPolicy { project_id, policy } => {
-                self.backend.policies()?.insert(project_id, policy.clone());
+            ClientRequest::SetApprovalPolicy {
+                project_id,
+                session_id,
+                policy,
+                auto_approve_actions,
+            } => {
+                if let Some(session_id) = session_id {
+                    let session = self.backend.sessions()?.get(session_id)?;
+                    if session.project_id != project_id {
+                        return Err(LoomError::new(
+                            ErrorCode::WorkspaceAccessDenied,
+                            "session does not belong to the requested workspace",
+                            false,
+                        ));
+                    }
+                    self.backend
+                        .session_policies()?
+                        .insert(session_id, policy.clone());
+                    if let Some(auto_approve_actions) = auto_approve_actions {
+                        self.backend
+                            .auto_approve_actions()?
+                            .insert(session_id, auto_approve_actions);
+                    }
+                } else {
+                    self.backend.policies()?.insert(project_id, policy.clone());
+                }
                 Ok(ServerResponse::ApprovalPolicy(policy))
             }
             ClientRequest::OpenTerminal {
@@ -2367,6 +2472,14 @@ impl InProcessConnection {
         let mut session_id = None;
         let mut run_id = None;
         match request {
+            ClientRequest::SetApprovalPolicy {
+                project_id: requested_project,
+                session_id: requested_session,
+                ..
+            } => {
+                project_id = Some(*requested_project);
+                session_id = *requested_session;
+            }
             ClientRequest::OpenWorkspace {
                 project_id: requested_project,
                 root,
@@ -2427,10 +2540,6 @@ impl InProcessConnection {
             }
             | ClientRequest::UndoWorkspaceEdit {
                 project_id: requested_project,
-            }
-            | ClientRequest::SetApprovalPolicy {
-                project_id: requested_project,
-                ..
             }
             | ClientRequest::OpenTerminal {
                 project_id: requested_project,
@@ -2701,7 +2810,7 @@ impl InProcessConnection {
         let checkpoint = workspace.create_checkpoint(Some(input.session_id), "before agent run")?;
         input.options.checkpoint_id = Some(checkpoint.id);
         let tools = ToolExecutor::new_with_workspace(workspace);
-        let policy = self.policy(session.project_id)?;
+        let policy = self.policy(session.id, session.project_id)?;
         let mut agent_task = AgentTask::new(input.task, input.model)?;
         agent_task.system_instructions = input.system_instructions;
         agent_task.repository_instructions = input.repository_instructions;
@@ -3023,6 +3132,7 @@ mod tests {
                 Capability::RetryFromCheckpoint,
                 Capability::ForkAgentSession,
                 Capability::ApproveAgentAction,
+                Capability::ConfigureApprovalPolicy,
                 Capability::ListProviders,
                 Capability::ReadProviderHealth,
                 Capability::ReadUsage,
@@ -3436,14 +3546,21 @@ mod tests {
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate(&connection);
+        let project_id = ProjectId::new();
         let session = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id: ProjectId::new(),
+            project_id,
             name: "M1 run".to_owned(),
         }));
         let session_id = match session.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
+        connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
+            project_id,
+            session_id: Some(session_id),
+            policy: ApprovalPolicy::default(),
+            auto_approve_actions: Some(false),
+        }));
         let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
             session_id,
             task: "create a demo file".to_owned(),
@@ -3759,6 +3876,28 @@ mod tests {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
+        let default_settings = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshot { session_id },
+        ));
+        let ServerResponse::AgentSessionSnapshot(default_settings) =
+            default_settings.result.unwrap()
+        else {
+            panic!("unexpected session snapshot response");
+        };
+        assert!(default_settings.auto_approve_actions);
+        assert_eq!(
+            default_settings.approval_policy,
+            loom_core::ApprovalPolicy::auto_approve()
+        );
+        let other_session =
+            connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
+                project_id,
+                name: "Other session".to_owned(),
+            }));
+        let other_session_id = match other_session.result.unwrap() {
+            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
         let policy = loom_core::ApprovalPolicy {
             write: PolicyDecision::Deny,
             ..Default::default()
@@ -3766,12 +3905,59 @@ mod tests {
         let policy_response =
             connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
                 project_id,
+                session_id: Some(session_id),
                 policy,
+                auto_approve_actions: Some(false),
             }));
         assert!(matches!(
             policy_response.result,
             Ok(ServerResponse::ApprovalPolicy(_))
         ));
+        let other_settings = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshot {
+                session_id: other_session_id,
+            },
+        ));
+        let ServerResponse::AgentSessionSnapshot(other_settings) = other_settings.result.unwrap()
+        else {
+            panic!("unexpected session snapshot response");
+        };
+        assert!(other_settings.auto_approve_actions);
+        assert_eq!(
+            other_settings.approval_policy,
+            loom_core::ApprovalPolicy::auto_approve()
+        );
+        let legacy_policy =
+            connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
+                project_id,
+                session_id: None,
+                policy: ApprovalPolicy::default(),
+                auto_approve_actions: None,
+            }));
+        assert!(matches!(
+            legacy_policy.result,
+            Ok(ServerResponse::ApprovalPolicy(_))
+        ));
+        let legacy_session =
+            connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
+                project_id,
+                name: "Legacy policy session".to_owned(),
+            }));
+        let legacy_session_id = match legacy_session.result.unwrap() {
+            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        let legacy_settings = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshot {
+                session_id: legacy_session_id,
+            },
+        ));
+        let ServerResponse::AgentSessionSnapshot(legacy_settings) = legacy_settings.result.unwrap()
+        else {
+            panic!("unexpected session snapshot response");
+        };
+        assert!(!legacy_settings.auto_approve_actions);
+        assert_eq!(legacy_settings.approval_policy, ApprovalPolicy::default());
         let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
             session_id,
             task: "attempt a write".to_owned(),
@@ -3831,6 +4017,12 @@ mod tests {
                 ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
                 response => panic!("unexpected response: {response:?}"),
             };
+            connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
+                project_id,
+                session_id: Some(session_id),
+                policy: ApprovalPolicy::default(),
+                auto_approve_actions: Some(false),
+            }));
             let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
                 session_id,
                 task: "create a demo file".to_owned(),
@@ -3872,6 +4064,16 @@ mod tests {
         let backend = InProcessBackend::new_persistent(&persistence).unwrap();
         let connection = backend.connect();
         negotiate_m3(&connection);
+        let recovered_session = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshot { session_id },
+        ));
+        let ServerResponse::AgentSessionSnapshot(recovered_session) =
+            recovered_session.result.unwrap()
+        else {
+            panic!("unexpected recovered session snapshot response");
+        };
+        assert!(!recovered_session.auto_approve_actions);
+        assert_eq!(recovered_session.approval_policy, ApprovalPolicy::default());
         let recovered =
             connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
         let ServerResponse::AgentRun(snapshot) = recovered.result.unwrap() else {
@@ -4021,6 +4223,12 @@ mod tests {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
+        connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
+            project_id,
+            session_id: Some(session_id),
+            policy: ApprovalPolicy::default(),
+            auto_approve_actions: Some(false),
+        }));
         let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
             session_id,
             task: "control".to_owned(),
@@ -4058,6 +4266,17 @@ mod tests {
             response => panic!("unexpected fork response: {response:?}"),
         };
         assert_ne!(forked_id, session_id);
+        let forked_settings = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshot {
+                session_id: forked_id,
+            },
+        ));
+        let ServerResponse::AgentSessionSnapshot(forked_settings) = forked_settings.result.unwrap()
+        else {
+            panic!("unexpected forked session snapshot response");
+        };
+        assert!(!forked_settings.auto_approve_actions);
+        assert_eq!(forked_settings.approval_policy, ApprovalPolicy::default());
 
         let providers = connection.request(RequestEnvelope::new(ClientRequest::ListProviders));
         let ServerResponse::Providers { providers } = providers.result.unwrap() else {
