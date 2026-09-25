@@ -524,6 +524,21 @@ fn worker_node_identity() -> (String, String) {
     (node_id, node_name)
 }
 
+fn openai_compatible_descriptor(model: ModelId) -> ModelDescriptor {
+    ModelDescriptor {
+        id: model,
+        provider: loom_model::ProviderId::new("openai-compatible"),
+        display_name: "OpenAI-compatible model".to_owned(),
+        context_window: None,
+        capabilities: loom_model::ModelCapabilities {
+            streaming: false,
+            tool_calling: true,
+            vision: false,
+            json_mode: true,
+        },
+    }
+}
+
 impl InProcessBackend {
     pub fn new() -> Arc<Self> {
         Self::with_provider_registry(ProviderRegistry::demo())
@@ -593,19 +608,7 @@ impl InProcessBackend {
         api_key: impl Into<String>,
         model: impl Into<ModelId>,
     ) -> Arc<Self> {
-        let model = model.into();
-        let descriptor = ModelDescriptor {
-            id: model,
-            provider: loom_model::ProviderId::new("openai-compatible"),
-            display_name: "OpenAI-compatible model".to_owned(),
-            context_window: None,
-            capabilities: loom_model::ModelCapabilities {
-                streaming: false,
-                tool_calling: true,
-                vision: false,
-                json_mode: true,
-            },
-        };
+        let descriptor = openai_compatible_descriptor(model.into());
         let credentials = Arc::new(loom_providers::InMemoryCredentialStore::default());
         credentials.insert(CredentialRef::new("legacy-openai"), api_key.into());
         let providers = ProviderRegistry::with_credentials(credentials);
@@ -628,19 +631,7 @@ impl InProcessBackend {
         model: impl Into<ModelId>,
         path: impl Into<PathBuf>,
     ) -> Result<Arc<Self>> {
-        let model = model.into();
-        let descriptor = ModelDescriptor {
-            id: model,
-            provider: loom_model::ProviderId::new("openai-compatible"),
-            display_name: "OpenAI-compatible model".to_owned(),
-            context_window: None,
-            capabilities: loom_model::ModelCapabilities {
-                streaming: false,
-                tool_calling: true,
-                vision: false,
-                json_mode: true,
-            },
-        };
+        let descriptor = openai_compatible_descriptor(model.into());
         let credentials = Arc::new(loom_providers::InMemoryCredentialStore::default());
         let api_key = api_key.into();
         let credential = if api_key.is_empty() {
@@ -667,19 +658,7 @@ impl InProcessBackend {
         model: impl Into<ModelId>,
         path: impl Into<PathBuf>,
     ) -> Result<Arc<Self>> {
-        let model = model.into();
-        let descriptor = ModelDescriptor {
-            id: model,
-            provider: loom_model::ProviderId::new("openai-compatible"),
-            display_name: "OpenAI-compatible model".to_owned(),
-            context_window: None,
-            capabilities: loom_model::ModelCapabilities {
-                streaming: false,
-                tool_calling: true,
-                vision: false,
-                json_mode: true,
-            },
-        };
+        let descriptor = openai_compatible_descriptor(model.into());
         let credentials = github_copilot_credentials()?;
         credentials.insert(CredentialRef::new("ui-openai-compatible"), api_key.into())?;
         let providers = ProviderRegistry::with_credentials(credentials);

@@ -289,20 +289,6 @@ impl ToolExecutor {
         }
     }
 
-    /// Executes independent tool calls concurrently and returns results in request order.
-    pub fn execute_many(&self, calls: &[ToolCall]) -> Vec<ToolResult> {
-        std::thread::scope(|scope| {
-            let workers = calls
-                .iter()
-                .map(|call| scope.spawn(move || self.execute(call)))
-                .collect::<Vec<_>>();
-            workers
-                .into_iter()
-                .map(|worker| worker.join().expect("tool worker panicked"))
-                .collect()
-        })
-    }
-
     fn list_files(&self, call: &ToolCall) -> ToolResult {
         let arguments: ListFilesArguments = match parse_arguments(call) {
             Ok(arguments) => arguments,

@@ -10,6 +10,9 @@ rust-version.workspace = true
 name = "loom-ui"
 path = "src/main.rs"
 
+[package.metadata.cargo-machete]
+ignored = ["getrandom"] # Enables wasm_js for transitive browser dependencies.
+
 [dependencies]
 gpui-kit.workspace = true
 loom-core.workspace = true
@@ -27,8 +30,6 @@ gpui-kit = { workspace = true, features = ["test-support"] }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 env_logger.workspace = true
 open.workspace = true
-loom-agent.workspace = true
-loom-process.workspace = true
 loom-providers.workspace = true
 loom-server.workspace = true
 loom-vcs.workspace = true
