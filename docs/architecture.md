@@ -112,21 +112,23 @@ reference their workspace; their files and repository checkouts remain
 session-scoped.
 
 Each `AgentSession` owns a backend-managed **session filesystem** with its own
-root. It contains session data and zero or more attached repository checkouts
-at normalized paths relative to that root. The backend assigns each checkout
-path when attaching a repository and persists the path with the session's
-repository record. Repository IDs and membership belong to the session. A
-fork receives copies of the source session's checkout contents in its own
-filesystem; the two sessions do not share a mutable working tree.
+root. It contains session data and zero or more attached sources at normalized
+paths relative to that root. GitHub repositories receive independent checkouts.
+A directory selected in native local mode is attached in place: file and Git
+operations use its original path, and the session discovers Git repositories
+in that directory and its immediate children. The worker persists both the
+source path and the session-relative attachment path. A fork copies attached
+contents into its own filesystem so the two sessions do not share a mutable
+working tree after forking.
 
-Use independent clones for attached repositories. A shared bare-object cache
-may reduce clone cost, but it is an internal optimization: working files and
-mutable Git state exposed to a session remain session-specific. Sharing a
-checkout with hierarchical sub-sessions may be considered later; it would
-need explicit ownership and coordination rules for concurrent file edits and
-Git operations. The filesystem boundary does not by itself promise OS-level
-process sandboxing; process isolation is a separate backend security
-capability.
+Use independent clones for remote repositories. A shared bare-object cache may
+reduce clone cost, but it is an internal optimization. Native local directories
+are an explicit exception: a session edits the original files, and another
+session can attach the same path. Sharing a checkout with hierarchical
+sub-sessions may be considered later; it would need explicit ownership and
+coordination rules for concurrent file edits and Git operations. The
+filesystem boundary does not by itself promise OS-level process sandboxing;
+process isolation is a separate backend security capability.
 
 `loom-workspace` is the session-filesystem service, despite the crate's
 historical name. It owns file trees, contents, watches, edits, snapshots,

@@ -2,25 +2,32 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
+use gpui_kit::TestSupportExt as _;
+use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::{Disableable, SelectableText, TextSelectionLayer};
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::input::{
+    Input as KitInput, InputEvent, InputState, Textarea, TextareaState,
+};
+use gpui_kit::component::list::ListItem;
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{
     Icon, IconName, IndexPath, Sizable,
-    menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
+    menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     select::{SearchableVec, Select, SelectEvent, SelectState},
     text::TextView,
+    tree::{Tree as KitTree, TreeItem, TreeState},
 };
 use gpui_kit::{
     Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
-    Decorations, Element, Entity, EntityInputHandler, FocusHandle, Focusable, HighlightStyle,
-    HitboxBehavior, ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels, Point, Render,
-    ResizeEdge, Subscription, Tiling, UTF16Selection, Window, WindowAppearance, WindowControlArea,
-    canvas, div, list, point, prelude::*, px, transparent_black,
+    Decorations, Element, Entity, FocusHandle, Focusable, HighlightStyle, HitboxBehavior,
+    ListAlignment, ListState, MouseButton, Pixels, Render, ResizeEdge, Subscription, Tiling,
+    Window, WindowAppearance, WindowControlArea, canvas, div, list, point, prelude::*, px,
+    transparent_black,
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
@@ -32,9 +39,9 @@ use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
-    RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse, SessionRepository,
-    TaskSnapshot, TaskStatus, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus,
-    WorkspaceConfig,
+    GitHubRepository, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse,
+    SessionDirectory, SessionRepository, TaskSnapshot, TaskStatus, WorkerNodeConfig,
+    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode};
@@ -51,13 +58,9 @@ use crate::{
         TimelineItem, activity_status_label, bounded, bounded_to, session_state_for_run,
         session_title_from_task, upsert_activity,
     },
-    text_input::{
-        Backspace, Copy, Delete, End, Home, InputField, Left, LoomTooltip, Paste, Right, SelectAll,
-        Submit, TextBufferState, TextInputElement,
-    },
     theme::{
         CLIENT_DECORATION_SHADOW, ClientCorners, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
-        ERROR_CARD_SURFACE, change_color, resize_edge, rgb, state_color,
+        ERROR_CARD_SURFACE, change_color, resize_edge, rgb,
     },
 };
 
@@ -116,6 +119,38 @@ fn responsive_layout(width: Pixels) -> ResponsiveLayout {
             review_width: FULL_REVIEW_WIDTH,
         }
     }
+}
+
+fn session_header_title() -> gpui_kit::Div {
+    div().flex().flex_1().min_w(px(0.)).items_center().gap_2()
+}
+
+fn session_header_actions() -> gpui_kit::Div {
+    div().flex().flex_shrink_0().items_center().gap_1()
+}
+
+fn empty_session_snapshot(workspace_id: WorkspaceId) -> AgentSessionSnapshot {
+    let now = loom_core::Timestamp::now();
+    AgentSessionSnapshot {
+        id: AgentSessionId::new(),
+        workspace_id,
+        name: "No session selected".to_owned(),
+        state: AgentSessionState::Idle,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn header_tooltip(
+    id: &'static str,
+    text: &'static str,
+    child: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .test_support()
+        .tooltip(move |_, cx| cx.new(|_| LoomTooltip { text: text.into() }).into())
+        .child(child)
 }
 
 #[cfg(target_family = "wasm")]
@@ -316,6 +351,7 @@ fn session_node_indicator_state(
     }
 }
 
+#[cfg(test)]
 fn order_session_nodes(
     mut nodes: Vec<(String, String)>,
     default_node_id: &str,
@@ -373,6 +409,9 @@ fn session_id_for_request(
         | ClientRequest::StartSessionAgentRun { session_id, .. }
         | ClientRequest::StartSessionAgentRunWithOptions { session_id, .. }
         | ClientRequest::AttachSessionRepository { session_id, .. }
+        | ClientRequest::AttachSessionDirectory { session_id, .. }
+        | ClientRequest::ListSessionDirectories { session_id }
+        | ClientRequest::DetachSessionDirectory { session_id, .. }
         | ClientRequest::ListSessionRepositories { session_id }
         | ClientRequest::DetachSessionRepository { session_id, .. }
         | ClientRequest::GetSessionFilesystemSnapshot { session_id }
@@ -1025,7 +1064,10 @@ pub(crate) struct LoomView {
     workspace_name: String,
     workspaces: Vec<WorkspaceRecord>,
     pub(crate) workspace_root: PathBuf,
+    local_directory_sources_available: bool,
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
+    session_tree: Option<Entity<TreeState>>,
+    session_tree_entries: Vec<(AgentSessionId, String)>,
     pub(crate) active_session: AgentSessionSnapshot,
     pub(crate) active_run: Option<AgentRunSnapshot>,
     pub(crate) active_run_id: Option<RunId>,
@@ -1070,21 +1112,27 @@ pub(crate) struct LoomView {
     pub(crate) archive_request_in_flight: bool,
     pub(crate) pending_approval: Option<ToolCall>,
     pub(crate) pending_input: Option<String>,
-    pub(crate) composer: TextBufferState,
+    composer_input: Option<Entity<TextareaState>>,
+    composer_placeholder: Option<String>,
+    input_subscriptions: Vec<Subscription>,
+    clear_composer_on_render: bool,
+    clear_node_on_render: bool,
+    rename_input_state: Option<Entity<InputState>>,
+    source_path_input: Option<Entity<InputState>>,
+    repository_filter_input: Option<Entity<InputState>>,
+    pending_source_path: Option<String>,
     pub(crate) composer_focus_handle: FocusHandle,
-    pub(crate) node_focus_handle: FocusHandle,
-    pub(crate) input_field: InputField,
     pub(crate) session_state: AgentSessionState,
     pub(crate) run_state: Option<AgentRunState>,
     pub(crate) summary: Option<String>,
     pub(crate) review: ReviewState,
     session_repositories: Vec<SessionRepository>,
+    session_directories: Vec<SessionDirectory>,
     selected_repository_id: Option<RepositoryId>,
     session_drawer_open: bool,
     pub(crate) tasks: Vec<TaskSnapshot>,
     pub(crate) rename_dialog: Option<RenameDialogState>,
-    repository_dialog: Option<TextBufferState>,
-    pub(crate) rename_focus_handle: FocusHandle,
+    source_dialog: Option<SessionSourceDialog>,
     pub(crate) demo_workspace: bool,
     pub(crate) login_enabled: bool,
     pub(crate) github_connected: bool,
@@ -1093,7 +1141,8 @@ pub(crate) struct LoomView {
     next_worker_node_id: u64,
     worker_node_polls_scheduled: BTreeSet<u64>,
     workspace_config: WorkspaceConfig,
-    pub(crate) node_input: TextBufferState,
+    node_input_initial: String,
+    node_input_state: Option<Entity<InputState>>,
     pub(crate) run_poll_scheduled: bool,
     #[cfg(target_family = "wasm")]
     browser_workspace: Option<String>,
@@ -1102,6 +1151,54 @@ pub(crate) struct LoomView {
     #[cfg(target_family = "wasm")]
     browser_window_initialized: bool,
     browser_startup_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionSourceDialogPurpose {
+    StartSession,
+    AddToSession,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionSourceChoice {
+    Empty,
+    LocalDirectory,
+    GitHub,
+}
+
+enum SessionCreationSource {
+    LocalDirectory(String),
+    GitHub(GitHubRepository),
+}
+
+fn session_name_for_source(source: &SessionCreationSource) -> String {
+    let name = match source {
+        SessionCreationSource::LocalDirectory(path) => Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+        SessionCreationSource::GitHub(repository) => {
+            repository.full_name.rsplit('/').next().map(str::to_owned)
+        }
+    };
+    name.filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "New session".to_owned())
+}
+
+fn session_name_for_path(path: &Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.trim().is_empty())
+}
+
+struct SessionSourceDialog {
+    purpose: SessionSourceDialogPurpose,
+    choice: SessionSourceChoice,
+    local_directory_available: bool,
+    filter_subscription: Option<Subscription>,
+    repositories: Vec<GitHubRepository>,
+    selected_repository: Option<String>,
+    repositories_loading: bool,
+    error: Option<String>,
 }
 
 struct TimelineView {
@@ -1236,144 +1333,32 @@ impl LoomView {
             true
         }
     }
-
-    pub(crate) fn input_state(&self, field: InputField) -> Option<&TextBufferState> {
-        match field {
-            InputField::Composer => Some(&self.composer),
-            InputField::Rename => self.rename_dialog.as_ref().map(|dialog| &dialog.input),
-            InputField::RepositorySource => self.repository_dialog.as_ref(),
-            InputField::Node => Some(&self.node_input),
-        }
-    }
-
-    pub(crate) fn input_state_mut(&mut self, field: InputField) -> Option<&mut TextBufferState> {
-        match field {
-            InputField::Composer => Some(&mut self.composer),
-            InputField::Rename => self.rename_dialog.as_mut().map(|dialog| &mut dialog.input),
-            InputField::RepositorySource => self.repository_dialog.as_mut(),
-            InputField::Node => Some(&mut self.node_input),
-        }
-    }
-
-    pub(crate) fn input_focus_handle(&self, field: InputField) -> FocusHandle {
-        match field {
-            InputField::Composer => self.composer_focus_handle.clone(),
-            InputField::Rename | InputField::RepositorySource => self.rename_focus_handle.clone(),
-            InputField::Node => self.node_focus_handle.clone(),
-        }
-    }
-
-    pub(crate) fn edit_input(&self) -> &TextBufferState {
-        self.input_state(self.input_field)
-            .expect("focused input field is present")
-    }
-
-    pub(crate) fn edit_input_mut(&mut self) -> &mut TextBufferState {
-        let field = self.input_field;
-        self.input_state_mut(field)
-            .expect("focused input field is present")
-    }
 }
 
-impl EntityInputHandler for LoomView {
-    fn text_for_range(
-        &mut self,
-        range_utf16: Range<usize>,
-        actual_range: &mut Option<Range<usize>>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<String> {
-        let input = self.input_state(self.input_field)?;
-        let range = input.range_from_utf16(&range_utf16);
-        actual_range.replace(input.range_to_utf16(&range));
-        input.text.get(range).map(str::to_owned)
-    }
+struct LoomTooltip {
+    text: String,
+}
 
-    fn selected_text_range(
-        &mut self,
-        _ignore_disabled_input: bool,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<UTF16Selection> {
-        let input = self.input_state(self.input_field)?;
-        Some(UTF16Selection {
-            range: input.range_to_utf16(&input.selected_range),
-            reversed: input.selection_reversed,
-        })
-    }
-
-    fn marked_text_range(
-        &self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Range<usize>> {
-        self.input_state(self.input_field)?
-            .marked_range
-            .as_ref()
-            .map(|range| {
-                self.input_state(self.input_field)
-                    .expect("composer input exists")
-                    .range_to_utf16(range)
-            })
-    }
-
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        if let Some(input) = self.input_state_mut(self.input_field) {
-            input.marked_range = None;
-        }
-    }
-
-    fn replace_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        new_text: &str,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(input) = self.input_state_mut(self.input_field) {
-            input.replace_utf16(range_utf16, new_text);
-        }
-        cx.notify();
-    }
-
-    fn replace_and_mark_text_in_range(
-        &mut self,
-        range_utf16: Option<Range<usize>>,
-        new_text: &str,
-        new_selected_range_utf16: Option<Range<usize>>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(input) = self.input_state_mut(self.input_field) else {
-            return;
-        };
-        let replacement = input.replace_utf16(range_utf16, new_text);
-        if let Some(selected) = new_selected_range_utf16 {
-            let selected = input.range_from_utf16(&selected);
-            input.selected_range =
-                replacement.start + selected.start..replacement.start + selected.end;
-            input.marked_range = Some(replacement);
-        }
-        cx.notify();
-    }
-
-    fn bounds_for_range(
-        &mut self,
-        _range_utf16: Range<usize>,
-        _element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Bounds<Pixels>> {
-        None
-    }
-
-    fn character_index_for_point(
-        &mut self,
-        _point: Point<Pixels>,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        None
+impl Render for LoomTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("loom-header-tooltip")
+            .test_support()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(rgb(0x20242c))
+            .border_1()
+            .border_color(rgb(0x3b4555))
+            .text_sm()
+            .text_color(rgb(0xe5e7eb))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(self.text.split('\n').map(str::to_owned)),
+            )
     }
 }
 
@@ -1388,8 +1373,6 @@ impl LoomView {
     pub(crate) fn try_new(
         options: &UiOptions,
         focus_handle: FocusHandle,
-        node_focus_handle: FocusHandle,
-        rename_focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
         let mut remote_cleanup_guard = None;
@@ -1483,29 +1466,54 @@ impl LoomView {
         );
         let sessions = list_workspace_sessions(&connection, workspace_id)?;
         info!("loaded {} session(s)", sessions.len());
+        let had_sessions = !sessions.is_empty();
         let (session, new_session) = match sessions.into_iter().next() {
             Some(session) => {
                 info!("resuming session {}", session.id);
                 (session, false)
             }
             None => {
-                info!("creating a new session");
-                (
-                    create_session_in_workspace(&connection, workspace_id, "New session")?,
-                    true,
-                )
+                if workspace_root.as_os_str().is_empty() {
+                    (empty_session_snapshot(workspace_id), false)
+                } else {
+                    info!("creating a session for the requested workspace");
+                    (
+                        create_session_in_workspace(
+                            &connection,
+                            workspace_id,
+                            session_name_for_path(&workspace_root)
+                                .as_deref()
+                                .unwrap_or("New session"),
+                        )?,
+                        true,
+                    )
+                }
             }
         };
-        if new_session
-            && !workspace_root.as_os_str().is_empty()
-            && (options.remote.is_some() || workspace_root.join(".git").exists())
-        {
-            attach_session_repository(
-                &connection,
-                session.id,
-                &workspace_root.display().to_string(),
-                "repo",
-            )?;
+        let has_session = had_sessions || new_session;
+        if new_session && !workspace_root.as_os_str().is_empty() {
+            if options.remote.is_none() {
+                let response = connection.request(RequestEnvelope::new(
+                    ClientRequest::AttachSessionDirectory {
+                        session_id: session.id,
+                        source: workspace_root.display().to_string(),
+                        path: "sources/local".to_owned(),
+                    },
+                ));
+                match response.result? {
+                    ServerResponse::SessionDirectoryAttached { .. } => {}
+                    response => {
+                        return Err(unexpected_response("directory attachment", response));
+                    }
+                }
+            } else if workspace_root.join(".git").exists() {
+                attach_session_repository(
+                    &connection,
+                    session.id,
+                    &workspace_root.display().to_string(),
+                    "repo",
+                )?;
+            }
         }
         let models = list_models(&connection)?;
         let model = if models.contains(&options.model) {
@@ -1533,7 +1541,11 @@ impl LoomView {
         };
         let backend = BackendWorker::spawn(connection.clone());
         let node_backends = BTreeMap::from([(default_backend_node_id.clone(), backend.clone())]);
-        let session_node_ids = BTreeMap::from([(session.id, default_backend_node_id.clone())]);
+        let session_node_ids = if has_session {
+            BTreeMap::from([(session.id, default_backend_node_id.clone())])
+        } else {
+            BTreeMap::new()
+        };
         let node_names = worker_nodes
             .iter()
             .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
@@ -1549,7 +1561,14 @@ impl LoomView {
             workspace_name: workspace.name,
             workspaces,
             workspace_root,
-            sessions: vec![session.clone()],
+            local_directory_sources_available: options.remote.is_none(),
+            sessions: if has_session {
+                vec![session.clone()]
+            } else {
+                Vec::new()
+            },
+            session_tree: None,
+            session_tree_entries: Vec::new(),
             active_session: session.clone(),
             active_run: run.clone(),
             active_run_id: run.as_ref().map(|run| run.id),
@@ -1594,21 +1613,27 @@ impl LoomView {
             archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
-            composer: TextBufferState::new(""),
+            composer_input: None,
+            composer_placeholder: None,
+            input_subscriptions: Vec::new(),
+            clear_composer_on_render: false,
+            clear_node_on_render: false,
+            rename_input_state: None,
+            source_path_input: None,
+            repository_filter_input: None,
+            pending_source_path: None,
             composer_focus_handle: focus_handle,
-            node_focus_handle,
-            input_field: InputField::Composer,
             session_state: session.state,
             run_state: run.as_ref().map(|run| run.state),
             summary: run.as_ref().and_then(|run| run.summary.clone()),
             review: ReviewState::default(),
             session_repositories: Vec::new(),
+            session_directories: Vec::new(),
             selected_repository_id: None,
             session_drawer_open: false,
             tasks: Vec::new(),
             rename_dialog: None,
-            repository_dialog: None,
-            rename_focus_handle,
+            source_dialog: None,
             demo_workspace,
             login_enabled: true,
             github_connected: false,
@@ -1617,14 +1642,17 @@ impl LoomView {
             worker_nodes,
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config,
-            node_input: TextBufferState::new(""),
+            node_input_initial: String::new(),
+            node_input_state: None,
             run_poll_scheduled: false,
             browser_startup_error: None,
         };
         view.refresh_models();
         view.refresh_sessions()?;
         let active_session = view.active_session.clone();
-        view.load_session(active_session);
+        if has_session {
+            view.load_session(active_session);
+        }
         info!("initial session state loaded");
         if let Some(guard) = &mut remote_cleanup_guard {
             guard.disarm();
@@ -1637,8 +1665,6 @@ impl LoomView {
         options: &BrowserOptions,
         startup_error: Option<String>,
         focus_handle: FocusHandle,
-        node_focus_handle: FocusHandle,
-        rename_focus_handle: FocusHandle,
     ) -> Self {
         let connection = ClientConnection::Disconnected;
         let backend = BackendWorker::spawn(connection.clone());
@@ -1652,11 +1678,9 @@ impl LoomView {
             created_at: timestamp,
             updated_at: timestamp,
         };
-        let node_input = TextBufferState::new(
-            format!("{} {}", options.remote(), options.token())
-                .trim()
-                .to_owned(),
-        );
+        let node_input_initial = format!("{} {}", options.remote(), options.token())
+            .trim()
+            .to_owned();
 
         Self {
             connected: false,
@@ -1670,7 +1694,10 @@ impl LoomView {
             workspace_name: "No workspace".to_owned(),
             workspaces: Vec::new(),
             workspace_root: PathBuf::new(),
+            local_directory_sources_available: false,
             sessions: Vec::new(),
+            session_tree: None,
+            session_tree_entries: Vec::new(),
             active_session,
             active_run: None,
             active_run_id: None,
@@ -1715,21 +1742,27 @@ impl LoomView {
             archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
-            composer: TextBufferState::new(""),
+            composer_input: None,
+            composer_placeholder: None,
+            input_subscriptions: Vec::new(),
+            clear_composer_on_render: false,
+            clear_node_on_render: false,
+            rename_input_state: None,
+            source_path_input: None,
+            repository_filter_input: None,
+            pending_source_path: None,
             composer_focus_handle: focus_handle,
-            node_focus_handle,
-            input_field: InputField::Composer,
             session_state: AgentSessionState::Idle,
             run_state: None,
             summary: None,
             review: ReviewState::default(),
             session_repositories: Vec::new(),
+            session_directories: Vec::new(),
             selected_repository_id: None,
             session_drawer_open: false,
             tasks: Vec::new(),
             rename_dialog: None,
-            repository_dialog: None,
-            rename_focus_handle,
+            source_dialog: None,
             demo_workspace: false,
             login_enabled: false,
             github_connected: false,
@@ -1738,7 +1771,7 @@ impl LoomView {
             worker_nodes: Vec::new(),
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config: WorkspaceConfig::default(),
-            node_input,
+            node_input_initial,
             run_poll_scheduled: false,
             browser_workspace: options.workspace().map(str::to_owned),
             browser_model: options.model().cloned(),
@@ -1759,8 +1792,6 @@ impl LoomView {
     pub(crate) async fn try_new_browser(
         options: &BrowserOptions,
         focus_handle: FocusHandle,
-        node_focus_handle: FocusHandle,
-        rename_focus_handle: FocusHandle,
     ) -> Result<Self, LoomError> {
         if worker_url_embeds_credential(options.remote()) {
             return Err(LoomError::invalid_request(
@@ -1783,6 +1814,7 @@ impl LoomView {
         };
         let workspace_id = workspace.id;
         let sessions = list_workspace_sessions_async(&connection, workspace_id).await?;
+        let had_sessions = !sessions.is_empty();
         let workspace_config = workspace_config_async(&connection, workspace_id).await?;
         let mut worker_nodes = initial_worker_nodes(
             node_status,
@@ -1799,11 +1831,25 @@ impl LoomView {
         }
         let (session, new_session) = match sessions.into_iter().next() {
             Some(session) => (session, false),
-            None => (
-                create_session_in_workspace_async(&connection, workspace_id, "New session").await?,
-                true,
-            ),
+            None => {
+                if options.workspace().is_some() {
+                    (
+                        create_session_in_workspace_async(
+                            &connection,
+                            workspace_id,
+                            session_name_for_path(Path::new(options.workspace().unwrap()))
+                                .as_deref()
+                                .unwrap_or("New session"),
+                        )
+                        .await?,
+                        true,
+                    )
+                } else {
+                    (empty_session_snapshot(workspace_id), false)
+                }
+            }
         };
+        let has_session = had_sessions || new_session;
         let workspace_root = options.workspace().map(PathBuf::from).unwrap_or_default();
         if new_session && !workspace_root.as_os_str().is_empty() {
             attach_session_repository_async(
@@ -1825,7 +1871,11 @@ impl LoomView {
             BTreeMap::from([(default_backend_node_id.clone(), models.clone())]);
         let backend = BackendWorker::spawn(connection.clone());
         let node_backends = BTreeMap::from([(default_backend_node_id.clone(), backend.clone())]);
-        let session_node_ids = BTreeMap::from([(session.id, default_backend_node_id.clone())]);
+        let session_node_ids = if has_session {
+            BTreeMap::from([(session.id, default_backend_node_id.clone())])
+        } else {
+            BTreeMap::new()
+        };
         let node_names = worker_nodes
             .iter()
             .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
@@ -1843,7 +1893,14 @@ impl LoomView {
             workspace_name: workspace.name,
             workspaces,
             workspace_root,
-            sessions: vec![session.clone()],
+            local_directory_sources_available: false,
+            sessions: if has_session {
+                vec![session.clone()]
+            } else {
+                Vec::new()
+            },
+            session_tree: None,
+            session_tree_entries: Vec::new(),
             active_session: session.clone(),
             active_run: None,
             active_run_id: None,
@@ -1888,21 +1945,27 @@ impl LoomView {
             archive_request_in_flight: false,
             pending_approval: None,
             pending_input: None,
-            composer: TextBufferState::new(""),
+            composer_input: None,
+            composer_placeholder: None,
+            input_subscriptions: Vec::new(),
+            clear_composer_on_render: false,
+            clear_node_on_render: false,
+            rename_input_state: None,
+            source_path_input: None,
+            repository_filter_input: None,
+            pending_source_path: None,
             composer_focus_handle: focus_handle,
-            node_focus_handle,
-            input_field: InputField::Composer,
             session_state: session.state,
             run_state: None,
             summary: None,
             review: ReviewState::default(),
             session_repositories: Vec::new(),
+            session_directories: Vec::new(),
             selected_repository_id: None,
             session_drawer_open: false,
             tasks: Vec::new(),
             rename_dialog: None,
-            repository_dialog: None,
-            rename_focus_handle,
+            source_dialog: None,
             demo_workspace: false,
             login_enabled: true,
             github_connected: false,
@@ -1911,7 +1974,8 @@ impl LoomView {
             worker_nodes,
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config,
-            node_input: TextBufferState::new(""),
+            node_input_initial: String::new(),
+            node_input_state: None,
             run_poll_scheduled: false,
             browser_workspace: options.workspace().map(str::to_owned),
             browser_model: options.model().cloned(),
@@ -2322,6 +2386,7 @@ impl LoomView {
     pub(crate) fn activate_session(&mut self, session: AgentSessionSnapshot) {
         self.active_session = session;
         self.session_repositories.clear();
+        self.session_directories.clear();
         self.selected_repository_id = None;
         self.session_state = self.active_session.state;
         self.auto_approve_actions = self
@@ -2417,6 +2482,17 @@ impl LoomView {
                 "load session repositories",
                 unexpected_response("session repository list", response),
             ),
+        }
+        if let Ok(ServerResponse::SessionDirectories { directories }) = self
+            .connection
+            .request(RequestEnvelope::new(
+                ClientRequest::ListSessionDirectories {
+                    session_id: self.active_session.id,
+                },
+            ))
+            .result
+        {
+            self.session_directories = directories;
         }
     }
 
@@ -2861,6 +2937,22 @@ impl LoomView {
     pub(crate) fn refresh_review(&mut self, cx: &mut Context<Self>) {
         self.dispatch(
             cx,
+            ClientRequest::ListSessionDirectories {
+                session_id: self.active_session.id,
+            },
+            |view, response, _| match response.result {
+                Ok(ServerResponse::SessionDirectories { directories }) => {
+                    view.session_directories = directories;
+                }
+                Err(error) => view.record_backend_error("list session directories", error),
+                Ok(response) => view.record_backend_error(
+                    "list session directories",
+                    unexpected_response("session directory list", response),
+                ),
+            },
+        );
+        self.dispatch(
+            cx,
             ClientRequest::GetSessionFilesystemChanges {
                 session_id: self.active_session.id,
                 after_sequence: None,
@@ -2944,7 +3036,13 @@ impl LoomView {
         let Some(dialog) = self.rename_dialog.take() else {
             return;
         };
-        let name = dialog.input.text.trim().to_owned();
+        let name = self
+            .rename_input_state
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
         if name.is_empty() {
             self.record_status("Session name cannot be empty");
             self.rename_dialog = Some(dialog);
@@ -2992,8 +3090,9 @@ impl LoomView {
                         if let Some(session) = view.sessions.first().cloned() {
                             view.select_session(session, cx);
                         } else {
-                            view.reset_projection();
-                            view.create_session_async("New session".to_owned(), cx);
+                            view.activate_session(empty_session_snapshot(view.workspace_id));
+                            view.review.open = false;
+                            cx.notify();
                         }
                     }
                     Err(error) => view.record_backend_error("archive session", error),
@@ -3222,139 +3321,36 @@ impl LoomView {
     }
 
     pub(crate) fn submit_composer(&mut self, cx: &mut Context<Self>) {
-        let text = self.composer.text.trim().to_owned();
+        let text = self
+            .composer_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
         if text.is_empty() {
             return;
         }
-        self.composer.set_text("");
+        self.clear_composer_on_render = true;
+        if text.starts_with('/') {
+            self.run_slash_command(&text, cx);
+            return;
+        }
         self.send_message(text, cx);
     }
 
-    pub(crate) fn focus_composer(
-        &mut self,
-        _: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.composer_focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn focus_node(
-        &mut self,
-        _: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.node_focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn focus_rename(
-        &mut self,
-        _: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.rename_focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
-        if self.edit_input().selected_range.is_empty() {
-            let cursor = self.edit_input().cursor_offset();
-            if cursor == 0 {
-                return;
+    fn run_slash_command(&mut self, text: &str, cx: &mut Context<Self>) {
+        match text.split_whitespace().next().unwrap_or_default() {
+            "/repo" | "/repository" => {
+                self.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
             }
-            let input = self.edit_input_mut();
-            input.selected_range = input.previous_boundary(cursor)..cursor;
-        }
-        self.edit_input_mut().replace_utf16(None, "");
-        cx.notify();
-    }
-
-    pub(crate) fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
-        if self.edit_input().selected_range.is_empty() {
-            let cursor = self.edit_input().cursor_offset();
-            if cursor >= self.edit_input().text.len() {
-                return;
+            "/review" => {
+                self.review.open = true;
+                self.review.panel = ReviewPanel::Changes;
+                self.refresh_review(cx);
             }
-            let input = self.edit_input_mut();
-            input.selected_range = cursor..input.next_boundary(cursor);
-        }
-        self.edit_input_mut().replace_utf16(None, "");
-        cx.notify();
-    }
-
-    pub(crate) fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
-        let offset = if self.edit_input().selected_range.is_empty() {
-            self.edit_input()
-                .previous_boundary(self.edit_input().cursor_offset())
-        } else {
-            self.edit_input().selected_range.start
-        };
-        self.edit_input_mut().move_to(offset, false);
-        cx.notify();
-    }
-
-    pub(crate) fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
-        let offset = if self.edit_input().selected_range.is_empty() {
-            self.edit_input()
-                .next_boundary(self.edit_input().cursor_offset())
-        } else {
-            self.edit_input().selected_range.end
-        };
-        self.edit_input_mut().move_to(offset, false);
-        cx.notify();
-    }
-
-    pub(crate) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
-        self.edit_input_mut().select_all();
-        cx.notify();
-    }
-
-    pub(crate) fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, _) = self
-            .edit_input()
-            .line_and_column(self.edit_input().cursor_offset());
-        let offset = self.edit_input().line_ranges()[line].start;
-        self.edit_input_mut().move_to(offset, false);
-        cx.notify();
-    }
-
-    pub(crate) fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
-        let (line, _) = self
-            .edit_input()
-            .line_and_column(self.edit_input().cursor_offset());
-        let offset = self.edit_input().line_ranges()[line].end;
-        self.edit_input_mut().move_to(offset, false);
-        cx.notify();
-    }
-
-    pub(crate) fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.edit_input_mut().replace_utf16(None, &text);
-            cx.notify();
-        }
-    }
-
-    pub(crate) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.edit_input().selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.edit_input().text[self.edit_input().selected_range.clone()].to_owned(),
-            ));
-        }
-    }
-
-    pub(crate) fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
-        if self.rename_dialog.is_some() {
-            self.confirm_rename(cx);
-        } else if self.repository_dialog.is_some() {
-            self.confirm_repository_attach(cx);
-        } else if self.input_field == InputField::Node {
-            self.connect_worker_node(cx);
-        } else {
-            self.submit_composer(cx);
+            "/help" => self.record_status("Available tools: /repo, /review, /help"),
+            command => self.record_status(format!("Unknown command '{command}'. Try /help.")),
         }
         cx.notify();
     }
@@ -3369,6 +3365,7 @@ impl LoomView {
             }
         };
         self.github_login = None;
+        self.source_dialog = None;
         self.settings_open = false;
         self.providers_open = false;
         self.about_open = false;
@@ -4084,6 +4081,25 @@ impl LoomView {
         self.providers_open = false;
         self.about_open = false;
         self.settings_open = true;
+        let node_id = self.default_backend_node_id.clone();
+        self.dispatch_to_node(
+            cx,
+            node_id,
+            ClientRequest::ListProviders,
+            |view, response, _| match response.result {
+                Ok(ServerResponse::Providers { providers }) => {
+                    view.github_connected = providers
+                        .iter()
+                        .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
+                    view.providers = providers;
+                }
+                Err(error) => view.record_backend_error("check GitHub connection", error),
+                Ok(response) => view.record_backend_error(
+                    "check GitHub connection",
+                    unexpected_response("provider list", response),
+                ),
+            },
+        );
         cx.notify();
     }
 
@@ -4673,7 +4689,13 @@ impl LoomView {
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn connect_worker_node(&mut self, cx: &mut Context<Self>) {
-        let value = self.node_input.text.trim().to_owned();
+        let value = self
+            .node_input_state
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_else(|| self.node_input_initial.clone())
+            .trim()
+            .to_owned();
         let mut parts = value.split_whitespace();
         let Some(url) = parts.next() else {
             self.record_status("Enter a node URL followed by its access token");
@@ -4776,8 +4798,12 @@ impl LoomView {
                             credential_detail,
                             cx,
                         );
-                        if view.node_input.text.trim() == submitted_value {
-                            view.node_input.set_text("");
+                        if view
+                            .node_input_state
+                            .as_ref()
+                            .is_some_and(|input| input.read(cx).value().as_ref() == submitted_value)
+                        {
+                            view.clear_node_on_render = true;
                         }
                     }
                     Ok((connection, _, _, _)) => {
@@ -4812,7 +4838,13 @@ impl LoomView {
 
     #[cfg(target_family = "wasm")]
     pub(crate) fn connect_worker_node(&mut self, cx: &mut Context<Self>) {
-        let value = self.node_input.text.trim().to_owned();
+        let value = self
+            .node_input_state
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
         let mut parts = value.split_whitespace();
         let Some(url) = parts.next() else {
             self.record_status("Enter a node URL followed by its access token");
@@ -4896,8 +4928,12 @@ impl LoomView {
                 match result {
                     Ok((connection, status, connected_url)) if is_pending => {
                         view.add_worker_node(connection, status, connected_url, None, cx);
-                        if view.node_input.text.trim() == submitted_value {
-                            view.node_input.set_text("");
+                        if view
+                            .node_input_state
+                            .as_ref()
+                            .is_some_and(|input| input.read(cx).value().as_ref() == submitted_value)
+                        {
+                            view.clear_node_on_render = true;
                         }
                     }
                     Ok((connection, _, _)) => {
@@ -4946,18 +4982,10 @@ impl LoomView {
             self.browser_model.clone(),
         );
         let focus_handle = self.composer_focus_handle.clone();
-        let node_focus_handle = self.node_focus_handle.clone();
-        let rename_focus_handle = self.rename_focus_handle.clone();
         let view = cx.entity();
         cx.notify();
         cx.spawn(async move |_, cx| {
-            let result = LoomView::try_new_browser(
-                &options,
-                focus_handle,
-                node_focus_handle,
-                rename_focus_handle,
-            )
-            .await;
+            let result = LoomView::try_new_browser(&options, focus_handle).await;
             view.update(cx, |view, cx| {
                 let is_pending = view.worker_nodes.iter().any(|node| {
                     node.id == id
@@ -4971,9 +4999,15 @@ impl LoomView {
                         initialized.browser_window_initialized = false;
                         *view = initialized;
                         view.reload_sessions(cx);
-                        view.select_session(active_session, cx);
-                        if view.node_input.text.trim() == submitted_value {
-                            view.node_input.set_text("");
+                        if !view.sessions.is_empty() {
+                            view.select_session(active_session, cx);
+                        }
+                        if view
+                            .node_input_state
+                            .as_ref()
+                            .is_some_and(|input| input.read(cx).value().as_ref() == submitted_value)
+                        {
+                            view.clear_node_on_render = true;
                         }
                     }
                     Ok(initialized) => {
@@ -5119,24 +5153,263 @@ impl LoomView {
     }
 
     pub(crate) fn new_session(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let name = format!("Session {}", self.sessions.len().saturating_add(1));
-        let node_id = self.available_session_nodes().first().map_or_else(
-            || self.default_backend_node_id.clone(),
-            |(id, _)| id.clone(),
-        );
-        self.create_session_on_node(node_id, name, cx);
+        self.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
     }
 
-    fn available_session_nodes(&self) -> Vec<(String, String)> {
-        let nodes = self
-            .worker_nodes
-            .iter()
-            .filter(|node| {
-                node.status.online && self.node_backends.contains_key(&node.status.node_id)
-            })
-            .map(|node| (node.status.node_id.clone(), worker_node_display_name(node)))
-            .collect::<Vec<_>>();
-        order_session_nodes(nodes, &self.default_backend_node_id)
+    fn begin_source_dialog(&mut self, purpose: SessionSourceDialogPurpose, cx: &mut Context<Self>) {
+        let local_directory_available = self.local_directory_sources_available
+            && match purpose {
+                SessionSourceDialogPurpose::StartSession => true,
+                SessionSourceDialogPurpose::AddToSession => self
+                    .session_node_ids
+                    .get(&self.active_session.id)
+                    .is_none_or(|node_id| node_id == &self.default_backend_node_id),
+            };
+        let choice = match purpose {
+            SessionSourceDialogPurpose::StartSession => SessionSourceChoice::Empty,
+            SessionSourceDialogPurpose::AddToSession if local_directory_available => {
+                SessionSourceChoice::LocalDirectory
+            }
+            SessionSourceDialogPurpose::AddToSession => SessionSourceChoice::GitHub,
+        };
+        self.source_dialog = Some(SessionSourceDialog {
+            purpose,
+            choice,
+            local_directory_available,
+            filter_subscription: None,
+            repositories: Vec::new(),
+            selected_repository: None,
+            repositories_loading: false,
+            error: None,
+        });
+        self.source_path_input = None;
+        self.repository_filter_input = None;
+        self.pending_source_path = None;
+        if choice == SessionSourceChoice::GitHub {
+            self.load_github_repositories(cx);
+        }
+        cx.notify();
+    }
+
+    fn choose_source(&mut self, choice: SessionSourceChoice, cx: &mut Context<Self>) {
+        let allowed = choice != SessionSourceChoice::Empty
+            || self
+                .source_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.purpose == SessionSourceDialogPurpose::StartSession);
+        if !allowed
+            || (choice == SessionSourceChoice::LocalDirectory
+                && !self
+                    .source_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.local_directory_available))
+        {
+            return;
+        }
+        if let Some(dialog) = &mut self.source_dialog {
+            dialog.choice = choice;
+            dialog.error = None;
+            if choice == SessionSourceChoice::GitHub && dialog.repositories.is_empty() {
+                dialog.repositories_loading = true;
+            }
+        }
+        if choice == SessionSourceChoice::GitHub {
+            self.load_github_repositories(cx);
+        }
+        cx.notify();
+    }
+
+    fn browse_local_directory(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose a local folder".into()),
+        });
+        cx.spawn(async move |view, cx| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.into_iter().next() {
+                    view.update(cx, |view, cx| {
+                        view.pending_source_path = Some(path.display().to_string());
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                view.update(cx, |view, cx| {
+                    view.record_status(format!("Could not open folder browser: {error}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+            Err(_) => {}
+        })
+        .detach();
+    }
+
+    fn load_github_repositories(&mut self, cx: &mut Context<Self>) {
+        let node_id = self
+            .source_dialog
+            .as_ref()
+            .map(|dialog| match dialog.purpose {
+                SessionSourceDialogPurpose::StartSession => self.default_backend_node_id.clone(),
+                SessionSourceDialogPurpose::AddToSession => self
+                    .session_node_ids
+                    .get(&self.active_session.id)
+                    .cloned()
+                    .unwrap_or_else(|| self.default_backend_node_id.clone()),
+            });
+        let Some(node_id) = node_id else {
+            return;
+        };
+        if let Some(dialog) = &mut self.source_dialog {
+            dialog.repositories_loading = true;
+            dialog.error = None;
+        }
+        self.dispatch_to_node(
+            cx,
+            node_id,
+            ClientRequest::ListGitHubRepositories,
+            |view, response, _| {
+                if let Some(dialog) = &mut view.source_dialog {
+                    dialog.repositories_loading = false;
+                    match response.result {
+                        Ok(ServerResponse::GitHubRepositories { repositories }) => {
+                            dialog.repositories = repositories;
+                            dialog.error = None;
+                        }
+                        Err(error) => dialog.error = Some(error.message),
+                        Ok(response) => {
+                            dialog.error = Some(
+                                unexpected_response("GitHub repository list", response).message,
+                            )
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    fn confirm_source_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.source_dialog.take() else {
+            return;
+        };
+        let local_path = self
+            .source_path_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        let source = match dialog.choice {
+            SessionSourceChoice::Empty => None,
+            SessionSourceChoice::LocalDirectory => {
+                let path = local_path.trim();
+                if path.is_empty() || !PathBuf::from(path).is_absolute() {
+                    self.source_dialog = Some(dialog);
+                    self.record_status("Enter an absolute local directory path");
+                    return;
+                }
+                Some(SessionCreationSource::LocalDirectory(path.to_owned()))
+            }
+            SessionSourceChoice::GitHub => {
+                let selected_repository = dialog.selected_repository.as_deref();
+                let Some(repository) = dialog
+                    .repositories
+                    .iter()
+                    .find(|repository| selected_repository == Some(repository.full_name.as_str()))
+                    .cloned()
+                else {
+                    self.source_dialog = Some(dialog);
+                    self.record_status("Choose a GitHub repository");
+                    return;
+                };
+                Some(SessionCreationSource::GitHub(repository))
+            }
+        };
+        self.source_dialog = None;
+        self.source_path_input = None;
+        self.repository_filter_input = None;
+        match dialog.purpose {
+            SessionSourceDialogPurpose::StartSession => {
+                let name = source.as_ref().map_or_else(
+                    || format!("Session {}", self.sessions.len().saturating_add(1)),
+                    session_name_for_source,
+                );
+                self.create_session_on_node_with_source(
+                    self.default_backend_node_id.clone(),
+                    name,
+                    source,
+                    cx,
+                );
+            }
+            SessionSourceDialogPurpose::AddToSession => {
+                if let Some(source) = source {
+                    self.add_source_to_active_session(source, cx);
+                }
+            }
+        }
+    }
+
+    fn add_source_to_active_session(
+        &mut self,
+        source: SessionCreationSource,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = self.active_session.id;
+        match source {
+            SessionCreationSource::LocalDirectory(source) => self.dispatch(
+                cx,
+                ClientRequest::AttachSessionDirectory {
+                    session_id,
+                    source,
+                    path: format!("sources/{}", uuid::Uuid::new_v4()),
+                },
+                |view, response, cx| match response.result {
+                    Ok(ServerResponse::SessionDirectoryAttached {
+                        directory,
+                        repositories,
+                    }) => {
+                        view.session_directories.push(directory);
+                        if let Some(repository) = repositories.first() {
+                            view.selected_repository_id = Some(repository.id);
+                        }
+                        view.session_repositories.extend(repositories);
+                        view.refresh_review(cx);
+                        cx.notify();
+                    }
+                    Err(error) => view.record_backend_error("attach directory", error),
+                    Ok(response) => view.record_backend_error(
+                        "attach directory",
+                        unexpected_response("directory attachment", response),
+                    ),
+                },
+            ),
+            SessionCreationSource::GitHub(repository) => {
+                let repository_id = RepositoryId::new();
+                self.dispatch(
+                    cx,
+                    ClientRequest::AttachSessionRepository {
+                        session_id,
+                        source: repository.clone_url,
+                        path: format!("repositories/{repository_id}"),
+                        revision: None,
+                    },
+                    move |view, response, cx| match response.result {
+                        Ok(ServerResponse::SessionRepositoryAttached(repository)) => {
+                            view.selected_repository_id = Some(repository.id);
+                            view.session_repositories.push(repository);
+                            view.refresh_review(cx);
+                        }
+                        Err(error) => view.record_backend_error("attach repository", error),
+                        Ok(response) => view.record_backend_error(
+                            "attach repository",
+                            unexpected_response("repository attachment", response),
+                        ),
+                    },
+                );
+            }
+        }
     }
 
     fn render_new_session_button(
@@ -5144,42 +5417,14 @@ impl LoomView {
         view: &Entity<Self>,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let targets = self.available_session_nodes();
-        let button = Button::new("new-session")
+        let _ = view;
+        Button::new("new-session")
             .icon(Icon::new(IconName::Plus))
             .ghost()
             .small()
-            .tooltip("Create a new session");
-        if targets.len() <= 1 {
-            button
-                .on_click(cx.listener(Self::new_session))
-                .into_any_element()
-        } else {
-            let default_node_id = self.default_backend_node_id.clone();
-            let view = view.clone();
-            button
-                .dropdown_menu(move |mut menu, _, _| {
-                    for (node_id, node_name) in targets.clone() {
-                        let target_view = view.clone();
-                        let is_default = node_id == default_node_id;
-                        let label = if is_default {
-                            format!("{node_name} (default)")
-                        } else {
-                            node_name.clone()
-                        };
-                        let target_node_id = node_id.clone();
-                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                            target_view.update(cx, |view, cx| {
-                                let name =
-                                    format!("Session {}", view.sessions.len().saturating_add(1));
-                                view.create_session_on_node(target_node_id.clone(), name, cx);
-                            });
-                        }));
-                    }
-                    menu
-                })
-                .into_any_element()
-        }
+            .tooltip("Start a session")
+            .on_click(cx.listener(Self::new_session))
+            .into_any_element()
     }
 
     fn select_workspace(&mut self, workspace: WorkspaceRecord, cx: &mut Context<Self>) {
@@ -5217,7 +5462,9 @@ impl LoomView {
                     if let Some(session) = view.sessions.first().cloned() {
                         view.select_session(session, cx);
                     } else {
-                        view.create_session_async("New session".to_owned(), cx);
+                        view.activate_session(empty_session_snapshot(workspace_id));
+                        view.review.open = false;
+                        cx.notify();
                     }
                 }
                 Err(error) => view.record_backend_error("workspace session list", error),
@@ -5257,6 +5504,16 @@ impl LoomView {
     }
 
     fn create_session_on_node(&mut self, node_id: String, name: String, cx: &mut Context<Self>) {
+        self.create_session_on_node_with_source(node_id, name, None, cx);
+    }
+
+    fn create_session_on_node_with_source(
+        &mut self,
+        node_id: String,
+        name: String,
+        source: Option<SessionCreationSource>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(backend) = self.node_backends.get(&node_id).cloned() else {
             self.record_backend_error(
                 "create session",
@@ -5270,8 +5527,6 @@ impl LoomView {
             return;
         };
         let workspace_id = self.workspace_id;
-        let default_backend_node_id = self.default_backend_node_id.clone();
-        let workspace_root = self.workspace_root.display().to_string();
         let Some(workspace) = self
             .workspaces
             .iter()
@@ -5349,26 +5604,47 @@ impl LoomView {
                     ServerResponse::AgentSessionCreated(snapshot) => snapshot,
                     response => return Err(unexpected_response("session creation", response)),
                 };
-                if node_id == default_backend_node_id
-                    && PathBuf::from(&workspace_root).join(".git").exists()
-                {
-                    let response = backend
-                        .submit(RequestEnvelope::new(
-                            ClientRequest::AttachSessionRepository {
+                let setup = match source {
+                    None => Ok(()),
+                    Some(SessionCreationSource::LocalDirectory(source)) => {
+                        let response = backend
+                            .submit(RequestEnvelope::new(ClientRequest::AttachSessionDirectory {
                                 session_id: snapshot.id,
-                                source: workspace_root,
-                                path: "repo".to_owned(),
-                                revision: None,
-                            },
-                        ))
-                        .wait()
-                        .await;
-                    match response.result? {
-                        ServerResponse::SessionRepositoryAttached(_) => {}
-                        response => {
-                            return Err(unexpected_response("repository attachment", response));
+                                source,
+                                path: format!("sources/{}", uuid::Uuid::new_v4()),
+                            }))
+                            .wait()
+                            .await;
+                        match response.result? {
+                            ServerResponse::SessionDirectoryAttached { .. } => Ok(()),
+                            response => Err(unexpected_response("directory attachment", response)),
                         }
                     }
+                    Some(SessionCreationSource::GitHub(repository)) => {
+                        let repository_id = RepositoryId::new();
+                        let response = backend
+                            .submit(RequestEnvelope::new(ClientRequest::AttachSessionRepository {
+                                session_id: snapshot.id,
+                                source: repository.clone_url,
+                                path: format!("repositories/{repository_id}"),
+                                revision: None,
+                            }))
+                            .wait()
+                            .await;
+                        match response.result? {
+                            ServerResponse::SessionRepositoryAttached(_) => Ok(()),
+                            response => Err(unexpected_response("repository attachment", response)),
+                        }
+                    }
+                };
+                if let Err(error) = setup {
+                    let _ = backend
+                        .submit(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
+                            session_id: snapshot.id,
+                        }))
+                        .wait()
+                        .await;
+                    return Err(error);
                 }
                 Ok(snapshot)
             }
@@ -5393,67 +5669,15 @@ impl LoomView {
     pub(crate) fn begin_session_rename(
         &mut self,
         session: AgentSessionSnapshot,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.select_session(session, cx);
         self.rename_dialog = Some(RenameDialogState {
             session: self.active_session.clone(),
-            input: TextBufferState::new(self.active_session.name.clone()),
+            input: self.active_session.name.clone(),
         });
-        self.rename_focus_handle.focus(window, cx);
-    }
-
-    fn begin_repository_attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.repository_dialog = Some(TextBufferState::new(""));
-        self.input_field = InputField::RepositorySource;
-        self.rename_focus_handle.focus(window, cx);
-        cx.notify();
-    }
-
-    fn confirm_repository_attach(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.repository_dialog.take() else {
-            return;
-        };
-        self.input_field = InputField::Composer;
-        let source = dialog.text.trim().to_owned();
-        if source.is_empty() {
-            self.repository_dialog = Some(dialog);
-            self.input_field = InputField::RepositorySource;
-            self.record_status("Enter a repository URL or absolute local path");
-            return;
-        }
-        let repository_id = RepositoryId::new();
-        self.dispatch(
-            cx,
-            ClientRequest::AttachSessionRepository {
-                session_id: self.active_session.id,
-                source,
-                path: format!("repositories/{repository_id}"),
-                revision: None,
-            },
-            move |view, response, cx| match response.result {
-                Ok(ServerResponse::SessionRepositoryAttached(repository)) => {
-                    let repository_id = repository.id;
-                    view.session_repositories.push(repository);
-                    view.selected_repository_id = Some(repository_id);
-                    view.refresh_review(cx);
-                }
-                Err(error) => {
-                    view.repository_dialog = Some(dialog);
-                    view.input_field = InputField::RepositorySource;
-                    view.record_backend_error("attach repository", error);
-                }
-                Ok(response) => {
-                    view.repository_dialog = Some(dialog);
-                    view.input_field = InputField::RepositorySource;
-                    view.record_backend_error(
-                        "attach repository",
-                        unexpected_response("repository attachment", response),
-                    );
-                }
-            },
-        );
+        self.rename_input_state = None;
     }
 
     fn select_session_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -5506,31 +5730,47 @@ impl LoomView {
         );
     }
 
-    pub(crate) fn toggle_changes_sidebar(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.review.panel = ReviewPanel::Changes;
-        self.review.open = !self.review.open;
-        self.refresh_review(cx);
-        cx.notify();
+    fn detach_session_directory(&mut self, path: String, cx: &mut Context<Self>) {
+        self.dispatch(
+            cx,
+            ClientRequest::DetachSessionDirectory {
+                session_id: self.active_session.id,
+                path: path.clone(),
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::SessionDirectoryDetached) => {
+                    view.session_directories
+                        .retain(|directory| directory.path != path);
+                    view.session_repositories.retain(|repository| {
+                        repository.path != path && !repository.path.starts_with(&format!("{path}/"))
+                    });
+                    if !view
+                        .session_repositories
+                        .iter()
+                        .any(|repository| Some(repository.id) == view.selected_repository_id)
+                    {
+                        view.selected_repository_id = view
+                            .session_repositories
+                            .first()
+                            .map(|repository| repository.id);
+                    }
+                    view.refresh_review(cx);
+                }
+                Err(error) => view.record_backend_error("detach directory", error),
+                Ok(response) => view.record_backend_error(
+                    "detach directory",
+                    unexpected_response("directory detachment", response),
+                ),
+            },
+        );
     }
 
-    pub(crate) fn show_review(
-        &mut self,
-        _panel: ReviewPanel,
-        event: &ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.settings_open = false;
-        self.providers_open = false;
-        self.about_open = false;
-        self.github_login = None;
-        self.session_drawer_open = false;
-        self.toggle_changes_sidebar(event, window, cx);
+    fn toggle_review_pane(&mut self, cx: &mut Context<Self>) {
+        self.review.open = !self.review.open;
+        if self.review.open {
+            self.refresh_review(cx);
+        }
+        cx.notify();
     }
 
     pub(crate) fn close_review(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -5568,122 +5808,108 @@ impl LoomView {
         );
     }
 
-    pub(crate) fn render_session_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div().flex().flex_col().gap_1();
-        let view = cx.entity();
-        for (index, session) in self.sessions.iter().enumerate() {
-            let active = session.id == self.active_session.id;
-            let session = session.clone();
-            let selected_session = session.clone();
-            let node_indicator = self.render_session_node_indicator(session.id, index);
-            let card =
-                div()
-                    .id(("session", index))
-                    .relative()
-                    .w_full()
-                    .px_2()
-                    .py_3()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(if active { rgb(0x3b5d85) } else { rgb(0x242833) })
-                    .bg(if active { rgb(0x25334a) } else { rgb(0x1b1d24) })
-                    .text_color(if active { rgb(0xf3f4f6) } else { rgb(0xb7c0d0) })
-                    .cursor_pointer()
-                    .hover(|style| style.bg(if active { rgb(0x293b56) } else { rgb(0x20242c) }))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .child(
-                                div().text_sm().child(session.name.clone()).when(
-                                    session.state == AgentSessionState::Archived,
-                                    |element| element.text_color(rgb(0x64748b)),
-                                ),
-                            )
-                            .child(node_indicator),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(state_color(session.state))
-                            .child(session_state_label(session.state)),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_session(selected_session.clone(), cx);
-                    }));
-            let rename_session = session.clone();
-            let archive_session = session.clone();
-            let context_view = view.clone();
-            list = list.child(card.context_menu(move |menu, _, _| {
-                let rename_view = context_view.clone();
-                let archive_view = context_view.clone();
-                let rename_session = rename_session.clone();
-                let archive_session = archive_session.clone();
-                menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
-                    let rename_session = rename_session.clone();
-                    rename_view.update(cx, |view, cx| {
-                        view.begin_session_rename(rename_session, window, cx);
-                    });
-                }))
-                .item(PopupMenuItem::new("Archive").on_click(move |_, _, _cx| {
-                    let archive_session = archive_session.clone();
-                    archive_view.update(_cx, |view, cx| {
-                        view.select_session(archive_session, cx);
-                        view.archive_active(cx);
-                    });
-                }))
-            }));
-        }
-        if self.sessions.is_empty() {
-            list = list.child(
-                div()
-                    .p_2()
-                    .text_sm()
-                    .text_color(rgb(0x8f98a6))
-                    .child("No sessions"),
-            );
-        }
-        list
-    }
+    pub(crate) fn render_session_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entries = self
+            .sessions
+            .iter()
+            .map(|session| (session.id, session.name.clone()))
+            .collect::<Vec<_>>();
+        let tree_items = entries
+            .iter()
+            .map(|(id, name)| TreeItem::new(id.to_string(), name.clone()))
+            .collect::<Vec<_>>();
+        let selected_index = self
+            .sessions
+            .iter()
+            .position(|session| session.id == self.active_session.id);
+        let tree = if let Some(tree) = self.session_tree.clone() {
+            if self.session_tree_entries != entries {
+                tree.update(cx, |state, cx| state.set_items(tree_items, cx));
+                self.session_tree_entries = entries.clone();
+            }
+            if tree.read(cx).selected_index() != selected_index {
+                tree.update(cx, |state, cx| state.set_selected_index(selected_index, cx));
+            }
+            tree
+        } else {
+            self.session_tree_entries = entries.clone();
+            let tree = cx.new(|cx| TreeState::new(cx).items(tree_items));
+            if let Some(index) = selected_index {
+                tree.update(cx, |state, cx| state.set_selected_index(Some(index), cx));
+            }
+            self.session_tree = Some(tree.clone());
+            tree
+        };
 
-    fn render_repository_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut list = div().flex().flex_col().gap_1();
-        for (index, repository) in self.session_repositories.iter().enumerate() {
-            let repository = repository.clone();
-            let repository_id = repository.id;
-            let active = self.selected_repository_id == Some(repository_id);
-            let view = cx.entity();
-            let detach_view = view.clone();
-            list = list.child(
-                div()
-                    .id(("session-repository", index))
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(if active { rgb(0x25334a) } else { rgb(0x1b1d24) })
-                    .text_xs()
-                    .text_color(if active { rgb(0xe5e7eb) } else { rgb(0x8f98a6) })
-                    .cursor_pointer()
-                    .child(repository.path.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_session_repository(repository_id, cx);
-                    }))
-                    .context_menu(move |menu, _, _| {
-                        let detach_view = detach_view.clone();
-                        menu.item(PopupMenuItem::new("Detach repository").on_click(
-                            move |_, _, cx| {
-                                detach_view.update(cx, |this, cx| {
-                                    this.detach_session_repository(repository_id, cx);
-                                });
-                            },
-                        ))
-                    }),
-            );
-        }
-        list
+        let sessions = self.sessions.clone();
+        let view = cx.entity();
+        let menu_sessions = sessions.clone();
+        let menu_view = view.clone();
+        KitTree::new(&tree, move |index, _, selected, _, app| {
+            let Some(session) = sessions.get(index).cloned() else {
+                return ListItem::new(("session-tree-root", index));
+            };
+            let node_indicator = view
+                .read(app)
+                .render_session_node_indicator(session.id, index);
+            let click_view = view.clone();
+            let click_session = session.clone();
+            ListItem::new(("session-tree-root", index))
+                .selected(selected)
+                .px_2()
+                .py_2()
+                .text_sm()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(AssetIconName::MessagesSquare)
+                                .size_4()
+                                .text_color(if selected {
+                                    rgb(0x93c5fd)
+                                } else {
+                                    rgb(0x8f98a6)
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .child(session.name.clone()),
+                        )
+                        .child(node_indicator),
+                )
+                .on_click(move |_, _, cx| {
+                    click_view.update(cx, |this, cx| {
+                        this.select_session(click_session.clone(), cx);
+                    });
+                })
+        })
+        .context_menu(move |index, _, menu, _window, _cx| {
+            let Some(session) = menu_sessions.get(index).cloned() else {
+                return menu;
+            };
+            let rename_view = menu_view.clone();
+            let archive_view = menu_view.clone();
+            let rename_session = session.clone();
+            menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                let rename_session = rename_session.clone();
+                rename_view.update(cx, |view, cx| {
+                    view.begin_session_rename(rename_session, window, cx);
+                });
+            }))
+            .item(PopupMenuItem::new("Archive").on_click(move |_, _, cx| {
+                archive_view.update(cx, |view, cx| {
+                    view.select_session(session.clone(), cx);
+                    view.archive_active(cx);
+                });
+            }))
+        })
+        .size_full()
     }
 
     fn render_session_node_indicator(
@@ -5874,10 +6100,7 @@ impl LoomView {
                     parent_for_toggle.update(cx, |this, cx| this.toggle_activity(activity_id, cx));
                 })
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
+                    session_header_title()
                         .child(
                             div()
                                 .w(px(12.))
@@ -6500,8 +6723,9 @@ impl LoomView {
     }
 
     fn render_composer(
-        &self,
+        &mut self,
         layout: ResponsiveLayout,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let placeholder = if self.pending_input.is_some() {
@@ -6513,6 +6737,19 @@ impl LoomView {
         } else {
             "Describe a task..."
         };
+        let composer = self
+            .composer_input
+            .as_ref()
+            .expect("composer input initialized before rendering");
+        if self.composer_placeholder.as_deref() != Some(placeholder) {
+            composer.update(cx, |state, cx| {
+                state.set_placeholder(placeholder, window, cx)
+            });
+            self.composer_placeholder = Some(placeholder.to_owned());
+            // Store the last presented placeholder so updating the component
+            // does not keep invalidating the view on every render.
+            // This is presentation state only; the text stays in InputState.
+        }
         div()
             .w_full()
             .p_3()
@@ -6529,27 +6766,13 @@ impl LoomView {
                     .border_1()
                     .border_color(rgb(0x3b4555))
                     .text_color(rgb(0xe5e7eb))
-                    .key_context("Composer")
-                    .track_focus(&self.composer_focus_handle)
-                    .cursor(CursorStyle::IBeam)
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_composer))
-                    .on_action(cx.listener(Self::backspace))
-                    .on_action(cx.listener(Self::delete))
-                    .on_action(cx.listener(Self::left))
-                    .on_action(cx.listener(Self::right))
-                    .on_action(cx.listener(Self::select_all))
-                    .on_action(cx.listener(Self::home))
-                    .on_action(cx.listener(Self::end))
-                    .on_action(cx.listener(Self::paste))
-                    .on_action(cx.listener(Self::copy))
-                    .on_action(cx.listener(Self::submit))
-                    .child(TextInputElement {
-                        view: cx.entity(),
-                        field: InputField::Composer,
-                    })
-                    .when(self.composer.text.is_empty(), |element| {
-                        element.child(div().text_sm().text_color(rgb(0x64748b)).child(placeholder))
-                    }),
+                    .child(
+                        Textarea::new(composer)
+                            .aria_label(placeholder)
+                            .h(px(72.))
+                            .appearance(false)
+                            .bordered(false),
+                    ),
             )
             .child(
                 div()
@@ -6607,34 +6830,15 @@ impl LoomView {
                     .child(format!("Current name: {}", dialog.session.name)),
             )
             .child(
-                div()
-                    .mt_3()
-                    .w_full()
-                    .min_h(px(34.))
-                    .p_2()
-                    .rounded_sm()
-                    .bg(rgb(0x0f1115))
-                    .border_1()
-                    .border_color(rgb(0x3b4555))
-                    .text_color(rgb(0xe5e7eb))
-                    .key_context("RenameDialog")
-                    .track_focus(&self.rename_focus_handle)
-                    .cursor(CursorStyle::IBeam)
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_rename))
-                    .on_action(cx.listener(Self::backspace))
-                    .on_action(cx.listener(Self::delete))
-                    .on_action(cx.listener(Self::left))
-                    .on_action(cx.listener(Self::right))
-                    .on_action(cx.listener(Self::select_all))
-                    .on_action(cx.listener(Self::home))
-                    .on_action(cx.listener(Self::end))
-                    .on_action(cx.listener(Self::paste))
-                    .on_action(cx.listener(Self::copy))
-                    .on_action(cx.listener(Self::submit))
-                    .child(TextInputElement {
-                        view: cx.entity(),
-                        field: InputField::Rename,
-                    }),
+                div().mt_3().child(
+                    KitInput::new(
+                        self.rename_input_state
+                            .as_ref()
+                            .expect("rename input initialized before rendering"),
+                    )
+                    .id("rename-session-input")
+                    .small(),
+                ),
             )
             .child(
                 div()
@@ -6678,17 +6882,208 @@ impl LoomView {
             .into_any()
     }
 
-    fn render_repository_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.repository_dialog.is_none() {
+    fn render_source_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(dialog) = &self.source_dialog else {
             return div().into_any();
+        };
+        let is_start = dialog.purpose == SessionSourceDialogPurpose::StartSession;
+        let selected_repo = dialog.selected_repository.as_deref();
+        let repository_query = self
+            .repository_filter_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default()
+            .trim()
+            .to_lowercase();
+        let mut repository_rows = div().mt_2().flex().flex_col().gap_1();
+        let mut filtered_repository_count = 0;
+        for repository in &dialog.repositories {
+            let searchable = format!(
+                "{} {}",
+                repository.full_name,
+                repository.description.as_deref().unwrap_or_default()
+            )
+            .to_lowercase();
+            if !searchable.contains(&repository_query) {
+                continue;
+            }
+            filtered_repository_count += 1;
+            let name = repository.full_name.clone();
+            let selected = selected_repo == Some(name.as_str());
+            repository_rows = repository_rows.child(
+                div()
+                    .id(format!("github-repository-{name}"))
+                    .p_2()
+                    .rounded_sm()
+                    .bg(if selected {
+                        rgb(0x263b58)
+                    } else {
+                        rgb(0x171c25)
+                    })
+                    .border_1()
+                    .border_color(if selected {
+                        rgb(0x2563eb)
+                    } else {
+                        rgb(0x293244)
+                    })
+                    .cursor_pointer()
+                    .child(div().text_sm().child(name.clone()))
+                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                        repository.description.clone().unwrap_or_else(|| {
+                            if repository.private {
+                                "Private repository"
+                            } else {
+                                "Public repository"
+                            }
+                            .to_owned()
+                        }),
+                    ))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(dialog) = &mut this.source_dialog {
+                            dialog.selected_repository = Some(name.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
         }
+
+        let mut dialog_body = div().mt_3();
+        if dialog.choice == SessionSourceChoice::LocalDirectory {
+            dialog_body = dialog_body
+                .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                    "Attach a local folder in place. Git repositories in that folder are available for review.",
+                ))
+                .child(
+                    div()
+                        .mt_2()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(34.))
+                                .px_2()
+                                .rounded_sm()
+                                .bg(rgb(0x0f1115))
+                                .border_1()
+                                .border_color(rgb(0x3b4555))
+                                .child(
+                                    KitInput::new(
+                                        self.source_path_input
+                                            .as_ref()
+                                            .expect("source input initialized before rendering"),
+                                    )
+                                    .id("local-session-directory-path")
+                                    .appearance(false)
+                                    .bordered(false),
+                                ),
+                        )
+                        .when(cfg!(not(target_family = "wasm")), |row| {
+                            row.child(
+                                Button::new("browse-local-session-directory")
+                                    .label("Browse…")
+                                    .small()
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.browse_local_directory(cx);
+                                    })),
+                            )
+                        }),
+                );
+        } else if dialog.choice == SessionSourceChoice::GitHub {
+            dialog_body = if dialog.repositories_loading {
+                dialog_body.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x8f98a6))
+                        .child("Loading repositories…"),
+                )
+            } else if let Some(error) = &dialog.error {
+                dialog_body
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xfca5a5))
+                            .child(error.clone()),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(rgb(0x8f98a6))
+                            .child("Connect GitHub in Settings to browse repositories."),
+                    )
+                    .child(
+                        Button::new("connect-github-from-repository-picker")
+                            .label("Open GitHub settings")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.source_dialog = None;
+                                this.open_settings_from_menu(cx);
+                            })),
+                    )
+            } else if dialog.repositories.is_empty() {
+                dialog_body.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x8f98a6))
+                        .child("No repositories found."),
+                )
+            } else {
+                dialog_body
+                    .child(
+                        KitInput::new(
+                            self.repository_filter_input
+                                .as_ref()
+                                .expect("repository filter initialized before rendering"),
+                        )
+                        .id("github-repository-filter")
+                        .small()
+                        .into_any_element(),
+                    )
+                    .child(if filtered_repository_count == 0 {
+                        div()
+                            .mt_2()
+                            .text_sm()
+                            .text_color(rgb(0x8f98a6))
+                            .child("No repositories match this filter.")
+                            .into_any_element()
+                    } else {
+                        div()
+                            .max_h(px(280.))
+                            .overflow_y_scrollbar()
+                            .child(repository_rows)
+                            .into_any_element()
+                    })
+            };
+        } else {
+            dialog_body = dialog_body
+                .text_sm()
+                .text_color(rgb(0x8f98a6))
+                .child("Start a new session with no files or repositories.");
+        }
+        if let Some(error) = &dialog.error
+            && dialog.choice != SessionSourceChoice::GitHub
+        {
+            dialog_body = dialog_body.child(
+                div()
+                    .mt_2()
+                    .text_xs()
+                    .text_color(rgb(0xfca5a5))
+                    .child(error.clone()),
+            );
+        }
+
         div()
-            .id("repository-dialog")
+            .id("session-source-dialog")
             .absolute()
-            .top(px(120.))
-            .left(px(280.))
-            .w(px(460.))
-            .p_3()
+            .top(px(80.))
+            .left(px(220.))
+            .w(px(560.))
+            .max_h(px(600.))
+            .overflow_y_scroll()
+            .p_4()
             .rounded_lg()
             .bg(rgb(0x1b1d24))
             .border_1()
@@ -6699,45 +7094,68 @@ impl LoomView {
                 div()
                     .text_sm()
                     .text_color(rgb(0xf3f4f6))
-                    .child("Attach repository"),
+                    .child(if is_start {
+                        "Start a session"
+                    } else {
+                        "Add to this session"
+                    }),
             )
             .child(
                 div()
                     .mt_1()
                     .text_xs()
                     .text_color(rgb(0x8f98a6))
-                    .child("Enter an HTTPS/SSH URL or an absolute local Git repository path."),
+                    .child(if is_start {
+                        "Choose what the new session starts with."
+                    } else {
+                        "Choose a repository or folder to add to the active session."
+                    }),
             )
             .child(
                 div()
                     .mt_3()
-                    .w_full()
-                    .min_h(px(34.))
-                    .p_2()
-                    .rounded_sm()
-                    .bg(rgb(0x0f1115))
-                    .border_1()
-                    .border_color(rgb(0x3b4555))
-                    .text_color(rgb(0xe5e7eb))
-                    .key_context("RenameDialog")
-                    .track_focus(&self.rename_focus_handle)
-                    .cursor(CursorStyle::IBeam)
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_rename))
-                    .on_action(cx.listener(Self::backspace))
-                    .on_action(cx.listener(Self::delete))
-                    .on_action(cx.listener(Self::left))
-                    .on_action(cx.listener(Self::right))
-                    .on_action(cx.listener(Self::select_all))
-                    .on_action(cx.listener(Self::home))
-                    .on_action(cx.listener(Self::end))
-                    .on_action(cx.listener(Self::paste))
-                    .on_action(cx.listener(Self::copy))
-                    .on_action(cx.listener(Self::submit))
-                    .child(TextInputElement {
-                        view: cx.entity(),
-                        field: InputField::RepositorySource,
-                    }),
+                    .flex()
+                    .gap_1()
+                    .when(is_start, |row| {
+                        row.child(
+                            Button::new("source-empty")
+                                .label("Empty session")
+                                .small()
+                                .when(dialog.choice == SessionSourceChoice::Empty, |button| {
+                                    button.primary()
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.choose_source(SessionSourceChoice::Empty, cx)
+                                })),
+                        )
+                    })
+                    .when(dialog.local_directory_available, |row| {
+                        row.child(
+                            Button::new("source-local-directory")
+                                .label("Local folder")
+                                .small()
+                                .when(
+                                    dialog.choice == SessionSourceChoice::LocalDirectory,
+                                    |button| button.primary(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.choose_source(SessionSourceChoice::LocalDirectory, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("source-github")
+                            .label("GitHub repository")
+                            .small()
+                            .when(dialog.choice == SessionSourceChoice::GitHub, |button| {
+                                button.primary()
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.choose_source(SessionSourceChoice::GitHub, cx)
+                            })),
+                    ),
             )
+            .child(dialog_body)
             .child(
                 div()
                     .mt_3()
@@ -6746,7 +7164,7 @@ impl LoomView {
                     .gap_1()
                     .child(
                         div()
-                            .id("cancel-attach-repository")
+                            .id("cancel-session-source")
                             .px_2()
                             .py_1()
                             .rounded_sm()
@@ -6756,14 +7174,13 @@ impl LoomView {
                             .cursor_pointer()
                             .child("Cancel")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.repository_dialog = None;
-                                this.input_field = InputField::Composer;
+                                this.source_dialog = None;
                                 cx.notify();
                             })),
                     )
                     .child(
                         div()
-                            .id("confirm-attach-repository")
+                            .id("confirm-session-source")
                             .px_2()
                             .py_1()
                             .rounded_sm()
@@ -6771,9 +7188,13 @@ impl LoomView {
                             .text_sm()
                             .text_color(rgb(0xffffff))
                             .cursor_pointer()
-                            .child("Attach")
+                            .child(if is_start {
+                                "Start session"
+                            } else {
+                                "Add to session"
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.confirm_repository_attach(cx);
+                                this.confirm_source_dialog(cx);
                                 cx.notify();
                             })),
                     ),
@@ -6909,7 +7330,7 @@ impl LoomView {
             GitHubLoginState::Success => div()
                 .text_sm()
                 .text_color(rgb(0x9ad7bd))
-                .child("GitHub Copilot is connected. You can now use its models."),
+                .child("GitHub is connected. Repository browsing and the GitHub Copilot provider are available."),
             GitHubLoginState::Error(error) => div()
                 .text_sm()
                 .text_color(rgb(0xfca5a5))
@@ -6935,7 +7356,7 @@ impl LoomView {
                         div()
                             .text_sm()
                             .text_color(rgb(0xf3f4f6))
-                            .child("Connect GitHub Copilot"),
+                            .child("Connect GitHub account"),
                     )
                     .child(
                         div()
@@ -7060,28 +7481,17 @@ impl LoomView {
             )
             .child(
                 div()
-                    .mt_3()
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child("DEFAULT MODEL FOR NEW SESSIONS"),
+                    .mt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_sm()
+                            .child("Default model for new sessions"),
+                    )
+                    .child(body),
             )
-            .child(div().mt_2().child(body))
-            .child(
-                div()
-                    .mt_4()
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child("WORKER NODES"),
-            )
-            .when_some(self.browser_startup_error.as_deref(), |element, error| {
-                element.child(
-                    div()
-                        .mt_2()
-                        .text_xs()
-                        .text_color(rgb(0xfca5a5))
-                        .child(error.to_owned()),
-                )
-            })
             .child(
                 div()
                     .mt_2()
@@ -7128,6 +7538,74 @@ impl LoomView {
                             })),
                     ),
             )
+            .child(
+                div()
+                    .mt_5()
+                    .text_xs()
+                    .text_color(rgb(0x93c5fd))
+                    .child("GITHUB ACCOUNT"),
+            )
+            .child(
+                div()
+                    .mt_2()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(0x171c25))
+                    .border_1()
+                    .border_color(rgb(0x293244))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(div().text_sm().child("GitHub"))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if self.github_connected {
+                                        rgb(0x9ad7bd)
+                                    } else {
+                                        rgb(0xfef3c7)
+                                    })
+                                    .child(if self.github_connected {
+                                        "Connected"
+                                    } else {
+                                        "Not connected"
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(0x8f98a6))
+                            .child("Connect GitHub to browse and clone repositories. This also adds GitHub Copilot as a model provider. GitHub access includes read and write permissions for repositories you can access."),
+                    )
+                    .when(!self.github_connected && self.login_enabled, |card| {
+                        card.child(
+                            Button::new("connect-github-account")
+                                .label("Connect GitHub")
+                                .small()
+                                .on_click(cx.listener(Self::toggle_github_login)),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .mt_4()
+                    .text_xs()
+                    .text_color(rgb(0x93c5fd))
+                    .child("WORKER NODES"),
+            )
+            .when_some(self.browser_startup_error.as_deref(), |element, error| {
+                element.child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(rgb(0xfca5a5))
+                        .child(error.to_owned()),
+                )
+            })
             .child(
                 div()
                     .mt_2()
@@ -7235,35 +7713,13 @@ impl LoomView {
                     .items_center()
                     .gap_2()
                     .child(
-                        div()
-                            .flex_1()
-                            .min_h(px(30.))
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(0x171c25))
-                            .border_1()
-                            .border_color(rgb(0x293244))
-                            .text_xs()
-                            .text_color(rgb(0xb7c0d0))
-                            .key_context("Composer")
-                            .track_focus(&self.node_focus_handle)
-                            .cursor(CursorStyle::IBeam)
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_node))
-                            .on_action(cx.listener(Self::backspace))
-                            .on_action(cx.listener(Self::delete))
-                            .on_action(cx.listener(Self::left))
-                            .on_action(cx.listener(Self::right))
-                            .on_action(cx.listener(Self::select_all))
-                            .on_action(cx.listener(Self::home))
-                            .on_action(cx.listener(Self::end))
-                            .on_action(cx.listener(Self::paste))
-                            .on_action(cx.listener(Self::copy))
-                            .on_action(cx.listener(Self::submit))
-                            .child(TextInputElement {
-                                view: cx.entity(),
-                                field: InputField::Node,
-                            }),
+                        KitInput::new(
+                            self.node_input_state
+                                .as_ref()
+                                .expect("worker connection input initialized before rendering"),
+                        )
+                        .id("worker-node-connection-input")
+                        .small(),
                     )
                     .child(
                         Button::new("connect-worker-node")
@@ -7453,7 +7909,7 @@ impl LoomView {
             }
         }
 
-        let mut github_card =
+        let github_card =
             div()
                 .p_3()
                 .rounded_lg()
@@ -7492,24 +7948,14 @@ impl LoomView {
                             if github_models == 1 { "" } else { "s" }
                         )
                     },
-                ));
-        if self.login_enabled && !self.github_connected {
-            github_card = github_card.child(
-                div()
-                    .id("connect-github-provider")
-                    .mt_3()
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .bg(rgb(0x2563eb))
-                    .hover(|style| style.bg(rgb(0x1d4ed8)))
-                    .text_xs()
-                    .text_color(rgb(0xffffff))
-                    .cursor_pointer()
-                    .child("Connect GitHub Copilot")
-                    .on_click(cx.listener(Self::toggle_github_login)),
-            );
-        }
+                ))
+                .child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child("Manage GitHub authentication in Settings. Connecting GitHub also adds this model provider."),
+                );
 
         div()
             .id("providers-dialog")
@@ -7580,7 +8026,7 @@ impl LoomView {
     }
 
     fn render_session_sidebar(
-        &self,
+        &mut self,
         view: &Entity<Self>,
         layout: ResponsiveLayout,
         cx: &mut Context<Self>,
@@ -7654,24 +8100,8 @@ impl LoomView {
                     .items_center()
                     .justify_between()
                     .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Sessions"))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                Button::new("attach-session-repository")
-                                    .label("+ Repo")
-                                    .ghost()
-                                    .small()
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.begin_repository_attach(window, cx);
-                                    })),
-                            )
-                            .child(self.render_new_session_button(view, cx)),
-                    ),
+                    .child(self.render_new_session_button(view, cx)),
             )
-            .child(self.render_repository_list(cx))
             .child(
                 div()
                     .flex_1()
@@ -7954,6 +8384,123 @@ impl Render for LoomView {
             self.composer_focus_handle.focus(window, cx);
             self.select_theme(ThemeChoice::System, window, cx);
         }
+        if self.composer_input.is_none() {
+            let input = cx.new(|cx| TextareaState::new(window, cx));
+            input.update(cx, |state, cx| state.focus(window, cx));
+            self.input_subscriptions.push(cx.subscribe(
+                &input,
+                |view, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::PressEnter { shift: false, .. }) {
+                        view.submit_composer(cx);
+                    }
+                },
+            ));
+            self.composer_input = Some(input);
+        }
+        if self.clear_composer_on_render {
+            if let Some(input) = self.composer_input.as_ref() {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+            self.clear_composer_on_render = false;
+        }
+        if self.node_input_state.is_none() {
+            let initial_value = self.node_input_initial.clone();
+            let input = cx.new(|cx| InputState::new(window, cx).default_value(initial_value));
+            if self.settings_open {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+            self.input_subscriptions.push(cx.subscribe(
+                &input,
+                |view, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        view.connect_worker_node(cx);
+                    }
+                },
+            ));
+            self.node_input_state = Some(input);
+        }
+        if self.clear_node_on_render {
+            if let Some(input) = self.node_input_state.as_ref() {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+            self.clear_node_on_render = false;
+        }
+        if self.rename_dialog.is_some() && self.rename_input_state.is_none() {
+            let initial_value = self
+                .rename_dialog
+                .as_ref()
+                .map(|dialog| dialog.input.clone())
+                .unwrap_or_default();
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(initial_value)
+                    .placeholder("Session name")
+            });
+            input.update(cx, |state, cx| state.focus(window, cx));
+            self.input_subscriptions.push(cx.subscribe(
+                &input,
+                |view, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        view.confirm_rename(cx);
+                    }
+                },
+            ));
+            self.rename_input_state = Some(input);
+        }
+        if let Some(path) = self.pending_source_path.take() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(path)
+                    .placeholder("Absolute folder path")
+            });
+            input.update(cx, |state, cx| state.focus(window, cx));
+            self.input_subscriptions.push(cx.subscribe(
+                &input,
+                |view, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        view.confirm_source_dialog(cx);
+                    }
+                },
+            ));
+            self.source_path_input = Some(input);
+        }
+        if self
+            .source_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.choice == SessionSourceChoice::LocalDirectory)
+            && self.source_path_input.is_none()
+            && self.pending_source_path.is_none()
+        {
+            let input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Absolute folder path"));
+            input.update(cx, |state, cx| state.focus(window, cx));
+            self.input_subscriptions.push(cx.subscribe(
+                &input,
+                |view, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        view.confirm_source_dialog(cx);
+                    }
+                },
+            ));
+            self.source_path_input = Some(input);
+        }
+        if self.source_dialog.as_ref().is_some_and(|dialog| {
+            dialog.choice == SessionSourceChoice::GitHub && dialog.filter_subscription.is_none()
+        }) {
+            let filter = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Filter by repository name or description")
+            });
+            filter.update(cx, |state, cx| state.focus(window, cx));
+            let subscription = cx.subscribe(&filter, |_, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            });
+            self.repository_filter_input = Some(filter);
+            if let Some(dialog) = &mut self.source_dialog {
+                dialog.filter_subscription = Some(subscription);
+            }
+        }
         self.schedule_worker_node_poll(cx);
         self.sync_model_select_states(window, cx);
         self.sync_agent_mode_select_state(window, cx);
@@ -8018,7 +8565,12 @@ impl Render for LoomView {
                             })
                             .child(div().text_xs().text_color(rgb(0x8f98a6)).child(format!(
                                 "{}  ·  {}",
-                                workspace_name, self.active_session.name
+                                workspace_name,
+                                if self.sessions.is_empty() {
+                                    "No session"
+                                } else {
+                                    &self.active_session.name
+                                }
                             ))),
                     )
                     .when(!cfg!(target_family = "wasm"), |element| {
@@ -8129,240 +8681,129 @@ impl Render for LoomView {
                                                     }),
                                             ),
                                     )
-                                    .when(false, |element| {
-                                        element.child(
-                                            div()
-                                                .flex()
-                                                .gap_1()
-                                                .child(
-                                                    div()
-                                                        .id("review-changes")
-                                                        .w(px(28.))
-                                                        .h(px(26.))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .rounded_sm()
-                                                        .bg(rgb(0x20242c))
-                                                        .hover(|style| style.bg(rgb(0x293244)))
-                                                        .text_sm()
-                                                        .text_color(rgb(0x94a3b8))
-                                                        .cursor_pointer()
-                                                        .tooltip(|_, cx| {
-                                                            cx.new(|_| LoomTooltip {
-                                                                text: "Changed files".into(),
-                                                            })
-                                                            .into()
-                                                        })
-                                                        .child(
-                                                            Icon::new(IconName::FileText).size_4(),
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            |this, event, window, cx| {
-                                                                this.show_review(
-                                                                    ReviewPanel::Changes,
-                                                                    event,
-                                                                    window,
+                                    .child(
+                                        session_header_actions()
+                                            .child(header_tooltip("session-sources-tooltip", "Session sources",
+                                        Button::new("session-sources")
+                                            .icon(Icon::new(AssetIconName::ListTree))
+                                            .ghost()
+                                            .small()
+                                            .dropdown_menu({
+                                                let view = view.clone();
+                                                let repositories = self.session_repositories.clone();
+                                                let directories = self.session_directories.clone();
+                                                let selected_repository_id = self.selected_repository_id;
+                                                move |mut menu, window, cx| {
+                                                    menu = menu.label("Session sources");
+                                                    let add_view = view.clone();
+                                                    menu = menu.item(PopupMenuItem::new("Add source…").on_click(
+                                                        move |_, _, cx| {
+                                                            add_view.update(cx, |this, cx| {
+                                                                this.begin_source_dialog(
+                                                                    SessionSourceDialogPurpose::AddToSession,
                                                                     cx,
+                                                                );
+                                                            });
+                                                        },
+                                                    ));
+                                                    if directories.is_empty() && repositories.is_empty() {
+                                                        menu = menu.separator().label("No sources attached");
+                                                    } else {
+                                                        menu = menu.separator();
+                                                    }
+                                                    for directory in &directories {
+                                                        let detach_view = view.clone();
+                                                        let path = directory.path.clone();
+                                                        let root_repository = repositories.iter().find(|repository| repository.path == directory.path);
+                                                        let name = Path::new(&directory.source)
+                                                            .file_name()
+                                                            .map(|name| name.to_string_lossy().into_owned())
+                                                            .unwrap_or_else(|| directory.source.clone());
+                                                        let label = if root_repository.is_some() {
+                                                            format!("Git repository: {name}")
+                                                        } else {
+                                                            format!("Folder: {name}")
+                                                        };
+                                                        let source_menu = PopupMenu::build(window, cx, |mut menu, _, _| {
+                                                            menu = menu.label(directory.source.clone());
+                                                            if let Some(repository) = root_repository {
+                                                                let repository_id = repository.id;
+                                                                let select_view = view.clone();
+                                                                menu = menu.item(
+                                                                    PopupMenuItem::new("Select for review")
+                                                                        .checked(selected_repository_id == Some(repository_id))
+                                                                        .on_click(move |_, _, cx| {
+                                                                            select_view.update(cx, |this, cx| {
+                                                                                this.select_session_repository(repository_id, cx);
+                                                                            });
+                                                                        }),
+                                                                );
+                                                            }
+                                                            menu.item(PopupMenuItem::new("Detach source")
+                                                                .on_click(move |_, _, cx| {
+                                                                    detach_view.update(cx, |this, cx| {
+                                                                        this.detach_session_directory(path.clone(), cx);
+                                                                    });
+                                                                }))
+                                                        });
+                                                        menu = menu.item(PopupMenuItem::submenu(
+                                                            label, source_menu,
+                                                        ));
+                                                    }
+                                                    let other_repositories = repositories.iter().filter(|repository| {
+                                                        !directories.iter().any(|directory| directory.path == repository.path)
+                                                    }).collect::<Vec<_>>();
+                                                    if !other_repositories.is_empty() {
+                                                        menu = menu.separator().label("Git repositories");
+                                                        for repository in other_repositories {
+                                                            let repository_id = repository.id;
+                                                            let select_view = view.clone();
+                                                            let detach_view = view.clone();
+                                                            let source_menu = PopupMenu::build(window, cx, |menu, _, _| {
+                                                                menu.label(repository.source.clone()).item(
+                                                                    PopupMenuItem::new("Select for review")
+                                                                        .checked(selected_repository_id == Some(repository_id))
+                                                                        .on_click(move |_, _, cx| {
+                                                                            select_view.update(cx, |this, cx| {
+                                                                                this.select_session_repository(repository_id, cx);
+                                                                            });
+                                                                        }),
                                                                 )
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("review-diff")
-                                                        .w(px(28.))
-                                                        .h(px(26.))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .rounded_sm()
-                                                        .bg(rgb(0x20242c))
-                                                        .hover(|style| style.bg(rgb(0x293244)))
-                                                        .text_sm()
-                                                        .text_color(rgb(0x94a3b8))
-                                                        .cursor_pointer()
-                                                        .tooltip(|_, cx| {
-                                                            cx.new(|_| LoomTooltip {
-                                                                text: "Read-only diff".into(),
-                                                            })
-                                                            .into()
-                                                        })
-                                                        .child(
-                                                            Icon::new(IconName::FileText).size_4(),
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            |this, event, window, cx| {
-                                                                this.show_review(
-                                                                    ReviewPanel::Diff,
-                                                                    event,
-                                                                    window,
-                                                                    cx,
+                                                                .item(
+                                                                    PopupMenuItem::new("Detach source")
+                                                                        .on_click(move |_, _, cx| {
+                                                                            detach_view.update(cx, |this, cx| {
+                                                                                this.detach_session_repository(repository_id, cx);
+                                                                            });
+                                                                        }),
                                                                 )
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("review-evidence")
-                                                        .w(px(28.))
-                                                        .h(px(26.))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .rounded_sm()
-                                                        .bg(rgb(0x20242c))
-                                                        .hover(|style| style.bg(rgb(0x293244)))
-                                                        .text_sm()
-                                                        .text_color(rgb(0x94a3b8))
-                                                        .cursor_pointer()
-                                                        .tooltip(|_, cx| {
-                                                            cx.new(|_| LoomTooltip {
-                                                                text: "Task evidence".into(),
-                                                            })
-                                                            .into()
-                                                        })
-                                                        .child(Icon::new(IconName::Check).size_4())
-                                                        .on_click(cx.listener(
-                                                            |this, event, window, cx| {
-                                                                this.show_review(
-                                                                    ReviewPanel::Evidence,
-                                                                    event,
-                                                                    window,
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        )),
-                                                )
-                                                .when(
-                                                    self.workspace_root
-                                                        .join("Cargo.toml")
-                                                        .is_file(),
-                                                    |element| {
-                                                        element
-                                                            .child(
-                                                                div()
-                                                                    .id("run-build")
-                                                                    .w(px(28.))
-                                                                    .h(px(26.))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .rounded_sm()
-                                                                    .bg(rgb(0x20242c))
-                                                                    .hover(|style| {
-                                                                        style.bg(rgb(0x293244))
-                                                                    })
-                                                                    .text_sm()
-                                                                    .text_color(rgb(0x94a3b8))
-                                                                    .cursor_pointer()
-                                                                    .tooltip(|_, cx| {
-                                                                        cx.new(|_| LoomTooltip {
-                                                                            text: "Run cargo check"
-                                                                                .into(),
-                                                                        })
-                                                                        .into()
-                                                                    })
-                                                                    .child(
-                                                                        Icon::new(IconName::Check)
-                                                                            .size_4(),
-                                                                    )
-                                                                    .on_click(
-                                                                        cx.listener(
-                                                                            |_, _, _, _| {},
-                                                                        ),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .id("run-tests")
-                                                                    .w(px(28.))
-                                                                    .h(px(26.))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .rounded_sm()
-                                                                    .bg(rgb(0x20242c))
-                                                                    .hover(|style| {
-                                                                        style.bg(rgb(0x293244))
-                                                                    })
-                                                                    .text_sm()
-                                                                    .text_color(rgb(0x94a3b8))
-                                                                    .cursor_pointer()
-                                                                    .tooltip(|_, cx| {
-                                                                        cx.new(|_| LoomTooltip {
-                                                                            text: "Run cargo test"
-                                                                                .into(),
-                                                                        })
-                                                                        .into()
-                                                                    })
-                                                                    .child("T")
-                                                                    .on_click(
-                                                                        cx.listener(
-                                                                            |_, _, _, _| {},
-                                                                        ),
-                                                                    ),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .id("run-lint")
-                                                                    .w(px(28.))
-                                                                    .h(px(26.))
-                                                                    .flex()
-                                                                    .items_center()
-                                                                    .justify_center()
-                                                                    .rounded_sm()
-                                                                    .bg(rgb(0x20242c))
-                                                                    .hover(|style| {
-                                                                        style.bg(rgb(0x293244))
-                                                                    })
-                                                                    .text_sm()
-                                                                    .text_color(rgb(0x94a3b8))
-                                                                    .cursor_pointer()
-                                                                    .tooltip(|_, cx| {
-                                                                        cx.new(|_| LoomTooltip {
-                                                                            text:
-                                                                                "Run cargo clippy"
-                                                                                    .into(),
-                                                                        })
-                                                                        .into()
-                                                                    })
-                                                                    .child(
-                                                                        Icon::new(
-                                                                            IconName::FileText,
-                                                                        )
-                                                                        .size_4(),
-                                                                    )
-                                                                    .on_click(
-                                                                        cx.listener(
-                                                                            |_, _, _, _| {},
-                                                                        ),
-                                                                    ),
-                                                            )
-                                                    },
-                                                )
-                                                .when(false, |element| element),
-                                        )
-                                    })
-                                    .when(!self.review.open, |element| {
-                                        element.child(
-                                            Button::new("toggle-review-sidebar")
-                                                .label("Review")
-                                                .icon(Icon::new(IconName::PanelRight))
-                                                .ghost()
-                                                .small()
-                                                .on_click(cx.listener(
-                                                    |this, event, window, cx| {
-                                                        this.show_review(
-                                                            ReviewPanel::Changes,
-                                                            event,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    },
-                                                )),
-                                        )
-                                    }),
+                                                            });
+                                                            let name = Path::new(&repository.source)
+                                                                .file_name()
+                                                                .map(|name| name.to_string_lossy().into_owned())
+                                                                .unwrap_or_else(|| repository.source.clone());
+                                                            menu = menu.item(PopupMenuItem::submenu(name, source_menu));
+                                                        }
+                                                    }
+                                                    menu
+                                                }
+                                            }),
+                                            ))
+                                            .child(header_tooltip("toggle-review-sidebar-tooltip", "Toggle side panel",
+                                        Button::new("toggle-review-sidebar")
+                                            .icon(Icon::new(if self.review.open {
+                                                IconName::PanelRightClose
+                                            } else {
+                                                IconName::PanelRightOpen
+                                            }))
+                                            .ghost()
+                                            .small()
+                                            .when(self.review.open, |button| button.secondary())
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_review_pane(cx);
+                                            })),
+                                            )),
+                                    ),
                             )
                             .child(
                                 div()
@@ -8371,12 +8812,34 @@ impl Render for LoomView {
                                     .overflow_hidden()
                                     .child(self.timeline_entity(cx)),
                             )
-                            .child(self.render_composer(layout, cx))
+                            .child(self.render_composer(layout, window, cx))
+                            .when(self.sessions.is_empty(), |element| {
+                                element.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(0.))
+                                        .right(px(0.))
+                                        .bottom(px(0.))
+                                        .left(px(0.))
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_3()
+                                        .bg(rgb(0x111318))
+                                        .child(div().text_base().child("No sessions"))
+                                        .child(
+                                            Button::new("start-first-session")
+                                                .label("Start a session")
+                                                .on_click(cx.listener(Self::new_session)),
+                                        ),
+                                )
+                            })
                             .when(self.rename_dialog.is_some(), |element| {
                                 element.child(self.render_rename_dialog(cx))
                             })
-                            .when(self.repository_dialog.is_some(), |element| {
-                                element.child(self.render_repository_dialog(cx))
+                            .when(self.source_dialog.is_some(), |element| {
+                                element.child(self.render_source_dialog(cx))
                             })
                             .when(self.settings_open, |element| {
                                 element.child(self.render_settings_dialog(cx))
@@ -8419,6 +8882,7 @@ impl Render for LoomView {
                     })
                     .when(
                         self.review.open
+                            && !self.sessions.is_empty()
                             && !self.settings_open
                             && !self.about_open
                             && !self.providers_open
@@ -8441,7 +8905,11 @@ impl Render for LoomView {
                     .text_color(rgb(0x8f98a6))
                     .child(format!(
                         "{}  ·  {} updates  ·  {}",
-                        session_state_label(self.session_state),
+                        if self.sessions.is_empty() {
+                            "No session"
+                        } else {
+                            session_state_label(self.session_state)
+                        },
                         self.timeline.len(),
                         if self.demo_workspace {
                             "Demo workspace"
@@ -8526,6 +8994,112 @@ impl Render for LoomView {
                 }),
         }
         .into_any()
+    }
+}
+
+#[cfg(test)]
+mod session_name_tests {
+    use super::{SessionCreationSource, session_name_for_path, session_name_for_source};
+    use loom_protocol::GitHubRepository;
+    use std::path::Path;
+
+    #[test]
+    fn local_source_uses_its_folder_name() {
+        let source =
+            SessionCreationSource::LocalDirectory("/home/user/work/my-project/".to_owned());
+        assert_eq!(session_name_for_source(&source), "my-project");
+        assert_eq!(
+            session_name_for_path(Path::new("/home/user/work/my-project")),
+            Some("my-project".to_owned())
+        );
+    }
+
+    #[test]
+    fn github_source_uses_repository_name_without_owner() {
+        let source = SessionCreationSource::GitHub(GitHubRepository {
+            full_name: "bearmuckle/loom".to_owned(),
+            description: None,
+            clone_url: "https://github.com/bearmuckle/loom.git".to_owned(),
+            private: false,
+            default_branch: "main".to_owned(),
+        });
+        assert_eq!(session_name_for_source(&source), "loom");
+    }
+}
+
+#[cfg(test)]
+mod session_header_render_tests {
+    use super::{header_tooltip, session_header_actions, session_header_title};
+    use gpui_kit::component::button::Button;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use std::time::Duration;
+
+    struct SessionHeader;
+
+    impl Render for SessionHeader {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    session_header_title()
+                        .child("A long session name that must leave room for header actions"),
+                )
+                .child(
+                    session_header_actions()
+                        .child(header_tooltip(
+                            "session-sources-tooltip",
+                            "Session sources",
+                            Button::new("session-sources").icon(gpui_kit::component::Icon::new(
+                                gpui_kit::assets::IconName::ListTree,
+                            )),
+                        ))
+                        .child(Button::new("toggle-review-sidebar").icon(
+                            gpui_kit::component::Icon::new(
+                                gpui_kit::component::IconName::PanelRightOpen,
+                            ),
+                        )),
+                )
+        }
+    }
+
+    #[gpui_kit::test]
+    fn header_actions_remain_visible_at_desktop_width(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(950.), px(100.)), |_, _| SessionHeader);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let mut previous_right = px(0.);
+            for id in ["session-sources", "toggle-review-sidebar"] {
+                let action = window.find(id);
+                assert!(action.visible(), "{id} should be visible");
+                assert!(action.bounds().size.width > px(0.));
+                assert!(action.bounds().right() <= window.viewport_size().width);
+                assert!(action.bounds().left() >= previous_right);
+                previous_right = action.bounds().right();
+            }
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn header_tooltip_appears_on_hover(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(950.), px(100.)), |_, _| SessionHeader);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.hover("session-sources-tooltip", cx);
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_millis(1000), |window, _| {
+            window
+                .try_find("loom-header-tooltip")
+                .is_some_and(|tooltip| tooltip.visible())
+        })
+        .await;
     }
 }
 

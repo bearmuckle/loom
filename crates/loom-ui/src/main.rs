@@ -3,8 +3,7 @@
 //! Native Loom client.
 //!
 //! The client is split into a protocol client (`connection`), client-side
-//! projections (`state`), the GPUI view (`view`), input handling
-//! (`text_input`), window chrome (`theme`), and native platform adapters
+//! projections (`state`), the GPUI view (`view`), window chrome (`theme`), and native platform adapters
 //! (`platform`).
 
 #[cfg(target_family = "wasm")]
@@ -15,13 +14,12 @@ mod connection;
 #[cfg(not(target_family = "wasm"))]
 mod platform;
 mod state;
-mod text_input;
 mod theme;
 mod view;
 
 #[cfg(target_family = "wasm")]
 use crate::{browser::BrowserOptions, view::LoomView};
-use gpui_kit::{App, KeyBinding, prelude::*};
+use gpui_kit::{App, prelude::*};
 #[cfg(not(target_family = "wasm"))]
 use gpui_kit::{
     Bounds, TitlebarOptions, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
@@ -32,9 +30,6 @@ use log::{error, info};
 
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::describe_startup_connection_error;
-#[cfg(not(target_family = "wasm"))]
-use crate::text_input::Paste;
-use crate::text_input::{Backspace, Copy, Delete, End, Home, Left, Right, SelectAll, Submit};
 #[cfg(not(target_family = "wasm"))]
 use crate::{platform::UiOptions, view::LoomView};
 
@@ -53,31 +48,6 @@ fn init_logging() {
 pub(crate) const MAX_TIMELINE_OUTPUT: usize = 32 * 1024;
 pub(crate) const MAX_REVIEW_CHANGES: usize = 80;
 pub(crate) const MAX_REVIEW_DIFF: usize = 48 * 1024;
-
-/// Registers the composer's key bindings. Shared by native `main` and the
-/// browser's `start`, since the same [`crate::text_input::TextInputElement`]
-/// handles typing on both platforms.
-fn bind_composer_keys(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("backspace", Backspace, Some("Composer")),
-        KeyBinding::new("delete", Delete, Some("Composer")),
-        KeyBinding::new("left", Left, Some("Composer")),
-        KeyBinding::new("right", Right, Some("Composer")),
-        KeyBinding::new("cmd-a", SelectAll, Some("Composer")),
-        KeyBinding::new("ctrl-a", SelectAll, Some("Composer")),
-        KeyBinding::new("home", Home, Some("Composer")),
-        KeyBinding::new("end", End, Some("Composer")),
-        // The web backend handles browser paste events directly; its
-        // synchronous clipboard read API is unavailable on wasm.
-        #[cfg(not(target_family = "wasm"))]
-        KeyBinding::new("cmd-v", Paste, Some("Composer")),
-        #[cfg(not(target_family = "wasm"))]
-        KeyBinding::new("ctrl-v", Paste, Some("Composer")),
-        KeyBinding::new("cmd-c", Copy, Some("Composer")),
-        KeyBinding::new("ctrl-c", Copy, Some("Composer")),
-        KeyBinding::new("enter", Submit, Some("Composer")),
-    ]);
-}
 
 #[cfg(not(target_family = "wasm"))]
 fn main() {
@@ -106,13 +76,7 @@ fn main() {
             info!("initializing GPUI components");
             gpui_kit::init(cx);
             crate::theme::apply_theme(WindowAppearance::Dark, cx);
-            bind_composer_keys(cx);
-            let view = match LoomView::try_new(
-                &options,
-                cx.focus_handle(),
-                cx.focus_handle(),
-                cx.focus_handle(),
-            ) {
+            let view = match LoomView::try_new(&options, cx.focus_handle()) {
                 Ok(view) => view,
                 Err(error) => {
                     error!(
@@ -201,16 +165,8 @@ fn start_browser_client(cx: &mut App) {
         }
     };
     let focus_handle = cx.focus_handle();
-    let node_focus_handle = cx.focus_handle();
-    let rename_focus_handle = cx.focus_handle();
     let auto_connect = options.is_configured();
-    let view = LoomView::new_browser_disconnected(
-        &options,
-        startup_error,
-        focus_handle,
-        node_focus_handle,
-        rename_focus_handle,
-    );
+    let view = LoomView::new_browser_disconnected(&options, startup_error, focus_handle);
     let window = match cx.open_window(Default::default(), |_, cx| cx.new(|_| view)) {
         Ok(window) => window,
         Err(error) => {
@@ -261,7 +217,6 @@ pub fn start() {
             .expect("failed to load embedded font");
         gpui_kit::init(cx);
         crate::theme::apply_theme(gpui_kit::WindowAppearance::Dark, cx);
-        bind_composer_keys(cx);
         start_browser_client(cx);
     });
     APPLICATION.with(|slot| *slot.borrow_mut() = Some(application));

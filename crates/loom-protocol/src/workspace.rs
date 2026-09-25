@@ -46,6 +46,21 @@ pub struct SessionRepository {
     pub attached_at: Timestamp,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionDirectory {
+    pub source: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GitHubRepository {
+    pub full_name: String,
+    pub description: Option<String>,
+    pub clone_url: String,
+    pub private: bool,
+    pub default_branch: String,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceEntryKind {

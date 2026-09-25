@@ -79,8 +79,9 @@ The first release should optimize for this exact loop:
 
 1. Create or open a workspace; it does not need a folder or repository.
 2. Start a named agent session with a selected provider and model.
-3. Select one or more repositories and revisions for that session; Loom
-   creates their isolated checkouts under the session filesystem root.
+3. Select sources for that session. Loom creates isolated checkouts for remote
+   repositories; a native local directory is attached in place and uses its
+   original files.
 4. Enter a task in natural language and optionally attach an issue, files,
    prior sessions, or repository instructions.
 5. Let the agent inspect the repositories and present a plan.

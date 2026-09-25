@@ -4,7 +4,6 @@ use std::{cell::RefCell, rc::Rc};
 
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
 use gpui_kit::{App, Pixels, Point, ResizeEdge, Rgba, Styled, Tiling, WindowAppearance, px};
-use loom_core::AgentSessionState;
 
 pub(crate) const CLIENT_DECORATION_ROUNDING: Pixels = px(10.);
 pub(crate) const CLIENT_DECORATION_SHADOW: Pixels = px(10.);
@@ -74,7 +73,6 @@ struct ThemePalette {
     danger_surface: Rgba,
     warning_surface: Rgba,
     info_surface: Rgba,
-    selection: Rgba,
 }
 
 impl ThemePalette {
@@ -117,7 +115,6 @@ impl ThemePalette {
             } else {
                 gpui_kit::rgb(INFO_SURFACE_LATTE)
             },
-            selection: colors.selection.into(),
         }
     }
 
@@ -367,14 +364,6 @@ pub(crate) fn rgb(value: u32) -> Rgba {
     })
 }
 
-pub(crate) fn selection() -> Rgba {
-    ACTIVE_THEME.with(|active| {
-        active
-            .borrow()
-            .map_or_else(|| gpui_kit::rgba(0x335b8def), |palette| palette.selection)
-    })
-}
-
 pub(crate) fn apply_theme(appearance: WindowAppearance, cx: &mut App) {
     gpui_kit::component::Theme::change(appearance, None, cx);
     let dark = Theme::global(cx).is_dark();
@@ -387,16 +376,6 @@ pub(crate) fn apply_theme(appearance: WindowAppearance, cx: &mut App) {
     Theme::global_mut(cx).apply_config(&theme);
     Theme::change(mode, None, cx);
     sync_palette(cx);
-}
-
-pub(crate) fn state_color(state: AgentSessionState) -> Rgba {
-    match state {
-        AgentSessionState::Completed => rgb(0x9ad7bd),
-        AgentSessionState::Failed | AgentSessionState::Cancelled => rgb(0xfca5a5),
-        AgentSessionState::AwaitingApproval | AgentSessionState::NeedsInput => rgb(0xfef3c7),
-        AgentSessionState::Archived => rgb(0x64748b),
-        _ => rgb(0x93c5fd),
-    }
 }
 
 pub(crate) fn change_color(kind: loom_workspace::WorkspaceChangeKind) -> Rgba {

@@ -37,6 +37,7 @@ pub enum Capability {
     JsonProtocol,
     ManageWorkspaces,
     ManageSessionRepositories,
+    BrowseGitHubRepositories,
     ReadSessionFilesystem,
     WriteSessionFilesystem,
 }

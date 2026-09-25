@@ -680,6 +680,13 @@ impl ProviderRegistry {
         self.register(ProviderConfig::github_copilot(credential))
     }
 
+    /// Resolves the GitHub account token used by Copilot and repository
+    /// browsing. Callers must keep this token backend-only.
+    pub fn github_account_token(&self) -> Result<String> {
+        self.credentials
+            .resolve(&CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF))
+    }
+
     pub fn add_model(&self, provider_id: &ProviderId, model: ModelDescriptor) -> Result<()> {
         if model.id.as_str().trim().is_empty() || model.provider.as_str().trim().is_empty() {
             return Err(LoomError::invalid_request(
@@ -1418,7 +1425,7 @@ impl GitHubCopilotAuthenticator {
             .header("Content-Type", "application/json")
             .send_json(serde_json::json!({
                 "client_id": self.client_id.as_str(),
-                "scope": "read:user"
+                "scope": "read:user repo"
             }))
             .map_err(|error| normalize_oauth_error("GitHub device authorization", error))?;
         let mut response = ensure_success("GitHub device authorization", response)?;

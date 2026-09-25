@@ -3,7 +3,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use git2::{BranchType, DiffFormat, DiffOptions, Repository, Status, StatusOptions};
+use git2::{
+    BranchType, Cred, DiffFormat, DiffOptions, FetchOptions, RemoteCallbacks, Repository, Status,
+    StatusOptions, build::RepoBuilder,
+};
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
 pub use loom_protocol::{
     GitBranch, GitDiff, GitFileStatus, GitFileStatusKind, GitRepositoryStatus,
@@ -20,6 +23,15 @@ impl GitService {
         destination: impl AsRef<Path>,
         revision: Option<&str>,
     ) -> Result<Self> {
+        Self::clone_from_authenticated(source, destination, revision, None)
+    }
+
+    pub fn clone_from_authenticated(
+        source: impl AsRef<str>,
+        destination: impl AsRef<Path>,
+        revision: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<Self> {
         let destination = destination.as_ref();
         if destination.exists() {
             return Err(LoomError::conflict(format!(
@@ -27,8 +39,23 @@ impl GitService {
                 destination.display()
             )));
         }
-        let repository = Repository::clone(source.as_ref(), destination)
-            .map_err(|error| git_error("could not clone repository", error))?;
+        let repository = if let Some(token) = token {
+            let token = token.to_owned();
+            let mut callbacks = RemoteCallbacks::new();
+            callbacks.credentials(move |_url, username_from_url, _allowed_types| {
+                Cred::userpass_plaintext(username_from_url.unwrap_or("x-access-token"), &token)
+            });
+            let mut fetch_options = FetchOptions::new();
+            fetch_options.remote_callbacks(callbacks);
+            let mut builder = RepoBuilder::new();
+            builder.fetch_options(fetch_options);
+            builder
+                .clone(source.as_ref(), destination)
+                .map_err(|error| git_error("could not clone repository", error))?
+        } else {
+            Repository::clone(source.as_ref(), destination)
+                .map_err(|error| git_error("could not clone repository", error))?
+        };
         if let Some(revision) = revision {
             let object = repository
                 .revparse_single(revision)

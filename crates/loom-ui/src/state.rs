@@ -11,7 +11,7 @@ use loom_protocol::{
     SessionFilesystemChange, SessionFilesystemFile,
 };
 
-use crate::{MAX_TIMELINE_OUTPUT, text_input::TextBufferState};
+use crate::MAX_TIMELINE_OUTPUT;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReviewPanel {
@@ -83,7 +83,7 @@ pub(crate) struct ReviewState {
 #[derive(Clone, Debug)]
 pub(crate) struct RenameDialogState {
     pub(crate) session: AgentSessionSnapshot,
-    pub(crate) input: TextBufferState,
+    pub(crate) input: String,
 }
 
 #[derive(Clone, Debug)]

@@ -1,13 +1,12 @@
 use std::{
     fs,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Command,
     sync::Arc,
     time::Duration,
 };
 
 use globset::Glob;
-use ignore::WalkBuilder;
 use loom_core::{ActionKind, AgentSessionId, ApprovalPolicy, Result};
 use loom_model::{ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
@@ -16,13 +15,6 @@ use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
 use url::Url;
-
-fn is_ignored_directory(name: &std::ffi::OsStr) -> bool {
-    matches!(
-        name.to_str(),
-        Some(".git" | "target" | "node_modules" | ".venv" | "vendor")
-    )
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolKind {
@@ -300,7 +292,7 @@ impl ToolExecutor {
             Err(error) => return ToolResult::failure(call, error),
         };
         let mut files = Vec::new();
-        if let Err(error) = self.collect_files(&path, Path::new(relative), &mut files) {
+        if let Err(error) = self.collect_files(&path, relative, &mut files) {
             return ToolResult::failure(call, error);
         }
         files.sort();
@@ -355,7 +347,7 @@ impl ToolExecutor {
         let mut matches = Vec::new();
         if let Err(error) = self.collect_matches(
             &path,
-            Path::new(relative),
+            relative,
             &arguments.query,
             arguments.glob.as_deref(),
             &mut matches,
@@ -513,7 +505,15 @@ impl ToolExecutor {
         if path.is_absolute() {
             let resolved = fs::canonicalize(path)
                 .map_err(|error| format!("could not resolve '{}': {error}", relative))?;
-            if !resolved.starts_with(&self.root) {
+            let mounted = self
+                .workspace
+                .mounted_directories()
+                .map_err(|error| error.message)?;
+            if !resolved.starts_with(&self.root)
+                && !mounted
+                    .iter()
+                    .any(|(_, source)| resolved.starts_with(source))
+            {
                 return Err(format!(
                     "path '{}' must stay inside the workspace root",
                     relative
@@ -521,64 +521,35 @@ impl ToolExecutor {
             }
             return Ok(resolved);
         }
-        if path
-            .components()
-            .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
-        {
-            return Err(format!(
-                "path '{}' must stay inside the workspace root",
-                relative
-            ));
-        }
-        let mut resolved = self.root.clone();
-        for component in path.components() {
-            let Component::Normal(component) = component else {
-                continue;
-            };
-            let candidate = resolved.join(component);
-            match fs::symlink_metadata(&candidate) {
-                Ok(_) => {
-                    resolved = fs::canonicalize(&candidate)
-                        .map_err(|error| format!("could not resolve '{}': {error}", relative))?;
-                    if !resolved.starts_with(&self.root) {
-                        return Err(format!(
-                            "path '{}' must stay inside the workspace root",
-                            relative
-                        ));
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(format!("workspace path '{}' was not found", relative));
-                }
-                Err(error) => {
-                    return Err(format!("could not resolve '{}': {error}", relative));
-                }
-            }
-        }
-        Ok(resolved)
+        self.workspace
+            .resolve_path(relative, false)
+            .map_err(|error| error.message)
     }
 
     fn collect_files(
         &self,
         requested_path: &Path,
-        relative: &Path,
+        requested_relative: &str,
         files: &mut Vec<String>,
     ) -> std::result::Result<(), String> {
-        for entry in self.walk_workspace() {
-            let entry = entry
-                .map_err(|error| format!("could not list '{}': {error}", relative.display()))?;
-            let child = entry.path();
-            if !child.starts_with(requested_path) {
+        for entry in self
+            .workspace
+            .snapshot()
+            .map_err(|error| error.message)?
+            .entries
+        {
+            if entry.kind != loom_workspace::WorkspaceEntryKind::File {
                 continue;
             }
-            if entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file())
+            let child = self
+                .workspace
+                .resolve_path(&entry.path, false)
+                .map_err(|error| error.message)?;
+            if requested_relative == "."
+                || Path::new(&entry.path).starts_with(requested_relative)
+                || child.starts_with(requested_path)
             {
-                let child_relative = child.strip_prefix(&self.root).map_err(|error| {
-                    format!("could not relativize '{}': {error}", child.display())
-                })?;
-                files.push(child_relative.display().to_string());
+                files.push(entry.path);
             }
         }
         Ok(())
@@ -587,7 +558,7 @@ impl ToolExecutor {
     fn collect_matches(
         &self,
         requested_path: &Path,
-        relative: &Path,
+        requested_relative: &str,
         query: &str,
         glob: Option<&str>,
         matches: &mut Vec<String>,
@@ -599,27 +570,33 @@ impl ToolExecutor {
                     .map_err(|error| format!("invalid glob '{pattern}': {error}"))
             })
             .transpose()?;
-        for entry in self.walk_workspace() {
-            let entry = entry
-                .map_err(|error| format!("could not search '{}': {error}", relative.display()))?;
-            let path = entry.path();
-            let is_file = entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_file());
-            if !path.starts_with(requested_path) || !is_file {
+        for entry in self
+            .workspace
+            .snapshot()
+            .map_err(|error| error.message)?
+            .entries
+        {
+            if entry.kind != loom_workspace::WorkspaceEntryKind::File {
                 continue;
             }
-
-            let child_relative = path
-                .strip_prefix(&self.root)
-                .map_err(|error| format!("could not relativize '{}': {error}", path.display()))?;
+            let path = self
+                .workspace
+                .resolve_path(&entry.path, false)
+                .map_err(|error| error.message)?;
+            if requested_relative != "."
+                && !Path::new(&entry.path).starts_with(requested_relative)
+                && !path.starts_with(requested_path)
+            {
+                continue;
+            }
+            let child_relative = Path::new(&entry.path);
             if matcher
                 .as_ref()
                 .is_some_and(|matcher| !matcher.is_match(child_relative))
             {
                 continue;
             }
-            let contents = match fs::read_to_string(path) {
+            let contents = match fs::read_to_string(&path) {
                 Ok(contents) => contents,
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
                 Err(error) => {
@@ -641,23 +618,6 @@ impl ToolExecutor {
             }
         }
         Ok(())
-    }
-
-    fn walk_workspace(&self) -> ignore::Walk {
-        let mut builder = WalkBuilder::new(&self.root);
-        builder
-            .hidden(false)
-            .git_ignore(true)
-            .git_global(false)
-            .git_exclude(false)
-            .parents(false)
-            .ignore(false)
-            .filter_entry(|entry| !is_ignored_directory(entry.file_name()));
-        let gitignore = self.root.join(".gitignore");
-        if gitignore.is_file() {
-            builder.add_ignore(gitignore);
-        }
-        builder.build()
     }
 
     fn limit_output(&self, mut output: String) -> String {
@@ -1040,6 +1000,28 @@ mod tests {
         assert!(command_result.output.contains("ok"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lists_and_reads_attached_directory_in_place() {
+        let root = workspace();
+        let source =
+            std::env::temp_dir().join(format!("loom-tools-source-{}", AgentSessionId::new()));
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("note.txt"), "attached content").unwrap();
+        let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
+        workspace.mount_directory("sources/local", &source).unwrap();
+        let executor = ToolExecutor::new_with_workspace(workspace);
+        let listed = executor.execute(&call("list_files", serde_json::json!({"path": "."})));
+        assert!(listed.output.contains("sources/local/note.txt"));
+        let read = executor.execute(&call(
+            "read_file",
+            serde_json::json!({"path": "sources/local/note.txt"}),
+        ));
+        assert_eq!(read.output, "attached content");
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source).unwrap();
     }
 
     #[test]

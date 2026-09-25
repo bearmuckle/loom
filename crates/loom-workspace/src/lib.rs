@@ -27,6 +27,21 @@ pub use loom_protocol::{
 
 const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
 
+fn checked_mount_path(relative: &str) -> Result<PathBuf> {
+    let path = Path::new(relative);
+    if relative.is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(LoomError::invalid_request(
+            "session mount path must be a normalized relative path",
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
 fn is_ignored_directory(name: &std::ffi::OsStr) -> bool {
     matches!(
         name.to_str(),
@@ -93,6 +108,7 @@ struct WorkspaceInner {
     session_id: AgentSessionId,
     root: PathBuf,
     state: Mutex<WorkspaceState>,
+    mounts: Mutex<BTreeMap<String, PathBuf>>,
 }
 
 #[derive(Clone, Debug)]
@@ -121,6 +137,7 @@ impl Workspace {
                     next_sequence: EventSequence::default(),
                     changes: Vec::new(),
                 }),
+                mounts: Mutex::new(BTreeMap::new()),
             }),
         };
         let snapshot = workspace.snapshot()?;
@@ -160,6 +177,128 @@ impl Workspace {
         &self.inner.root
     }
 
+    pub fn mounted_directories(&self) -> Result<Vec<(String, PathBuf)>> {
+        Ok(self
+            .inner
+            .mounts
+            .lock()
+            .map_err(|_| LoomError::invalid_state("workspace mounts are unavailable"))?
+            .iter()
+            .map(|(path, source)| (path.clone(), source.clone()))
+            .collect())
+    }
+
+    pub fn mounted_source_for(&self, relative: &str) -> Result<Option<PathBuf>> {
+        Ok(self
+            .mounted_directories()?
+            .into_iter()
+            .find(|(path, _)| relative == path || relative.starts_with(&format!("{path}/")))
+            .map(|(_, source)| source))
+    }
+
+    pub fn mount_directory(&self, relative: &str, source: impl AsRef<Path>) -> Result<PathBuf> {
+        let source = Self::canonical_root(source)?;
+        let relative_path = checked_mount_path(relative)?;
+        let destination = self.inner.root.join(&relative_path);
+        if destination.starts_with(&source) || source.starts_with(&destination) {
+            return Err(LoomError::invalid_request(
+                "a session directory cannot be mounted inside itself",
+            ));
+        }
+        if let Some(parent) = destination.parent() {
+            let parent_relative = relative_path.parent().unwrap_or(Path::new(""));
+            if self
+                .mounted_source_for(&display_relative(parent_relative))?
+                .is_some()
+            {
+                return Err(LoomError::invalid_request(
+                    "session mount path cannot be inside another attached directory",
+                ));
+            }
+            fs::create_dir_all(parent).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not create mount parent: {error}"),
+                    false,
+                )
+            })?;
+            if !fs::canonicalize(parent)
+                .map(|canonical| canonical.starts_with(&self.inner.root))
+                .unwrap_or(false)
+            {
+                return Err(LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    "session mount parent escapes its filesystem root",
+                    false,
+                ));
+            }
+        }
+        match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                if fs::canonicalize(&destination).ok().as_deref() != Some(source.as_path()) {
+                    return Err(LoomError::conflict("session mount path is already in use"));
+                }
+            }
+            Ok(_) => return Err(LoomError::conflict("session mount path is already in use")),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&source, &destination).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        format!("could not attach local directory: {error}"),
+                        false,
+                    )
+                })?;
+                #[cfg(windows)]
+                std::os::windows::fs::symlink_dir(&source, &destination).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        format!("could not attach local directory: {error}"),
+                        false,
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not inspect session mount path: {error}"),
+                    false,
+                ));
+            }
+        }
+        self.inner
+            .mounts
+            .lock()
+            .map_err(|_| LoomError::invalid_state("workspace mounts are unavailable"))?
+            .insert(relative.to_owned(), source.clone());
+        Ok(source)
+    }
+
+    pub fn unmount_directory(&self, relative: &str) -> Result<()> {
+        let relative_path = checked_mount_path(relative)?;
+        let mut mounts = self
+            .inner
+            .mounts
+            .lock()
+            .map_err(|_| LoomError::invalid_state("workspace mounts are unavailable"))?;
+        if !mounts.contains_key(relative) {
+            return Err(LoomError::new(
+                ErrorCode::NotFound,
+                "session directory not attached",
+                false,
+            ));
+        }
+        fs::remove_file(self.inner.root.join(relative_path)).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not remove session directory link: {error}"),
+                false,
+            )
+        })?;
+        mounts.remove(relative);
+        Ok(())
+    }
+
     pub fn watch(&self) -> WorkspaceWatcher {
         WorkspaceWatcher {
             workspace: self.clone(),
@@ -174,6 +313,10 @@ impl Workspace {
             )));
         }
         Ok(path)
+    }
+
+    pub fn resolve_path(&self, relative: &str, allow_missing: bool) -> Result<PathBuf> {
+        self.resolve_relative(relative, allow_missing)
     }
 
     pub fn control(&self) -> Result<WorkspaceControl> {
@@ -326,6 +469,16 @@ impl Workspace {
     pub fn snapshot(&self) -> Result<SessionFilesystemSnapshot> {
         let mut entries = Vec::new();
         self.collect_entries(&self.inner.root, Path::new("."), &mut entries)?;
+        for (relative, source) in self.mounted_directories()? {
+            entries.push(WorkspaceEntry {
+                path: relative.clone(),
+                kind: WorkspaceEntryKind::Directory,
+                size: 0,
+                modified_at: modified_at(&source),
+                revision: "directory".to_owned(),
+            });
+            self.collect_entries(&source, Path::new(&relative), &mut entries)?;
+        }
         entries.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(SessionFilesystemSnapshot {
             session_id: self.inner.session_id,
@@ -819,14 +972,15 @@ impl Workspace {
 
     fn collect_entries(
         &self,
-        _path: &Path,
-        _relative: &Path,
+        path: &Path,
+        relative: &Path,
         entries: &mut Vec<WorkspaceEntry>,
     ) -> Result<()> {
-        let mut walker = WalkBuilder::new(&self.inner.root);
+        let mut walker = WalkBuilder::new(path);
         walker
             .hidden(false)
             .git_ignore(true)
+            .require_git(false)
             .git_global(false)
             .git_exclude(false)
             .parents(false)
@@ -842,7 +996,7 @@ impl Workspace {
                 )
             })?;
             let child_path = entry.path();
-            if child_path == self.inner.root {
+            if child_path == path {
                 continue;
             }
             if entries.len() >= MAX_SNAPSHOT_ENTRIES {
@@ -852,7 +1006,7 @@ impl Workspace {
                     false,
                 ));
             }
-            let child_relative = child_path.strip_prefix(&self.inner.root).map_err(|error| {
+            let child_relative = child_path.strip_prefix(path).map_err(|error| {
                 LoomError::new(
                     ErrorCode::ToolExecution,
                     format!("could not relativize '{}': {error}", child_path.display()),
@@ -869,7 +1023,7 @@ impl Workspace {
             if file_type.is_symlink() {
                 continue;
             }
-            let path = display_relative(child_relative);
+            let path = display_relative(&relative.join(child_relative));
             if file_type.is_dir() {
                 entries.push(WorkspaceEntry {
                     path,
@@ -911,7 +1065,21 @@ impl Workspace {
                 false,
             ));
         }
-        let mut resolved = self.inner.root.clone();
+        let mount = self
+            .mounted_directories()?
+            .into_iter()
+            .filter_map(|(mount_path, source)| {
+                path.strip_prefix(&mount_path)
+                    .ok()
+                    .map(|suffix| (mount_path.len(), source, suffix.to_path_buf()))
+            })
+            .max_by_key(|(length, _, _)| *length);
+        let (allowed_root, path) = if let Some((_, source, suffix)) = mount {
+            (source, suffix)
+        } else {
+            (self.inner.root.clone(), path.to_path_buf())
+        };
+        let mut resolved = allowed_root.clone();
         let mut unresolved = false;
         for component in path.components() {
             let Component::Normal(component) = component else {
@@ -931,7 +1099,7 @@ impl Workspace {
                             false,
                         )
                     })?;
-                    if !canonical.starts_with(&self.inner.root) {
+                    if !canonical.starts_with(&allowed_root) {
                         return Err(LoomError::new(
                             ErrorCode::WorkspaceAccessDenied,
                             format!("path '{relative}' must stay inside the workspace root"),
@@ -948,7 +1116,7 @@ impl Workspace {
                             false,
                         )
                     })?;
-                    if !canonical.starts_with(&self.inner.root) {
+                    if !canonical.starts_with(&allowed_root) {
                         return Err(LoomError::new(
                             ErrorCode::WorkspaceAccessDenied,
                             format!("path '{relative}' must stay inside the workspace root"),
@@ -977,7 +1145,7 @@ impl Workspace {
                 }
             }
         }
-        if !resolved.starts_with(&self.inner.root) {
+        if !resolved.starts_with(&allowed_root) {
             return Err(LoomError::new(
                 ErrorCode::WorkspaceAccessDenied,
                 format!("path '{relative}' must stay inside the workspace root"),
@@ -1089,6 +1257,43 @@ mod tests {
         let error = workspace.read_file("../outside").unwrap_err();
         assert_eq!(error.code, ErrorCode::WorkspaceAccessDenied);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mounted_directory_edits_the_original_and_unmount_keeps_it() {
+        let (workspace, root) = workspace();
+        let source = std::env::temp_dir().join(format!("loom-source-{}", AgentSessionId::new()));
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("note.txt"), "before").unwrap();
+        workspace.mount_directory("sources/local", &source).unwrap();
+        assert_eq!(
+            workspace
+                .read_file("sources/local/note.txt")
+                .unwrap()
+                .content,
+            "before"
+        );
+        assert!(
+            workspace
+                .snapshot()
+                .unwrap()
+                .entries
+                .iter()
+                .any(|entry| entry.path == "sources/local/note.txt")
+        );
+        workspace
+            .write_file_bytes("sources/local/note.txt", b"after".to_vec(), None)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(source.join("note.txt")).unwrap(),
+            "after"
+        );
+        workspace.unmount_directory("sources/local").unwrap();
+        assert!(source.join("note.txt").exists());
+        assert!(!root.join("sources/local").exists());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(source).unwrap();
     }
 
     #[test]
