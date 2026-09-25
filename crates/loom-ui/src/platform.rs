@@ -6,19 +6,13 @@
 
 #[cfg(test)]
 use std::{collections::BTreeMap, sync::Mutex};
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{env, fs, path::PathBuf, sync::Arc};
 
-use loom_core::{ErrorCode, LoomError, ProjectId};
+use loom_core::{ErrorCode, LoomError, WorkspaceId};
 use loom_model::ModelId;
-use loom_persistence::FilePersistence;
 use loom_providers::{CredentialRef, GITHUB_COPILOT_DEFAULT_MODEL};
 use loom_vcs::GitService;
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 
 const PEER_CREDENTIAL_SERVICE: &str = "com.bearmuckle.loom.worker-peer";
 
@@ -77,35 +71,35 @@ impl PeerCredentialStore {
 
     pub(crate) fn get(
         &self,
-        project_id: ProjectId,
+        workspace_id: WorkspaceId,
         url: &str,
     ) -> Result<Option<String>, LoomError> {
         self.backend
-            .get(peer_credential_reference(project_id, url).as_str())
+            .get(peer_credential_reference(workspace_id, url).as_str())
             .map_err(|error| peer_credential_error("read", error))
     }
 
     pub(crate) fn set(
         &self,
-        project_id: ProjectId,
+        workspace_id: WorkspaceId,
         url: &str,
         token: &str,
     ) -> Result<(), LoomError> {
         self.backend
-            .set(peer_credential_reference(project_id, url).as_str(), token)
+            .set(peer_credential_reference(workspace_id, url).as_str(), token)
             .map_err(|error| peer_credential_error("save", error))
     }
 
-    pub(crate) fn delete(&self, project_id: ProjectId, url: &str) -> Result<(), LoomError> {
+    pub(crate) fn delete(&self, workspace_id: WorkspaceId, url: &str) -> Result<(), LoomError> {
         self.backend
-            .delete(peer_credential_reference(project_id, url).as_str())
+            .delete(peer_credential_reference(workspace_id, url).as_str())
             .map_err(|error| peer_credential_error("remove", error))
     }
 }
 
-fn peer_credential_reference(project_id: ProjectId, url: &str) -> CredentialRef {
+fn peer_credential_reference(workspace_id: WorkspaceId, url: &str) -> CredentialRef {
     let mut digest = Sha256::new();
-    digest.update(project_id.to_string().as_bytes());
+    digest.update(workspace_id.to_string().as_bytes());
     digest.update([0]);
     digest.update(url.as_bytes());
     let key = digest
@@ -330,23 +324,6 @@ pub(crate) fn backend_persistence_path() -> PathBuf {
     state_root().join("loom").join("state.db")
 }
 
-pub(crate) fn migrate_legacy_backend_persistence(root: &Path) -> Result<(), LoomError> {
-    let state_root = state_root();
-    let persistence_path = backend_persistence_path();
-    let legacy_path = legacy_backend_persistence_path(root, &state_root);
-    if legacy_path.is_file() {
-        let imported = FilePersistence::open(&persistence_path)?
-            .import_sections_from(&FilePersistence::open(&legacy_path)?)?;
-        if !imported {
-            log::warn!(
-                "legacy project state at '{}' was preserved but not imported because shared Loom state already exists",
-                legacy_path.display()
-            );
-        }
-    }
-    Ok(())
-}
-
 fn state_root() -> PathBuf {
     env::var_os("LOOM_STATE_DIR")
         .map(PathBuf::from)
@@ -355,26 +332,6 @@ fn state_root() -> PathBuf {
             env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
         })
         .unwrap_or_else(|| env::temp_dir().join("loom-state"))
-}
-
-fn legacy_backend_persistence_path(root: &Path, state_root: &Path) -> PathBuf {
-    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
-    let project_key = digest
-        .iter()
-        .take(16)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    state_root
-        .join("loom")
-        .join("projects")
-        .join(format!("{project_key}.db"))
-}
-
-pub(crate) fn stable_project_id(root: &Path) -> ProjectId {
-    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
-    let mut bytes = [0_u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    ProjectId::from_uuid(Uuid::from_bytes(bytes))
 }
 
 #[cfg(test)]
@@ -409,43 +366,35 @@ mod tests {
     }
 
     #[test]
-    fn project_ids_are_stable_and_persistence_is_shared_across_workspaces() {
-        let first = Path::new("/tmp/loom-project");
-        let second = Path::new("/tmp/other-project");
-        assert_eq!(stable_project_id(first), stable_project_id(first));
-        assert_ne!(stable_project_id(first), stable_project_id(second));
+    fn persistence_is_shared_across_workspaces() {
         assert_eq!(
             backend_persistence_path(),
             state_root().join("loom").join("state.db")
         );
-        assert_ne!(
-            legacy_backend_persistence_path(first, Path::new("/tmp/state")),
-            legacy_backend_persistence_path(second, Path::new("/tmp/state"))
-        );
     }
 
     #[test]
-    fn peer_credentials_are_scoped_by_project_and_url_and_deleted_with_peer() {
+    fn peer_credentials_are_scoped_by_workspace_and_url_and_deleted_with_peer() {
         let backend = Arc::new(MemoryPeerCredentialBackend::default());
         let store = PeerCredentialStore::with_backend(backend);
-        let project_id = stable_project_id(Path::new("/tmp/loom-project"));
-        let other_project_id = stable_project_id(Path::new("/tmp/other-project"));
+        let workspace_id = WorkspaceId::new();
+        let other_workspace_id = WorkspaceId::new();
         let first_url = "wss://worker.example/ws";
-        let reference = peer_credential_reference(project_id, first_url);
+        let reference = peer_credential_reference(workspace_id, first_url);
         assert!(!reference.as_str().contains(first_url));
 
-        store.set(project_id, first_url, "peer-secret").unwrap();
+        store.set(workspace_id, first_url, "peer-secret").unwrap();
 
         assert_eq!(
-            store.get(project_id, first_url).unwrap().as_deref(),
+            store.get(workspace_id, first_url).unwrap().as_deref(),
             Some("peer-secret")
         );
-        assert_eq!(store.get(other_project_id, first_url).unwrap(), None);
+        assert_eq!(store.get(other_workspace_id, first_url).unwrap(), None);
         assert_eq!(
-            store.get(project_id, "wss://other.example/ws").unwrap(),
+            store.get(workspace_id, "wss://other.example/ws").unwrap(),
             None
         );
-        store.delete(project_id, first_url).unwrap();
-        assert_eq!(store.get(project_id, first_url).unwrap(), None);
+        store.delete(workspace_id, first_url).unwrap();
+        assert_eq!(store.get(workspace_id, first_url).unwrap(), None);
     }
 }

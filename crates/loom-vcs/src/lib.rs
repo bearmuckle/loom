@@ -310,12 +310,12 @@ fn git_error(operation: &str, error: git2::Error) -> LoomError {
 mod tests {
     use std::{fs, path::PathBuf, process::Command};
 
-    use loom_core::ProjectId;
+    use loom_core::AgentSessionId;
 
     use super::*;
 
     fn repository() -> (GitService, PathBuf) {
-        let root = std::env::temp_dir().join(format!("loom-git-{}", ProjectId::new()));
+        let root = std::env::temp_dir().join(format!("loom-git-{}", AgentSessionId::new()));
         fs::create_dir(&root).unwrap();
         run(&root, &["init", "-q"]);
         run(&root, &["config", "user.email", "loom@example.test"]);

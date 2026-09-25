@@ -2121,13 +2121,13 @@ fn publish_events(
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use loom_core::{AgentSessionId, LimitKind, ProjectId, SessionLimits};
+    use loom_core::{AgentSessionId, LimitKind, SessionLimits};
     use loom_providers::DeterministicProvider;
 
     use super::*;
 
     fn workspace() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("loom-agent-{}", ProjectId::new()));
+        let root = std::env::temp_dir().join(format!("loom-agent-{}", AgentSessionId::new()));
         fs::create_dir_all(&root).unwrap();
         root
     }

@@ -10,8 +10,7 @@ use std::{
 
 use loom_agent::{AgentEvent, AgentRunState};
 use loom_core::{
-    AgentSessionId, AgentSessionState, Capability, CapabilitySet, ErrorCode, LoomError, ProjectId,
-    RunId,
+    AgentSessionId, AgentSessionState, Capability, CapabilitySet, ErrorCode, LoomError, RunId,
 };
 use loom_model::ModelId;
 use loom_process::{TaskKind, TaskSpec, TaskStatus, TerminalEvent, TerminalStatus};
@@ -50,7 +49,7 @@ fn main() -> Result<(), LoomError> {
     let persistence_path = options.persistence.clone().or_else(|| {
         options
             .m3_demo
-            .then(|| env::temp_dir().join(format!("loom-m3-demo-{}.db", ProjectId::new())))
+            .then(|| env::temp_dir().join(format!("loom-m3-demo-{}.db", AgentSessionId::new())))
     });
     let backend = match persistence_path.as_deref() {
         Some(path) if options.model.as_str() != "deterministic/demo" => {
@@ -85,7 +84,7 @@ fn main() -> Result<(), LoomError> {
     println!("Task: {}", options.task);
     stream_run(&connection, session.id, run_id, options.manual_approval)?;
     if options.m2_demo {
-        demonstrate_m2_services(&connection, session.project_id, &workspace_root)?;
+        demonstrate_m2_services(&connection, session.id)?;
     }
     if options.m3_demo {
         demonstrate_m3_recovery(
@@ -93,7 +92,6 @@ fn main() -> Result<(), LoomError> {
             connection,
             persistence_path.as_deref().expect("M3 persistence path"),
             temporary_persistence,
-            session.project_id,
             session.id,
             run_id,
         )?;
@@ -259,51 +257,20 @@ fn run_login(provider: &str) -> Result<(), LoomError> {
 }
 
 fn run_server(options: CliOptions) -> Result<(), LoomError> {
+    if options.root.is_some() {
+        return Err(LoomError::invalid_request(
+            "--root is only available for one-shot sessions; server sessions manage their own repositories",
+        ));
+    }
     let token = options
         .token
         .filter(|token| !token.trim().is_empty())
         .ok_or_else(|| LoomError::invalid_request("--serve requires a non-empty --token"))?;
     let persistence_path = options.persistence;
-    let workspace_root = options.root;
     let backend = match persistence_path {
         Some(path) => InProcessBackend::new_persistent_with_github_copilot(path)?,
         None => InProcessBackend::new_with_github_copilot()?,
     };
-    if let Some(root) = workspace_root {
-        fs::create_dir_all(&root).map_err(|error| {
-            LoomError::new(
-                ErrorCode::ToolExecution,
-                format!(
-                    "could not create worker workspace '{}': {error}",
-                    root.display()
-                ),
-                false,
-            )
-        })?;
-        let root = fs::canonicalize(&root).map_err(|error| {
-            LoomError::new(
-                ErrorCode::ToolExecution,
-                format!(
-                    "could not resolve worker workspace '{}': {error}",
-                    root.display()
-                ),
-                false,
-            )
-        })?;
-        let connection = backend.connect();
-        negotiate(&connection)?;
-        let project_id = ProjectId::new();
-        let response = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-            project_id,
-            root: root.display().to_string(),
-        }));
-        match response.result? {
-            ServerResponse::WorkspaceOpened(_) => {
-                println!("Opened worker workspace {}", root.display());
-            }
-            response => return Err(unexpected_response("workspace open", response)),
-        }
-    }
     let auth = Arc::new(AuthTokenStore::new());
     let _issued = auth.insert(token, AuthorizationScope::all())?;
     let config = RemoteServerConfig {
@@ -575,37 +542,30 @@ fn client_capabilities() -> CapabilitySet {
         Capability::ReadProviderHealth,
         Capability::ReadUsage,
         Capability::InspectContext,
-        Capability::OpenWorkspace,
-        Capability::ReadWorkspace,
-        Capability::WriteWorkspace,
-        Capability::SubscribeWorkspaceEvents,
-        Capability::OpenTerminal,
-        Capability::ControlTerminal,
-        Capability::ReadTask,
-        Capability::StartTask,
-        Capability::ControlTask,
+        Capability::ReadWorkspaceConfig,
+        Capability::OpenSessionTerminal,
+        Capability::ControlSessionTerminal,
+        Capability::ReadSessionTask,
+        Capability::StartSessionTask,
+        Capability::ControlSessionTask,
         Capability::ConfigureApprovalPolicy,
         Capability::ManageCheckpoints,
-        Capability::TakeoverWorkspace,
-        Capability::ReadWorkspaceInstructions,
         Capability::ReadVcsStatus,
         Capability::ReadVcsDiff,
-        Capability::ReadTaskEvidence,
+        Capability::ReadSessionTaskEvidence,
         Capability::JsonProtocol,
     ])
 }
 
 fn demonstrate_m2_services(
     connection: &InProcessConnection,
-    project_id: ProjectId,
-    workspace_root: &Path,
+    session_id: AgentSessionId,
 ) -> Result<(), LoomError> {
-    let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-        project_id,
-        root: workspace_root.display().to_string(),
-    }));
-    let snapshot = match opened.result? {
-        ServerResponse::WorkspaceOpened(snapshot) => snapshot,
+    let filesystem = connection.request(RequestEnvelope::new(
+        ClientRequest::GetSessionFilesystemSnapshot { session_id },
+    ));
+    let snapshot = match filesystem.result? {
+        ServerResponse::SessionFilesystemSnapshot(snapshot) => snapshot,
         response => return Err(unexpected_response("workspace open", response)),
     };
     println!(
@@ -623,8 +583,8 @@ fn demonstrate_m2_services(
         ("printf".to_owned(), vec!["terminal\\n".to_owned()])
     };
     let terminal = match connection
-        .request(RequestEnvelope::new(ClientRequest::OpenTerminal {
-            project_id,
+        .request(RequestEnvelope::new(ClientRequest::OpenSessionTerminal {
+            session_id,
             command,
             args,
             cwd: None,
@@ -635,8 +595,8 @@ fn demonstrate_m2_services(
         response => return Err(unexpected_response("terminal open", response)),
     };
     connection
-        .request(RequestEnvelope::new(ClientRequest::ResizeTerminal {
-            project_id,
+        .request(RequestEnvelope::new(ClientRequest::ResizeSessionTerminal {
+            session_id,
             terminal_id: terminal.id,
             rows: 30,
             columns: 100,
@@ -645,11 +605,13 @@ fn demonstrate_m2_services(
     let mut after_terminal = None;
     for _ in 0..100 {
         let events = match connection
-            .request(RequestEnvelope::new(ClientRequest::GetTerminalEvents {
-                project_id,
-                terminal_id: terminal.id,
-                after_sequence: after_terminal,
-            }))
+            .request(RequestEnvelope::new(
+                ClientRequest::GetSessionTerminalEvents {
+                    session_id,
+                    terminal_id: terminal.id,
+                    after_sequence: after_terminal,
+                },
+            ))
             .result?
         {
             ServerResponse::TerminalEvents { events } => events,
@@ -685,8 +647,8 @@ fn demonstrate_m2_services(
         ("printf".to_owned(), vec!["task\\n".to_owned()])
     };
     let task = match connection
-        .request(RequestEnvelope::new(ClientRequest::StartTask {
-            project_id,
+        .request(RequestEnvelope::new(ClientRequest::StartSessionTask {
+            session_id,
             spec: TaskSpec {
                 kind: TaskKind::Test,
                 label: "M2 demo task".to_owned(),
@@ -704,8 +666,8 @@ fn demonstrate_m2_services(
     };
     for _ in 0..100 {
         let snapshot = match connection
-            .request(RequestEnvelope::new(ClientRequest::GetTask {
-                project_id,
+            .request(RequestEnvelope::new(ClientRequest::GetSessionTask {
+                session_id,
                 task_id: task.id,
             }))
             .result?
@@ -735,7 +697,6 @@ fn demonstrate_m3_recovery(
     connection: InProcessConnection,
     persistence_path: &Path,
     temporary_persistence: bool,
-    project_id: ProjectId,
     session_id: AgentSessionId,
     run_id: RunId,
 ) -> Result<(), LoomError> {
@@ -779,11 +740,11 @@ fn demonstrate_m3_recovery(
         ServerResponse::SessionEvents { events } => events.len(),
         response => return Err(unexpected_response("recovered events", response)),
     };
-    let workspace = recovered.request(RequestEnvelope::new(ClientRequest::GetWorkspaceSnapshot {
-        project_id,
-    }));
-    let entries = match workspace.result? {
-        ServerResponse::WorkspaceSnapshot(snapshot) => snapshot.entries.len(),
+    let filesystem = recovered.request(RequestEnvelope::new(
+        ClientRequest::GetSessionFilesystemSnapshot { session_id },
+    ));
+    let entries = match filesystem.result? {
+        ServerResponse::SessionFilesystemSnapshot(snapshot) => snapshot.entries.len(),
         response => return Err(unexpected_response("recovered workspace", response)),
     };
     println!(
@@ -874,22 +835,17 @@ fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
             Capability::ReadProviderHealth,
             Capability::ReadUsage,
             Capability::InspectContext,
-            Capability::OpenWorkspace,
-            Capability::ReadWorkspace,
-            Capability::WriteWorkspace,
-            Capability::SubscribeWorkspaceEvents,
-            Capability::OpenTerminal,
-            Capability::ControlTerminal,
-            Capability::ReadTask,
-            Capability::StartTask,
-            Capability::ControlTask,
+            Capability::ReadWorkspaceConfig,
+            Capability::OpenSessionTerminal,
+            Capability::ControlSessionTerminal,
+            Capability::ReadSessionTask,
+            Capability::StartSessionTask,
+            Capability::ControlSessionTask,
             Capability::ConfigureApprovalPolicy,
             Capability::ManageCheckpoints,
-            Capability::TakeoverWorkspace,
-            Capability::ReadWorkspaceInstructions,
             Capability::ReadVcsStatus,
             Capability::ReadVcsDiff,
-            Capability::ReadTaskEvidence,
+            Capability::ReadSessionTaskEvidence,
             Capability::JsonProtocol,
         ]),
     }));
@@ -1233,7 +1189,7 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
                 println!("Run completed [{}]", run_state_name(snapshot.state))
             }
         },
-        ServerEvent::WorkspaceChanged { change } => {
+        ServerEvent::SessionFilesystemChanged { change } => {
             println!("Workspace {:?}: {}", change.kind, change.path);
         }
         ServerEvent::Terminal { event } => {

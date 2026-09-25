@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_family = "wasm"))]
 use std::{
-    path::Path,
     sync::mpsc::{self, Sender},
     thread,
     time::Duration,
@@ -21,8 +20,8 @@ use std::{
 
 use futures_channel::oneshot;
 use loom_core::{
-    AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, ProjectId, RequestId,
-    WorkspaceId, WorkspaceRecord,
+    AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, RequestId, WorkspaceId,
+    WorkspaceRecord,
 };
 use loom_model::ModelId;
 #[cfg(not(target_family = "wasm"))]
@@ -30,8 +29,8 @@ use loom_model::ProviderId;
 #[cfg(not(target_family = "wasm"))]
 use loom_protocol::AgentRunSnapshot;
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, ProjectSnapshot, RequestEnvelope, ResponseEnvelope,
-    ServerResponse, SessionRepository, WorkerNodeStatus, WorkspaceConfig,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ResponseEnvelope, ServerResponse,
+    SessionRepository, WorkerNodeStatus, WorkspaceConfig,
 };
 #[cfg(target_family = "wasm")]
 use std::task::Poll;
@@ -364,14 +363,16 @@ pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> 
                 Capability::ConfigureProviders,
                 Capability::ConfigureApprovalPolicy,
                 Capability::ManageCheckpoints,
-                Capability::OpenWorkspace,
-                Capability::ReadWorkspace,
+                Capability::ManageWorkspaces,
+                Capability::ManageSessionRepositories,
+                Capability::ReadSessionFilesystem,
+                Capability::WriteSessionFilesystem,
                 Capability::ReadVcsStatus,
                 Capability::ReadVcsDiff,
-                Capability::ReadTask,
-                Capability::StartTask,
-                Capability::ControlTask,
-                Capability::ReadTaskEvidence,
+                Capability::ReadSessionTask,
+                Capability::StartSessionTask,
+                Capability::ControlSessionTask,
+                Capability::ReadSessionTaskEvidence,
                 Capability::ReadWorkerNodeStatus,
                 Capability::JsonProtocol,
             ]),
@@ -400,14 +401,16 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::ListProviders,
         Capability::ConfigureProviders,
         Capability::ConfigureApprovalPolicy,
-        Capability::OpenWorkspace,
-        Capability::ReadWorkspace,
+        Capability::ManageWorkspaces,
+        Capability::ManageSessionRepositories,
+        Capability::ReadSessionFilesystem,
+        Capability::WriteSessionFilesystem,
         Capability::ReadVcsStatus,
         Capability::ReadVcsDiff,
-        Capability::ReadTask,
-        Capability::StartTask,
-        Capability::ControlTask,
-        Capability::ReadTaskEvidence,
+        Capability::ReadSessionTask,
+        Capability::StartSessionTask,
+        Capability::ControlSessionTask,
+        Capability::ReadSessionTaskEvidence,
         Capability::ReadWorkerNodeStatus,
         Capability::JsonProtocol,
     ])
@@ -578,40 +581,6 @@ pub(crate) async fn negotiate_async(connection: &ClientConnection) -> Result<(),
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub(crate) fn open_workspace(
-    connection: &ClientConnection,
-    project_id: ProjectId,
-    root: &Path,
-) -> Result<(), LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-        project_id,
-        root: root.display().to_string(),
-    }));
-    match response.result? {
-        ServerResponse::WorkspaceOpened(_) => Ok(()),
-        response => Err(unexpected_response("workspace open", response)),
-    }
-}
-
-#[cfg(target_family = "wasm")]
-pub(crate) async fn open_workspace_async(
-    connection: &ClientConnection,
-    project_id: ProjectId,
-    root: &str,
-) -> Result<(), LoomError> {
-    let response = connection
-        .request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-            project_id,
-            root: root.to_owned(),
-        }))
-        .await;
-    match response.result? {
-        ServerResponse::WorkspaceOpened(_) => Ok(()),
-        response => Err(unexpected_response("workspace open", response)),
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
 pub(crate) fn list_workspaces(
     connection: &ClientConnection,
 ) -> Result<Vec<WorkspaceRecord>, LoomError> {
@@ -662,6 +631,36 @@ pub(crate) async fn create_workspace_async(
     match response.result? {
         ServerResponse::WorkspaceCreated(workspace) => Ok(workspace),
         response => Err(unexpected_response("workspace creation", response)),
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn register_workspace(
+    connection: &ClientConnection,
+    workspace: WorkspaceRecord,
+) -> Result<(), LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::RegisterWorkspace {
+        workspace,
+    }));
+    match response.result? {
+        ServerResponse::WorkspaceCreated(_) => Ok(()),
+        response => Err(unexpected_response("workspace registration", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn register_workspace_async(
+    connection: &ClientConnection,
+    workspace: WorkspaceRecord,
+) -> Result<(), LoomError> {
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::RegisterWorkspace {
+            workspace,
+        }))
+        .await;
+    match response.result? {
+        ServerResponse::WorkspaceCreated(_) => Ok(()),
+        response => Err(unexpected_response("workspace registration", response)),
     }
 }
 
@@ -777,55 +776,6 @@ pub(crate) async fn attach_session_repository_async(
         ServerResponse::SessionRepositoryAttached(repository) => Ok(repository),
         response => Err(unexpected_response("repository attachment", response)),
     }
-}
-
-#[cfg(not(target_family = "wasm"))]
-pub(crate) fn list_projects(
-    connection: &ClientConnection,
-) -> Result<Vec<ProjectSnapshot>, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ListProjects));
-    match response.result? {
-        ServerResponse::Projects { projects } => Ok(projects),
-        response => Err(unexpected_response("project list", response)),
-    }
-}
-
-#[cfg(target_family = "wasm")]
-pub(crate) async fn list_projects_async(
-    connection: &ClientConnection,
-) -> Result<Vec<ProjectSnapshot>, LoomError> {
-    let response = connection
-        .request(RequestEnvelope::new(ClientRequest::ListProjects))
-        .await;
-    match response.result? {
-        ServerResponse::Projects { projects } => Ok(projects),
-        response => Err(unexpected_response("project list", response)),
-    }
-}
-
-pub(crate) fn select_remote_project(
-    projects: &[ProjectSnapshot],
-    requested_root: Option<&str>,
-) -> Result<ProjectSnapshot, LoomError> {
-    let project = requested_root
-        .and_then(|root| {
-            projects.iter().find(|project| {
-                project
-                    .root
-                    .as_deref()
-                    .is_some_and(|project_root| project_root == root)
-            })
-        })
-        .or_else(|| projects.first())
-        .cloned()
-        .ok_or_else(|| {
-            LoomError::new(
-                ErrorCode::NotFound,
-                "remote backend has no open projects",
-                false,
-            )
-        })?;
-    Ok(project)
 }
 
 #[cfg(not(target_family = "wasm"))]

@@ -9,7 +9,7 @@ use std::{
 
 use ignore::WalkBuilder;
 use loom_core::{
-    AgentSessionId, CheckpointId, ErrorCode, EventSequence, LoomError, ProjectId, Result, Timestamp,
+    AgentSessionId, CheckpointId, ErrorCode, EventSequence, LoomError, Result, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,9 +19,10 @@ mod instructions;
 
 pub use instructions::MAX_CONTEXT_FILE_BYTES;
 pub use loom_protocol::{
-    Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, RevertResult, UndoResult,
-    WorkspaceChange, WorkspaceChangeKind, WorkspaceControl, WorkspaceEdit, WorkspaceEditResult,
-    WorkspaceEntry, WorkspaceEntryKind, WorkspaceFile, WorkspaceSnapshot,
+    Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, RevertResult,
+    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, UndoResult,
+    WorkspaceChangeKind, WorkspaceControl, WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry,
+    WorkspaceEntryKind,
 };
 
 const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
@@ -59,13 +60,13 @@ pub struct WorkspaceEditHistory {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceStateSnapshot {
-    pub project_id: ProjectId,
+    pub session_id: AgentSessionId,
     pub root: String,
     pub control: WorkspaceControl,
     pub checkpoints: Vec<Checkpoint>,
     pub edits: Vec<WorkspaceEditHistory>,
     pub next_sequence: EventSequence,
-    pub changes: Vec<WorkspaceChange>,
+    pub changes: Vec<SessionFilesystemChange>,
 }
 
 #[derive(Debug)]
@@ -73,9 +74,9 @@ struct WorkspaceState {
     control: WorkspaceControl,
     checkpoints: BTreeMap<CheckpointId, Checkpoint>,
     edits: Vec<EditRecord>,
-    watcher_snapshot: Option<WorkspaceSnapshot>,
+    watcher_snapshot: Option<SessionFilesystemSnapshot>,
     next_sequence: EventSequence,
-    changes: Vec<WorkspaceChange>,
+    changes: Vec<SessionFilesystemChange>,
 }
 
 #[derive(Clone, Debug)]
@@ -89,7 +90,7 @@ struct EditRecord {
 
 #[derive(Debug)]
 struct WorkspaceInner {
-    project_id: ProjectId,
+    session_id: AgentSessionId,
     root: PathBuf,
     state: Mutex<WorkspaceState>,
 }
@@ -105,12 +106,12 @@ pub struct WorkspaceWatcher {
 }
 
 impl Workspace {
-    pub fn open(project_id: ProjectId, root: impl Into<PathBuf>) -> Result<Self> {
+    pub fn open(session_id: AgentSessionId, root: impl Into<PathBuf>) -> Result<Self> {
         let requested = root.into();
         let root = Self::canonical_root(&requested)?;
         let workspace = Self {
             inner: Arc::new(WorkspaceInner {
-                project_id,
+                session_id,
                 root,
                 state: Mutex::new(WorkspaceState {
                     control: WorkspaceControl::Agent,
@@ -151,8 +152,8 @@ impl Workspace {
         })
     }
 
-    pub fn project_id(&self) -> ProjectId {
-        self.inner.project_id
+    pub fn session_id(&self) -> AgentSessionId {
+        self.inner.session_id
     }
 
     pub fn root(&self) -> &Path {
@@ -189,7 +190,7 @@ impl Workspace {
     pub fn export_state(&self) -> Result<WorkspaceStateSnapshot> {
         let state = self.lock_state()?;
         Ok(WorkspaceStateSnapshot {
-            project_id: self.inner.project_id,
+            session_id: self.inner.session_id,
             root: self.inner.root.display().to_string(),
             control: state.control,
             checkpoints: state.checkpoints.values().cloned().collect(),
@@ -214,7 +215,7 @@ impl Workspace {
     }
 
     pub fn restore_state(&self, persisted: WorkspaceStateSnapshot) -> Result<()> {
-        if persisted.project_id != self.inner.project_id
+        if persisted.session_id != self.inner.session_id
             || Path::new(&persisted.root) != self.inner.root
         {
             return Err(LoomError::new(
@@ -227,22 +228,22 @@ impl Workspace {
         if persisted
             .changes
             .iter()
-            .any(|change| change.project_id != self.inner.project_id)
+            .any(|change| change.session_id != self.inner.session_id)
         {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                "persisted workspace change belongs to another project",
+                "persisted filesystem change belongs to another session",
                 false,
             ));
         }
         if persisted
             .checkpoints
             .iter()
-            .any(|checkpoint| checkpoint.project_id != self.inner.project_id)
+            .any(|checkpoint| checkpoint.session_id != self.inner.session_id)
         {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                "persisted checkpoint belongs to another project",
+                "persisted checkpoint belongs to another session",
                 false,
             ));
         }
@@ -322,19 +323,19 @@ impl Workspace {
         Ok(self.lock_state()?.checkpoints.values().cloned().collect())
     }
 
-    pub fn snapshot(&self) -> Result<WorkspaceSnapshot> {
+    pub fn snapshot(&self) -> Result<SessionFilesystemSnapshot> {
         let mut entries = Vec::new();
         self.collect_entries(&self.inner.root, Path::new("."), &mut entries)?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(WorkspaceSnapshot {
-            project_id: self.inner.project_id,
+        Ok(SessionFilesystemSnapshot {
+            session_id: self.inner.session_id,
             root: self.inner.root.display().to_string(),
             captured_at: Timestamp::now(),
             entries,
         })
     }
 
-    pub fn read_file(&self, relative: &str) -> Result<WorkspaceFile> {
+    pub fn read_file(&self, relative: &str) -> Result<SessionFilesystemFile> {
         let file = self.read_file_bytes(relative)?;
         let content = String::from_utf8(file.bytes).map_err(|error| {
             LoomError::new(
@@ -343,7 +344,8 @@ impl Workspace {
                 false,
             )
         })?;
-        Ok(WorkspaceFile {
+        Ok(SessionFilesystemFile {
+            session_id: self.inner.session_id,
             path: relative.to_owned(),
             revision: revision(&content),
             content,
@@ -556,11 +558,7 @@ impl Workspace {
         })
     }
 
-    pub fn create_checkpoint(
-        &self,
-        session_id: Option<AgentSessionId>,
-        label: impl Into<String>,
-    ) -> Result<Checkpoint> {
+    pub fn create_checkpoint(&self, label: impl Into<String>) -> Result<Checkpoint> {
         let label = label.into();
         if label.trim().is_empty() {
             return Err(LoomError::invalid_request(
@@ -596,8 +594,7 @@ impl Workspace {
         }
         let checkpoint = Checkpoint {
             id: CheckpointId::new(),
-            project_id: self.inner.project_id,
-            session_id,
+            session_id: self.inner.session_id,
             label,
             created_at: Timestamp::now(),
             files,
@@ -758,7 +755,7 @@ impl Workspace {
         })
     }
 
-    pub fn poll_changes(&self) -> Result<Vec<WorkspaceChange>> {
+    pub fn poll_changes(&self) -> Result<Vec<SessionFilesystemChange>> {
         let current = self.snapshot()?;
         let mut state = self.lock_state()?;
         let previous = state
@@ -792,9 +789,9 @@ impl Workspace {
             };
             if let Some(kind) = kind {
                 state.next_sequence = state.next_sequence.next();
-                let change = WorkspaceChange {
+                let change = SessionFilesystemChange {
                     sequence: state.next_sequence,
-                    project_id: self.inner.project_id,
+                    session_id: self.inner.session_id,
                     path: path.clone(),
                     kind,
                     revision: after.get(&path).map(|entry| entry.revision.clone()),
@@ -806,7 +803,10 @@ impl Workspace {
         Ok(changes)
     }
 
-    pub fn changes_since(&self, after: Option<EventSequence>) -> Result<Vec<WorkspaceChange>> {
+    pub fn changes_since(
+        &self,
+        after: Option<EventSequence>,
+    ) -> Result<Vec<SessionFilesystemChange>> {
         let _ = self.poll_changes()?;
         Ok(self
             .lock_state()?
@@ -999,11 +999,14 @@ impl Workspace {
 }
 
 impl WorkspaceWatcher {
-    pub fn poll(&self) -> Result<Vec<WorkspaceChange>> {
+    pub fn poll(&self) -> Result<Vec<SessionFilesystemChange>> {
         self.workspace.poll_changes()
     }
 
-    pub fn events_since(&self, after: Option<EventSequence>) -> Result<Vec<WorkspaceChange>> {
+    pub fn events_since(
+        &self,
+        after: Option<EventSequence>,
+    ) -> Result<Vec<SessionFilesystemChange>> {
         self.workspace.changes_since(after)
     }
 }
@@ -1051,16 +1054,17 @@ fn unified_diff(path: &str, before: &str, after: &str) -> String {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use loom_core::{ErrorCode, ProjectId};
+    use loom_core::{AgentSessionId, ErrorCode};
 
     use super::*;
 
     fn workspace() -> (Workspace, PathBuf) {
-        let root = std::env::temp_dir().join(format!("loom-workspace-{}", ProjectId::new()));
+        let session_id = AgentSessionId::new();
+        let root = std::env::temp_dir().join(format!("loom-workspace-{session_id}"));
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("README.md"), "hello\n").unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn answer() -> u8 { 1 }\n").unwrap();
-        (Workspace::open(ProjectId::new(), &root).unwrap(), root)
+        (Workspace::open(session_id, &root).unwrap(), root)
     }
 
     #[test]
@@ -1113,9 +1117,7 @@ mod tests {
     fn checkpoint_revert_and_user_takeover_are_conflict_safe() {
         let (workspace, root) = workspace();
         fs::write(root.join("binary.bin"), [0, 159, 146, 150]).unwrap();
-        let checkpoint = workspace
-            .create_checkpoint(None, "before agent edit")
-            .unwrap();
+        let checkpoint = workspace.create_checkpoint("before agent edit").unwrap();
         assert!(!checkpoint.files.contains_key("binary.bin"));
         let before = workspace.read_file("README.md").unwrap();
         workspace
@@ -1169,12 +1171,10 @@ mod tests {
     #[test]
     fn workspace_state_restores_checkpoints_and_user_control() {
         let (workspace, root) = workspace();
-        let checkpoint = workspace
-            .create_checkpoint(None, "durable checkpoint")
-            .unwrap();
+        let checkpoint = workspace.create_checkpoint("durable checkpoint").unwrap();
         workspace.take_control(WorkspaceControl::User).unwrap();
         let state = workspace.export_state().unwrap();
-        let restored = Workspace::open(workspace.project_id(), &root).unwrap();
+        let restored = Workspace::open(workspace.session_id(), &root).unwrap();
         restored.restore_state(state).unwrap();
 
         assert_eq!(restored.control().unwrap(), WorkspaceControl::User);
@@ -1185,7 +1185,7 @@ mod tests {
     #[test]
     fn workspace_state_rejects_unsupported_revisions() {
         let (workspace, root) = workspace();
-        workspace.create_checkpoint(None, "checkpoint").unwrap();
+        workspace.create_checkpoint("checkpoint").unwrap();
         let before = workspace.read_file("README.md").unwrap();
         workspace
             .apply_edit(WorkspaceEdit {
@@ -1196,7 +1196,7 @@ mod tests {
             })
             .unwrap();
         let state = workspace.export_state().unwrap();
-        let restored = Workspace::open(workspace.project_id(), &root).unwrap();
+        let restored = Workspace::open(workspace.session_id(), &root).unwrap();
         for field in ["revision", "expected_revision", "after_revision"] {
             let mut invalid = state.clone();
             match field {

@@ -13,18 +13,18 @@ use loom_agent::{
 };
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Capability,
-    CapabilitySet, ErrorCode, EventSequence, LoomError, ProjectId, ProtocolVersion, RepositoryId,
-    Result, SessionEventRecord, Timestamp, WorkspaceId, WorkspaceRecord,
+    CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId, Result,
+    SessionEventRecord, Timestamp, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
 use loom_persistence::{CURRENT_SCHEMA_VERSION, FilePersistence};
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
-    ClientRequest, GitHubCopilotLoginStatus, NegotiationResult, ProjectSnapshot, RequestEnvelope,
-    ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionFilesystemChange,
-    SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository, WorkerNodeResources,
-    WorkerNodeStatus, WorkspaceConfig, unsupported_version_error,
+    ClientRequest, GitHubCopilotLoginStatus, NegotiationResult, RequestEnvelope, ResponseEnvelope,
+    ServerEventEnvelope, ServerResponse, SessionFilesystemChange, SessionFilesystemFile,
+    SessionFilesystemSnapshot, SessionRepository, WorkerNodeResources, WorkerNodeStatus,
+    WorkspaceConfig, unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
@@ -395,14 +395,12 @@ struct PersistedBackendState {
     workspace_records: loom_session::WorkspaceManagerState,
     journal: EventJournal,
     runs: BTreeMap<loom_core::RunId, AgentRuntimeState>,
-    workspaces: BTreeMap<ProjectId, loom_workspace::WorkspaceStateSnapshot>,
     session_filesystems: BTreeMap<AgentSessionId, PersistedSessionFilesystem>,
-    policies: BTreeMap<ProjectId, ApprovalPolicy>,
     session_policies: BTreeMap<AgentSessionId, ApprovalPolicy>,
     auto_approve_actions: BTreeMap<AgentSessionId, bool>,
     provider_configs: Vec<ProviderConfig>,
     provider_health: BTreeMap<ProviderId, ProviderHealth>,
-    workspace_configs: BTreeMap<ProjectId, WorkspaceConfig>,
+    workspace_configs: BTreeMap<WorkspaceId, WorkspaceConfig>,
     provider_usage: UsageLedger,
     idempotency: BTreeMap<loom_core::RequestId, IdempotencyRecord>,
 }
@@ -610,7 +608,6 @@ struct StartRunInput {
     session_id: AgentSessionId,
     task: String,
     model: ModelId,
-    workspace_root: Option<String>,
     system_instructions: Option<String>,
     repository_instructions: Option<String>,
     options: AgentRuntimeOptions,
@@ -628,19 +625,14 @@ pub struct InProcessBackend {
     workspace_records: Mutex<loom_session::WorkspaceManager>,
     runs: Mutex<BTreeMap<loom_core::RunId, Arc<RunHandle>>>,
     journal: Mutex<EventJournal>,
-    workspaces: Mutex<BTreeMap<ProjectId, Workspace>>,
     session_filesystems: Mutex<BTreeMap<AgentSessionId, Workspace>>,
     session_repositories:
         Mutex<BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>,
     session_vcs: Mutex<BTreeMap<(AgentSessionId, RepositoryId), GitService>>,
-    vcs: Mutex<BTreeMap<ProjectId, GitService>>,
-    task_supervisors: Mutex<BTreeMap<ProjectId, TaskSupervisor>>,
     session_task_supervisors: Mutex<BTreeMap<AgentSessionId, TaskSupervisor>>,
-    policies: Mutex<BTreeMap<ProjectId, ApprovalPolicy>>,
     session_policies: Mutex<BTreeMap<AgentSessionId, ApprovalPolicy>>,
     auto_approve_actions: Mutex<BTreeMap<AgentSessionId, bool>>,
-    workspace_configs: Mutex<BTreeMap<ProjectId, WorkspaceConfig>>,
-    terminal_projects: Mutex<BTreeMap<loom_core::TerminalId, ProjectId>>,
+    workspace_configs: Mutex<BTreeMap<WorkspaceId, WorkspaceConfig>>,
     session_terminals: Mutex<BTreeMap<loom_core::TerminalId, AgentSessionId>>,
     terminals: TerminalManager,
     resource_monitor: Mutex<ResourceMonitor>,
@@ -943,7 +935,12 @@ impl InProcessBackend {
         };
         let (node_id, node_name) = worker_node_identity();
         let session_root_base = persistence.as_ref().map_or_else(
-            || std::env::temp_dir().join(format!("loom-session-roots-{node_id}")),
+            || {
+                std::env::temp_dir().join(format!(
+                    "loom-session-roots-{node_id}-{}",
+                    WorkspaceId::new()
+                ))
+            },
             |persistence| persistence.path().with_extension("session-roots"),
         );
         let backend = Arc::new(Self {
@@ -953,18 +950,13 @@ impl InProcessBackend {
             workspace_records: Mutex::new(loom_session::WorkspaceManager::default()),
             runs: Mutex::new(BTreeMap::new()),
             journal: Mutex::new(EventJournal::default()),
-            workspaces: Mutex::new(BTreeMap::new()),
             session_filesystems: Mutex::new(BTreeMap::new()),
             session_repositories: Mutex::new(BTreeMap::new()),
             session_vcs: Mutex::new(BTreeMap::new()),
-            vcs: Mutex::new(BTreeMap::new()),
-            task_supervisors: Mutex::new(BTreeMap::new()),
             session_task_supervisors: Mutex::new(BTreeMap::new()),
-            policies: Mutex::new(BTreeMap::new()),
             session_policies: Mutex::new(BTreeMap::new()),
             auto_approve_actions: Mutex::new(BTreeMap::new()),
             workspace_configs: Mutex::new(BTreeMap::new()),
-            terminal_projects: Mutex::new(BTreeMap::new()),
             session_terminals: Mutex::new(BTreeMap::new()),
             terminals: TerminalManager::new(),
             resource_monitor: Mutex::new(ResourceMonitor::default()),
@@ -986,22 +978,17 @@ impl InProcessBackend {
                 Capability::ReadProviderHealth,
                 Capability::ReadUsage,
                 Capability::InspectContext,
-                Capability::OpenWorkspace,
-                Capability::ReadWorkspace,
-                Capability::WriteWorkspace,
-                Capability::SubscribeWorkspaceEvents,
-                Capability::OpenTerminal,
-                Capability::ControlTerminal,
-                Capability::ReadTask,
-                Capability::StartTask,
-                Capability::ControlTask,
+                Capability::ReadWorkspaceConfig,
+                Capability::OpenSessionTerminal,
+                Capability::ControlSessionTerminal,
+                Capability::ReadSessionTask,
+                Capability::StartSessionTask,
+                Capability::ControlSessionTask,
                 Capability::ConfigureApprovalPolicy,
                 Capability::ManageCheckpoints,
-                Capability::TakeoverWorkspace,
-                Capability::ReadWorkspaceInstructions,
                 Capability::ReadVcsStatus,
                 Capability::ReadVcsDiff,
-                Capability::ReadTaskEvidence,
+                Capability::ReadSessionTaskEvidence,
                 Capability::ReadWorkerNodeStatus,
                 Capability::JsonProtocol,
                 Capability::ManageWorkspaces,
@@ -1146,46 +1133,6 @@ impl InProcessBackend {
         })
     }
 
-    fn workspaces(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, Workspace>>> {
-        self.workspaces.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "workspace manager lock was poisoned",
-                true,
-            )
-        })
-    }
-
-    fn vcs(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, GitService>>> {
-        self.vcs.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "Git service manager lock was poisoned",
-                true,
-            )
-        })
-    }
-
-    fn task_supervisors(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, TaskSupervisor>>> {
-        self.task_supervisors.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "task supervisor lock was poisoned",
-                true,
-            )
-        })
-    }
-
-    fn policies(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, ApprovalPolicy>>> {
-        self.policies.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "approval policy lock was poisoned",
-                true,
-            )
-        })
-    }
-
     fn session_policies(&self) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, ApprovalPolicy>>> {
         self.session_policies.lock().map_err(|_| {
             LoomError::new(
@@ -1206,7 +1153,7 @@ impl InProcessBackend {
         })
     }
 
-    fn workspace_configs(&self) -> Result<MutexGuard<'_, BTreeMap<ProjectId, WorkspaceConfig>>> {
+    fn workspace_configs(&self) -> Result<MutexGuard<'_, BTreeMap<WorkspaceId, WorkspaceConfig>>> {
         self.workspace_configs.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -1226,7 +1173,11 @@ impl InProcessBackend {
         })
     }
 
-    fn set_workspace_config(&self, project_id: ProjectId, config: WorkspaceConfig) -> Result<()> {
+    fn set_workspace_config(
+        &self,
+        workspace_id: WorkspaceId,
+        config: WorkspaceConfig,
+    ) -> Result<()> {
         let unique_urls = config
             .worker_nodes
             .iter()
@@ -1245,34 +1196,22 @@ impl InProcessBackend {
         }
         let current_revision = self
             .workspace_configs()?
-            .get(&project_id)
+            .get(&workspace_id)
             .map(|config| config.revision);
         if current_revision.is_some_and(|revision| revision > config.revision) {
             return Ok(());
         }
-        let previous = self.workspace_configs()?.insert(project_id, config);
+        let previous = self.workspace_configs()?.insert(workspace_id, config);
         if let Err(error) = self.persist_state() {
             let mut configs = self.workspace_configs()?;
             if let Some(previous) = previous {
-                configs.insert(project_id, previous);
+                configs.insert(workspace_id, previous);
             } else {
-                configs.remove(&project_id);
+                configs.remove(&workspace_id);
             }
             return Err(error);
         }
         Ok(())
-    }
-
-    fn terminal_projects(
-        &self,
-    ) -> Result<MutexGuard<'_, BTreeMap<loom_core::TerminalId, ProjectId>>> {
-        self.terminal_projects.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "terminal project lock was poisoned",
-                true,
-            )
-        })
     }
 
     fn create_session_filesystem(
@@ -1292,7 +1231,7 @@ impl InProcessBackend {
                 false,
             )
         })?;
-        Workspace::open(ProjectId::from_uuid(*workspace_id.as_uuid()), root)
+        Workspace::open(session_id, root)
     }
 
     fn restore_persisted(self: &Arc<Self>) -> Result<()> {
@@ -1331,13 +1270,11 @@ impl InProcessBackend {
                 .unwrap_or_default(),
             journal: from_json(required("journal")?)?,
             runs: from_json(required("runs")?)?,
-            workspaces: from_json(required("workspaces")?)?,
             session_filesystems: persistence
                 .load_section("session_filesystems", CURRENT_SCHEMA_VERSION)?
                 .map(from_json)
                 .transpose()?
                 .unwrap_or_default(),
-            policies: from_json(required("policies")?)?,
             session_policies: session_policies.unwrap_or_default(),
             auto_approve_actions: persistence
                 .load_section("auto_approve_actions", CURRENT_SCHEMA_VERSION)?
@@ -1354,8 +1291,6 @@ impl InProcessBackend {
             provider_usage: from_json(required("provider_usage")?)?,
             idempotency: from_json(required("idempotency")?)?,
         };
-        let _: BTreeMap<loom_core::TerminalId, ProjectId> =
-            from_json(required("terminal_projects")?)?;
         let _: Vec<ModelDescriptor> = from_json(required("models")?)?;
         let sessions = SessionManager::from_state(state.sessions)?;
         {
@@ -1388,10 +1323,6 @@ impl InProcessBackend {
             *target = state.idempotency;
         }
         {
-            let mut target = self.policies()?;
-            *target = state.policies;
-        }
-        {
             let mut target = self.session_policies()?;
             *target = state.session_policies;
         }
@@ -1399,48 +1330,13 @@ impl InProcessBackend {
             let mut target = self.auto_approve_actions()?;
             *target = state.auto_approve_actions;
         }
-        {
-            let mut target = self.terminal_projects()?;
-            // Child process handles cannot be restored safely; stale ids must
-            // not grant access to a newly created terminal.
-            *target = BTreeMap::new();
-        }
         self.providers.restore_configs(state.provider_configs)?;
         self.providers.restore_health(state.provider_health)?;
         self.providers.restore_usage(state.provider_usage)?;
         *self.workspace_configs()? = state.workspace_configs;
 
-        let original_workspace_records = state.workspace_records.clone();
-        let mut workspace_records =
+        *self.workspace_records()? =
             loom_session::WorkspaceManager::from_state(state.workspace_records)?;
-        for (project_id, persisted) in &state.workspaces {
-            let name = Path::new(&persisted.root)
-                .file_name()
-                .map(|name| format!("Workspace {}", name.to_string_lossy()))
-                .unwrap_or_else(|| format!("Workspace {project_id}"));
-            workspace_records.ensure_legacy(WorkspaceId::from_uuid(*project_id.as_uuid()), name);
-        }
-        for session in self.sessions()?.list_in_workspace(None, true) {
-            if workspace_records.get(session.workspace_id).is_err() {
-                workspace_records.ensure_legacy(
-                    session.workspace_id,
-                    format!("Workspace {}", session.workspace_id),
-                );
-            }
-        }
-        let exported_workspace_records = workspace_records.export_state();
-        needs_persist |= exported_workspace_records != original_workspace_records;
-        *self.workspace_records()? = workspace_records;
-
-        let mut workspaces = self.workspaces()?;
-        for (project_id, persisted) in state.workspaces {
-            let original = persisted.clone();
-            let workspace = Workspace::open(project_id, PathBuf::from(&persisted.root))?;
-            workspace.restore_state(persisted)?;
-            needs_persist |= workspace.export_state()? != original;
-            workspaces.insert(project_id, workspace);
-        }
-        drop(workspaces);
 
         let mut session_filesystems = self.session_filesystems()?;
         let mut session_repositories = self.session_repositories()?;
@@ -1465,10 +1361,7 @@ impl InProcessBackend {
                     false,
                 ));
             }
-            let filesystem = Workspace::open(
-                ProjectId::from_uuid(*session.workspace_id.as_uuid()),
-                &canonical_expected_root,
-            )?;
+            let filesystem = Workspace::open(session_id, &canonical_expected_root)?;
             filesystem.restore_state(persisted.filesystem)?;
             for (repository_id, repository) in &persisted.repositories {
                 if *repository_id != repository.id {
@@ -1499,20 +1392,17 @@ impl InProcessBackend {
                 ));
             }
             let session = self.sessions()?.get(runtime_state.session_id)?;
-            let workspace = match self.session_filesystems()?.get(&session.id).cloned() {
-                Some(workspace) => workspace,
-                None => self
-                    .workspaces()?
-                    .get(&session.project_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        LoomError::new(
-                            ErrorCode::RecoveryRequired,
-                            format!("filesystem for persisted run {run_id} is unavailable"),
-                            true,
-                        )
-                    })?,
-            };
+            let workspace = self
+                .session_filesystems()?
+                .get(&session.id)
+                .cloned()
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::RecoveryRequired,
+                        format!("filesystem for persisted run {run_id} is unavailable"),
+                        true,
+                    )
+                })?;
             let mut recovery_reason = None;
             let provider =
                 match self.provider_at(&runtime_state.task.model, runtime_state.provider_cursor) {
@@ -1567,11 +1457,6 @@ impl InProcessBackend {
             .iter()
             .map(|(run_id, handle)| (*run_id, handle.state()))
             .collect();
-        let workspaces = self
-            .workspaces()?
-            .iter()
-            .map(|(project_id, workspace)| Ok((*project_id, workspace.export_state()?)))
-            .collect::<Result<BTreeMap<_, _>>>()?;
         let session_filesystems = self
             .session_filesystems()?
             .iter()
@@ -1599,9 +1484,7 @@ impl InProcessBackend {
                 ),
                 ("journal", json_value(self.journal()?.clone())?),
                 ("runs", json_value(runs)?),
-                ("workspaces", json_value(workspaces)?),
                 ("session_filesystems", json_value(session_filesystems)?),
-                ("policies", json_value(self.policies()?.clone())?),
                 (
                     "session_approval_policies",
                     json_value(self.session_policies()?.clone())?,
@@ -1613,10 +1496,6 @@ impl InProcessBackend {
                 (
                     "workspace_configs",
                     json_value(self.workspace_configs()?.clone())?,
-                ),
-                (
-                    "terminal_projects",
-                    json_value(self.terminal_projects()?.clone())?,
                 ),
                 (
                     "provider_configs",
@@ -1917,8 +1796,8 @@ impl InProcessConnection {
             .map(|event| event.sequence)
             .max()
             .unwrap_or_default();
-        let approval_policy = self.policy(session_id, session.project_id)?;
-        let auto_approve_actions = self.auto_approve_actions(session_id, session.project_id)?;
+        let approval_policy = self.policy(session_id)?;
+        let auto_approve_actions = self.auto_approve_actions(session_id)?;
         Ok(AgentSessionSnapshotProjection {
             session,
             active_run,
@@ -1928,74 +1807,12 @@ impl InProcessConnection {
         })
     }
 
-    fn project_snapshots(&self) -> Result<Vec<ProjectSnapshot>> {
-        let sessions = self.backend.sessions()?.list(None, true);
-        let workspaces = self.backend.workspaces()?;
-        let mut projects = BTreeMap::new();
-
-        for (project_id, workspace) in workspaces.iter() {
-            let name = workspace
-                .root()
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or("Project")
-                .to_owned();
-            projects.insert(
-                *project_id,
-                ProjectSnapshot {
-                    id: *project_id,
-                    name,
-                    root: Some(workspace.root().display().to_string()),
-                    session_count: 0,
-                    updated_at: None,
-                },
-            );
-        }
-        drop(workspaces);
-
-        for session in sessions {
-            let project = projects
-                .entry(session.project_id)
-                .or_insert_with(|| ProjectSnapshot {
-                    id: session.project_id,
-                    name: format!("Project {}", session.project_id),
-                    root: None,
-                    session_count: 0,
-                    updated_at: None,
-                });
-            project.session_count = project.session_count.saturating_add(1);
-            project.updated_at = Some(project.updated_at.map_or(session.updated_at, |updated| {
-                updated.max(session.updated_at)
-            }));
-        }
-        Ok(projects.into_values().collect())
-    }
-
-    fn open_workspace(&self, project_id: ProjectId, root: String) -> Result<Workspace> {
-        let requested_root = Workspace::canonical_root(&root)?;
-        let mut workspaces = self.backend.workspaces()?;
-        if let Some(existing) = workspaces.get(&project_id) {
-            if existing.root() != requested_root {
-                return Err(LoomError::conflict(format!(
-                    "project {project_id} is already configured for workspace '{}'",
-                    existing.root().display()
-                )));
-            }
-            return Ok(existing.clone());
-        }
-        let candidate = Workspace::open(project_id, requested_root)?;
-        workspaces.insert(project_id, candidate.clone());
-        drop(workspaces);
-        let workspace_id = WorkspaceId::from_uuid(*project_id.as_uuid());
-        self.backend
-            .workspace_records()?
-            .ensure_legacy(workspace_id, format!("Workspace {workspace_id}"));
-        Ok(candidate)
-    }
-
     fn create_workspace(&self, name: String) -> Result<WorkspaceRecord> {
         self.backend.workspace_records()?.create(name)
+    }
+
+    fn register_workspace(&self, workspace: WorkspaceRecord) -> Result<WorkspaceRecord> {
+        self.backend.workspace_records()?.register(workspace)
     }
 
     fn rename_workspace(&self, workspace_id: WorkspaceId, name: String) -> Result<WorkspaceRecord> {
@@ -2032,64 +1849,17 @@ impl InProcessConnection {
     }
 
     fn session_filesystem(&self, session_id: AgentSessionId) -> Result<Workspace> {
-        if let Some(filesystem) = self
-            .backend
+        self.backend
             .session_filesystems()?
             .get(&session_id)
             .cloned()
-        {
-            return Ok(filesystem);
-        }
-        let session = self.backend.sessions()?.get(session_id)?;
-        let mut filesystem = self
-            .backend
-            .create_session_filesystem(session.workspace_id, session.id)?;
-        let legacy = self
-            .backend
-            .workspaces()?
-            .get(&session.project_id)
-            .map(|workspace| workspace.root().to_path_buf());
-        if let Some(legacy_root) = legacy {
-            let root = filesystem.root().to_path_buf();
-            let staging = root.with_file_name(format!(".migration-{}", session.id));
-            let _ = fs::remove_dir_all(&staging);
-            fs::create_dir(&staging).map_err(|error| {
+            .ok_or_else(|| {
                 LoomError::new(
-                    ErrorCode::WorkspaceAccessDenied,
-                    format!("could not create session migration staging directory: {error}"),
-                    false,
+                    ErrorCode::RecoveryRequired,
+                    format!("filesystem for session {session_id} is unavailable"),
+                    true,
                 )
-            })?;
-            if let Err(error) = copy_filesystem_tree(&legacy_root, &staging) {
-                let _ = fs::remove_dir_all(&staging);
-                return Err(error);
-            }
-            fs::remove_dir_all(&root).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::WorkspaceAccessDenied,
-                    format!("could not replace legacy session filesystem: {error}"),
-                    false,
-                )
-            })?;
-            fs::rename(&staging, &root).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::WorkspaceAccessDenied,
-                    format!("could not install migrated session filesystem: {error}"),
-                    false,
-                )
-            })?;
-            filesystem =
-                Workspace::open(ProjectId::from_uuid(*session.workspace_id.as_uuid()), &root)?;
-        }
-        self.backend
-            .session_filesystems()?
-            .insert(session_id, filesystem.clone());
-        self.backend
-            .session_repositories()?
-            .entry(session_id)
-            .or_default();
-        self.backend.persist_state()?;
-        Ok(filesystem)
+            })
     }
 
     fn attach_session_repository(
@@ -2325,78 +2095,20 @@ impl InProcessConnection {
         Ok(())
     }
 
-    fn workspace(&self, project_id: ProjectId) -> Result<Workspace> {
-        self.backend
-            .workspaces()?
-            .get(&project_id)
-            .cloned()
-            .ok_or_else(|| LoomError::not_found("workspace", project_id))
-    }
-
-    fn vcs(&self, project_id: ProjectId) -> Result<GitService> {
-        if let Some(service) = self.backend.vcs()?.get(&project_id).cloned() {
-            return Ok(service);
-        }
-        let workspace = self.workspace(project_id)?;
-        let service = GitService::open(workspace.root())?;
-        self.backend.vcs()?.insert(project_id, service.clone());
-        Ok(service)
-    }
-
-    fn policy(&self, session_id: AgentSessionId, project_id: ProjectId) -> Result<ApprovalPolicy> {
+    fn policy(&self, session_id: AgentSessionId) -> Result<ApprovalPolicy> {
         if let Some(policy) = self.backend.session_policies()?.get(&session_id).cloned() {
             return Ok(policy);
         }
-        let mut policies = self.backend.policies()?;
-        Ok(policies
-            .entry(project_id)
-            .or_insert_with(ApprovalPolicy::auto_approve)
-            .clone())
+        Ok(ApprovalPolicy::auto_approve())
     }
 
-    fn auto_approve_actions(
-        &self,
-        session_id: AgentSessionId,
-        project_id: ProjectId,
-    ) -> Result<bool> {
+    fn auto_approve_actions(&self, session_id: AgentSessionId) -> Result<bool> {
         let settings = self.backend.auto_approve_actions()?;
         if let Some(auto_approve_actions) = settings.get(&session_id) {
             return Ok(*auto_approve_actions);
         }
         drop(settings);
-        Ok(self.policy(session_id, project_id)? == ApprovalPolicy::auto_approve())
-    }
-
-    fn task_supervisor(&self, project_id: ProjectId) -> Result<TaskSupervisor> {
-        let workspace = self.workspace(project_id)?;
-        let mut supervisors = self.backend.task_supervisors()?;
-        if let Some(supervisor) = supervisors.get(&project_id) {
-            return Ok(supervisor.clone());
-        }
-        let supervisor = TaskSupervisor::new(workspace.root())?;
-        supervisors.insert(project_id, supervisor.clone());
-        Ok(supervisor)
-    }
-
-    fn check_terminal_project(
-        &self,
-        project_id: ProjectId,
-        terminal_id: loom_core::TerminalId,
-    ) -> Result<()> {
-        let owner = self
-            .backend
-            .terminal_projects()?
-            .get(&terminal_id)
-            .copied()
-            .ok_or_else(|| LoomError::not_found("terminal", terminal_id))?;
-        if owner != project_id {
-            return Err(LoomError::new(
-                ErrorCode::WorkspaceAccessDenied,
-                "terminal does not belong to the requested workspace",
-                false,
-            ));
-        }
-        Ok(())
+        Ok(self.policy(session_id)? == ApprovalPolicy::auto_approve())
     }
 
     pub fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
@@ -2535,6 +2247,9 @@ impl InProcessConnection {
             ClientRequest::CreateWorkspace { name } => Ok(ServerResponse::WorkspaceCreated(
                 self.create_workspace(name)?,
             )),
+            ClientRequest::RegisterWorkspace { workspace } => Ok(ServerResponse::WorkspaceCreated(
+                self.register_workspace(workspace)?,
+            )),
             ClientRequest::ListWorkspaces => {
                 let workspaces = self
                     .backend
@@ -2542,12 +2257,9 @@ impl InProcessConnection {
                     .list()
                     .into_iter()
                     .filter(|workspace| {
-                        self.auth.as_ref().is_none_or(|auth| {
-                            auth.scope().allows_workspace(workspace.id)
-                                && auth
-                                    .scope()
-                                    .allows_project(ProjectId::from_uuid(*workspace.id.as_uuid()))
-                        })
+                        self.auth
+                            .as_ref()
+                            .is_none_or(|auth| auth.scope().allows_workspace(workspace.id))
                     })
                     .collect();
                 Ok(ServerResponse::Workspaces { workspaces })
@@ -2562,7 +2274,14 @@ impl InProcessConnection {
                 sessions: self
                     .backend
                     .sessions()?
-                    .list_in_workspace(Some(workspace_id), include_archived),
+                    .list_in_workspace(Some(workspace_id), include_archived)
+                    .into_iter()
+                    .filter(|session| {
+                        self.auth
+                            .as_ref()
+                            .is_none_or(|auth| auth.scope().allows_session(session.id))
+                    })
+                    .collect(),
             }),
             ClientRequest::CreateAgentSessionInWorkspace { workspace_id, name } => {
                 Ok(ServerResponse::AgentSessionCreated(
@@ -2570,11 +2289,10 @@ impl InProcessConnection {
                 ))
             }
             ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id } => {
-                let project_id = ProjectId::from_uuid(*workspace_id.as_uuid());
                 Ok(ServerResponse::WorkspaceConfig(
                     self.backend
                         .workspace_configs()?
-                        .get(&project_id)
+                        .get(&workspace_id)
                         .cloned()
                         .unwrap_or_default(),
                 ))
@@ -2583,8 +2301,7 @@ impl InProcessConnection {
                 workspace_id,
                 config,
             } => {
-                self.backend
-                    .set_workspace_config(ProjectId::from_uuid(*workspace_id.as_uuid()), config)?;
+                self.backend.set_workspace_config(workspace_id, config)?;
                 Ok(ServerResponse::WorkspaceConfigUpdated)
             }
             ClientRequest::AttachSessionRepository {
@@ -2612,46 +2329,6 @@ impl InProcessConnection {
             } => {
                 self.detach_session_repository(session_id, repository_id)?;
                 Ok(ServerResponse::SessionRepositoryDetached)
-            }
-            ClientRequest::ListProjects => {
-                let projects = self
-                    .project_snapshots()?
-                    .into_iter()
-                    .filter(|project| {
-                        self.auth
-                            .as_ref()
-                            .is_none_or(|auth| auth.scope().allows_project(project.id))
-                    })
-                    .collect();
-                Ok(ServerResponse::Projects { projects })
-            }
-            ClientRequest::ListAgentSessions {
-                project_id,
-                include_archived,
-            } => {
-                let sessions = self
-                    .backend
-                    .sessions()?
-                    .list(project_id, include_archived)
-                    .into_iter()
-                    .filter(|session| {
-                        self.auth.as_ref().is_none_or(|auth| {
-                            auth.scope().allows_project(session.project_id)
-                                && auth.scope().allows_session(session.id)
-                                && auth.scope().allows_workspace(session.workspace_id)
-                        })
-                    })
-                    .collect();
-                Ok(ServerResponse::AgentSessions { sessions })
-            }
-            ClientRequest::CreateAgentSession { project_id, name } => {
-                let workspace_id = WorkspaceId::from_uuid(*project_id.as_uuid());
-                self.backend
-                    .workspace_records()?
-                    .ensure_legacy(workspace_id, format!("Workspace {workspace_id}"));
-                let (snapshot, record) = self.backend.sessions()?.create(project_id, name)?;
-                self.backend.journal()?.append_session(record);
-                Ok(ServerResponse::AgentSessionCreated(snapshot))
             }
             ClientRequest::GetAgentSession { session_id } => {
                 let snapshot = self.backend.sessions()?.get(session_id)?;
@@ -2701,44 +2378,6 @@ impl InProcessConnection {
                     events: journal.recent_events(session_id, limit as usize),
                 })
             }
-            ClientRequest::StartAgentRun {
-                session_id,
-                task,
-                model,
-                workspace_root,
-                system_instructions,
-                repository_instructions,
-            } => self.start_run(
-                session_id,
-                task,
-                model,
-                workspace_root,
-                system_instructions,
-                repository_instructions,
-            ),
-            ClientRequest::StartAgentRunWithOptions {
-                session_id,
-                task,
-                model,
-                workspace_root,
-                system_instructions,
-                repository_instructions,
-                limits,
-                context,
-            } => self.start_run_with_options(StartRunInput {
-                session_id,
-                task,
-                model,
-                workspace_root: Some(workspace_root),
-                system_instructions,
-                repository_instructions,
-                options: AgentRuntimeOptions {
-                    limits,
-                    context,
-                    checkpoint_id: None,
-                    ..Default::default()
-                },
-            }),
             ClientRequest::StartSessionAgentRun {
                 session_id,
                 task,
@@ -2749,7 +2388,6 @@ impl InProcessConnection {
                 session_id,
                 task,
                 model,
-                workspace_root: None,
                 system_instructions,
                 repository_instructions,
                 options: AgentRuntimeOptions::default(),
@@ -2766,7 +2404,6 @@ impl InProcessConnection {
                 session_id,
                 task,
                 model,
-                workspace_root: None,
                 system_instructions,
                 repository_instructions,
                 options: AgentRuntimeOptions {
@@ -2783,11 +2420,11 @@ impl InProcessConnection {
                 self.run_snapshot_projection(run_id)?,
             )),
             ClientRequest::GetRunCheckpoint { run_id } => {
-                let (project_id, checkpoint_id) = {
+                let (session_id, checkpoint_id) = {
                     let handle = self.run_handle(run_id)?;
                     let session = self.backend.sessions()?.get(handle.session_id)?;
                     (
-                        session.project_id,
+                        session.id,
                         handle.state().options.checkpoint_id.ok_or_else(|| {
                             LoomError::new(
                                 ErrorCode::NotFound,
@@ -2798,7 +2435,8 @@ impl InProcessConnection {
                     )
                 };
                 Ok(ServerResponse::RunCheckpoint(
-                    self.workspace(project_id)?.checkpoint(checkpoint_id)?,
+                    self.session_filesystem(session_id)?
+                        .checkpoint(checkpoint_id)?,
                 ))
             }
             ClientRequest::ApproveAgentAction {
@@ -2839,9 +2477,8 @@ impl InProcessConnection {
                         "forked agent session name must not be empty",
                     ));
                 }
-                let project_id = source.project_id;
-                let approval_policy = self.policy(session_id, project_id)?;
-                let auto_approve_actions = self.auto_approve_actions(session_id, project_id)?;
+                let approval_policy = self.policy(session_id)?;
+                let auto_approve_actions = self.auto_approve_actions(session_id)?;
                 let source_filesystem = self.session_filesystem(session_id)?;
                 let target_id = AgentSessionId::new();
                 let target_root = self
@@ -2861,10 +2498,7 @@ impl InProcessConnection {
                     let _ = fs::remove_dir_all(&target_root);
                     return Err(error);
                 }
-                let target_filesystem = Workspace::open(
-                    ProjectId::from_uuid(*source.workspace_id.as_uuid()),
-                    &target_root,
-                )?;
+                let target_filesystem = Workspace::open(target_id, &target_root)?;
                 let mut target_repositories = BTreeMap::new();
                 let source_repositories = self
                     .backend
@@ -3075,7 +2709,7 @@ impl InProcessConnection {
             ClientRequest::CreateSessionCheckpoint { session_id, label } => {
                 Ok(ServerResponse::CheckpointCreated(
                     self.session_filesystem(session_id)?
-                        .create_checkpoint(Some(session_id), label)?,
+                        .create_checkpoint(label)?,
                 ))
             }
             ClientRequest::RevertSessionCheckpoint {
@@ -3124,107 +2758,6 @@ impl InProcessConnection {
             } => Ok(ServerResponse::VcsConflicts {
                 paths: self.session_git(session_id, repository_id)?.conflicts()?,
             }),
-            ClientRequest::OpenWorkspace { project_id, root } => {
-                let workspace = self.open_workspace(project_id, root)?;
-                Ok(ServerResponse::WorkspaceOpened(workspace.snapshot()?))
-            }
-            ClientRequest::GetWorkspaceConfig { project_id } => {
-                Ok(ServerResponse::WorkspaceConfig(
-                    self.backend
-                        .workspace_configs()?
-                        .get(&project_id)
-                        .cloned()
-                        .unwrap_or_default(),
-                ))
-            }
-            ClientRequest::SetWorkspaceConfig { project_id, config } => {
-                self.backend.set_workspace_config(project_id, config)?;
-                Ok(ServerResponse::WorkspaceConfigUpdated)
-            }
-            ClientRequest::GetWorkspaceSnapshot { project_id } => Ok(
-                ServerResponse::WorkspaceSnapshot(self.workspace(project_id)?.snapshot()?),
-            ),
-            ClientRequest::GetWorkspaceEvents {
-                project_id,
-                after_sequence,
-            } => Ok(ServerResponse::WorkspaceEvents {
-                events: self.workspace(project_id)?.changes_since(after_sequence)?,
-            }),
-            ClientRequest::GetWorkspaceChanges {
-                project_id,
-                after_sequence,
-            } => {
-                let mut changes = self.workspace(project_id)?.changes_since(after_sequence)?;
-                let truncated = changes.len() > MAX_REVIEW_CHANGES;
-                if changes.len() > MAX_REVIEW_CHANGES {
-                    let start = changes.len() - MAX_REVIEW_CHANGES;
-                    changes = changes.split_off(start);
-                }
-                Ok(ServerResponse::WorkspaceChanges { changes, truncated })
-            }
-            ClientRequest::ReadWorkspaceFile { project_id, path } => {
-                let mut file = self.workspace(project_id)?.read_file(&path)?;
-                file.content = bounded_review_text(&file.content, MAX_REVIEW_FILE_BYTES);
-                Ok(ServerResponse::WorkspaceFile(file))
-            }
-            ClientRequest::ApplyWorkspaceEdit { project_id, edit } => {
-                Ok(ServerResponse::WorkspaceEditApplied(
-                    self.workspace(project_id)?.apply_user_edit(edit)?,
-                ))
-            }
-            ClientRequest::TakeWorkspaceControl {
-                project_id,
-                control,
-            } => {
-                self.workspace(project_id)?.take_control(control)?;
-                Ok(ServerResponse::WorkspaceControl(control))
-            }
-            ClientRequest::CreateCheckpoint {
-                project_id,
-                session_id,
-                label,
-            } => Ok(ServerResponse::CheckpointCreated(
-                self.workspace(project_id)?
-                    .create_checkpoint(session_id, label)?,
-            )),
-            ClientRequest::RevertCheckpoint {
-                project_id,
-                checkpoint_id,
-            } => Ok(ServerResponse::CheckpointReverted(
-                self.workspace(project_id)?
-                    .revert_checkpoint(checkpoint_id)?,
-            )),
-            ClientRequest::UndoWorkspaceEdit { project_id } => Ok(ServerResponse::WorkspaceUndo(
-                self.workspace(project_id)?.undo_last_agent_edit()?,
-            )),
-            ClientRequest::SetApprovalPolicy {
-                project_id,
-                session_id,
-                policy,
-                auto_approve_actions,
-            } => {
-                if let Some(session_id) = session_id {
-                    let session = self.backend.sessions()?.get(session_id)?;
-                    if session.project_id != project_id {
-                        return Err(LoomError::new(
-                            ErrorCode::WorkspaceAccessDenied,
-                            "session does not belong to the requested workspace",
-                            false,
-                        ));
-                    }
-                    self.backend
-                        .session_policies()?
-                        .insert(session_id, policy.clone());
-                    if let Some(auto_approve_actions) = auto_approve_actions {
-                        self.backend
-                            .auto_approve_actions()?
-                            .insert(session_id, auto_approve_actions);
-                    }
-                } else {
-                    self.backend.policies()?.insert(project_id, policy.clone());
-                }
-                Ok(ServerResponse::ApprovalPolicy(policy))
-            }
             ClientRequest::SetSessionApprovalPolicy {
                 session_id,
                 policy,
@@ -3337,120 +2870,6 @@ impl InProcessConnection {
                     .get(task_id)?
                     .evidence,
             }),
-            ClientRequest::OpenTerminal {
-                project_id,
-                command,
-                args,
-                cwd,
-            } => {
-                let workspace = self.workspace(project_id)?;
-                let cwd = workspace.directory_path(cwd.as_deref().unwrap_or("."))?;
-                let snapshot = self.backend.terminals.open(command, args, cwd)?;
-                self.backend
-                    .terminal_projects()?
-                    .insert(snapshot.id, project_id);
-                Ok(ServerResponse::TerminalOpened(snapshot))
-            }
-            ClientRequest::WriteTerminalInput {
-                project_id,
-                terminal_id,
-                input,
-            } => {
-                self.check_terminal_project(project_id, terminal_id)?;
-                self.backend.terminals.write_input(terminal_id, &input)?;
-                Ok(ServerResponse::Terminal(
-                    self.backend.terminals.get(terminal_id)?,
-                ))
-            }
-            ClientRequest::ResizeTerminal {
-                project_id,
-                terminal_id,
-                rows,
-                columns,
-            } => {
-                self.check_terminal_project(project_id, terminal_id)?;
-                Ok(ServerResponse::Terminal(self.backend.terminals.resize(
-                    terminal_id,
-                    rows,
-                    columns,
-                )?))
-            }
-            ClientRequest::GetTerminalEvents {
-                project_id,
-                terminal_id,
-                after_sequence,
-            } => Ok(ServerResponse::TerminalEvents {
-                events: {
-                    self.check_terminal_project(project_id, terminal_id)?;
-                    self.backend
-                        .terminals
-                        .events_since(terminal_id, after_sequence)?
-                },
-            }),
-            ClientRequest::CancelTerminal {
-                project_id,
-                terminal_id,
-            } => {
-                self.check_terminal_project(project_id, terminal_id)?;
-                Ok(ServerResponse::Terminal(
-                    self.backend.terminals.cancel(terminal_id)?,
-                ))
-            }
-            ClientRequest::StartTask { project_id, spec } => {
-                let supervisor = self.task_supervisor(project_id)?;
-                Ok(ServerResponse::TaskStarted(supervisor.start(spec)?))
-            }
-            ClientRequest::ListTasks { project_id } => Ok(ServerResponse::Tasks {
-                tasks: self.task_supervisor(project_id)?.list()?,
-            }),
-            ClientRequest::GetTask {
-                project_id,
-                task_id,
-            } => Ok(ServerResponse::Task(
-                self.task_supervisor(project_id)?.get(task_id)?,
-            )),
-            ClientRequest::GetTaskEvents {
-                project_id,
-                task_id,
-                after_sequence,
-            } => Ok(ServerResponse::TaskEvents {
-                events: self
-                    .task_supervisor(project_id)?
-                    .events_since(task_id, after_sequence)?,
-            }),
-            ClientRequest::CancelTask {
-                project_id,
-                task_id,
-            } => Ok(ServerResponse::Task(
-                self.task_supervisor(project_id)?.cancel(task_id)?,
-            )),
-            ClientRequest::GetTaskEvidence {
-                project_id,
-                task_id,
-            } => Ok(ServerResponse::TaskEvidence {
-                evidence: self.task_supervisor(project_id)?.get(task_id)?.evidence,
-            }),
-            ClientRequest::GetContextFiles { project_id } => Ok(ServerResponse::ContextFiles {
-                files: self.workspace(project_id)?.context_files()?,
-            }),
-            ClientRequest::GetVcsStatus { project_id } => {
-                Ok(ServerResponse::VcsStatus(self.vcs(project_id)?.status()?))
-            }
-            ClientRequest::GetVcsDiff {
-                project_id,
-                path,
-                staged,
-            } => {
-                let mut diff = self.vcs(project_id)?.diff(path.as_deref(), staged)?;
-                diff.patch = bounded_review_text(&diff.patch, MAX_REVIEW_DIFF_BYTES);
-                Ok(ServerResponse::VcsDiff(diff))
-            }
-            ClientRequest::GetVcsBranches { project_id } => Ok(ServerResponse::VcsBranches {
-                branches: self.vcs(project_id)?.branches()?,
-            }),
-            ClientRequest::GetVcsConflicts { project_id } => Ok(ServerResponse::VcsConflicts {
-                paths: self.vcs(project_id)?.conflicts()?,
-            }),
             ClientRequest::AttachRunEvidence { run_id, evidence } => {
                 let handle = self.run_handle(run_id)?;
                 let mut runtime = handle.runtime_for_entry()?;
@@ -3462,17 +2881,20 @@ impl InProcessConnection {
     }
 
     fn worker_node_status(&self) -> Result<WorkerNodeStatus> {
-        let (disk_total_bytes, disk_available_bytes) = self
+        let storage_root = self
             .backend
-            .workspaces()
-            .ok()
-            .and_then(|workspaces| {
-                workspaces
-                    .values()
-                    .next()
-                    .map(|workspace| Self::disk_resources(workspace.root()))
+            .session_filesystems()?
+            .values()
+            .next()
+            .map(|filesystem| filesystem.root().to_path_buf())
+            .or_else(|| {
+                self.backend
+                    .session_root_base
+                    .parent()
+                    .map(Path::to_path_buf)
             })
-            .unwrap_or((None, None));
+            .unwrap_or_else(|| self.backend.session_root_base.clone());
+        let (disk_total_bytes, disk_available_bytes) = Self::disk_resources(&storage_root);
         let resources = self
             .backend
             .resource_monitor()?
@@ -3624,16 +3046,12 @@ impl InProcessConnection {
             ));
         }
 
-        let mut project_id = None;
         let mut workspace_id = None;
         let mut session_id = None;
         let mut run_id = None;
         match request {
             ClientRequest::CreateWorkspace { .. } => {
-                if auth.scope().workspaces.is_some()
-                    || auth.scope().projects.is_some()
-                    || auth.scope().sessions.is_some()
-                {
+                if auth.scope().workspaces.is_some() || auth.scope().sessions.is_some() {
                     return Err(LoomError::new(
                         ErrorCode::AuthorizationDenied,
                         "workspace-scoped tokens cannot create workspaces",
@@ -3641,153 +3059,53 @@ impl InProcessConnection {
                     ));
                 }
             }
+            ClientRequest::RegisterWorkspace { workspace } => {
+                if auth.scope().sessions.is_some() {
+                    return Err(LoomError::new(
+                        ErrorCode::AuthorizationDenied,
+                        "session-scoped tokens cannot register workspaces",
+                        false,
+                    ));
+                }
+                workspace_id = Some(workspace.id);
+            }
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: requested_workspace,
+                ..
+            } => {
+                if auth.scope().sessions.is_some() {
+                    return Err(LoomError::new(
+                        ErrorCode::AuthorizationDenied,
+                        "session-scoped tokens cannot create sessions",
+                        false,
+                    ));
+                }
+                workspace_id = Some(*requested_workspace);
+            }
             ClientRequest::RenameWorkspace {
                 workspace_id: requested_workspace,
                 ..
             }
-            | ClientRequest::ListWorkspaceSessions {
+            | ClientRequest::SetWorkspaceConfigForWorkspace {
                 workspace_id: requested_workspace,
                 ..
+            } => {
+                if auth.scope().sessions.is_some() {
+                    return Err(LoomError::new(
+                        ErrorCode::AuthorizationDenied,
+                        "session-scoped tokens cannot modify workspace configuration",
+                        false,
+                    ));
+                }
+                workspace_id = Some(*requested_workspace);
             }
-            | ClientRequest::CreateAgentSessionInWorkspace {
+            ClientRequest::ListWorkspaceSessions {
                 workspace_id: requested_workspace,
                 ..
             }
             | ClientRequest::GetWorkspaceConfigForWorkspace {
                 workspace_id: requested_workspace,
-            }
-            | ClientRequest::SetWorkspaceConfigForWorkspace {
-                workspace_id: requested_workspace,
-                ..
             } => workspace_id = Some(*requested_workspace),
-            ClientRequest::SetApprovalPolicy {
-                project_id: requested_project,
-                session_id: requested_session,
-                ..
-            } => {
-                project_id = Some(*requested_project);
-                session_id = *requested_session;
-            }
-            ClientRequest::OpenWorkspace {
-                project_id: requested_project,
-                root,
-            } => {
-                project_id = Some(*requested_project);
-                if !auth
-                    .scope()
-                    .allows_workspace_root(*requested_project, Path::new(root))
-                {
-                    return Err(LoomError::new(
-                        ErrorCode::WorkspaceAccessDenied,
-                        "token is not authorized for the requested workspace root",
-                        false,
-                    ));
-                }
-            }
-            ClientRequest::ListAgentSessions {
-                project_id: Some(requested_project),
-                ..
-            }
-            | ClientRequest::CreateAgentSession {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetWorkspaceConfig {
-                project_id: requested_project,
-            }
-            | ClientRequest::SetWorkspaceConfig {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetWorkspaceSnapshot {
-                project_id: requested_project,
-            }
-            | ClientRequest::GetWorkspaceEvents {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetWorkspaceChanges {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::ReadWorkspaceFile {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::ApplyWorkspaceEdit {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::TakeWorkspaceControl {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::RevertCheckpoint {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::UndoWorkspaceEdit {
-                project_id: requested_project,
-            }
-            | ClientRequest::OpenTerminal {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::WriteTerminalInput {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::ResizeTerminal {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetTerminalEvents {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::CancelTerminal {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::StartTask {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::ListTasks {
-                project_id: requested_project,
-            }
-            | ClientRequest::GetTask {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetTaskEvents {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::CancelTask {
-                project_id: requested_project,
-                ..
-            } => project_id = Some(*requested_project),
-            ClientRequest::GetContextFiles {
-                project_id: requested_project,
-            }
-            | ClientRequest::GetVcsStatus {
-                project_id: requested_project,
-            }
-            | ClientRequest::GetVcsDiff {
-                project_id: requested_project,
-                ..
-            }
-            | ClientRequest::GetVcsBranches {
-                project_id: requested_project,
-            }
-            | ClientRequest::GetVcsConflicts {
-                project_id: requested_project,
-            }
-            | ClientRequest::GetTaskEvidence {
-                project_id: requested_project,
-                ..
-            } => project_id = Some(*requested_project),
             ClientRequest::GetAgentSession {
                 session_id: requested_session,
             }
@@ -3816,15 +3134,7 @@ impl InProcessConnection {
                 session_id: requested_session,
                 ..
             } => session_id = Some(*requested_session),
-            ClientRequest::StartAgentRun {
-                session_id: requested_session,
-                ..
-            }
-            | ClientRequest::StartAgentRunWithOptions {
-                session_id: requested_session,
-                ..
-            }
-            | ClientRequest::StartSessionAgentRun {
+            ClientRequest::StartSessionAgentRun {
                 session_id: requested_session,
                 ..
             }
@@ -3986,21 +3296,9 @@ impl InProcessConnection {
                 run_id: requested_run,
                 ..
             } => run_id = Some(*requested_run),
-            ClientRequest::CreateCheckpoint {
-                project_id: requested_project,
-                session_id: Some(requested_session),
-                ..
-            } => {
-                project_id = Some(*requested_project);
-                session_id = Some(*requested_session);
-            }
             ClientRequest::Negotiate { .. }
             | ClientRequest::DiscoverCapabilities
             | ClientRequest::ListWorkspaces
-            | ClientRequest::ListProjects
-            | ClientRequest::ListAgentSessions {
-                project_id: None, ..
-            }
             | ClientRequest::ListModels
             | ClientRequest::GetWorkerNodeStatus
             | ClientRequest::ListProviders
@@ -4009,9 +3307,6 @@ impl InProcessConnection {
             | ClientRequest::DiscoverProviderModels { .. }
             | ClientRequest::GetProviderHealth { .. } => {}
             ClientRequest::ConfigureGitHubCopilot { .. } => {}
-            ClientRequest::CreateCheckpoint {
-                session_id: None, ..
-            } => {}
         }
 
         if let ClientRequest::AttachSessionRepository { source, .. } = request
@@ -4030,7 +3325,6 @@ impl InProcessConnection {
                 return Err(unauthorized_session(session_id));
             }
             let session = self.backend.sessions()?.get(session_id)?;
-            let session_project = session.project_id;
             if !auth.scope().allows_workspace(session.workspace_id) {
                 return Err(LoomError::new(
                     ErrorCode::AuthorizationDenied,
@@ -4046,16 +3340,8 @@ impl InProcessConnection {
                 ));
             }
             workspace_id = Some(session.workspace_id);
-            if project_id.is_some_and(|requested_project| requested_project != session_project) {
-                return Err(LoomError::new(
-                    ErrorCode::WorkspaceAccessDenied,
-                    "session does not belong to the requested workspace",
-                    false,
-                ));
-            }
-            project_id = Some(session_project);
         } else if run_id.is_none()
-            && project_id.is_none()
+            && workspace_id.is_none()
             && matches!(
                 request,
                 ClientRequest::GetSessionEvents {
@@ -4063,9 +3349,7 @@ impl InProcessConnection {
                     ..
                 }
             )
-            && (auth.scope().projects.is_some()
-                || auth.scope().sessions.is_some()
-                || auth.scope().workspaces.is_some())
+            && (auth.scope().sessions.is_some() || auth.scope().workspaces.is_some())
         {
             return Err(LoomError::new(
                 ErrorCode::AuthorizationDenied,
@@ -4093,46 +3377,18 @@ impl InProcessConnection {
                 ));
             }
             workspace_id = Some(session.workspace_id);
-            project_id = Some(session.project_id);
         }
 
-        if let Some(workspace_id) = workspace_id {
-            if !auth.scope().allows_workspace(workspace_id) {
-                return Err(LoomError::new(
-                    ErrorCode::AuthorizationDenied,
-                    "token is not authorized for the requested workspace",
-                    false,
-                ));
-            }
-            project_id.get_or_insert_with(|| ProjectId::from_uuid(*workspace_id.as_uuid()));
-        }
-
-        if let Some(project_id) = project_id
-            && !auth.scope().allows_project(project_id)
+        if let Some(workspace_id) = workspace_id
+            && !auth.scope().allows_workspace(workspace_id)
         {
-            return Err(unauthorized_project(project_id));
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "token is not authorized for the requested workspace",
+                false,
+            ));
         }
         Ok(())
-    }
-
-    fn start_run(
-        &self,
-        session_id: AgentSessionId,
-        task: String,
-        model: ModelId,
-        workspace_root: String,
-        system_instructions: Option<String>,
-        repository_instructions: Option<String>,
-    ) -> Result<ServerResponse> {
-        self.start_run_with_options(StartRunInput {
-            session_id,
-            task,
-            model,
-            workspace_root: Some(workspace_root),
-            system_instructions,
-            repository_instructions,
-            options: AgentRuntimeOptions::default(),
-        })
     }
 
     fn start_run_with_options(&self, mut input: StartRunInput) -> Result<ServerResponse> {
@@ -4153,20 +3409,17 @@ impl InProcessConnection {
             self.backend.providers.pricing(&input.model)?;
         input.options.input_cost_micros_per_1k = input_cost_micros_per_1k;
         input.options.output_cost_micros_per_1k = output_cost_micros_per_1k;
-        let workspace = match input.workspace_root.take() {
-            Some(root) => self.open_workspace(session.project_id, root)?,
-            None => self.session_filesystem(session.id)?,
-        };
+        let workspace = self.session_filesystem(session.id)?;
         if input.repository_instructions.is_none() {
             let instructions = workspace.instruction_text()?;
             if !instructions.trim().is_empty() {
                 input.repository_instructions = Some(instructions);
             }
         }
-        let checkpoint = workspace.create_checkpoint(Some(input.session_id), "before agent run")?;
+        let checkpoint = workspace.create_checkpoint("before agent run")?;
         input.options.checkpoint_id = Some(checkpoint.id);
         let tools = ToolExecutor::new_with_workspace(workspace);
-        let policy = self.policy(session.id, session.project_id)?;
+        let policy = self.policy(session.id)?;
         let mut agent_task = AgentTask::new(input.task, input.model)?;
         agent_task.system_instructions = input.system_instructions;
         agent_task.repository_instructions = input.repository_instructions;
@@ -4302,13 +3555,13 @@ impl InProcessConnection {
         checkpoint_id: loom_core::CheckpointId,
     ) -> Result<ServerResponse> {
         let handle = self.run_handle(run_id)?;
-        let project_id = self.backend.sessions()?.get(handle.session_id)?.project_id;
+        let session_id = self.backend.sessions()?.get(handle.session_id)?.id;
         if handle.state().options.checkpoint_id != Some(checkpoint_id) {
             return Err(LoomError::conflict(format!(
                 "checkpoint {checkpoint_id} is not the checkpoint associated with run {run_id}"
             )));
         }
-        self.workspace(project_id)?
+        self.session_filesystem(session_id)?
             .revert_checkpoint(checkpoint_id)?;
         self.continue_run(run_id, AgentRuntime::checkpoint_retry_entry)
     }
@@ -4380,14 +3633,6 @@ fn run_snapshot_projection(state: &AgentRuntimeState) -> AgentRunSnapshotProject
     }
 }
 
-fn unauthorized_project(project_id: ProjectId) -> LoomError {
-    LoomError::new(
-        ErrorCode::AuthorizationDenied,
-        format!("token is not authorized for project {project_id}"),
-        false,
-    )
-}
-
 fn unauthorized_session(session_id: AgentSessionId) -> LoomError {
     LoomError::new(
         ErrorCode::AuthorizationDenied,
@@ -4418,7 +3663,7 @@ mod tests {
     use std::{fs, path::PathBuf, process::Command, thread, time::Duration};
 
     use loom_context::ContextAssemblyOptions;
-    use loom_core::{CapabilitySet, PolicyDecision, ProjectId, ToolCallId};
+    use loom_core::{AgentSessionId, CapabilitySet, PolicyDecision, ToolCallId, WorkspaceId};
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
     use loom_protocol::{
         AgentActivityStatus, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
@@ -4431,103 +3676,21 @@ mod tests {
     fn negotiate(connection: &InProcessConnection) {
         let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
             client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: CapabilitySet::new([
-                Capability::CreateAgentSession,
-                Capability::ReadAgentSession,
-                Capability::ControlAgentSession,
-                Capability::SubscribeSessionEvents,
-                Capability::StartAgentRun,
-                Capability::ReadAgentRun,
-                Capability::ControlAgentRun,
-                Capability::ApproveAgentAction,
-            ]),
+            capabilities: connection.backend.supported_capabilities.clone(),
         }));
         assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
     }
 
     fn negotiate_m2(connection: &InProcessConnection) {
-        let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: CapabilitySet::new([
-                Capability::CreateAgentSession,
-                Capability::ReadAgentSession,
-                Capability::SubscribeSessionEvents,
-                Capability::StartAgentRun,
-                Capability::ReadAgentRun,
-                Capability::ControlAgentRun,
-                Capability::ApproveAgentAction,
-                Capability::OpenWorkspace,
-                Capability::ReadWorkspace,
-                Capability::WriteWorkspace,
-                Capability::SubscribeWorkspaceEvents,
-                Capability::OpenTerminal,
-                Capability::ControlTerminal,
-                Capability::ReadTask,
-                Capability::StartTask,
-                Capability::ControlTask,
-                Capability::ConfigureApprovalPolicy,
-                Capability::ManageCheckpoints,
-                Capability::TakeoverWorkspace,
-            ]),
-        }));
-        assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
+        negotiate(connection);
     }
 
     fn negotiate_m3(connection: &InProcessConnection) {
-        let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: CapabilitySet::new([
-                Capability::CreateAgentSession,
-                Capability::ReadAgentSession,
-                Capability::SubscribeSessionEvents,
-                Capability::StartAgentRun,
-                Capability::ReadAgentRun,
-                Capability::ControlAgentRun,
-                Capability::PauseAgentRun,
-                Capability::ResumeAgentRun,
-                Capability::RetryFromCheckpoint,
-                Capability::ForkAgentSession,
-                Capability::ApproveAgentAction,
-                Capability::ConfigureApprovalPolicy,
-                Capability::ListProviders,
-                Capability::ReadProviderHealth,
-                Capability::ReadUsage,
-                Capability::InspectContext,
-                Capability::OpenWorkspace,
-                Capability::ReadWorkspace,
-                Capability::WriteWorkspace,
-                Capability::SubscribeWorkspaceEvents,
-                Capability::ManageCheckpoints,
-            ]),
-        }));
-        assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
+        negotiate(connection);
     }
 
     fn negotiate_m5(connection: &InProcessConnection) {
-        let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: CapabilitySet::new([
-                Capability::CreateAgentSession,
-                Capability::ReadAgentSession,
-                Capability::ControlAgentSession,
-                Capability::SubscribeSessionEvents,
-                Capability::StartAgentRun,
-                Capability::ReadAgentRun,
-                Capability::ControlAgentRun,
-                Capability::ApproveAgentAction,
-                Capability::OpenWorkspace,
-                Capability::ReadWorkspace,
-                Capability::WriteWorkspace,
-                Capability::ReadWorkspaceInstructions,
-                Capability::ReadVcsStatus,
-                Capability::ReadVcsDiff,
-                Capability::ReadTask,
-                Capability::StartTask,
-                Capability::ReadTaskEvidence,
-                Capability::ReadWorkerNodeStatus,
-            ]),
-        }));
-        assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
+        negotiate(connection);
     }
 
     #[test]
@@ -4535,21 +3698,6 @@ mod tests {
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate_m5(&connection);
-        #[cfg(unix)]
-        let project_id = ProjectId::new();
-        #[cfg(unix)]
-        let disk_root = {
-            let root = workspace();
-            let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-                project_id,
-                root: root.display().to_string(),
-            }));
-            assert!(matches!(
-                opened.result,
-                Ok(ServerResponse::WorkspaceOpened(_))
-            ));
-            root
-        };
         let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus));
         let response =
             loom_protocol::decode_response(&loom_protocol::encode_response(&response).unwrap())
@@ -4573,11 +3721,6 @@ mod tests {
                 .memory_usage_percent
                 .is_some_and(|value| value <= 100)
         );
-        #[cfg(unix)]
-        {
-            assert!(status.resources.disk_total_bytes.is_some());
-            assert!(status.resources.disk_available_bytes.is_some());
-        }
 
         std::thread::sleep(Duration::from_millis(250));
         let refreshed =
@@ -4613,12 +3756,6 @@ mod tests {
             refreshed.resources.memory_total_bytes,
             status.resources.memory_total_bytes
         );
-        #[cfg(unix)]
-        {
-            assert!(refreshed.resources.disk_total_bytes.is_some());
-            assert!(refreshed.resources.disk_available_bytes.is_some());
-            fs::remove_dir_all(disk_root).unwrap();
-        }
         assert!(status.capabilities.contains(Capability::ReadAgentSession));
     }
 
@@ -4651,8 +3788,8 @@ mod tests {
     #[test]
     fn workspace_config_is_persisted_and_excludes_access_tokens() {
         let path =
-            std::env::temp_dir().join(format!("loom-workspace-config-{}.db", ProjectId::new()));
-        let project_id = ProjectId::new();
+            std::env::temp_dir().join(format!("loom-workspace-config-{}.db", WorkspaceId::new()));
+        let workspace_id;
         let config = WorkspaceConfig {
             revision: 1,
             cpu_pulse_threshold_percent: 37,
@@ -4664,11 +3801,20 @@ mod tests {
             let backend = InProcessBackend::new_persistent(&path).unwrap();
             let connection = backend.connect();
             negotiate_m5(&connection);
-            let response =
-                connection.request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
-                    project_id,
-                    config: config.clone(),
+            let created =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Config test".to_owned(),
                 }));
+            let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+                panic!("expected workspace creation");
+            };
+            workspace_id = workspace.id;
+            let response = connection.request(RequestEnvelope::new(
+                ClientRequest::SetWorkspaceConfigForWorkspace {
+                    workspace_id: workspace.id,
+                    config: config.clone(),
+                },
+            ));
             assert!(matches!(
                 response.result,
                 Ok(ServerResponse::WorkspaceConfigUpdated)
@@ -4679,17 +3825,16 @@ mod tests {
             let backend = InProcessBackend::new_persistent(&path).unwrap();
             let connection = backend.connect();
             negotiate_m5(&connection);
-            let response =
-                connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceConfig {
-                    project_id,
-                }));
+            let response = connection.request(RequestEnvelope::new(
+                ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
+            ));
             assert!(matches!(
                 response.result,
                 Ok(ServerResponse::WorkspaceConfig(saved)) if saved == config
             ));
-            let response =
-                connection.request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
-                    project_id,
+            let response = connection.request(RequestEnvelope::new(
+                ClientRequest::SetWorkspaceConfigForWorkspace {
+                    workspace_id,
                     config: WorkspaceConfig {
                         revision: 0,
                         cpu_pulse_threshold_percent: 5,
@@ -4697,15 +3842,15 @@ mod tests {
                             url: "wss://stale.example/ws".to_owned(),
                         }],
                     },
-                }));
+                },
+            ));
             assert!(matches!(
                 response.result,
                 Ok(ServerResponse::WorkspaceConfigUpdated)
             ));
-            let response =
-                connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceConfig {
-                    project_id,
-                }));
+            let response = connection.request(RequestEnvelope::new(
+                ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
+            ));
             assert!(matches!(
                 response.result,
                 Ok(ServerResponse::WorkspaceConfig(saved)) if saved == config
@@ -4714,9 +3859,9 @@ mod tests {
                 "wss://worker.example/ws?%61ccess_token=secret",
                 "wss://user:secret@worker.example/ws",
             ] {
-                let response =
-                    connection.request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
-                        project_id,
+                let response = connection.request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id,
                         config: WorkspaceConfig {
                             revision: 2,
                             cpu_pulse_threshold_percent: 5,
@@ -4724,7 +3869,8 @@ mod tests {
                                 url: url.to_owned(),
                             }],
                         },
-                    }));
+                    },
+                ));
                 assert!(response.result.is_err());
             }
         }
@@ -4755,7 +3901,7 @@ mod tests {
     }
 
     fn workspace() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("loom-server-{}", ProjectId::new()));
+        let root = std::env::temp_dir().join(format!("loom-server-{}", AgentSessionId::new()));
         fs::create_dir(&root).unwrap();
         root
     }
@@ -4937,81 +4083,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sessions_are_migrated_into_independent_filesystems() {
-        let source = git_repository();
-        let backend = InProcessBackend::new();
-        let connection = backend.connect();
-        let capabilities = CapabilitySet::new([
-            Capability::OpenWorkspace,
-            Capability::CreateAgentSession,
-            Capability::ReadSessionFilesystem,
-            Capability::WriteSessionFilesystem,
-        ]);
-        let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities,
-        }));
-        assert!(matches!(
-            negotiated.result,
-            Ok(ServerResponse::Negotiated(_))
-        ));
-        let project_id = ProjectId::new();
-        let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-            project_id,
-            root: source.display().to_string(),
-        }));
-        assert!(matches!(
-            opened.result,
-            Ok(ServerResponse::WorkspaceOpened(_))
-        ));
-        let create_session = |name: &str| {
-            let response =
-                connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-                    project_id,
-                    name: name.to_owned(),
-                }));
-            let Ok(ServerResponse::AgentSessionCreated(session)) = response.result else {
-                panic!("expected legacy session creation");
-            };
-            session
-        };
-        let first = create_session("First legacy session");
-        let second = create_session("Second legacy session");
-        for (session_id, content) in [(first.id, "first"), (second.id, "second")] {
-            let edit = connection.request(RequestEnvelope::new(
-                ClientRequest::ApplySessionFilesystemEdit {
-                    session_id,
-                    edit: WorkspaceEdit {
-                        path: "README.md".to_owned(),
-                        old_text: "source".to_owned(),
-                        new_text: content.to_owned(),
-                        expected_revision: None,
-                    },
-                },
-            ));
-            assert!(matches!(
-                edit.result,
-                Ok(ServerResponse::WorkspaceEditApplied(_))
-            ));
-        }
-        for (session_id, expected_content) in [(first.id, "first\n"), (second.id, "second\n")] {
-            let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
-                session_id,
-                path: "README.md".to_owned(),
-            }));
-            let Ok(ServerResponse::SessionFilesystemFile(file)) = file.result else {
-                panic!("expected migrated session file");
-            };
-            assert_eq!(file.content, expected_content);
-        }
-        assert_eq!(
-            fs::read_to_string(source.join("README.md")).unwrap(),
-            "source\n"
-        );
-        fs::remove_dir_all(source).unwrap();
-    }
-
-    #[test]
     fn session_filesystem_and_repository_metadata_survive_restart() {
         let source = git_repository();
         let state_dir = workspace();
@@ -5060,10 +4131,14 @@ mod tests {
                     revision: None,
                 },
             ));
-            assert!(matches!(
-                attached.result,
-                Ok(ServerResponse::SessionRepositoryAttached(_))
-            ));
+            assert!(
+                matches!(
+                    attached.result,
+                    Ok(ServerResponse::SessionRepositoryAttached(_))
+                ),
+                "{:?}",
+                attached.result
+            );
             let edit = connection.request(RequestEnvelope::new(
                 ClientRequest::ApplySessionFilesystemEdit {
                     session_id: session.id,
@@ -5142,37 +4217,44 @@ mod tests {
 
     #[test]
     fn m5_session_projections_reconnect_and_archive_authoritatively() {
-        let root = workspace();
-        fs::write(root.join("README.md"), "M5 session projection\n").unwrap();
+        let root = git_repository();
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate_m5(&connection);
-        let project_id = ProjectId::new();
-
-        let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-            project_id,
-            root: root.display().to_string(),
+        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Navigator".to_owned(),
         }));
-        assert!(matches!(
-            opened.result,
-            Ok(ServerResponse::WorkspaceOpened(_))
+        let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+            panic!("expected workspace creation");
+        };
+        let created = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Navigator session".to_owned(),
+            },
         ));
-
-        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id,
-            name: "Navigator session".to_owned(),
-        }));
         let session = match created.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot,
             response => panic!("unexpected response: {response:?}"),
         };
 
-        let projects = connection.request(RequestEnvelope::new(ClientRequest::ListProjects));
-        let ServerResponse::Projects { projects } = projects.result.unwrap() else {
-            panic!("unexpected project response");
+        let attached = connection.request(RequestEnvelope::new(
+            ClientRequest::AttachSessionRepository {
+                session_id: session.id,
+                source: root.display().to_string(),
+                path: "repo".to_owned(),
+                revision: None,
+            },
+        ));
+        assert!(matches!(
+            attached.result,
+            Ok(ServerResponse::SessionRepositoryAttached(_))
+        ));
+        let workspaces = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+        let ServerResponse::Workspaces { workspaces } = workspaces.result.unwrap() else {
+            panic!("unexpected workspace response");
         };
-        assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].session_count, 1);
+        assert_eq!(workspaces, vec![workspace.clone()]);
 
         let renamed = connection.request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
             session_id: session.id,
@@ -5184,14 +4266,14 @@ mod tests {
         };
         assert_eq!(session.name, "Renamed session");
 
-        let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
-            session_id: session.id,
-            task: "inspect the workspace".to_owned(),
-            model: loom_model::ModelId::new("deterministic/demo"),
-            workspace_root: root.display().to_string(),
-            system_instructions: None,
-            repository_instructions: None,
-        }));
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id: session.id,
+                task: "inspect the workspace".to_owned(),
+                model: loom_model::ModelId::new("deterministic/demo"),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
         let run_id = match started.result.unwrap() {
             ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
             response => panic!("unexpected run response: {response:?}"),
@@ -5221,14 +4303,15 @@ mod tests {
         assert_eq!(run.run.id, run_id);
         assert!(!run.messages.is_empty());
 
-        let changes =
-            connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceChanges {
-                project_id,
+        let changes = connection.request(RequestEnvelope::new(
+            ClientRequest::GetSessionFilesystemChanges {
+                session_id: session.id,
                 after_sequence: None,
-            }));
+            },
+        ));
         assert!(matches!(
             changes.result,
-            Ok(ServerResponse::WorkspaceChanges { .. })
+            Ok(ServerResponse::SessionFilesystemChanges { .. })
         ));
 
         let archived =
@@ -5239,14 +4322,16 @@ mod tests {
             archived.result,
             Ok(ServerResponse::AgentSessionArchived(_))
         ));
-        let sessions = connection.request(RequestEnvelope::new(ClientRequest::ListAgentSessions {
-            project_id: Some(project_id),
-            include_archived: false,
-        }));
+        let sessions =
+            connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+                workspace_id: workspace.id,
+                include_archived: false,
+            }));
         let ServerResponse::AgentSessions { sessions } = sessions.result.unwrap() else {
             panic!("unexpected session list response");
         };
         assert!(sessions.is_empty());
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5256,10 +4341,18 @@ mod tests {
         let connection = backend.connect();
         negotiate(&connection);
 
-        let create = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id: ProjectId::new(),
-            name: "In-process demo".to_owned(),
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "In-process workspace".to_owned(),
         }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let create = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "In-process demo".to_owned(),
+            },
+        ));
         let session_id = match create.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
@@ -5278,33 +4371,57 @@ mod tests {
 
     #[test]
     fn runs_deterministic_agent_through_approvals() {
-        let root = workspace();
+        let root = git_repository();
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate(&connection);
-        let project_id = ProjectId::new();
-        let session = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id,
-            name: "M1 run".to_owned(),
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "M1 workspace".to_owned(),
         }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "M1 run".to_owned(),
+            },
+        ));
         let session_id = match session.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
-        connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
-            project_id,
-            session_id: Some(session_id),
-            policy: ApprovalPolicy::default(),
-            auto_approve_actions: Some(false),
-        }));
-        let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
-            session_id,
-            task: "create a demo file".to_owned(),
-            model: ModelId::new("deterministic/demo"),
-            workspace_root: root.display().to_string(),
-            system_instructions: Some("Be concise.".to_owned()),
-            repository_instructions: Some("Keep changes focused.".to_owned()),
-        }));
+        connection.request(RequestEnvelope::new(
+            ClientRequest::SetSessionApprovalPolicy {
+                session_id,
+                policy: ApprovalPolicy::default(),
+                auto_approve_actions: Some(false),
+            },
+        ));
+        let attached = connection.request(RequestEnvelope::new(
+            ClientRequest::AttachSessionRepository {
+                session_id,
+                source: root.display().to_string(),
+                path: "repo".to_owned(),
+                revision: None,
+            },
+        ));
+        assert!(
+            matches!(
+                attached.result,
+                Ok(ServerResponse::SessionRepositoryAttached(_))
+            ),
+            "{:?}",
+            attached.result
+        );
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id,
+                task: "create a demo file".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                system_instructions: Some("Be concise.".to_owned()),
+                repository_instructions: Some("Keep changes focused.".to_owned()),
+            }));
         let run_id = match started.result.unwrap() {
             ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
@@ -5374,7 +4491,15 @@ mod tests {
                 } if activity.run_id == run_id && activity.completed_at.is_some()
             )
         }));
-        assert!(root.join("loom-m1-demo.txt").is_file());
+        assert!(
+            backend
+                .session_root_base
+                .join(workspace.id.to_string())
+                .join(session_id.to_string())
+                .join("fs/loom-m1-demo.txt")
+                .is_file()
+        );
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5382,11 +4507,7 @@ mod tests {
     fn requires_negotiation_before_session_requests() {
         let backend = InProcessBackend::new();
         let connection = backend.connect();
-        let response =
-            connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-                project_id: ProjectId::new(),
-                name: "Rejected".to_owned(),
-            }));
+        let response = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
 
         assert_eq!(response.result.unwrap_err().code, ErrorCode::InvalidRequest);
     }
@@ -5406,71 +4527,113 @@ mod tests {
 
     #[test]
     fn exposes_workspace_terminal_task_and_checkpoint_controls() {
-        let root = workspace();
-        fs::write(root.join("README.md"), "before\n").unwrap();
+        let root = git_repository();
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate_m2(&connection);
-        let project_id = ProjectId::new();
-
-        let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-            project_id,
-            root: root.display().to_string(),
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Filesystem controls".to_owned(),
         }));
-        let snapshot = match opened.result.unwrap() {
-            ServerResponse::WorkspaceOpened(snapshot) => snapshot,
-            response => panic!("unexpected response: {response:?}"),
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let created = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Filesystem controls".to_owned(),
+            },
+        ));
+        let ServerResponse::AgentSessionCreated(session) = created.result.unwrap() else {
+            panic!("unexpected session response");
+        };
+        let session_id = session.id;
+        let attached = connection.request(RequestEnvelope::new(
+            ClientRequest::AttachSessionRepository {
+                session_id,
+                source: root.display().to_string(),
+                path: "repo".to_owned(),
+                revision: None,
+            },
+        ));
+        assert!(matches!(
+            attached.result,
+            Ok(ServerResponse::SessionRepositoryAttached(_))
+        ));
+        let snapshot = connection.request(RequestEnvelope::new(
+            ClientRequest::GetSessionFilesystemSnapshot { session_id },
+        ));
+        let ServerResponse::SessionFilesystemSnapshot(snapshot) = snapshot.result.unwrap() else {
+            panic!("unexpected filesystem snapshot");
         };
         assert!(
             snapshot
                 .entries
                 .iter()
-                .any(|entry| entry.path == "README.md")
+                .any(|entry| entry.path == "repo/README.md")
         );
-        let file = connection.request(RequestEnvelope::new(ClientRequest::ReadWorkspaceFile {
-            project_id,
-            path: "README.md".to_owned(),
+        let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+            session_id,
+            path: "repo/README.md".to_owned(),
         }));
         let revision = match file.result.unwrap() {
-            ServerResponse::WorkspaceFile(file) => file.revision,
+            ServerResponse::SessionFilesystemFile(file) => file.revision,
             response => panic!("unexpected response: {response:?}"),
         };
-        let checkpoint =
-            connection.request(RequestEnvelope::new(ClientRequest::CreateCheckpoint {
-                project_id,
-                session_id: None,
+        let checkpoint = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateSessionCheckpoint {
+                session_id,
                 label: "before user edit".to_owned(),
-            }));
+            },
+        ));
         let checkpoint_id = match checkpoint.result.unwrap() {
             ServerResponse::CheckpointCreated(checkpoint) => checkpoint.id,
             response => panic!("unexpected response: {response:?}"),
         };
-        let edit = connection.request(RequestEnvelope::new(ClientRequest::ApplyWorkspaceEdit {
-            project_id,
-            edit: WorkspaceEdit {
-                path: "README.md".to_owned(),
-                old_text: "before".to_owned(),
-                new_text: "user".to_owned(),
-                expected_revision: Some(revision),
+        let edit = connection.request(RequestEnvelope::new(
+            ClientRequest::ApplySessionFilesystemEdit {
+                session_id,
+                edit: WorkspaceEdit {
+                    path: "repo/README.md".to_owned(),
+                    old_text: "source".to_owned(),
+                    new_text: "user".to_owned(),
+                    expected_revision: Some(revision),
+                },
             },
-        }));
+        ));
         assert!(matches!(
             edit.result,
             Ok(ServerResponse::WorkspaceEditApplied(_))
         ));
-        let changes = connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceEvents {
-            project_id,
-            after_sequence: None,
-        }));
-        let ServerResponse::WorkspaceEvents { events } = changes.result.unwrap() else {
-            panic!("unexpected workspace event response");
+        let changes = connection.request(RequestEnvelope::new(
+            ClientRequest::GetSessionFilesystemChanges {
+                session_id,
+                after_sequence: None,
+            },
+        ));
+        let ServerResponse::SessionFilesystemChanges { changes, .. } = changes.result.unwrap()
+        else {
+            panic!("unexpected filesystem changes response");
         };
-        assert!(events.iter().any(|event| event.path == "README.md"));
-        let revert = connection.request(RequestEnvelope::new(ClientRequest::RevertCheckpoint {
-            project_id,
-            checkpoint_id,
+        assert!(changes.iter().any(|event| event.path == "repo/README.md"));
+        let revert = connection.request(RequestEnvelope::new(
+            ClientRequest::RevertSessionCheckpoint {
+                session_id,
+                checkpoint_id,
+            },
+        ));
+        assert_eq!(
+            revert.result.unwrap_err().code,
+            ErrorCode::Conflict,
+            "checkpoint revert must preserve the intervening user edit"
+        );
+        let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+            session_id,
+            path: "repo/README.md".to_owned(),
         }));
-        assert_eq!(revert.result.unwrap_err().code, ErrorCode::Conflict);
+        assert!(matches!(
+            file.result,
+            Ok(ServerResponse::SessionFilesystemFile(file)) if file.content == "user\n"
+        ));
 
         let terminal_command = if cfg!(windows) {
             (
@@ -5480,24 +4643,26 @@ mod tests {
         } else {
             ("printf".to_owned(), vec!["terminal".to_owned()])
         };
-        let terminal = connection.request(RequestEnvelope::new(ClientRequest::OpenTerminal {
-            project_id,
-            command: terminal_command.0,
-            args: terminal_command.1,
-            cwd: None,
-        }));
+        let terminal =
+            connection.request(RequestEnvelope::new(ClientRequest::OpenSessionTerminal {
+                session_id,
+                command: terminal_command.0,
+                args: terminal_command.1,
+                cwd: None,
+            }));
         let terminal_id = match terminal.result.unwrap() {
             ServerResponse::TerminalOpened(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
         let mut terminal_done = false;
         for _ in 0..100 {
-            let events =
-                connection.request(RequestEnvelope::new(ClientRequest::GetTerminalEvents {
-                    project_id,
+            let events = connection.request(RequestEnvelope::new(
+                ClientRequest::GetSessionTerminalEvents {
+                    session_id,
                     terminal_id,
                     after_sequence: None,
-                }));
+                },
+            ));
             let ServerResponse::TerminalEvents { events } = events.result.unwrap() else {
                 panic!("unexpected terminal event response");
             };
@@ -5528,16 +4693,16 @@ mod tests {
                 vec!["-c".to_owned(), "printf artifact > artifact.txt".to_owned()],
             )
         };
-        let task = connection.request(RequestEnvelope::new(ClientRequest::StartTask {
-            project_id,
+        let task = connection.request(RequestEnvelope::new(ClientRequest::StartSessionTask {
+            session_id,
             spec: TaskSpec {
                 kind: TaskKind::Test,
                 label: "M2 task".to_owned(),
                 command: task_command.0,
                 args: task_command.1,
-                cwd: None,
+                cwd: Some("repo".to_owned()),
                 output_limit_bytes: Some(4096),
-                artifact_paths: vec!["artifact.txt".to_owned()],
+                artifact_paths: vec!["repo/artifact.txt".to_owned()],
             },
         }));
         let task_id = match task.result.unwrap() {
@@ -5546,8 +4711,8 @@ mod tests {
         };
         let mut task_done = false;
         for _ in 0..100 {
-            let current = connection.request(RequestEnvelope::new(ClientRequest::GetTask {
-                project_id,
+            let current = connection.request(RequestEnvelope::new(ClientRequest::GetSessionTask {
+                session_id,
                 task_id,
             }));
             let ServerResponse::Task(snapshot) = current.result.unwrap() else {
@@ -5564,18 +4729,19 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(task_done);
-        let listed = connection.request(RequestEnvelope::new(ClientRequest::ListTasks {
-            project_id,
+        let listed = connection.request(RequestEnvelope::new(ClientRequest::ListSessionTasks {
+            session_id,
         }));
         let ServerResponse::Tasks { tasks } = listed.result.unwrap() else {
             panic!("unexpected task list response");
         };
         assert!(tasks.iter().any(|task| task.id == task_id));
-        let task_events = connection.request(RequestEnvelope::new(ClientRequest::GetTaskEvents {
-            project_id,
-            task_id,
-            after_sequence: None,
-        }));
+        let task_events =
+            connection.request(RequestEnvelope::new(ClientRequest::GetSessionTaskEvents {
+                session_id,
+                task_id,
+                after_sequence: None,
+            }));
         let ServerResponse::TaskEvents { events } = task_events.result.unwrap() else {
             panic!("unexpected task event response");
         };
@@ -5585,29 +4751,37 @@ mod tests {
                 .any(|event| matches!(event.event, TaskEvent::Completed { .. }))
         );
 
-        let control =
-            connection.request(RequestEnvelope::new(ClientRequest::TakeWorkspaceControl {
-                project_id,
+        let control = connection.request(RequestEnvelope::new(
+            ClientRequest::TakeSessionFilesystemControl {
+                session_id,
                 control: WorkspaceControl::User,
-            }));
+            },
+        ));
         assert!(matches!(
             control.result,
             Ok(ServerResponse::WorkspaceControl(WorkspaceControl::User))
         ));
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn policy_decisions_are_visible_and_can_stop_agent_writes() {
-        let root = workspace();
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate_m2(&connection);
-        let project_id = ProjectId::new();
-        let session = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id,
-            name: "M2 policy".to_owned(),
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Policy workspace".to_owned(),
         }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "M2 policy".to_owned(),
+            },
+        ));
         let session_id = match session.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
@@ -5625,11 +4799,12 @@ mod tests {
             default_settings.approval_policy,
             loom_core::ApprovalPolicy::auto_approve()
         );
-        let other_session =
-            connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-                project_id,
+        let other_session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
                 name: "Other session".to_owned(),
-            }));
+            },
+        ));
         let other_session_id = match other_session.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
@@ -5638,13 +4813,13 @@ mod tests {
             write: PolicyDecision::Deny,
             ..Default::default()
         };
-        let policy_response =
-            connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
-                project_id,
-                session_id: Some(session_id),
+        let policy_response = connection.request(RequestEnvelope::new(
+            ClientRequest::SetSessionApprovalPolicy {
+                session_id,
                 policy,
                 auto_approve_actions: Some(false),
-            }));
+            },
+        ));
         assert!(matches!(
             policy_response.result,
             Ok(ServerResponse::ApprovalPolicy(_))
@@ -5663,45 +4838,14 @@ mod tests {
             other_settings.approval_policy,
             loom_core::ApprovalPolicy::auto_approve()
         );
-        let legacy_policy =
-            connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
-                project_id,
-                session_id: None,
-                policy: ApprovalPolicy::default(),
-                auto_approve_actions: None,
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id,
+                task: "attempt a write".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                system_instructions: None,
+                repository_instructions: None,
             }));
-        assert!(matches!(
-            legacy_policy.result,
-            Ok(ServerResponse::ApprovalPolicy(_))
-        ));
-        let legacy_session =
-            connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-                project_id,
-                name: "Legacy policy session".to_owned(),
-            }));
-        let legacy_session_id = match legacy_session.result.unwrap() {
-            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
-            response => panic!("unexpected response: {response:?}"),
-        };
-        let legacy_settings = connection.request(RequestEnvelope::new(
-            ClientRequest::GetAgentSessionSnapshot {
-                session_id: legacy_session_id,
-            },
-        ));
-        let ServerResponse::AgentSessionSnapshot(legacy_settings) = legacy_settings.result.unwrap()
-        else {
-            panic!("unexpected session snapshot response");
-        };
-        assert!(!legacy_settings.auto_approve_actions);
-        assert_eq!(legacy_settings.approval_policy, ApprovalPolicy::default());
-        let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
-            session_id,
-            task: "attempt a write".to_owned(),
-            model: ModelId::new("deterministic/demo"),
-            workspace_root: root.display().to_string(),
-            system_instructions: None,
-            repository_instructions: None,
-        }));
         let run_id = match started.result.unwrap() {
             ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
@@ -5731,42 +4875,51 @@ mod tests {
             panic!("unexpected run response");
         };
         assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
     }
 
     #[test]
     fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
-        let root = workspace();
         let persistence =
-            std::env::temp_dir().join(format!("loom-server-state-{}.db", ProjectId::new()));
-        let project_id = ProjectId::new();
+            std::env::temp_dir().join(format!("loom-server-state-{}.db", WorkspaceId::new()));
+        let session_root_base;
         let (session_id, run_id, approval_id) = {
             let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            session_root_base = backend.session_root_base.clone();
             let connection = backend.connect();
             negotiate_m3(&connection);
-            let session =
-                connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-                    project_id,
-                    name: "durable run".to_owned(),
+            let created =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Durable workspace".to_owned(),
                 }));
+            let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            let session = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "durable run".to_owned(),
+                },
+            ));
             let session_id = match session.result.unwrap() {
                 ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
                 response => panic!("unexpected response: {response:?}"),
             };
-            connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
-                project_id,
-                session_id: Some(session_id),
-                policy: ApprovalPolicy::default(),
-                auto_approve_actions: Some(false),
-            }));
-            let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
-                session_id,
-                task: "create a demo file".to_owned(),
-                model: ModelId::new("deterministic/demo"),
-                workspace_root: root.display().to_string(),
-                system_instructions: Some("Be concise.".to_owned()),
-                repository_instructions: Some("Keep changes focused.".to_owned()),
-            }));
+            connection.request(RequestEnvelope::new(
+                ClientRequest::SetSessionApprovalPolicy {
+                    session_id,
+                    policy: ApprovalPolicy::default(),
+                    auto_approve_actions: Some(false),
+                },
+            ));
+            let started =
+                connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                    session_id,
+                    task: "create a demo file".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    system_instructions: Some("Be concise.".to_owned()),
+                    repository_instructions: Some("Keep changes focused.".to_owned()),
+                }));
             let run_id = match started.result.unwrap() {
                 ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
                 response => panic!("unexpected response: {response:?}"),
@@ -5846,7 +4999,7 @@ mod tests {
         let ServerResponse::RunCheckpoint(checkpoint) = checkpoint.result.unwrap() else {
             panic!("unexpected checkpoint response");
         };
-        assert_eq!(checkpoint.session_id, Some(session_id));
+        assert_eq!(checkpoint.session_id, session_id);
 
         let response =
             connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
@@ -5911,11 +5064,13 @@ mod tests {
         assert_eq!(usage.input_tokens, 240);
         assert_eq!(usage.output_tokens, 52);
         assert_eq!(usage.tool_calls, 3);
-        let workspace_snapshot =
-            connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceSnapshot {
-                project_id,
-            }));
-        assert!(workspace_snapshot.result.is_ok());
+        let filesystem = connection.request(RequestEnvelope::new(
+            ClientRequest::GetSessionFilesystemSnapshot { session_id },
+        ));
+        assert!(matches!(
+            filesystem.result,
+            Ok(ServerResponse::SessionFilesystemSnapshot(_))
+        ));
         backend.flush().unwrap();
         drop(connection);
         drop(backend);
@@ -5941,38 +5096,45 @@ mod tests {
             AgentRunState::AwaitingApproval
         );
         fs::remove_file(persistence).unwrap();
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(session_root_base).unwrap();
     }
 
     #[test]
     fn pause_resume_fork_and_provider_discovery_are_protocol_operations() {
-        let root = workspace();
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate_m3(&connection);
-        let project_id = ProjectId::new();
-        let session = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id,
-            name: "control run".to_owned(),
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Control workspace".to_owned(),
         }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "control run".to_owned(),
+            },
+        ));
         let session_id = match session.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
-        connection.request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
-            project_id,
-            session_id: Some(session_id),
-            policy: ApprovalPolicy::default(),
-            auto_approve_actions: Some(false),
-        }));
-        let started = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
-            session_id,
-            task: "control".to_owned(),
-            model: ModelId::new("deterministic/demo"),
-            workspace_root: root.display().to_string(),
-            system_instructions: None,
-            repository_instructions: None,
-        }));
+        connection.request(RequestEnvelope::new(
+            ClientRequest::SetSessionApprovalPolicy {
+                session_id,
+                policy: ApprovalPolicy::default(),
+                auto_approve_actions: Some(false),
+            },
+        ));
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id,
+                task: "control".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
         let run_id = match started.result.unwrap() {
             ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
@@ -6028,30 +5190,35 @@ mod tests {
                 .iter()
                 .any(|provider| provider.kind == loom_providers::ProviderKind::Deterministic)
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
     }
 
     #[test]
     fn explicit_limits_and_context_inspection_are_durable_protocol_state() {
-        let root = workspace();
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate_m3(&connection);
-        let project_id = ProjectId::new();
-        let session = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id,
-            name: "limited run".to_owned(),
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Limited workspace".to_owned(),
         }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "limited run".to_owned(),
+            },
+        ));
         let session_id = match session.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
         let started = connection.request(RequestEnvelope::new(
-            ClientRequest::StartAgentRunWithOptions {
+            ClientRequest::StartSessionAgentRunWithOptions {
                 session_id,
                 task: "limited".to_owned(),
                 model: ModelId::new("deterministic/demo"),
-                workspace_root: root.display().to_string(),
                 system_instructions: Some("system".to_owned()),
                 repository_instructions: Some("repository".to_owned()),
                 limits: loom_core::SessionLimits {
@@ -6104,13 +5271,13 @@ mod tests {
                 run_id,
             }));
         assert_eq!(context.result.unwrap_err().code, ErrorCode::InvalidState);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
     }
 
     #[test]
     fn non_sqlite_persistence_file_is_rejected_without_fallback() {
         let path =
-            std::env::temp_dir().join(format!("loom-server-malformed-{}.db", ProjectId::new()));
+            std::env::temp_dir().join(format!("loom-server-malformed-{}.db", WorkspaceId::new()));
         fs::write(&path, br#"{"schema_version":1,"state":{"broken":true}}"#).unwrap();
         let error = match InProcessBackend::new_persistent(&path) {
             Ok(_) => panic!("non-SQLite persistence unexpectedly loaded"),
@@ -6148,30 +5315,56 @@ mod tests {
         let backend = InProcessBackend::new();
         let connection = backend.connect();
         negotiate_m5(&connection);
-        let project_id = ProjectId::new();
-        let opened = connection.request(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-            project_id,
-            root: root.display().to_string(),
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Context workspace".to_owned(),
         }));
-        assert!(matches!(
-            opened.result,
-            Ok(ServerResponse::WorkspaceOpened(_))
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let created = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Context session".to_owned(),
+            },
         ));
-
-        let context = connection.request(RequestEnvelope::new(ClientRequest::GetContextFiles {
-            project_id,
-        }));
+        let ServerResponse::AgentSessionCreated(session) = created.result.unwrap() else {
+            panic!("unexpected session response");
+        };
+        let session_id = session.id;
+        let attached = connection.request(RequestEnvelope::new(
+            ClientRequest::AttachSessionRepository {
+                session_id,
+                source: root.display().to_string(),
+                path: "repo".to_owned(),
+                revision: None,
+            },
+        ));
+        assert!(matches!(
+            attached.result,
+            Ok(ServerResponse::SessionRepositoryAttached(_))
+        ));
+        let context = connection.request(RequestEnvelope::new(
+            ClientRequest::GetSessionContextFiles { session_id },
+        ));
         assert!(matches!(
             context.result,
             Ok(ServerResponse::ContextFiles { .. })
         ));
-        let vcs = connection.request(RequestEnvelope::new(ClientRequest::GetVcsStatus {
-            project_id,
+        let repositories = connection.request(RequestEnvelope::new(
+            ClientRequest::ListSessionRepositories { session_id },
+        ));
+        let ServerResponse::SessionRepositories { repositories } = repositories.result.unwrap()
+        else {
+            panic!("unexpected session repositories");
+        };
+        let vcs = connection.request(RequestEnvelope::new(ClientRequest::GetSessionVcsStatus {
+            session_id,
+            repository_id: repositories[0].id,
         }));
         assert!(matches!(vcs.result, Ok(ServerResponse::VcsStatus(_))));
 
-        let task = connection.request(RequestEnvelope::new(ClientRequest::StartTask {
-            project_id,
+        let task = connection.request(RequestEnvelope::new(ClientRequest::StartSessionTask {
+            session_id,
             spec: TaskSpec {
                 kind: TaskKind::Test,
                 label: "evidence fixture".to_owned(),
@@ -6195,8 +5388,8 @@ mod tests {
             response => panic!("unexpected task response: {response:?}"),
         };
         for _ in 0..100 {
-            let current = connection.request(RequestEnvelope::new(ClientRequest::GetTask {
-                project_id,
+            let current = connection.request(RequestEnvelope::new(ClientRequest::GetSessionTask {
+                session_id,
                 task_id,
             }));
             if let Ok(ServerResponse::Task(snapshot)) = current.result
@@ -6205,15 +5398,17 @@ mod tests {
                     TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
                 )
             {
-                let evidence =
-                    connection.request(RequestEnvelope::new(ClientRequest::GetTaskEvidence {
-                        project_id,
+                let evidence = connection.request(RequestEnvelope::new(
+                    ClientRequest::GetSessionTaskEvidence {
+                        session_id,
                         task_id,
-                    }));
+                    },
+                ));
                 assert!(matches!(
                     evidence.result,
                     Ok(ServerResponse::TaskEvidence { .. })
                 ));
+                fs::remove_dir_all(&backend.session_root_base).unwrap();
                 fs::remove_dir_all(root).unwrap();
                 return;
             }
@@ -6262,29 +5457,35 @@ mod tests {
 
     #[test]
     fn a_running_model_call_can_be_interrupted_without_blocking_the_request() {
-        let root = workspace();
         let (endpoint, started) = slow_model_endpoint();
         let backend =
             InProcessBackend::with_openai_compatible(endpoint, "key", ModelId::new("slow/model"));
         let connection = backend.connect();
         negotiate_m3(&connection);
-        let project_id = ProjectId::new();
-        let session = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id,
-            name: "interruptible run".to_owned(),
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Interruptible workspace".to_owned(),
         }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "interruptible run".to_owned(),
+            },
+        ));
         let session_id = match session.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
-        let started_run = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
-            session_id,
-            task: "stream for a long time".to_owned(),
-            model: ModelId::new("slow/model"),
-            workspace_root: root.display().to_string(),
-            system_instructions: None,
-            repository_instructions: None,
-        }));
+        let started_run =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id,
+                task: "stream for a long time".to_owned(),
+                model: ModelId::new("slow/model"),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
         let run_id = match started_run.result.unwrap() {
             ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
@@ -6340,34 +5541,40 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "interrupt waited {elapsed:?} for the model call"
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
     }
 
     #[test]
     fn a_running_model_call_can_be_paused_and_resumed() {
-        let root = workspace();
         let (endpoint, started) = slow_model_endpoint();
         let backend =
             InProcessBackend::with_openai_compatible(endpoint, "key", ModelId::new("slow/model"));
         let connection = backend.connect();
         negotiate_m3(&connection);
-        let project_id = ProjectId::new();
-        let session = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id,
-            name: "pausable run".to_owned(),
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Pausable workspace".to_owned(),
         }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "pausable run".to_owned(),
+            },
+        ));
         let session_id = match session.result.unwrap() {
             ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
-        let started_run = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
-            session_id,
-            task: "stream for a long time".to_owned(),
-            model: ModelId::new("slow/model"),
-            workspace_root: root.display().to_string(),
-            system_instructions: None,
-            repository_instructions: None,
-        }));
+        let started_run =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id,
+                task: "stream for a long time".to_owned(),
+                model: ModelId::new("slow/model"),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
         let run_id = match started_run.result.unwrap() {
             ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
@@ -6394,30 +5601,44 @@ mod tests {
             panic!("unexpected run response");
         };
         assert_eq!(snapshot.state, AgentRunState::Paused);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
     }
 
     #[test]
     fn retryable_mutation_idempotency_survives_backend_restart() {
         let path =
-            std::env::temp_dir().join(format!("loom-server-idempotency-{}.db", ProjectId::new()));
+            std::env::temp_dir().join(format!("loom-server-idempotency-{}.db", WorkspaceId::new()));
         let request_id = loom_core::RequestId::new();
-        let request = RequestEnvelope::with_request_id(
-            request_id,
-            ClientRequest::CreateAgentSession {
-                project_id: ProjectId::new(),
-                name: "durable idempotency".to_owned(),
-            },
-        );
-        let first = {
+        let (workspace_id, first) = {
             let backend = InProcessBackend::new_persistent(&path).unwrap();
             let connection = backend.connect();
             negotiate(&connection);
-            connection.request(request.clone())
+            let created =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Idempotency workspace".to_owned(),
+                }));
+            let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            let request = RequestEnvelope::with_request_id(
+                request_id,
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "durable idempotency".to_owned(),
+                },
+            );
+            (workspace.id, connection.request(request))
         };
         let backend = InProcessBackend::new_persistent(&path).unwrap();
         let connection = backend.connect();
         negotiate(&connection);
+        let request = RequestEnvelope::with_request_id(
+            request_id,
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id,
+                name: "durable idempotency".to_owned(),
+            },
+        );
         let second = connection.request(request);
         assert_eq!(first, second);
         assert!(matches!(

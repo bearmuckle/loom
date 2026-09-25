@@ -1,6 +1,6 @@
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet,
-    EventSequence, ProjectId, ProtocolVersion, RunId, SessionLimits, StepId, Timestamp,
+    EventSequence, ProtocolVersion, RunId, SessionLimits, StepId, Timestamp, WorkspaceId,
 };
 use loom_model::{ModelId, ToolCall};
 use loom_protocol::{
@@ -8,10 +8,10 @@ use loom_protocol::{
     AgentPlanStep, AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientFrame,
     ClientRequest, ContextAssemblyOptions, FileActivityOperation, GitHubCopilotLoginStatus,
     RequestEnvelope, ResponseEnvelope, ServerEvent, ServerEventEnvelope, ServerFrame,
-    ServerResponse, TaskKind, TaskSpec, ToolResult, WorkerNodeResources, WorkerNodeStatus,
-    WorkspaceConfig, WorkspaceEdit, WorkspaceSnapshot, decode_client_frame, decode_event,
-    decode_request, decode_response, decode_server_frame, encode_client_frame, encode_event,
-    encode_request, encode_response, encode_server_frame,
+    ServerResponse, SessionFilesystemSnapshot, TaskKind, TaskSpec, ToolResult, WorkerNodeResources,
+    WorkerNodeStatus, WorkspaceConfig, WorkspaceEdit, WorkspaceRecord, decode_client_frame,
+    decode_event, decode_request, decode_response, decode_server_frame, encode_client_frame,
+    encode_event, encode_request, encode_response, encode_server_frame,
 };
 
 #[test]
@@ -29,25 +29,14 @@ fn request_json_round_trip_preserves_typed_envelope() {
 
     assert_eq!(decoded, request);
 
-    let approval_settings = RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
-        project_id: ProjectId::new(),
-        session_id: Some(AgentSessionId::new()),
+    let approval_settings = RequestEnvelope::new(ClientRequest::SetSessionApprovalPolicy {
+        session_id: AgentSessionId::new(),
         policy: loom_core::ApprovalPolicy::default(),
         auto_approve_actions: Some(false),
     });
     assert_eq!(
         decode_request(&encode_request(&approval_settings).unwrap()).unwrap(),
         approval_settings
-    );
-    let legacy_approval_policy = RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
-        project_id: ProjectId::new(),
-        session_id: None,
-        policy: loom_core::ApprovalPolicy::default(),
-        auto_approve_actions: None,
-    });
-    assert_eq!(
-        decode_request(&encode_request(&legacy_approval_policy).unwrap()).unwrap(),
-        legacy_approval_policy
     );
 }
 
@@ -135,7 +124,6 @@ fn event_json_round_trip_preserves_sequence_and_session() {
     let snapshot = AgentSessionSnapshot {
         id: session_id,
         workspace_id: loom_core::WorkspaceId::new(),
-        project_id: ProjectId::new(),
         name: "Protocol fixture".to_owned(),
         state: AgentSessionState::Idle,
         created_at: Timestamp::from_unix_millis(1),
@@ -271,8 +259,8 @@ fn activity_event_round_trip_preserves_typed_work_and_relationships() {
 
 #[test]
 fn m2_workspace_and_task_requests_round_trip_without_untyped_envelopes() {
-    let request = RequestEnvelope::new(ClientRequest::ApplyWorkspaceEdit {
-        project_id: ProjectId::new(),
+    let request = RequestEnvelope::new(ClientRequest::ApplySessionFilesystemEdit {
+        session_id: AgentSessionId::new(),
         edit: WorkspaceEdit {
             path: "src/lib.rs".to_owned(),
             old_text: "old".to_owned(),
@@ -294,8 +282,8 @@ fn m2_workspace_and_task_requests_round_trip_without_untyped_envelopes() {
     };
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::WorkspaceSnapshot(WorkspaceSnapshot {
-            project_id: ProjectId::new(),
+        ServerResponse::SessionFilesystemSnapshot(SessionFilesystemSnapshot {
+            session_id: AgentSessionId::new(),
             root: "/workspace".to_owned(),
             captured_at: Timestamp::from_unix_millis(4),
             entries: Vec::new(),
@@ -308,11 +296,10 @@ fn m2_workspace_and_task_requests_round_trip_without_untyped_envelopes() {
 
 #[test]
 fn m3_run_options_provider_and_context_contracts_round_trip() {
-    let request = RequestEnvelope::new(ClientRequest::StartAgentRunWithOptions {
+    let request = RequestEnvelope::new(ClientRequest::StartSessionAgentRunWithOptions {
         session_id: AgentSessionId::new(),
         task: "durable task".to_owned(),
         model: ModelId::new("deterministic/demo"),
-        workspace_root: "/workspace".to_owned(),
         system_instructions: Some("system".to_owned()),
         repository_instructions: Some("repository".to_owned()),
         limits: SessionLimits {
@@ -344,9 +331,9 @@ fn m3_run_options_provider_and_context_contracts_round_trip() {
 }
 
 #[test]
-fn m4_capability_discovery_and_version_migration_are_additive() {
+fn capability_discovery_accepts_current_major_and_rejects_old_major() {
     let request = RequestEnvelope::with_version(
-        ProtocolVersion::new(1, 7),
+        ProtocolVersion::new(2, 0),
         ClientRequest::DiscoverCapabilities,
     );
     assert_eq!(
@@ -358,7 +345,7 @@ fn m4_capability_discovery_and_version_migration_are_additive() {
             .protocol_version
             .is_compatible_with(CURRENT_PROTOCOL_VERSION)
     );
-    assert!(!ProtocolVersion::new(2, 0).is_compatible_with(CURRENT_PROTOCOL_VERSION));
+    assert!(!ProtocolVersion::new(1, 7).is_compatible_with(CURRENT_PROTOCOL_VERSION));
 }
 
 #[test]
@@ -383,9 +370,9 @@ fn m4_transport_frames_preserve_typed_envelopes() {
 
 #[test]
 fn m5_session_run_review_and_evidence_contracts_round_trip() {
-    let project_id = ProjectId::new();
-    let sessions = RequestEnvelope::new(ClientRequest::ListAgentSessions {
-        project_id: Some(project_id),
+    let workspace_id = WorkspaceId::new();
+    let sessions = RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+        workspace_id,
         include_archived: false,
     });
     assert_eq!(
@@ -400,28 +387,29 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
         decode_request(&encode_request(&message).unwrap()).unwrap(),
         message
     );
-    let changes = RequestEnvelope::new(ClientRequest::GetWorkspaceChanges {
-        project_id,
+    let changes = RequestEnvelope::new(ClientRequest::GetSessionFilesystemChanges {
+        session_id: AgentSessionId::new(),
         after_sequence: Some(EventSequence::new(4)),
     });
     assert_eq!(
         decode_request(&encode_request(&changes).unwrap()).unwrap(),
         changes
     );
-    let tasks = RequestEnvelope::new(ClientRequest::ListTasks { project_id });
+    let tasks = RequestEnvelope::new(ClientRequest::ListSessionTasks {
+        session_id: AgentSessionId::new(),
+    });
     assert_eq!(
         decode_request(&encode_request(&tasks).unwrap()).unwrap(),
         tasks
     );
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::Projects {
-            projects: vec![loom_protocol::ProjectSnapshot {
-                id: project_id,
+        ServerResponse::Workspaces {
+            workspaces: vec![WorkspaceRecord {
+                id: workspace_id,
                 name: "workspace".to_owned(),
-                root: Some("/workspace".to_owned()),
-                session_count: 1,
-                updated_at: Some(Timestamp::from_unix_millis(5)),
+                created_at: Timestamp::from_unix_millis(5),
+                updated_at: Timestamp::from_unix_millis(5),
             }],
         },
     );

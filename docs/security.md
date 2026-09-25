@@ -36,10 +36,8 @@ in memory. Issued-token debug output is redacted, authentication failures do
 not echo the supplied token, and authorization headers are not copied into
 protocol events. Revocation is checked on every request, including requests
 from an already-upgraded WebSocket. Token grants can restrict capabilities,
-projects, and sessions; an unrestricted grant is an explicit deployment
+workspaces, and sessions; an unrestricted grant is an explicit deployment
 choice rather than an implicit network default.
-The current project-scoped compatibility API can pin a project to a canonical
-workspace root before the first `OpenWorkspace`.
 
 The service binds to `127.0.0.1` by default. Binding a non-loopback address
 requires an explicit `--bind` choice and a token. TLS termination is expected
@@ -70,14 +68,12 @@ The first release does not need a complete multi-user identity system, but it
 must have an explicit trust boundary so one can be added without redesigning
 the protocol.
 
-The current M2 implementation enforces the local boundary with canonical
-project/workspace roots, traversal and outside-root symlink rejection,
-revision-checked edits, workspace-scoped task working directories, and
-project ownership checks for terminal/task control requests. In the target
-model, the same canonicalization and traversal protections apply to each
-session-owned root and its repository checkouts; a workspace does not grant
+The backend enforces the local boundary with canonical session roots,
+traversal and outside-root symlink rejection, revision-checked edits,
+session-scoped task working directories, and session ownership checks for
+terminal and task control requests. Workspace membership does not grant
 filesystem access by itself. A session root is a path-ownership boundary, not
-a promise of OS-level process sandboxing. The current default `ApprovalPolicy`
+a promise of OS-level process sandboxing. The default `ApprovalPolicy`
 allows reads, pauses writes and commands for approval, requests approval for
 network actions, and denies
 destructive actions. The policy evaluation is included in the agent event
@@ -102,20 +98,15 @@ returned as bounded structured citations, and may be restricted to explicit
 hostnames by the tool request. Page retrieval and arbitrary URL fetching are
 not implied by this tool.
 
-In the current compatibility model, roots remain backend-owned after the
-first `OpenWorkspace` for a project and canonical workspace checks reject
-traversal and outside-root symlinks. The target model keeps these checks but
-makes the session, rather than the workspace/project, the owner of each root.
-Current M4 project/session authorization prevents a token from using another
-project's IDs; target authorization must preserve workspace/session ownership
-without allowing a workspace grant to escape a session root. Deployments must
-also constrain the backend process account and filesystem permissions. A full
-per-user identity/invitation system and encrypted secret vault remain
-deferred.
+The backend owns and canonicalizes each session filesystem root, rejecting
+traversal and outside-root symlinks. Workspace authorization governs access to
+workspace metadata and session membership; session authorization governs
+filesystem, process, and run operations. Deployments must also constrain the
+backend process account and filesystem permissions. A full per-user
+identity/invitation system and encrypted secret vault remain deferred.
 
-M5 adds no new trust boundary. The current client reads only
-backend-authoritative, project-scoped session, workspace-change, diff, task,
-and evidence projections. Target projections are session-scoped. File previews
+M5 adds no new trust boundary. The client reads only backend-authoritative,
+session-scoped filesystem, diff, task, and evidence projections. File previews
 and diffs are bounded and cannot mutate the session filesystem; existing
 agent tools, approval policies, canonical path checks, and VCS argument
 validation remain the authority for mutations.

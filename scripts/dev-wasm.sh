@@ -8,7 +8,6 @@ HEALTH_URL="${LOOM_HEALTH_URL:-http://${BACKEND_BIND}/health}"
 FRONTEND_HOST="${LOOM_FRONTEND_HOST:-127.0.0.1}"
 FRONTEND_PORT="${LOOM_FRONTEND_PORT:-8080}"
 TOKEN="${LOOM_TOKEN:-loom-local-dev-token}"
-WORKSPACE="${LOOM_WORKSPACE:-$ROOT}"
 
 if ! command -v curl >/dev/null 2>&1; then
     echo "error: curl is required to wait for the backend to become ready" >&2
@@ -56,8 +55,7 @@ echo "Starting Loom backend on ${BACKEND_BIND}..."
 cargo run --quiet -p loom-cli -- \
     --serve \
     --bind "$BACKEND_BIND" \
-    --token "$TOKEN" \
-    --root "$WORKSPACE" &
+    --token "$TOKEN" &
 backend_pid=$!
 
 for _ in {1..300}; do
