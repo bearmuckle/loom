@@ -62,25 +62,40 @@ use crate::{
 };
 
 const COMPACT_LAYOUT_WIDTH: Pixels = px(960.);
+const PHONE_LAYOUT_WIDTH: Pixels = px(640.);
 const COMPACT_SIDEBAR_WIDTH: Pixels = px(200.);
 const FULL_SIDEBAR_WIDTH: Pixels = px(250.);
+const PHONE_SIDEBAR_WIDTH: Pixels = px(300.);
 const COMPACT_REVIEW_WIDTH: Pixels = px(280.);
 const FULL_REVIEW_WIDTH: Pixels = px(340.);
 
 #[derive(Clone, Copy, Debug)]
 struct ResponsiveLayout {
+    phone: bool,
     sidebar_width: Pixels,
     review_width: Pixels,
 }
 
 fn responsive_layout(width: Pixels) -> ResponsiveLayout {
-    if width < COMPACT_LAYOUT_WIDTH {
+    if width < PHONE_LAYOUT_WIDTH {
         ResponsiveLayout {
+            phone: true,
+            sidebar_width: if width < PHONE_SIDEBAR_WIDTH {
+                width
+            } else {
+                PHONE_SIDEBAR_WIDTH
+            },
+            review_width: width,
+        }
+    } else if width < COMPACT_LAYOUT_WIDTH {
+        ResponsiveLayout {
+            phone: false,
             sidebar_width: COMPACT_SIDEBAR_WIDTH,
             review_width: COMPACT_REVIEW_WIDTH,
         }
     } else {
         ResponsiveLayout {
+            phone: false,
             sidebar_width: FULL_SIDEBAR_WIDTH,
             review_width: FULL_REVIEW_WIDTH,
         }
@@ -1017,6 +1032,7 @@ pub(crate) struct LoomView {
     pub(crate) run_state: Option<AgentRunState>,
     pub(crate) summary: Option<String>,
     pub(crate) review: ReviewState,
+    session_drawer_open: bool,
     pub(crate) tasks: Vec<TaskSnapshot>,
     pub(crate) rename_dialog: Option<RenameDialogState>,
     pub(crate) rename_focus_handle: FocusHandle,
@@ -1504,6 +1520,7 @@ impl LoomView {
             run_state: run.as_ref().map(|run| run.state),
             summary: run.as_ref().and_then(|run| run.summary.clone()),
             review: ReviewState::default(),
+            session_drawer_open: false,
             tasks: Vec::new(),
             rename_dialog: None,
             rename_focus_handle,
@@ -1616,6 +1633,7 @@ impl LoomView {
             run_state: None,
             summary: None,
             review: ReviewState::default(),
+            session_drawer_open: false,
             tasks: Vec::new(),
             rename_dialog: None,
             rename_focus_handle,
@@ -1783,6 +1801,7 @@ impl LoomView {
             run_state: None,
             summary: None,
             review: ReviewState::default(),
+            session_drawer_open: false,
             tasks: Vec::new(),
             rename_dialog: None,
             rename_focus_handle,
@@ -3820,6 +3839,7 @@ impl LoomView {
 
     pub(crate) fn open_settings_from_menu(&mut self, cx: &mut Context<Self>) {
         self.github_login = None;
+        self.session_drawer_open = false;
         self.review.open = false;
         self.providers_open = false;
         self.about_open = false;
@@ -4702,6 +4722,7 @@ impl LoomView {
 
     pub(crate) fn open_about_from_menu(&mut self, cx: &mut Context<Self>) {
         self.github_login = None;
+        self.session_drawer_open = false;
         self.review.open = false;
         self.settings_open = false;
         self.providers_open = false;
@@ -4715,6 +4736,7 @@ impl LoomView {
 
     fn open_providers_for_node(&mut self, node_id: String, cx: &mut Context<Self>) {
         self.github_login = None;
+        self.session_drawer_open = false;
         self.review.open = false;
         self.settings_open = false;
         self.about_open = false;
@@ -4847,7 +4869,7 @@ impl LoomView {
         let button = Button::new("new-session")
             .icon(Icon::new(IconName::Plus))
             .ghost()
-            .xsmall()
+            .small()
             .tooltip("Create a new session");
         if targets.len() <= 1 {
             button
@@ -5024,11 +5046,13 @@ impl LoomView {
         self.providers_open = false;
         self.about_open = false;
         self.github_login = None;
+        self.session_drawer_open = false;
         self.toggle_changes_sidebar(event, window, cx);
     }
 
     pub(crate) fn close_review(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.review.open = false;
+        self.session_drawer_open = false;
         cx.notify();
     }
 
@@ -5207,8 +5231,11 @@ impl LoomView {
             .into_any_element()
     }
 
-    pub(crate) fn render_model_picker(&self) -> impl IntoElement {
-        let mut picker = div().flex_1().min_w(px(120.)).w_full();
+    pub(crate) fn render_model_picker(&self, phone: bool) -> impl IntoElement {
+        let mut picker = div()
+            .flex_1()
+            .min_w(if phone { px(100.) } else { px(120.) })
+            .w_full();
         if let Some(state) = &self.model_select {
             picker = picker.child(
                 Select::new(state)
@@ -5223,8 +5250,8 @@ impl LoomView {
         picker
     }
 
-    pub(crate) fn render_agent_mode_picker(&self) -> impl IntoElement {
-        let mut picker = div().w(px(140.));
+    pub(crate) fn render_agent_mode_picker(&self, phone: bool) -> impl IntoElement {
+        let mut picker = div().w(if phone { px(110.) } else { px(140.) });
         if let Some(state) = &self.agent_mode_select {
             picker = picker.child(
                 Select::new(state)
@@ -5873,8 +5900,12 @@ impl LoomView {
             }
         }
         div()
-            .w(layout.review_width)
-            .h_full()
+            .when(layout.phone, |element| {
+                element.size_full().absolute().top(px(0.)).left(px(0.))
+            })
+            .when(!layout.phone, |element| {
+                element.w(layout.review_width).h_full()
+            })
             .flex()
             .flex_col()
             .bg(rgb(0x17191f))
@@ -5896,36 +5927,40 @@ impl LoomView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                div().text_xs().text_color(rgb(0x8f98a6)).child(
-                                    self.review
-                                        .vcs
-                                        .as_ref()
-                                        .map(|status| {
-                                            format!(
-                                                "{}  {}",
-                                                status.branch.as_deref().unwrap_or("detached"),
-                                                if status.clean { "clean" } else { "modified" }
-                                            )
-                                        })
-                                        .unwrap_or_else(|| "VCS unavailable".to_owned()),
-                                ),
-                            )
-                            .child(
-                                Button::new("close-review")
-                                    .icon(Icon::new(IconName::FileText))
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.review.panel = ReviewPanel::Changes;
-                                        cx.notify();
-                                    })),
-                            )
+                            .when(!layout.phone, |element| {
+                                element.child(
+                                    div().text_xs().text_color(rgb(0x8f98a6)).child(
+                                        self.review
+                                            .vcs
+                                            .as_ref()
+                                            .map(|status| {
+                                                format!(
+                                                    "{}  {}",
+                                                    status.branch.as_deref().unwrap_or("detached"),
+                                                    if status.clean { "clean" } else { "modified" }
+                                                )
+                                            })
+                                            .unwrap_or_else(|| "VCS unavailable".to_owned()),
+                                    ),
+                                )
+                            })
+                            .when(!layout.phone, |element| {
+                                element.child(
+                                    Button::new("close-review")
+                                        .icon(Icon::new(IconName::FileText))
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.review.panel = ReviewPanel::Changes;
+                                            cx.notify();
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("toggle-review-sidebar-close")
-                                    .icon(Icon::new(IconName::PanelRight))
+                                    .label("Close")
                                     .ghost()
-                                    .xsmall()
+                                    .small()
                                     .on_click(cx.listener(Self::close_review)),
                             ),
                     ),
@@ -5933,7 +5968,11 @@ impl LoomView {
             .child(body)
     }
 
-    pub(crate) fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_composer(
+        &self,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let placeholder = if self.pending_input.is_some() {
             "Answer the agent question..."
         } else if self.sending_message {
@@ -5995,8 +6034,8 @@ impl LoomView {
                             .relative()
                             .items_center()
                             .gap_1()
-                            .child(self.render_agent_mode_picker())
-                            .child(self.render_model_picker())
+                            .child(self.render_agent_mode_picker(layout.phone))
+                            .child(self.render_model_picker(layout.phone))
                             .when(self.sending_message, |element| {
                                 element.child(
                                     div().text_xs().text_color(rgb(0x64748b)).child("Working…"),
@@ -6856,6 +6895,111 @@ impl LoomView {
             .into_any()
     }
 
+    fn render_session_sidebar(
+        &self,
+        view: &Entity<Self>,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .w(layout.sidebar_width)
+            .h_full()
+            .relative()
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .bg(rgb(0x17191f))
+            .border_r_1()
+            .border_color(rgb(0x30343f))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().text_color(rgb(0xf3f4f6)).child("Workspace"))
+                    .when(layout.phone, |element| {
+                        element.child(
+                            Button::new("close-session-drawer")
+                                .label("Close")
+                                .ghost()
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.session_drawer_open = false;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Sessions"))
+                    .child(self.render_new_session_button(view, cx)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .id("session-list")
+                    .overflow_y_scroll()
+                    .child(self.render_session_list(cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .border_t_1()
+                    .border_color(rgb(0x30343f))
+                    .pt_2()
+                    .child(
+                        Button::new("account-menu")
+                            .icon(Icon::new(IconName::User))
+                            .ghost()
+                            .small()
+                            .dropdown_menu({
+                                let view = view.clone();
+                                move |menu, _, _| {
+                                    let providers_view = view.clone();
+                                    let about_view = view.clone();
+                                    menu.item(PopupMenuItem::new("Providers").on_click(
+                                        move |_, _, cx| {
+                                            providers_view.update(cx, |view, cx| {
+                                                view.open_providers_from_menu(cx);
+                                            });
+                                        },
+                                    ))
+                                    .item(
+                                        PopupMenuItem::new("About Loom").on_click(
+                                            move |_, _, cx| {
+                                                about_view.update(cx, |view, cx| {
+                                                    view.open_about_from_menu(cx);
+                                                });
+                                            },
+                                        ),
+                                    )
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("settings-button")
+                            .icon(Icon::new(IconName::Settings))
+                            .ghost()
+                            .small()
+                            .on_click({
+                                let view = view.clone();
+                                move |_, _, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.open_settings_from_menu(cx);
+                                    });
+                                }
+                            }),
+                    ),
+            )
+    }
+
     #[cfg(target_family = "wasm")]
     fn render_disconnected(&self, window: &Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let layout = responsive_layout(window.bounds().size.width);
@@ -6882,8 +7026,9 @@ impl LoomView {
                 div()
                     .flex_1()
                     .flex()
+                    .relative()
                     .overflow_hidden()
-                    .child(
+                    .when(!layout.phone, |row| row.child(
                         div()
                             .w(layout.sidebar_width)
                             .h_full()
@@ -6942,7 +7087,7 @@ impl LoomView {
                                             })),
                                     ),
                             ),
-                    )
+                    ))
                     .child(
                         div()
                             .flex_1()
@@ -7188,106 +7333,11 @@ impl Render for LoomView {
                 div()
                     .flex_1()
                     .flex()
+                    .relative()
                     .overflow_hidden()
-                    .child(
-                        div()
-                            .w(layout.sidebar_width)
-                            .h_full()
-                            .relative()
-                            .p_2()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .bg(rgb(0x17191f))
-                            .border_r_1()
-                            .border_color(rgb(0x30343f))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(0xf3f4f6))
-                                            .child("Workspace"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div().text_xs().text_color(rgb(0x8f98a6)).child("Sessions"),
-                                    )
-                                    .child(self.render_new_session_button(&view, cx)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .id("session-list")
-                                    .overflow_y_scroll()
-                                    .child(self.render_session_list(cx)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .border_t_1()
-                                    .border_color(rgb(0x30343f))
-                                    .pt_2()
-                                    .child(
-                                        Button::new("account-menu")
-                                            .icon(Icon::new(IconName::User))
-                                            .ghost()
-                                            .xsmall()
-                                            .dropdown_menu({
-                                                let view = view.clone();
-                                                move |menu, _, _| {
-                                                    let providers_view = view.clone();
-                                                    let about_view = view.clone();
-                                                    menu.item(
-                                                        PopupMenuItem::new("Providers").on_click(
-                                                            move |_, _, cx| {
-                                                                providers_view.update(
-                                                                    cx,
-                                                                    |view, cx| {
-                                                                        view.open_providers_from_menu(
-                                                                            cx,
-                                                                        );
-                                                                    },
-                                                                );
-                                                            },
-                                                        ),
-                                                    )
-                                                    .item(PopupMenuItem::new("About Loom").on_click(
-                                                        move |_, _, cx| {
-                                                            about_view.update(cx, |view, cx| {
-                                                                view.open_about_from_menu(cx);
-                                                            });
-                                                        },
-                                                    ))
-                                                }
-                                            }),
-                                    )
-                                    .child(
-                                        Button::new("settings-button")
-                                            .icon(Icon::new(IconName::Settings))
-                                            .ghost()
-                                            .xsmall()
-                                            .on_click({
-                                                let view = view.clone();
-                                                move |_, _, cx| {
-                                                    view.update(cx, |view, cx| {
-                                                        view.open_settings_from_menu(cx);
-                                                    });
-                                                }
-                                            }),
-                                    ),
-                            )
-                    )
+                    .when(!layout.phone, |row| {
+                        row.child(self.render_session_sidebar(&view, layout, cx))
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -7310,22 +7360,44 @@ impl Render for LoomView {
                                     .child(
                                         div()
                                             .flex()
-                                            .flex_col()
-                                            .child(self.active_session.name.clone())
+                                            .items_center()
+                                            .gap_2()
+                                            .when(layout.phone, |element| {
+                                                element.child(
+                                                    Button::new("open-session-drawer")
+                                                        .label("Sessions")
+                                                        .small()
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.session_drawer_open = true;
+                                                            cx.notify();
+                                                        })),
+                                                )
+                                            })
                                             .child(
-                                                div().text_xs().text_color(rgb(0x8f98a6)).child(
-                                                    format!(
-                                                        "{}  ·  {}  ·  {} model{}",
-                                                        run_state_label(self.run_state),
-                                                        self.model.as_str(),
-                                                        self.models.len(),
-                                                        if self.models.len() == 1 {
-                                                            ""
-                                                        } else {
-                                                            "s"
-                                                        }
-                                                    ),
-                                                ),
+                                                div()
+                                                    .flex()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .flex_col()
+                                                    .child(self.active_session.name.clone())
+                                                    .when(!layout.phone, |element| {
+                                                        element.child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(rgb(0x8f98a6))
+                                                                .child(format!(
+                                                                    "{}  ·  {}  ·  {} model{}",
+                                                                    run_state_label(self.run_state),
+                                                                    self.model.as_str(),
+                                                                    self.models.len(),
+                                                                    if self.models.len() == 1 {
+                                                                        ""
+                                                                    } else {
+                                                                        "s"
+                                                                    }
+                                                                )),
+                                                        )
+                                                    }),
                                             ),
                                     )
                                     .when(false, |element| {
@@ -7546,9 +7618,10 @@ impl Render for LoomView {
                                     .when(!self.review.open, |element| {
                                         element.child(
                                             Button::new("toggle-review-sidebar")
+                                                .label("Review")
                                                 .icon(Icon::new(IconName::PanelRight))
                                                 .ghost()
-                                                .xsmall()
+                                                .small()
                                                 .on_click(cx.listener(
                                                     |this, event, window, cx| {
                                                         this.show_review(
@@ -7569,7 +7642,7 @@ impl Render for LoomView {
                                     .overflow_hidden()
                                     .child(self.timeline_entity(cx)),
                             )
-                            .child(self.render_composer(cx))
+                            .child(self.render_composer(layout, cx))
                             .when(self.rename_dialog.is_some(), |element| {
                                 element.child(self.render_rename_dialog(cx))
                             })
@@ -7587,6 +7660,31 @@ impl Render for LoomView {
                                 element.child(self.render_github_login_dialog(cx))
                             }),
                     )
+                    .when(layout.phone && self.session_drawer_open, |row| {
+                        row.child(
+                            div()
+                                .id("mobile-session-backdrop")
+                                .size_full()
+                                .absolute()
+                                .top(px(0.))
+                                .left(px(0.))
+                                .bg(gpui_kit::hsla(0., 0., 0., 0.55))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.session_drawer_open = false;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("mobile-session-drawer")
+                                .absolute()
+                                .top(px(0.))
+                                .bottom(px(0.))
+                                .left(px(0.))
+                                .shadow_lg()
+                                .child(self.render_session_sidebar(&view, layout, cx)),
+                        )
+                    })
                     .when(
                         self.review.open
                             && !self.settings_open
@@ -7703,7 +7801,7 @@ impl Render for LoomView {
 mod responsive_layout_tests {
     use super::{
         COMPACT_REVIEW_WIDTH, COMPACT_SIDEBAR_WIDTH, FULL_REVIEW_WIDTH, FULL_SIDEBAR_WIDTH,
-        responsive_layout,
+        PHONE_SIDEBAR_WIDTH, responsive_layout,
     };
     use gpui_kit::px;
 
@@ -7717,8 +7815,25 @@ mod responsive_layout_tests {
     #[test]
     fn wide_windows_keep_full_navigation_panels() {
         let layout = responsive_layout(px(960.));
+        assert!(!layout.phone);
         assert_eq!(layout.sidebar_width, FULL_SIDEBAR_WIDTH);
         assert_eq!(layout.review_width, FULL_REVIEW_WIDTH);
+    }
+
+    #[test]
+    fn phone_windows_show_single_column_and_full_width_review() {
+        let layout = responsive_layout(px(390.));
+        assert!(layout.phone);
+        assert_eq!(layout.sidebar_width, PHONE_SIDEBAR_WIDTH);
+        assert_eq!(layout.review_width, px(390.));
+    }
+
+    #[test]
+    fn very_narrow_phones_keep_the_session_drawer_in_view() {
+        let layout = responsive_layout(px(280.));
+        assert!(layout.phone);
+        assert_eq!(layout.sidebar_width, px(280.));
+        assert_eq!(layout.review_width, px(280.));
     }
 }
 
