@@ -68,6 +68,7 @@ const FULL_SIDEBAR_WIDTH: Pixels = px(250.);
 const PHONE_SIDEBAR_WIDTH: Pixels = px(300.);
 const COMPACT_REVIEW_WIDTH: Pixels = px(280.);
 const FULL_REVIEW_WIDTH: Pixels = px(340.);
+const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(760.);
 
 #[derive(Clone, Copy, Debug)]
 struct ResponsiveLayout {
@@ -1131,26 +1132,33 @@ impl Render for TimelineView {
                 .child(
                     div()
                         .w_full()
-                        .p_5()
-                        .rounded_lg()
-                        .bg(rgb(0x171c25))
-                        .border_1()
-                        .border_color(rgb(0x293244))
-                        .text_sm()
-                        .text_color(rgb(0xb7c0d0))
+                        .flex()
+                        .justify_center()
                         .child(
                             div()
-                                .text_base()
-                                .text_color(rgb(0xf3f4f6))
-                                .child("Ready when you are"),
-                        )
-                        .child(
-                            div()
-                                .mt_1()
+                                .w_full()
+                                .max_w(TIMELINE_CONTENT_MAX_WIDTH)
+                                .p_5()
+                                .rounded_lg()
+                                .bg(rgb(0x171c25))
+                                .border_1()
+                                .border_color(rgb(0x293244))
                                 .text_sm()
-                                .text_color(rgb(0x8f98a6))
-                                .child("Describe a task below and Loom will keep the work, decisions, and results together."),
-                        ),
+                                .text_color(rgb(0xb7c0d0))
+                                .child(
+                                    div()
+                                        .text_base()
+                                        .text_color(rgb(0xf3f4f6))
+                                        .child("Ready when you are"),
+                                )
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_sm()
+                                        .text_color(rgb(0x8f98a6))
+                                        .child("Describe a task below and Loom will keep the work, decisions, and results together."),
+                                ),
+                        )
                 );
         }
 
@@ -1158,7 +1166,17 @@ impl Render for TimelineView {
         let timeline = list(self.list_state.clone(), move |index, _window, cx| {
             let view = parent.read(cx);
             let item = &view.timeline[index];
-            view.render_timeline_item(item, index, &parent)
+            div()
+                .w_full()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(TIMELINE_CONTENT_MAX_WIDTH)
+                        .child(view.render_timeline_item(item, index, &parent)),
+                )
+                .into_any()
         })
         .size_full();
 
