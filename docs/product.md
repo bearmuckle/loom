@@ -3,8 +3,9 @@
 ## Product direction
 
 The primary use case is an interactive coding-agent session. A user opens a
-repository, gives an agent a goal such as "fix the failing tests" or "add
-support for this API", and follows the agent as it:
+workspace, starts a session, selects one or more repositories for that
+session, gives an agent a goal such as "fix the failing tests" or "add support
+for this API", and follows the agent as it:
 
 1. Inspects the repository, existing instructions, history, and relevant
    files.
@@ -19,8 +20,23 @@ support for this API", and follows the agent as it:
 The user must be able to interrupt, approve, deny, redirect, retry, or take
 over at any point. The agent is not a one-shot prompt wrapper: a session is a
 durable orchestration object containing conversation history, plans, tool
-invocations, approvals, artifacts, child tasks, model usage, and the
-associated workspace.
+invocations, approvals, artifacts, child tasks, model usage, and an isolated
+filesystem root containing the repositories it works with.
+
+A **workspace** is a durable container for sessions and workspace-level
+settings. It is not a directory, repository, clone, or filesystem root, and
+can exist before any session or repository has been added. Each **session**
+owns its execution context and isolated filesystem root. A session may use
+one or more repositories, each checked out at a stable relative path inside
+that root. Concurrent sessions never share a mutable working tree; the
+backend may use shared immutable Git object storage to create their
+session-owned clones or worktrees efficiently.
+
+Repositories are inputs to sessions rather than identities for workspaces.
+The same repository can be attached to sessions in different workspaces, and
+one session can work across multiple repositories. Repository selection
+records the source and requested revision; the session's checkout, files,
+processes, checkpoints, and diffs remain scoped to its isolated root.
 
 Loom is therefore an agent orchestration application with a code workspace,
 not a code editor with an optional chat panel. The primary objects in the
@@ -38,8 +54,9 @@ requirements, along with patterns to adopt and failure modes to avoid.
 
 Loom should support these concrete workflows:
 
-- **Interactive coding:** ask an agent to understand, modify, and validate a
-  repository while observing every action.
+- **Interactive coding:** start a session in a workspace, attach one or more
+  repositories, and ask an agent to understand, modify, and validate them
+  while observing every action.
 - **Issue-driven work:** start a session from an issue or task, keep the issue
   context available, and produce a reviewable change.
 - **Parallel work:** run multiple agents against isolated worktrees or
@@ -60,25 +77,28 @@ Loom should support these concrete workflows:
 
 The first release should optimize for this exact loop:
 
-1. Create or open a repository-backed project.
+1. Create or open a workspace; it does not need a folder or repository.
 2. Start a named agent session with a selected provider and model.
-3. Enter a task in natural language and optionally attach an issue, files,
+3. Select one or more repositories and revisions for that session; Loom
+   creates their isolated checkouts under the session filesystem root.
+4. Enter a task in natural language and optionally attach an issue, files,
    prior sessions, or repository instructions.
-4. Let the agent inspect the repository and present a plan.
-5. Approve the plan and individual high-risk actions according to policy.
-6. Watch streamed model messages, tool calls, terminal output, file changes,
+5. Let the agent inspect the repositories and present a plan.
+6. Approve the plan and individual high-risk actions according to policy.
+7. Watch streamed model messages, tool calls, terminal output, file changes,
    diagnostics, and test results.
-7. Interrupt or redirect the agent, then resume from the preserved context.
-8. Review the resulting diff, test evidence, and agent summary.
-9. Continue the session, create a commit, or hand the work to another agent.
-10. Disconnect and reconnect from a native or browser client without losing
+8. Interrupt or redirect the agent, then resume from the preserved context.
+9. Review the resulting diffs, test evidence, and agent summary.
+10. Continue the session, create commits, or hand the work to another agent.
+11. Disconnect and reconnect from a native or browser client without losing
     the backend session.
 
 ## Feature areas
 
 | Area | Target capability |
 | --- | --- |
-| Projects | Open local directories, clone repositories, configure workspace roots, and remember recent projects |
+| Workspaces | Create, rename, configure, and navigate durable containers for sessions; no repository or directory is required |
+| Session repositories | Attach one or more repository sources and revisions to a session; create isolated clones or worktrees under its filesystem root |
 | Agent sessions | Create, rename, pause, resume, interrupt, retry, archive, fork, and compare persistent sessions |
 | Agent orchestration | Plans, steps, dependencies, child agents, parallel tasks, retries, cancellation, budgets, and durable event history |
 | Model providers | Multiple hosted providers, OpenAI-compatible endpoints, local model servers, model discovery, per-session selection, fallback, and usage reporting |
@@ -86,7 +106,7 @@ The first release should optimize for this exact loop:
 | Permissions | Approval policies for file reads/writes, commands, network access, secrets, plugins, and destructive operations |
 | Tool execution | Search, file operations, patching, terminals, diagnostics, source control, language services, HTTP, and extensible tool adapters |
 | Editor | Read-only file and diff previews tied to agent work; full editing remains a later surface |
-| Navigation | Project and session navigation plus direct links into agent changes; fuzzy and symbol navigation remain later |
+| Navigation | Workspace and session navigation plus direct links into agent changes; fuzzy and symbol navigation remain later |
 | Terminal | Bounded command and task output in the agent timeline; interactive terminals remain a later surface |
 | Tasks | Agent-owned and user-owned build/test/lint commands with run, monitor, cancel, restart, and artifact inspection |
 | Source control | Read-only status and diff review for agent work; staging and commit controls remain later |
@@ -101,17 +121,18 @@ able to discover which capabilities a backend supports instead of assuming
 that every installation has the same tools available.
 
 The M5 vertical slice makes the orchestration experience concrete without
-changing the agent/session authority. A compact GPUI shell puts projects and
-sessions in a small navigator, the active conversation and run timeline in
-the main canvas, and the composer at the point of control. Approvals,
-changed-file diffs, task results, and evidence open as focused review
+changing the agent/session authority. A compact GPUI shell puts workspaces
+and their sessions in a small navigator, the active conversation and run
+timeline in the main canvas, and the composer at the point of control.
+Approvals, changed-file diffs, task results, and evidence open as focused review
 surfaces. File contents and repository state are read-only projections in
 M5; the client is not a general-purpose editor.
 
 ## Guiding principles
 
 1. **Backend owns truth.** The frontend renders state and submits commands; it
-   does not become the source of truth for an agent, workspace, or task.
+   does not become the source of truth for a workspace, session filesystem,
+   agent, or task.
 2. **Local should feel local.** A local backend uses the cheapest available
    transport and must not pay remote-mode costs for ordinary interactions.
 3. **Remote should be a first-class mode.** Reconnection, resumable events,

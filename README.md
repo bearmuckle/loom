@@ -32,6 +32,11 @@ cargo build
 cargo run -p loom-ui -- --workspace /path/to/project
 ```
 
+The `--workspace PATH` option is the current folder-backed bootstrap
+compatibility path. The target model makes a workspace a container for
+sessions; each session will own an isolated filesystem root with its own
+repository checkouts.
+
 Demo mode:
 
 ```text

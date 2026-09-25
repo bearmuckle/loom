@@ -36,6 +36,33 @@ transport boundary without changing request IDs or event sequences.
   are exposed.
 - Redaction rules for secrets in logs and event history.
 
+## Workspace, session, and repository ownership
+
+The target domain model separates organization from execution:
+
+- A `Workspace` groups sessions and workspace-level settings. It has an ID
+  and lifecycle independent of any local directory or Git repository.
+- An `AgentSession` belongs to a workspace and owns an isolated filesystem
+  root on its backend. The host path is backend-internal and is not returned
+  to remote clients. This defines filesystem ownership and path scope; it
+  does not by itself guarantee OS-level process sandboxing.
+- A session may attach zero or more repository sources. Each attachment
+  identifies a source, requested revision, and stable relative checkout path
+  within that root. The backend materializes a session-owned clone or
+  worktree; mutable working trees are not shared between sessions.
+- File, process, terminal, checkpoint, change, and VCS operations are scoped
+  to a session. Repository paths are interpreted relative to that session's
+  checkout, while root-relative paths can address files elsewhere in the
+  session filesystem.
+
+The protocol should therefore evolve toward workspace lifecycle/list
+operations, workspace-scoped session listing/creation, and session-scoped
+repository attachment and filesystem operations. Existing project-scoped
+requests are transitional compatibility forms, not the target ownership
+model. Migration must be explicit and versioned: clients must not infer a
+workspace ID from a filesystem path or treat a repository ID as a workspace
+ID.
+
 M4 adds `DiscoverCapabilities`, additive `ClientFrame`/`ServerFrame` codec
 types, and `SessionEventsSnapshot`. Existing `RequestEnvelope`,
 `ResponseEnvelope`, and `ServerEventEnvelope` JSON forms remain valid.
@@ -84,8 +111,9 @@ These names are illustrative; the schema should use explicit request and
 event types rather than a generic "run arbitrary method" envelope.
 
 ```text
-OpenProject
+CreateWorkspace / ListWorkspaces
 CreateAgentSession
+AttachSessionRepository / DetachSessionRepository / ListSessionRepositories
 StartAgentRun
 PauseAgentRun
 ResumeAgentRun
@@ -98,10 +126,10 @@ ListProviders
 ListModels
 SetSessionModel
 GetSessionContext
-GetWorkspaceSnapshot
-ReadFile
-ApplyTextEdit
-SubscribeWorkspaceEvents
+GetSessionFilesystemSnapshot
+ReadSessionFile
+ApplySessionEdit
+SubscribeSessionFilesystemEvents
 OpenTerminal
 WriteTerminalInput
 ResizeTerminal
@@ -110,25 +138,26 @@ CancelTask
 GetRepositoryStatus
 ```
 
-M2 adds typed workspace and process requests rather than exposing filesystem or
-process primitives directly:
+M2 adds typed session-filesystem and process requests rather than exposing
+filesystem or process primitives directly:
 
 ```text
-OpenWorkspace / GetWorkspaceSnapshot / GetWorkspaceEvents
-ReadWorkspaceFile / ApplyWorkspaceEdit / TakeWorkspaceControl
-CreateCheckpoint / RevertCheckpoint / UndoWorkspaceEdit
+AttachSessionRepository / DetachSessionRepository / ListSessionRepositories
+GetSessionFilesystemSnapshot / GetSessionFilesystemEvents
+ReadSessionFile / ApplySessionEdit / TakeSessionFilesystemControl
+CreateCheckpoint / RevertCheckpoint / UndoSessionEdit
 SetApprovalPolicy
 OpenTerminal / WriteTerminalInput / ResizeTerminal
 GetTerminalEvents / CancelTerminal
 StartTask / GetTask / GetTaskEvents / CancelTask
 ```
 
-Workspace edits carry an optional content revision and return a structured
-conflict when it no longer matches. Terminal and task output is delivered as
-bounded, sequence-numbered records; snapshots remain available after a client
-disconnects. Policy evaluations are agent events before a tool executes, and
-the existing approval request/decision events remain authoritative for
-approval-required actions.
+Session filesystem edits carry an optional content revision and return a
+structured conflict when it no longer matches. Terminal and task output is
+delivered as bounded, sequence-numbered records; snapshots remain available
+after a client disconnects. Policy evaluations are agent events before a
+tool executes, and the existing approval request/decision events remain
+authoritative for approval-required actions.
 
 Agent and Edit modes allow read, write, command, and network actions without
 prompting by default; the session settings can opt out, which restores explicit
@@ -176,7 +205,7 @@ Important event families include `AgentMessageDelta`,
 `AgentPlanProposed`, `AgentStepStarted`, `ToolCallRequested`,
 `ToolApprovalRequired`, `ToolCallStarted`, `ToolOutputChunk`,
 `AgentStepCompleted`, `AgentNeedsInput`, `AgentRunUsage`,
-`WorkspaceChanged`, and `AgentRunCompleted`. Events must identify the
+`SessionFilesystemChanged`, and `AgentRunCompleted`. Events must identify the
 session, run, step, tool call, and sequence number so a client can render
 partial progress and recover a consistent view.
 
@@ -206,13 +235,13 @@ M5 adds only the capability-gated projections required for the focused agent
 client:
 
 ```text
-ListProjects / ListAgentSessions / GetAgentSessionSnapshot
+ListWorkspaces / ListAgentSessions / GetAgentSessionSnapshot
 GetAgentRunSnapshot / GetSessionEvents
-GetWorkspaceChanges / ReadWorkspaceFile / GetVcsDiff
+GetSessionFilesystemChanges / ReadSessionFile / GetVcsDiff
 ListTasks / GetTask / GetTaskEvidence
 ```
 
-Worker-node management adds project-scoped `GetWorkspaceConfig` and
+Worker-node management adds workspace-scoped `GetWorkspaceConfig` and
 `SetWorkspaceConfig` requests. The persisted config contains a revision,
 worker WebSocket URLs, and a CPU pulse threshold for session-card node
 indicators (default 5%); credentials, workspace files, and session state are
@@ -260,7 +289,7 @@ archiving it, so clients do not need to issue a separate interrupt request.
 Session and run snapshots must be sufficient to render the active
 conversation, plan, step state, tool calls, approvals, bounded output,
 questions, errors, and final summary after reconnect. Review responses are
-read-only, project-scoped, and bounded; diffs and task artifacts retain stable
+read-only, session-scoped, and bounded; diffs and task artifacts retain stable
 references without exposing credentials or shell strings.
 
 The protocol has no editor-buffer, editor-layout, or language-service
