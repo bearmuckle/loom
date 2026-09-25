@@ -109,6 +109,81 @@ impl FilePersistence {
         })
     }
 
+    pub fn import_sections_from(&self, source: &Self) -> Result<bool> {
+        if !source.path.exists() {
+            return Ok(false);
+        }
+        let source_connection = source.connection()?;
+        let mut statement = source_connection
+            .prepare("SELECT name, schema_version, payload FROM sections ORDER BY name")
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read legacy persistence sections: {error}"),
+                    true,
+                )
+            })?;
+        let sections = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read legacy persistence sections: {error}"),
+                    true,
+                )
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not decode legacy persistence sections: {error}"),
+                    true,
+                )
+            })?;
+        if sections.is_empty() {
+            return Ok(false);
+        }
+
+        let mut destination = self.connection_for_write()?;
+        let transaction = destination.transaction().map_err(|error| {
+            persistence_error(format!("could not begin persistence import: {error}"), true)
+        })?;
+        let existing_sections: i64 = transaction
+            .query_row("SELECT COUNT(*) FROM sections", [], |row| row.get(0))
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect destination persistence: {error}"),
+                    true,
+                )
+            })?;
+        if existing_sections != 0 {
+            return Ok(false);
+        }
+        for (name, schema_version, payload) in sections {
+            transaction
+                .execute(
+                    "INSERT INTO sections (name, schema_version, payload) VALUES (?1, ?2, ?3)",
+                    params![name, schema_version, payload],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not import persistence section '{name}': {error}"),
+                        true,
+                    )
+                })?;
+        }
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit persistence import: {error}"),
+                true,
+            )
+        })?;
+        Ok(true)
+    }
+
     fn connection(&self) -> Result<Connection> {
         Connection::open(&self.path).map_err(|error| {
             persistence_error(
@@ -301,5 +376,53 @@ mod tests {
             2
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_sections_import_only_into_an_empty_destination() {
+        let source_path =
+            std::env::temp_dir().join(format!("loom-persistence-source-{}.db", Uuid::new_v4()));
+        let destination_path = std::env::temp_dir().join(format!(
+            "loom-persistence-destination-{}.db",
+            Uuid::new_v4()
+        ));
+        let source = FilePersistence::open(&source_path).unwrap();
+        let destination = FilePersistence::open(&destination_path).unwrap();
+        source
+            .save_sections(
+                CURRENT_SCHEMA_VERSION,
+                &[("sessions", serde_json::json!({"count": 3}))],
+            )
+            .unwrap();
+
+        assert!(destination.import_sections_from(&source).unwrap());
+        assert!(!destination.import_sections_from(&source).unwrap());
+        assert_eq!(
+            destination
+                .load_section::<serde_json::Value>("sessions", CURRENT_SCHEMA_VERSION)
+                .unwrap(),
+            Some(serde_json::json!({"count": 3}))
+        );
+
+        let existing_path =
+            std::env::temp_dir().join(format!("loom-persistence-existing-{}.db", Uuid::new_v4()));
+        let existing = FilePersistence::open(&existing_path).unwrap();
+        existing
+            .save_sections(
+                CURRENT_SCHEMA_VERSION,
+                &[("sessions", serde_json::json!({"count": 7}))],
+            )
+            .unwrap();
+        assert!(!existing.import_sections_from(&source).unwrap());
+        assert_eq!(
+            existing
+                .load_section::<serde_json::Value>("sessions", CURRENT_SCHEMA_VERSION)
+                .unwrap(),
+            Some(serde_json::json!({"count": 7}))
+        );
+
+        for path in [source_path, destination_path, existing_path] {
+            fs::remove_file(path).unwrap();
+        }
     }
 }

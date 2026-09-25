@@ -14,6 +14,7 @@ use std::{
 
 use loom_core::{ErrorCode, LoomError, ProjectId};
 use loom_model::ModelId;
+use loom_persistence::FilePersistence;
 use loom_providers::{CredentialRef, GITHUB_COPILOT_DEFAULT_MODEL};
 use loom_vcs::GitService;
 use sha2::{Digest, Sha256};
@@ -325,24 +326,48 @@ pub(crate) fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), 
     Ok((root, options.demo))
 }
 
-pub(crate) fn backend_persistence_path(root: &Path) -> Result<PathBuf, LoomError> {
-    let state_root = env::var_os("LOOM_STATE_DIR")
+pub(crate) fn backend_persistence_path() -> PathBuf {
+    state_root().join("loom").join("state.db")
+}
+
+pub(crate) fn migrate_legacy_backend_persistence(root: &Path) -> Result<(), LoomError> {
+    let state_root = state_root();
+    let persistence_path = backend_persistence_path();
+    let legacy_path = legacy_backend_persistence_path(root, &state_root);
+    if legacy_path.is_file() {
+        let imported = FilePersistence::open(&persistence_path)?
+            .import_sections_from(&FilePersistence::open(&legacy_path)?)?;
+        if !imported {
+            log::warn!(
+                "legacy project state at '{}' was preserved but not imported because shared Loom state already exists",
+                legacy_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn state_root() -> PathBuf {
+    env::var_os("LOOM_STATE_DIR")
         .map(PathBuf::from)
         .or_else(|| env::var_os("XDG_STATE_HOME").map(PathBuf::from))
         .or_else(|| {
             env::var_os("HOME").map(|home| PathBuf::from(home).join(".local").join("state"))
         })
-        .unwrap_or_else(|| env::temp_dir().join("loom-state"));
+        .unwrap_or_else(|| env::temp_dir().join("loom-state"))
+}
+
+fn legacy_backend_persistence_path(root: &Path, state_root: &Path) -> PathBuf {
     let digest = Sha256::digest(root.to_string_lossy().as_bytes());
     let project_key = digest
         .iter()
         .take(16)
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    Ok(state_root
+    state_root
         .join("loom")
         .join("projects")
-        .join(format!("{project_key}.db")))
+        .join(format!("{project_key}.db"))
 }
 
 pub(crate) fn stable_project_id(root: &Path) -> ProjectId {
@@ -384,14 +409,18 @@ mod tests {
     }
 
     #[test]
-    fn project_identity_and_persistence_path_are_stable_per_workspace() {
+    fn project_ids_are_stable_and_persistence_is_shared_across_workspaces() {
         let first = Path::new("/tmp/loom-project");
         let second = Path::new("/tmp/other-project");
         assert_eq!(stable_project_id(first), stable_project_id(first));
         assert_ne!(stable_project_id(first), stable_project_id(second));
+        assert_eq!(
+            backend_persistence_path(),
+            state_root().join("loom").join("state.db")
+        );
         assert_ne!(
-            backend_persistence_path(first).unwrap(),
-            backend_persistence_path(second).unwrap()
+            legacy_backend_persistence_path(first, Path::new("/tmp/state")),
+            legacy_backend_persistence_path(second, Path::new("/tmp/state"))
         );
     }
 
