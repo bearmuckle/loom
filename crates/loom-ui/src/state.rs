@@ -59,9 +59,10 @@ impl AgentMode {
         }
     }
 
-    pub(crate) fn approval_policy(self) -> ApprovalPolicy {
+    pub(crate) fn approval_policy(self, auto_approve_actions: bool) -> ApprovalPolicy {
         match self {
             Self::AutoApprove => ApprovalPolicy::auto_approve(),
+            Self::Edit | Self::Agent if auto_approve_actions => ApprovalPolicy::auto_approve(),
             Self::Ask | Self::Edit | Self::Agent => ApprovalPolicy::default(),
         }
     }
@@ -251,6 +252,34 @@ mod tests {
         let value = bounded_to("abcdef", 3);
         assert_eq!(value, "abc\n...[output truncated]");
         assert!(bounded_to("😀😀", 4).starts_with('😀'));
+    }
+
+    #[test]
+    fn agent_and_edit_modes_default_to_safe_auto_approval() {
+        assert_eq!(
+            AgentMode::Agent.approval_policy(true),
+            ApprovalPolicy::auto_approve()
+        );
+        assert_eq!(
+            AgentMode::Edit.approval_policy(true),
+            ApprovalPolicy::auto_approve()
+        );
+        assert_eq!(
+            AgentMode::Agent.approval_policy(false),
+            ApprovalPolicy::default()
+        );
+        assert_eq!(
+            AgentMode::Edit.approval_policy(false),
+            ApprovalPolicy::default()
+        );
+        assert_eq!(
+            AgentMode::Ask.approval_policy(true),
+            ApprovalPolicy::default()
+        );
+        assert_eq!(
+            AgentMode::AutoApprove.approval_policy(false),
+            ApprovalPolicy::auto_approve()
+        );
     }
 
     #[test]

@@ -3,7 +3,8 @@ use std::{fs, path::PathBuf, sync::Arc, time::Duration};
 use futures_util::{SinkExt, StreamExt};
 use loom_agent::AgentEvent;
 use loom_core::{
-    AgentSessionId, Capability, CapabilitySet, ErrorCode, EventSequence, ProjectId, RequestId,
+    AgentSessionId, ApprovalPolicy, Capability, CapabilitySet, ErrorCode, EventSequence, ProjectId,
+    RequestId,
 };
 use loom_model::ModelId;
 use loom_protocol::{
@@ -29,6 +30,7 @@ fn capabilities() -> CapabilitySet {
         Capability::ReadAgentRun,
         Capability::ControlAgentRun,
         Capability::ApproveAgentAction,
+        Capability::ConfigureApprovalPolicy,
         Capability::ListProviders,
         Capability::OpenWorkspace,
         Capability::ConfigureProviders,
@@ -522,6 +524,17 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
     negotiate(&mut first).await;
     let project_id = ProjectId::new();
     let session = session(&mut first, project_id).await;
+    first
+        .request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
+            project_id,
+            session_id: Some(session.id),
+            policy: ApprovalPolicy::default(),
+            auto_approve_actions: Some(false),
+        }))
+        .await
+        .unwrap()
+        .result
+        .unwrap();
     let run_id = match first
         .request(RequestEnvelope::new(ClientRequest::StartAgentRun {
             session_id: session.id,

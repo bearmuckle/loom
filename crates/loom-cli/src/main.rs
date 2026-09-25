@@ -66,7 +66,13 @@ fn main() -> Result<(), LoomError> {
 
     negotiate(&connection)?;
     let session = create_session(&connection, &options.name)?;
-    let run_id = start_run(&connection, session.id, &options, &workspace_root)?;
+    let run_id = start_run(
+        &connection,
+        session.id,
+        session.project_id,
+        &options,
+        &workspace_root,
+    )?;
 
     println!(
         "Loom native {} shell",
@@ -386,6 +392,15 @@ async fn m4_demo_remote(
         ServerResponse::AgentSessionCreated(snapshot) => snapshot,
         response => return Err(unexpected_response("remote session creation", response)),
     };
+    first
+        .request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
+            project_id,
+            session_id: Some(session.id),
+            policy: loom_core::ApprovalPolicy::default(),
+            auto_approve_actions: Some(false),
+        }))
+        .await?
+        .result?;
     let run_id = match first
         .request(RequestEnvelope::new(ClientRequest::StartAgentRun {
             session_id: session.id,
@@ -862,9 +877,24 @@ fn create_session(
 fn start_run(
     connection: &InProcessConnection,
     session_id: AgentSessionId,
+    project_id: ProjectId,
     options: &CliOptions,
     workspace_root: &Path,
 ) -> Result<RunId, LoomError> {
+    if options.manual_approval {
+        match connection
+            .request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
+                project_id,
+                session_id: Some(session_id),
+                policy: loom_core::ApprovalPolicy::default(),
+                auto_approve_actions: Some(false),
+            }))
+            .result?
+        {
+            ServerResponse::ApprovalPolicy(_) => {}
+            response => return Err(unexpected_response("approval policy", response)),
+        }
+    }
     let response = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
         session_id,
         task: options.task.clone(),

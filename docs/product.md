@@ -51,6 +51,8 @@ Loom should support these concrete workflows:
   tool semantics.
 - **Human-in-the-loop automation:** configure approval policies for reads,
   writes, commands, network access, credentials, and destructive operations.
+  Agent and Edit modes automatically approve non-destructive actions by default,
+  with a per-session opt-out; destructive actions remain denied.
 - **Remote control:** connect to a backend on a workstation, server, or
   development container from a native or browser client.
 
