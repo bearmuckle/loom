@@ -1,15 +1,15 @@
 # Security and trust model
 
-The backend can execute commands, access valuable project data, call remote
-model providers, and use configured credentials. A remote connection is never
-implicitly trusted.
+The backend can execute commands, access valuable repository and session
+data, call remote model providers, and use configured credentials. A remote
+connection is never implicitly trusted.
 
 ## Requirements
 
 - Bind local-only servers to a local transport by default.
 - Require explicit opt-in before listening on a network interface.
 - Authenticate remote clients and authorize each workspace/session.
-- Scope filesystem access to configured workspace roots.
+- Scope filesystem access to the active session's filesystem root.
 - Make command execution policy visible and configurable.
 - Treat environment variables, command output, file contents, repository
   instructions, model output, and tool responses as untrusted data.
@@ -38,8 +38,8 @@ protocol events. Revocation is checked on every request, including requests
 from an already-upgraded WebSocket. Token grants can restrict capabilities,
 projects, and sessions; an unrestricted grant is an explicit deployment
 choice rather than an implicit network default.
-Scope builders may also pin a project to a canonical workspace root before
-the first `OpenWorkspace`.
+The current project-scoped compatibility API can pin a project to a canonical
+workspace root before the first `OpenWorkspace`.
 
 The service binds to `127.0.0.1` by default. Binding a non-loopback address
 requires an explicit `--bind` choice and a token. TLS termination is expected
@@ -52,7 +52,7 @@ directly to an untrusted network.
 Tool permissions should be typed and policy-driven rather than inferred from
 the UI. At minimum, distinguish:
 
-- Reading files and searching the workspace.
+- Reading files and searching the session filesystem.
 - Writing or deleting files.
 - Running commands and choosing their environment.
 - Accessing the network.
@@ -61,20 +61,25 @@ the UI. At minimum, distinguish:
 - Creating commits, branches, worktrees, or other source-control mutations.
 - Starting child agents or spending additional model budget.
 
-The user should see why an action requires approval, which workspace and
-resources it affects, and what the agent requested. Policies may allow
-automatic approval for low-risk actions, but high-risk operations remain
-explicit by default.
+The user should see why an action requires approval, which workspace, session,
+and repository resources it affects, and what the agent requested. Policies
+may allow automatic approval for low-risk actions, but high-risk operations
+remain explicit by default.
 
 The first release does not need a complete multi-user identity system, but it
 must have an explicit trust boundary so one can be added without redesigning
 the protocol.
 
-M2 implements the local boundary with canonical workspace roots, traversal and
-outside-root symlink rejection, revision-checked edits, workspace-scoped task
-working directories, and project ownership checks for terminal/task control
-requests. Its default `ApprovalPolicy` allows reads, pauses writes and
-commands for approval, requests approval for network actions, and denies
+The current M2 implementation enforces the local boundary with canonical
+project/workspace roots, traversal and outside-root symlink rejection,
+revision-checked edits, workspace-scoped task working directories, and
+project ownership checks for terminal/task control requests. In the target
+model, the same canonicalization and traversal protections apply to each
+session-owned root and its repository checkouts; a workspace does not grant
+filesystem access by itself. A session root is a path-ownership boundary, not
+a promise of OS-level process sandboxing. The current default `ApprovalPolicy`
+allows reads, pauses writes and commands for approval, requests approval for
+network actions, and denies
 destructive actions. The policy evaluation is included in the agent event
 stream before a tool executes. The UI's optional Auto approve mode allows
 non-destructive writes, commands, and network actions, but destructive actions
@@ -97,18 +102,22 @@ returned as bounded structured citations, and may be restricted to explicit
 hostnames by the tool request. Page retrieval and arbitrary URL fetching are
 not implied by this tool.
 
-Workspace roots remain backend-owned after the first `OpenWorkspace` for a
-project and canonical workspace checks from M2 still reject traversal and
-outside-root symlinks. M4 project/session authorization prevents a token from
-using another project's IDs; deployments that allow a token to select a
-project's initial root must additionally constrain the process account and
-filesystem permissions. A full per-user identity/invitation system and
-encrypted secret vault remain deferred.
+In the current compatibility model, roots remain backend-owned after the
+first `OpenWorkspace` for a project and canonical workspace checks reject
+traversal and outside-root symlinks. The target model keeps these checks but
+makes the session, rather than the workspace/project, the owner of each root.
+Current M4 project/session authorization prevents a token from using another
+project's IDs; target authorization must preserve workspace/session ownership
+without allowing a workspace grant to escape a session root. Deployments must
+also constrain the backend process account and filesystem permissions. A full
+per-user identity/invitation system and encrypted secret vault remain
+deferred.
 
-M5 adds no new trust boundary. The client reads only backend-authoritative,
-project-scoped session, workspace-change, diff, task, and evidence
-projections. File previews and diffs are bounded and cannot mutate the
-workspace; existing agent tools, approval policies, canonical workspace
-checks, and VCS argument validation remain the authority for mutations.
+M5 adds no new trust boundary. The current client reads only
+backend-authoritative, project-scoped session, workspace-change, diff, task,
+and evidence projections. Target projections are session-scoped. File previews
+and diffs are bounded and cannot mutate the session filesystem; existing
+agent tools, approval policies, canonical path checks, and VCS argument
+validation remain the authority for mutations.
 Repository instructions and context references are displayed as untrusted data
 and do not change approval policy.

@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
-use loom_core::{AgentSessionId, CheckpointId, EventSequence, ProjectId, Timestamp};
+pub use loom_core::WorkspaceRecord;
+use loom_core::{AgentSessionId, CheckpointId, EventSequence, ProjectId, RepositoryId, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceConfig {
-    /// Monotonically increasing per-project version used to ignore stale
+    /// Monotonically increasing per-workspace version used to ignore stale
     /// config updates arriving after newer node-membership changes.
     #[serde(default)]
     pub revision: u64,
@@ -36,6 +37,15 @@ pub struct WorkerNodeConfig {
     pub url: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionRepository {
+    pub id: RepositoryId,
+    pub source: String,
+    pub path: String,
+    pub revision: Option<String>,
+    pub attached_at: Timestamp,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceEntryKind {
@@ -60,6 +70,14 @@ pub struct WorkspaceSnapshot {
     pub entries: Vec<WorkspaceEntry>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionFilesystemSnapshot {
+    pub session_id: AgentSessionId,
+    pub root: String,
+    pub captured_at: Timestamp,
+    pub entries: Vec<WorkspaceEntry>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceChangeKind {
@@ -78,7 +96,24 @@ pub struct WorkspaceChange {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionFilesystemChange {
+    pub sequence: EventSequence,
+    pub session_id: AgentSessionId,
+    pub path: String,
+    pub kind: WorkspaceChangeKind,
+    pub revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceFile {
+    pub path: String,
+    pub content: String,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionFilesystemFile {
+    pub session_id: AgentSessionId,
     pub path: String,
     pub content: String,
     pub revision: String,

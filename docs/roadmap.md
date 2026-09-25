@@ -32,10 +32,12 @@ an empty agent session, and renders its state and event stream.
 **Exit condition:** a user can ask an agent to make a small repository change,
 approve the plan and patch, run a test command, and inspect the final diff.
 
-### M2 - Workspace tools and human control
+### M2 - Session filesystems and human control
 
-- Open a configured project root and expose file snapshots. Change detection
-  is pull-based revision comparison; a watch mechanism is not implemented yet.
+- Create sessions with backend-managed isolated filesystem roots and expose
+  file snapshots. Attach one or more repository sources to a session, each
+  checked out at a stable relative path. Change detection is pull-based
+  revision comparison; a watch mechanism is not implemented yet.
 - Add persistent terminals with output streaming, resize, input, and
   cancellation.
 - Add task supervision, bounded output buffers, backpressure, exit status, and
@@ -112,7 +114,7 @@ durable agent session. It should feel close to the GitHub Copilot app in
 information architecture and interaction model, while retaining Loom's
 backend-owned state, provider neutrality, and remote-control boundary.
 
-- Provide a small project/session navigator with new-session, rename, resume,
+- Provide a small workspace/session navigator with new-session, rename, resume,
   archive, and connection-status actions.
 - Make the active session the main canvas: task prompt, streamed assistant
   messages, proposed plan, step progress, tool calls, bounded command output,
@@ -133,12 +135,12 @@ backend-owned state, provider neutrality, and remote-control boundary.
   Zed is a reference for visual tone only, not for editor features,
   navigation, or layout behavior.
 
-The M5 client should reuse the existing session, workspace, process, task,
+The M5 client should reuse the existing session-filesystem, process, task,
 VCS, and protocol services. Add only the narrow session, run, review, and
 evidence projections that the UI needs; do not introduce an editor buffer
 authority or a second orchestration model.
 
-**Exit condition:** a user can open a project, start an agent session, watch a
+**Exit condition:** a user can open a workspace, start an agent session, watch a
 plan and live tool timeline, approve or interrupt work, provide follow-up
 direction, reconnect to a paused or running session, and review changed files,
 diffs, and validation evidence before continuing or handing off the task.
@@ -160,6 +162,29 @@ session-centric product model.
 against a remote backend using supported browsers.
 
 ## Quality bar
+
+### Workspace/session model transition
+
+The current implementation uses project IDs to couple a local directory,
+workspace services, configuration, and sessions. This is a transitional
+bootstrap model, not the product model. Evolve it without silently changing
+existing persisted or protocol identities:
+
+- Introduce workspace records that group sessions without requiring a
+  filesystem path or repository.
+- Move session ownership from project IDs to workspace IDs.
+- Give every session its own managed filesystem root and repository
+  attachment list; keep mutable checkouts session-exclusive.
+- Scope filesystem, process, terminal, checkpoint, and VCS services to the
+  session. Keep any shared clone cache immutable and backend-internal.
+- Migrate the CLI's current folder-backed `--workspace` bootstrap as a
+  compatibility path, then replace it with explicit workspace and
+  session-repository operations.
+
+Before implementation, settle repository attachment lifecycle and checkout
+choices (clone versus worktree) at the service boundary. Those choices must
+not change workspace identity or permit one session's tools to mutate another
+session's working tree.
 
 ### Correctness
 

@@ -65,14 +65,12 @@ fn main() -> Result<(), LoomError> {
     let connection = backend.connect();
 
     negotiate(&connection)?;
-    let session = create_session(&connection, &options.name)?;
-    let run_id = start_run(
-        &connection,
-        session.id,
-        session.project_id,
-        &options,
-        &workspace_root,
-    )?;
+    let workspace = create_workspace(&connection, &options.name)?;
+    let session = create_session(&connection, workspace.id, &options.name)?;
+    if workspace_root.join(".git").exists() {
+        attach_repository(&connection, session.id, &workspace_root)?;
+    }
+    let run_id = start_run(&connection, session.id, &options)?;
 
     println!(
         "Loom native {} shell",
@@ -380,33 +378,66 @@ async fn m4_demo_remote(
     let transport = WebSocketTransport::new(url, token);
     let mut first = transport.connect().await?;
     negotiate_remote(&mut first).await?;
-    let project_id = ProjectId::new();
-    let session = match first
-        .request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id,
+    let workspace = match first
+        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
             name: "M4 remote reconnect".to_owned(),
         }))
+        .await?
+        .result?
+    {
+        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        response => return Err(unexpected_response("remote workspace creation", response)),
+    };
+    let session = match first
+        .request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "M4 remote reconnect".to_owned(),
+            },
+        ))
         .await?
         .result?
     {
         ServerResponse::AgentSessionCreated(snapshot) => snapshot,
         response => return Err(unexpected_response("remote session creation", response)),
     };
+    if workspace_root.join(".git").exists() {
+        match first
+            .request(RequestEnvelope::new(
+                ClientRequest::AttachSessionRepository {
+                    session_id: session.id,
+                    source: workspace_root.display().to_string(),
+                    path: "repo".to_owned(),
+                    revision: None,
+                },
+            ))
+            .await?
+            .result?
+        {
+            ServerResponse::SessionRepositoryAttached(_) => {}
+            response => {
+                return Err(unexpected_response(
+                    "remote repository attachment",
+                    response,
+                ));
+            }
+        }
+    }
     first
-        .request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
-            project_id,
-            session_id: Some(session.id),
-            policy: loom_core::ApprovalPolicy::default(),
-            auto_approve_actions: Some(false),
-        }))
+        .request(RequestEnvelope::new(
+            ClientRequest::SetSessionApprovalPolicy {
+                session_id: session.id,
+                policy: loom_core::ApprovalPolicy::default(),
+                auto_approve_actions: Some(false),
+            },
+        ))
         .await?
         .result?;
     let run_id = match first
-        .request(RequestEnvelope::new(ClientRequest::StartAgentRun {
+        .request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
             session_id: session.id,
             task,
             model: ModelId::new("deterministic/demo"),
-            workspace_root: workspace_root.display().to_string(),
             system_instructions: Some("Use the available tools and report validation.".to_owned()),
             repository_instructions: Some("Keep the demonstration change small.".to_owned()),
         }))
@@ -526,6 +557,10 @@ fn client_capabilities() -> CapabilitySet {
     CapabilitySet::new([
         Capability::CreateAgentSession,
         Capability::ReadAgentSession,
+        Capability::ManageWorkspaces,
+        Capability::ManageSessionRepositories,
+        Capability::ReadSessionFilesystem,
+        Capability::WriteSessionFilesystem,
         Capability::SubscribeSessionEvents,
         Capability::StartAgentRun,
         Capability::ReadAgentRun,
@@ -821,6 +856,10 @@ fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
         capabilities: CapabilitySet::new([
             Capability::CreateAgentSession,
             Capability::ReadAgentSession,
+            Capability::ManageWorkspaces,
+            Capability::ManageSessionRepositories,
+            Capability::ReadSessionFilesystem,
+            Capability::WriteSessionFilesystem,
             Capability::SubscribeSessionEvents,
             Capability::StartAgentRun,
             Capability::ReadAgentRun,
@@ -862,44 +901,77 @@ fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
 
 fn create_session(
     connection: &InProcessConnection,
+    workspace_id: loom_core::WorkspaceId,
     name: &str,
 ) -> Result<loom_core::AgentSessionSnapshot, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-        project_id: ProjectId::new(),
-        name: name.to_owned(),
-    }));
+    let response = connection.request(RequestEnvelope::new(
+        ClientRequest::CreateAgentSessionInWorkspace {
+            workspace_id,
+            name: name.to_owned(),
+        },
+    ));
     match response.result? {
         ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
         response => Err(unexpected_response("session creation", response)),
     }
 }
 
+fn create_workspace(
+    connection: &InProcessConnection,
+    name: &str,
+) -> Result<loom_core::WorkspaceRecord, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+        name: name.to_owned(),
+    }));
+    match response.result? {
+        ServerResponse::WorkspaceCreated(workspace) => Ok(workspace),
+        response => Err(unexpected_response("workspace creation", response)),
+    }
+}
+
+fn attach_repository(
+    connection: &InProcessConnection,
+    session_id: AgentSessionId,
+    root: &Path,
+) -> Result<(), LoomError> {
+    let response = connection.request(RequestEnvelope::new(
+        ClientRequest::AttachSessionRepository {
+            session_id,
+            source: root.display().to_string(),
+            path: "repo".to_owned(),
+            revision: None,
+        },
+    ));
+    match response.result? {
+        ServerResponse::SessionRepositoryAttached(_) => Ok(()),
+        response => Err(unexpected_response("repository attachment", response)),
+    }
+}
+
 fn start_run(
     connection: &InProcessConnection,
     session_id: AgentSessionId,
-    project_id: ProjectId,
     options: &CliOptions,
-    workspace_root: &Path,
 ) -> Result<RunId, LoomError> {
     if options.manual_approval {
         match connection
-            .request(RequestEnvelope::new(ClientRequest::SetApprovalPolicy {
-                project_id,
-                session_id: Some(session_id),
-                policy: loom_core::ApprovalPolicy::default(),
-                auto_approve_actions: Some(false),
-            }))
+            .request(RequestEnvelope::new(
+                ClientRequest::SetSessionApprovalPolicy {
+                    session_id,
+                    policy: loom_core::ApprovalPolicy::default(),
+                    auto_approve_actions: Some(false),
+                },
+            ))
             .result?
         {
             ServerResponse::ApprovalPolicy(_) => {}
             response => return Err(unexpected_response("approval policy", response)),
         }
     }
-    let response = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
         session_id,
         task: options.task.clone(),
         model: options.model.clone(),
-        workspace_root: workspace_root.display().to_string(),
         system_instructions: Some(
             "Work methodically, use the available tools, and report validation.".to_owned(),
         ),

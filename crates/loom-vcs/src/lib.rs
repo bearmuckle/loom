@@ -15,6 +15,43 @@ pub struct GitService {
 }
 
 impl GitService {
+    pub fn clone_from(
+        source: impl AsRef<str>,
+        destination: impl AsRef<Path>,
+        revision: Option<&str>,
+    ) -> Result<Self> {
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(LoomError::conflict(format!(
+                "repository checkout destination '{}' already exists",
+                destination.display()
+            )));
+        }
+        let repository = Repository::clone(source.as_ref(), destination)
+            .map_err(|error| git_error("could not clone repository", error))?;
+        if let Some(revision) = revision {
+            let object = repository
+                .revparse_single(revision)
+                .or_else(|_| repository.revparse_single(&format!("refs/remotes/origin/{revision}")))
+                .map_err(|error| {
+                    git_error(
+                        &format!("could not resolve requested repository revision '{revision}'"),
+                        error,
+                    )
+                })?;
+            let commit = object.peel_to_commit().map_err(|error| {
+                git_error("requested repository revision is not a commit", error)
+            })?;
+            repository
+                .checkout_tree(commit.as_object(), None)
+                .map_err(|error| git_error("could not check out requested revision", error))?;
+            repository
+                .set_head_detached(commit.id())
+                .map_err(|error| git_error("could not set detached repository head", error))?;
+        }
+        Self::open(destination)
+    }
+
     pub fn init(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         if !root.is_dir() {
@@ -302,6 +339,23 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    #[test]
+    fn cloning_creates_an_independent_working_tree() {
+        let (source, source_root) = repository();
+        let destination =
+            std::env::temp_dir().join(format!("loom-git-clone-{}", loom_core::RepositoryId::new()));
+        let cloned =
+            GitService::clone_from(source.root().to_string_lossy(), &destination, None).unwrap();
+        fs::write(cloned.root().join("README.md"), "changed in clone\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(source.root().join("README.md")).unwrap(),
+            "before\n"
+        );
+        assert!(!cloned.status().unwrap().clean);
+        fs::remove_dir_all(destination).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
     }
 
     #[test]

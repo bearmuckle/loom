@@ -40,6 +40,10 @@ pub enum Capability {
     ReadTaskEvidence,
     ReadWorkerNodeStatus,
     JsonProtocol,
+    ManageWorkspaces,
+    ManageSessionRepositories,
+    ReadSessionFilesystem,
+    WriteSessionFilesystem,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

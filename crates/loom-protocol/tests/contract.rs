@@ -134,6 +134,7 @@ fn event_json_round_trip_preserves_sequence_and_session() {
     let session_id = AgentSessionId::new();
     let snapshot = AgentSessionSnapshot {
         id: session_id,
+        workspace_id: loom_core::WorkspaceId::new(),
         project_id: ProjectId::new(),
         name: "Protocol fixture".to_owned(),
         state: AgentSessionState::Idle,

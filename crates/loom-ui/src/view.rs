@@ -24,7 +24,7 @@ use gpui_kit::{
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
-    EventSequence, LoomError, ProjectId, RunId,
+    EventSequence, LoomError, ProjectId, RepositoryId, RunId, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{MessageRole, ModelId, ProviderKind, ProviderSummary, ToolCall};
 #[cfg(target_family = "wasm")]
@@ -32,8 +32,9 @@ use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
-    ProjectSnapshot, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse, TaskSnapshot,
-    TaskStatus, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
+    ProjectSnapshot, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse,
+    SessionRepository, TaskSnapshot, TaskStatus, WorkerNodeConfig, WorkerNodeResources,
+    WorkerNodeStatus, WorkspaceConfig,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode};
@@ -42,10 +43,7 @@ use loom_server::InProcessBackend;
 
 use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
-    connection::{
-        BackendWorker, ClientConnection, ConnectionCleanupGuard, list_models_from_backend,
-        redact_secret, select_remote_project, unexpected_response,
-    },
+    connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
         AgentMode, GitHubLoginState, RenameDialogState, ReviewPanel, ReviewState, ThemeChoice,
         TimelineItem, activity_status_label, bounded, bounded_to, session_state_for_run,
@@ -60,6 +58,20 @@ use crate::{
         ERROR_CARD_SURFACE, change_color, resize_edge, rgb, state_color,
     },
 };
+
+#[cfg(not(target_family = "wasm"))]
+use crate::connection::{
+    attach_session_repository, create_session_in_workspace, create_workspace,
+    list_models_from_backend, list_workspace_sessions, list_workspaces, redact_secret,
+    select_remote_project, unexpected_response,
+};
+#[cfg(target_family = "wasm")]
+use crate::connection::{
+    attach_session_repository_async, create_session_in_workspace_async, create_workspace_async,
+    list_models_from_backend, list_workspace_sessions_async, list_workspaces_async,
+};
+#[cfg(target_family = "wasm")]
+use crate::connection::{redact_secret, select_remote_project, unexpected_response};
 
 const COMPACT_LAYOUT_WIDTH: Pixels = px(960.);
 const PHONE_LAYOUT_WIDTH: Pixels = px(640.);
@@ -107,20 +119,19 @@ fn responsive_layout(width: Pixels) -> ResponsiveLayout {
 use crate::{
     browser::BrowserOptions,
     connection::{
-        create_session_async, list_models_async, list_projects_async, list_sessions_async,
-        negotiate_async, open_workspace_async, set_workspace_config_async,
-        worker_node_status_async, workspace_config_async,
+        list_models_async, list_projects_async, negotiate_async, open_workspace_async,
+        set_workspace_config_async, worker_node_status_async, workspace_config_async,
     },
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::{
     connection::{
-        create_session, list_models, list_projects, list_provider_ids, list_sessions, negotiate,
-        open_workspace, set_workspace_config, start_run, worker_node_status, workspace_config,
+        list_models, list_projects, list_provider_ids, negotiate, open_workspace,
+        set_workspace_config, start_run, worker_node_status, workspace_config,
     },
     platform::{
-        PeerCredentialStore, UiOptions, backend_persistence_path, prepare_workspace,
-        stable_project_id,
+        PeerCredentialStore, UiOptions, backend_persistence_path,
+        migrate_legacy_backend_persistence, prepare_workspace, stable_project_id,
     },
 };
 #[cfg(not(target_family = "wasm"))]
@@ -365,6 +376,36 @@ fn session_id_for_request(
         | ClientRequest::GetRecentSessionEvents { session_id, .. }
         | ClientRequest::StartAgentRun { session_id, .. }
         | ClientRequest::StartAgentRunWithOptions { session_id, .. }
+        | ClientRequest::StartSessionAgentRun { session_id, .. }
+        | ClientRequest::StartSessionAgentRunWithOptions { session_id, .. }
+        | ClientRequest::AttachSessionRepository { session_id, .. }
+        | ClientRequest::ListSessionRepositories { session_id }
+        | ClientRequest::DetachSessionRepository { session_id, .. }
+        | ClientRequest::GetSessionFilesystemSnapshot { session_id }
+        | ClientRequest::GetSessionFilesystemChanges { session_id, .. }
+        | ClientRequest::ReadSessionFile { session_id, .. }
+        | ClientRequest::ApplySessionFilesystemEdit { session_id, .. }
+        | ClientRequest::TakeSessionFilesystemControl { session_id, .. }
+        | ClientRequest::CreateSessionCheckpoint { session_id, .. }
+        | ClientRequest::RevertSessionCheckpoint { session_id, .. }
+        | ClientRequest::UndoSessionEdit { session_id }
+        | ClientRequest::GetSessionContextFiles { session_id }
+        | ClientRequest::GetSessionVcsStatus { session_id, .. }
+        | ClientRequest::GetSessionVcsDiff { session_id, .. }
+        | ClientRequest::GetSessionVcsBranches { session_id, .. }
+        | ClientRequest::GetSessionVcsConflicts { session_id, .. }
+        | ClientRequest::OpenSessionTerminal { session_id, .. }
+        | ClientRequest::WriteSessionTerminalInput { session_id, .. }
+        | ClientRequest::ResizeSessionTerminal { session_id, .. }
+        | ClientRequest::GetSessionTerminalEvents { session_id, .. }
+        | ClientRequest::CancelSessionTerminal { session_id, .. }
+        | ClientRequest::StartSessionTask { session_id, .. }
+        | ClientRequest::ListSessionTasks { session_id }
+        | ClientRequest::GetSessionTask { session_id, .. }
+        | ClientRequest::GetSessionTaskEvents { session_id, .. }
+        | ClientRequest::CancelSessionTask { session_id, .. }
+        | ClientRequest::GetSessionTaskEvidence { session_id, .. }
+        | ClientRequest::SetSessionApprovalPolicy { session_id, .. }
         | ClientRequest::ForkAgentSession { session_id, .. }
         | ClientRequest::GetSessionUsage { session_id } => Some(*session_id),
         ClientRequest::CreateCheckpoint {
@@ -991,6 +1032,9 @@ pub(crate) struct LoomView {
     /// Sessions stay pinned to the node that created them.
     session_node_ids: BTreeMap<AgentSessionId, String>,
     pub(crate) project_id: ProjectId,
+    pub(crate) workspace_id: WorkspaceId,
+    workspace_name: String,
+    workspaces: Vec<WorkspaceRecord>,
     pub(crate) project: Option<ProjectSnapshot>,
     pub(crate) workspace_root: PathBuf,
     pub(crate) projects: Vec<ProjectSnapshot>,
@@ -1047,9 +1091,12 @@ pub(crate) struct LoomView {
     pub(crate) run_state: Option<AgentRunState>,
     pub(crate) summary: Option<String>,
     pub(crate) review: ReviewState,
+    session_repositories: Vec<SessionRepository>,
+    selected_repository_id: Option<RepositoryId>,
     session_drawer_open: bool,
     pub(crate) tasks: Vec<TaskSnapshot>,
     pub(crate) rename_dialog: Option<RenameDialogState>,
+    repository_dialog: Option<TextBufferState>,
     pub(crate) rename_focus_handle: FocusHandle,
     pub(crate) demo_workspace: bool,
     pub(crate) login_enabled: bool,
@@ -1207,6 +1254,7 @@ impl LoomView {
         match field {
             InputField::Composer => Some(&self.composer),
             InputField::Rename => self.rename_dialog.as_ref().map(|dialog| &dialog.input),
+            InputField::RepositorySource => self.repository_dialog.as_ref(),
             InputField::Node => Some(&self.node_input),
         }
     }
@@ -1215,6 +1263,7 @@ impl LoomView {
         match field {
             InputField::Composer => Some(&mut self.composer),
             InputField::Rename => self.rename_dialog.as_mut().map(|dialog| &mut dialog.input),
+            InputField::RepositorySource => self.repository_dialog.as_mut(),
             InputField::Node => Some(&mut self.node_input),
         }
     }
@@ -1222,7 +1271,7 @@ impl LoomView {
     pub(crate) fn input_focus_handle(&self, field: InputField) -> FocusHandle {
         match field {
             InputField::Composer => self.composer_focus_handle.clone(),
-            InputField::Rename => self.rename_focus_handle.clone(),
+            InputField::Rename | InputField::RepositorySource => self.rename_focus_handle.clone(),
             InputField::Node => self.node_focus_handle.clone(),
         }
     }
@@ -1400,11 +1449,14 @@ impl LoomView {
             } else {
                 stable_project_id(&workspace_root)
             };
+            if !demo_workspace {
+                migrate_legacy_backend_persistence(&workspace_root)?;
+            }
             let backend = if demo_workspace {
                 info!("starting demo backend");
                 InProcessBackend::demo_with_github_copilot()?
             } else if let Some(endpoint) = &options.endpoint {
-                let persistence_path = backend_persistence_path(&workspace_root)?;
+                let persistence_path = backend_persistence_path();
                 info!(
                     "starting local backend with OpenAI-compatible endpoint; state '{}'",
                     persistence_path.display()
@@ -1416,7 +1468,7 @@ impl LoomView {
                     persistence_path,
                 )?
             } else {
-                let persistence_path = backend_persistence_path(&workspace_root)?;
+                let persistence_path = backend_persistence_path();
                 info!(
                     "starting local backend with GitHub Copilot; state '{}'",
                     persistence_path.display()
@@ -1424,7 +1476,7 @@ impl LoomView {
                 InProcessBackend::new_persistent_with_github_copilot(persistence_path)?
             };
             (
-                ClientConnection::InProcess(backend.connect()),
+                ClientConnection::InProcess(Box::new(backend.connect())),
                 workspace_root,
                 project_id,
                 demo_workspace,
@@ -1437,25 +1489,51 @@ impl LoomView {
         }
         let node_status = worker_node_status(&connection)?;
         let default_backend_node_id = node_status.node_id.clone();
-        let workspace_config = workspace_config(&connection, project_id)?;
+        let legacy_workspace_id = WorkspaceId::from_uuid(*project_id.as_uuid());
+        let mut workspaces = list_workspaces(&connection)?;
+        let workspace = match workspaces
+            .iter()
+            .find(|workspace| workspace.id == legacy_workspace_id)
+            .or_else(|| workspaces.first())
+        {
+            Some(workspace) => workspace.clone(),
+            None => {
+                let workspace = create_workspace(&connection, "Default")?;
+                workspaces.push(workspace.clone());
+                workspace
+            }
+        };
+        let workspace_id = workspace.id;
+        let workspace_config = workspace_config(&connection, workspace_id)?;
         let worker_nodes = initial_worker_nodes(
             node_status,
             connection.clone(),
             &workspace_config,
             options.remote.as_deref(),
         );
-        let sessions = list_sessions(&connection, project_id)?;
+        let sessions = list_workspace_sessions(&connection, workspace_id)?;
         info!("loaded {} session(s)", sessions.len());
-        let session = sessions.into_iter().next().map_or_else(
-            || {
-                info!("creating a new session");
-                create_session(&connection, project_id, "New session")
-            },
-            |session| {
+        let (session, new_session) = match sessions.into_iter().next() {
+            Some(session) => {
                 info!("resuming session {}", session.id);
-                Ok(session)
-            },
-        )?;
+                (session, false)
+            }
+            None => {
+                info!("creating a new session");
+                (
+                    create_session_in_workspace(&connection, workspace_id, "New session")?,
+                    true,
+                )
+            }
+        };
+        if new_session && (options.remote.is_some() || workspace_root.join(".git").exists()) {
+            attach_session_repository(
+                &connection,
+                session.id,
+                &workspace_root.display().to_string(),
+                ".",
+            )?;
+        }
         let models = list_models(&connection)?;
         let model = if models.contains(&options.model) {
             options.model.clone()
@@ -1476,13 +1554,7 @@ impl LoomView {
         );
         let run = if demo_workspace {
             info!("starting demo agent run");
-            Some(start_run(
-                &connection,
-                &session,
-                &workspace_root,
-                &model,
-                &options.task,
-            )?)
+            Some(start_run(&connection, &session, &model, &options.task)?)
         } else {
             None
         };
@@ -1501,6 +1573,9 @@ impl LoomView {
             node_names,
             session_node_ids,
             project_id,
+            workspace_id,
+            workspace_name: workspace.name,
+            workspaces,
             project: None,
             workspace_root,
             projects: Vec::new(),
@@ -1557,9 +1632,12 @@ impl LoomView {
             run_state: run.as_ref().map(|run| run.state),
             summary: run.as_ref().and_then(|run| run.summary.clone()),
             review: ReviewState::default(),
+            session_repositories: Vec::new(),
+            selected_repository_id: None,
             session_drawer_open: false,
             tasks: Vec::new(),
             rename_dialog: None,
+            repository_dialog: None,
             rename_focus_handle,
             demo_workspace,
             login_enabled: true,
@@ -1595,9 +1673,11 @@ impl LoomView {
         let connection = ClientConnection::Disconnected;
         let backend = BackendWorker::spawn(connection.clone());
         let project_id = ProjectId::new();
+        let workspace_id = WorkspaceId::new();
         let timestamp = loom_core::Timestamp::from_unix_millis(0);
         let active_session = AgentSessionSnapshot {
             id: AgentSessionId::new(),
+            workspace_id,
             project_id,
             name: "No worker connected".to_owned(),
             state: AgentSessionState::Idle,
@@ -1619,6 +1699,9 @@ impl LoomView {
             node_names: BTreeMap::new(),
             session_node_ids: BTreeMap::new(),
             project_id,
+            workspace_id,
+            workspace_name: "No workspace".to_owned(),
+            workspaces: Vec::new(),
             project: None,
             workspace_root: PathBuf::new(),
             projects: Vec::new(),
@@ -1675,9 +1758,12 @@ impl LoomView {
             run_state: None,
             summary: None,
             review: ReviewState::default(),
+            session_repositories: Vec::new(),
+            selected_repository_id: None,
             session_drawer_open: false,
             tasks: Vec::new(),
             rename_dialog: None,
+            repository_dialog: None,
             rename_focus_handle,
             demo_workspace: false,
             login_enabled: false,
@@ -1747,8 +1833,23 @@ impl LoomView {
                     (None, project_id, PathBuf::from(root))
                 }
             };
-        let sessions = list_sessions_async(&connection, project_id).await?;
-        let workspace_config = workspace_config_async(&connection, project_id).await?;
+        let legacy_workspace_id = WorkspaceId::from_uuid(*project_id.as_uuid());
+        let mut workspaces = list_workspaces_async(&connection).await?;
+        let workspace = match workspaces
+            .iter()
+            .find(|workspace| workspace.id == legacy_workspace_id)
+            .or_else(|| workspaces.first())
+        {
+            Some(workspace) => workspace.clone(),
+            None => {
+                let workspace = create_workspace_async(&connection, "Default").await?;
+                workspaces.push(workspace.clone());
+                workspace
+            }
+        };
+        let workspace_id = workspace.id;
+        let sessions = list_workspace_sessions_async(&connection, workspace_id).await?;
+        let workspace_config = workspace_config_async(&connection, workspace_id).await?;
         let mut worker_nodes = initial_worker_nodes(
             node_status,
             connection.clone(),
@@ -1762,10 +1863,22 @@ impl LoomView {
                 Some(options.token()),
             ));
         }
-        let session = match sessions.into_iter().next() {
-            Some(session) => session,
-            None => create_session_async(&connection, project_id, "New session").await?,
+        let (session, new_session) = match sessions.into_iter().next() {
+            Some(session) => (session, false),
+            None => (
+                create_session_in_workspace_async(&connection, workspace_id, "New session").await?,
+                true,
+            ),
         };
+        if new_session {
+            attach_session_repository_async(
+                &connection,
+                session.id,
+                &workspace_root.display().to_string(),
+                ".",
+            )
+            .await?;
+        }
         let models = list_models_async(&connection).await?;
         let model = options
             .model()
@@ -1792,6 +1905,9 @@ impl LoomView {
             node_names,
             session_node_ids,
             project_id,
+            workspace_id,
+            workspace_name: workspace.name,
+            workspaces,
             project,
             workspace_root,
             projects,
@@ -1848,9 +1964,12 @@ impl LoomView {
             run_state: None,
             summary: None,
             review: ReviewState::default(),
+            session_repositories: Vec::new(),
+            selected_repository_id: None,
             session_drawer_open: false,
             tasks: Vec::new(),
             rename_dialog: None,
+            repository_dialog: None,
             rename_focus_handle,
             demo_workspace: false,
             login_enabled: true,
@@ -2138,8 +2257,8 @@ impl LoomView {
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), LoomError> {
         let response =
             self.connection
-                .request(RequestEnvelope::new(ClientRequest::ListAgentSessions {
-                    project_id: Some(self.project_id),
+                .request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+                    workspace_id: self.workspace_id,
                     include_archived: false,
                 }));
         match response.result? {
@@ -2180,7 +2299,7 @@ impl LoomView {
 
     /// Reloads sessions from every connected node while keeping their owners.
     pub(crate) fn reload_sessions(&mut self, cx: &mut Context<Self>) {
-        let project_id = self.project_id;
+        let workspace_id = self.workspace_id;
         let mut node_requests = BTreeMap::new();
         for node in self
             .worker_nodes
@@ -2191,8 +2310,8 @@ impl LoomView {
                 node_requests
                     .entry(node.status.node_id.clone())
                     .or_insert_with(|| {
-                        backend.submit(RequestEnvelope::new(ClientRequest::ListAgentSessions {
-                            project_id: Some(project_id),
+                        backend.submit(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+                            workspace_id,
                             include_archived: false,
                         }))
                     });
@@ -2302,6 +2421,8 @@ impl LoomView {
 
     pub(crate) fn activate_session(&mut self, session: AgentSessionSnapshot) {
         self.active_session = session;
+        self.session_repositories.clear();
+        self.selected_repository_id = None;
         self.session_state = self.active_session.state;
         self.auto_approve_actions = self
             .session_auto_approve_actions
@@ -2320,6 +2441,7 @@ impl LoomView {
         self.review.diff = None;
         self.review.diff_path = None;
         self.review.evidence.clear();
+        self.review.vcs = None;
         self.tasks.clear();
     }
 
@@ -2377,8 +2499,25 @@ impl LoomView {
                 .insert(self.active_session.id, run.task.clone());
             self.ensure_session_task_message(self.active_session.id);
         }
-        // The session projection and event stream are sufficient for the
-        // central view. Review/VCS data is loaded when the review pane opens.
+        match self
+            .connection
+            .request(RequestEnvelope::new(
+                ClientRequest::ListSessionRepositories {
+                    session_id: self.active_session.id,
+                },
+            ))
+            .result
+        {
+            Ok(ServerResponse::SessionRepositories { repositories }) => {
+                self.selected_repository_id = repositories.first().map(|repository| repository.id);
+                self.session_repositories = repositories;
+            }
+            Err(error) => self.record_backend_error("load session repositories", error),
+            Ok(response) => self.record_backend_error(
+                "load session repositories",
+                unexpected_response("session repository list", response),
+            ),
+        }
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -2822,18 +2961,26 @@ impl LoomView {
     pub(crate) fn refresh_review(&mut self, cx: &mut Context<Self>) {
         self.dispatch(
             cx,
-            ClientRequest::GetWorkspaceChanges {
-                project_id: self.project_id,
+            ClientRequest::GetSessionFilesystemChanges {
+                session_id: self.active_session.id,
                 after_sequence: None,
             },
             |view, response, _| match response.result {
-                Ok(ServerResponse::WorkspaceChanges { changes, truncated }) => {
+                Ok(ServerResponse::SessionFilesystemChanges { changes, truncated }) => {
                     let mut seen = BTreeSet::new();
+                    let project_id = view.active_session.project_id;
                     view.review.changes = changes
                         .into_iter()
                         .rev()
                         .filter(|change| seen.insert(change.path.clone()))
                         .take(MAX_REVIEW_CHANGES)
+                        .map(|change| loom_protocol::WorkspaceChange {
+                            sequence: change.sequence,
+                            project_id,
+                            path: change.path,
+                            kind: change.kind,
+                            revision: change.revision,
+                        })
                         .collect();
                     if truncated {
                         view.record_status(
@@ -2850,18 +2997,70 @@ impl LoomView {
         );
         self.dispatch(
             cx,
-            ClientRequest::GetVcsStatus {
-                project_id: self.project_id,
+            ClientRequest::ListSessionRepositories {
+                session_id: self.active_session.id,
             },
-            |view, response, _| match response.result {
-                Ok(ServerResponse::VcsStatus(status)) => view.review.vcs = Some(status),
+            |view, response, cx| match response.result {
+                Ok(ServerResponse::SessionRepositories { repositories }) => {
+                    let repository = repositories
+                        .iter()
+                        .find(|repository| Some(repository.id) == view.selected_repository_id)
+                        .or_else(|| repositories.first())
+                        .cloned();
+                    view.session_repositories = repositories;
+                    view.selected_repository_id =
+                        repository.as_ref().map(|repository| repository.id);
+                    if let Some(repository) = repository {
+                        view.dispatch(
+                            cx,
+                            ClientRequest::GetSessionVcsStatus {
+                                session_id: view.active_session.id,
+                                repository_id: repository.id,
+                            },
+                            |view, response, _| match response.result {
+                                Ok(ServerResponse::VcsStatus(status)) => {
+                                    view.review.vcs = Some(status)
+                                }
+                                Err(error) => {
+                                    view.review.vcs = None;
+                                    view.record_status(format!("VCS review unavailable: {error}"));
+                                }
+                                Ok(response) => view.record_backend_error(
+                                    "VCS review refresh",
+                                    unexpected_response("VCS status", response),
+                                ),
+                            },
+                        );
+                    } else {
+                        view.review.vcs = None;
+                        view.dispatch(
+                            cx,
+                            ClientRequest::GetVcsStatus {
+                                project_id: view.project_id,
+                            },
+                            |view, response, _| match response.result {
+                                Ok(ServerResponse::VcsStatus(status)) => {
+                                    view.review.vcs = Some(status)
+                                }
+                                Err(error) => {
+                                    view.review.vcs = None;
+                                    view.record_status(format!("VCS review unavailable: {error}"));
+                                }
+                                Ok(response) => view.record_backend_error(
+                                    "VCS review refresh",
+                                    unexpected_response("VCS status", response),
+                                ),
+                            },
+                        );
+                    }
+                }
                 Err(error) => {
                     view.review.vcs = None;
                     view.record_status(format!("VCS review unavailable: {error}"));
                 }
                 Ok(response) => view.record_backend_error(
                     "VCS review refresh",
-                    unexpected_response("VCS status", response),
+                    unexpected_response("session repository list", response),
                 ),
             },
         );
@@ -3006,11 +3205,10 @@ impl LoomView {
                 );
                 return;
             }
-            ClientRequest::StartAgentRun {
+            ClientRequest::StartSessionAgentRun {
                 session_id: self.active_session.id,
                 task: message.clone(),
                 model: self.model.clone(),
-                workspace_root: self.workspace_root.display().to_string(),
                 system_instructions: Some(
                     "Work methodically, use the available tools, and report validation.".to_owned(),
                 ),
@@ -3277,6 +3475,8 @@ impl LoomView {
     pub(crate) fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         if self.rename_dialog.is_some() {
             self.confirm_rename(cx);
+        } else if self.repository_dialog.is_some() {
+            self.confirm_repository_attach(cx);
         } else if self.input_field == InputField::Node {
             self.connect_worker_node(cx);
         } else {
@@ -3419,6 +3619,7 @@ impl LoomView {
             ),
         }
         self.ensure_session_task_message(session_id);
+        self.refresh_review(cx);
         cx.notify();
     }
 
@@ -4248,7 +4449,7 @@ impl LoomView {
         retiring: Option<(String, ClientConnection)>,
         cx: &mut Context<Self>,
     ) {
-        let project_id = self.project_id;
+        let workspace_id = self.workspace_id;
         let config = self.workspace_config.clone();
         let source = self.connection.clone();
         let peers = self
@@ -4266,19 +4467,20 @@ impl LoomView {
             let errors = cx
                 .background_spawn(async move {
                     let mut errors = Vec::new();
-                    if let Err(error) = set_workspace_config(&source, project_id, config.clone()) {
+                    if let Err(error) = set_workspace_config(&source, workspace_id, config.clone())
+                    {
                         errors.push(("save workspace config".to_owned(), error));
                     }
                     for (name, connection) in peers {
                         if let Err(error) =
-                            set_workspace_config(&connection, project_id, config.clone())
+                            set_workspace_config(&connection, workspace_id, config.clone())
                         {
                             errors.push((format!("distribute workspace config to {name}"), error));
                         }
                     }
                     if let Some((name, connection)) = retiring {
                         if let Err(error) =
-                            set_workspace_config(&connection, project_id, config.clone())
+                            set_workspace_config(&connection, workspace_id, config.clone())
                         {
                             errors.push((
                                 format!("remove worker node {name} from its config"),
@@ -4305,13 +4507,13 @@ impl LoomView {
         cx.spawn(async move |view, cx| {
             let mut errors = Vec::new();
             if let Err(error) =
-                set_workspace_config_async(&source, project_id, config.clone()).await
+                set_workspace_config_async(&source, workspace_id, config.clone()).await
             {
                 errors.push(("save workspace config".to_owned(), error));
             } else {
                 for (name, connection) in peers {
                     if let Err(error) =
-                        set_workspace_config_async(&connection, project_id, config.clone()).await
+                        set_workspace_config_async(&connection, workspace_id, config.clone()).await
                     {
                         errors.push((format!("distribute workspace config to {name}"), error));
                     }
@@ -4319,7 +4521,7 @@ impl LoomView {
             }
             if let Some((name, connection)) = retiring {
                 if let Err(error) =
-                    set_workspace_config_async(&connection, project_id, config.clone()).await
+                    set_workspace_config_async(&connection, workspace_id, config.clone()).await
                 {
                     errors.push((format!("remove worker node {name} from its config"), error));
                 }
@@ -5076,6 +5278,77 @@ impl LoomView {
         }
     }
 
+    fn select_workspace(&mut self, workspace: WorkspaceRecord, cx: &mut Context<Self>) {
+        if workspace.id == self.workspace_id {
+            return;
+        }
+        let workspace_id = workspace.id;
+        self.dispatch(
+            cx,
+            ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
+            |view, response, _| match response.result {
+                Ok(ServerResponse::WorkspaceConfig(config)) => view.workspace_config = config,
+                Err(error) => view.record_backend_error("workspace config", error),
+                Ok(response) => view.record_backend_error(
+                    "workspace config",
+                    unexpected_response("workspace config", response),
+                ),
+            },
+        );
+        self.dispatch(
+            cx,
+            ClientRequest::ListWorkspaceSessions {
+                workspace_id,
+                include_archived: false,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::AgentSessions { sessions }) => {
+                    view.workspace_id = workspace_id;
+                    view.project_id = ProjectId::from_uuid(*workspace_id.as_uuid());
+                    view.workspace_name = workspace.name.clone();
+                    view.sessions = sessions;
+                    for session in &view.sessions {
+                        view.session_node_ids
+                            .insert(session.id, view.default_backend_node_id.clone());
+                    }
+                    if let Some(session) = view.sessions.first().cloned() {
+                        view.select_session(session, cx);
+                    } else {
+                        view.create_session_async("New session".to_owned(), cx);
+                    }
+                }
+                Err(error) => view.record_backend_error("workspace session list", error),
+                Ok(response) => view.record_backend_error(
+                    "workspace session list",
+                    unexpected_response("workspace session list", response),
+                ),
+            },
+        );
+    }
+
+    fn create_workspace_container(&mut self, cx: &mut Context<Self>) {
+        let name = format!("Workspace {}", self.workspaces.len().saturating_add(1));
+        self.dispatch(
+            cx,
+            ClientRequest::CreateWorkspace { name },
+            |view, response, cx| match response.result {
+                Ok(ServerResponse::WorkspaceCreated(workspace)) => {
+                    view.workspace_id = workspace.id;
+                    view.project_id = ProjectId::from_uuid(*workspace.id.as_uuid());
+                    view.workspace_name = workspace.name.clone();
+                    view.workspaces.push(workspace);
+                    view.sessions.clear();
+                    view.create_session_async("New session".to_owned(), cx);
+                }
+                Err(error) => view.record_backend_error("workspace creation", error),
+                Ok(response) => view.record_backend_error(
+                    "workspace creation",
+                    unexpected_response("workspace creation", response),
+                ),
+            },
+        );
+    }
+
     /// Creates a session through the selected node and pins it to that node.
     pub(crate) fn create_session_async(&mut self, name: String, cx: &mut Context<Self>) {
         self.create_session_on_node(self.default_backend_node_id.clone(), name, cx);
@@ -5095,6 +5368,7 @@ impl LoomView {
             return;
         };
         let project_id = self.project_id;
+        let workspace_id = self.workspace_id;
         let workspace_root = self.workspace_root.display().to_string();
         let open_workspace = node_id != self.default_backend_node_id;
         let model = self.default_model.clone();
@@ -5143,7 +5417,7 @@ impl LoomView {
                     let response = backend
                         .submit(RequestEnvelope::new(ClientRequest::OpenWorkspace {
                             project_id,
-                            root: workspace_root,
+                            root: workspace_root.clone(),
                         }))
                         .wait()
                         .await;
@@ -5155,16 +5429,35 @@ impl LoomView {
                     }
                 }
                 let response = backend
-                    .submit(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-                        project_id,
-                        name,
-                    }))
+                    .submit(RequestEnvelope::new(
+                        ClientRequest::CreateAgentSessionInWorkspace { workspace_id, name },
+                    ))
                     .wait()
                     .await;
-                match response.result? {
-                    ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
-                    response => Err(unexpected_response("session creation", response)),
+                let snapshot = match response.result? {
+                    ServerResponse::AgentSessionCreated(snapshot) => snapshot,
+                    response => return Err(unexpected_response("session creation", response)),
+                };
+                if open_workspace || PathBuf::from(&workspace_root).join(".git").exists() {
+                    let response = backend
+                        .submit(RequestEnvelope::new(
+                            ClientRequest::AttachSessionRepository {
+                                session_id: snapshot.id,
+                                source: workspace_root,
+                                path: "repo".to_owned(),
+                                revision: None,
+                            },
+                        ))
+                        .wait()
+                        .await;
+                    match response.result? {
+                        ServerResponse::SessionRepositoryAttached(_) => {}
+                        response => {
+                            return Err(unexpected_response("repository attachment", response));
+                        }
+                    }
                 }
+                Ok(snapshot)
             }
             .await;
             view.update(cx, |view, cx| match result {
@@ -5196,6 +5489,108 @@ impl LoomView {
             input: TextBufferState::new(self.active_session.name.clone()),
         });
         self.rename_focus_handle.focus(window, cx);
+    }
+
+    fn begin_repository_attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.repository_dialog = Some(TextBufferState::new(""));
+        self.input_field = InputField::RepositorySource;
+        self.rename_focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    fn confirm_repository_attach(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.repository_dialog.take() else {
+            return;
+        };
+        self.input_field = InputField::Composer;
+        let source = dialog.text.trim().to_owned();
+        if source.is_empty() {
+            self.repository_dialog = Some(dialog);
+            self.input_field = InputField::RepositorySource;
+            self.record_status("Enter a repository URL or absolute local path");
+            return;
+        }
+        let repository_id = RepositoryId::new();
+        self.dispatch(
+            cx,
+            ClientRequest::AttachSessionRepository {
+                session_id: self.active_session.id,
+                source,
+                path: format!("repositories/{repository_id}"),
+                revision: None,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::SessionRepositoryAttached(repository)) => {
+                    let repository_id = repository.id;
+                    view.session_repositories.push(repository);
+                    view.selected_repository_id = Some(repository_id);
+                    view.refresh_review(cx);
+                }
+                Err(error) => {
+                    view.repository_dialog = Some(dialog);
+                    view.input_field = InputField::RepositorySource;
+                    view.record_backend_error("attach repository", error);
+                }
+                Ok(response) => {
+                    view.repository_dialog = Some(dialog);
+                    view.input_field = InputField::RepositorySource;
+                    view.record_backend_error(
+                        "attach repository",
+                        unexpected_response("repository attachment", response),
+                    );
+                }
+            },
+        );
+    }
+
+    fn select_session_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        self.selected_repository_id = Some(repository_id);
+        self.dispatch(
+            cx,
+            ClientRequest::GetSessionVcsStatus {
+                session_id: self.active_session.id,
+                repository_id,
+            },
+            |view, response, _| match response.result {
+                Ok(ServerResponse::VcsStatus(status)) => view.review.vcs = Some(status),
+                Err(error) => {
+                    view.review.vcs = None;
+                    view.record_status(format!("VCS review unavailable: {error}"));
+                }
+                Ok(response) => view.record_backend_error(
+                    "VCS review refresh",
+                    unexpected_response("VCS status", response),
+                ),
+            },
+        );
+    }
+
+    fn detach_session_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        self.dispatch(
+            cx,
+            ClientRequest::DetachSessionRepository {
+                session_id: self.active_session.id,
+                repository_id,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::SessionRepositoryDetached) => {
+                    view.session_repositories
+                        .retain(|repository| repository.id != repository_id);
+                    if view.selected_repository_id == Some(repository_id) {
+                        view.selected_repository_id = view
+                            .session_repositories
+                            .first()
+                            .map(|repository| repository.id);
+                    }
+                    view.refresh_review(cx);
+                }
+                Err(error) => view.record_backend_error("detach repository", error),
+                Ok(response) => view.record_backend_error(
+                    "detach repository",
+                    unexpected_response("repository detachment", response),
+                ),
+            },
+        );
     }
 
     pub(crate) fn toggle_changes_sidebar(
@@ -5234,15 +5629,19 @@ impl LoomView {
     pub(crate) fn open_review_file(&mut self, path: String, cx: &mut Context<Self>) {
         self.dispatch(
             cx,
-            ClientRequest::ReadWorkspaceFile {
-                project_id: self.project_id,
+            ClientRequest::ReadSessionFile {
+                session_id: self.active_session.id,
                 path,
             },
             |view, response, _| match response.result {
-                Ok(ServerResponse::WorkspaceFile(mut file)) => {
+                Ok(ServerResponse::SessionFilesystemFile(mut file)) => {
                     file.content = bounded_to(&file.content, MAX_REVIEW_DIFF);
                     view.review.diff_path = Some(file.path.clone());
-                    view.review.selected_file = Some(file);
+                    view.review.selected_file = Some(loom_protocol::WorkspaceFile {
+                        path: file.path,
+                        content: file.content,
+                        revision: file.revision,
+                    });
                     view.review.open = true;
                     view.review.panel = ReviewPanel::Changes;
                 }
@@ -5331,6 +5730,43 @@ impl LoomView {
                     .text_sm()
                     .text_color(rgb(0x8f98a6))
                     .child("No sessions"),
+            );
+        }
+        list
+    }
+
+    fn render_repository_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = div().flex().flex_col().gap_1();
+        for (index, repository) in self.session_repositories.iter().enumerate() {
+            let repository = repository.clone();
+            let repository_id = repository.id;
+            let active = self.selected_repository_id == Some(repository_id);
+            let view = cx.entity();
+            let detach_view = view.clone();
+            list = list.child(
+                div()
+                    .id(("session-repository", index))
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(if active { rgb(0x25334a) } else { rgb(0x1b1d24) })
+                    .text_xs()
+                    .text_color(if active { rgb(0xe5e7eb) } else { rgb(0x8f98a6) })
+                    .cursor_pointer()
+                    .child(repository.path.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_session_repository(repository_id, cx);
+                    }))
+                    .context_menu(move |menu, _, _| {
+                        let detach_view = detach_view.clone();
+                        menu.item(PopupMenuItem::new("Detach repository").on_click(
+                            move |_, _, cx| {
+                                detach_view.update(cx, |this, cx| {
+                                    this.detach_session_repository(repository_id, cx);
+                                });
+                            },
+                        ))
+                    }),
             );
         }
         list
@@ -5942,8 +6378,14 @@ impl LoomView {
                     );
                 }
                 if let Some(status) = &self.review.vcs {
+                    let repository_prefix = self
+                        .session_repositories
+                        .iter()
+                        .find(|repository| Some(repository.id) == self.selected_repository_id)
+                        .map(|repository| format!("{}/", repository.path))
+                        .unwrap_or_default();
                     for (index, file) in status.files.iter().take(24).enumerate() {
-                        let path = file.path.clone();
+                        let path = format!("{repository_prefix}{}", file.path);
                         body = body.child(
                             div()
                                 .id(("git-file", index))
@@ -6315,6 +6757,109 @@ impl LoomView {
                             .child("Rename")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.confirm_rename(cx);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any()
+    }
+
+    fn render_repository_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.repository_dialog.is_none() {
+            return div().into_any();
+        }
+        div()
+            .id("repository-dialog")
+            .absolute()
+            .top(px(120.))
+            .left(px(280.))
+            .w(px(460.))
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(0x1b1d24))
+            .border_1()
+            .border_color(rgb(0x3b4555))
+            .shadow_lg()
+            .text_color(rgb(0xe5e7eb))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0xf3f4f6))
+                    .child("Attach repository"),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child("Enter an HTTPS/SSH URL or an absolute local Git repository path."),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .w_full()
+                    .min_h(px(34.))
+                    .p_2()
+                    .rounded_sm()
+                    .bg(rgb(0x0f1115))
+                    .border_1()
+                    .border_color(rgb(0x3b4555))
+                    .text_color(rgb(0xe5e7eb))
+                    .key_context("RenameDialog")
+                    .track_focus(&self.rename_focus_handle)
+                    .cursor(CursorStyle::IBeam)
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::focus_rename))
+                    .on_action(cx.listener(Self::backspace))
+                    .on_action(cx.listener(Self::delete))
+                    .on_action(cx.listener(Self::left))
+                    .on_action(cx.listener(Self::right))
+                    .on_action(cx.listener(Self::select_all))
+                    .on_action(cx.listener(Self::home))
+                    .on_action(cx.listener(Self::end))
+                    .on_action(cx.listener(Self::paste))
+                    .on_action(cx.listener(Self::copy))
+                    .on_action(cx.listener(Self::submit))
+                    .child(TextInputElement {
+                        view: cx.entity(),
+                        field: InputField::RepositorySource,
+                    }),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("cancel-attach-repository")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x242833))
+                            .hover(|style| style.bg(rgb(0x293244)))
+                            .text_sm()
+                            .cursor_pointer()
+                            .child("Cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.repository_dialog = None;
+                                this.input_field = InputField::Composer;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("confirm-attach-repository")
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x2563eb))
+                            .text_sm()
+                            .text_color(rgb(0xffffff))
+                            .cursor_pointer()
+                            .child("Attach")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_repository_attach(cx);
                                 cx.notify();
                             })),
                     ),
@@ -7142,7 +7687,40 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_sm().text_color(rgb(0xf3f4f6)).child("Workspace"))
+                    .child(
+                        Button::new("workspace-picker")
+                            .label(self.workspace_name.clone())
+                            .ghost()
+                            .small()
+                            .dropdown_menu({
+                                let workspaces = self.workspaces.clone();
+                                let view = view.clone();
+                                move |mut menu, _, _| {
+                                    for workspace in workspaces.clone() {
+                                        let select_view = view.clone();
+                                        let selected = workspace.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(workspace.name.clone()).on_click(
+                                                move |_, _, cx| {
+                                                    let workspace = selected.clone();
+                                                    select_view.update(cx, |view, cx| {
+                                                        view.select_workspace(workspace, cx);
+                                                    });
+                                                },
+                                            ),
+                                        );
+                                    }
+                                    let create_view = view.clone();
+                                    menu.item(PopupMenuItem::new("New workspace").on_click(
+                                        move |_, _, cx| {
+                                            create_view.update(cx, |view, cx| {
+                                                view.create_workspace_container(cx);
+                                            });
+                                        },
+                                    ))
+                                }
+                            }),
+                    )
                     .when(layout.phone, |element| {
                         element.child(
                             Button::new("close-session-drawer")
@@ -7162,8 +7740,24 @@ impl LoomView {
                     .items_center()
                     .justify_between()
                     .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Sessions"))
-                    .child(self.render_new_session_button(view, cx)),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new("attach-session-repository")
+                                    .label("+ Repo")
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.begin_repository_attach(window, cx);
+                                    })),
+                            )
+                            .child(self.render_new_session_button(view, cx)),
+                    ),
             )
+            .child(self.render_repository_list(cx))
             .child(
                 div()
                     .flex_1()
@@ -7871,6 +8465,9 @@ impl Render for LoomView {
                             .when(self.rename_dialog.is_some(), |element| {
                                 element.child(self.render_rename_dialog(cx))
                             })
+                            .when(self.repository_dialog.is_some(), |element| {
+                                element.child(self.render_repository_dialog(cx))
+                            })
                             .when(self.settings_open, |element| {
                                 element.child(self.render_settings_dialog(cx))
                             })
@@ -8077,7 +8674,7 @@ mod worker_node_tests {
     };
     use loom_core::{
         AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ProjectId, RunId,
-        Timestamp,
+        Timestamp, WorkspaceId,
     };
     use loom_core::{ErrorCode, LoomError};
     use loom_model::ModelId;
@@ -8219,7 +8816,9 @@ mod worker_node_tests {
     fn failed_connection_state_clears_transport_and_keeps_node_url() {
         let mut node = node(7, false);
         let backend = loom_server::InProcessBackend::new();
-        node.connection = Some(super::ClientConnection::InProcess(backend.connect()));
+        node.connection = Some(super::ClientConnection::InProcess(Box::new(
+            backend.connect(),
+        )));
         node.status.online = true;
         node.connection_state = WorkerConnectionState::Connected;
 
@@ -8240,6 +8839,7 @@ mod worker_node_tests {
     fn session(id: AgentSessionId, name: &str) -> AgentSessionSnapshot {
         AgentSessionSnapshot {
             id,
+            workspace_id: WorkspaceId::new(),
             project_id: ProjectId::new(),
             name: name.to_owned(),
             state: AgentSessionState::Idle,

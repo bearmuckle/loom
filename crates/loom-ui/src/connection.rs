@@ -22,6 +22,7 @@ use std::{
 use futures_channel::oneshot;
 use loom_core::{
     AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, ProjectId, RequestId,
+    WorkspaceId, WorkspaceRecord,
 };
 use loom_model::ModelId;
 #[cfg(not(target_family = "wasm"))]
@@ -30,7 +31,7 @@ use loom_model::ProviderId;
 use loom_protocol::AgentRunSnapshot;
 use loom_protocol::{
     CURRENT_PROTOCOL_VERSION, ClientRequest, ProjectSnapshot, RequestEnvelope, ResponseEnvelope,
-    ServerResponse, WorkerNodeStatus, WorkspaceConfig,
+    ServerResponse, SessionRepository, WorkerNodeStatus, WorkspaceConfig,
 };
 #[cfg(target_family = "wasm")]
 use std::task::Poll;
@@ -123,7 +124,7 @@ use wasm_bindgen::{JsCast, closure::Closure};
 #[derive(Clone)]
 pub(crate) enum ClientConnection {
     #[cfg(not(target_family = "wasm"))]
-    InProcess(InProcessConnection),
+    InProcess(Box<InProcessConnection>),
     #[cfg(not(target_family = "wasm"))]
     Remote {
         runtime: Arc<tokio::runtime::Runtime>,
@@ -348,6 +349,10 @@ pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> 
                 Capability::CreateAgentSession,
                 Capability::ReadAgentSession,
                 Capability::ControlAgentSession,
+                Capability::ManageWorkspaces,
+                Capability::ManageSessionRepositories,
+                Capability::ReadSessionFilesystem,
+                Capability::WriteSessionFilesystem,
                 Capability::SubscribeSessionEvents,
                 Capability::StartAgentRun,
                 Capability::ReadAgentRun,
@@ -358,6 +363,7 @@ pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> 
                 Capability::ListProviders,
                 Capability::ConfigureProviders,
                 Capability::ConfigureApprovalPolicy,
+                Capability::ManageCheckpoints,
                 Capability::OpenWorkspace,
                 Capability::ReadWorkspace,
                 Capability::ReadVcsStatus,
@@ -490,11 +496,11 @@ async fn request_with_timeout(
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn workspace_config(
     connection: &ClientConnection,
-    project_id: ProjectId,
+    workspace_id: WorkspaceId,
 ) -> Result<WorkspaceConfig, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkspaceConfig {
-        project_id,
-    }));
+    let response = connection.request(RequestEnvelope::new(
+        ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
+    ));
     match response.result? {
         ServerResponse::WorkspaceConfig(config) => Ok(config),
         response => Err(unexpected_response("workspace config", response)),
@@ -504,12 +510,12 @@ pub(crate) fn workspace_config(
 #[cfg(target_family = "wasm")]
 pub(crate) async fn workspace_config_async(
     connection: &ClientConnection,
-    project_id: ProjectId,
+    workspace_id: WorkspaceId,
 ) -> Result<WorkspaceConfig, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::GetWorkspaceConfig {
-            project_id,
-        }))
+        .request(RequestEnvelope::new(
+            ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
+        ))
         .await;
     match response.result? {
         ServerResponse::WorkspaceConfig(config) => Ok(config),
@@ -520,13 +526,15 @@ pub(crate) async fn workspace_config_async(
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn set_workspace_config(
     connection: &ClientConnection,
-    project_id: ProjectId,
+    workspace_id: WorkspaceId,
     config: WorkspaceConfig,
 ) -> Result<(), LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
-        project_id,
-        config,
-    }));
+    let response = connection.request(RequestEnvelope::new(
+        ClientRequest::SetWorkspaceConfigForWorkspace {
+            workspace_id,
+            config,
+        },
+    ));
     match response.result? {
         ServerResponse::WorkspaceConfigUpdated => Ok(()),
         response => Err(unexpected_response("workspace config update", response)),
@@ -536,14 +544,16 @@ pub(crate) fn set_workspace_config(
 #[cfg(target_family = "wasm")]
 pub(crate) async fn set_workspace_config_async(
     connection: &ClientConnection,
-    project_id: ProjectId,
+    workspace_id: WorkspaceId,
     config: WorkspaceConfig,
 ) -> Result<(), LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::SetWorkspaceConfig {
-            project_id,
-            config,
-        }))
+        .request(RequestEnvelope::new(
+            ClientRequest::SetWorkspaceConfigForWorkspace {
+                workspace_id,
+                config,
+            },
+        ))
         .await;
     match response.result? {
         ServerResponse::WorkspaceConfigUpdated => Ok(()),
@@ -602,68 +612,170 @@ pub(crate) async fn open_workspace_async(
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub(crate) fn create_session(
+pub(crate) fn list_workspaces(
     connection: &ClientConnection,
-    project_id: ProjectId,
-    name: &str,
-) -> Result<AgentSessionSnapshot, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-        project_id,
-        name: name.to_owned(),
-    }));
+) -> Result<Vec<WorkspaceRecord>, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
     match response.result? {
-        ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
-        response => Err(unexpected_response("session creation", response)),
+        ServerResponse::Workspaces { workspaces } => Ok(workspaces),
+        response => Err(unexpected_response("workspace list", response)),
     }
 }
 
 #[cfg(target_family = "wasm")]
-pub(crate) async fn create_session_async(
+pub(crate) async fn list_workspaces_async(
     connection: &ClientConnection,
-    project_id: ProjectId,
-    name: &str,
-) -> Result<AgentSessionSnapshot, LoomError> {
+) -> Result<Vec<WorkspaceRecord>, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::CreateAgentSession {
-            project_id,
-            name: name.to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::ListWorkspaces))
         .await;
     match response.result? {
-        ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
-        response => Err(unexpected_response("session creation", response)),
+        ServerResponse::Workspaces { workspaces } => Ok(workspaces),
+        response => Err(unexpected_response("workspace list", response)),
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub(crate) fn list_sessions(
+pub(crate) fn create_workspace(
     connection: &ClientConnection,
-    project_id: ProjectId,
-) -> Result<Vec<AgentSessionSnapshot>, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ListAgentSessions {
-        project_id: Some(project_id),
-        include_archived: false,
+    name: &str,
+) -> Result<WorkspaceRecord, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+        name: name.to_owned(),
     }));
     match response.result? {
-        ServerResponse::AgentSessions { sessions } => Ok(sessions),
-        response => Err(unexpected_response("session list", response)),
+        ServerResponse::WorkspaceCreated(workspace) => Ok(workspace),
+        response => Err(unexpected_response("workspace creation", response)),
     }
 }
 
 #[cfg(target_family = "wasm")]
-pub(crate) async fn list_sessions_async(
+pub(crate) async fn create_workspace_async(
     connection: &ClientConnection,
-    project_id: ProjectId,
+    name: &str,
+) -> Result<WorkspaceRecord, LoomError> {
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: name.to_owned(),
+        }))
+        .await;
+    match response.result? {
+        ServerResponse::WorkspaceCreated(workspace) => Ok(workspace),
+        response => Err(unexpected_response("workspace creation", response)),
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn list_workspace_sessions(
+    connection: &ClientConnection,
+    workspace_id: WorkspaceId,
+) -> Result<Vec<AgentSessionSnapshot>, LoomError> {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+        workspace_id,
+        include_archived: false,
+    }));
+    match response.result? {
+        ServerResponse::AgentSessions { sessions } => Ok(sessions),
+        response => Err(unexpected_response("workspace session list", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn list_workspace_sessions_async(
+    connection: &ClientConnection,
+    workspace_id: WorkspaceId,
 ) -> Result<Vec<AgentSessionSnapshot>, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::ListAgentSessions {
-            project_id: Some(project_id),
+        .request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+            workspace_id,
             include_archived: false,
         }))
         .await;
     match response.result? {
         ServerResponse::AgentSessions { sessions } => Ok(sessions),
-        response => Err(unexpected_response("session list", response)),
+        response => Err(unexpected_response("workspace session list", response)),
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn create_session_in_workspace(
+    connection: &ClientConnection,
+    workspace_id: WorkspaceId,
+    name: &str,
+) -> Result<AgentSessionSnapshot, LoomError> {
+    let response = connection.request(RequestEnvelope::new(
+        ClientRequest::CreateAgentSessionInWorkspace {
+            workspace_id,
+            name: name.to_owned(),
+        },
+    ));
+    match response.result? {
+        ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
+        response => Err(unexpected_response("workspace session creation", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn create_session_in_workspace_async(
+    connection: &ClientConnection,
+    workspace_id: WorkspaceId,
+    name: &str,
+) -> Result<AgentSessionSnapshot, LoomError> {
+    let response = connection
+        .request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id,
+                name: name.to_owned(),
+            },
+        ))
+        .await;
+    match response.result? {
+        ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
+        response => Err(unexpected_response("workspace session creation", response)),
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+pub(crate) fn attach_session_repository(
+    connection: &ClientConnection,
+    session_id: loom_core::AgentSessionId,
+    source: &str,
+    path: &str,
+) -> Result<SessionRepository, LoomError> {
+    let response = connection.request(RequestEnvelope::new(
+        ClientRequest::AttachSessionRepository {
+            session_id,
+            source: source.to_owned(),
+            path: path.to_owned(),
+            revision: None,
+        },
+    ));
+    match response.result? {
+        ServerResponse::SessionRepositoryAttached(repository) => Ok(repository),
+        response => Err(unexpected_response("repository attachment", response)),
+    }
+}
+
+#[cfg(target_family = "wasm")]
+pub(crate) async fn attach_session_repository_async(
+    connection: &ClientConnection,
+    session_id: loom_core::AgentSessionId,
+    source: &str,
+    path: &str,
+) -> Result<SessionRepository, LoomError> {
+    let response = connection
+        .request(RequestEnvelope::new(
+            ClientRequest::AttachSessionRepository {
+                session_id,
+                source: source.to_owned(),
+                path: path.to_owned(),
+                revision: None,
+            },
+        ))
+        .await;
+    match response.result? {
+        ServerResponse::SessionRepositoryAttached(repository) => Ok(repository),
+        response => Err(unexpected_response("repository attachment", response)),
     }
 }
 
@@ -827,15 +939,13 @@ pub(crate) fn list_provider_ids(
 pub(crate) fn start_run(
     connection: &ClientConnection,
     session: &AgentSessionSnapshot,
-    workspace_root: &Path,
     model: &ModelId,
     task: &str,
 ) -> Result<AgentRunSnapshot, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::StartAgentRun {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
         session_id: session.id,
         task: task.to_owned(),
         model: model.clone(),
-        workspace_root: workspace_root.display().to_string(),
         system_instructions: Some(
             "Work methodically, use the available tools, and report validation.".to_owned(),
         ),

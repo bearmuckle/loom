@@ -32,6 +32,12 @@ cargo build
 cargo run -p loom-ui -- --workspace /path/to/project
 ```
 
+Workspaces are durable containers for sessions, independent of repository
+folders. Each session owns an isolated filesystem root and can attach one or
+more independent repository checkouts. The `--workspace PATH` option remains
+as a bootstrap convenience: Loom imports the selected Git repository into the
+new session instead of using that folder as the session filesystem.
+
 Demo mode:
 
 ```text

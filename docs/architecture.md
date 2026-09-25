@@ -84,7 +84,8 @@ Suggested backend boundaries:
   domain and protocol types remain provider-neutral.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
   result normalization, and tool adapters.
-- `loom-workspace`: file tree, file contents, watches, edits, and snapshots.
+- `loom-workspace`: session-root file trees, file contents, watches, edits,
+  snapshots, and repository-instruction discovery.
 - `loom-process`: commands, terminals, task supervision, output streaming, and
   cancellation.
 - `loom-vcs`: source-control abstraction and read-only repository status,
@@ -103,18 +104,33 @@ filesystem, and process primitives directly. This keeps provider
 normalization, authorization, auditing, cancellation, and future sandboxing
 in one place.
 
-`loom-workspace` is not a second editor authority; it owns files, snapshots,
-edits, checkpoints, and repository instruction discovery. The GPUI client
-projects backend-owned project, session, run, approval, workspace-change,
-task, and evidence state into a session navigator and active-session canvas.
+`Workspace` is a durable container for sessions and workspace-level settings;
+it is not a filesystem root or repository. An `AgentSession` owns an isolated,
+backend-managed filesystem root. The root contains zero or more
+session-specific repository checkouts at stable relative paths. A checkout
+may be implemented as a clone or a Git worktree, but its mutable working tree
+belongs exclusively to that session. Shared bare-object caches are an
+implementation detail and are never exposed as a shared working directory.
+This ownership and path boundary does not by itself promise OS-level process
+sandboxing; process isolation is a separate backend security capability.
+
+`loom-workspace` is not a second editor authority; it owns session-root files,
+snapshots, edits, checkpoints, repository instruction discovery, and the
+mapping from repository-relative paths to paths inside the session root.
+Tools, terminal working directories, process permissions, VCS status and
+diffs, and file events all resolve against the active session root. A
+session's filesystem root is not the workspace's root, and a repository is
+not the workspace's identity. The GPUI client projects backend-owned
+workspace, session, run, approval, session-filesystem, task, and evidence
+state into a workspace/session navigator and active-session canvas.
 The canvas contains the chronological agent conversation and tool timeline
 plus a composer for new tasks, follow-up direction, and answers to agent
 questions.
 
 Changed paths, bounded diffs, task artifacts, and repository status are
 read-only review projections opened in a drawer or focused overlay. They are
-loaded through the canonical workspace, process, and VCS services and remain
-scoped to the active project/session. The client does not own an editable
+loaded through the canonical session-filesystem, process, and VCS services
+and remain scoped to the active session. The client does not own an editable
 buffer, tab/pane layout, language-service state, or orchestration state. A
 remote client receives the same projections over the authenticated transport.
 

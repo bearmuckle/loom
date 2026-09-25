@@ -2,9 +2,13 @@ use std::{cmp::Reverse, collections::BTreeMap};
 
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, LoomError, ProjectId,
-    Result, SessionEvent, SessionEventRecord, Timestamp,
+    Result, SessionEvent, SessionEventRecord, Timestamp, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
+
+mod workspace;
+
+pub use workspace::{WorkspaceManager, WorkspaceManagerState};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionManagerState {
@@ -21,7 +25,8 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub fn from_state(state: SessionManagerState) -> Result<Self> {
+    pub fn from_state(mut state: SessionManagerState) -> Result<Self> {
+        Self::migrate_workspace_ids(&mut state);
         if state
             .sessions
             .iter()
@@ -67,6 +72,7 @@ impl SessionManager {
                         ));
                     };
                     if current.project_id != snapshot.project_id
+                        || current.workspace_id != snapshot.workspace_id
                         || current.created_at != snapshot.created_at
                     {
                         return Err(LoomError::new(
@@ -188,17 +194,40 @@ impl SessionManager {
         project_id: ProjectId,
         name: impl Into<String>,
     ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        self.create_in_workspace(WorkspaceId::from_uuid(*project_id.as_uuid()), name)
+    }
+
+    pub fn create_in_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        name: impl Into<String>,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        self.create_in_workspace_with_id(workspace_id, AgentSessionId::new(), name)
+    }
+
+    pub fn create_in_workspace_with_id(
+        &mut self,
+        workspace_id: WorkspaceId,
+        session_id: AgentSessionId,
+        name: impl Into<String>,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
         let name = name.into();
         if name.trim().is_empty() {
             return Err(LoomError::invalid_request(
                 "agent session name must not be empty",
             ));
         }
+        if self.sessions.contains_key(&session_id) {
+            return Err(LoomError::conflict(format!(
+                "agent session {session_id} already exists"
+            )));
+        }
 
         let now = Timestamp::now();
         let snapshot = AgentSessionSnapshot {
-            id: AgentSessionId::new(),
-            project_id,
+            id: session_id,
+            workspace_id,
+            project_id: ProjectId::from_uuid(*workspace_id.as_uuid()),
             name,
             state: AgentSessionState::Idle,
             created_at: now,
@@ -232,6 +261,24 @@ impl SessionManager {
             .values()
             .filter(|snapshot| {
                 project_id.is_none_or(|project_id| snapshot.project_id == project_id)
+                    && (include_archived || snapshot.state != AgentSessionState::Archived)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|snapshot| Reverse(snapshot.updated_at));
+        sessions
+    }
+
+    pub fn list_in_workspace(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        include_archived: bool,
+    ) -> Vec<AgentSessionSnapshot> {
+        let mut sessions = self
+            .sessions
+            .values()
+            .filter(|snapshot| {
+                workspace_id.is_none_or(|workspace_id| snapshot.workspace_id == workspace_id)
                     && (include_archived || snapshot.state != AgentSessionState::Archived)
             })
             .cloned()
@@ -355,6 +402,15 @@ impl SessionManager {
         source_session_id: AgentSessionId,
         name: impl Into<String>,
     ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
+        self.fork_with_id(source_session_id, name, AgentSessionId::new())
+    }
+
+    pub fn fork_with_id(
+        &mut self,
+        source_session_id: AgentSessionId,
+        name: impl Into<String>,
+        id: AgentSessionId,
+    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
         let source = self.get(source_session_id)?;
         let name = name.into();
         if name.trim().is_empty() {
@@ -364,7 +420,8 @@ impl SessionManager {
         }
         let now = Timestamp::now();
         let snapshot = AgentSessionSnapshot {
-            id: AgentSessionId::new(),
+            id,
+            workspace_id: source.workspace_id,
             project_id: source.project_id,
             name,
             state: AgentSessionState::Idle,
@@ -381,6 +438,25 @@ impl SessionManager {
             },
         );
         Ok((snapshot, record))
+    }
+
+    fn migrate_workspace_ids(state: &mut SessionManagerState) {
+        for snapshot in state.sessions.values_mut() {
+            if snapshot.workspace_id.as_uuid().is_nil() {
+                snapshot.workspace_id = WorkspaceId::from_uuid(*snapshot.project_id.as_uuid());
+            }
+        }
+        for record in &mut state.events {
+            match &mut record.event {
+                SessionEvent::AgentSessionCreated { snapshot }
+                | SessionEvent::AgentSessionForked { snapshot, .. }
+                    if snapshot.workspace_id.as_uuid().is_nil() =>
+                {
+                    snapshot.workspace_id = WorkspaceId::from_uuid(*snapshot.project_id.as_uuid());
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn events_since(

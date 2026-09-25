@@ -4376,6 +4376,7 @@ dependencies = [
  "log",
  "loom-core",
  "loom-model",
+ "loom-persistence",
  "loom-protocol",
  "loom-providers",
  "loom-server",
