@@ -1061,7 +1061,7 @@ impl ProviderRegistry {
             .lock()
             .map_err(|_| internal_lock_error("provider configuration"))?
             .clone();
-        for config in configs {
+        for mut config in configs {
             if let Some(current) = existing.get(&config.id) {
                 if config.kind == ProviderKind::GitHubCopilot && config.models.len() <= 1 {
                     continue;
@@ -1078,6 +1078,9 @@ impl ProviderRegistry {
                 .is_none_or(|reference| self.credentials.resolve(reference).is_err())
             {
                 continue;
+            }
+            if config.kind == ProviderKind::GitHubCopilot {
+                config.models = vec![github_copilot_descriptor()];
             }
             self.register(config)?;
         }
@@ -1602,19 +1605,25 @@ impl GitHubCopilotProvider {
                             false,
                         )
                     })?;
-                Ok(ModelDescriptor {
-                    id: ModelId::new(id),
-                    provider: self.descriptor.provider.clone(),
-                    display_name: id.to_owned(),
-                    context_window: self.descriptor.context_window,
-                    capabilities: self.descriptor.capabilities.clone(),
-                })
+                Ok((
+                    ModelDescriptor {
+                        id: ModelId::new(id),
+                        provider: self.descriptor.provider.clone(),
+                        display_name: id.to_owned(),
+                        context_window: self.descriptor.context_window,
+                        capabilities: self.descriptor.capabilities.clone(),
+                    },
+                    github_copilot_supports_tool_calls(model),
+                ))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(model, supports_tool_calls)| supports_tool_calls.then_some(model))
+            .collect::<Vec<_>>();
         if models.is_empty() {
             return Err(LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
-                "GitHub Copilot model discovery returned no models",
+                "GitHub Copilot model discovery returned no agentic models",
                 false,
             ));
         }
@@ -1670,6 +1679,15 @@ impl GitHubCopilotProvider {
 struct CopilotAccessToken {
     value: String,
     api_endpoint: String,
+}
+
+fn github_copilot_supports_tool_calls(model: &serde_json::Value) -> bool {
+    model
+        .get("capabilities")
+        .and_then(|capabilities| capabilities.get("supports"))
+        .and_then(|supports| supports.get("tool_calls"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 impl ModelProvider for GitHubCopilotProvider {
@@ -2876,6 +2894,53 @@ mod tests {
         assert!(uses_responses_endpoint("gpt-6-luna"));
         assert!(uses_responses_endpoint("gpt-6-astra"));
         assert!(!uses_responses_endpoint("gpt-4o"));
+    }
+
+    #[test]
+    fn github_copilot_discovery_lists_only_models_with_tool_call_support() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut token_stream, _) = listener.accept().unwrap();
+            read_request_headers(&mut token_stream).unwrap();
+            write_response(
+                &mut token_stream,
+                "application/json",
+                &format!(r#"{{"token":"copilot-token","endpoints":{{"api":"http://{address}"}}}}"#),
+            )
+            .unwrap();
+
+            let (mut models_stream, _) = listener.accept().unwrap();
+            read_request_headers(&mut models_stream).unwrap();
+            write_response(
+                &mut models_stream,
+                "application/json",
+                r#"{"data":[
+                    {"id":"agentic-model","capabilities":{"supports":{"tool_calls":true}}},
+                    {"id":"chat-model","capabilities":{"supports":{"tool_calls":false}}},
+                    {"id":"unknown-model","capabilities":{"supports":{}}}
+                ]}"#,
+            )
+            .unwrap();
+        });
+        let descriptor = github_copilot_descriptor();
+        let provider = GitHubCopilotProvider::with_endpoints(
+            format!("http://{address}"),
+            format!("http://{address}/token"),
+            "github-token",
+            descriptor,
+        );
+
+        let models = provider.discover_models().unwrap();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["agentic-model"]
+        );
+        server.join().unwrap();
     }
 
     fn collect(provider: &mut impl ModelProvider, request: &ModelRequest) -> Vec<ModelStreamEvent> {
