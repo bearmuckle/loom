@@ -32,9 +32,9 @@ use log::{error, info};
 
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::describe_startup_connection_error;
-use crate::text_input::{
-    Backspace, Copy, Delete, End, Home, Left, Paste, Right, SelectAll, Submit,
-};
+#[cfg(not(target_family = "wasm"))]
+use crate::text_input::Paste;
+use crate::text_input::{Backspace, Copy, Delete, End, Home, Left, Right, SelectAll, Submit};
 #[cfg(not(target_family = "wasm"))]
 use crate::{platform::UiOptions, view::LoomView};
 
@@ -67,7 +67,11 @@ fn bind_composer_keys(cx: &mut App) {
         KeyBinding::new("ctrl-a", SelectAll, Some("Composer")),
         KeyBinding::new("home", Home, Some("Composer")),
         KeyBinding::new("end", End, Some("Composer")),
+        // The web backend handles browser paste events directly; its
+        // synchronous clipboard read API is unavailable on wasm.
+        #[cfg(not(target_family = "wasm"))]
         KeyBinding::new("cmd-v", Paste, Some("Composer")),
+        #[cfg(not(target_family = "wasm"))]
         KeyBinding::new("ctrl-v", Paste, Some("Composer")),
         KeyBinding::new("cmd-c", Copy, Some("Composer")),
         KeyBinding::new("ctrl-c", Copy, Some("Composer")),
