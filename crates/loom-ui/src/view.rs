@@ -24,7 +24,7 @@ use gpui_kit::{
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
-    EventSequence, LoomError, ProjectId, RepositoryId, RunId, WorkspaceId, WorkspaceRecord,
+    EventSequence, LoomError, RepositoryId, RunId, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{MessageRole, ModelId, ProviderKind, ProviderSummary, ToolCall};
 #[cfg(target_family = "wasm")]
@@ -32,14 +32,16 @@ use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
-    ProjectSnapshot, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse,
-    SessionRepository, TaskSnapshot, TaskStatus, WorkerNodeConfig, WorkerNodeResources,
-    WorkerNodeStatus, WorkspaceConfig,
+    RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse, SessionRepository,
+    TaskSnapshot, TaskStatus, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus,
+    WorkspaceConfig,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode};
 #[cfg(not(target_family = "wasm"))]
 use loom_server::InProcessBackend;
+#[cfg(not(target_family = "wasm"))]
+use std::fs;
 
 use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
@@ -63,15 +65,16 @@ use crate::{
 use crate::connection::{
     attach_session_repository, create_session_in_workspace, create_workspace,
     list_models_from_backend, list_workspace_sessions, list_workspaces, redact_secret,
-    select_remote_project, unexpected_response,
+    register_workspace, unexpected_response,
 };
 #[cfg(target_family = "wasm")]
 use crate::connection::{
     attach_session_repository_async, create_session_in_workspace_async, create_workspace_async,
     list_models_from_backend, list_workspace_sessions_async, list_workspaces_async,
+    register_workspace_async,
 };
 #[cfg(target_family = "wasm")]
-use crate::connection::{redact_secret, select_remote_project, unexpected_response};
+use crate::connection::{redact_secret, unexpected_response};
 
 const COMPACT_LAYOUT_WIDTH: Pixels = px(960.);
 const PHONE_LAYOUT_WIDTH: Pixels = px(640.);
@@ -119,20 +122,17 @@ fn responsive_layout(width: Pixels) -> ResponsiveLayout {
 use crate::{
     browser::BrowserOptions,
     connection::{
-        list_models_async, list_projects_async, negotiate_async, open_workspace_async,
-        set_workspace_config_async, worker_node_status_async, workspace_config_async,
+        list_models_async, negotiate_async, set_workspace_config_async, worker_node_status_async,
+        workspace_config_async,
     },
 };
 #[cfg(not(target_family = "wasm"))]
 use crate::{
     connection::{
-        list_models, list_projects, list_provider_ids, negotiate, open_workspace,
-        set_workspace_config, start_run, worker_node_status, workspace_config,
+        list_models, list_provider_ids, negotiate, set_workspace_config, start_run,
+        worker_node_status, workspace_config,
     },
-    platform::{
-        PeerCredentialStore, UiOptions, backend_persistence_path,
-        migrate_legacy_backend_persistence, prepare_workspace, stable_project_id,
-    },
+    platform::{PeerCredentialStore, UiOptions, backend_persistence_path, prepare_workspace},
 };
 #[cfg(not(target_family = "wasm"))]
 use log::info;
@@ -365,17 +365,11 @@ fn session_id_for_request(
     active_session_id: AgentSessionId,
 ) -> Option<AgentSessionId> {
     match request {
-        ClientRequest::SetApprovalPolicy {
-            session_id: Some(session_id),
-            ..
-        } => Some(*session_id),
         ClientRequest::GetAgentSession { session_id }
         | ClientRequest::GetAgentSessionSnapshot { session_id }
         | ClientRequest::RenameAgentSession { session_id, .. }
         | ClientRequest::ArchiveAgentSession { session_id }
         | ClientRequest::GetRecentSessionEvents { session_id, .. }
-        | ClientRequest::StartAgentRun { session_id, .. }
-        | ClientRequest::StartAgentRunWithOptions { session_id, .. }
         | ClientRequest::StartSessionAgentRun { session_id, .. }
         | ClientRequest::StartSessionAgentRunWithOptions { session_id, .. }
         | ClientRequest::AttachSessionRepository { session_id, .. }
@@ -408,10 +402,6 @@ fn session_id_for_request(
         | ClientRequest::SetSessionApprovalPolicy { session_id, .. }
         | ClientRequest::ForkAgentSession { session_id, .. }
         | ClientRequest::GetSessionUsage { session_id } => Some(*session_id),
-        ClientRequest::CreateCheckpoint {
-            session_id: Some(session_id),
-            ..
-        } => Some(*session_id),
         ClientRequest::GetSessionEvents { session_id, .. } => {
             Some(session_id.unwrap_or(active_session_id))
         }
@@ -1023,7 +1013,7 @@ pub(crate) struct LoomView {
     pub(crate) connection: ClientConnection,
     /// Used for every request made once the view is interactive.
     pub(crate) backend: BackendWorker,
-    /// The startup backend remains the default for project-wide requests and new sessions.
+    /// The startup backend remains the default for workspace requests and new sessions.
     default_backend_node_id: String,
     /// Connections are keyed by the backend's stable node identity.
     node_backends: BTreeMap<String, BackendWorker>,
@@ -1031,13 +1021,10 @@ pub(crate) struct LoomView {
     node_names: BTreeMap<String, String>,
     /// Sessions stay pinned to the node that created them.
     session_node_ids: BTreeMap<AgentSessionId, String>,
-    pub(crate) project_id: ProjectId,
     pub(crate) workspace_id: WorkspaceId,
     workspace_name: String,
     workspaces: Vec<WorkspaceRecord>,
-    pub(crate) project: Option<ProjectSnapshot>,
     pub(crate) workspace_root: PathBuf,
-    pub(crate) projects: Vec<ProjectSnapshot>,
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
     pub(crate) active_session: AgentSessionSnapshot,
     pub(crate) active_run: Option<AgentRunSnapshot>,
@@ -1406,8 +1393,7 @@ impl LoomView {
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
         let mut remote_cleanup_guard = None;
-        let (connection, workspace_root, project_id, demo_workspace) = if let Some(remote_url) =
-            &options.remote
+        let (connection, workspace_root, demo_workspace) = if let Some(remote_url) = &options.remote
         {
             info!("connecting to remote backend");
             if worker_url_embeds_credential(remote_url) {
@@ -1422,21 +1408,20 @@ impl LoomView {
             remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
             info!("remote transport connected; negotiating protocol");
             negotiate(&connection)?;
-            let projects = list_projects(&connection)?;
-            info!("remote backend returned {} project(s)", projects.len());
-            let project = select_remote_project(
-                &projects,
-                options.workspace.as_deref().and_then(|path| path.to_str()),
-            )?;
-            let workspace_root = project.root.clone().map(PathBuf::from).ok_or_else(|| {
-                LoomError::new(
-                    ErrorCode::WorkspaceAccessDenied,
-                    "selected remote project has no configured workspace root",
-                    false,
-                )
-            })?;
-            info!("selected remote project {}", project.id);
-            (connection, workspace_root, project.id, false)
+            let workspace_root = options
+                .workspace
+                .clone()
+                .map(fs::canonicalize)
+                .transpose()
+                .map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        format!("could not open repository source: {error}"),
+                        false,
+                    )
+                })?
+                .unwrap_or_default();
+            (connection, workspace_root, false)
         } else {
             let (workspace_root, demo_workspace) = prepare_workspace(options)?;
             info!(
@@ -1444,14 +1429,6 @@ impl LoomView {
                 workspace_root.display(),
                 if demo_workspace { " (demo)" } else { "" }
             );
-            let project_id = if demo_workspace {
-                ProjectId::new()
-            } else {
-                stable_project_id(&workspace_root)
-            };
-            if !demo_workspace {
-                migrate_legacy_backend_persistence(&workspace_root)?;
-            }
             let backend = if demo_workspace {
                 info!("starting demo backend");
                 InProcessBackend::demo_with_github_copilot()?
@@ -1478,24 +1455,17 @@ impl LoomView {
             (
                 ClientConnection::InProcess(Box::new(backend.connect())),
                 workspace_root,
-                project_id,
                 demo_workspace,
             )
         };
         if options.remote.is_none() {
-            info!("negotiating protocol and opening workspace");
+            info!("negotiating protocol");
             negotiate(&connection)?;
-            open_workspace(&connection, project_id, &workspace_root)?;
         }
         let node_status = worker_node_status(&connection)?;
         let default_backend_node_id = node_status.node_id.clone();
-        let legacy_workspace_id = WorkspaceId::from_uuid(*project_id.as_uuid());
         let mut workspaces = list_workspaces(&connection)?;
-        let workspace = match workspaces
-            .iter()
-            .find(|workspace| workspace.id == legacy_workspace_id)
-            .or_else(|| workspaces.first())
-        {
+        let workspace = match workspaces.first() {
             Some(workspace) => workspace.clone(),
             None => {
                 let workspace = create_workspace(&connection, "Default")?;
@@ -1526,12 +1496,15 @@ impl LoomView {
                 )
             }
         };
-        if new_session && (options.remote.is_some() || workspace_root.join(".git").exists()) {
+        if new_session
+            && !workspace_root.as_os_str().is_empty()
+            && (options.remote.is_some() || workspace_root.join(".git").exists())
+        {
             attach_session_repository(
                 &connection,
                 session.id,
                 &workspace_root.display().to_string(),
-                ".",
+                "repo",
             )?;
         }
         let models = list_models(&connection)?;
@@ -1572,13 +1545,10 @@ impl LoomView {
             node_backends,
             node_names,
             session_node_ids,
-            project_id,
             workspace_id,
             workspace_name: workspace.name,
             workspaces,
-            project: None,
             workspace_root,
-            projects: Vec::new(),
             sessions: vec![session.clone()],
             active_session: session.clone(),
             active_run: run.clone(),
@@ -1672,13 +1642,11 @@ impl LoomView {
     ) -> Self {
         let connection = ClientConnection::Disconnected;
         let backend = BackendWorker::spawn(connection.clone());
-        let project_id = ProjectId::new();
         let workspace_id = WorkspaceId::new();
         let timestamp = loom_core::Timestamp::from_unix_millis(0);
         let active_session = AgentSessionSnapshot {
             id: AgentSessionId::new(),
             workspace_id,
-            project_id,
             name: "No worker connected".to_owned(),
             state: AgentSessionState::Idle,
             created_at: timestamp,
@@ -1698,13 +1666,10 @@ impl LoomView {
             node_backends: BTreeMap::new(),
             node_names: BTreeMap::new(),
             session_node_ids: BTreeMap::new(),
-            project_id,
             workspace_id,
             workspace_name: "No workspace".to_owned(),
             workspaces: Vec::new(),
-            project: None,
             workspace_root: PathBuf::new(),
-            projects: Vec::new(),
             sessions: Vec::new(),
             active_session,
             active_run: None,
@@ -1807,39 +1772,8 @@ impl LoomView {
         negotiate_async(&connection).await?;
         let node_status = worker_node_status_async(&connection).await?;
         let default_backend_node_id = node_status.node_id.clone();
-        let projects = list_projects_async(&connection).await?;
-        // A freshly started `--serve` backend has no projects open yet; if
-        // none match (or none exist), open the requested workspace as a new
-        // project ourselves, the same way the native remote-mode M4 demo
-        // does.
-        let (project, project_id, workspace_root) =
-            match select_remote_project(&projects, options.workspace()) {
-                Ok(project) => {
-                    let workspace_root =
-                        project.root.clone().map(PathBuf::from).ok_or_else(|| {
-                            LoomError::new(
-                                ErrorCode::WorkspaceAccessDenied,
-                                "selected remote project has no configured workspace root",
-                                false,
-                            )
-                        })?;
-                    let project_id = project.id;
-                    (Some(project), project_id, workspace_root)
-                }
-                Err(error) => {
-                    let root = options.workspace().ok_or(error)?;
-                    let project_id = ProjectId::new();
-                    open_workspace_async(&connection, project_id, root).await?;
-                    (None, project_id, PathBuf::from(root))
-                }
-            };
-        let legacy_workspace_id = WorkspaceId::from_uuid(*project_id.as_uuid());
         let mut workspaces = list_workspaces_async(&connection).await?;
-        let workspace = match workspaces
-            .iter()
-            .find(|workspace| workspace.id == legacy_workspace_id)
-            .or_else(|| workspaces.first())
-        {
+        let workspace = match workspaces.first() {
             Some(workspace) => workspace.clone(),
             None => {
                 let workspace = create_workspace_async(&connection, "Default").await?;
@@ -1870,12 +1804,13 @@ impl LoomView {
                 true,
             ),
         };
-        if new_session {
+        let workspace_root = options.workspace().map(PathBuf::from).unwrap_or_default();
+        if new_session && !workspace_root.as_os_str().is_empty() {
             attach_session_repository_async(
                 &connection,
                 session.id,
                 &workspace_root.display().to_string(),
-                ".",
+                "repo",
             )
             .await?;
         }
@@ -1904,13 +1839,10 @@ impl LoomView {
             node_backends,
             node_names,
             session_node_ids,
-            project_id,
             workspace_id,
             workspace_name: workspace.name,
             workspaces,
-            project,
             workspace_root,
-            projects,
             sessions: vec![session.clone()],
             active_session: session.clone(),
             active_run: None,
@@ -2251,7 +2183,7 @@ impl LoomView {
         ));
     }
 
-    /// Loads the session and project lists synchronously for the startup
+    /// Loads the session list synchronously for the startup
     /// bootstrap. Interactive refreshes use [`Self::reload_sessions`].
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), LoomError> {
@@ -2280,20 +2212,6 @@ impl LoomView {
             response => return Err(unexpected_response("session list", response)),
         }
 
-        let response = self
-            .connection
-            .request(RequestEnvelope::new(ClientRequest::ListProjects));
-        match response.result? {
-            ServerResponse::Projects { projects } => {
-                self.projects = projects;
-                self.project = self
-                    .projects
-                    .iter()
-                    .find(|project| project.id == self.project_id)
-                    .cloned();
-            }
-            response => return Err(unexpected_response("project list", response)),
-        }
         Ok(())
     }
 
@@ -2317,17 +2235,14 @@ impl LoomView {
                     });
             }
         }
-        let project_request = self
-            .backend
-            .submit(RequestEnvelope::new(ClientRequest::ListProjects));
         cx.spawn(async move |view, cx| {
-            let (node_responses, project_response) = cx
+            let node_responses = cx
                 .background_spawn(async move {
                     let mut node_responses = Vec::with_capacity(node_requests.len());
                     for (node_id, pending) in node_requests {
                         node_responses.push((node_id, pending.wait().await));
                     }
-                    (node_responses, project_request.wait().await)
+                    node_responses
                 })
                 .await;
             view.update(cx, |view, cx| {
@@ -2365,21 +2280,6 @@ impl LoomView {
                 {
                     view.active_session = active.clone();
                     view.session_state = active.state;
-                }
-                match project_response.result {
-                    Ok(ServerResponse::Projects { projects }) => {
-                        view.projects = projects;
-                        view.project = view
-                            .projects
-                            .iter()
-                            .find(|project| project.id == view.project_id)
-                            .cloned();
-                    }
-                    Err(error) => view.record_backend_error("project list refresh", error),
-                    Ok(response) => view.record_backend_error(
-                        "project list refresh",
-                        unexpected_response("project list", response),
-                    ),
                 }
                 cx.notify();
             })
@@ -2696,7 +2596,7 @@ impl LoomView {
                 self.update_session_list();
             }
             ServerEvent::Agent { event } => self.consume_agent_event(event),
-            ServerEvent::WorkspaceChanged { change } => {
+            ServerEvent::SessionFilesystemChanged { change } => {
                 self.record_status(format!("Workspace {:?}: {}", change.kind, change.path));
             }
             ServerEvent::Terminal { .. } | ServerEvent::Task { .. } => {}
@@ -2968,19 +2868,11 @@ impl LoomView {
             |view, response, _| match response.result {
                 Ok(ServerResponse::SessionFilesystemChanges { changes, truncated }) => {
                     let mut seen = BTreeSet::new();
-                    let project_id = view.active_session.project_id;
                     view.review.changes = changes
                         .into_iter()
                         .rev()
                         .filter(|change| seen.insert(change.path.clone()))
                         .take(MAX_REVIEW_CHANGES)
-                        .map(|change| loom_protocol::WorkspaceChange {
-                            sequence: change.sequence,
-                            project_id,
-                            path: change.path,
-                            kind: change.kind,
-                            revision: change.revision,
-                        })
                         .collect();
                     if truncated {
                         view.record_status(
@@ -3033,25 +2925,7 @@ impl LoomView {
                         );
                     } else {
                         view.review.vcs = None;
-                        view.dispatch(
-                            cx,
-                            ClientRequest::GetVcsStatus {
-                                project_id: view.project_id,
-                            },
-                            |view, response, _| match response.result {
-                                Ok(ServerResponse::VcsStatus(status)) => {
-                                    view.review.vcs = Some(status)
-                                }
-                                Err(error) => {
-                                    view.review.vcs = None;
-                                    view.record_status(format!("VCS review unavailable: {error}"));
-                                }
-                                Ok(response) => view.record_backend_error(
-                                    "VCS review refresh",
-                                    unexpected_response("VCS status", response),
-                                ),
-                            },
-                        );
+                        view.review.vcs = None;
                     }
                 }
                 Err(error) => {
@@ -4108,9 +3982,8 @@ impl LoomView {
         self.approval_settings_request_in_flight = true;
         self.dispatch(
             cx,
-            ClientRequest::SetApprovalPolicy {
-                project_id: self.active_session.project_id,
-                session_id: Some(session_id),
+            ClientRequest::SetSessionApprovalPolicy {
+                session_id,
                 policy,
                 auto_approve_actions: Some(self.auto_approve_actions),
             },
@@ -4147,9 +4020,8 @@ impl LoomView {
         self.approval_settings_request_in_flight = true;
         self.dispatch(
             cx,
-            ClientRequest::SetApprovalPolicy {
-                project_id: self.active_session.project_id,
-                session_id: Some(session_id),
+            ClientRequest::SetSessionApprovalPolicy {
+                session_id,
                 policy,
                 auto_approve_actions: Some(auto_approve_actions),
             },
@@ -4413,12 +4285,12 @@ impl LoomView {
         self.reload_sessions(cx);
         #[cfg(not(target_family = "wasm"))]
         if let Some(url) = node.url {
-            let project_id = self.project_id;
+            let workspace_id = self.workspace_id;
             cx.spawn(async move |view, cx| {
                 let result = cx
-                    .background_spawn(
-                        async move { PeerCredentialStore::new().delete(project_id, &url) },
-                    )
+                    .background_spawn(async move {
+                        PeerCredentialStore::new().delete(workspace_id, &url)
+                    })
                     .await;
                 view.update(cx, |view, cx| {
                     if let Err(error) = result {
@@ -4450,6 +4322,11 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         let workspace_id = self.workspace_id;
+        let workspace = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .cloned();
         let config = self.workspace_config.clone();
         let source = self.connection.clone();
         let peers = self
@@ -4472,6 +4349,15 @@ impl LoomView {
                         errors.push(("save workspace config".to_owned(), error));
                     }
                     for (name, connection) in peers {
+                        let registration = workspace
+                            .clone()
+                            .ok_or_else(|| LoomError::not_found("workspace", workspace_id));
+                        if let Err(error) = registration
+                            .and_then(|workspace| register_workspace(&connection, workspace))
+                        {
+                            errors.push((format!("register workspace on {name}"), error));
+                            continue;
+                        }
                         if let Err(error) =
                             set_workspace_config(&connection, workspace_id, config.clone())
                         {
@@ -4479,6 +4365,11 @@ impl LoomView {
                         }
                     }
                     if let Some((name, connection)) = retiring {
+                        if let Some(workspace) = workspace.clone()
+                            && let Err(error) = register_workspace(&connection, workspace)
+                        {
+                            errors.push((format!("register workspace on {name}"), error));
+                        }
                         if let Err(error) =
                             set_workspace_config(&connection, workspace_id, config.clone())
                         {
@@ -4512,6 +4403,14 @@ impl LoomView {
                 errors.push(("save workspace config".to_owned(), error));
             } else {
                 for (name, connection) in peers {
+                    let registration = match workspace.clone() {
+                        Some(workspace) => register_workspace_async(&connection, workspace).await,
+                        None => Err(LoomError::not_found("workspace", workspace_id)),
+                    };
+                    if let Err(error) = registration {
+                        errors.push((format!("register workspace on {name}"), error));
+                        continue;
+                    }
                     if let Err(error) =
                         set_workspace_config_async(&connection, workspace_id, config.clone()).await
                     {
@@ -4520,6 +4419,11 @@ impl LoomView {
                 }
             }
             if let Some((name, connection)) = retiring {
+                if let Some(workspace) = workspace
+                    && let Err(error) = register_workspace_async(&connection, workspace).await
+                {
+                    errors.push((format!("register workspace on {name}"), error));
+                }
                 if let Err(error) =
                     set_workspace_config_async(&connection, workspace_id, config.clone()).await
                 {
@@ -4590,7 +4494,7 @@ impl LoomView {
         if candidates.is_empty() {
             return;
         }
-        let project_id = self.project_id;
+        let workspace_id = self.workspace_id;
         for (id, url) in candidates {
             if worker_url_embeds_credential(&url) {
                 self.set_worker_node_connection_failure(
@@ -4609,7 +4513,7 @@ impl LoomView {
                 let result = cx
                     .background_spawn(async move {
                         let credentials = PeerCredentialStore::new();
-                        let token = match credentials.get(project_id, &candidate_url) {
+                        let token = match credentials.get(workspace_id, &candidate_url) {
                             Ok(Some(token)) => token,
                             Ok(None) => {
                                 return Err((
@@ -4808,7 +4712,7 @@ impl LoomView {
             cx.notify();
             return;
         };
-        let project_id = self.project_id;
+        let workspace_id = self.workspace_id;
         let submitted_value = value;
         let node_url = url.clone();
         let connect_url = url.clone();
@@ -4839,7 +4743,7 @@ impl LoomView {
                         }
                     };
                     let credential_detail = PeerCredentialStore::new()
-                        .set(project_id, &node_url, &token)
+                        .set(workspace_id, &node_url, &token)
                         .err()
                         .map(|error| {
                             worker_connection_failure_detail(
@@ -5304,7 +5208,6 @@ impl LoomView {
             move |view, response, cx| match response.result {
                 Ok(ServerResponse::AgentSessions { sessions }) => {
                     view.workspace_id = workspace_id;
-                    view.project_id = ProjectId::from_uuid(*workspace_id.as_uuid());
                     view.workspace_name = workspace.name.clone();
                     view.sessions = sessions;
                     for session in &view.sessions {
@@ -5334,7 +5237,6 @@ impl LoomView {
             |view, response, cx| match response.result {
                 Ok(ServerResponse::WorkspaceCreated(workspace)) => {
                     view.workspace_id = workspace.id;
-                    view.project_id = ProjectId::from_uuid(*workspace.id.as_uuid());
                     view.workspace_name = workspace.name.clone();
                     view.workspaces.push(workspace);
                     view.sessions.clear();
@@ -5367,10 +5269,22 @@ impl LoomView {
             cx.notify();
             return;
         };
-        let project_id = self.project_id;
         let workspace_id = self.workspace_id;
+        let default_backend_node_id = self.default_backend_node_id.clone();
         let workspace_root = self.workspace_root.display().to_string();
-        let open_workspace = node_id != self.default_backend_node_id;
+        let Some(workspace) = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .cloned()
+        else {
+            self.record_backend_error(
+                "create session",
+                LoomError::not_found("workspace", workspace_id),
+            );
+            cx.notify();
+            return;
+        };
         let model = self.default_model.clone();
         let node_name = self
             .node_names
@@ -5413,19 +5327,16 @@ impl LoomView {
                 return;
             }
             let result = async {
-                if open_workspace {
-                    let response = backend
-                        .submit(RequestEnvelope::new(ClientRequest::OpenWorkspace {
-                            project_id,
-                            root: workspace_root.clone(),
-                        }))
-                        .wait()
-                        .await;
-                    match response.result? {
-                        ServerResponse::WorkspaceOpened(_) => {}
-                        response => {
-                            return Err(unexpected_response("workspace open", response));
-                        }
+                let registered = backend
+                    .submit(RequestEnvelope::new(ClientRequest::RegisterWorkspace {
+                        workspace: workspace.clone(),
+                    }))
+                    .wait()
+                    .await;
+                match registered.result? {
+                    ServerResponse::WorkspaceCreated(_) => {}
+                    response => {
+                        return Err(unexpected_response("workspace registration", response));
                     }
                 }
                 let response = backend
@@ -5438,7 +5349,9 @@ impl LoomView {
                     ServerResponse::AgentSessionCreated(snapshot) => snapshot,
                     response => return Err(unexpected_response("session creation", response)),
                 };
-                if open_workspace || PathBuf::from(&workspace_root).join(".git").exists() {
+                if node_id == default_backend_node_id
+                    && PathBuf::from(&workspace_root).join(".git").exists()
+                {
                     let response = backend
                         .submit(RequestEnvelope::new(
                             ClientRequest::AttachSessionRepository {
@@ -5637,7 +5550,8 @@ impl LoomView {
                 Ok(ServerResponse::SessionFilesystemFile(mut file)) => {
                     file.content = bounded_to(&file.content, MAX_REVIEW_DIFF);
                     view.review.diff_path = Some(file.path.clone());
-                    view.review.selected_file = Some(loom_protocol::WorkspaceFile {
+                    view.review.selected_file = Some(loom_protocol::SessionFilesystemFile {
+                        session_id: file.session_id,
                         path: file.path,
                         content: file.content,
                         revision: file.revision,
@@ -8046,11 +7960,7 @@ impl Render for LoomView {
         self.schedule_run_poll(cx);
         let view = cx.entity();
         let layout = responsive_layout(window.bounds().size.width);
-        let project_name = self
-            .project
-            .as_ref()
-            .map(|project| project.name.as_str())
-            .unwrap_or("Project");
+        let workspace_name = self.workspace_name.as_str();
         let decorations = window.window_decorations();
         let client_decorated = matches!(decorations, Decorations::Client { .. });
         let shadow_size = CLIENT_DECORATION_SHADOW;
@@ -8108,7 +8018,7 @@ impl Render for LoomView {
                             })
                             .child(div().text_xs().text_color(rgb(0x8f98a6)).child(format!(
                                 "{}  ·  {}",
-                                project_name, self.active_session.name
+                                workspace_name, self.active_session.name
                             ))),
                     )
                     .when(!cfg!(target_family = "wasm"), |element| {
@@ -8673,8 +8583,8 @@ mod worker_node_tests {
         worker_node_display_name, worker_node_name_for_id, worker_url_embeds_credential,
     };
     use loom_core::{
-        AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ProjectId, RunId,
-        Timestamp, WorkspaceId,
+        AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, RunId, Timestamp,
+        WorkspaceId,
     };
     use loom_core::{ErrorCode, LoomError};
     use loom_model::ModelId;
@@ -8840,7 +8750,6 @@ mod worker_node_tests {
         AgentSessionSnapshot {
             id,
             workspace_id: WorkspaceId::new(),
-            project_id: ProjectId::new(),
             name: name.to_owned(),
             state: AgentSessionState::Idle,
             created_at: Timestamp::from_unix_millis(1),
@@ -8984,14 +8893,13 @@ mod worker_node_tests {
         );
         assert!(assigned_node_id(&BTreeMap::new(), active_session_id).is_err());
         assert_eq!(
-            session_id_for_request(&ClientRequest::ListProjects, active_session_id),
+            session_id_for_request(&ClientRequest::ListWorkspaces, active_session_id),
             None
         );
         assert_eq!(
             session_id_for_request(
-                &ClientRequest::CreateCheckpoint {
-                    project_id: ProjectId::new(),
-                    session_id: Some(active_session_id),
+                &ClientRequest::CreateSessionCheckpoint {
+                    session_id: active_session_id,
                     label: "checkpoint".to_owned(),
                 },
                 AgentSessionId::new()

@@ -77,19 +77,20 @@ impl Workspace {
 mod tests {
     use std::fs;
 
-    use loom_core::ProjectId;
+    use loom_core::AgentSessionId;
 
     use super::*;
 
     #[test]
     fn repository_instructions_are_loaded_from_the_workspace() {
-        let root = std::env::temp_dir().join(format!("loom-instructions-{}", ProjectId::new()));
+        let root =
+            std::env::temp_dir().join(format!("loom-instructions-{}", AgentSessionId::new()));
         fs::create_dir_all(root.join("docs")).unwrap();
         fs::write(root.join("AGENTS.md"), "Follow the house style.\n").unwrap();
         fs::write(root.join("README.md"), "Loom\n").unwrap();
         fs::write(root.join("docs/architecture.md"), "Layers\n").unwrap();
         fs::write(root.join("src.rs"), "fn main() {}\n").unwrap();
-        let workspace = Workspace::open(ProjectId::new(), &root).unwrap();
+        let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
 
         let files = workspace.context_files().unwrap();
         assert!(

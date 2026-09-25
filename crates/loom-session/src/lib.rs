@@ -1,8 +1,8 @@
 use std::{cmp::Reverse, collections::BTreeMap};
 
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, LoomError, ProjectId,
-    Result, SessionEvent, SessionEventRecord, Timestamp, WorkspaceId,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, LoomError, Result,
+    SessionEvent, SessionEventRecord, Timestamp, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +25,7 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub fn from_state(mut state: SessionManagerState) -> Result<Self> {
-        Self::migrate_workspace_ids(&mut state);
+    pub fn from_state(state: SessionManagerState) -> Result<Self> {
         if state
             .sessions
             .iter()
@@ -71,8 +70,7 @@ impl SessionManager {
                             false,
                         ));
                     };
-                    if current.project_id != snapshot.project_id
-                        || current.workspace_id != snapshot.workspace_id
+                    if current.workspace_id != snapshot.workspace_id
                         || current.created_at != snapshot.created_at
                     {
                         return Err(LoomError::new(
@@ -189,14 +187,6 @@ impl SessionManager {
         self.export_state()
     }
 
-    pub fn create(
-        &mut self,
-        project_id: ProjectId,
-        name: impl Into<String>,
-    ) -> Result<(AgentSessionSnapshot, SessionEventRecord)> {
-        self.create_in_workspace(WorkspaceId::from_uuid(*project_id.as_uuid()), name)
-    }
-
     pub fn create_in_workspace(
         &mut self,
         workspace_id: WorkspaceId,
@@ -227,7 +217,6 @@ impl SessionManager {
         let snapshot = AgentSessionSnapshot {
             id: session_id,
             workspace_id,
-            project_id: ProjectId::from_uuid(*workspace_id.as_uuid()),
             name,
             state: AgentSessionState::Idle,
             created_at: now,
@@ -249,24 +238,6 @@ impl SessionManager {
             .get(&session_id)
             .cloned()
             .ok_or_else(|| LoomError::not_found("agent session", session_id))
-    }
-
-    pub fn list(
-        &self,
-        project_id: Option<ProjectId>,
-        include_archived: bool,
-    ) -> Vec<AgentSessionSnapshot> {
-        let mut sessions = self
-            .sessions
-            .values()
-            .filter(|snapshot| {
-                project_id.is_none_or(|project_id| snapshot.project_id == project_id)
-                    && (include_archived || snapshot.state != AgentSessionState::Archived)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        sessions.sort_by_key(|snapshot| Reverse(snapshot.updated_at));
-        sessions
     }
 
     pub fn list_in_workspace(
@@ -422,7 +393,6 @@ impl SessionManager {
         let snapshot = AgentSessionSnapshot {
             id,
             workspace_id: source.workspace_id,
-            project_id: source.project_id,
             name,
             state: AgentSessionState::Idle,
             created_at: now,
@@ -438,25 +408,6 @@ impl SessionManager {
             },
         );
         Ok((snapshot, record))
-    }
-
-    fn migrate_workspace_ids(state: &mut SessionManagerState) {
-        for snapshot in state.sessions.values_mut() {
-            if snapshot.workspace_id.as_uuid().is_nil() {
-                snapshot.workspace_id = WorkspaceId::from_uuid(*snapshot.project_id.as_uuid());
-            }
-        }
-        for record in &mut state.events {
-            match &mut record.event {
-                SessionEvent::AgentSessionCreated { snapshot }
-                | SessionEvent::AgentSessionForked { snapshot, .. }
-                    if snapshot.workspace_id.as_uuid().is_nil() =>
-                {
-                    snapshot.workspace_id = WorkspaceId::from_uuid(*snapshot.project_id.as_uuid());
-                }
-                _ => {}
-            }
-        }
     }
 
     pub fn events_since(
@@ -498,12 +449,14 @@ mod tests {
 
     #[test]
     fn creates_idle_session_and_journals_creation() {
-        let project_id = ProjectId::new();
+        let workspace_id = WorkspaceId::new();
         let mut manager = SessionManager::default();
 
-        let (snapshot, event) = manager.create(project_id, "Foundation demo").unwrap();
+        let (snapshot, event) = manager
+            .create_in_workspace(workspace_id, "Foundation demo")
+            .unwrap();
 
-        assert_eq!(snapshot.project_id, project_id);
+        assert_eq!(snapshot.workspace_id, workspace_id);
         assert_eq!(snapshot.state, AgentSessionState::Idle);
         assert_eq!(event.sequence, EventSequence::new(1));
         assert_eq!(manager.session_count(), 1);
@@ -513,7 +466,7 @@ mod tests {
     fn rejects_blank_session_names() {
         let mut manager = SessionManager::default();
 
-        let result = manager.create(ProjectId::new(), "  ");
+        let result = manager.create_in_workspace(WorkspaceId::new(), "  ");
 
         assert_eq!(
             result.unwrap_err().code,
@@ -524,7 +477,9 @@ mod tests {
     #[test]
     fn transitions_are_journaled() {
         let mut manager = SessionManager::default();
-        let (snapshot, _) = manager.create(ProjectId::new(), "Transition demo").unwrap();
+        let (snapshot, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Transition demo")
+            .unwrap();
 
         let (updated, event) = manager
             .transition(snapshot.id, AgentSessionState::Planning)
@@ -538,7 +493,9 @@ mod tests {
     #[test]
     fn state_round_trips_and_forks_with_an_explicit_event() {
         let mut manager = SessionManager::default();
-        let (source, _) = manager.create(ProjectId::new(), "Source").unwrap();
+        let (source, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Source")
+            .unwrap();
         let (fork, event) = manager.fork(source.id, "Fork").unwrap();
         let restored = SessionManager::from_state(manager.export_state()).unwrap();
 
@@ -554,9 +511,11 @@ mod tests {
 
     #[test]
     fn renames_and_archives_sessions_without_deleting_history() {
-        let project_id = ProjectId::new();
+        let workspace_id = WorkspaceId::new();
         let mut manager = SessionManager::default();
-        let (snapshot, _) = manager.create(project_id, "Initial").unwrap();
+        let (snapshot, _) = manager
+            .create_in_workspace(workspace_id, "Initial")
+            .unwrap();
 
         let (renamed, rename_event) = manager.rename(snapshot.id, "Renamed").unwrap();
         assert_eq!(renamed.name, "Renamed");
@@ -571,8 +530,15 @@ mod tests {
         assert_eq!(archived.state, AgentSessionState::Archived);
         let restored = SessionManager::from_state(manager.export_state()).unwrap();
         assert_eq!(restored.get(archived.id).unwrap(), archived);
-        assert!(manager.list(Some(project_id), false).is_empty());
-        assert_eq!(manager.list(Some(project_id), true), vec![archived.clone()]);
+        assert!(
+            manager
+                .list_in_workspace(Some(workspace_id), false)
+                .is_empty()
+        );
+        assert_eq!(
+            manager.list_in_workspace(Some(workspace_id), true),
+            vec![archived.clone()]
+        );
         assert!(matches!(
             archive_event.event,
             SessionEvent::AgentSessionArchived { session_id } if session_id == archived.id

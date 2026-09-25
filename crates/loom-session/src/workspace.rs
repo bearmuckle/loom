@@ -37,21 +37,6 @@ impl WorkspaceManager {
         }
     }
 
-    pub fn ensure_legacy(&mut self, id: WorkspaceId, name: impl Into<String>) -> WorkspaceRecord {
-        if let Some(workspace) = self.workspaces.get(&id) {
-            return workspace.clone();
-        }
-        let now = Timestamp::now();
-        let workspace = WorkspaceRecord {
-            id,
-            name: name.into(),
-            created_at: now,
-            updated_at: now,
-        };
-        self.workspaces.insert(id, workspace.clone());
-        workspace
-    }
-
     pub fn create(&mut self, name: impl Into<String>) -> Result<WorkspaceRecord> {
         let name = validate_name(name.into())?;
         let now = Timestamp::now();
@@ -63,6 +48,30 @@ impl WorkspaceManager {
         };
         self.workspaces.insert(workspace.id, workspace.clone());
         Ok(workspace)
+    }
+
+    pub fn register(&mut self, workspace: WorkspaceRecord) -> Result<WorkspaceRecord> {
+        if workspace.name.trim().is_empty() || workspace.updated_at < workspace.created_at {
+            return Err(LoomError::invalid_request(
+                "workspace record is inconsistent",
+            ));
+        }
+        match self.workspaces.get(&workspace.id) {
+            Some(current) if current.updated_at > workspace.updated_at => Ok(current.clone()),
+            Some(current) if current.updated_at == workspace.updated_at => {
+                if current.name == workspace.name {
+                    Ok(current.clone())
+                } else {
+                    Err(LoomError::invalid_request(
+                        "workspace record conflicts with the registered workspace",
+                    ))
+                }
+            }
+            _ => {
+                self.workspaces.insert(workspace.id, workspace.clone());
+                Ok(workspace)
+            }
+        }
     }
 
     pub fn get(&self, id: WorkspaceId) -> Result<WorkspaceRecord> {
@@ -121,16 +130,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_workspace_records_round_trip() {
+    fn workspace_registration_is_idempotent_and_keeps_the_newest_record() {
         let mut manager = WorkspaceManager::default();
-        let id = WorkspaceId::new();
-        let workspace = manager.ensure_legacy(id, format!("Workspace {id}"));
-        assert_eq!(
-            WorkspaceManager::from_state(manager.export_state())
-                .unwrap()
-                .get(id)
-                .unwrap(),
-            workspace
-        );
+        let workspace = manager.create("Research").unwrap();
+        assert_eq!(manager.register(workspace.clone()).unwrap(), workspace);
+
+        let newer = WorkspaceRecord {
+            name: "Implementation".to_owned(),
+            updated_at: Timestamp::from_unix_millis(
+                workspace.updated_at.as_unix_millis().saturating_add(1),
+            ),
+            ..workspace.clone()
+        };
+        assert_eq!(manager.register(newer.clone()).unwrap(), newer);
+        assert_eq!(manager.register(workspace.clone()).unwrap(), newer);
     }
 }

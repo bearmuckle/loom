@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 pub use loom_core::WorkspaceRecord;
-use loom_core::{AgentSessionId, CheckpointId, EventSequence, ProjectId, RepositoryId, Timestamp};
+use loom_core::{AgentSessionId, CheckpointId, EventSequence, RepositoryId, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -63,14 +63,6 @@ pub struct WorkspaceEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceSnapshot {
-    pub project_id: ProjectId,
-    pub root: String,
-    pub captured_at: Timestamp,
-    pub entries: Vec<WorkspaceEntry>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionFilesystemSnapshot {
     pub session_id: AgentSessionId,
     pub root: String,
@@ -87,28 +79,12 @@ pub enum WorkspaceChangeKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceChange {
-    pub sequence: EventSequence,
-    pub project_id: ProjectId,
-    pub path: String,
-    pub kind: WorkspaceChangeKind,
-    pub revision: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionFilesystemChange {
     pub sequence: EventSequence,
     pub session_id: AgentSessionId,
     pub path: String,
     pub kind: WorkspaceChangeKind,
     pub revision: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceFile {
-    pub path: String,
-    pub content: String,
-    pub revision: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -145,8 +121,7 @@ pub enum WorkspaceControl {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Checkpoint {
     pub id: CheckpointId,
-    pub project_id: ProjectId,
-    pub session_id: Option<AgentSessionId>,
+    pub session_id: AgentSessionId,
     pub label: String,
     pub created_at: Timestamp,
     pub files: BTreeMap<String, CheckpointFile>,

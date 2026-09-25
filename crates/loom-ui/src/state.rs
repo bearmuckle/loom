@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use loom_core::{AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError};
 use loom_protocol::{
     AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitRepositoryStatus,
-    WorkspaceChange, WorkspaceFile,
+    SessionFilesystemChange, SessionFilesystemFile,
 };
 
 use crate::{MAX_TIMELINE_OUTPUT, text_input::TextBufferState};
@@ -72,12 +72,12 @@ impl AgentMode {
 pub(crate) struct ReviewState {
     pub(crate) open: bool,
     pub(crate) panel: ReviewPanel,
-    pub(crate) changes: Vec<WorkspaceChange>,
+    pub(crate) changes: Vec<SessionFilesystemChange>,
     pub(crate) diff: Option<GitDiff>,
     pub(crate) diff_path: Option<String>,
     pub(crate) vcs: Option<GitRepositoryStatus>,
     pub(crate) evidence: Vec<String>,
-    pub(crate) selected_file: Option<WorkspaceFile>,
+    pub(crate) selected_file: Option<SessionFilesystemFile>,
 }
 
 #[derive(Clone, Debug)]

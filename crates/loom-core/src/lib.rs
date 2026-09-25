@@ -11,8 +11,8 @@ mod workspace;
 pub use capability::{Capability, CapabilitySet};
 pub use error::{ErrorCode, LoomError, Result};
 pub use id::{
-    ActivityId, AgentSessionId, CheckpointId, EventSequence, ProjectId, RepositoryId, RequestId,
-    RunId, StepId, TaskId, TerminalId, ToolCallId, WorkspaceId,
+    ActivityId, AgentSessionId, CheckpointId, EventSequence, RepositoryId, RequestId, RunId,
+    StepId, TaskId, TerminalId, ToolCallId, WorkspaceId,
 };
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
 pub use policy::{ActionKind, ApprovalPolicy, PolicyDecision, PolicyEvaluation};

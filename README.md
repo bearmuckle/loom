@@ -81,10 +81,11 @@ The launcher starts a configured worker backend on `127.0.0.1:8765`, waits
 for its health endpoint, then starts Trunk from `crates/loom-ui` on
 `127.0.0.1:8080`. GitHub Copilot is the default model preference; local Ollama
 is added only when its endpoint is configured. It prints a complete URL
-containing the WebSocket endpoint and token; the worker opens the workspace
-configured by `LOOM_WORKSPACE`. Open that URL in a browser. Press `Ctrl-C` to
-stop both processes. Set `LOOM_TOKEN`, `LOOM_BACKEND_BIND`,
-`LOOM_FRONTEND_PORT`, or `LOOM_WORKSPACE` to override the local defaults.
+containing the WebSocket endpoint and token. Open that URL in a browser;
+sessions and their repository checkouts are created independently of the
+worker's launch directory. Press `Ctrl-C` to stop both processes. Set
+`LOOM_TOKEN`, `LOOM_BACKEND_BIND`, or `LOOM_FRONTEND_PORT` to override the
+local defaults.
 GitHub Copilot models become available after signing in. Configure local
 Ollama models explicitly with `LOOM_OLLAMA_ENDPOINT` and optionally
 `LOOM_OLLAMA_MODEL`; unconfigured local models are not listed.

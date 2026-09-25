@@ -8,7 +8,7 @@ use std::{
 
 use globset::Glob;
 use ignore::WalkBuilder;
-use loom_core::{ActionKind, ApprovalPolicy, ProjectId, Result};
+use loom_core::{ActionKind, AgentSessionId, ApprovalPolicy, Result};
 use loom_model::{ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
 use loom_workspace::{Workspace, WorkspaceEdit};
@@ -229,7 +229,7 @@ pub struct ToolExecutor {
 
 impl ToolExecutor {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let workspace = Workspace::open(ProjectId::new(), root)?;
+        let workspace = Workspace::open(AgentSessionId::new(), root)?;
         Ok(Self::new_with_workspace(workspace))
     }
 
@@ -433,7 +433,8 @@ impl ToolExecutor {
         let current_file = match self.workspace.read_file(&arguments.path) {
             Ok(file) => file,
             Err(error) if error.code == loom_core::ErrorCode::NotFound => {
-                loom_workspace::WorkspaceFile {
+                loom_workspace::SessionFilesystemFile {
+                    session_id: self.workspace.session_id(),
                     path: arguments.path.clone(),
                     content: String::new(),
                     revision: String::new(),
@@ -929,12 +930,12 @@ mod tests {
         thread,
     };
 
-    use loom_core::{ProjectId, ToolCallId};
+    use loom_core::{AgentSessionId, ToolCallId};
 
     use super::*;
 
     fn workspace() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("loom-tools-{}", ProjectId::new()));
+        let root = std::env::temp_dir().join(format!("loom-tools-{}", AgentSessionId::new()));
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("README.md"), "Loom workspace\n").unwrap();
         fs::write(root.join(".gitignore"), "ignored/\n").unwrap();

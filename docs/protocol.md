@@ -55,41 +55,35 @@ The target domain model separates organization from execution:
   checkout, while root-relative paths can address files elsewhere in the
   session filesystem.
 
-The protocol should therefore evolve toward workspace lifecycle/list
-operations, workspace-scoped session listing/creation, and session-scoped
-repository attachment and filesystem operations. Existing project-scoped
-requests are transitional compatibility forms, not the target ownership
-model. Migration must be explicit and versioned: clients must not infer a
-workspace ID from a filesystem path or treat a repository ID as a workspace
-ID.
+The protocol exposes workspace lifecycle/list operations,
+workspace-scoped session listing/creation, and session-scoped repository
+attachment and filesystem operations. Workspace IDs are independent of paths
+and repository IDs. Protocol version 2 is the clean break for this ownership
+model; version 1 clients are rejected rather than adapted.
 
-M4 adds `DiscoverCapabilities`, additive `ClientFrame`/`ServerFrame` codec
-types, and `SessionEventsSnapshot`. Existing `RequestEnvelope`,
-`ResponseEnvelope`, and `ServerEventEnvelope` JSON forms remain valid.
+Protocol version 2 includes `DiscoverCapabilities`,
+`ClientFrame`/`ServerFrame` codec types, and `SessionEventsSnapshot`.
 Version compatibility is major-version based: a client may negotiate a newer
 minor version within the same major, while an incompatible major returns the
 existing `unsupported_protocol` error.
 
-Protocol 1.1 scopes approval policies to an agent session. Session snapshots
+Approval policies are scoped to an agent session. Session snapshots
 include the effective approval policy and the session's `auto_approve_actions`
 preference; the session-scoped `SetApprovalPolicy` form updates both for
-subsequent runs. The project-wide request form remains accepted for older
-clients, and existing project policies remain the fallback until a session has
-its own override.
+subsequent runs.
 
 The WebSocket service authenticates during the HTTP upgrade using a bearer
 token, then creates an authenticated view of the existing in-process
 connection. Each request re-checks the token so revocation takes effect
-without restarting the service. Capability negotiation is intersected with
-the token grant, and every project/session/run request is checked against the
-token's explicit scope.
+without restarting the service. Capability negotiation is intersected with the token grant, and every
+workspace/session/run request is checked against the token's explicit scope.
 
 The backend should journal enough event metadata to replay the current
 projection after reconnecting, while avoiding unbounded memory growth. A
 client that falls behind must be able to request a fresh snapshot and resume
 from a known sequence.
 
-M4 retains a bounded global journal (4096 events by default). If a
+The server retains a bounded global journal (4096 events by default). If a
 session-specific cursor is older than the retained range,
 `GetSessionEvents` returns `SessionEventsSnapshot` with the current session
 projection, retained events, the oldest available sequence, and the latest
@@ -112,9 +106,9 @@ event types rather than a generic "run arbitrary method" envelope.
 
 ```text
 CreateWorkspace / ListWorkspaces
-CreateAgentSession
+CreateAgentSessionInWorkspace / ListWorkspaceSessions
 AttachSessionRepository / DetachSessionRepository / ListSessionRepositories
-StartAgentRun
+StartSessionAgentRun
 PauseAgentRun
 ResumeAgentRun
 InterruptAgentRun
@@ -145,11 +139,11 @@ filesystem or process primitives directly:
 AttachSessionRepository / DetachSessionRepository / ListSessionRepositories
 GetSessionFilesystemSnapshot / GetSessionFilesystemEvents
 ReadSessionFile / ApplySessionEdit / TakeSessionFilesystemControl
-CreateCheckpoint / RevertCheckpoint / UndoSessionEdit
-SetApprovalPolicy
-OpenTerminal / WriteTerminalInput / ResizeTerminal
-GetTerminalEvents / CancelTerminal
-StartTask / GetTask / GetTaskEvents / CancelTask
+CreateSessionCheckpoint / RevertSessionCheckpoint / UndoSessionEdit
+SetSessionApprovalPolicy
+OpenSessionTerminal / WriteSessionTerminalInput / ResizeSessionTerminal
+GetSessionTerminalEvents / CancelSessionTerminal
+StartSessionTask / GetSessionTask / GetSessionTaskEvents / CancelSessionTask
 ```
 
 Session filesystem edits carry an optional content revision and return a
@@ -235,14 +229,15 @@ M5 adds only the capability-gated projections required for the focused agent
 client:
 
 ```text
-ListWorkspaces / ListAgentSessions / GetAgentSessionSnapshot
+ListWorkspaces / ListWorkspaceSessions / GetAgentSessionSnapshot
 GetAgentRunSnapshot / GetSessionEvents
-GetSessionFilesystemChanges / ReadSessionFile / GetVcsDiff
-ListTasks / GetTask / GetTaskEvidence
+GetSessionFilesystemChanges / ReadSessionFile / GetSessionVcsDiff
+ListSessionTasks / GetSessionTask / GetSessionTaskEvidence
 ```
 
-Worker-node management adds workspace-scoped `GetWorkspaceConfig` and
-`SetWorkspaceConfig` requests. The persisted config contains a revision,
+Worker-node management adds workspace-scoped
+`GetWorkspaceConfigForWorkspace` and `SetWorkspaceConfigForWorkspace`
+requests. The persisted config contains a revision,
 worker WebSocket URLs, and a CPU pulse threshold for session-card node
 indicators (default 5%); credentials, workspace files, and session state are
 not included. Connected peers receive the updated config when nodes join or

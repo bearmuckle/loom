@@ -1,11 +1,5 @@
+use crate::{AgentSessionId, EventSequence, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-fn missing_workspace_id() -> WorkspaceId {
-    WorkspaceId::from_uuid(Uuid::nil())
-}
-
-use crate::{AgentSessionId, EventSequence, ProjectId, Timestamp, WorkspaceId};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,11 +21,7 @@ pub enum AgentSessionState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentSessionSnapshot {
     pub id: AgentSessionId,
-    #[serde(default = "missing_workspace_id")]
     pub workspace_id: WorkspaceId,
-    /// Compatibility identity for protocol 1.x clients. New code must use
-    /// `workspace_id`; this value no longer identifies a filesystem root.
-    pub project_id: ProjectId,
     pub name: String,
     pub state: AgentSessionState,
     pub created_at: Timestamp,

@@ -6,7 +6,7 @@ use std::{
 };
 
 use loom_core::{
-    AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError, ProjectId, Result, WorkspaceId,
+    AgentSessionId, Capability, CapabilitySet, ErrorCode, LoomError, Result, WorkspaceId,
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -16,14 +16,10 @@ use uuid::Uuid;
 pub struct AuthorizationScope {
     /// `None` means every capability supported by the backend.
     pub capabilities: Option<CapabilitySet>,
-    /// `None` means every project.
-    pub projects: Option<BTreeSet<ProjectId>>,
-    /// `None` means every session in an allowed project.
+    /// `None` means every session in an allowed workspace.
     pub sessions: Option<BTreeSet<AgentSessionId>>,
     /// `None` means every workspace; `Some(empty)` grants no workspace access.
     pub workspaces: Option<BTreeSet<WorkspaceId>>,
-    /// When present, a project may only be opened at its configured root.
-    pub workspace_roots: Option<BTreeMap<ProjectId, PathBuf>>,
     /// When present, local repository sources must be below one of these roots.
     pub repository_source_roots: Option<Vec<PathBuf>>,
 }
@@ -33,30 +29,14 @@ impl AuthorizationScope {
         Self::default()
     }
 
-    pub fn for_projects(
-        projects: impl IntoIterator<Item = ProjectId>,
-        capabilities: CapabilitySet,
-    ) -> Self {
-        Self {
-            capabilities: Some(capabilities),
-            projects: Some(projects.into_iter().collect()),
-            sessions: None,
-            workspaces: None,
-            workspace_roots: None,
-            repository_source_roots: Some(Vec::new()),
-        }
-    }
-
     pub fn for_sessions(
         sessions: impl IntoIterator<Item = AgentSessionId>,
         capabilities: CapabilitySet,
     ) -> Self {
         Self {
             capabilities: Some(capabilities),
-            projects: None,
             sessions: Some(sessions.into_iter().collect()),
             workspaces: None,
-            workspace_roots: None,
             repository_source_roots: Some(Vec::new()),
         }
     }
@@ -67,10 +47,8 @@ impl AuthorizationScope {
     ) -> Self {
         Self {
             capabilities: Some(capabilities),
-            projects: None,
             sessions: None,
             workspaces: Some(workspaces.into_iter().collect()),
-            workspace_roots: None,
             repository_source_roots: Some(Vec::new()),
         }
     }
@@ -79,12 +57,6 @@ impl AuthorizationScope {
         self.capabilities
             .as_ref()
             .is_none_or(|capabilities| capabilities.contains(capability))
-    }
-
-    pub fn allows_project(&self, project_id: ProjectId) -> bool {
-        self.projects
-            .as_ref()
-            .is_none_or(|projects| projects.contains(&project_id))
     }
 
     pub fn allows_session(&self, session_id: AgentSessionId) -> bool {
@@ -116,34 +88,6 @@ impl AuthorizationScope {
         roots
             .iter()
             .any(|root| std::fs::canonicalize(root).is_ok_and(|root| source.starts_with(root)))
-    }
-
-    pub fn allows_project_and_session(
-        &self,
-        project_id: ProjectId,
-        session_id: AgentSessionId,
-    ) -> bool {
-        self.allows_project(project_id) && self.allows_session(session_id)
-    }
-
-    pub fn with_workspace_root(mut self, project_id: ProjectId, root: impl Into<PathBuf>) -> Self {
-        self.workspace_roots
-            .get_or_insert_with(BTreeMap::new)
-            .insert(project_id, root.into());
-        self
-    }
-
-    pub fn allows_workspace_root(&self, project_id: ProjectId, root: &Path) -> bool {
-        let Some(roots) = &self.workspace_roots else {
-            return true;
-        };
-        let Some(expected) = roots.get(&project_id) else {
-            return false;
-        };
-        match (std::fs::canonicalize(expected), std::fs::canonicalize(root)) {
-            (Ok(expected), Ok(root)) => expected == root,
-            _ => false,
-        }
     }
 }
 

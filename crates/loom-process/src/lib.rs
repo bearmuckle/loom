@@ -854,7 +854,7 @@ fn internal_lock_error(resource: &str) -> LoomError {
 mod tests {
     use std::{fs, thread, time::Duration};
 
-    use loom_core::ProjectId;
+    use loom_core::AgentSessionId;
 
     use super::*;
 
@@ -882,7 +882,7 @@ mod tests {
 
     #[test]
     fn terminal_streams_output_and_records_resize_and_exit() {
-        let root = std::env::temp_dir().join(format!("loom-process-{}", ProjectId::new()));
+        let root = std::env::temp_dir().join(format!("loom-process-{}", AgentSessionId::new()));
         fs::create_dir_all(&root).unwrap();
         let (program, args) = command("printf hello");
         let manager = TerminalManager::new();
@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     fn terminal_input_and_cancellation_are_explicit() {
-        let root = std::env::temp_dir().join(format!("loom-process-{}", ProjectId::new()));
+        let root = std::env::temp_dir().join(format!("loom-process-{}", AgentSessionId::new()));
         fs::create_dir_all(&root).unwrap();
         let (program, args) = command(if cfg!(windows) {
             "set /p value & echo %value%"
@@ -937,7 +937,7 @@ mod tests {
 
     #[test]
     fn task_output_is_bounded_and_artifacts_are_reported() {
-        let root = std::env::temp_dir().join(format!("loom-task-{}", ProjectId::new()));
+        let root = std::env::temp_dir().join(format!("loom-task-{}", AgentSessionId::new()));
         fs::create_dir_all(&root).unwrap();
         let (program, args) = command(if cfg!(windows) {
             "echo artifact>artifact.txt & echo 1234567890"

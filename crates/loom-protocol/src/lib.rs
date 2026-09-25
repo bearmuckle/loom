@@ -1,7 +1,7 @@
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, Capability, CapabilitySet, EventSequence, LoomError,
-    ProjectId, ProtocolVersion, RepositoryId, RequestId, RunId, SessionEvent, SessionEventRecord,
-    SessionLimits, Timestamp, ToolCallId, UsageSnapshot, WorkspaceId,
+    ProtocolVersion, RepositoryId, RequestId, RunId, SessionEvent, SessionEventRecord,
+    SessionLimits, ToolCallId, UsageSnapshot, WorkspaceId,
 };
 use loom_model::{
     ModelDescriptor, ModelId, ModelMessage, ProviderHealth, ProviderId, ProviderSummary,
@@ -39,21 +39,11 @@ pub use vcs::{GitBranch, GitDiff, GitFileStatus, GitFileStatusKind, GitRepositor
 pub use workspace::{
     Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, RevertResult,
     SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
-    UndoResult, WorkerNodeConfig, WorkspaceChange, WorkspaceChangeKind, WorkspaceConfig,
-    WorkspaceControl, WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceFile, WorkspaceRecord, WorkspaceSnapshot,
+    UndoResult, WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
+    WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 2);
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ProjectSnapshot {
-    pub id: ProjectId,
-    pub name: String,
-    pub root: Option<String>,
-    pub session_count: usize,
-    pub updated_at: Option<Timestamp>,
-}
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerNodeResources {
@@ -165,6 +155,9 @@ pub enum ClientRequest {
     GetWorkerNodeStatus,
     CreateWorkspace {
         name: String,
+    },
+    RegisterWorkspace {
+        workspace: WorkspaceRecord,
     },
     ListWorkspaces,
     RenameWorkspace {
@@ -321,15 +314,6 @@ pub enum ClientRequest {
         policy: loom_core::ApprovalPolicy,
         auto_approve_actions: Option<bool>,
     },
-    ListProjects,
-    ListAgentSessions {
-        project_id: Option<ProjectId>,
-        include_archived: bool,
-    },
-    CreateAgentSession {
-        project_id: ProjectId,
-        name: String,
-    },
     GetAgentSession {
         session_id: AgentSessionId,
     },
@@ -350,24 +334,6 @@ pub enum ClientRequest {
     GetRecentSessionEvents {
         session_id: AgentSessionId,
         limit: u32,
-    },
-    StartAgentRun {
-        session_id: AgentSessionId,
-        task: String,
-        model: ModelId,
-        workspace_root: String,
-        system_instructions: Option<String>,
-        repository_instructions: Option<String>,
-    },
-    StartAgentRunWithOptions {
-        session_id: AgentSessionId,
-        task: String,
-        model: ModelId,
-        workspace_root: String,
-        system_instructions: Option<String>,
-        repository_instructions: Option<String>,
-        limits: SessionLimits,
-        context: ContextAssemblyOptions,
     },
     GetAgentRun {
         run_id: RunId,
@@ -435,127 +401,6 @@ pub enum ClientRequest {
     InspectAgentContext {
         run_id: RunId,
     },
-    OpenWorkspace {
-        project_id: ProjectId,
-        root: String,
-    },
-    GetWorkspaceConfig {
-        project_id: ProjectId,
-    },
-    SetWorkspaceConfig {
-        project_id: ProjectId,
-        config: WorkspaceConfig,
-    },
-    GetWorkspaceSnapshot {
-        project_id: ProjectId,
-    },
-    GetWorkspaceEvents {
-        project_id: ProjectId,
-        after_sequence: Option<EventSequence>,
-    },
-    GetWorkspaceChanges {
-        project_id: ProjectId,
-        after_sequence: Option<EventSequence>,
-    },
-    ReadWorkspaceFile {
-        project_id: ProjectId,
-        path: String,
-    },
-    ApplyWorkspaceEdit {
-        project_id: ProjectId,
-        edit: WorkspaceEdit,
-    },
-    TakeWorkspaceControl {
-        project_id: ProjectId,
-        control: WorkspaceControl,
-    },
-    CreateCheckpoint {
-        project_id: ProjectId,
-        session_id: Option<AgentSessionId>,
-        label: String,
-    },
-    RevertCheckpoint {
-        project_id: ProjectId,
-        checkpoint_id: loom_core::CheckpointId,
-    },
-    UndoWorkspaceEdit {
-        project_id: ProjectId,
-    },
-    SetApprovalPolicy {
-        project_id: ProjectId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_id: Option<AgentSessionId>,
-        policy: loom_core::ApprovalPolicy,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auto_approve_actions: Option<bool>,
-    },
-    OpenTerminal {
-        project_id: ProjectId,
-        command: String,
-        args: Vec<String>,
-        cwd: Option<String>,
-    },
-    WriteTerminalInput {
-        project_id: ProjectId,
-        terminal_id: loom_core::TerminalId,
-        input: String,
-    },
-    ResizeTerminal {
-        project_id: ProjectId,
-        terminal_id: loom_core::TerminalId,
-        rows: u16,
-        columns: u16,
-    },
-    GetTerminalEvents {
-        project_id: ProjectId,
-        terminal_id: loom_core::TerminalId,
-        after_sequence: Option<EventSequence>,
-    },
-    CancelTerminal {
-        project_id: ProjectId,
-        terminal_id: loom_core::TerminalId,
-    },
-    StartTask {
-        project_id: ProjectId,
-        spec: TaskSpec,
-    },
-    ListTasks {
-        project_id: ProjectId,
-    },
-    GetTask {
-        project_id: ProjectId,
-        task_id: loom_core::TaskId,
-    },
-    GetTaskEvents {
-        project_id: ProjectId,
-        task_id: loom_core::TaskId,
-        after_sequence: Option<EventSequence>,
-    },
-    CancelTask {
-        project_id: ProjectId,
-        task_id: loom_core::TaskId,
-    },
-    GetContextFiles {
-        project_id: ProjectId,
-    },
-    GetVcsStatus {
-        project_id: ProjectId,
-    },
-    GetVcsDiff {
-        project_id: ProjectId,
-        path: Option<String>,
-        staged: bool,
-    },
-    GetVcsBranches {
-        project_id: ProjectId,
-    },
-    GetVcsConflicts {
-        project_id: ProjectId,
-    },
-    GetTaskEvidence {
-        project_id: ProjectId,
-        task_id: loom_core::TaskId,
-    },
     AttachRunEvidence {
         run_id: RunId,
         evidence: Vec<loom_core::EvidenceLink>,
@@ -567,14 +412,14 @@ impl ClientRequest {
         match self {
             Self::Negotiate { .. } | Self::DiscoverCapabilities => None,
             Self::GetWorkerNodeStatus => Some(Capability::ReadWorkerNodeStatus),
-            Self::CreateWorkspace { .. } | Self::RenameWorkspace { .. } => {
-                Some(Capability::ManageWorkspaces)
-            }
+            Self::CreateWorkspace { .. }
+            | Self::RegisterWorkspace { .. }
+            | Self::RenameWorkspace { .. } => Some(Capability::ManageWorkspaces),
             Self::ListWorkspaces | Self::ListWorkspaceSessions { .. } => {
                 Some(Capability::ReadAgentSession)
             }
             Self::CreateAgentSessionInWorkspace { .. } => Some(Capability::CreateAgentSession),
-            Self::GetWorkspaceConfigForWorkspace { .. } => Some(Capability::ReadWorkspace),
+            Self::GetWorkspaceConfigForWorkspace { .. } => Some(Capability::ReadWorkspaceConfig),
             Self::SetWorkspaceConfigForWorkspace { .. } => Some(Capability::ManageWorkspaces),
             Self::AttachSessionRepository { .. } | Self::DetachSessionRepository { .. } => {
                 Some(Capability::ManageSessionRepositories)
@@ -596,22 +441,18 @@ impl ClientRequest {
             | Self::GetSessionVcsBranches { .. }
             | Self::GetSessionVcsConflicts { .. } => Some(Capability::ReadVcsStatus),
             Self::GetSessionVcsDiff { .. } => Some(Capability::ReadVcsDiff),
-            Self::OpenSessionTerminal { .. } => Some(Capability::OpenTerminal),
+            Self::OpenSessionTerminal { .. } => Some(Capability::OpenSessionTerminal),
             Self::WriteSessionTerminalInput { .. }
             | Self::ResizeSessionTerminal { .. }
-            | Self::CancelSessionTerminal { .. } => Some(Capability::ControlTerminal),
-            Self::GetSessionTerminalEvents { .. } => Some(Capability::ControlTerminal),
-            Self::StartSessionTask { .. } => Some(Capability::StartTask),
+            | Self::CancelSessionTerminal { .. } => Some(Capability::ControlSessionTerminal),
+            Self::GetSessionTerminalEvents { .. } => Some(Capability::ControlSessionTerminal),
+            Self::StartSessionTask { .. } => Some(Capability::StartSessionTask),
             Self::ListSessionTasks { .. }
             | Self::GetSessionTask { .. }
-            | Self::GetSessionTaskEvents { .. } => Some(Capability::ReadTask),
-            Self::CancelSessionTask { .. } => Some(Capability::ControlTask),
-            Self::GetSessionTaskEvidence { .. } => Some(Capability::ReadTaskEvidence),
+            | Self::GetSessionTaskEvents { .. } => Some(Capability::ReadSessionTask),
+            Self::CancelSessionTask { .. } => Some(Capability::ControlSessionTask),
+            Self::GetSessionTaskEvidence { .. } => Some(Capability::ReadSessionTaskEvidence),
             Self::SetSessionApprovalPolicy { .. } => Some(Capability::ConfigureApprovalPolicy),
-            Self::ListProjects | Self::ListAgentSessions { .. } => {
-                Some(Capability::ReadAgentSession)
-            }
-            Self::CreateAgentSession { .. } => Some(Capability::CreateAgentSession),
             Self::GetAgentSession { .. } | Self::GetAgentSessionSnapshot { .. } => {
                 Some(Capability::ReadAgentSession)
             }
@@ -621,8 +462,6 @@ impl ClientRequest {
             Self::GetSessionEvents { .. } | Self::GetRecentSessionEvents { .. } => {
                 Some(Capability::SubscribeSessionEvents)
             }
-            Self::StartAgentRun { .. } => Some(Capability::StartAgentRun),
-            Self::StartAgentRunWithOptions { .. } => Some(Capability::StartAgentRun),
             Self::GetAgentRun { .. } | Self::GetAgentRunSnapshot { .. } => {
                 Some(Capability::ReadAgentRun)
             }
@@ -648,36 +487,6 @@ impl ClientRequest {
             Self::GetRunUsage { .. } => Some(Capability::ReadUsage),
             Self::GetSessionUsage { .. } => Some(Capability::ReadUsage),
             Self::InspectAgentContext { .. } => Some(Capability::InspectContext),
-            Self::OpenWorkspace { .. } => Some(Capability::OpenWorkspace),
-            Self::GetWorkspaceConfig { .. } => Some(Capability::ReadWorkspace),
-            Self::SetWorkspaceConfig { .. } => Some(Capability::OpenWorkspace),
-            Self::GetWorkspaceSnapshot { .. } | Self::ReadWorkspaceFile { .. } => {
-                Some(Capability::ReadWorkspace)
-            }
-            Self::GetWorkspaceEvents { .. } => Some(Capability::SubscribeWorkspaceEvents),
-            Self::GetWorkspaceChanges { .. } => Some(Capability::ReadWorkspace),
-            Self::ApplyWorkspaceEdit { .. } => Some(Capability::WriteWorkspace),
-            Self::TakeWorkspaceControl { .. } => Some(Capability::TakeoverWorkspace),
-            Self::CreateCheckpoint { .. }
-            | Self::RevertCheckpoint { .. }
-            | Self::UndoWorkspaceEdit { .. } => Some(Capability::ManageCheckpoints),
-            Self::SetApprovalPolicy { .. } => Some(Capability::ConfigureApprovalPolicy),
-            Self::OpenTerminal { .. } => Some(Capability::OpenTerminal),
-            Self::WriteTerminalInput { .. }
-            | Self::ResizeTerminal { .. }
-            | Self::CancelTerminal { .. } => Some(Capability::ControlTerminal),
-            Self::GetTerminalEvents { .. } => Some(Capability::ControlTerminal),
-            Self::StartTask { .. } => Some(Capability::StartTask),
-            Self::ListTasks { .. } | Self::GetTask { .. } | Self::GetTaskEvents { .. } => {
-                Some(Capability::ReadTask)
-            }
-            Self::CancelTask { .. } => Some(Capability::ControlTask),
-            Self::GetContextFiles { .. } => Some(Capability::ReadWorkspaceInstructions),
-            Self::GetVcsStatus { .. }
-            | Self::GetVcsBranches { .. }
-            | Self::GetVcsConflicts { .. } => Some(Capability::ReadVcsStatus),
-            Self::GetVcsDiff { .. } => Some(Capability::ReadVcsDiff),
-            Self::GetTaskEvidence { .. } => Some(Capability::ReadTaskEvidence),
             Self::AttachRunEvidence { .. } => Some(Capability::ControlAgentRun),
         }
     }
@@ -686,6 +495,7 @@ impl ClientRequest {
         matches!(
             self,
             Self::CreateWorkspace { .. }
+                | Self::RegisterWorkspace { .. }
                 | Self::RenameWorkspace { .. }
                 | Self::CreateAgentSessionInWorkspace { .. }
                 | Self::SetWorkspaceConfigForWorkspace { .. }
@@ -705,11 +515,8 @@ impl ClientRequest {
                 | Self::StartSessionTask { .. }
                 | Self::CancelSessionTask { .. }
                 | Self::SetSessionApprovalPolicy { .. }
-                | Self::CreateAgentSession { .. }
                 | Self::RenameAgentSession { .. }
                 | Self::ArchiveAgentSession { .. }
-                | Self::StartAgentRun { .. }
-                | Self::StartAgentRunWithOptions { .. }
                 | Self::ApproveAgentAction { .. }
                 | Self::RejectAgentAction { .. }
                 | Self::SendAgentMessage { .. }
@@ -720,20 +527,6 @@ impl ClientRequest {
                 | Self::RetryAgentFromCheckpoint { .. }
                 | Self::ForkAgentSession { .. }
                 | Self::ConfigureGitHubCopilot { .. }
-                | Self::OpenWorkspace { .. }
-                | Self::SetWorkspaceConfig { .. }
-                | Self::ApplyWorkspaceEdit { .. }
-                | Self::TakeWorkspaceControl { .. }
-                | Self::CreateCheckpoint { .. }
-                | Self::RevertCheckpoint { .. }
-                | Self::UndoWorkspaceEdit { .. }
-                | Self::SetApprovalPolicy { .. }
-                | Self::OpenTerminal { .. }
-                | Self::WriteTerminalInput { .. }
-                | Self::ResizeTerminal { .. }
-                | Self::CancelTerminal { .. }
-                | Self::StartTask { .. }
-                | Self::CancelTask { .. }
                 | Self::AttachRunEvidence { .. }
         )
     }
@@ -780,9 +573,6 @@ pub enum ServerResponse {
     },
     SessionRepositoryAttached(SessionRepository),
     SessionRepositoryDetached,
-    Projects {
-        projects: Vec<ProjectSnapshot>,
-    },
     AgentSessions {
         sessions: Vec<AgentSessionSnapshot>,
     },
@@ -832,23 +622,13 @@ pub enum ServerResponse {
         provider: ProviderUsageSummary,
     },
     ContextInspection(ContextInspection),
-    WorkspaceOpened(WorkspaceSnapshot),
     WorkspaceConfig(WorkspaceConfig),
     WorkspaceConfigUpdated,
-    WorkspaceSnapshot(WorkspaceSnapshot),
     SessionFilesystemSnapshot(SessionFilesystemSnapshot),
-    WorkspaceEvents {
-        events: Vec<WorkspaceChange>,
-    },
-    WorkspaceChanges {
-        changes: Vec<WorkspaceChange>,
-        truncated: bool,
-    },
     SessionFilesystemChanges {
         changes: Vec<SessionFilesystemChange>,
         truncated: bool,
     },
-    WorkspaceFile(WorkspaceFile),
     SessionFilesystemFile(SessionFilesystemFile),
     WorkspaceEditApplied(WorkspaceEditResult),
     WorkspaceControl(WorkspaceControl),
@@ -947,8 +727,8 @@ pub enum ServerEvent {
     Agent {
         event: AgentEvent,
     },
-    WorkspaceChanged {
-        change: WorkspaceChange,
+    SessionFilesystemChanged {
+        change: SessionFilesystemChange,
     },
     Terminal {
         event: TerminalEventRecord,
