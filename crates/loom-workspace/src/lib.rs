@@ -246,37 +246,33 @@ impl Workspace {
                 false,
             ));
         }
-        let mut persisted = persisted;
-        for checkpoint in &mut persisted.checkpoints {
-            for (path, file) in &mut checkpoint.files {
-                let current_path = self.resolve_relative(path, true)?;
-                let expected_revision = revision(&file.content);
-                if file.revision == legacy_revision(&file.content) {
-                    file.revision = expected_revision.clone();
-                } else if file.revision != expected_revision {
+        for checkpoint in &persisted.checkpoints {
+            for (path, file) in &checkpoint.files {
+                self.resolve_relative(path, true)?;
+                if file.revision != revision(&file.content) {
                     return Err(LoomError::new(
                         ErrorCode::MalformedPayload,
                         format!("persisted checkpoint revision for '{path}' is invalid"),
                         false,
                     ));
                 }
-                if file.expected_revision == legacy_revision(&file.content) {
-                    file.expected_revision = expected_revision;
-                    continue;
-                }
-                if let Ok(current) = fs::read_to_string(current_path)
-                    && file.expected_revision == legacy_revision(&current)
-                {
-                    file.expected_revision = revision(&current);
+                if !is_current_revision(&file.expected_revision) {
+                    return Err(LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted checkpoint expected revision for '{path}' is invalid"),
+                        false,
+                    ));
                 }
             }
         }
-        for edit in &mut persisted.edits {
+        for edit in &persisted.edits {
             self.resolve_relative(&edit.path, true)?;
-            if let Ok(current) = fs::read_to_string(self.resolve_relative(&edit.path, true)?)
-                && edit.after_revision == legacy_revision(&current)
-            {
-                edit.after_revision = revision(&current);
+            if !is_current_revision(&edit.after_revision) {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted edit revision for '{}' is invalid", edit.path),
+                    false,
+                ));
             }
         }
         if persisted
@@ -1037,13 +1033,11 @@ fn revision_bytes(content: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn legacy_revision(content: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in content.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+fn is_current_revision(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn unified_diff(path: &str, before: &str, after: &str) -> String {
@@ -1189,28 +1183,51 @@ mod tests {
     }
 
     #[test]
-    fn workspace_state_upgrades_legacy_checkpoint_revisions() {
+    fn workspace_state_rejects_unsupported_revisions() {
         let (workspace, root) = workspace();
-        let checkpoint = workspace
-            .create_checkpoint(None, "legacy checkpoint")
+        workspace.create_checkpoint(None, "checkpoint").unwrap();
+        let before = workspace.read_file("README.md").unwrap();
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: "hello".to_owned(),
+                new_text: "agent".to_owned(),
+                expected_revision: Some(before.revision),
+            })
             .unwrap();
-        let mut state = workspace.export_state().unwrap();
-        let file = state
-            .checkpoints
-            .first_mut()
-            .unwrap()
-            .files
-            .get_mut("README.md")
-            .unwrap();
-        file.revision = legacy_revision(&file.content);
-        file.expected_revision = file.revision.clone();
-
+        let state = workspace.export_state().unwrap();
         let restored = Workspace::open(workspace.project_id(), &root).unwrap();
+        for field in ["revision", "expected_revision", "after_revision"] {
+            let mut invalid = state.clone();
+            match field {
+                "revision" => {
+                    invalid.checkpoints[0]
+                        .files
+                        .get_mut("README.md")
+                        .unwrap()
+                        .revision = "0123456789abcdef".to_owned();
+                }
+                "expected_revision" => {
+                    invalid.checkpoints[0]
+                        .files
+                        .get_mut("README.md")
+                        .unwrap()
+                        .expected_revision = "0123456789abcdef".to_owned();
+                }
+                "after_revision" => {
+                    invalid.edits[0].after_revision = "0123456789abcdef".to_owned();
+                }
+                _ => unreachable!(),
+            }
+            let error = restored.restore_state(invalid).unwrap_err();
+            assert_eq!(error.code, ErrorCode::MalformedPayload, "{field}");
+            assert!(error.message.contains("revision"), "{field}: {error}");
+        }
         restored.restore_state(state).unwrap();
-
-        let restored_file = &restored.checkpoint(checkpoint.id).unwrap().files["README.md"];
-        assert_eq!(restored_file.revision, revision("hello\n"));
-        assert_eq!(restored_file.expected_revision, revision("hello\n"));
+        assert_eq!(
+            restored.export_state().unwrap(),
+            workspace.export_state().unwrap()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

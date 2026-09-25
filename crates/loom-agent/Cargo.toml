@@ -17,4 +17,3 @@ serde_json.workspace = true
 
 [dev-dependencies]
 loom-providers.workspace = true
-uuid.workspace = true
