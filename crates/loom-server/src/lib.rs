@@ -21,10 +21,10 @@ use loom_persistence::{CURRENT_SCHEMA_VERSION, FilePersistence};
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
-    ClientRequest, GitHubCopilotLoginStatus, NegotiationResult, RequestEnvelope, ResponseEnvelope,
-    ServerEventEnvelope, ServerResponse, SessionFilesystemChange, SessionFilesystemFile,
-    SessionFilesystemSnapshot, SessionRepository, WorkerNodeResources, WorkerNodeStatus,
-    WorkspaceConfig, unsupported_version_error,
+    ClientRequest, GitHubCopilotLoginStatus, GitHubRepository, NegotiationResult, RequestEnvelope,
+    ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionDirectory,
+    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
+    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
@@ -47,6 +47,171 @@ fn json_value<T: Serialize>(value: T) -> Result<Value> {
         LoomError::new(
             ErrorCode::Persistence,
             format!("could not serialize persistence section: {error}"),
+            false,
+        )
+    })
+}
+
+#[derive(Deserialize)]
+struct GitHubApiRepository {
+    full_name: String,
+    description: Option<String>,
+    clone_url: String,
+    private: bool,
+    default_branch: String,
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {
+    let source = fs::canonicalize(source).map_err(|error| {
+        LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            format!("could not resolve local directory: {error}"),
+            false,
+        )
+    })?;
+    if !source.is_dir() {
+        return Err(LoomError::invalid_request(
+            "local import source must be a directory",
+        ));
+    }
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| LoomError::invalid_request("local import destination must have a parent"))?;
+    fs::create_dir_all(destination_parent).map_err(|error| {
+        LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            format!("could not create local import destination: {error}"),
+            false,
+        )
+    })?;
+    let destination_parent = fs::canonicalize(destination_parent).map_err(|error| {
+        LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            format!("could not resolve local import destination: {error}"),
+            false,
+        )
+    })?;
+    if destination_parent.starts_with(&source) {
+        return Err(LoomError::invalid_request(
+            "cannot import a directory that contains the session filesystem",
+        ));
+    }
+    let destination = destination_parent.join(
+        destination
+            .file_name()
+            .ok_or_else(|| LoomError::invalid_request("invalid import destination"))?,
+    );
+    if destination.exists() {
+        return Err(LoomError::conflict(
+            "local import destination already exists",
+        ));
+    }
+    let temporary = destination.with_file_name(format!(".loom-import-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&temporary).map_err(|error| {
+        LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            format!("could not create temporary import directory: {error}"),
+            false,
+        )
+    })?;
+
+    fn copy_tree(
+        root: &Path,
+        source: &Path,
+        destination: &Path,
+        ancestors: &mut BTreeSet<PathBuf>,
+    ) -> Result<()> {
+        let source = fs::canonicalize(source).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not resolve imported path: {error}"),
+                false,
+            )
+        })?;
+        if !source.starts_with(root) {
+            return Err(LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                "local import contains a symbolic link outside its source directory",
+                false,
+            ));
+        }
+        let metadata = fs::metadata(&source).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not inspect imported path: {error}"),
+                false,
+            )
+        })?;
+        if metadata.is_dir() {
+            if !ancestors.insert(source.clone()) {
+                return Err(LoomError::invalid_request(
+                    "local import contains a directory link cycle",
+                ));
+            }
+            fs::create_dir_all(destination).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not create imported directory: {error}"),
+                    false,
+                )
+            })?;
+            for entry in fs::read_dir(&source).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not read imported directory: {error}"),
+                    false,
+                )
+            })? {
+                let entry = entry.map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        format!("could not read imported entry: {error}"),
+                        false,
+                    )
+                })?;
+                copy_tree(
+                    root,
+                    &entry.path(),
+                    &destination.join(entry.file_name()),
+                    ancestors,
+                )?;
+            }
+            ancestors.remove(&source);
+        } else if metadata.is_file() {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        format!("could not create imported file parent: {error}"),
+                        false,
+                    )
+                })?;
+            }
+            fs::copy(source, destination).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not copy imported file: {error}"),
+                    false,
+                )
+            })?;
+        } else {
+            return Err(LoomError::invalid_request(
+                "local import contains an unsupported special file",
+            ));
+        }
+        Ok(())
+    }
+
+    let result = copy_tree(&source, &source, &temporary, &mut BTreeSet::new());
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    fs::rename(&temporary, &destination).map_err(|error| {
+        let _ = fs::remove_dir_all(&temporary);
+        LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            format!("could not install imported directory: {error}"),
             false,
         )
     })
@@ -409,6 +574,8 @@ struct PersistedBackendState {
 struct PersistedSessionFilesystem {
     filesystem: loom_workspace::WorkspaceStateSnapshot,
     repositories: BTreeMap<RepositoryId, SessionRepository>,
+    #[serde(default)]
+    directories: Vec<SessionDirectory>,
 }
 
 /// One agent run owned by the backend.
@@ -993,6 +1160,7 @@ impl InProcessBackend {
                 Capability::JsonProtocol,
                 Capability::ManageWorkspaces,
                 Capability::ManageSessionRepositories,
+                Capability::BrowseGitHubRepositories,
                 Capability::ReadSessionFilesystem,
                 Capability::WriteSessionFilesystem,
             ]),
@@ -1362,6 +1530,9 @@ impl InProcessBackend {
                 ));
             }
             let filesystem = Workspace::open(session_id, &canonical_expected_root)?;
+            for directory in &persisted.directories {
+                filesystem.mount_directory(&directory.path, &directory.source)?;
+            }
             filesystem.restore_state(persisted.filesystem)?;
             for (repository_id, repository) in &persisted.repositories {
                 if *repository_id != repository.id {
@@ -1371,7 +1542,7 @@ impl InProcessBackend {
                         false,
                     ));
                 }
-                let path = checked_session_path(filesystem.root(), &repository.path)?;
+                let path = filesystem.directory_path(&repository.path)?;
                 let service = GitService::open(path)?;
                 self.session_vcs()?
                     .insert((session_id, *repository_id), service);
@@ -1470,6 +1641,14 @@ impl InProcessBackend {
                             .get(session_id)
                             .cloned()
                             .unwrap_or_default(),
+                        directories: filesystem
+                            .mounted_directories()?
+                            .into_iter()
+                            .map(|(path, source)| SessionDirectory {
+                                path,
+                                source: source.display().to_string(),
+                            })
+                            .collect(),
                     },
                 ))
             })
@@ -1862,6 +2041,267 @@ impl InProcessConnection {
             })
     }
 
+    fn import_session_directory(
+        &self,
+        session_id: AgentSessionId,
+        source: String,
+        relative_path: String,
+    ) -> Result<ServerResponse> {
+        let source_path = Path::new(&source);
+        if !source_path.is_absolute() {
+            return Err(LoomError::invalid_request(
+                "local import source must be an absolute path",
+            ));
+        }
+        if GitService::open(source_path).is_ok() {
+            let repository =
+                self.attach_session_repository(session_id, source, relative_path.clone(), None)?;
+            return Ok(ServerResponse::SessionDirectoryImported {
+                path: relative_path,
+                repository: Some(repository),
+            });
+        }
+        let session = self.backend.sessions()?.get(session_id)?;
+        if matches!(
+            session.state,
+            AgentSessionState::Queued
+                | AgentSessionState::Planning
+                | AgentSessionState::AwaitingApproval
+                | AgentSessionState::Paused
+                | AgentSessionState::Executing
+                | AgentSessionState::Evaluating
+                | AgentSessionState::NeedsInput
+        ) {
+            return Err(LoomError::invalid_state(
+                "directories cannot be imported while a session is active",
+            ));
+        }
+        let relative = checked_session_relative_path(&relative_path)?;
+        let filesystem = self.session_filesystem(session_id)?;
+        let destination = filesystem.root().join(&relative);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| LoomError::invalid_request("session import path must have a parent"))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not create session import parent: {error}"),
+                false,
+            )
+        })?;
+        let root = fs::canonicalize(filesystem.root()).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not resolve session filesystem root: {error}"),
+                false,
+            )
+        })?;
+        let parent = fs::canonicalize(parent).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not resolve session import parent: {error}"),
+                false,
+            )
+        })?;
+        if !parent.starts_with(&root) {
+            return Err(LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                "session import path escapes its filesystem root",
+                false,
+            ));
+        }
+        let destination = parent.join(
+            destination
+                .file_name()
+                .ok_or_else(|| LoomError::invalid_request("invalid session import path"))?,
+        );
+        copy_directory_contents(source_path, &destination)?;
+        Ok(ServerResponse::SessionDirectoryImported {
+            path: relative_path,
+            repository: None,
+        })
+    }
+
+    fn attach_session_directory(
+        &self,
+        session_id: AgentSessionId,
+        source: String,
+        relative_path: String,
+    ) -> Result<ServerResponse> {
+        let session = self.backend.sessions()?.get(session_id)?;
+        if matches!(
+            session.state,
+            AgentSessionState::Queued
+                | AgentSessionState::Planning
+                | AgentSessionState::AwaitingApproval
+                | AgentSessionState::Paused
+                | AgentSessionState::Executing
+                | AgentSessionState::Evaluating
+                | AgentSessionState::NeedsInput
+        ) {
+            return Err(LoomError::invalid_state(
+                "directories cannot be attached while a session is active",
+            ));
+        }
+        checked_session_relative_path(&relative_path)?;
+        let filesystem = self.session_filesystem(session_id)?;
+        let source_path = Path::new(&source);
+        if !source_path.is_absolute() {
+            return Err(LoomError::invalid_request(
+                "local directory source must be an absolute path",
+            ));
+        }
+        let source_path = Workspace::canonical_root(source_path)?;
+        let mut discovered = Vec::new();
+        if source_path.join(".git").exists() {
+            discovered.push((relative_path.clone(), source_path.clone()));
+        }
+        for entry in fs::read_dir(&source_path).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not inspect local directory: {error}"),
+                false,
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not inspect local directory entry: {error}"),
+                    false,
+                )
+            })?;
+            if entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.path().join(".git").exists()
+            {
+                discovered.push((
+                    format!("{}/{}", relative_path, entry.file_name().to_string_lossy()),
+                    entry.path(),
+                ));
+            }
+        }
+        let mut services = Vec::new();
+        for (path, source_path) in discovered {
+            let service = GitService::open(&source_path)?;
+            services.push((path, service));
+        }
+        let source_path = filesystem.mount_directory(&relative_path, &source_path)?;
+        let mut repositories = Vec::new();
+        for (path, service) in services {
+            let repository = SessionRepository {
+                id: RepositoryId::new(),
+                source: service.root().display().to_string(),
+                path,
+                revision: service.status()?.head,
+                attached_at: Timestamp::now(),
+            };
+            self.backend
+                .session_vcs()?
+                .insert((session_id, repository.id), service);
+            self.backend
+                .session_repositories()?
+                .entry(session_id)
+                .or_default()
+                .insert(repository.id, repository.clone());
+            repositories.push(repository);
+        }
+        Ok(ServerResponse::SessionDirectoryAttached {
+            directory: SessionDirectory {
+                source: source_path.display().to_string(),
+                path: relative_path,
+            },
+            repositories,
+        })
+    }
+
+    fn detach_session_directory(&self, session_id: AgentSessionId, path: String) -> Result<()> {
+        let session = self.backend.sessions()?.get(session_id)?;
+        if matches!(
+            session.state,
+            AgentSessionState::Queued
+                | AgentSessionState::Planning
+                | AgentSessionState::AwaitingApproval
+                | AgentSessionState::Paused
+                | AgentSessionState::Executing
+                | AgentSessionState::Evaluating
+                | AgentSessionState::NeedsInput
+        ) {
+            return Err(LoomError::invalid_state(
+                "directories cannot be detached while a session is active",
+            ));
+        }
+        let filesystem = self.session_filesystem(session_id)?;
+        filesystem.unmount_directory(&path)?;
+        let removed = self
+            .backend
+            .session_repositories()?
+            .entry(session_id)
+            .or_default()
+            .iter()
+            .filter(|(_, repository)| {
+                repository.path == path || repository.path.starts_with(&format!("{path}/"))
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for repository_id in removed {
+            self.backend
+                .session_repositories()?
+                .entry(session_id)
+                .or_default()
+                .remove(&repository_id);
+            self.backend
+                .session_vcs()?
+                .remove(&(session_id, repository_id));
+        }
+        Ok(())
+    }
+
+    fn list_github_repositories(&self) -> Result<ServerResponse> {
+        let token = self.backend.providers.github_account_token()?;
+        let mut repositories = Vec::new();
+        for page in 1..=100 {
+            let url =
+                format!("https://api.github.com/user/repos?per_page=100&sort=updated&page={page}");
+            let mut response = ureq::get(&url)
+                .header("Accept", "application/vnd.github+json")
+                .header("Authorization", &format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "Loom")
+                .call()
+                .map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::ProviderAuthentication,
+                        format!("could not list GitHub repositories: {error}"),
+                        true,
+                    )
+                })?;
+            let page_repositories: Vec<GitHubApiRepository> =
+                response.body_mut().read_json().map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::ProviderInvalidResponse,
+                        format!("GitHub returned an invalid repository list: {error}"),
+                        false,
+                    )
+                })?;
+            let page_len = page_repositories.len();
+            repositories.extend(
+                page_repositories
+                    .into_iter()
+                    .map(|repository| GitHubRepository {
+                        full_name: repository.full_name,
+                        description: repository.description,
+                        clone_url: repository.clone_url,
+                        private: repository.private,
+                        default_branch: repository.default_branch,
+                    }),
+            );
+            if page_len < 100 {
+                break;
+            }
+        }
+        repositories.sort_by(|left, right| left.full_name.cmp(&right.full_name));
+        Ok(ServerResponse::GitHubRepositories { repositories })
+    }
+
     fn attach_session_repository(
         &self,
         session_id: AgentSessionId,
@@ -1933,7 +2373,16 @@ impl InProcessConnection {
                 "temporary repository checkout path already exists",
             ));
         }
-        let cloned = match GitService::clone_from(&source, &temporary, revision.as_deref()) {
+        let github_token = url::Url::parse(&source)
+            .ok()
+            .filter(|url| url.scheme() == "https" && url.host_str() == Some("github.com"))
+            .and_then(|_| self.backend.providers.github_account_token().ok());
+        let cloned = match GitService::clone_from_authenticated(
+            &source,
+            &temporary,
+            revision.as_deref(),
+            github_token.as_deref(),
+        ) {
             Ok(cloned) => cloned,
             Err(error) => {
                 if temporary.exists() {
@@ -2015,14 +2464,16 @@ impl InProcessConnection {
             .cloned()
             .ok_or_else(|| LoomError::not_found("session repository", repository_id))?;
         let filesystem = self.session_filesystem(session_id)?;
-        let path = checked_session_path(filesystem.root(), &repository.path)?;
-        fs::remove_dir_all(&path).map_err(|error| {
-            LoomError::new(
-                ErrorCode::ToolExecution,
-                format!("could not remove detached repository checkout: {error}"),
-                false,
-            )
-        })?;
+        if filesystem.mounted_source_for(&repository.path)?.is_none() {
+            let path = filesystem.directory_path(&repository.path)?;
+            fs::remove_dir_all(&path).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::ToolExecution,
+                    format!("could not remove detached repository checkout: {error}"),
+                    false,
+                )
+            })?;
+        }
         self.backend
             .session_repositories()?
             .entry(session_id)
@@ -2055,7 +2506,7 @@ impl InProcessConnection {
             .cloned()
             .ok_or_else(|| LoomError::not_found("session repository", repository_id))?;
         let filesystem = self.session_filesystem(session_id)?;
-        let path = checked_session_path(filesystem.root(), &repository.path)?;
+        let path = filesystem.directory_path(&repository.path)?;
         let service = GitService::open(path)?;
         self.backend
             .session_vcs()?
@@ -2066,11 +2517,20 @@ impl InProcessConnection {
     fn session_task_supervisor(&self, session_id: AgentSessionId) -> Result<TaskSupervisor> {
         let filesystem = self.session_filesystem(session_id)?;
         let mut supervisors = self.backend.session_task_supervisors()?;
-        if let Some(supervisor) = supervisors.get(&session_id) {
-            return Ok(supervisor.clone());
-        }
-        let supervisor = TaskSupervisor::new(filesystem.root())?;
-        supervisors.insert(session_id, supervisor.clone());
+        let supervisor = if let Some(supervisor) = supervisors.get(&session_id) {
+            supervisor.clone()
+        } else {
+            let supervisor = TaskSupervisor::new(filesystem.root())?;
+            supervisors.insert(session_id, supervisor.clone());
+            supervisor
+        };
+        supervisor.set_allowed_roots(
+            filesystem
+                .mounted_directories()?
+                .into_iter()
+                .map(|(_, source)| source)
+                .collect(),
+        )?;
         Ok(supervisor)
     }
 
@@ -2312,6 +2772,35 @@ impl InProcessConnection {
             } => Ok(ServerResponse::SessionRepositoryAttached(
                 self.attach_session_repository(session_id, source, path, revision)?,
             )),
+            ClientRequest::ImportSessionDirectory {
+                session_id,
+                source,
+                path,
+            } => self.import_session_directory(session_id, source, path),
+            ClientRequest::AttachSessionDirectory {
+                session_id,
+                source,
+                path,
+            } => self.attach_session_directory(session_id, source, path),
+            ClientRequest::ListSessionDirectories { session_id } => {
+                self.backend.sessions()?.get(session_id)?;
+                Ok(ServerResponse::SessionDirectories {
+                    directories: self
+                        .session_filesystem(session_id)?
+                        .mounted_directories()?
+                        .into_iter()
+                        .map(|(path, source)| SessionDirectory {
+                            path,
+                            source: source.display().to_string(),
+                        })
+                        .collect(),
+                })
+            }
+            ClientRequest::DetachSessionDirectory { session_id, path } => {
+                self.detach_session_directory(session_id, path)?;
+                Ok(ServerResponse::SessionDirectoryDetached)
+            }
+            ClientRequest::ListGitHubRepositories => self.list_github_repositories(),
             ClientRequest::ListSessionRepositories { session_id } => {
                 self.backend.sessions()?.get(session_id)?;
                 Ok(ServerResponse::SessionRepositories {
@@ -2497,6 +2986,17 @@ impl InProcessConnection {
                 if let Err(error) = copy_filesystem_tree(source_filesystem.root(), &target_root) {
                     let _ = fs::remove_dir_all(&target_root);
                     return Err(error);
+                }
+                for (path, source) in source_filesystem.mounted_directories()? {
+                    let destination = target_root.join(&path);
+                    fs::remove_file(&destination).map_err(|error| {
+                        LoomError::new(
+                            ErrorCode::WorkspaceAccessDenied,
+                            format!("could not prepare forked directory copy: {error}"),
+                            false,
+                        )
+                    })?;
+                    copy_directory_contents(&source, &destination)?;
                 }
                 let target_filesystem = Workspace::open(target_id, &target_root)?;
                 let mut target_repositories = BTreeMap::new();
@@ -3146,6 +3646,21 @@ impl InProcessConnection {
                 session_id: requested_session,
                 ..
             }
+            | ClientRequest::ImportSessionDirectory {
+                session_id: requested_session,
+                ..
+            }
+            | ClientRequest::AttachSessionDirectory {
+                session_id: requested_session,
+                ..
+            }
+            | ClientRequest::ListSessionDirectories {
+                session_id: requested_session,
+            }
+            | ClientRequest::DetachSessionDirectory {
+                session_id: requested_session,
+                ..
+            }
             | ClientRequest::ListSessionRepositories {
                 session_id: requested_session,
             }
@@ -3302,6 +3817,7 @@ impl InProcessConnection {
             | ClientRequest::ListModels
             | ClientRequest::GetWorkerNodeStatus
             | ClientRequest::ListProviders
+            | ClientRequest::ListGitHubRepositories
             | ClientRequest::StartGitHubCopilotLogin
             | ClientRequest::GetGitHubCopilotLoginStatus { .. }
             | ClientRequest::DiscoverProviderModels { .. }
@@ -3309,13 +3825,15 @@ impl InProcessConnection {
             ClientRequest::ConfigureGitHubCopilot { .. } => {}
         }
 
-        if let ClientRequest::AttachSessionRepository { source, .. } = request
+        if let ClientRequest::AttachSessionRepository { source, .. }
+        | ClientRequest::ImportSessionDirectory { source, .. }
+        | ClientRequest::AttachSessionDirectory { source, .. } = request
             && Path::new(source).is_absolute()
             && !auth.scope().allows_repository_source(Path::new(source))
         {
             return Err(LoomError::new(
                 ErrorCode::WorkspaceAccessDenied,
-                "token is not authorized to attach a repository from that local path",
+                "token is not authorized to access that local source path",
                 false,
             ));
         }
@@ -3925,6 +4443,108 @@ mod tests {
         run(&["add", "--", "README.md"]);
         run(&["commit", "-qm", "initial"]);
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attaching_local_directory_uses_original_and_discovers_immediate_repositories() {
+        let source = workspace();
+        fs::write(source.join("note.txt"), "original").unwrap();
+        fs::rename(git_repository(), source.join("child-repo")).unwrap();
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        negotiate_m5(&connection);
+        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Local source".to_owned(),
+        }));
+        let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+            panic!("expected workspace creation");
+        };
+        let created = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Local source".to_owned(),
+            },
+        ));
+        let Ok(ServerResponse::AgentSessionCreated(session)) = created.result else {
+            panic!("expected session creation");
+        };
+        let attached = connection.request(RequestEnvelope::new(
+            ClientRequest::AttachSessionDirectory {
+                session_id: session.id,
+                source: source.display().to_string(),
+                path: "sources/local".to_owned(),
+            },
+        ));
+        let Ok(ServerResponse::SessionDirectoryAttached {
+            directory,
+            repositories,
+        }) = attached.result
+        else {
+            panic!("expected directory attachment: {:?}", attached.result);
+        };
+        assert_eq!(directory.source, source.display().to_string());
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].path, "sources/local/child-repo");
+        let edit = connection.request(RequestEnvelope::new(
+            ClientRequest::ApplySessionFilesystemEdit {
+                session_id: session.id,
+                edit: WorkspaceEdit {
+                    path: "sources/local/note.txt".to_owned(),
+                    old_text: "original".to_owned(),
+                    new_text: "changed".to_owned(),
+                    expected_revision: None,
+                },
+            },
+        ));
+        assert!(matches!(
+            edit.result,
+            Ok(ServerResponse::WorkspaceEditApplied(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(source.join("note.txt")).unwrap(),
+            "changed"
+        );
+        let detached = connection.request(RequestEnvelope::new(
+            ClientRequest::DetachSessionDirectory {
+                session_id: session.id,
+                path: directory.path,
+            },
+        ));
+        assert!(matches!(
+            detached.result,
+            Ok(ServerResponse::SessionDirectoryDetached)
+        ));
+        assert!(source.join("child-repo/.git").exists());
+        let repository_root = git_repository();
+        let attached = connection.request(RequestEnvelope::new(
+            ClientRequest::AttachSessionDirectory {
+                session_id: session.id,
+                source: repository_root.display().to_string(),
+                path: "sources/repo-root".to_owned(),
+            },
+        ));
+        let Ok(ServerResponse::SessionDirectoryAttached {
+            directory,
+            repositories,
+        }) = attached.result
+        else {
+            panic!("expected repository root attachment");
+        };
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(repositories[0].path, "sources/repo-root");
+        let detached = connection.request(RequestEnvelope::new(
+            ClientRequest::DetachSessionDirectory {
+                session_id: session.id,
+                path: directory.path,
+            },
+        ));
+        assert!(matches!(
+            detached.result,
+            Ok(ServerResponse::SessionDirectoryDetached)
+        ));
+        fs::remove_dir_all(repository_root).unwrap();
+        fs::remove_dir_all(source).unwrap();
     }
 
     #[test]

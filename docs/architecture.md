@@ -104,25 +104,49 @@ filesystem, and process primitives directly. This keeps provider
 normalization, authorization, auditing, cancellation, and future sandboxing
 in one place.
 
-`Workspace` is a durable container for sessions and workspace-level settings;
-it is not a filesystem root or repository. An `AgentSession` owns an isolated,
-backend-managed filesystem root. The root contains zero or more
-session-specific repository checkouts at stable relative paths. A checkout
-may be implemented as a clone or a Git worktree, but its mutable working tree
-belongs exclusively to that session. Shared bare-object caches are an
-implementation detail and are never exposed as a shared working directory.
-This ownership and path boundary does not by itself promise OS-level process
-sandboxing; process isolation is a separate backend security capability.
+In this document, a **workspace** is a durable logical grouping for agent
+sessions and settings shared by those sessions. It has an ID and display
+metadata, but it has no filesystem root and is not a repository. A workspace
+is a grouping and configuration boundary, not a security boundary. Sessions
+reference their workspace; their files and repository checkouts remain
+session-scoped.
 
-`loom-workspace` is not a second editor authority; it owns session-root files,
-snapshots, edits, checkpoints, repository instruction discovery, and the
-mapping from repository-relative paths to paths inside the session root.
+Each `AgentSession` owns a backend-managed **session filesystem** with its own
+root. It contains session data and zero or more attached sources at normalized
+paths relative to that root. GitHub repositories receive independent checkouts.
+A directory selected in native local mode is attached in place: file and Git
+operations use its original path, and the session discovers Git repositories
+in that directory and its immediate children. The worker persists both the
+source path and the session-relative attachment path. A fork copies attached
+contents into its own filesystem so the two sessions do not share a mutable
+working tree after forking.
+
+Use independent clones for remote repositories. A shared bare-object cache may
+reduce clone cost, but it is an internal optimization. Native local directories
+are an explicit exception: a session edits the original files, and another
+session can attach the same path. Sharing a checkout with hierarchical
+sub-sessions may be considered later; it would need explicit ownership and
+coordination rules for concurrent file edits and Git operations. The
+filesystem boundary does not by itself promise OS-level process sandboxing;
+process isolation is a separate backend security capability.
+
+`loom-workspace` is the session-filesystem service, despite the crate's
+historical name. It owns file trees, contents, watches, edits, snapshots,
+checkpoints, and repository-instruction discovery rooted at one session
+filesystem. It validates and resolves session-relative paths, but does not
+own the durable workspace record or its settings. The session owns its
+repository membership. The worker node coordinates attach, detach, and
+fork-copy operations, using the filesystem service for paths and files and
+`loom-vcs` for Git operations against a session's checkout. The network
+server authenticates and transports these requests to the worker node; it does
+not own repository lifecycle.
+
 Tools, terminal working directories, process permissions, VCS status and
-diffs, and file events all resolve against the active session root. A
-session's filesystem root is not the workspace's root, and a repository is
-not the workspace's identity. The GPUI client projects backend-owned
-workspace, session, run, approval, session-filesystem, task, and evidence
-state into a workspace/session navigator and active-session canvas.
+diffs, and file events all resolve against the active session filesystem.
+Repository-relative paths are resolved through that session's repository
+record and checked against its filesystem root. The GPUI client projects
+backend-owned workspace, session, run, approval, session-filesystem, task, and
+evidence state into a workspace/session navigator and active-session canvas.
 The canvas contains the chronological agent conversation and tool timeline
 plus a composer for new tasks, follow-up direction, and answers to agent
 questions.

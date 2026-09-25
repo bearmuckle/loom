@@ -4333,6 +4333,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "ureq",
  "url",
  "uuid",
 ]

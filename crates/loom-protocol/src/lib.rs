@@ -37,10 +37,11 @@ pub use process::{
 pub use tool::ToolResult;
 pub use vcs::{GitBranch, GitDiff, GitFileStatus, GitFileStatusKind, GitRepositoryStatus};
 pub use workspace::{
-    Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, RevertResult,
-    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
-    UndoResult, WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
-    WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
+    Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, GitHubRepository,
+    RevertResult, SessionDirectory, SessionFilesystemChange, SessionFilesystemFile,
+    SessionFilesystemSnapshot, SessionRepository, UndoResult, WorkerNodeConfig,
+    WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceEdit, WorkspaceEditResult,
+    WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
@@ -192,6 +193,24 @@ pub enum ClientRequest {
         session_id: AgentSessionId,
         repository_id: RepositoryId,
     },
+    ImportSessionDirectory {
+        session_id: AgentSessionId,
+        source: String,
+        path: String,
+    },
+    AttachSessionDirectory {
+        session_id: AgentSessionId,
+        source: String,
+        path: String,
+    },
+    ListSessionDirectories {
+        session_id: AgentSessionId,
+    },
+    DetachSessionDirectory {
+        session_id: AgentSessionId,
+        path: String,
+    },
+    ListGitHubRepositories,
     StartSessionAgentRun {
         session_id: AgentSessionId,
         task: String,
@@ -424,7 +443,13 @@ impl ClientRequest {
             Self::AttachSessionRepository { .. } | Self::DetachSessionRepository { .. } => {
                 Some(Capability::ManageSessionRepositories)
             }
-            Self::ListSessionRepositories { .. } => Some(Capability::ReadSessionFilesystem),
+            Self::ImportSessionDirectory { .. }
+            | Self::AttachSessionDirectory { .. }
+            | Self::DetachSessionDirectory { .. } => Some(Capability::WriteSessionFilesystem),
+            Self::ListGitHubRepositories => Some(Capability::BrowseGitHubRepositories),
+            Self::ListSessionRepositories { .. } | Self::ListSessionDirectories { .. } => {
+                Some(Capability::ReadSessionFilesystem)
+            }
             Self::StartSessionAgentRun { .. } | Self::StartSessionAgentRunWithOptions { .. } => {
                 Some(Capability::StartAgentRun)
             }
@@ -501,6 +526,8 @@ impl ClientRequest {
                 | Self::SetWorkspaceConfigForWorkspace { .. }
                 | Self::AttachSessionRepository { .. }
                 | Self::DetachSessionRepository { .. }
+                | Self::AttachSessionDirectory { .. }
+                | Self::DetachSessionDirectory { .. }
                 | Self::StartSessionAgentRun { .. }
                 | Self::StartSessionAgentRunWithOptions { .. }
                 | Self::ApplySessionFilesystemEdit { .. }
@@ -573,6 +600,21 @@ pub enum ServerResponse {
     },
     SessionRepositoryAttached(SessionRepository),
     SessionRepositoryDetached,
+    SessionDirectoryImported {
+        path: String,
+        repository: Option<SessionRepository>,
+    },
+    SessionDirectoryAttached {
+        directory: SessionDirectory,
+        repositories: Vec<SessionRepository>,
+    },
+    SessionDirectories {
+        directories: Vec<SessionDirectory>,
+    },
+    SessionDirectoryDetached,
+    GitHubRepositories {
+        repositories: Vec<GitHubRepository>,
+    },
     AgentSessions {
         sessions: Vec<AgentSessionSnapshot>,
     },

@@ -430,11 +430,13 @@ struct TaskHandle {
     cancel_requested: AtomicBool,
     artifact_paths: Vec<String>,
     root: PathBuf,
+    allowed_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
 pub struct TaskSupervisor {
     root: PathBuf,
+    allowed_roots: Arc<Mutex<Vec<PathBuf>>>,
     tasks: Arc<Mutex<BTreeMap<TaskId, Arc<TaskHandle>>>>,
     event_limit: usize,
 }
@@ -458,8 +460,17 @@ impl TaskSupervisor {
                 )
             })?,
             tasks: Arc::new(Mutex::new(BTreeMap::new())),
+            allowed_roots: Arc::new(Mutex::new(Vec::new())),
             event_limit: DEFAULT_EVENT_LIMIT,
         })
+    }
+
+    pub fn set_allowed_roots(&self, roots: Vec<PathBuf>) -> Result<()> {
+        *self
+            .allowed_roots
+            .lock()
+            .map_err(|_| internal_lock_error("task allowed roots"))? = roots;
+        Ok(())
     }
 
     pub fn start(&self, spec: TaskSpec) -> Result<TaskSnapshot> {
@@ -537,6 +548,11 @@ impl TaskSupervisor {
             cancel_requested: AtomicBool::new(false),
             artifact_paths: spec.artifact_paths,
             root: self.root.clone(),
+            allowed_roots: self
+                .allowed_roots
+                .lock()
+                .map_err(|_| internal_lock_error("task allowed roots"))?
+                .clone(),
         });
         self.tasks
             .lock()
@@ -647,7 +663,13 @@ impl TaskSupervisor {
                 false,
             )
         })?;
-        if !resolved.starts_with(&self.root) {
+        let allowed_roots = self
+            .allowed_roots
+            .lock()
+            .map_err(|_| internal_lock_error("task allowed roots"))?;
+        if !resolved.starts_with(&self.root)
+            && !allowed_roots.iter().any(|root| resolved.starts_with(root))
+        {
             return Err(LoomError::new(
                 ErrorCode::WorkspaceAccessDenied,
                 format!("task path '{relative}' must stay inside the workspace root"),
@@ -771,7 +793,13 @@ fn wait_for_task(handle: Arc<TaskHandle>, event_limit: usize) {
             let resolved = handle.root.join(path);
             let metadata = fs::canonicalize(&resolved)
                 .ok()
-                .filter(|resolved| resolved.starts_with(&handle.root))
+                .filter(|resolved| {
+                    resolved.starts_with(&handle.root)
+                        || handle
+                            .allowed_roots
+                            .iter()
+                            .any(|root| resolved.starts_with(root))
+                })
                 .and_then(|resolved| fs::metadata(resolved).ok());
             TaskArtifact {
                 path: path.clone(),
