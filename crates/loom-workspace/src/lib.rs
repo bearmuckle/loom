@@ -123,7 +123,23 @@ pub struct WorkspaceWatcher {
 
 impl Workspace {
     pub fn open(session_id: AgentSessionId, root: impl Into<PathBuf>) -> Result<Self> {
-        let requested = root.into();
+        Self::open_inner(session_id, root.into(), true)
+    }
+
+    /// Opens a persisted filesystem without walking its tree before state restore.
+    ///
+    /// `restore_state` captures the watcher baseline once, after mounts and saved
+    /// metadata are installed. This avoids the previous eager scan followed by a
+    /// second scan during restore.
+    pub fn open_for_restore(session_id: AgentSessionId, root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_inner(session_id, root.into(), false)
+    }
+
+    fn open_inner(
+        session_id: AgentSessionId,
+        requested: PathBuf,
+        scan_initial: bool,
+    ) -> Result<Self> {
         let root = Self::canonical_root(&requested)?;
         let workspace = Self {
             inner: Arc::new(WorkspaceInner {
@@ -140,8 +156,10 @@ impl Workspace {
                 mounts: Mutex::new(BTreeMap::new()),
             }),
         };
-        let snapshot = workspace.snapshot()?;
-        workspace.lock_state()?.watcher_snapshot = Some(snapshot);
+        if scan_initial {
+            let snapshot = workspace.snapshot()?;
+            workspace.lock_state()?.watcher_snapshot = Some(snapshot);
+        }
         Ok(workspace)
     }
 

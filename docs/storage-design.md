@@ -1,7 +1,8 @@
 # Proposed durable state model
 
 Status: design proposal, 2026-09-26. This replaces the version-2 `sections`
-container; it is not an implementation or migration already applied.
+container. This release does not import existing databases: it creates a fresh
+database and rejects an existing unsupported format without changing it.
 See the [investigation](storage-investigation.md) for measurements and code evidence.
 
 ## Decision
@@ -73,7 +74,7 @@ query indexes listed below.
 
 | Tables | Important columns and relationships |
 | --- | --- |
-| `store_meta`, `schema_migrations` | Stable store UUID, cursor epoch, schema version; ordered migrations and checksums |
+| `store_meta` | Stable store UUID, cursor epoch, and schema version |
 | `workspaces` | `id`, `name`, `config_revision`, bounded options |
 | `workspace_peers` | Workspace, peer/node ID, URL, credential reference; unique workspace + peer |
 | `sessions` | `id`, `workspace_id`, `name`, `archived_at`, `deleted_at`, `last_activity_at`, `latest_local_run_id`, provenance IDs |
@@ -289,7 +290,7 @@ made. This bounds payload bytes, not total SQLite file size including free pages
 An expired cursor returns `ResyncRequired`, followed by an authoritative snapshot
 with a fresh cursor read in the same SQLite read transaction. Subscribe after that
 cursor to close the snapshot/live-update race. Epoch changes invalidate cursors
-after incompatible migration or explicit backup restoration.
+after an explicit state reset or backup restoration.
 
 This requires a negotiated protocol capability/version for scoped cursors,
 paged history, and content-range reads. Do not silently reinterpret the existing
@@ -313,7 +314,7 @@ non-Git/mounted/untracked use cases.
 
 Keep the current rollback conflict checks, including expected post-edit revisions
 and files created after a checkpoint. Preserve existing text-file coverage in the
-first migration; binary support can use the same byte store but needs deliberate
+first implementation; binary support can use the same byte store but needs deliberate
 rollback behavior. Symlinks and concurrent external changes require the existing
 path/access checks. Without filesystem snapshot support, there is no promise of
 a single atomic view of externally changing files.
@@ -384,7 +385,7 @@ conflate separate checkouts. Cached stat/hash data accelerates observation; a
 strong checkpoint must not blindly trust unchanged file size/mtime as proof of
 identical content.
 
-## Implementation and migration
+## Implementation
 
 Replace generic `save_sections` with typed store queries and transactional
 commands in `loom-persistence`. `loom-session` supplies domain validation rather
@@ -396,8 +397,8 @@ remote clients use the same API; the browser does not become another state owner
 
 Implement in this order:
 
-1. Establish the typed schema/store, ownership guard, migration machinery, and
-   summary queries. Add phase timings and row/byte counters.
+1. Establish the typed schema/store, ownership guard, and summary queries. Add
+   phase timings and row/byte counters.
 2. Migrate messages, tools, activities, and immutable content; add paging and
    canonical context loading. Make startup and history independent of filesystems.
 3. Move execution, approvals, idempotency, and publication to transactional domain
@@ -406,20 +407,11 @@ Implement in this order:
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
    exports and their mirrored in-memory journals completely.
 
-Build a new database beside a consistent backup under exclusive backend
-ownership. Import each version-2 section once, using typed runtime messages and
-activities as authoritative where available. Deduplicate exact content, preserve
-IDs and rollback revisions, and use retained journal history to recover additional
-history only when identity/order can be established. Keep ambiguous legacy
-material in the backup and report any fidelity limits; do not invent complete
-history already evicted from the old journal.
-
-Validate foreign keys, counts, content hashes, sample conversations, pending
-decisions, and checkpoint revert before cutover. Checkpoint/close both databases
-and atomically install the completed new store without changing the managed
-session-root layout. Never copy/rename a live database while ignoring its WAL.
-Keep the backup for recovery; automatic downgrade is not supported after new
-writes. Do not enable the replacement writer until the full recovery path works.
+This release has a clean start only. It does not copy, import, rename, or remove
+an existing state database. When the configured path contains an unsupported
+database, startup reports that state is unsupported and leaves the file intact.
+Any future import process is a separate product decision and is outside this
+design's implementation scope.
 
 ## Acceptance criteria
 
@@ -437,8 +429,8 @@ writes. Do not enable the replacement writer until the full recovery path works.
 - Crash injection before/after tool intent, file replacement, approval commit,
   output flush, and feed publication preserves acknowledged state and reports
   ambiguous external outcomes.
-- Migration preserves recoverable behavior and is restartable without changing
-  the original database. Performance is measured in both debug and release builds.
+- An unsupported existing database is rejected without changing its contents or
+  SQLite journal mode. Performance is measured in both debug and release builds.
 
 The key performance contract is about work performed, not a guessed launch-time
 target: reading one session must not require processing the rest of the account.

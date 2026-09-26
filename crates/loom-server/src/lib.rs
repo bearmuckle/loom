@@ -1574,7 +1574,7 @@ impl InProcessBackend {
                     false,
                 ));
             }
-            let filesystem = Workspace::open(session_id, &canonical_expected_root)?;
+            let filesystem = Workspace::open_for_restore(session_id, &canonical_expected_root)?;
             for directory in &persisted.directories {
                 filesystem.mount_directory(&directory.path, &directory.source)?;
             }

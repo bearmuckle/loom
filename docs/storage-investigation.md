@@ -203,12 +203,11 @@ not necessary to fix these issues.
    checkpoints, filesystem changes, and usage detail. Support explicit deletion
    and reference-aware garbage collection. Archiving should unload data without
    silently deleting conversation history.
-5. **Migrate safely and measure scaling.** Import version-2 section payloads in a
-   resumable or atomic migration, preserving IDs, ordering, approvals, rollback
-   data, and retained fork history. Keep a backup and validate counts/references.
-   Lost history already evicted from the journal cannot be reconstructed from
-   that journal alone. Add byte/time metrics and a deliberate maintenance policy
-   for reclaiming free database pages.
+5. **Start clean and measure scaling.** This implementation does not import the
+   section database. It must reject unsupported existing state without changing
+   it; state reset is an explicit operator action outside this implementation.
+   Add byte/time metrics and a deliberate maintenance policy for reclaiming free
+   database pages.
 
 A suitable schema separates `workspaces`, `sessions`, `runs`, `messages`,
 `activities`, `events`, `checkpoints`, `checkpoint_files`, `blobs`, and expiring
@@ -219,9 +218,9 @@ can then be evaluated on cold blobs without making every startup decode everythi
 
 Acceptance checks should include startup with thousands of archived sessions,
 renaming one session without serializing unrelated history, bounded reconnect
-storage under large outputs, interrupted migrations, concurrent writes, crash
-recovery around durability boundaries, and rollback after checkpoint garbage
-collection. Startup and single-session operations should be insensitive to the
-volume of unrelated archived content.
+storage under large outputs, concurrent writes, crash recovery around durability
+boundaries, and rollback after checkpoint garbage collection. Startup and
+single-session operations should be insensitive to the volume of unrelated
+archived content.
 
 The concrete replacement proposal is in [storage design](storage-design.md).
