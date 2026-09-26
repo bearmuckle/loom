@@ -19,7 +19,7 @@ use loom_core::{
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
 use loom_persistence::{
     CURRENT_SCHEMA_VERSION, DurableFeedState, DurableIdempotencyRecord, DurableProviderState,
-    DurableSessionSettings, DurableStateWrite, FilePersistence,
+    DurableRunSummary, DurableSessionSettings, DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -1717,42 +1717,10 @@ impl InProcessBackend {
 
         let mut run_summaries = BTreeMap::new();
         let mut restored_runs = BTreeMap::new();
-        for section in persistence.list_sections_with_prefix("run:")? {
-            let run_id = section
-                .strip_prefix("run:")
-                .and_then(|value| value.parse::<loom_core::RunId>().ok())
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("persisted run section '{section}' has an invalid id"),
-                        false,
-                    )
-                })?;
-            let snapshot = persistence
-                .load_section_path::<AgentRunSnapshot>(&section, "/krun", CURRENT_SCHEMA_VERSION)?
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("persisted run section '{section}' has no snapshot"),
-                        false,
-                    )
-                })?;
-            let usage = persistence
-                .load_section_path::<UsageSnapshot>(&section, "/kusage", CURRENT_SCHEMA_VERSION)?
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("persisted run section '{section}' has no usage"),
-                        false,
-                    )
-                })?;
-            if run_id != snapshot.id {
-                return Err(LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    format!("persisted run key does not match run snapshot {run_id}"),
-                    false,
-                ));
-            }
+        for (run_id, summary) in persistence.load_run_summaries()? {
+            let snapshot = summary.snapshot;
+            let usage = summary.usage;
+            let section = format!("run:{run_id}");
             self.sessions()?.get(snapshot.session_id)?;
             let active_run = !matches!(
                 snapshot.state,
@@ -1843,6 +1811,28 @@ impl InProcessBackend {
             .iter()
             .map(|(run_id, handle)| (*run_id, handle.state()))
             .collect();
+        let mut durable_run_summaries: BTreeMap<loom_core::RunId, DurableRunSummary> = self
+            .persisted_runs()?
+            .iter()
+            .map(|(run_id, summary)| {
+                (
+                    *run_id,
+                    DurableRunSummary {
+                        snapshot: summary.snapshot.clone(),
+                        usage: summary.usage.clone(),
+                    },
+                )
+            })
+            .collect();
+        for (run_id, state) in &runs {
+            durable_run_summaries.insert(
+                *run_id,
+                DurableRunSummary {
+                    snapshot: state.run.clone(),
+                    usage: state.usage.clone(),
+                },
+            );
+        }
         let mut entity_sections = runs
             .into_iter()
             .map(|(run_id, state)| Ok((format!("run:{run_id}"), json_value(state)?)))
@@ -1913,6 +1903,7 @@ impl InProcessBackend {
             providers: Some(&provider_state),
             usage: Some(&provider_usage),
             idempotency: Some(&idempotency),
+            run_summaries: Some(&durable_run_summaries),
             records: &entity_sections,
             feed: Some(&feed),
             sections: &sections,

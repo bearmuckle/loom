@@ -9,10 +9,11 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ErrorCode,
-    EventSequence, LoomError, RequestId, Result, Timestamp, WorkspaceId, WorkspaceRecord,
+    EventSequence, LoomError, RequestId, Result, RunId, Timestamp, UsageSnapshot, WorkspaceId,
+    WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
-use loom_protocol::{ServerEventEnvelope, WorkspaceConfig};
+use loom_protocol::{AgentRunSnapshot, AgentRunState, ServerEventEnvelope, WorkspaceConfig};
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -21,8 +22,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 12;
-const DATABASE_SCHEMA_VERSION: u32 = 12;
+pub const CURRENT_SCHEMA_VERSION: u32 = 13;
+const DATABASE_SCHEMA_VERSION: u32 = 13;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -50,6 +51,23 @@ CREATE INDEX IF NOT EXISTS sessions_visible
     ON sessions(workspace_id, updated_at DESC, id DESC) WHERE state != 'archived';
 CREATE INDEX IF NOT EXISTS sessions_archived
     ON sessions(workspace_id, updated_at DESC, id DESC) WHERE state = 'archived';
+CREATE TABLE IF NOT EXISTS run_summaries (
+    run_id BLOB PRIMARY KEY NOT NULL CHECK(length(run_id) = 16),
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE CHECK(length(session_id) = 16),
+    state TEXT NOT NULL CHECK(state IN (
+        'planning', 'executing', 'awaiting_approval', 'paused', 'needs_input',
+        'evaluating', 'completed', 'failed', 'cancelled'
+    )),
+    started_at INTEGER NOT NULL CHECK(started_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= started_at),
+    completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
+    snapshot TEXT NOT NULL CHECK(length(snapshot) <= 1048576),
+    usage TEXT NOT NULL CHECK(length(usage) <= 16384)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS runs_by_session_activity
+    ON run_summaries(session_id, updated_at DESC, run_id DESC);
+CREATE INDEX IF NOT EXISTS runs_by_state_activity
+    ON run_summaries(state, updated_at DESC, run_id DESC);
 CREATE TABLE IF NOT EXISTS workspaces (
     id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
     name TEXT NOT NULL CHECK(length(trim(name)) > 0),
@@ -388,6 +406,12 @@ pub struct DurableIdempotencyRecord {
     pub response: Value,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRunSummary {
+    pub snapshot: AgentRunSnapshot,
+    pub usage: UsageSnapshot,
+}
+
 pub struct DurableStateWrite<'a> {
     pub schema_version: u32,
     pub sessions: &'a SessionManagerState,
@@ -397,6 +421,7 @@ pub struct DurableStateWrite<'a> {
     pub providers: Option<&'a DurableProviderState>,
     pub usage: Option<&'a UsageLedger>,
     pub idempotency: Option<&'a BTreeMap<RequestId, DurableIdempotencyRecord>>,
+    pub run_summaries: Option<&'a BTreeMap<RunId, DurableRunSummary>>,
     pub records: &'a [(String, Value)],
     pub feed: Option<&'a DurableFeedState>,
     pub sections: &'a [(&'a str, Value)],
@@ -1051,6 +1076,78 @@ impl FilePersistence {
         Ok(records)
     }
 
+    /// Loads indexed run summaries without reading runtime details or transcripts.
+    pub fn load_run_summaries(&self) -> Result<BTreeMap<RunId, DurableRunSummary>> {
+        if !self.path.exists() {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT run_id, session_id, state, started_at, updated_at, completed_at,
+                        snapshot, usage
+                 FROM run_summaries ORDER BY updated_at DESC, run_id DESC",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare run summaries: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read run summaries: {error}"), true)
+            })?;
+        let mut summaries = BTreeMap::new();
+        for row in rows {
+            let (run_id, session_id, state, started, updated, completed, snapshot, usage) = row
+                .map_err(|error| {
+                    persistence_error(format!("could not read run summaries: {error}"), true)
+                })?;
+            let run_id = RunId::from_uuid(decode_uuid(&run_id, "run id")?);
+            let session_id = AgentSessionId::from_uuid(decode_uuid(&session_id, "run session id")?);
+            let snapshot: AgentRunSnapshot = serde_json::from_str(&snapshot).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted run summary is malformed: {error}"),
+                    false,
+                )
+            })?;
+            let usage: UsageSnapshot = serde_json::from_str(&usage).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted run usage is malformed: {error}"),
+                    false,
+                )
+            })?;
+            let completed = completed.map(decode_timestamp).transpose()?;
+            if snapshot.id != run_id
+                || snapshot.session_id != session_id
+                || run_state_name(snapshot.state) != state
+                || snapshot.started_at != decode_timestamp(started)?
+                || snapshot.updated_at != decode_timestamp(updated)?
+                || snapshot.completed_at != completed
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted run summary columns do not match its payload",
+                    false,
+                ));
+            }
+            summaries.insert(run_id, DurableRunSummary { snapshot, usage });
+        }
+        Ok(summaries)
+    }
+
     /// Loads the bounded reconnect feed from sequence-indexed records.
     pub fn load_feed_state(&self) -> Result<Option<DurableFeedState>> {
         if !self.path.exists() {
@@ -1238,6 +1335,7 @@ impl FilePersistence {
             providers: None,
             usage: None,
             idempotency: None,
+            run_summaries: None,
             records,
             feed,
             sections,
@@ -1263,6 +1361,7 @@ impl FilePersistence {
             providers: None,
             usage: None,
             idempotency: None,
+            run_summaries: None,
             records,
             feed,
             sections,
@@ -1297,6 +1396,9 @@ impl FilePersistence {
         }
         if let Some(idempotency) = write.idempotency {
             save_idempotency_rows(&transaction, idempotency)?;
+        }
+        if let Some(run_summaries) = write.run_summaries {
+            save_run_summary_rows(&transaction, run_summaries)?;
         }
         if let Some(feed) = write.feed {
             save_feed_rows(&transaction, feed)?;
@@ -2152,6 +2254,111 @@ fn save_idempotency_rows(
     Ok(())
 }
 
+fn save_run_summary_rows(
+    transaction: &Transaction<'_>,
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_runs (
+                run_id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_runs;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run summaries: {error}"), true)
+        })?;
+    for (run_id, summary) in summaries {
+        if summary.snapshot.id != *run_id {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run summary key does not match its run id",
+                false,
+            ));
+        }
+        let snapshot = serde_json::to_string(&summary.snapshot).map_err(|error| {
+            persistence_error(format!("could not encode run summary: {error}"), false)
+        })?;
+        let usage = serde_json::to_string(&summary.usage).map_err(|error| {
+            persistence_error(format!("could not encode run usage: {error}"), false)
+        })?;
+        if snapshot.len() > 1024 * 1024 || usage.len() > 16 * 1024 {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "run summary exceeds its maximum supported size",
+                false,
+            ));
+        }
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let session_id_bytes = summary.snapshot.session_id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_runs(run_id) VALUES (?1)",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not stage run summary {run_id}: {error}"),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO run_summaries(
+                    run_id, session_id, state, started_at, updated_at, completed_at, snapshot, usage
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    state=excluded.state,
+                    started_at=excluded.started_at,
+                    updated_at=excluded.updated_at,
+                    completed_at=excluded.completed_at,
+                    snapshot=excluded.snapshot,
+                    usage=excluded.usage
+                 WHERE run_summaries.session_id IS NOT excluded.session_id
+                    OR run_summaries.state IS NOT excluded.state
+                    OR run_summaries.started_at IS NOT excluded.started_at
+                    OR run_summaries.updated_at IS NOT excluded.updated_at
+                    OR run_summaries.completed_at IS NOT excluded.completed_at
+                    OR run_summaries.snapshot IS NOT excluded.snapshot
+                    OR run_summaries.usage IS NOT excluded.usage",
+                params![
+                    run_id_bytes.as_slice(),
+                    session_id_bytes.as_slice(),
+                    run_state_name(summary.snapshot.state),
+                    encode_timestamp(summary.snapshot.started_at)?,
+                    encode_timestamp(summary.snapshot.updated_at)?,
+                    summary
+                        .snapshot
+                        .completed_at
+                        .map(encode_timestamp)
+                        .transpose()?,
+                    snapshot,
+                    usage,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save run summary {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM run_summaries
+             WHERE NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_runs wanted
+                WHERE wanted.run_id=run_summaries.run_id
+             )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prune run summaries: {error}"), true)
+        })?;
+    Ok(())
+}
+
 fn save_provider_json_rows<'a, T, I>(
     transaction: &Transaction<'_>,
     table: &str,
@@ -2340,6 +2547,20 @@ fn session_state_name(state: AgentSessionState) -> &'static str {
         AgentSessionState::Failed => "failed",
         AgentSessionState::Cancelled => "cancelled",
         AgentSessionState::Archived => "archived",
+    }
+}
+
+fn run_state_name(state: AgentRunState) -> &'static str {
+    match state {
+        AgentRunState::Planning => "planning",
+        AgentRunState::Executing => "executing",
+        AgentRunState::AwaitingApproval => "awaiting_approval",
+        AgentRunState::Paused => "paused",
+        AgentRunState::NeedsInput => "needs_input",
+        AgentRunState::Evaluating => "evaluating",
+        AgentRunState::Completed => "completed",
+        AgentRunState::Failed => "failed",
+        AgentRunState::Cancelled => "cancelled",
     }
 }
 
@@ -2974,6 +3195,27 @@ mod tests {
                 response: serde_json::json!({"sessions": []}),
             },
         )]);
+        let run_id = RunId::new();
+        let run_summary = DurableRunSummary {
+            snapshot: AgentRunSnapshot {
+                id: run_id,
+                session_id: session.id,
+                task: "indexed run summary".to_owned(),
+                model: ModelId::new("deterministic-model"),
+                state: AgentRunState::Completed,
+                started_at: Timestamp::from_unix_millis(1000),
+                updated_at: Timestamp::from_unix_millis(2000),
+                completed_at: Some(Timestamp::from_unix_millis(2000)),
+                summary: Some("finished".to_owned()),
+                evidence: Vec::new(),
+            },
+            usage: UsageSnapshot {
+                input_tokens: 13,
+                output_tokens: 7,
+                ..UsageSnapshot::default()
+            },
+        };
+        let run_summaries = BTreeMap::from([(run_id, run_summary)]);
         persistence
             .save_state(DurableStateWrite {
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -2984,6 +3226,7 @@ mod tests {
                 providers: Some(&provider_state),
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
+                run_summaries: Some(&run_summaries),
                 records: &[],
                 feed: None,
                 sections: &[],
@@ -3022,6 +3265,7 @@ mod tests {
             serde_json::json!({"method": "list_sessions"})
         );
         assert_eq!(loaded_record.response, serde_json::json!({"sessions": []}));
+        assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
 
         assert!(
             persistence
@@ -3034,6 +3278,7 @@ mod tests {
                     providers: Some(&DurableProviderState::default()),
                     usage: Some(&UsageLedger::default()),
                     idempotency: Some(&BTreeMap::new()),
+                    run_summaries: Some(&BTreeMap::new()),
                     records: &[],
                     feed: None,
                     sections: &[("", serde_json::json!({"invalid": true}))],
@@ -3054,6 +3299,7 @@ mod tests {
         );
         assert_eq!(persistence.load_provider_usage().unwrap(), usage);
         assert_eq!(persistence.load_idempotency_records().unwrap(), idempotency);
+        assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
 
         let connection = Connection::open(&path).unwrap();
         let plan: String = connection
@@ -3076,6 +3322,15 @@ mod tests {
             idempotency_plan.contains("idempotency_expiry"),
             "{idempotency_plan}"
         );
+        let run_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT run_id FROM run_summaries
+                 WHERE session_id=?1 ORDER BY updated_at DESC, run_id DESC LIMIT 50",
+                [session.id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(run_plan.contains("runs_by_session_activity"), "{run_plan}");
         let config_plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT config FROM provider_configs WHERE provider_id=?1",
