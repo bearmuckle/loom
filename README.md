@@ -74,6 +74,9 @@ the `wasm32-unknown-unknown` Rust target. The helper starts both services on
 loopback by default and places its development bearer token in the browser
 URL. Keep it local; do not expose this setup to a network. For a token-free
 browser walkthrough, build the WASM client and open it with `?demo=true`.
+Pushes to `main` also publish the browser client to
+https://bearmuckle.github.io/loom/ through GitHub Pages. Add `?demo=true` to
+the URL to open the deterministic demo without a backend.
 
 ## Development checks
 
