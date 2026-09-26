@@ -101,3 +101,10 @@ to enable deployment. The client requires a separately running Loom backend.
 Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
 `LOOM_MODEL`, or connect to a remote backend with `LOOM_REMOTE_URL` and
 `LOOM_TOKEN`. GitHub Copilot login is available in the UI.
+
+## License
+
+Loom's core libraries and client components are licensed under GPL-3.0-only;
+see [LICENSE](LICENSE). The protocol and server-side components in
+`crates/loom-protocol` and `crates/loom-server` are licensed under
+AGPL-3.0-only; see [LICENSE-AGPL](LICENSE-AGPL).
