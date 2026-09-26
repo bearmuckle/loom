@@ -815,3 +815,84 @@ fn websocket_connect_error(error: TungsteniteError) -> LoomError {
         )
     }
 }
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{auth_error_response, bearer_token, request_token, websocket_connect_error};
+    use axum::{
+        http::{HeaderMap, HeaderValue, header::AUTHORIZATION},
+        response::IntoResponse,
+    };
+    use loom_core::ErrorCode;
+    use std::{collections::HashMap, io};
+    use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+
+    #[test]
+    fn request_auth_prefers_a_valid_bearer_header_and_falls_back_to_query() {
+        let mut headers = HeaderMap::new();
+        let query = HashMap::from([("access_token".to_owned(), "query-secret".to_owned())]);
+        assert_eq!(request_token(&headers, &query).unwrap(), "query-secret");
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer header-secret"),
+        );
+        assert_eq!(bearer_token(&headers).unwrap(), "header-secret");
+        assert_eq!(request_token(&headers, &query).unwrap(), "header-secret");
+    }
+
+    #[test]
+    fn request_auth_rejects_empty_query_and_malformed_or_non_bearer_headers() {
+        let mut headers = HeaderMap::new();
+        let empty_query = HashMap::from([("access_token".to_owned(), String::new())]);
+        assert_eq!(
+            request_token(&headers, &empty_query).unwrap_err().code,
+            ErrorCode::AuthenticationRequired
+        );
+        assert_eq!(
+            bearer_token(&headers).unwrap_err().code,
+            ErrorCode::AuthenticationRequired
+        );
+
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic abc"));
+        assert_eq!(
+            bearer_token(&headers).unwrap_err().code,
+            ErrorCode::AuthenticationFailed
+        );
+        headers.insert(AUTHORIZATION, HeaderValue::from_bytes(&[0x80]).unwrap());
+        assert_eq!(
+            bearer_token(&headers).unwrap_err().message,
+            "authorization header is malformed"
+        );
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        assert_eq!(bearer_token(&headers).unwrap(), "");
+    }
+
+    #[test]
+    fn authentication_response_and_socket_errors_map_to_stable_codes() {
+        let unauthorized = auth_error_response(loom_core::LoomError::new(
+            ErrorCode::AuthenticationRequired,
+            "missing",
+            false,
+        ))
+        .into_response();
+        assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let forbidden = auth_error_response(loom_core::LoomError::new(
+            ErrorCode::AuthorizationDenied,
+            "denied",
+            false,
+        ))
+        .into_response();
+        assert_eq!(forbidden.status(), axum::http::StatusCode::FORBIDDEN);
+
+        for (message, code) in [
+            ("timed out", ErrorCode::DeadlineExceeded),
+            ("connection refused", ErrorCode::ProviderUnavailable),
+            ("unexpected network failure", ErrorCode::Internal),
+        ] {
+            assert_eq!(
+                websocket_connect_error(TungsteniteError::Io(io::Error::other(message))).code,
+                code
+            );
+        }
+    }
+}

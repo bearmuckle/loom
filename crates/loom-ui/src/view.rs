@@ -127,6 +127,24 @@ fn responsive_layout(width: Pixels) -> ResponsiveLayout {
     }
 }
 
+fn review_panel_is_visible(
+    layout: ResponsiveLayout,
+    review_open: bool,
+    session_count: usize,
+    settings_open: bool,
+    about_open: bool,
+    providers_open: bool,
+    github_login_open: bool,
+) -> bool {
+    !layout.phone
+        && review_open
+        && session_count > 0
+        && !settings_open
+        && !about_open
+        && !providers_open
+        && !github_login_open
+}
+
 fn session_header_title() -> gpui_kit::Div {
     div().flex().flex_1().min_w(px(0.)).items_center().gap_2()
 }
@@ -8923,13 +8941,15 @@ impl Render for LoomView {
         self.schedule_run_poll(cx);
         let view = cx.entity();
         let layout = responsive_layout(window.bounds().size.width);
-        let review_panel_visible = !layout.phone
-            && self.review.open
-            && !self.sessions.is_empty()
-            && !self.settings_open
-            && !self.about_open
-            && !self.providers_open
-            && self.github_login.is_none();
+        let review_panel_visible = review_panel_is_visible(
+            layout,
+            self.review.open,
+            self.sessions.len(),
+            self.settings_open,
+            self.about_open,
+            self.providers_open,
+            self.github_login.is_some(),
+        );
         let workspace_name = self.workspace_name.clone();
         let decorations = window.window_decorations();
         let client_decorated = matches!(decorations, Decorations::Client { .. });
@@ -9541,6 +9561,25 @@ mod session_name_tests {
         });
         assert_eq!(session_name_for_source(&source), "loom");
     }
+
+    #[test]
+    fn sources_without_a_usable_name_receive_a_safe_fallback() {
+        assert_eq!(
+            session_name_for_source(&SessionCreationSource::LocalDirectory("/".to_owned())),
+            "New session"
+        );
+        assert_eq!(session_name_for_path(Path::new("/")), None);
+        assert_eq!(
+            session_name_for_source(&SessionCreationSource::GitHub(GitHubRepository {
+                full_name: "owner/ ".to_owned(),
+                description: None,
+                clone_url: "https://github.com/owner/repo.git".to_owned(),
+                private: false,
+                default_branch: "main".to_owned(),
+            })),
+            "New session"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9548,11 +9587,12 @@ mod display_helper_tests {
     use super::{
         AgentActivityData, AgentActivityRecord, AgentActivityStatus, FileActivityOperation,
         activity_label, activity_marker, activity_output, activity_turn_title, change_kind_label,
-        format_bytes, format_duration, format_percentage, run_state_label, session_state_label,
+        format_bytes, format_duration, format_percentage, is_redundant_completion_summary,
+        run_state_label, session_state_label,
     };
     use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
     use loom_model::{ModelId, ToolCall};
-    use loom_protocol::{AgentActivityKind, AgentRunState};
+    use loom_protocol::{AgentActivityKind, AgentRunState, ToolResult};
     use serde_json::json;
 
     fn activity(data: AgentActivityData) -> AgentActivityRecord {
@@ -9669,6 +9709,30 @@ mod display_helper_tests {
             result: None,
         });
         assert_eq!(activity_label(&file).0, "Read file");
+        let listed = activity(AgentActivityData::File {
+            call: call("list_files"),
+            operation: FileActivityOperation::List,
+            path: None,
+            result: Some(ToolResult::success(
+                &call("list_files"),
+                "src/lib.rs".to_owned(),
+            )),
+        });
+        assert_eq!(activity_label(&listed).0, "List files");
+        assert_eq!(activity_output(&listed), Some("src/lib.rs"));
+        let empty_result = activity(AgentActivityData::ToolCall {
+            call: call("inspect"),
+            result: Some(ToolResult::success(&call("inspect"), String::new())),
+        });
+        assert_eq!(activity_output(&empty_result), None);
+        let tool_only = activity(AgentActivityData::ToolCall {
+            call: call("inspect"),
+            result: None,
+        });
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&tool_only)),
+            "Using tools"
+        );
         assert_eq!(
             activity_turn_title(std::slice::from_ref(&file)),
             "Inspecting the workspace"
@@ -9710,6 +9774,42 @@ mod display_helper_tests {
             "Running commands"
         );
         assert_eq!(activity_turn_title(&[]), "Working on the task");
+        for data in [
+            AgentActivityData::File {
+                call: call("read_file"),
+                operation: FileActivityOperation::Read,
+                path: Some("src/lib.rs".to_owned()),
+                result: Some(ToolResult::success(
+                    &call("read_file"),
+                    "file output".to_owned(),
+                )),
+            },
+            AgentActivityData::Search {
+                call: call("search"),
+                query: "needle".to_owned(),
+                path: None,
+                result: Some(ToolResult::success(
+                    &call("search"),
+                    "search output".to_owned(),
+                )),
+            },
+            AgentActivityData::Command {
+                call: call("run"),
+                command: "cargo".to_owned(),
+                args: vec!["test".to_owned()],
+                cwd: None,
+                result: Some(ToolResult::success(
+                    &call("run"),
+                    "command output".to_owned(),
+                )),
+            },
+        ] {
+            assert!(activity_output(&activity(data)).is_some());
+        }
+        assert!(is_redundant_completion_summary(
+            "Completed task: fixed the bug"
+        ));
+        assert!(!is_redundant_completion_summary("The task was completed"));
     }
 }
 
@@ -9795,6 +9895,7 @@ mod loom_view_render_tests {
         LoomView, SessionSourceChoice, SessionSourceDialog, SessionSourceDialogPurpose,
         WorkerConnectionState, WorkerNodeEntry,
     };
+    use crate::state::GitHubLoginState;
     use crate::state::RenameDialogState;
     use crate::state::ReviewRow;
     use crate::state::TimelineItem;
@@ -9813,7 +9914,15 @@ mod loom_view_render_tests {
     use std::collections::BTreeSet;
 
     fn render_scenario(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
-        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        render_scenario_at(cx, size(px(1280.), px(800.)), configure);
+    }
+
+    fn render_scenario_at(
+        cx: &mut TestAppContext,
+        window_size: gpui_kit::Size<gpui_kit::Pixels>,
+        configure: impl FnOnce(&mut LoomView),
+    ) {
+        let handle = cx.open_window(window_size, |_, cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
             configure(&mut view);
             view
@@ -9878,6 +9987,27 @@ mod loom_view_render_tests {
         render_scenario(cx, |view| view.settings_open = true);
         render_scenario(cx, |view| view.about_open = true);
         render_scenario(cx, |view| view.providers_open = true);
+    }
+
+    #[gpui_kit::test]
+    fn github_login_states_and_phone_session_drawer_render(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for state in [
+            GitHubLoginState::Starting,
+            GitHubLoginState::Awaiting {
+                verification_uri: "https://github.com/login/device".to_owned(),
+                user_code: "ABCD-EFGH".to_owned(),
+                expires_in: 600,
+            },
+            GitHubLoginState::Success,
+            GitHubLoginState::Error("Unable to connect".to_owned()),
+        ] {
+            render_scenario(cx, |view| view.github_login = Some(state));
+        }
+        render_scenario_at(cx, size(px(390.), px(844.)), |view| {
+            view.session_drawer_open = true;
+            view.sessions = vec![view.active_session.clone()];
+        });
     }
 
     #[gpui_kit::test]
@@ -10081,7 +10211,7 @@ mod loom_view_render_tests {
 mod responsive_layout_tests {
     use super::{
         COMPACT_REVIEW_WIDTH, COMPACT_SIDEBAR_WIDTH, FULL_REVIEW_WIDTH, FULL_SIDEBAR_WIDTH,
-        PHONE_SIDEBAR_WIDTH, responsive_layout,
+        PHONE_SIDEBAR_WIDTH, responsive_layout, review_panel_is_visible,
     };
     use gpui_kit::px;
 
@@ -10117,6 +10247,42 @@ mod responsive_layout_tests {
         assert_eq!(layout.sidebar_width, px(280.));
         assert_eq!(layout.review_width, px(280.));
     }
+
+    #[test]
+    fn review_panel_visibility_is_a_pure_layout_decision() {
+        let desktop = responsive_layout(px(1280.));
+        assert!(review_panel_is_visible(
+            desktop, true, 1, false, false, false, false
+        ));
+        assert!(!review_panel_is_visible(
+            desktop, false, 1, false, false, false, false
+        ));
+        assert!(!review_panel_is_visible(
+            desktop, true, 0, false, false, false, false
+        ));
+        for modal_open in 0..4 {
+            let mut blockers = [false; 4];
+            blockers[modal_open] = true;
+            assert!(!review_panel_is_visible(
+                desktop,
+                true,
+                1,
+                blockers[0],
+                blockers[1],
+                blockers[2],
+                blockers[3]
+            ));
+        }
+        assert!(!review_panel_is_visible(
+            responsive_layout(px(390.)),
+            true,
+            1,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -10124,13 +10290,14 @@ mod worker_node_tests {
     use super::{
         ACTIVE_BACKEND_NODE_ENTRY_ID, SessionNodeIndicatorState, WorkerConnectionStage,
         WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold, assigned_node_id,
-        format_percentage, format_session_resource_percentages, format_worker_node_resources,
-        mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
-        order_session_nodes, remove_worker_node_entry, safe_worker_url_label,
-        session_id_for_request, session_node_indicator_state, session_node_pulse,
-        session_owner_status, transition_worker_connection_to_connecting,
-        update_worker_node_status, validate_model_for_node, worker_connection_failure_detail,
-        worker_node_display_name, worker_node_name_for_id, worker_url_embeds_credential,
+        connection_placeholder, format_percentage, format_session_resource_percentages,
+        format_worker_node_resources, initial_worker_nodes, mark_worker_connection_failed,
+        merge_node_sessions, next_severe_load_streak, order_session_nodes,
+        remove_worker_node_entry, safe_worker_url_label, session_id_for_request,
+        session_node_indicator_state, session_node_pulse, session_owner_status,
+        transition_worker_connection_to_connecting, update_worker_node_status,
+        validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
+        worker_node_name_for_id, worker_url_embeds_credential,
     };
     use loom_core::{
         AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, RunId, Timestamp,
@@ -10244,6 +10411,48 @@ mod worker_node_tests {
         );
         assert!(bootstrap_save.contains("browser could not save"));
         assert!(!bootstrap_save.contains("secret"));
+
+        let input = worker_connection_failure_detail(
+            WorkerConnectionStage::InputValidation,
+            &LoomError::invalid_request("empty input"),
+            None,
+        );
+        assert!(input.contains("URL followed by its access token"));
+        let cancelled = worker_connection_failure_detail(
+            WorkerConnectionStage::Negotiation,
+            &LoomError::new(ErrorCode::RequestCancelled, "closed", false),
+            None,
+        );
+        assert!(cancelled.contains("before negotiation completed"));
+        let cancelled_status = worker_connection_failure_detail(
+            WorkerConnectionStage::Status,
+            &LoomError::new(ErrorCode::RequestCancelled, "closed", false),
+            None,
+        );
+        assert!(cancelled_status.contains("before returning status"));
+        let token = worker_connection_failure_detail(
+            WorkerConnectionStage::Transport,
+            &LoomError::invalid_request("invalid bearer token"),
+            None,
+        );
+        assert!(token.contains("unsupported characters"));
+        let timeout_text = worker_connection_failure_detail(
+            WorkerConnectionStage::Negotiation,
+            &LoomError::new(ErrorCode::Internal, "gateway timeout", false),
+            None,
+        );
+        assert!(timeout_text.contains("timed out"));
+        #[cfg(target_family = "wasm")]
+        let bootstrap_stage = worker_connection_failure_detail(
+            WorkerConnectionStage::Bootstrap,
+            &LoomError::new(ErrorCode::Internal, "failed with secret", false),
+            Some("secret"),
+        );
+        #[cfg(target_family = "wasm")]
+        {
+            assert!(bootstrap_stage.contains("could not open its workspace"));
+            assert!(!bootstrap_stage.contains("secret"));
+        }
     }
 
     #[test]
@@ -10269,6 +10478,90 @@ mod worker_node_tests {
             ),
             "wss://worker.example/ws"
         );
+        assert_eq!(
+            safe_worker_url_label("user@host/path?secret=value"),
+            "host/path"
+        );
+        assert_eq!(
+            safe_worker_url_label("wss://user:pass@worker.example"),
+            "wss://worker.example"
+        );
+        assert_eq!(
+            safe_worker_url_label("wss://worker.example/ws#secret"),
+            "wss://worker.example/ws"
+        );
+        assert!(!worker_url_embeds_credential(
+            "worker.example/ws?token=hidden"
+        ));
+        for key in [
+            "token",
+            "access_token",
+            "auth",
+            "authorization",
+            "bearer",
+            "key",
+            "api_key",
+            "password",
+            "secret",
+            "client_secret",
+        ] {
+            assert!(
+                worker_url_embeds_credential(&format!("wss://worker.example/ws?{key}=hidden")),
+                "{key}"
+            );
+        }
+        assert!(!worker_url_embeds_credential(
+            "wss://worker.example/ws?theme=dark"
+        ));
+    }
+
+    #[test]
+    fn worker_node_fixtures_preserve_local_connection_and_hide_url_credentials() {
+        let placeholder = connection_placeholder(
+            7,
+            "wss://user:secret@worker.example/ws?token=hidden".to_owned(),
+            WorkerConnectionState::Disconnected,
+            Some("offline".to_owned()),
+        );
+        assert_eq!(placeholder.status.name, "wss://worker.example/ws");
+        assert_eq!(
+            placeholder.status.node_id,
+            "wss://user:secret@worker.example/ws?token=hidden"
+        );
+        assert!(!placeholder.status.online);
+        assert_eq!(placeholder.connection_detail.as_deref(), Some("offline"));
+
+        let local_status = node(ACTIVE_BACKEND_NODE_ENTRY_ID, true).status;
+        let local_connection = super::ClientConnection::InProcess(Box::new(
+            loom_server::InProcessBackend::new().connect(),
+        ));
+        let config = loom_protocol::WorkspaceConfig {
+            worker_nodes: vec![
+                loom_protocol::WorkerNodeConfig {
+                    url: "ws://local-worker/ws".to_owned(),
+                },
+                loom_protocol::WorkerNodeConfig {
+                    url: "wss://remote-worker/ws".to_owned(),
+                },
+            ],
+            ..loom_protocol::WorkspaceConfig::default()
+        };
+        let nodes = initial_worker_nodes(
+            local_status,
+            local_connection,
+            &config,
+            Some("ws://local-worker/ws"),
+        );
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes[0].is_local);
+        assert_eq!(nodes[0].connection_state, WorkerConnectionState::Connected);
+        assert_eq!(nodes[1].id, 1);
+        assert_eq!(nodes[1].url.as_deref(), Some("wss://remote-worker/ws"));
+        assert_eq!(
+            nodes[1].connection_state,
+            WorkerConnectionState::Disconnected
+        );
+        assert!(nodes[1].connection.is_none());
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -10325,6 +10618,7 @@ mod worker_node_tests {
         assert_eq!(removed.id, 1);
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].is_local());
+        assert!(remove_worker_node_entry(&mut nodes, 999).is_none());
     }
 
     #[test]
@@ -10360,6 +10654,18 @@ mod worker_node_tests {
         assert!(updated_summary.contains("CPU 31% of 8 cores"));
         assert!(updated_summary.contains("RAM 50% of 16.0 GiB"));
         assert!(updated_summary.contains("disk 512.0 MiB available"));
+        assert!(
+            format_worker_node_resources(&WorkerNodeResources {
+                cpu_count: 0,
+                cpu_usage_percent: None,
+                memory_usage_percent: None,
+                memory_total_bytes: None,
+                memory_available_bytes: None,
+                disk_total_bytes: None,
+                disk_available_bytes: None,
+            })
+            .starts_with("CPU n/a · RAM")
+        );
     }
 
     #[test]
@@ -10382,11 +10688,15 @@ mod worker_node_tests {
         let mut refreshed = nodes[0].status.clone();
         refreshed.resources.cpu_usage_percent = Some(25);
         refreshed.resources.memory_usage_percent = Some(50);
-        assert_eq!(update_worker_node_status(&mut nodes, 1, refreshed), None);
+        assert_eq!(
+            update_worker_node_status(&mut nodes, 1, refreshed.clone()),
+            None
+        );
 
         let summary = format_worker_node_resources(&nodes[0].status.resources);
         assert!(summary.contains("CPU 25% of 4 cores · RAM 50% of 8.0 GiB"));
         assert!(summary.contains("disk 50.0 GiB available"));
+        assert_eq!(update_worker_node_status(&mut nodes, 999, refreshed), None);
     }
 
     #[test]
@@ -10455,6 +10765,250 @@ mod worker_node_tests {
                 AgentSessionId::new()
             ),
             Some(active_session_id)
+        );
+    }
+
+    #[test]
+    fn session_request_routing_covers_explicit_active_and_non_session_requests() {
+        let session = AgentSessionId::new();
+        let active = AgentSessionId::new();
+        let repository = loom_core::RepositoryId::new();
+        let terminal = loom_core::TerminalId::new();
+        let task = loom_core::TaskId::new();
+        let checkpoint = loom_core::CheckpointId::new();
+        let explicit_requests = vec![
+            ClientRequest::GetAgentSession {
+                session_id: session,
+            },
+            ClientRequest::GetAgentSessionSnapshot {
+                session_id: session,
+            },
+            ClientRequest::RenameAgentSession {
+                session_id: session,
+                name: "renamed".into(),
+            },
+            ClientRequest::ArchiveAgentSession {
+                session_id: session,
+            },
+            ClientRequest::GetRecentSessionEvents {
+                session_id: session,
+                limit: 5,
+            },
+            ClientRequest::StartSessionAgentRun {
+                session_id: session,
+                task: "task".into(),
+                model: ModelId::new("model"),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+            ClientRequest::StartSessionAgentRunWithOptions {
+                session_id: session,
+                task: "task".into(),
+                model: ModelId::new("model"),
+                system_instructions: None,
+                repository_instructions: None,
+                limits: loom_core::SessionLimits::default(),
+                context: loom_protocol::ContextAssemblyOptions::default(),
+            },
+            ClientRequest::AttachSessionRepository {
+                session_id: session,
+                source: "/repo".into(),
+                path: "repo".into(),
+                revision: None,
+            },
+            ClientRequest::AttachSessionDirectory {
+                session_id: session,
+                source: "/folder".into(),
+                path: "folder".into(),
+            },
+            ClientRequest::ListSessionDirectories {
+                session_id: session,
+            },
+            ClientRequest::DetachSessionDirectory {
+                session_id: session,
+                path: "folder".into(),
+            },
+            ClientRequest::ListSessionRepositories {
+                session_id: session,
+            },
+            ClientRequest::DetachSessionRepository {
+                session_id: session,
+                repository_id: repository,
+            },
+            ClientRequest::GetSessionFilesystemSnapshot {
+                session_id: session,
+            },
+            ClientRequest::GetSessionFilesystemChanges {
+                session_id: session,
+                after_sequence: None,
+            },
+            ClientRequest::ReadSessionFile {
+                session_id: session,
+                path: "file".into(),
+            },
+            ClientRequest::ApplySessionFilesystemEdit {
+                session_id: session,
+                edit: loom_protocol::WorkspaceEdit {
+                    path: "file".into(),
+                    old_text: "old".into(),
+                    new_text: "new".into(),
+                    expected_revision: None,
+                },
+            },
+            ClientRequest::TakeSessionFilesystemControl {
+                session_id: session,
+                control: loom_protocol::WorkspaceControl::Agent,
+            },
+            ClientRequest::CreateSessionCheckpoint {
+                session_id: session,
+                label: "checkpoint".into(),
+            },
+            ClientRequest::RevertSessionCheckpoint {
+                session_id: session,
+                checkpoint_id: checkpoint,
+            },
+            ClientRequest::UndoSessionEdit {
+                session_id: session,
+            },
+            ClientRequest::GetSessionContextFiles {
+                session_id: session,
+            },
+            ClientRequest::GetSessionVcsStatus {
+                session_id: session,
+                repository_id: repository,
+            },
+            ClientRequest::GetSessionVcsDiff {
+                session_id: session,
+                repository_id: repository,
+                path: None,
+                staged: false,
+            },
+            ClientRequest::GetSessionVcsBranches {
+                session_id: session,
+                repository_id: repository,
+            },
+            ClientRequest::GetSessionVcsConflicts {
+                session_id: session,
+                repository_id: repository,
+            },
+            ClientRequest::OpenSessionTerminal {
+                session_id: session,
+                command: "sh".into(),
+                args: Vec::new(),
+                cwd: None,
+            },
+            ClientRequest::WriteSessionTerminalInput {
+                session_id: session,
+                terminal_id: terminal,
+                input: "exit".into(),
+            },
+            ClientRequest::ResizeSessionTerminal {
+                session_id: session,
+                terminal_id: terminal,
+                rows: 24,
+                columns: 80,
+            },
+            ClientRequest::GetSessionTerminalEvents {
+                session_id: session,
+                terminal_id: terminal,
+                after_sequence: None,
+            },
+            ClientRequest::CancelSessionTerminal {
+                session_id: session,
+                terminal_id: terminal,
+            },
+            ClientRequest::StartSessionTask {
+                session_id: session,
+                spec: loom_protocol::TaskSpec {
+                    kind: loom_protocol::TaskKind::Test,
+                    label: "test".into(),
+                    command: "cargo".into(),
+                    args: vec!["test".into()],
+                    cwd: None,
+                    output_limit_bytes: None,
+                    artifact_paths: Vec::new(),
+                },
+            },
+            ClientRequest::ListSessionTasks {
+                session_id: session,
+            },
+            ClientRequest::GetSessionTask {
+                session_id: session,
+                task_id: task,
+            },
+            ClientRequest::GetSessionTaskEvents {
+                session_id: session,
+                task_id: task,
+                after_sequence: None,
+            },
+            ClientRequest::CancelSessionTask {
+                session_id: session,
+                task_id: task,
+            },
+            ClientRequest::GetSessionTaskEvidence {
+                session_id: session,
+                task_id: task,
+            },
+            ClientRequest::SetSessionApprovalPolicy {
+                session_id: session,
+                policy: loom_core::ApprovalPolicy::default(),
+                auto_approve_actions: None,
+            },
+            ClientRequest::ForkAgentSession {
+                session_id: session,
+                name: "fork".into(),
+            },
+            ClientRequest::GetSessionUsage {
+                session_id: session,
+            },
+        ];
+        assert!(
+            explicit_requests
+                .iter()
+                .all(|request| { session_id_for_request(request, active) == Some(session) })
+        );
+
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::GetSessionEvents {
+                    session_id: None,
+                    after_sequence: None
+                },
+                active
+            ),
+            Some(active)
+        );
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::GetSessionEvents {
+                    session_id: Some(session),
+                    after_sequence: None
+                },
+                active
+            ),
+            Some(session)
+        );
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::GetAgentRun {
+                    run_id: RunId::new()
+                },
+                active
+            ),
+            Some(active)
+        );
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::GetRunUsage {
+                    run_id: RunId::new()
+                },
+                active
+            ),
+            Some(active)
+        );
+        assert_eq!(
+            session_id_for_request(&ClientRequest::ListWorkspaces, active),
+            None
         );
     }
 
@@ -10536,6 +11090,10 @@ mod worker_node_tests {
         assert!(validate_model_for_node(&catalogs, "local", &local_model).is_ok());
         assert!(validate_model_for_node(&catalogs, "worker", &local_model).is_err());
         assert!(validate_model_for_node(&catalogs, "worker", &worker_model).is_ok());
+        assert_eq!(
+            validate_model_for_node(&catalogs, "missing", &worker_model),
+            Err("model availability has not been checked".to_owned())
+        );
     }
 
     #[test]
@@ -10570,6 +11128,7 @@ mod worker_node_tests {
         assert_eq!(adjusted_cpu_pulse_threshold(0, -1), 0);
         assert_eq!(adjusted_cpu_pulse_threshold(100, 1), 100);
         assert_eq!(adjusted_cpu_pulse_threshold(99, 1), 100);
+        assert_eq!(adjusted_cpu_pulse_threshold(255, 0), 100);
     }
 
     #[test]
@@ -10590,6 +11149,7 @@ mod worker_node_tests {
             session_node_indicator_state(Some(&status), third),
             SessionNodeIndicatorState::Severe
         );
+        assert_eq!(next_severe_load_streak(u8::MAX, &status.resources), u8::MAX);
 
         status.resources.cpu_usage_percent = Some(90);
         assert_eq!(next_severe_load_streak(third, &status.resources), 0);

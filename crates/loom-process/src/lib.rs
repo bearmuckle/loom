@@ -1001,4 +1001,24 @@ mod tests {
         }
         panic!("task did not finish");
     }
+
+    #[test]
+    fn task_paths_reject_absolute_and_parent_traversal_but_allow_nested_paths() {
+        assert!(validate_relative_path("src/main.rs").is_ok());
+        assert_eq!(
+            validate_relative_path("../outside.txt").unwrap_err().code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        assert_eq!(
+            validate_relative_path("/etc/passwd").unwrap_err().code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            validate_relative_path("C:\\Windows\\system.ini")
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+    }
 }

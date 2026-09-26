@@ -3259,6 +3259,104 @@ mod tests {
     }
 
     #[test]
+    fn openai_response_normalization_validates_envelopes_and_argument_shapes() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"choices": []}),
+            serde_json::json!({"choices": [{}]}),
+        ] {
+            assert_eq!(
+                normalize_openai_response(&body).unwrap_err().code,
+                ErrorCode::ProviderInvalidResponse
+            );
+        }
+        for tool_call in [
+            serde_json::json!({}),
+            serde_json::json!({"function": {}}),
+            serde_json::json!({"function": {"name": "read_file", "arguments": 7}}),
+        ] {
+            let body = serde_json::json!({
+                "choices": [{"message": {"tool_calls": [tool_call]}}]
+            });
+            assert_eq!(
+                normalize_openai_response(&body).unwrap_err().code,
+                ErrorCode::ProviderInvalidResponse
+            );
+        }
+
+        let events = normalize_openai_response(&serde_json::json!({
+            "choices": [{"message": {
+                "content": "",
+                "tool_calls": [{"function": {"name": "read_file"}}]
+            }, "finish_reason": null}]
+        }))
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.first(),
+            Some(ModelStreamEvent::ToolCallDelta { call })
+                if call.name == "read_file" && call.arguments == serde_json::json!({})
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(ModelStreamEvent::Completed {
+                reason: FinishReason::Stop
+            })
+        ));
+    }
+
+    #[test]
+    fn responses_normalization_covers_text_tool_usage_and_invalid_calls() {
+        let mut call_ids = BTreeMap::new();
+        let events = normalize_responses_response(
+            &serde_json::json!({
+                "status": "completed",
+                "output": [
+                    {"type":"message","content":[{"text":"answer"},{"text": 4}]},
+                    {"type":"function_call","call_id":"call-1","name":"read_file","arguments":"{\"path\":\"README.md\"}"},
+                    {"type":"unknown"}
+                ],
+                "usage":{"input_tokens":10,"output_tokens":3,"input_tokens_details":{"cached_tokens":2}}
+            }),
+            &mut call_ids,
+        )
+        .unwrap();
+        assert!(matches!(events[0], ModelStreamEvent::TextDelta { ref text } if text == "answer"));
+        assert!(
+            matches!(events[1], ModelStreamEvent::ToolCallDelta { ref call } if call.name == "read_file" && call.arguments["path"] == "README.md")
+        );
+        assert!(
+            matches!(events[2], ModelStreamEvent::Usage { ref usage } if usage.cached_input_tokens == 2)
+        );
+        assert!(matches!(
+            events[3],
+            ModelStreamEvent::Completed {
+                reason: FinishReason::Stop
+            }
+        ));
+
+        for output in [
+            serde_json::json!([{"type":"function_call"}]),
+            serde_json::json!([{"type":"function_call","name":"read_file","arguments":"invalid"}]),
+        ] {
+            assert_eq!(
+                normalize_responses_response(&serde_json::json!({"output": output}), &mut call_ids)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ProviderInvalidResponse
+            );
+        }
+        assert!(matches!(
+            normalize_responses_response(&serde_json::json!({"status":"failed"}), &mut call_ids)
+                .unwrap()
+                .last(),
+            Some(ModelStreamEvent::Completed {
+                reason: FinishReason::Error
+            })
+        ));
+    }
+
+    #[test]
     fn registry_lists_deterministic_and_local_models_without_secrets() {
         let registry = ProviderRegistry::demo();
         let models = registry.list_models().unwrap();
@@ -3414,6 +3512,38 @@ mod tests {
             "secret-value"
         );
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn credential_store_handles_missing_entries_removal_and_malformed_files() {
+        let suffix = loom_core::ToolCallId::new().to_string();
+        let directory = std::env::temp_dir().join(format!("loom-credential-errors-{suffix}"));
+        let path = directory.join("credentials.json");
+        let store = FileCredentialStore::open(&path).unwrap();
+        let reference = CredentialRef::new("provider");
+        assert_eq!(
+            store.resolve(&reference).unwrap_err().code,
+            ErrorCode::ProviderAuthentication
+        );
+        assert!(!store.remove(&reference).unwrap());
+        store
+            .insert(reference.clone(), "secret".to_owned())
+            .unwrap();
+        assert!(store.remove(&reference).unwrap());
+        assert_eq!(
+            FileCredentialStore::open(&path)
+                .unwrap()
+                .resolve(&reference)
+                .unwrap_err()
+                .code,
+            ErrorCode::ProviderAuthentication
+        );
+        fs::write(&path, b"not-json").unwrap();
+        assert_eq!(
+            FileCredentialStore::open(&path).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
