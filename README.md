@@ -10,9 +10,10 @@ a local or remote backend.
 
 The current project is a developer preview, not a supported general-purpose
 product. It is under active development; behavior and configuration may change
-between commits. There are no prebuilt release packages or compatibility
-guarantees yet. CI currently builds on Linux; other operating systems and
-browsers have not been documented as supported targets.
+between commits. Tagged GitHub releases include native UI client binaries for
+Linux x86_64, macOS x86_64 and arm64, and Windows x86_64. These preview builds
+have no compatibility guarantees. CI currently builds on Linux; other
+operating systems and browsers have not been documented as supported targets.
 
 ## Current capabilities and limitations
 
