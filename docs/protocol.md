@@ -179,7 +179,24 @@ InspectAgentContext
 `RunUsageUpdated` events; a context budget failure is a structured
 `context_limit_exceeded` failure rather than silent truncation or provider
 failover. `ContextInspected` events identify required, included, omitted, and
-compacted context items.
+compacted context items. Before each model call, the runtime clamps configured
+windows to the active model's advertised limit, counts tool schemas once, and
+sends the reserved output limit to the provider. Models without a known window
+use a visible 8,192-token fallback unless a window is configured explicitly.
+
+At 90% of the input budget, context assembly keeps recent exchanges together
+and replaces older history with bounded, explicitly lossy excerpts. System and
+repository instructions, the original task, and the latest user direction remain
+intact. Large tool outputs may be shortened with omission markers; call IDs and
+arguments are preserved. If required context or the latest exchange still cannot
+fit, the run reports a context-limit error. Compaction uses the active provider's
+token estimator; these counts remain estimates, not server-side token guarantees.
+
+The runtime persists the summary and its history boundary across recovery,
+retaining the full transcript separately. The UI shows estimated input usage and
+output reserve, and records compaction in the timeline. Excerpts preserve the
+beginning and end of older content; they are not model-generated semantic
+summaries and may omit intermediate decisions or details.
 
 Provider summaries contain provider/model IDs, capabilities, credential
 reference IDs, and health state, never raw credentials. Normalized provider

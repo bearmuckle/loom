@@ -1104,6 +1104,7 @@ pub(crate) struct LoomView {
     pub(crate) active_session: AgentSessionSnapshot,
     pub(crate) active_run: Option<AgentRunSnapshot>,
     pub(crate) active_run_id: Option<RunId>,
+    context_inspection: Option<loom_protocol::ContextInspection>,
     pub(crate) model: ModelId,
     pub(crate) default_model: ModelId,
     pub(crate) session_models: BTreeMap<AgentSessionId, ModelId>,
@@ -1440,6 +1441,7 @@ impl LoomView {
             active_session: active_session.clone(),
             active_run: None,
             active_run_id: None,
+            context_inspection: None,
             default_model: model.clone(),
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
@@ -1584,7 +1586,7 @@ impl LoomView {
             info!("remote transport connected; negotiating protocol");
             negotiate(&connection)?;
             let workspace_root = options
-                .workspace
+                .project
                 .clone()
                 .map(fs::canonicalize)
                 .transpose()
@@ -1783,6 +1785,7 @@ impl LoomView {
             active_session: session.clone(),
             active_run: run.clone(),
             active_run_id: run.as_ref().map(|run| run.id),
+            context_inspection: None,
             default_model: model.clone(),
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
@@ -1921,6 +1924,7 @@ impl LoomView {
             active_session,
             active_run: None,
             active_run_id: None,
+            context_inspection: None,
             default_model: if demo_mode {
                 ModelId::new("deterministic/demo")
             } else {
@@ -2145,6 +2149,7 @@ impl LoomView {
             active_session: session.clone(),
             active_run: None,
             active_run_id: None,
+            context_inspection: None,
             default_model: model.clone(),
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
@@ -2600,6 +2605,7 @@ impl LoomView {
         self.pending_input = None;
         self.active_run = None;
         self.active_run_id = None;
+        self.context_inspection = None;
         self.run_state = None;
         self.after_sequence = None;
     }
@@ -2932,6 +2938,7 @@ impl LoomView {
     pub(crate) fn consume_agent_event(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::RunStarted { snapshot } => {
+                self.context_inspection = None;
                 self.active_run = Some(snapshot.clone());
                 self.active_run_id = Some(snapshot.id);
                 self.run_state = Some(snapshot.state);
@@ -2991,7 +2998,12 @@ impl LoomView {
                     }
                 }
             }
-            AgentEvent::ContextInspected { .. } => {}
+            AgentEvent::ContextInspected { inspection, .. } => {
+                if inspection.compacted {
+                    self.record_status(format!("Context compacted into lossy excerpts (approximately {} tokens removed). Full history is retained.", inspection.omitted_tokens));
+                }
+                self.context_inspection = Some(inspection.clone());
+            }
             AgentEvent::ProviderError { error, .. } | AgentEvent::ContextError { error, .. } => {
                 self.timeline.push(TimelineItem::Error {
                     operation: "agent".to_owned(),
@@ -7241,6 +7253,32 @@ impl LoomView {
             .bg(rgb(0x17191f))
             .border_t_1()
             .border_color(rgb(0x30343f))
+            .when_some(self.context_inspection.as_ref(), |element, inspection| {
+                let budget = inspection.budget.effective_input_tokens.map_or_else(
+                    || "unknown budget".to_owned(),
+                    |limit| format!("{limit} input tokens"),
+                );
+                let fallback = if inspection
+                    .items
+                    .iter()
+                    .any(|item| item.label.contains("fallback"))
+                {
+                    " · model limit unknown; conservative estimate"
+                } else {
+                    ""
+                };
+                element.child(
+                    div()
+                        .id("context-usage")
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .mb_2()
+                        .child(format!(
+                            "Context ≈ {} / {budget} · {} reserved for output{fallback}",
+                            inspection.included_tokens, inspection.budget.reserved_output_tokens
+                        )),
+                )
+            })
             .child(
                 div()
                     .w_full()
@@ -9960,7 +9998,7 @@ mod loom_view_render_tests {
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
             let options = |remote: &str, token: Option<&str>| super::UiOptions {
-                workspace: None,
+                project: None,
                 task: "startup validation".to_owned(),
                 demo: false,
                 model: ModelId::new("deterministic/demo"),
@@ -9997,7 +10035,7 @@ mod loom_view_render_tests {
             let invalid_workspace =
                 std::env::temp_dir().join(format!("loom-ui-missing-{}", uuid::Uuid::new_v4()));
             let local_options = super::UiOptions {
-                workspace: Some(invalid_workspace),
+                project: Some(invalid_workspace),
                 task: "startup validation".to_owned(),
                 demo: false,
                 model: ModelId::new("deterministic/demo"),
@@ -10024,7 +10062,7 @@ mod loom_view_render_tests {
         cx.update(gpui_kit::init);
         let _handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
             let options = super::UiOptions {
-                workspace: None,
+                project: None,
                 task: "bootstrap test".to_owned(),
                 demo: false,
                 model: ModelId::new("deterministic/demo"),
@@ -10586,6 +10624,35 @@ mod loom_view_render_tests {
             window.render_frame(cx);
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn context_events_update_usage_and_only_record_compaction(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let mut inspection = loom_protocol::ContextInspection {
+                items: Vec::new(), total_tokens: 200, included_tokens: 200, omitted_tokens: 0,
+                budget: loom_protocol::ContextBudget::new(Some(1_000), None, 100).unwrap(),
+                compacted: false, summary: None,
+            };
+            let run_id = RunId::new();
+            view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected { run_id, inspection: inspection.clone() });
+            assert!(view.timeline.is_empty());
+            assert_eq!(view.context_inspection.as_ref().unwrap().included_tokens, 200);
+            inspection.compacted = true;
+            inspection.omitted_tokens = 120;
+            inspection.included_tokens = 80;
+            view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected { run_id, inspection: inspection.clone() });
+            assert!(matches!(view.timeline.last(), Some(TimelineItem::Status(text)) if text.contains("Context compacted") && text.contains("lossy excerpts")));
+            let count = view.timeline.len();
+            inspection.compacted = false;
+            view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected { run_id, inspection });
+            assert_eq!(view.timeline.len(), count);
+            assert_eq!(view.context_inspection.as_ref().unwrap().included_tokens, 80);
+            view.reset_projection();
+            assert!(view.context_inspection.is_none());
+        });
     }
 
     #[gpui_kit::test]

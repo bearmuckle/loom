@@ -25,79 +25,52 @@ should be interchangeable views of the same durable backend session.
 
 ## Build and run
 
-Requires Rust 1.95 or newer.
+Install Rust 1.95 or newer, then run:
 
-```text
-cargo build
-cargo run -p loom-ui -- --workspace /path/to/project
+```sh
+cargo run -p loom-ui
 ```
 
-Workspaces are durable containers for sessions, independent of repository
-folders. Each session owns a filesystem root. GitHub repositories use isolated
-checkouts. In native local mode, selecting a local directory or passing
-`--workspace PATH` attaches that directory in place; session edits affect its
-original files. Loom discovers Git repositories in the directory itself and
-its immediate child directories.
+By default, Loom uses the directory you launch it from. To use a different
+project directory, pass `--project PATH`:
 
-Demo mode:
+```sh
+cargo run -p loom-ui -- --project /path/to/project
+```
 
-```text
+To try the demo without connecting a model provider:
+
+```sh
 cargo run -p loom-ui -- --demo
 ```
 
+For browser development, run `./scripts/dev-wasm.sh`. This requires Trunk and
+the `wasm32-unknown-unknown` Rust target.
+
+## Development checks
+
 Run the full Rust check suite locally:
 
-```text
+```sh
 ./scripts/ci-check.sh
 ```
 
-To check formatting automatically before every commit, enable the repository
-hook once:
+To enable the formatting check before every commit, run:
 
-```text
+```sh
 git config core.hooksPath .githooks
 ```
 
-The commit hook runs `cargo fmt --all -- --check` without compiling Rust. The
-full Clippy, test, and build checks run in CI and can be run locally with
-`./scripts/ci-check.sh`.
-
-Browser target (GPUI currently requires a nightly compiler for wasm atomics):
-
-```text
-RUSTC_BOOTSTRAP=1 cargo check -p loom-ui --target wasm32-unknown-unknown
-```
-
-The wasm binary is a browser-hosted GPUI client; native-only workspace,
-process, and credential integrations remain available through the remote
-backend boundary.
-
-Run the backend and browser client together for local WASM development:
-
-```text
-./scripts/dev-wasm.sh
-```
-
-The launcher starts a configured worker backend on `127.0.0.1:8765`, waits
-for its health endpoint, then starts Trunk from `crates/loom-ui` on
-`127.0.0.1:8080`. GitHub Copilot is the default model preference; local Ollama
-is added only when its endpoint is configured. It prints a complete URL
-containing the WebSocket endpoint and token. Open that URL in a browser;
-sessions and their repository checkouts are created independently of the
-worker's launch directory. Press `Ctrl-C` to stop both processes. Set
-`LOOM_TOKEN`, `LOOM_BACKEND_BIND`, or `LOOM_FRONTEND_PORT` to override the
-local defaults.
-GitHub Copilot models become available after signing in. Configure local
-Ollama models explicitly with `LOOM_OLLAMA_ENDPOINT` and optionally
-`LOOM_OLLAMA_MODEL`; unconfigured local models are not listed.
-Without a URL or saved worker connection, the full client opens disconnected;
-connect a worker from Settings. Worker settings are saved in browser storage.
-
-The browser client is deployed to Vercel on pushes to `main` and can also be
-published manually from the Actions tab. Configure a Vercel project and the
-`VERCEL_TOKEN`, `VERCEL_ORG_ID`, and `VERCEL_PROJECT_ID` GitHub Actions secrets
-to enable deployment. The client requires a separately running Loom backend.
+The hook runs `cargo fmt --all -- --check`. CI also runs Clippy, tests, and
+build checks.
 
 Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
 `LOOM_MODEL`, or connect to a remote backend with `LOOM_REMOTE_URL` and
 `LOOM_TOKEN`. GitHub Copilot login is available in the UI.
+
+## License
+
+Loom's core libraries and client components are licensed under GPL-3.0-only;
+see [LICENSE](LICENSE). The protocol and server-side components in
+`crates/loom-protocol` and `crates/loom-server` are licensed under
+`AGPL-3.0-only`; see [LICENSE-AGPL](LICENSE-AGPL).
