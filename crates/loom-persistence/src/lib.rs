@@ -25,10 +25,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 17;
-const DATABASE_SCHEMA_VERSION: u32 = 17;
+pub const CURRENT_SCHEMA_VERSION: u32 = 18;
+const DATABASE_SCHEMA_VERSION: u32 = 18;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
+const CONTENT_PART_BYTES: usize = 256 * 1024;
 const MAX_MESSAGE_FRAGMENT_BYTES: usize = 32 * 1024;
 const MAX_CONTENT_RANGE_BYTES: usize = 256 * 1024;
 const MAX_RUN_MESSAGE_PAGE_SIZE: usize = 100;
@@ -82,7 +83,7 @@ CREATE TABLE IF NOT EXISTS run_messages (
         CHECK(length(session_id) = 16),
     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
     role TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant', 'tool')),
-    content_hash BLOB REFERENCES content_blobs(hash) ON DELETE RESTRICT
+    content_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
         CHECK(content_hash IS NULL OR length(content_hash) = 32),
     name TEXT,
     tool_call_id BLOB CHECK(tool_call_id IS NULL OR length(tool_call_id) = 16),
@@ -99,7 +100,7 @@ CREATE TABLE IF NOT EXISTS run_message_fragments (
     fragment_ordinal INTEGER NOT NULL CHECK(fragment_ordinal >= 0),
     byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
     byte_length INTEGER NOT NULL CHECK(byte_length > 0 AND byte_length <= 32768),
-    content_hash BLOB NOT NULL REFERENCES content_blobs(hash) ON DELETE RESTRICT
+    content_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE RESTRICT
         CHECK(length(content_hash) = 32),
     PRIMARY KEY(run_id, message_ordinal, fragment_ordinal),
     UNIQUE(run_id, message_ordinal, byte_offset),
@@ -135,7 +136,7 @@ CREATE TABLE IF NOT EXISTS checkpoint_files (
     existed INTEGER NOT NULL CHECK(existed IN (0, 1)),
     revision TEXT NOT NULL,
     expected_revision TEXT NOT NULL,
-    content_hash BLOB NOT NULL REFERENCES content_blobs(hash) ON DELETE RESTRICT
+    content_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE RESTRICT
         CHECK(length(content_hash) = 32),
     PRIMARY KEY(session_id, checkpoint_id, path),
     FOREIGN KEY(session_id, checkpoint_id)
@@ -209,16 +210,33 @@ CREATE TABLE IF NOT EXISTS section_meta (
 ) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS content_blobs (
     hash BLOB PRIMARY KEY NOT NULL CHECK(length(hash) = 32),
-    raw_size INTEGER NOT NULL CHECK(raw_size >= 0),
+    raw_size INTEGER NOT NULL CHECK(raw_size > 0 AND raw_size <= 262144),
     codec INTEGER NOT NULL CHECK(codec IN (0, 1)),
     payload BLOB NOT NULL
 ) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS content_objects (
+    hash BLOB PRIMARY KEY NOT NULL CHECK(length(hash) = 32),
+    raw_size INTEGER NOT NULL CHECK(raw_size >= 0 AND raw_size <= 536870912)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS content_parts (
+    content_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE CASCADE
+        CHECK(length(content_hash) = 32),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
+    byte_length INTEGER NOT NULL CHECK(byte_length > 0 AND byte_length <= 262144),
+    blob_hash BLOB NOT NULL REFERENCES content_blobs(hash) ON DELETE RESTRICT
+        CHECK(length(blob_hash) = 32),
+    PRIMARY KEY(content_hash, ordinal),
+    UNIQUE(content_hash, byte_offset)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS content_parts_by_blob
+    ON content_parts(blob_hash);
 CREATE TABLE IF NOT EXISTS state_nodes (
     section TEXT NOT NULL REFERENCES section_meta(name) ON DELETE CASCADE,
     path TEXT NOT NULL,
     node_kind INTEGER NOT NULL CHECK(node_kind BETWEEN 0 AND 3),
     scalar BLOB,
-    content_hash BLOB REFERENCES content_blobs(hash) ON DELETE RESTRICT,
+    content_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT,
     PRIMARY KEY(section, path),
     CHECK((node_kind = 2 AND scalar IS NOT NULL AND content_hash IS NULL)
        OR (node_kind = 3 AND scalar IS NULL AND content_hash IS NOT NULL)
@@ -295,7 +313,7 @@ fn unescape_object_segment(segment: &str) -> Option<String> {
     Some(decoded)
 }
 
-fn decode_content(connection: &Connection, hash: &[u8]) -> Result<String> {
+fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> {
     let (raw_size, codec, payload): (i64, i64, Vec<u8>) = connection
         .query_row(
             "SELECT raw_size, codec, payload FROM content_blobs WHERE hash = ?1",
@@ -303,12 +321,12 @@ fn decode_content(connection: &Connection, hash: &[u8]) -> Result<String> {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| {
-            persistence_error(format!("could not read state content: {error}"), true)
+            persistence_error(format!("could not read state content part: {error}"), true)
         })?;
-    if raw_size < 0 || raw_size > MAX_CONTENT_BYTES as i64 {
+    if raw_size <= 0 || raw_size > CONTENT_PART_BYTES as i64 {
         return Err(LoomError::new(
             ErrorCode::MalformedPayload,
-            "persisted state content exceeds the maximum supported size",
+            "persisted content part has an invalid size",
             false,
         ));
     }
@@ -322,7 +340,7 @@ fn decode_content(connection: &Connection, hash: &[u8]) -> Result<String> {
                 .map_err(|error| {
                     LoomError::new(
                         ErrorCode::MalformedPayload,
-                        format!("persisted state content is malformed: {error}"),
+                        format!("persisted content part is malformed: {error}"),
                         false,
                     )
                 })?;
@@ -331,11 +349,143 @@ fn decode_content(connection: &Connection, hash: &[u8]) -> Result<String> {
         _ => {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                "persisted state content uses an unsupported codec",
+                "persisted content part uses an unsupported codec",
                 false,
             ));
         }
     };
+    if bytes.len() as i64 != raw_size || Sha256::digest(&bytes).as_slice() != hash {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted content part failed its length or hash check",
+            false,
+        ));
+    }
+    Ok(bytes)
+}
+
+fn load_content_range(
+    connection: &Connection,
+    hash: &[u8],
+    offset: usize,
+    requested_len: usize,
+) -> Result<Vec<u8>> {
+    let raw_size: i64 = connection
+        .query_row(
+            "SELECT raw_size FROM content_objects WHERE hash = ?1",
+            [hash],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read state content metadata: {error}"),
+                true,
+            )
+        })?;
+    if raw_size < 0 || raw_size > MAX_CONTENT_BYTES as i64 {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted state content exceeds the maximum supported size",
+            false,
+        ));
+    }
+    let start = offset.min(raw_size as usize);
+    let end = start.saturating_add(requested_len).min(raw_size as usize);
+    if start == end {
+        return Ok(Vec::new());
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT byte_offset, byte_length, blob_hash FROM content_parts
+             WHERE content_hash=?1 AND byte_offset < ?2
+               AND byte_offset + byte_length > ?3
+             ORDER BY byte_offset",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prepare content range: {error}"), true)
+        })?;
+    let parts = statement
+        .query_map(params![hash, end as i64, start as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(|error| {
+            persistence_error(format!("could not read content range: {error}"), true)
+        })?;
+    let mut output = Vec::with_capacity(end - start);
+    let mut cursor = start;
+    for part in parts {
+        let (part_offset, part_length, blob_hash) = part.map_err(|error| {
+            persistence_error(format!("could not read content part: {error}"), true)
+        })?;
+        let part_offset = usize::try_from(part_offset).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted content part has an invalid offset",
+                false,
+            )
+        })?;
+        let part_length = usize::try_from(part_length).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted content part has an invalid length",
+                false,
+            )
+        })?;
+        let part_end = part_offset.checked_add(part_length).ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted content part range overflowed",
+                false,
+            )
+        })?;
+        let slice_start = start.max(part_offset);
+        let slice_end = end.min(part_end);
+        if slice_start != cursor || slice_start >= slice_end {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted content parts are not contiguous",
+                false,
+            ));
+        }
+        let part_bytes = decode_content_blob(connection, &blob_hash)?;
+        if part_bytes.len() != part_length {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted content part length does not match its range",
+                false,
+            ));
+        }
+        output.extend_from_slice(&part_bytes[slice_start - part_offset..slice_end - part_offset]);
+        cursor = slice_end;
+    }
+    if cursor != end {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted content range is incomplete",
+            false,
+        ));
+    }
+    Ok(output)
+}
+
+fn decode_content(connection: &Connection, hash: &[u8]) -> Result<String> {
+    let raw_size: i64 = connection
+        .query_row(
+            "SELECT raw_size FROM content_objects WHERE hash = ?1",
+            [hash],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read state content metadata: {error}"),
+                true,
+            )
+        })?;
+    let bytes = load_content_range(connection, hash, 0, raw_size.max(0) as usize)?;
     if bytes.len() as i64 != raw_size || Sha256::digest(&bytes).as_slice() != hash {
         return Err(LoomError::new(
             ErrorCode::MalformedPayload,
@@ -1368,7 +1518,7 @@ impl FilePersistence {
                 "SELECT m.ordinal, m.role,
                         MAX(
                             COALESCE(
-                                (SELECT raw_size FROM content_blobs WHERE hash=m.content_hash),
+                                (SELECT raw_size FROM content_objects WHERE hash=m.content_hash),
                                 0
                             ),
                             COALESCE(
@@ -1535,7 +1685,7 @@ impl FilePersistence {
             .query_row(
                 "SELECT COALESCE(content.raw_size, 0)
                  FROM run_messages message
-                 LEFT JOIN content_blobs content ON content.hash=message.content_hash
+                 LEFT JOIN content_objects content ON content.hash=message.content_hash
                  WHERE message.run_id=?1 AND message.ordinal=?2",
                 params![run_id_bytes.as_slice(), message_ordinal],
                 |row| row.get(0),
@@ -1675,7 +1825,7 @@ impl FilePersistence {
             .query_row(
                 "SELECT COALESCE(content.raw_size, 0)
                  FROM run_messages message
-                 LEFT JOIN content_blobs content ON content.hash=message.content_hash
+                 LEFT JOIN content_objects content ON content.hash=message.content_hash
                  WHERE message.run_id=?1 AND message.ordinal=?2",
                 params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
                 |row| row.get(0),
@@ -1732,16 +1882,30 @@ impl FilePersistence {
             })?
             .ok_or_else(|| LoomError::invalid_request("run message does not exist"))?;
         if let Some(content_hash) = content_hash {
-            let content = decode_content(&connection, &content_hash)?;
             let start = usize::try_from(byte_offset)
                 .map_err(|_| LoomError::invalid_request("message byte offset is out of range"))?;
-            let mut output = if start < content.len() {
-                content.as_bytes()[start..start.saturating_add(length).min(content.len())].to_vec()
-            } else {
-                Vec::new()
-            };
+            let content_size: i64 = connection
+                .query_row(
+                    "SELECT raw_size FROM content_objects WHERE hash=?1",
+                    [&content_hash],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not read message content size: {error}"),
+                        true,
+                    )
+                })?;
+            let content_size = usize::try_from(content_size).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted message content size is invalid",
+                    false,
+                )
+            })?;
+            let mut output = load_content_range(&connection, &content_hash, start, length)?;
             if output.len() < length {
-                let content_end = u64::try_from(content.len()).map_err(|_| {
+                let content_end = u64::try_from(content_size).map_err(|_| {
                     LoomError::new(
                         ErrorCode::MalformedPayload,
                         "persisted message content is too large",
@@ -2535,10 +2699,15 @@ fn flatten_value(value: &Value, path: &str, nodes: &mut Vec<EncodedNode>) -> Res
 }
 
 fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8>> {
+    if content.len() > MAX_CONTENT_BYTES {
+        return Err(LoomError::invalid_request(
+            "persisted content exceeds the maximum supported size",
+        ));
+    }
     let hash = Sha256::digest(content).to_vec();
     let already_stored = transaction
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM content_blobs WHERE hash=?1)",
+            "SELECT EXISTS(SELECT 1 FROM content_objects WHERE hash=?1)",
             [hash.as_slice()],
             |row| row.get::<_, bool>(0),
         )
@@ -2548,15 +2717,56 @@ fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8
     if already_stored {
         return Ok(hash);
     }
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(content).map_err(|error| {
-        persistence_error(format!("could not compress state content: {error}"), false)
-    })?;
-    let compressed = encoder.finish().map_err(|error| {
-        persistence_error(format!("could not compress state content: {error}"), false)
-    })?;
-    let (codec, payload) = if compressed.len() < content.len() {
-        (1_i64, compressed)
+    transaction
+        .execute(
+            "INSERT INTO content_objects(hash, raw_size) VALUES (?1, ?2)",
+            params![hash, content.len() as i64],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not store content metadata: {error}"), true)
+        })?;
+    for (ordinal, part) in content.chunks(CONTENT_PART_BYTES).enumerate() {
+        let byte_offset = ordinal * CONTENT_PART_BYTES;
+        let part_hash = store_content_blob(transaction, part)?;
+        transaction
+            .execute(
+                "INSERT INTO content_parts(
+                    content_hash, ordinal, byte_offset, byte_length, blob_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    hash,
+                    ordinal as i64,
+                    byte_offset as i64,
+                    part.len() as i64,
+                    part_hash
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not store content part reference: {error}"),
+                    true,
+                )
+            })?;
+    }
+    Ok(hash)
+}
+
+fn store_content_blob(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8>> {
+    debug_assert!(!content.is_empty() && content.len() <= CONTENT_PART_BYTES);
+    let hash = Sha256::digest(content).to_vec();
+    let (codec, payload) = if content.len() >= EXTERNAL_STRING_THRESHOLD {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(content).map_err(|error| {
+            persistence_error(format!("could not compress state content: {error}"), false)
+        })?;
+        let compressed = encoder.finish().map_err(|error| {
+            persistence_error(format!("could not compress state content: {error}"), false)
+        })?;
+        if compressed.len().saturating_mul(100) <= content.len().saturating_mul(90) {
+            (1_i64, compressed)
+        } else {
+            (0_i64, content.to_vec())
+        }
     } else {
         (0_i64, content.to_vec())
     };
@@ -2567,7 +2777,7 @@ fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8
             params![hash, content.len() as i64, codec, payload],
         )
         .map_err(|error| {
-            persistence_error(format!("could not store state content: {error}"), true)
+            persistence_error(format!("could not store state content part: {error}"), true)
         })?;
     Ok(hash)
 }
@@ -2575,24 +2785,38 @@ fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8
 fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
     transaction
         .execute(
-            "DELETE FROM content_blobs
+            "DELETE FROM content_objects
              WHERE NOT EXISTS (
-                SELECT 1 FROM state_nodes WHERE state_nodes.content_hash=content_blobs.hash
+                SELECT 1 FROM state_nodes WHERE state_nodes.content_hash=content_objects.hash
              ) AND NOT EXISTS (
                 SELECT 1 FROM checkpoint_files
-                WHERE checkpoint_files.content_hash=content_blobs.hash
+                WHERE checkpoint_files.content_hash=content_objects.hash
              ) AND NOT EXISTS (
                 SELECT 1 FROM run_messages
-                WHERE run_messages.content_hash=content_blobs.hash
+                WHERE run_messages.content_hash=content_objects.hash
              ) AND NOT EXISTS (
                 SELECT 1 FROM run_message_fragments
-                WHERE run_message_fragments.content_hash=content_blobs.hash
+                WHERE run_message_fragments.content_hash=content_objects.hash
              )",
             [],
         )
         .map_err(|error| {
             persistence_error(
-                format!("could not collect unused state content: {error}"),
+                format!("could not collect unused content metadata: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM content_blobs
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM content_parts WHERE content_parts.blob_hash=content_blobs.hash
+             )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not collect unused content parts: {error}"),
                 true,
             )
         })?;
@@ -5207,6 +5431,13 @@ mod tests {
                     tool_call_id: None,
                     tool_calls: Vec::new(),
                 },
+                DurableRunMessage {
+                    role: loom_model::MessageRole::User,
+                    content: "0123456789".repeat(60_000),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
             ],
         )]);
         persistence
@@ -5250,6 +5481,12 @@ mod tests {
             b"lo wo"
         );
         assert_eq!(
+            persistence
+                .load_run_message_content_range(run_id, 3, (CONTENT_PART_BYTES - 3) as u64, 10,)
+                .unwrap(),
+            b"1234567890"
+        );
+        assert_eq!(
             persistence.load_run_messages(run_id).unwrap()[1].content,
             "seedhello world"
         );
@@ -5282,7 +5519,9 @@ mod tests {
             .unwrap();
         drop(persistence);
         let persistence = FilePersistence::open(&path).unwrap();
-        let newest_page = persistence.load_run_message_page(run_id, None, 1).unwrap();
+        let newest_page = persistence
+            .load_run_message_page(run_id, Some(3), 1)
+            .unwrap();
         assert_eq!(newest_page[0].ordinal, 2);
         assert_eq!(newest_page[0].content_bytes, 7);
         assert_eq!(
@@ -5471,6 +5710,21 @@ mod tests {
         assert!(
             range_plan.contains("run_message_fragments_by_range"),
             "{range_plan}"
+        );
+        let content_range_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT byte_offset, byte_length, blob_hash
+                 FROM content_parts
+                 WHERE content_hash=?1 AND byte_offset<?2
+                   AND byte_offset + byte_length > ?3
+                 ORDER BY byte_offset",
+                params![vec![0_u8; 32], CONTENT_PART_BYTES as i64, 0_i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            content_range_plan.contains("content_hash=? AND byte_offset<?"),
+            "{content_range_plan}"
         );
         drop(connection);
         fs::remove_file(path).unwrap();

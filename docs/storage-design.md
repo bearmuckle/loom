@@ -424,9 +424,11 @@ Implement in this order:
    and activities; add paging and canonical context loading. Make startup and
    history independent of filesystems. The persistence layer now appends streamed
    assistant fragments and exposes bounded keyset pages and byte-range reads.
-   Protocol-level conversation paging, chunked range reads for completed
-   compressed content objects, batching fragments at the intended flush
-   thresholds, and canonical context loading remain to be completed.
+   Completed content is stored as immutable 256 KiB chunks, so a bounded range
+   read decodes only the chunks intersecting that range. Protocol-level
+   conversation paging, batching fragments at the intended flush thresholds,
+   migration of tools and activities, and canonical context loading remain to
+   be completed.
 3. Move execution, approvals, idempotency, and publication to transactional domain
    commands. Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.
