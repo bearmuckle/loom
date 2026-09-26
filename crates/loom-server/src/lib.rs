@@ -661,6 +661,25 @@ struct PersistedSessionFilesystem {
     directories: Vec<SessionDirectory>,
 }
 
+fn sync_cached_run_attempt(state: &mut AgentRuntimeState) {
+    let Some(attempt) = state
+        .attempts
+        .iter_mut()
+        .rfind(|attempt| attempt.id == state.run.attempt_id)
+    else {
+        return;
+    };
+    attempt.state = state.run.state;
+    attempt.completed_at = if matches!(
+        state.run.state,
+        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+    ) {
+        Some(state.run.completed_at.unwrap_or(state.run.updated_at))
+    } else {
+        None
+    };
+}
+
 /// One agent run owned by the backend.
 ///
 /// The runtime lock is held only while a step is executing. Reads and control
@@ -1019,12 +1038,20 @@ impl RunHandle {
         match event {
             AgentEvent::RunStarted { snapshot } | AgentEvent::RunCompleted { snapshot } => {
                 state.run = snapshot.clone();
+                sync_cached_run_attempt(&mut state);
             }
             AgentEvent::RunStateChanged {
                 state: run_state, ..
             } => {
                 state.run.state = *run_state;
                 state.run.updated_at = Timestamp::now();
+                let checkpoint_retry_transition = *run_state == AgentRunState::Planning
+                    && state.attempts.iter().any(|attempt| {
+                        attempt.id == state.run.attempt_id && attempt.completed_at.is_some()
+                    });
+                if !checkpoint_retry_transition {
+                    sync_cached_run_attempt(&mut state);
+                }
             }
             AgentEvent::RunUsageUpdated { usage, .. } => state.usage = usage.clone(),
             AgentEvent::ToolApprovalRequired {
@@ -2116,6 +2143,14 @@ impl InProcessBackend {
                 })?;
             runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
             runtime_state.activities = persistence.load_run_activities(run_id)?;
+            runtime_state.attempts = persistence.load_run_attempts(run_id)?;
+            if runtime_state.attempts.is_empty() {
+                return Err(LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("persisted run {run_id} has no typed attempt history"),
+                    true,
+                ));
+            }
             runtime_state.interactions = persistence.load_run_interactions(run_id)?;
             if runtime_state.run.id != run_id {
                 return Err(LoomError::new(
@@ -2195,6 +2230,7 @@ impl InProcessBackend {
                     DurableRunSummary {
                         snapshot: summary.snapshot.clone(),
                         usage: summary.usage.clone(),
+                        attempts: None,
                         interactions: None,
                     },
                 )
@@ -2206,6 +2242,7 @@ impl InProcessBackend {
                 DurableRunSummary {
                     snapshot: state.run.clone(),
                     usage: state.usage.clone(),
+                    attempts: Some(state.attempts.clone()),
                     interactions: Some(state.interactions.clone()),
                 },
             );
@@ -2219,6 +2256,7 @@ impl InProcessBackend {
                     .insert(run_id, durable_run_messages_from_runtime(&state.messages));
                 state.messages.clear();
                 durable_run_activities.insert(run_id, std::mem::take(&mut state.activities));
+                state.attempts.clear();
                 state.interactions.clear();
                 Ok((format!("run:{run_id}"), json_value(state)?))
             })
@@ -2796,6 +2834,17 @@ impl InProcessConnection {
         state.messages =
             persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
         state.activities = persistence.load_run_activities(summary.snapshot.id)?;
+        state.attempts = persistence.load_run_attempts(summary.snapshot.id)?;
+        if state.attempts.is_empty() {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!(
+                    "persisted run {} has no typed attempt history",
+                    summary.snapshot.id
+                ),
+                true,
+            ));
+        }
         state.interactions = persistence.load_run_interactions(summary.snapshot.id)?;
         Ok(state)
     }
@@ -7288,6 +7337,14 @@ mod tests {
         let ServerResponse::AgentRun(before_retry) = before_retry.result.unwrap() else {
             panic!("unexpected run response before checkpoint retry");
         };
+        let prior_attempts = reopened
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_attempts(run_id)
+            .unwrap();
+        assert_eq!(prior_attempts.len(), 1);
+        assert_eq!(prior_attempts[0].id, before_retry.attempt_id);
         let retried = reopened_connection.request(RequestEnvelope::new(
             ClientRequest::RetryAgentFromCheckpoint {
                 run_id,
@@ -7308,6 +7365,28 @@ mod tests {
             panic!("unexpected run response after checkpoint retry");
         };
         assert_eq!(after_retry.attempt_id, retried.attempt_id);
+        let mut attempts = Vec::new();
+        for _ in 0..1_000 {
+            attempts = reopened
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_attempts(run_id)
+                .unwrap();
+            if attempts
+                .last()
+                .is_some_and(|attempt| attempt.state == AgentRunState::AwaitingApproval)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].id, before_retry.attempt_id);
+        assert_eq!(attempts[0].number, 1);
+        assert_eq!(attempts[1].id, retried.attempt_id);
+        assert_eq!(attempts[1].number, 2);
+        assert_eq!(attempts[1].state, AgentRunState::AwaitingApproval);
         fs::remove_file(persistence).unwrap();
         fs::remove_dir_all(session_root_base).unwrap();
     }

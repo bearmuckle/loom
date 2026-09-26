@@ -35,6 +35,10 @@ records the source of truth**. Store large immutable content separately from
 those records, inside SQLite initially. Maintain a small, disposable reconnect
 feed. Instantiate agent runtimes and filesystem services only when needed.
 
+Typed `run_attempts` rows now retain each attempt's stable identity, number,
+state, checkpoint reference, and start/completion times independently of the
+current run snapshot.
+
 The application must be able to answer “show my sessions” without reading a
 conversation, “show the last 50 timeline items” without opening a filesystem,
 and “rename this session” without serializing anything belonging to another
@@ -465,6 +469,10 @@ Implement in this order:
    in-flight tool automatically; it marks the run failed with an unknown
    external outcome and requires an explicit retry. Typed tool-attempt records,
    further execution-state normalization, and crash-injection coverage remain.
+   Schema v22 stores ordered run-attempt identity, state, checkpoint, and timing
+   records separately; checkpoint retry adds a new row while earlier attempts
+   remain queryable. These rows are written transactionally with the run
+   summary, interaction history, and feed.
    Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section

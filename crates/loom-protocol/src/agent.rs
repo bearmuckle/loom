@@ -1,6 +1,6 @@
 use loom_core::{
-    AgentSessionId, EvidenceLink, InteractionId, LimitStatus, LoomError, PolicyEvaluation,
-    RunAttemptId, RunId, StepId, Timestamp, ToolCallId, UsageSnapshot,
+    AgentSessionId, CheckpointId, EvidenceLink, InteractionId, LimitStatus, LoomError,
+    PolicyEvaluation, RunAttemptId, RunId, StepId, Timestamp, ToolCallId, UsageSnapshot,
 };
 use loom_model::{ModelId, TokenUsage, ToolCall};
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,18 @@ pub struct AgentRunSnapshot {
     pub summary: Option<String>,
     #[serde(default)]
     pub evidence: Vec<EvidenceLink>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentRunAttemptRecord {
+    pub run_id: RunId,
+    pub session_id: AgentSessionId,
+    pub id: RunAttemptId,
+    pub number: u32,
+    pub state: AgentRunState,
+    pub checkpoint_id: Option<CheckpointId>,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -52,6 +52,8 @@ pub struct AgentRuntimeState {
     pub run: AgentRunSnapshot,
     pub plan: AgentPlan,
     pub messages: Vec<ModelMessage>,
+    #[serde(default)]
+    pub attempts: Vec<loom_protocol::AgentRunAttemptRecord>,
     pub pending_approval: Option<ToolCall>,
     #[serde(default)]
     pub pending_tool_execution: Option<ToolCall>,
@@ -231,6 +233,7 @@ pub struct AgentRuntime {
     session_id: AgentSessionId,
     task: AgentTask,
     run: AgentRunSnapshot,
+    attempts: Vec<loom_protocol::AgentRunAttemptRecord>,
     plan: AgentPlan,
     provider: Option<Box<dyn ModelProvider>>,
     tools: ToolExecutor,
@@ -296,12 +299,23 @@ impl AgentRuntime {
             summary: None,
             evidence: Vec::new(),
         };
+        let attempts = vec![loom_protocol::AgentRunAttemptRecord {
+            run_id: run.id,
+            session_id,
+            id: run.attempt_id,
+            number: 1,
+            state: run.state,
+            checkpoint_id: options.checkpoint_id,
+            started_at: now,
+            completed_at: None,
+        }];
         let plan = AgentPlan { steps: Vec::new() };
         let messages = initial_messages(&task);
         Self {
             session_id,
             task,
             run,
+            attempts,
             plan,
             provider: Some(provider),
             tools,
@@ -523,6 +537,7 @@ impl AgentRuntime {
             run: self.run.clone(),
             plan: self.plan.clone(),
             messages: self.messages.clone(),
+            attempts: self.attempts.clone(),
             pending_approval: self
                 .pending_approval
                 .as_ref()
@@ -592,6 +607,30 @@ impl AgentRuntime {
                 interaction.resolved_at = Some(resolved_at);
             }
         }
+        if state.attempts.is_empty() {
+            state.attempts.push(loom_protocol::AgentRunAttemptRecord {
+                run_id: state.run.id,
+                session_id: state.session_id,
+                id: state.run.attempt_id,
+                number: 1,
+                state: state.run.state,
+                checkpoint_id: state.options.checkpoint_id,
+                started_at: state.run.started_at,
+                completed_at: state.run.completed_at,
+            });
+        }
+        if !state.attempts.iter().any(|attempt| {
+            attempt.id == state.run.attempt_id
+                && attempt.run_id == state.run.id
+                && attempt.session_id == state.session_id
+                && attempt.state == state.run.state
+        }) {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "agent runtime state does not contain its current attempt",
+                false,
+            ));
+        }
         if provider.descriptor().id != state.task.model {
             return Err(LoomError::new(
                 ErrorCode::ProviderUnavailable,
@@ -607,6 +646,7 @@ impl AgentRuntime {
             session_id: state.session_id,
             task: state.task,
             run: state.run,
+            attempts: state.attempts,
             plan: state.plan,
             provider: Some(provider),
             tools,
@@ -1175,12 +1215,37 @@ impl AgentRuntime {
         }
         let previous_attempt_id = self.run.attempt_id;
         self.abandon_pending_interactions(previous_attempt_id);
+        let attempt_number = self
+            .attempts
+            .iter()
+            .map(|attempt| attempt.number)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::InvalidState,
+                    "run attempt number is exhausted",
+                    false,
+                )
+            })?;
         self.run.attempt_id = loom_core::RunAttemptId::new();
         self.run.control_revision = 0;
         self.run.completed_at = None;
         self.run.summary = None;
-        self.run.updated_at = Timestamp::now();
+        let started_at = Timestamp::now();
+        self.run.updated_at = started_at;
         self.run.state = AgentRunState::Planning;
+        self.attempts.push(loom_protocol::AgentRunAttemptRecord {
+            run_id: self.run.id,
+            session_id: self.session_id,
+            id: self.run.attempt_id,
+            number: attempt_number,
+            state: AgentRunState::Planning,
+            checkpoint_id: self.options.checkpoint_id,
+            started_at,
+            completed_at: None,
+        });
         self.messages = initial_messages(&self.task);
         self.pending_approval = None;
         self.pending_tool_execution = None;
@@ -2297,7 +2362,22 @@ impl AgentRuntime {
             return Vec::new();
         }
         self.run.state = state;
-        self.run.updated_at = Timestamp::now();
+        let updated_at = Timestamp::now();
+        self.run.updated_at = updated_at;
+        let attempt = self
+            .attempts
+            .iter_mut()
+            .rfind(|attempt| attempt.id == self.run.attempt_id)
+            .expect("the current run attempt must be recorded");
+        attempt.state = state;
+        attempt.completed_at = if matches!(
+            state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        ) {
+            Some(updated_at)
+        } else {
+            None
+        };
         vec![AgentEvent::RunStateChanged {
             run_id: self.run.id,
             state,
@@ -3383,6 +3463,8 @@ mod tests {
         );
         let mut state = runtime.export_state();
         state.run.state = AgentRunState::Completed;
+        state.attempts[0].state = AgentRunState::Completed;
+        state.attempts[0].completed_at = Some(Timestamp::now());
         state.pending_approval = Some(ToolCall {
             id: loom_core::ToolCallId::new(),
             name: "read_file".to_owned(),

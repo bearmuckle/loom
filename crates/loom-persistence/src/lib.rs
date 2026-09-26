@@ -15,9 +15,9 @@ use loom_core::{
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
-    AgentInteractionKind, AgentInteractionRecord, AgentInteractionStatus, AgentRunSnapshot,
-    AgentRunState, ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope,
-    WorkspaceConfig, WorkspaceControl,
+    AgentInteractionKind, AgentInteractionRecord, AgentInteractionStatus, AgentRunAttemptRecord,
+    AgentRunSnapshot, AgentRunState, ApprovalDecision, Checkpoint, CheckpointFile,
+    ServerEventEnvelope, WorkspaceConfig, WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -27,8 +27,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 21;
-const DATABASE_SCHEMA_VERSION: u32 = 21;
+pub const CURRENT_SCHEMA_VERSION: u32 = 22;
+const DATABASE_SCHEMA_VERSION: u32 = 22;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -79,6 +79,25 @@ CREATE INDEX IF NOT EXISTS runs_by_session_activity
     ON run_summaries(session_id, updated_at DESC, run_id DESC);
 CREATE INDEX IF NOT EXISTS runs_by_state_activity
     ON run_summaries(state, updated_at DESC, run_id DESC);
+CREATE TABLE IF NOT EXISTS run_attempts (
+    run_id BLOB NOT NULL,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+    attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+    state TEXT NOT NULL CHECK(state IN (
+        'planning', 'executing', 'awaiting_approval', 'paused', 'needs_input',
+        'evaluating', 'completed', 'failed', 'cancelled'
+    )),
+    checkpoint_id BLOB CHECK(checkpoint_id IS NULL OR length(checkpoint_id) = 16),
+    started_at INTEGER NOT NULL CHECK(started_at >= 0),
+    completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
+    PRIMARY KEY(run_id, attempt_id),
+    UNIQUE(run_id, attempt_number),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_attempts_by_session
+    ON run_attempts(session_id, run_id, attempt_number DESC);
 CREATE TABLE IF NOT EXISTS run_interactions (
     run_id BLOB NOT NULL,
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -696,6 +715,7 @@ pub struct DurableIdempotencyRecord {
 pub struct DurableRunSummary {
     pub snapshot: AgentRunSnapshot,
     pub usage: UsageSnapshot,
+    pub attempts: Option<Vec<AgentRunAttemptRecord>>,
     pub interactions: Option<Vec<AgentInteractionRecord>>,
 }
 
@@ -1468,11 +1488,76 @@ impl FilePersistence {
                 DurableRunSummary {
                     snapshot,
                     usage,
+                    attempts: None,
                     interactions: None,
                 },
             );
         }
         Ok(summaries)
+    }
+
+    /// Loads a run's typed attempt history independently of its runtime section.
+    pub fn load_run_attempts(&self, run_id: RunId) -> Result<Vec<AgentRunAttemptRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, attempt_id, attempt_number, state, checkpoint_id,
+                        started_at, completed_at
+                 FROM run_attempts WHERE run_id=?1 ORDER BY attempt_number",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare run attempts: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read run attempts: {error}"), true)
+            })?;
+        let mut attempts = Vec::new();
+        for row in rows {
+            let (session_id, attempt_id, number, state, checkpoint_id, started_at, completed_at) =
+                row.map_err(|error| {
+                    persistence_error(format!("could not read run attempt row: {error}"), true)
+                })?;
+            let number = u32::try_from(number).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted run attempt number is out of range",
+                    false,
+                )
+            })?;
+            attempts.push(AgentRunAttemptRecord {
+                run_id,
+                session_id: AgentSessionId::from_uuid(decode_uuid(
+                    &session_id,
+                    "run attempt session id",
+                )?),
+                id: RunAttemptId::from_uuid(decode_uuid(&attempt_id, "run attempt id")?),
+                number,
+                state: parse_run_state(&state)?,
+                checkpoint_id: checkpoint_id
+                    .as_deref()
+                    .map(|id| decode_uuid(id, "run attempt checkpoint id"))
+                    .transpose()?
+                    .map(CheckpointId::from_uuid),
+                started_at: decode_timestamp(started_at)?,
+                completed_at: completed_at.map(decode_timestamp).transpose()?,
+            });
+        }
+        Ok(attempts)
     }
 
     /// Loads a run's approval and input interaction history independently of
@@ -2703,6 +2788,7 @@ impl FilePersistence {
         }
         if let Some(run_summaries) = write.run_summaries {
             save_run_summary_rows(&transaction, run_summaries)?;
+            save_run_attempt_rows(&transaction, run_summaries)?;
         }
         if let Some(run_activities) = write.run_activities {
             save_run_activity_rows(&transaction, run_activities)?;
@@ -4361,6 +4447,149 @@ fn save_run_summary_rows(
     Ok(())
 }
 
+fn save_run_attempt_rows(
+    transaction: &Transaction<'_>,
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_attempts (
+                run_id BLOB NOT NULL, attempt_id BLOB NOT NULL,
+                PRIMARY KEY(run_id, attempt_id)
+             ) WITHOUT ROWID, STRICT;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run attempts: {error}"), true)
+        })?;
+    for (run_id, summary) in summaries {
+        let Some(attempts) = summary.attempts.as_ref() else {
+            continue;
+        };
+        let session_id = summary.snapshot.session_id;
+        let current_attempt = attempts.iter().find(|attempt| {
+            attempt.id == summary.snapshot.attempt_id
+                && attempt.run_id == *run_id
+                && attempt.session_id == session_id
+                && attempt.state == summary.snapshot.state
+        });
+        let latest_number = attempts.iter().map(|attempt| attempt.number).max();
+        if current_attempt.is_none()
+            || current_attempt.map(|attempt| attempt.number) != latest_number
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run attempt history does not contain the current attempt as its latest record",
+                false,
+            ));
+        }
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "DELETE FROM _loom_wanted_run_attempts WHERE run_id=?1",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not reset staged attempts for run {run_id}: {error}"),
+                    true,
+                )
+            })?;
+        let mut seen_ids = BTreeSet::new();
+        let mut seen_numbers = BTreeSet::new();
+        for attempt in attempts {
+            if attempt.run_id != *run_id
+                || attempt.session_id != session_id
+                || attempt.number == 0
+                || !seen_ids.insert(attempt.id)
+                || !seen_numbers.insert(attempt.number)
+                || attempt
+                    .completed_at
+                    .is_some_and(|completed| completed < attempt.started_at)
+                || (matches!(
+                    attempt.state,
+                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                ) != attempt.completed_at.is_some())
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "run attempt ownership, identity, state, or timestamps are invalid",
+                    false,
+                ));
+            }
+            let attempt_id = attempt.id.as_uuid().as_bytes();
+            let attempt_number = i64::from(attempt.number);
+            let checkpoint_id = attempt
+                .checkpoint_id
+                .map(|id| id.as_uuid().as_bytes().to_vec());
+            transaction
+                .execute(
+                    "INSERT INTO _loom_wanted_run_attempts(run_id, attempt_id)
+                     VALUES (?1, ?2)",
+                    params![run_id_bytes.as_slice(), attempt_id.as_slice()],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not stage run attempt {}: {error}", attempt.id),
+                        true,
+                    )
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO run_attempts(
+                        run_id, session_id, attempt_id, attempt_number, state,
+                        checkpoint_id, started_at, completed_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(run_id, attempt_id) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        attempt_number=excluded.attempt_number,
+                        state=excluded.state,
+                        checkpoint_id=excluded.checkpoint_id,
+                        started_at=excluded.started_at,
+                        completed_at=excluded.completed_at
+                     WHERE run_attempts.session_id IS NOT excluded.session_id
+                        OR run_attempts.attempt_number IS NOT excluded.attempt_number
+                        OR run_attempts.state IS NOT excluded.state
+                        OR run_attempts.checkpoint_id IS NOT excluded.checkpoint_id
+                        OR run_attempts.started_at IS NOT excluded.started_at
+                        OR run_attempts.completed_at IS NOT excluded.completed_at",
+                    params![
+                        run_id_bytes.as_slice(),
+                        session_id.as_uuid().as_bytes().as_slice(),
+                        attempt_id.as_slice(),
+                        attempt_number,
+                        run_state_name(attempt.state),
+                        checkpoint_id,
+                        encode_timestamp(attempt.started_at)?,
+                        attempt.completed_at.map(encode_timestamp).transpose()?,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save run attempt {}: {error}", attempt.id),
+                        true,
+                    )
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_attempts
+                 WHERE run_id=?1 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_attempts wanted
+                    WHERE wanted.run_id=run_attempts.run_id
+                      AND wanted.attempt_id=run_attempts.attempt_id
+                 )",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune run attempts for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    Ok(())
+}
+
 fn save_run_interaction_rows(
     transaction: &Transaction<'_>,
     summaries: &BTreeMap<RunId, DurableRunSummary>,
@@ -5170,6 +5399,25 @@ fn run_state_name(state: AgentRunState) -> &'static str {
     }
 }
 
+fn parse_run_state(state: &str) -> Result<AgentRunState> {
+    match state {
+        "planning" => Ok(AgentRunState::Planning),
+        "executing" => Ok(AgentRunState::Executing),
+        "awaiting_approval" => Ok(AgentRunState::AwaitingApproval),
+        "paused" => Ok(AgentRunState::Paused),
+        "needs_input" => Ok(AgentRunState::NeedsInput),
+        "evaluating" => Ok(AgentRunState::Evaluating),
+        "completed" => Ok(AgentRunState::Completed),
+        "failed" => Ok(AgentRunState::Failed),
+        "cancelled" => Ok(AgentRunState::Cancelled),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted run attempt state is unknown",
+            false,
+        )),
+    }
+}
+
 fn workspace_control_name(control: WorkspaceControl) -> &'static str {
     match control {
         WorkspaceControl::Agent => "agent",
@@ -5841,6 +6089,7 @@ mod tests {
                 output_tokens: 7,
                 ..UsageSnapshot::default()
             },
+            attempts: None,
             interactions: None,
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
@@ -6251,6 +6500,7 @@ mod tests {
                 evidence: Vec::new(),
             },
             usage: UsageSnapshot::default(),
+            attempts: None,
             interactions: None,
         };
         let run_summaries = BTreeMap::from([(run_id, summary)]);
@@ -6690,6 +6940,16 @@ mod tests {
         let interaction_id = InteractionId::new();
         let prompt = "Which branch should I use?".to_owned();
         let created_at = Timestamp::from_unix_millis(1_000);
+        let attempt = AgentRunAttemptRecord {
+            run_id,
+            session_id: session.id,
+            id: attempt_id,
+            number: 1,
+            state: AgentRunState::NeedsInput,
+            checkpoint_id: None,
+            started_at: created_at,
+            completed_at: None,
+        };
         let mut interaction = AgentInteractionRecord {
             id: interaction_id,
             run_id,
@@ -6720,6 +6980,7 @@ mod tests {
                 evidence: Vec::new(),
             },
             usage: UsageSnapshot::default(),
+            attempts: Some(vec![attempt.clone()]),
             interactions: Some(vec![interaction.clone()]),
         };
         let run_summaries = BTreeMap::from([(run_id, summary.clone())]);
@@ -6764,6 +7025,10 @@ mod tests {
             };
         save(&run_summaries, &feed).unwrap();
         assert_eq!(
+            persistence.load_run_attempts(run_id).unwrap(),
+            vec![attempt.clone()]
+        );
+        assert_eq!(
             persistence.load_run_interactions(run_id).unwrap(),
             vec![interaction.clone()]
         );
@@ -6773,6 +7038,10 @@ mod tests {
         summary.snapshot.state = AgentRunState::Executing;
         summary.snapshot.control_revision = 2;
         summary.snapshot.updated_at = Timestamp::from_unix_millis(2_000);
+        summary.attempts = Some(vec![AgentRunAttemptRecord {
+            state: AgentRunState::Executing,
+            ..attempt.clone()
+        }]);
         summary.interactions = Some(vec![interaction.clone()]);
         let resolved_event = loom_protocol::ServerEventEnvelope {
             protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
@@ -6803,12 +7072,23 @@ mod tests {
                 ..interaction.clone()
             }]
         );
+        assert_eq!(
+            persistence.load_run_attempts(run_id).unwrap(),
+            vec![attempt.clone()]
+        );
         let persisted_feed = persistence.load_feed_state().unwrap().unwrap();
         assert_eq!(persisted_feed.next_sequence, EventSequence::new(1));
         assert_eq!(persisted_feed.events, vec![input_event]);
 
         feed.next_sequence = EventSequence::new(2);
         save(&resolved_summaries, &feed).unwrap();
+        assert_eq!(
+            persistence.load_run_attempts(run_id).unwrap(),
+            vec![AgentRunAttemptRecord {
+                state: AgentRunState::Executing,
+                ..attempt
+            }]
+        );
         assert_eq!(
             persistence.load_run_interactions(run_id).unwrap(),
             vec![interaction]
