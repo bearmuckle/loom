@@ -23,6 +23,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Test browser entry point
+        run: node --experimental-vm-modules --test scripts/browser-entry.test.mjs
+
       - name: Install Rust and WASM target
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,6 +45,9 @@ jobs:
         env:
           RUSTC_BOOTSTRAP: "1"
         run: trunk build --release --public-url /loom/
+
+      - name: Generate stable browser entry point
+        run: node scripts/build-browser-entry.mjs crates/loom-ui/dist
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
