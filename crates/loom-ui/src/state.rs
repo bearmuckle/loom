@@ -5,10 +5,11 @@
 
 use std::collections::BTreeSet;
 
+use gpui_kit::{ListAlignment, ListState, px};
 use loom_core::{AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError};
 use loom_protocol::{
-    AgentActivityRecord, AgentActivityStatus, AgentRunState, GitRepositoryStatus,
-    SessionFilesystemChange, SessionFilesystemFile,
+    AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitDiffLine,
+    GitRepositoryStatus, SessionFilesystemChange, SessionFilesystemFile,
 };
 
 use crate::MAX_TIMELINE_OUTPUT;
@@ -72,7 +73,52 @@ pub(crate) struct ReviewState {
     pub(crate) panel: ReviewPanel,
     pub(crate) changes: Vec<SessionFilesystemChange>,
     pub(crate) vcs: Option<GitRepositoryStatus>,
+    pub(crate) repositories_loaded: bool,
     pub(crate) selected_file: Option<SessionFilesystemFile>,
+    pub(crate) selected_path: Option<String>,
+    pub(crate) selected_staged: bool,
+    pub(crate) selection_revision: u64,
+    pub(crate) selected_diff: Option<GitDiff>,
+    pub(crate) diff_error: Option<String>,
+    pub(crate) loading_diff: bool,
+    pub(crate) rows: Vec<ReviewRow>,
+    pub(crate) hunk_rows: Vec<usize>,
+    pub(crate) selected_hunk: usize,
+    pub(crate) list_state: ListState,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ReviewRow {
+    Hunk {
+        old_start: u32,
+        old_lines: u32,
+        new_start: u32,
+        new_lines: u32,
+    },
+    Line(GitDiffLine),
+}
+
+impl ReviewState {
+    pub(crate) fn show_diff(&mut self, diff: GitDiff) {
+        self.rows.clear();
+        self.hunk_rows.clear();
+        for hunk in &diff.hunks {
+            self.hunk_rows.push(self.rows.len());
+            self.rows.push(ReviewRow::Hunk {
+                old_start: hunk.old_start,
+                old_lines: hunk.old_lines,
+                new_start: hunk.new_start,
+                new_lines: hunk.new_lines,
+            });
+            self.rows
+                .extend(hunk.lines.iter().cloned().map(ReviewRow::Line));
+        }
+        self.list_state.reset(self.rows.len());
+        self.selected_hunk = 0;
+        self.selected_diff = Some(diff);
+        self.loading_diff = false;
+        self.diff_error = None;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -102,7 +148,18 @@ impl Default for ReviewState {
             panel: ReviewPanel::Changes,
             changes: Vec::new(),
             vcs: None,
+            repositories_loaded: false,
             selected_file: None,
+            selected_path: None,
+            selected_staged: false,
+            selection_revision: 0,
+            selected_diff: None,
+            diff_error: None,
+            loading_diff: false,
+            rows: Vec::new(),
+            hunk_rows: Vec::new(),
+            selected_hunk: 0,
+            list_state: ListState::new(0, ListAlignment::Top, px(120.)),
         }
     }
 }
@@ -237,7 +294,49 @@ mod tests {
     use super::*;
     use loom_core::{ActivityId, RunId, Timestamp, ToolCallId};
     use loom_model::{ModelId, ToolCall};
-    use loom_protocol::{AgentActivityData, AgentActivityKind, AgentActivityStatus};
+    use loom_protocol::{
+        AgentActivityData, AgentActivityKind, AgentActivityStatus, GitDiffHunk, GitDiffLineKind,
+    };
+
+    #[test]
+    fn review_hunks_map_to_virtual_rows() {
+        let mut review = ReviewState::default();
+        review.show_diff(GitDiff {
+            path: Some("src/lib.rs".to_owned()),
+            staged: false,
+            patch: String::new(),
+            binary: false,
+            truncated: false,
+            hunks: vec![
+                GitDiffHunk {
+                    old_start: 2,
+                    old_lines: 1,
+                    new_start: 2,
+                    new_lines: 1,
+                    lines: vec![GitDiffLine {
+                        kind: GitDiffLineKind::Removed,
+                        old_line: Some(2),
+                        new_line: None,
+                        content: "old".to_owned(),
+                    }],
+                },
+                GitDiffHunk {
+                    old_start: 20,
+                    old_lines: 1,
+                    new_start: 20,
+                    new_lines: 1,
+                    lines: vec![GitDiffLine {
+                        kind: GitDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(20),
+                        content: "new".to_owned(),
+                    }],
+                },
+            ],
+        });
+        assert_eq!(review.hunk_rows, vec![0, 2]);
+        assert_eq!(review.list_state.item_count(), 4);
+    }
 
     #[test]
     fn bounded_projection_is_explicit() {

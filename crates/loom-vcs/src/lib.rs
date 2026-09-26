@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Component, Path, PathBuf},
 };
@@ -9,7 +10,8 @@ use git2::{
 };
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
 pub use loom_protocol::{
-    GitBranch, GitDiff, GitFileStatus, GitFileStatusKind, GitRepositoryStatus,
+    GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
+    GitFileStatusKind, GitRepositoryStatus,
 };
 
 #[derive(Clone, Debug)]
@@ -147,6 +149,8 @@ impl GitService {
         let statuses = repository
             .statuses(Some(&mut options))
             .map_err(|error| git_error("could not read Git status", error))?;
+        let index_counts = count_diff_lines(&repository, true)?;
+        let worktree_counts = count_diff_lines(&repository, false)?;
         let mut files = Vec::new();
         for entry in &statuses {
             let status = entry.status();
@@ -161,6 +165,10 @@ impl GitService {
                 .filter(|old_path| *old_path != Path::new(&path))
                 .map(|old_path| old_path.to_string_lossy().replace('\\', "/"));
             files.push(GitFileStatus {
+                index_additions: index_counts.get(&path).map_or(0, |counts| counts.0),
+                index_deletions: index_counts.get(&path).map_or(0, |counts| counts.1),
+                worktree_additions: worktree_counts.get(&path).map_or(0, |counts| counts.0),
+                worktree_deletions: worktree_counts.get(&path).map_or(0, |counts| counts.1),
                 path,
                 original_path,
                 index: status_kind(status, true),
@@ -188,6 +196,10 @@ impl GitService {
         let normalized = path.map(|path| self.validate_path(path)).transpose()?;
         let repository = self.repository()?;
         let mut options = DiffOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true);
         if let Some(path) = normalized.as_deref() {
             options.pathspec(path);
         }
@@ -204,18 +216,49 @@ impl GitService {
                 .diff_index_to_workdir(None, Some(&mut options))
                 .map_err(|error| git_error("could not create Git diff", error))?
         };
-        let binary = diff
-            .deltas()
-            .any(|delta| delta.old_file().is_binary() || delta.new_file().is_binary());
         let mut patch = Vec::new();
-        diff.print(DiffFormat::Patch, |_delta, _hunk, line| {
+        let mut hunks: Vec<GitDiffHunk> = Vec::new();
+        diff.print(DiffFormat::Patch, |_delta, hunk, line| {
+            if let Some(hunk) = hunk {
+                let new_hunk = hunks.last().is_none_or(|last| {
+                    last.old_start != hunk.old_start() || last.new_start != hunk.new_start()
+                });
+                if new_hunk {
+                    hunks.push(GitDiffHunk {
+                        old_start: hunk.old_start(),
+                        old_lines: hunk.old_lines(),
+                        new_start: hunk.new_start(),
+                        new_lines: hunk.new_lines(),
+                        lines: Vec::new(),
+                    });
+                }
+            }
             if matches!(line.origin(), ' ' | '+' | '-') {
                 patch.push(line.origin() as u8);
+                if let Some(hunk) = hunks.last_mut() {
+                    let kind = match line.origin() {
+                        '+' => GitDiffLineKind::Added,
+                        '-' => GitDiffLineKind::Removed,
+                        _ => GitDiffLineKind::Context,
+                    };
+                    hunk.lines.push(GitDiffLine {
+                        kind,
+                        old_line: line.old_lineno(),
+                        new_line: line.new_lineno(),
+                        content: String::from_utf8_lossy(line.content())
+                            .trim_end_matches('\n')
+                            .trim_end_matches('\r')
+                            .to_owned(),
+                    });
+                }
             }
             patch.extend_from_slice(line.content());
             true
         })
         .map_err(|error| git_error("could not render Git diff", error))?;
+        let binary = diff
+            .deltas()
+            .any(|delta| delta.old_file().is_binary() || delta.new_file().is_binary());
         let patch = String::from_utf8(patch).map_err(|error| {
             LoomError::new(
                 ErrorCode::Vcs,
@@ -228,6 +271,8 @@ impl GitService {
             staged,
             binary,
             patch,
+            hunks,
+            truncated: false,
         })
     }
 
@@ -295,6 +340,41 @@ impl GitService {
         Repository::open(&self.root)
             .map_err(|error| git_error("could not open Git repository", error))
     }
+}
+
+fn count_diff_lines(repository: &Repository, staged: bool) -> Result<BTreeMap<String, (u32, u32)>> {
+    let mut options = DiffOptions::new();
+    options
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .show_untracked_content(true);
+    let diff = if staged {
+        let head = repository
+            .head()
+            .ok()
+            .and_then(|head| head.peel_to_tree().ok());
+        repository.diff_tree_to_index(head.as_ref(), None, Some(&mut options))
+    } else {
+        repository.diff_index_to_workdir(None, Some(&mut options))
+    }
+    .map_err(|error| git_error("could not count Git diff lines", error))?;
+    let mut counts: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    diff.print(DiffFormat::Patch, |delta, _hunk, line| {
+        let Some(path) = delta.new_file().path().or_else(|| delta.old_file().path()) else {
+            return true;
+        };
+        let entry = counts
+            .entry(path.to_string_lossy().replace('\\', "/"))
+            .or_default();
+        match line.origin() {
+            '+' => entry.0 = entry.0.saturating_add(1),
+            '-' => entry.1 = entry.1.saturating_add(1),
+            _ => {}
+        }
+        true
+    })
+    .map_err(|error| git_error("could not count Git diff lines", error))?;
+    Ok(counts)
 }
 
 fn status_kind(status: Status, index: bool) -> GitFileStatusKind {
@@ -393,9 +473,56 @@ mod tests {
         let status = git.status().unwrap();
         assert!(!status.clean);
         assert!(status.files.iter().any(|file| file.path == "README.md"));
+        let changed = status
+            .files
+            .iter()
+            .find(|file| file.path == "README.md")
+            .unwrap();
+        assert_eq!(
+            (changed.worktree_additions, changed.worktree_deletions),
+            (1, 1)
+        );
         let diff = git.diff(Some("README.md"), false).unwrap();
         assert!(diff.patch.contains("-before"));
         assert!(diff.patch.contains("+after"));
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(diff.hunks[0].lines[0].old_line, Some(1));
+        assert_eq!(diff.hunks[0].lines[0].new_line, None);
+        assert_eq!(diff.hunks[0].lines[1].kind, GitDiffLineKind::Added);
+        let untracked = git.diff(Some("new.txt"), false).unwrap();
+        assert_eq!(untracked.hunks[0].lines[0].content, "new");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn separate_changes_produce_navigable_hunks() {
+        let (git, root) = repository();
+        let before = (1..=30)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        fs::write(root.join("README.md"), &before).unwrap();
+        run(&root, &["add", "--", "README.md"]);
+        run(&root, &["commit", "-qm", "long file"]);
+        let after = before
+            .replace("line 1\n", "first\n")
+            .replace("line 30\n", "last\n");
+        fs::write(root.join("README.md"), after).unwrap();
+
+        let diff = git.diff(Some("README.md"), false).unwrap();
+        assert_eq!(diff.hunks.len(), 2);
+        assert_eq!(diff.hunks[0].new_start, 1);
+        assert!(diff.hunks[1].new_start > 20);
+        assert_eq!(diff.hunks[1].lines.last().unwrap().new_line, Some(30));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn binary_changes_have_an_explicit_state() {
+        let (git, root) = repository();
+        fs::write(root.join("image.bin"), b"\0\x01\x02").unwrap();
+        let diff = git.diff(Some("image.bin"), false).unwrap();
+        assert!(diff.binary);
+        assert!(diff.hunks.is_empty());
         fs::remove_dir_all(root).unwrap();
     }
 

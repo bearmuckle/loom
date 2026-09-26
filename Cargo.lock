@@ -4251,6 +4251,7 @@ dependencies = [
 name = "loom-core"
 version = "0.1.0"
 dependencies = [
+ "js-sys",
  "serde",
  "thiserror 2.0.21",
  "uuid",
