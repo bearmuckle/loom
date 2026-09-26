@@ -57,6 +57,9 @@ pub struct AgentRuntimeState {
     pub options: AgentRuntimeOptions,
     pub usage: UsageSnapshot,
     pub context_inspection: Option<ContextInspection>,
+    /// Summary and exclusive boundary in the repaired conversation history.
+    #[serde(default)]
+    pub context_checkpoint: Option<loom_protocol::ContextSummary>,
     pub provider_cursor: usize,
     pub step_id: Option<StepId>,
     pub step_index: u32,
@@ -232,6 +235,7 @@ pub struct AgentRuntime {
     options: AgentRuntimeOptions,
     usage: UsageSnapshot,
     context_inspection: Option<ContextInspection>,
+    context_checkpoint: Option<loom_protocol::ContextSummary>,
     provider_cursor: usize,
     step_id: Option<StepId>,
     step_index: u32,
@@ -298,6 +302,7 @@ impl AgentRuntime {
             options,
             usage: UsageSnapshot::default(),
             context_inspection: None,
+            context_checkpoint: None,
             provider_cursor: 0,
             step_id: None,
             step_index: 0,
@@ -515,6 +520,7 @@ impl AgentRuntime {
             options: self.options.clone(),
             usage: self.usage.clone(),
             context_inspection: self.context_inspection.clone(),
+            context_checkpoint: self.context_checkpoint.clone(),
             provider_cursor: self.provider_cursor,
             step_id: self.step_id,
             step_index: self.step_index,
@@ -578,6 +584,7 @@ impl AgentRuntime {
             options: state.options,
             usage: state.usage,
             context_inspection: state.context_inspection,
+            context_checkpoint: state.context_checkpoint,
             provider_cursor: state.provider_cursor,
             step_id: state.step_id,
             step_index: state.step_index,
@@ -977,6 +984,7 @@ impl AgentRuntime {
         self.active_message_id = None;
         self.usage = UsageSnapshot::default();
         self.context_inspection = None;
+        self.context_checkpoint = None;
         if let Some(provider) = self.provider.as_mut() {
             provider.reset();
         }
@@ -1073,6 +1081,7 @@ impl AgentRuntime {
                 return Ok(StepOutcome::Blocked);
             }
         };
+        self.context_checkpoint = inspection.summary.clone();
         self.context_inspection = Some(inspection.clone());
         events.push(AgentEvent::ContextInspected {
             run_id: self.run.id,
@@ -1721,62 +1730,98 @@ impl AgentRuntime {
     }
 
     fn model_request(&self) -> Result<(ModelRequest, ContextInspection)> {
+        let provider = self.provider()?;
         let initial_count = initial_messages(&self.task).len();
-        let conversation = self
-            .messages
-            .get(initial_count..)
-            .unwrap_or_default()
-            .to_vec();
-        let mut context_options = self.options.context.clone();
-        if context_options.context_window.is_none() {
-            context_options.context_window =
-                self.provider()?.descriptor().context_window.map(u64::from);
-        }
-        if context_options.max_input_tokens.is_none() {
-            context_options.max_input_tokens = self.options.limits.max_input_tokens;
-        }
-        let tools = if self.provider()?.descriptor().capabilities.tool_calling {
+        let source = self.messages.get(initial_count..).unwrap_or_default();
+        // Repair legacy transcripts before budgeting, so repair cannot reinsert
+        // an oversized output after the assembler has removed it.
+        let conversation = repair_tool_transcript(source.to_vec(), source);
+        let checkpoint = self
+            .context_checkpoint
+            .as_ref()
+            .filter(|summary| summary.source_message_count <= conversation.len());
+        let boundary = checkpoint.map_or(0, |summary| summary.source_message_count);
+        let mut options = self.options.context.clone();
+        // Explicit overrides may lower, but never raise, a known model limit.
+        // Unknown models use a conservative bounded fallback instead of an
+        // unlimited conversation. Users can supply a known window explicitly.
+        options.context_window =
+            match (options.context_window, provider.descriptor().context_window) {
+                (Some(requested), Some(model)) => Some(requested.min(u64::from(model))),
+                (Some(requested), None) => Some(requested),
+                (None, model) => Some(model.map_or(8_192, u64::from)),
+            };
+        options.max_input_tokens = match (
+            options.max_input_tokens,
+            self.options.limits.max_input_tokens,
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let reserve = loom_context::output_reserve(&options).min(u64::from(u32::MAX));
+        options.reserved_output_tokens = Some(reserve);
+        let budget = loom_protocol::ContextBudget::new(
+            options.context_window,
+            options.max_input_tokens,
+            reserve,
+        )?;
+        let tools = if provider.descriptor().capabilities.tool_calling {
             tool_definitions()
         } else {
             Vec::new()
         };
-        let tool_tokens = self.provider()?.count_tokens(&ModelRequest {
+        let completion = CompletionOptions {
+            max_output_tokens: Some(reserve as u32),
+            ..Default::default()
+        };
+        let tool_tokens = provider.count_tokens(&ModelRequest {
             model: self.task.model.clone(),
             messages: Vec::new(),
             tools: tools.clone(),
-            options: CompletionOptions::default(),
+            options: completion.clone(),
         });
-        if let Some(context_window) = context_options.context_window {
-            context_options.context_window = Some(context_window.saturating_sub(tool_tokens));
-        }
-        if let Some(max_input_tokens) = context_options.max_input_tokens {
-            context_options.max_input_tokens = Some(max_input_tokens.saturating_sub(tool_tokens));
-        }
-        let assembly = ContextAssembler::assemble(
+        let message_limit = budget
+            .effective_input_tokens
+            .unwrap_or(u64::MAX)
+            .saturating_sub(tool_tokens);
+        let message_options = ContextAssemblyOptions {
+            context_window: None,
+            max_input_tokens: Some(message_limit),
+            reserved_output_tokens: Some(reserve),
+        };
+        let assembly = ContextAssembler::assemble_with_counter(
             &ContextInput {
                 system_instructions: self.task.system_instructions.clone(),
                 repository_instructions: self.task.repository_instructions.clone(),
                 task: self.task.task.clone(),
-                conversation,
-                existing_summary: self
-                    .context_inspection
-                    .as_ref()
-                    .and_then(|inspection| inspection.summary.as_ref())
-                    .map(|summary| summary.text.clone()),
+                conversation: conversation[boundary..].to_vec(),
+                existing_summary: checkpoint.map(|summary| summary.text.clone()),
+                latest_user_message: conversation
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, message)| message.role == MessageRole::User)
+                    .filter(|(index, _)| *index < boundary)
+                    .map(|(_, message)| message.content.clone()),
             },
-            &context_options,
+            &message_options,
+            |message| {
+                provider.count_tokens(&ModelRequest {
+                    model: self.task.model.clone(),
+                    messages: vec![message.clone()],
+                    tools: Vec::new(),
+                    options: completion.clone(),
+                })
+            },
         )?;
-        let messages = repair_tool_transcript(assembly.messages, &self.messages);
         let request = ModelRequest {
             model: self.task.model.clone(),
-            messages,
+            messages: assembly.messages,
             tools,
-            options: CompletionOptions::default(),
+            options: completion,
         };
-        let request_tokens = self.provider()?.count_tokens(&request);
-        if assembly
-            .inspection
-            .budget
+        let request_tokens = provider.count_tokens(&request);
+        if budget
             .effective_input_tokens
             .is_some_and(|limit| request_tokens > limit)
         {
@@ -1789,8 +1834,26 @@ impl AgentRuntime {
             ));
         }
         let mut inspection = assembly.inspection;
+        inspection.budget = budget;
         inspection.included_tokens = request_tokens;
-        inspection.total_tokens = inspection.total_tokens.max(request_tokens);
+        inspection.total_tokens = inspection
+            .total_tokens
+            .saturating_add(tool_tokens)
+            .max(request_tokens);
+        if let Some(summary) = &mut inspection.summary {
+            summary.source_message_count += boundary;
+        }
+        if provider.descriptor().context_window.is_none()
+            && self.options.context.context_window.is_none()
+        {
+            inspection.items.push(loom_protocol::ContextItem {
+                kind: loom_protocol::ContextItemKind::SystemInstructions,
+                label: "Model context window unknown; using an 8192-token fallback".to_owned(),
+                estimated_tokens: 0,
+                included: true,
+                omission_reason: None,
+            });
+        }
         Ok((request, inspection))
     }
 
@@ -2812,6 +2875,164 @@ mod tests {
             )
         }));
         assert!(runtime.usage().cost_micros >= 10);
+        fs::remove_dir_all(root).unwrap();
+    }
+    fn context_runtime(root: &std::path::Path) -> AgentRuntime {
+        AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("Complete the task", ModelId::new("deterministic/demo")).unwrap(),
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(root).unwrap(),
+        )
+    }
+
+    #[test]
+    fn tool_schema_tokens_are_charged_once_and_output_reserve_is_sent() {
+        let root = workspace();
+        let mut runtime = context_runtime(&root);
+        let (baseline, _) = runtime.model_request().unwrap();
+        let count = runtime.provider().unwrap().count_tokens(&baseline);
+        runtime.options.context.max_input_tokens = Some(count);
+        runtime.options.context.reserved_output_tokens = Some(512);
+        let (request, inspection) = runtime.model_request().unwrap();
+        assert_eq!(inspection.included_tokens, count);
+        assert_eq!(inspection.budget.effective_input_tokens, Some(count));
+        assert_eq!(request.options.max_output_tokens, Some(512));
+        assert!(inspection.within_budget());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn context_checkpoint_survives_recovery_and_advances_only_for_new_history() {
+        let root = workspace();
+        let mut runtime = context_runtime(&root);
+        runtime.options.context.max_input_tokens = Some(4_000);
+        runtime.messages.push(ModelMessage::new(
+            MessageRole::User,
+            "Keep all public signatures unchanged.",
+        ));
+        for i in 0..30 {
+            runtime.messages.push(ModelMessage::new(
+                MessageRole::Assistant,
+                format!("Step {i}: {}", "work details ".repeat(100)),
+            ));
+        }
+        runtime
+            .messages
+            .push(ModelMessage::new(MessageRole::Assistant, "latest result"));
+        let (request, inspection) = runtime.model_request().unwrap();
+        assert!(inspection.compacted);
+        let boundary = inspection.summary.as_ref().unwrap().source_message_count;
+        assert!(boundary > 0);
+        runtime.context_checkpoint = inspection.summary.clone();
+        runtime.context_inspection = Some(inspection);
+        let state = runtime.export_state();
+        let serialized = serde_json::to_string(&state).unwrap();
+        let mut restored = AgentRuntime::from_state(
+            serde_json::from_str(&serialized).unwrap(),
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap();
+        let (next_request, next) = restored.model_request().unwrap();
+        assert!(!next.compacted);
+        assert_eq!(
+            next.summary.as_ref().unwrap().source_message_count,
+            boundary
+        );
+        assert_eq!(next_request.messages, request.messages);
+        assert!(
+            next_request
+                .messages
+                .iter()
+                .any(|message| message.content == "Keep all public signatures unchanged.")
+        );
+        for _ in 0..20 {
+            restored.messages.push(ModelMessage::new(
+                MessageRole::Assistant,
+                "more progress ".repeat(100),
+            ));
+        }
+        restored.messages.push(ModelMessage::new(
+            MessageRole::User,
+            "Now add a regression test.",
+        ));
+        let (request, next) = restored.model_request().unwrap();
+        assert!(next.compacted);
+        assert!(next.summary.unwrap().source_message_count > boundary);
+        assert_eq!(
+            request.messages.last().unwrap().content,
+            "Now add a regression test."
+        );
+        assert_eq!(state.messages.len(), runtime.messages.len());
+        let mut legacy = serde_json::to_value(state).unwrap();
+        legacy.as_object_mut().unwrap().remove("context_checkpoint");
+        assert!(
+            serde_json::from_value::<AgentRuntimeState>(legacy)
+                .unwrap()
+                .context_checkpoint
+                .is_none()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_context_window_cannot_raise_the_model_limit() {
+        let root = workspace();
+        let mut runtime = context_runtime(&root);
+        runtime.options.context.context_window = Some(1_000_000);
+        let (_, inspection) = runtime.model_request().unwrap();
+        assert_eq!(
+            inspection.budget.context_window,
+            runtime
+                .provider()
+                .unwrap()
+                .descriptor()
+                .context_window
+                .map(u64::from)
+        );
+        runtime.options.context.context_window = Some(4_000);
+        let (_, inspection) = runtime.model_request().unwrap();
+        assert_eq!(inspection.budget.context_window, Some(4_000));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn unknown_model_uses_a_visible_fallback_and_changed_limits_are_reapplied() {
+        let root = workspace();
+        let mut runtime = context_runtime(&root);
+        let mut descriptor = runtime.provider().unwrap().descriptor().clone();
+        descriptor.context_window = None;
+        runtime.provider = Some(Box::new(
+            loom_providers::OpenAiCompatibleProvider::with_descriptor(
+                "http://unused",
+                "unused",
+                descriptor.clone(),
+            ),
+        ));
+        let (_, inspection) = runtime.model_request().unwrap();
+        assert_eq!(inspection.budget.context_window, Some(8_192));
+        assert!(
+            inspection
+                .items
+                .iter()
+                .any(|item| item.label.contains("fallback"))
+        );
+        descriptor.context_window = Some(4_096);
+        runtime.provider = Some(Box::new(
+            loom_providers::OpenAiCompatibleProvider::with_descriptor(
+                "http://unused",
+                "unused",
+                descriptor,
+            ),
+        ));
+        let (_, inspection) = runtime.model_request().unwrap();
+        assert_eq!(inspection.budget.context_window, Some(4_096));
+        assert!(
+            !inspection
+                .items
+                .iter()
+                .any(|item| item.label.contains("fallback"))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
