@@ -844,7 +844,13 @@ impl ProviderRegistry {
                     id: ModelId::new(id),
                     provider: provider_id.clone(),
                     display_name: id.to_owned(),
-                    context_window: config.models.first().and_then(|model| model.context_window),
+                    context_window: discovered_context_window(model).or_else(|| {
+                        config
+                            .models
+                            .iter()
+                            .find(|configured| configured.id.as_str() == id)
+                            .and_then(|configured| configured.context_window)
+                    }),
                     capabilities: config
                         .models
                         .first()
@@ -1617,7 +1623,11 @@ impl GitHubCopilotProvider {
                         id: ModelId::new(id),
                         provider: self.descriptor.provider.clone(),
                         display_name: id.to_owned(),
-                        context_window: self.descriptor.context_window,
+                        context_window: discovered_context_window(model).or_else(|| {
+                            (self.descriptor.id.as_str() == id)
+                                .then_some(self.descriptor.context_window)
+                                .flatten()
+                        }),
                         capabilities: self.descriptor.capabilities.clone(),
                     },
                     github_copilot_supports_tool_calls(model),
@@ -1686,6 +1696,22 @@ impl GitHubCopilotProvider {
 struct CopilotAccessToken {
     value: String,
     api_endpoint: String,
+}
+
+// Copilot exposes per-model limits under capabilities.limits. Some compatible
+// catalogs expose context_length directly. A prompt cap is also a safe upper
+// bound on our usable window, since the runtime separately reserves output.
+fn discovered_context_window(model: &serde_json::Value) -> Option<u32> {
+    [
+        "/capabilities/limits/max_context_window_tokens",
+        "/capabilities/limits/max_prompt_tokens",
+        "/context_length",
+    ]
+    .iter()
+    .filter_map(|path| model.pointer(path).and_then(serde_json::Value::as_u64))
+    .filter_map(|value| u32::try_from(value).ok())
+    .filter(|value| *value > 0)
+    .min()
 }
 
 fn github_copilot_supports_tool_calls(model: &serde_json::Value) -> bool {
@@ -3181,6 +3207,29 @@ mod tests {
     }
 
     #[test]
+    fn discovery_limits_are_per_model_and_validate_advertised_values() {
+        assert_eq!(
+            discovered_context_window(&serde_json::json!({"context_length": 8192})),
+            Some(8192)
+        );
+        assert_eq!(
+            discovered_context_window(
+                &serde_json::json!({"capabilities": {"limits": {"max_context_window_tokens": 64000, "max_prompt_tokens": 32000}}})
+            ),
+            Some(32000)
+        );
+        for model in [
+            serde_json::json!({}),
+            serde_json::json!({"context_length": 0}),
+            serde_json::json!({"context_length": -1}),
+            serde_json::json!({"context_length": u64::MAX}),
+            serde_json::json!({"context_length": "8192"}),
+        ] {
+            assert_eq!(discovered_context_window(&model), None);
+        }
+    }
+
+    #[test]
     fn github_copilot_discovery_lists_only_models_with_tool_call_support() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3200,7 +3249,7 @@ mod tests {
                 &mut models_stream,
                 "application/json",
                 r#"{"data":[
-                    {"id":"agentic-model","capabilities":{"supports":{"tool_calls":true}}},
+                    {"id":"agentic-model","capabilities":{"supports":{"tool_calls":true},"limits":{"max_context_window_tokens":64000,"max_prompt_tokens":32000}}},
                     {"id":"chat-model","capabilities":{"supports":{"tool_calls":false}}},
                     {"id":"unknown-model","capabilities":{"supports":{}}}
                 ]}"#,
@@ -3216,6 +3265,7 @@ mod tests {
         );
 
         let models = provider.discover_models().unwrap();
+        assert_eq!(models[0].context_window, Some(32_000));
 
         assert_eq!(
             models
@@ -3843,6 +3893,7 @@ mod tests {
             .discover_models(&ProviderId::new("gateway"))
             .unwrap();
         assert_eq!(models[0].id.as_str(), "discovered/model");
+        assert_eq!(models[0].context_window, None);
         assert_eq!(models[0].provider.as_str(), "gateway");
         assert_eq!(
             registry.pricing(&ModelId::new("discovered/model")).unwrap(),
