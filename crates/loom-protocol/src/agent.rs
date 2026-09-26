@@ -1,6 +1,6 @@
 use loom_core::{
-    AgentSessionId, EvidenceLink, LimitStatus, LoomError, PolicyEvaluation, RunId, StepId,
-    Timestamp, ToolCallId, UsageSnapshot,
+    AgentSessionId, EvidenceLink, LimitStatus, LoomError, PolicyEvaluation, RunAttemptId, RunId,
+    StepId, Timestamp, ToolCallId, UsageSnapshot,
 };
 use loom_model::{ModelId, TokenUsage, ToolCall};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ pub enum AgentRunState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentRunSnapshot {
     pub id: RunId,
+    pub attempt_id: RunAttemptId,
+    pub control_revision: u64,
     pub session_id: AgentSessionId,
     pub task: String,
     pub model: ModelId,
@@ -94,10 +96,14 @@ pub enum AgentEvent {
     },
     UserMessage {
         run_id: RunId,
+        attempt_id: RunAttemptId,
+        control_revision: u64,
         text: String,
     },
     NeedsInput {
         run_id: RunId,
+        attempt_id: RunAttemptId,
+        control_revision: u64,
         prompt: String,
     },
     ToolCallRequested {
@@ -106,6 +112,8 @@ pub enum AgentEvent {
     },
     ToolApprovalRequired {
         run_id: RunId,
+        attempt_id: RunAttemptId,
+        control_revision: u64,
         call: ToolCall,
     },
     ToolPolicyEvaluated {
@@ -115,6 +123,8 @@ pub enum AgentEvent {
     },
     ToolApprovalDecided {
         run_id: RunId,
+        attempt_id: RunAttemptId,
+        control_revision: u64,
         tool_call_id: ToolCallId,
         decision: ApprovalDecision,
     },

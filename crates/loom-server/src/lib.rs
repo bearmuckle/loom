@@ -855,14 +855,44 @@ impl RunHandle {
                 state.run.updated_at = Timestamp::now();
             }
             AgentEvent::RunUsageUpdated { usage, .. } => state.usage = usage.clone(),
-            AgentEvent::ToolApprovalRequired { call, .. } => {
+            AgentEvent::ToolApprovalRequired {
+                attempt_id,
+                control_revision,
+                call,
+                ..
+            } => {
                 state.pending_approval = Some(call.clone());
+                state.run.attempt_id = *attempt_id;
+                state.run.control_revision = *control_revision;
             }
-            AgentEvent::ToolApprovalDecided { .. } => state.pending_approval = None,
-            AgentEvent::NeedsInput { prompt, .. } => {
+            AgentEvent::ToolApprovalDecided {
+                attempt_id,
+                control_revision,
+                ..
+            } => {
+                state.pending_approval = None;
+                state.run.attempt_id = *attempt_id;
+                state.run.control_revision = *control_revision;
+            }
+            AgentEvent::NeedsInput {
+                attempt_id,
+                control_revision,
+                prompt,
+                ..
+            } => {
                 state.pending_input = Some(prompt.clone());
+                state.run.attempt_id = *attempt_id;
+                state.run.control_revision = *control_revision;
             }
-            AgentEvent::UserMessage { .. } => state.pending_input = None,
+            AgentEvent::UserMessage {
+                attempt_id,
+                control_revision,
+                ..
+            } => {
+                state.pending_input = None;
+                state.run.attempt_id = *attempt_id;
+                state.run.control_revision = *control_revision;
+            }
             AgentEvent::ActivityRecorded { activity, .. } => {
                 if let Some(existing) = state
                     .activities
@@ -3551,21 +3581,29 @@ impl InProcessConnection {
             }
             ClientRequest::ApproveAgentAction {
                 run_id,
+                attempt_id,
+                expected_control_revision,
                 tool_call_id,
-            } => self.continue_run(run_id, |run| run.approve_entry(tool_call_id)),
+            } => self.continue_run(run_id, |run| {
+                run.approve_entry(tool_call_id, attempt_id, expected_control_revision)
+            }),
             ClientRequest::RejectAgentAction {
                 run_id,
+                attempt_id,
+                expected_control_revision,
                 tool_call_id,
                 reason,
             } => self.continue_run(run_id, |run| {
-                run.reject(tool_call_id, reason).map(|events| RunProgress {
-                    events,
-                    continues: false,
-                })
+                run.reject_entry(tool_call_id, reason, attempt_id, expected_control_revision)
             }),
-            ClientRequest::SendAgentMessage { run_id, message } => {
-                self.continue_run(run_id, |run| run.message_entry(message))
-            }
+            ClientRequest::SendAgentMessage {
+                run_id,
+                attempt_id,
+                expected_control_revision,
+                message,
+            } => self.continue_run(run_id, |run| {
+                run.message_entry_at_revision(message, attempt_id, expected_control_revision)
+            }),
             ClientRequest::InterruptAgentRun { run_id } => {
                 self.stop_run(run_id, RunStop::Interrupt)
             }
@@ -6117,6 +6155,8 @@ mod tests {
                     event:
                         AgentEvent::ToolApprovalRequired {
                             run_id: event_run,
+                            attempt_id,
+                            control_revision,
                             call,
                         },
                 } = &event.event
@@ -6125,6 +6165,8 @@ mod tests {
                     let response = connection.request(RequestEnvelope::new(
                         ClientRequest::ApproveAgentAction {
                             run_id,
+                            attempt_id: *attempt_id,
+                            expected_control_revision: *control_revision,
                             tool_call_id: call.id,
                         },
                     ));
@@ -6639,7 +6681,7 @@ mod tests {
         let persistence =
             std::env::temp_dir().join(format!("loom-server-state-{}.db", WorkspaceId::new()));
         let session_root_base;
-        let (session_id, run_id, approval_id) = {
+        let (session_id, run_id, approval) = {
             let backend = InProcessBackend::new_persistent(&persistence).unwrap();
             session_root_base = backend.session_root_base.clone();
             let connection = backend.connect();
@@ -6693,16 +6735,22 @@ mod tests {
                 ServerResponse::SessionEvents { events } => events,
                 response => panic!("unexpected response: {response:?}"),
             };
-            let approval_id = events
+            let approval = events
                 .iter()
                 .find_map(|event| match &event.event {
                     ServerEvent::Agent {
-                        event: AgentEvent::ToolApprovalRequired { call, .. },
-                    } => Some(call.id),
+                        event:
+                            AgentEvent::ToolApprovalRequired {
+                                call,
+                                attempt_id,
+                                control_revision,
+                                ..
+                            },
+                    } => Some((call.id, *attempt_id, *control_revision)),
                     _ => None,
                 })
                 .unwrap();
-            (session_id, run_id, approval_id)
+            (session_id, run_id, approval)
         };
         assert!(persistence.is_file());
 
@@ -6725,6 +6773,8 @@ mod tests {
             panic!("unexpected run response");
         };
         assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
+        assert_eq!(snapshot.attempt_id, approval.1);
+        assert_eq!(snapshot.control_revision, approval.2);
         let recovered_snapshot =
             connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
                 run_id,
@@ -6824,6 +6874,16 @@ mod tests {
             legacy_negotiation.result.unwrap_err().code,
             ErrorCode::UnsupportedProtocol
         );
+        let protocol_3_connection = backend.connect();
+        let protocol_3_negotiation =
+            protocol_3_connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+                client_version: ProtocolVersion::new(3, 0),
+                capabilities: backend.supported_capabilities.clone(),
+            }));
+        assert_eq!(
+            protocol_3_negotiation.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
 
         let capability_limited_connection = backend.connect();
         let capability_limited = CapabilitySet::new(
@@ -6870,10 +6930,29 @@ mod tests {
         };
         assert_eq!(checkpoint.session_id, session_id);
 
+        let wrong_attempt =
+            connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+                run_id,
+                attempt_id: loom_core::RunAttemptId::new(),
+                expected_control_revision: approval.2,
+                tool_call_id: approval.0,
+            }));
+        assert_eq!(wrong_attempt.result.unwrap_err().code, ErrorCode::Conflict);
+        let stale_revision =
+            connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+                run_id,
+                attempt_id: approval.1,
+                expected_control_revision: approval.2.saturating_sub(1),
+                tool_call_id: approval.0,
+            }));
+        assert_eq!(stale_revision.result.unwrap_err().code, ErrorCode::Conflict);
+
         let response =
             connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                 run_id,
-                tool_call_id: approval_id,
+                attempt_id: approval.1,
+                expected_control_revision: approval.2,
+                tool_call_id: approval.0,
             }));
         assert!(response.result.is_ok());
         await_settled_run(&connection, run_id);
@@ -6892,8 +6971,16 @@ mod tests {
                 };
                 let approval = events.iter().find_map(|event| match &event.event {
                     ServerEvent::Agent {
-                        event: AgentEvent::ToolApprovalRequired { call, .. },
-                    } if call.name == "run_command" => Some(call.id),
+                        event:
+                            AgentEvent::ToolApprovalRequired {
+                                call,
+                                attempt_id,
+                                control_revision,
+                                ..
+                            },
+                    } if call.name == "run_command" => {
+                        Some((call.id, *attempt_id, *control_revision))
+                    }
                     _ => None,
                 });
                 approval.or_else(|| {
@@ -6905,7 +6992,9 @@ mod tests {
         let response =
             connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                 run_id,
-                tool_call_id: command_approval,
+                attempt_id: command_approval.1,
+                expected_control_revision: command_approval.2,
+                tool_call_id: command_approval.0,
             }));
         assert!(response.result.is_ok());
         let mut usage = match connection
@@ -6953,17 +7042,31 @@ mod tests {
         };
         assert_eq!(usage.input_tokens, 240);
         assert_eq!(usage.output_tokens, 52);
+        let before_retry = reopened_connection
+            .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+        let ServerResponse::AgentRun(before_retry) = before_retry.result.unwrap() else {
+            panic!("unexpected run response before checkpoint retry");
+        };
         let retried = reopened_connection.request(RequestEnvelope::new(
             ClientRequest::RetryAgentFromCheckpoint {
                 run_id,
                 checkpoint_id: checkpoint.id,
             },
         ));
-        assert!(matches!(retried.result, Ok(ServerResponse::AgentRun(_))));
+        let ServerResponse::AgentRun(retried) = retried.result.unwrap() else {
+            panic!("unexpected checkpoint retry response");
+        };
+        assert_ne!(retried.attempt_id, before_retry.attempt_id);
         assert_eq!(
             await_settled_run(&reopened_connection, run_id).state,
             AgentRunState::AwaitingApproval
         );
+        let after_retry = reopened_connection
+            .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+        let ServerResponse::AgentRun(after_retry) = after_retry.result.unwrap() else {
+            panic!("unexpected run response after checkpoint retry");
+        };
+        assert_eq!(after_retry.attempt_id, retried.attempt_id);
         fs::remove_file(persistence).unwrap();
         fs::remove_dir_all(session_root_base).unwrap();
     }

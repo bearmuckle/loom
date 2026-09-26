@@ -431,11 +431,11 @@ Implement in this order:
    assistant fragments and exposes bounded keyset pages and byte-range reads.
    Completed content is stored as immutable 256 KiB chunks, so a bounded range
    read decodes only the chunks intersecting that range. Protocol-level
-   conversation paging and content ranges use protocol 3.0's separately
+   conversation paging and content ranges use protocol 4.0's separately
    negotiated `read_agent_run_messages` capability. Native and browser clients
    share these request/response types through the common client transport; this
-   adds an API surface, not a new transcript UI. Protocol 2.x peers are rejected
-   at negotiation; no legacy protocol adapter is in scope.
+   adds an API surface, not a new transcript UI. Protocol 3.x and older peers
+   are rejected at negotiation; no legacy protocol adapter is in scope.
    Runtime context checkpoints now include a repaired-prefix digest and
    projection version, and are invalidated when recovered history differs.
    Schema v19 stores ordered run activities in typed rows with session/time and
@@ -447,7 +447,11 @@ Implement in this order:
    tool-attempt/interaction records, and loading the canonical context directly
    from bounded persistence pages remain to be completed.
 3. Move execution, approvals, idempotency, and publication to transactional domain
-   commands. Test crash boundaries before switching live writes.
+   commands. Protocol 4.0 approval and input commands now carry the run-attempt
+   identity and expected control revision, and stale commands are rejected;
+   the run snapshot persists those guards across recovery. Typed interaction rows,
+   atomic decision/feed transactions, and crash-boundary tests are still
+   required. Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
    exports and their mirrored in-memory journals completely.

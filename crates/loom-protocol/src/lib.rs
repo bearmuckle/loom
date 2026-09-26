@@ -47,7 +47,7 @@ pub use workspace::{
     WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 0);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(4, 0);
 pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
 pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
 
@@ -391,15 +391,21 @@ pub enum ClientRequest {
     },
     ApproveAgentAction {
         run_id: RunId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
         tool_call_id: ToolCallId,
     },
     RejectAgentAction {
         run_id: RunId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
         tool_call_id: ToolCallId,
         reason: Option<String>,
     },
     SendAgentMessage {
         run_id: RunId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
         message: String,
     },
     InterruptAgentRun {

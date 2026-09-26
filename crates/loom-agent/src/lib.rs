@@ -276,6 +276,8 @@ impl AgentRuntime {
         let now = Timestamp::now();
         let run = AgentRunSnapshot {
             id: RunId::new(),
+            attempt_id: loom_core::RunAttemptId::new(),
+            control_revision: 0,
             session_id,
             task: task.task.clone(),
             model: task.model.clone(),
@@ -641,18 +643,31 @@ impl AgentRuntime {
     }
 
     pub fn approve(&mut self, tool_call_id: loom_core::ToolCallId) -> Result<Vec<AgentEvent>> {
-        let result = self.approve_inner(tool_call_id);
+        let attempt_id = self.run.attempt_id;
+        let control_revision = self.run.control_revision;
+        let result = self.approve_inner(tool_call_id, attempt_id, control_revision);
         self.publish(result)
     }
 
     /// Applies an approval and runs the approved tool without driving the run.
-    pub fn approve_entry(&mut self, tool_call_id: loom_core::ToolCallId) -> Result<RunProgress> {
-        let result = self.approve_entry_inner(tool_call_id);
+    pub fn approve_entry(
+        &mut self,
+        tool_call_id: loom_core::ToolCallId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<RunProgress> {
+        let result = self.approve_entry_inner(tool_call_id, attempt_id, expected_control_revision);
         self.publish_progress(result)
     }
 
-    fn approve_inner(&mut self, tool_call_id: loom_core::ToolCallId) -> Result<Vec<AgentEvent>> {
-        let progress = self.approve_entry_inner(tool_call_id)?;
+    fn approve_inner(
+        &mut self,
+        tool_call_id: loom_core::ToolCallId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<Vec<AgentEvent>> {
+        let progress =
+            self.approve_entry_inner(tool_call_id, attempt_id, expected_control_revision)?;
         let mut events = progress.events;
         if progress.continues {
             events.extend(self.advance()?);
@@ -660,7 +675,13 @@ impl AgentRuntime {
         Ok(events)
     }
 
-    fn approve_entry_inner(&mut self, tool_call_id: loom_core::ToolCallId) -> Result<RunProgress> {
+    fn approve_entry_inner(
+        &mut self,
+        tool_call_id: loom_core::ToolCallId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<RunProgress> {
+        self.validate_control_revision(attempt_id, expected_control_revision)?;
         if self.run.state != AgentRunState::AwaitingApproval {
             return Err(LoomError::new(
                 ErrorCode::InvalidState,
@@ -668,9 +689,13 @@ impl AgentRuntime {
                 false,
             ));
         }
+        let control_revision = self.next_control_revision()?;
         let pending = self.take_pending(tool_call_id)?;
+        self.run.control_revision = control_revision;
         let mut events = vec![AgentEvent::ToolApprovalDecided {
             run_id: self.run.id,
+            attempt_id: self.run.attempt_id,
+            control_revision,
             tool_call_id,
             decision: ApprovalDecision::Approved,
         }];
@@ -686,6 +711,33 @@ impl AgentRuntime {
         tool_call_id: loom_core::ToolCallId,
         reason: Option<String>,
     ) -> Result<Vec<AgentEvent>> {
+        let attempt_id = self.run.attempt_id;
+        let control_revision = self.run.control_revision;
+        let result = self.reject_entry_inner(tool_call_id, reason, attempt_id, control_revision);
+        self.publish(result.map(|progress| progress.events))
+    }
+
+    /// Applies a rejection using the interaction revision observed by the client.
+    pub fn reject_entry(
+        &mut self,
+        tool_call_id: loom_core::ToolCallId,
+        reason: Option<String>,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<RunProgress> {
+        let result =
+            self.reject_entry_inner(tool_call_id, reason, attempt_id, expected_control_revision);
+        self.publish_progress(result)
+    }
+
+    fn reject_entry_inner(
+        &mut self,
+        tool_call_id: loom_core::ToolCallId,
+        reason: Option<String>,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<RunProgress> {
+        self.validate_control_revision(attempt_id, expected_control_revision)?;
         if self.run.state != AgentRunState::AwaitingApproval {
             return Err(LoomError::new(
                 ErrorCode::InvalidState,
@@ -693,9 +745,13 @@ impl AgentRuntime {
                 false,
             ));
         }
+        let control_revision = self.next_control_revision()?;
         let pending = self.take_pending(tool_call_id)?;
+        self.run.control_revision = control_revision;
         let mut events = vec![AgentEvent::ToolApprovalDecided {
             run_id: self.run.id,
+            attempt_id: self.run.attempt_id,
+            control_revision,
             tool_call_id,
             decision: ApprovalDecision::Rejected,
         }];
@@ -712,7 +768,7 @@ impl AgentRuntime {
         });
         events.push(self.complete_tool_activity(&result, AgentActivityStatus::Failed));
         events.extend(self.finish_failed(output));
-        self.publish(Ok(events))
+        Ok(RunProgress::blocked(events))
     }
 
     pub fn interrupt(&mut self) -> Result<Vec<AgentEvent>> {
@@ -805,12 +861,27 @@ impl AgentRuntime {
 
     /// Records a user message without driving the run.
     pub fn message_entry(&mut self, message: impl Into<String>) -> Result<RunProgress> {
-        let result = self.message_entry_inner(message);
+        let attempt_id = self.run.attempt_id;
+        let control_revision = self.run.control_revision;
+        let result = self.message_entry_inner(message, attempt_id, control_revision);
+        self.publish_progress(result)
+    }
+
+    /// Records a user message only if it targets the current attempt revision.
+    pub fn message_entry_at_revision(
+        &mut self,
+        message: impl Into<String>,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<RunProgress> {
+        let result = self.message_entry_inner(message, attempt_id, expected_control_revision);
         self.publish_progress(result)
     }
 
     fn send_message_inner(&mut self, message: impl Into<String>) -> Result<Vec<AgentEvent>> {
-        let progress = self.message_entry_inner(message)?;
+        let attempt_id = self.run.attempt_id;
+        let control_revision = self.run.control_revision;
+        let progress = self.message_entry_inner(message, attempt_id, control_revision)?;
         let mut events = progress.events;
         if progress.continues {
             events.extend(self.advance()?);
@@ -818,7 +889,13 @@ impl AgentRuntime {
         Ok(events)
     }
 
-    fn message_entry_inner(&mut self, message: impl Into<String>) -> Result<RunProgress> {
+    fn message_entry_inner(
+        &mut self,
+        message: impl Into<String>,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<RunProgress> {
+        self.validate_control_revision(attempt_id, expected_control_revision)?;
         let message = message.into();
         if message.trim().is_empty() {
             return Err(LoomError::invalid_request(
@@ -838,15 +915,19 @@ impl AgentRuntime {
                 "agent run is currently processing a message",
             ));
         }
+        let control_revision = self.next_control_revision()?;
         self.messages
             .push(ModelMessage::new(MessageRole::User, message.clone()));
         self.pending_input = None;
+        self.run.control_revision = control_revision;
         self.active_message_id = None;
         self.last_failed_call = None;
         self.run.completed_at = None;
         self.run.summary = None;
         let mut events = vec![AgentEvent::UserMessage {
             run_id: self.run.id,
+            attempt_id: self.run.attempt_id,
+            control_revision,
             text: message,
         }];
         events.extend(self.set_state(AgentRunState::Executing));
@@ -873,10 +954,14 @@ impl AgentRuntime {
                 "finished agent runs cannot request input",
             ));
         }
+        let control_revision = self.next_control_revision()?;
         self.pending_input = Some(prompt.clone());
+        self.run.control_revision = control_revision;
         let mut events = self.set_state(AgentRunState::NeedsInput);
         events.push(AgentEvent::NeedsInput {
             run_id: self.run.id,
+            attempt_id: self.run.attempt_id,
+            control_revision,
             prompt,
         });
         self.publish(Ok(events))
@@ -975,6 +1060,8 @@ impl AgentRuntime {
                 false,
             ));
         }
+        self.run.attempt_id = loom_core::RunAttemptId::new();
+        self.run.control_revision = 0;
         self.run.completed_at = None;
         self.run.summary = None;
         self.run.updated_at = Timestamp::now();
@@ -1316,7 +1403,9 @@ impl AgentRuntime {
                     evaluation.decision,
                     loom_core::PolicyDecision::RequireApproval
                 ) {
+                    let control_revision = self.next_control_revision()?;
                     self.pending_approval = Some(PendingApproval { call: call.clone() });
+                    self.run.control_revision = control_revision;
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
                     ctx.events.push(AgentEvent::StepCompleted {
@@ -1331,6 +1420,8 @@ impl AgentRuntime {
                     );
                     ctx.events.push(AgentEvent::ToolApprovalRequired {
                         run_id: self.run.id,
+                        attempt_id: self.run.attempt_id,
+                        control_revision,
                         call,
                     });
                     ctx.finished = true;
@@ -1454,7 +1545,9 @@ impl AgentRuntime {
                         });
                         return Ok(StreamFlow::Stop);
                     };
+                    let control_revision = self.next_control_revision()?;
                     self.pending_input = Some(prompt.to_owned());
+                    self.run.control_revision = control_revision;
                     self.messages.push(ModelMessage {
                         role: MessageRole::Tool,
                         content: format!("Waiting for user input: {prompt}"),
@@ -1475,6 +1568,8 @@ impl AgentRuntime {
                     );
                     ctx.events.push(AgentEvent::NeedsInput {
                         run_id: self.run.id,
+                        attempt_id: self.run.attempt_id,
+                        control_revision,
                         prompt: prompt.to_owned(),
                     });
                     ctx.finished = true;
@@ -1740,6 +1835,33 @@ impl AgentRuntime {
             )));
         }
         Ok(pending)
+    }
+
+    fn validate_control_revision(
+        &self,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
+    ) -> Result<()> {
+        if self.run.attempt_id != attempt_id
+            || self.run.control_revision != expected_control_revision
+        {
+            return Err(LoomError::new(
+                ErrorCode::Conflict,
+                "agent interaction belongs to a different attempt or control revision",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    fn next_control_revision(&self) -> Result<u64> {
+        self.run.control_revision.checked_add(1).ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::InvalidState,
+                "agent control revision is exhausted",
+                false,
+            )
+        })
     }
 
     fn model_request(&self) -> Result<(ModelRequest, ContextInspection)> {
@@ -2789,6 +2911,79 @@ mod tests {
             matches!(event, AgentEvent::UserMessage { text, .. } if text.contains("standard"))
         }));
         assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn input_commands_require_the_current_attempt_and_control_revision() {
+        let root = workspace();
+        let mut runtime = context_runtime(&root);
+        let attempt_id = runtime.snapshot().attempt_id;
+        let requested = runtime
+            .request_input("Which validation should I run?")
+            .unwrap();
+        let control_revision = requested
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::NeedsInput {
+                    attempt_id,
+                    control_revision,
+                    ..
+                } => Some((*attempt_id, *control_revision)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(control_revision.0, attempt_id);
+
+        let wrong_attempt = runtime.message_entry_at_revision(
+            "stale attempt",
+            loom_core::RunAttemptId::new(),
+            control_revision.1,
+        );
+        assert_eq!(wrong_attempt.unwrap_err().code, ErrorCode::Conflict);
+
+        let stale_revision = runtime.message_entry_at_revision(
+            "stale revision",
+            attempt_id,
+            control_revision.1.saturating_sub(1),
+        );
+        assert_eq!(stale_revision.unwrap_err().code, ErrorCode::Conflict);
+        assert_eq!(
+            runtime.pending_input().as_deref(),
+            Some("Which validation should I run?")
+        );
+
+        let accepted = runtime
+            .message_entry_at_revision(
+                "Run the standard validation.",
+                attempt_id,
+                control_revision.1,
+            )
+            .unwrap();
+        assert!(accepted.events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::UserMessage {
+                    attempt_id: event_attempt,
+                    control_revision: event_revision,
+                    text,
+                    ..
+                } if *event_attempt == attempt_id
+                    && *event_revision == control_revision.1 + 1
+                    && text.contains("standard")
+            )
+        }));
+        assert_eq!(runtime.snapshot().control_revision, control_revision.1 + 1);
+        assert_eq!(runtime.pending_input(), None);
+
+        let restored = AgentRuntime::from_state(
+            runtime.export_state(),
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(restored.snapshot().attempt_id, attempt_id);
+        assert_eq!(restored.snapshot().control_revision, control_revision.1 + 1);
         fs::remove_dir_all(root).unwrap();
     }
 

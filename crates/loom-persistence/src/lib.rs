@@ -26,8 +26,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 19;
-const DATABASE_SCHEMA_VERSION: u32 = 19;
+pub const CURRENT_SCHEMA_VERSION: u32 = 20;
+const DATABASE_SCHEMA_VERSION: u32 = 20;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -5494,6 +5494,8 @@ mod tests {
         let run_summary = DurableRunSummary {
             snapshot: AgentRunSnapshot {
                 id: run_id,
+                attempt_id: loom_core::RunAttemptId::new(),
+                control_revision: 0,
                 session_id: session.id,
                 task: "indexed run summary".to_owned(),
                 model: ModelId::new("deterministic-model"),
@@ -5905,6 +5907,8 @@ mod tests {
         let summary = DurableRunSummary {
             snapshot: AgentRunSnapshot {
                 id: run_id,
+                attempt_id: loom_core::RunAttemptId::new(),
+                control_revision: 0,
                 session_id: session.id,
                 task: "stream fragments".to_owned(),
                 model: ModelId::new("deterministic-model"),

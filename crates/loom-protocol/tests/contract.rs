@@ -186,6 +186,8 @@ fn worker_status_response_round_trip_preserves_resource_samples() {
 fn agent_event_json_round_trip_preserves_run_identity() {
     let run = AgentRunSnapshot {
         id: RunId::new(),
+        attempt_id: loom_core::RunAttemptId::new(),
+        control_revision: 0,
         session_id: AgentSessionId::new(),
         task: "inspect the workspace".to_owned(),
         model: ModelId::new("deterministic/demo"),
@@ -333,7 +335,7 @@ fn m3_run_options_provider_and_context_contracts_round_trip() {
 #[test]
 fn capability_discovery_accepts_current_major_and_rejects_old_major() {
     let request = RequestEnvelope::with_version(
-        ProtocolVersion::new(3, 0),
+        ProtocolVersion::new(4, 0),
         ClientRequest::DiscoverCapabilities,
     );
     assert_eq!(
@@ -345,6 +347,7 @@ fn capability_discovery_accepts_current_major_and_rejects_old_major() {
             .protocol_version
             .is_compatible_with(CURRENT_PROTOCOL_VERSION)
     );
+    assert!(!ProtocolVersion::new(3, 9).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(2, 9).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(1, 7).is_compatible_with(CURRENT_PROTOCOL_VERSION));
 }
@@ -382,6 +385,8 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
     );
     let message = RequestEnvelope::new(ClientRequest::SendAgentMessage {
         run_id: RunId::new(),
+        attempt_id: loom_core::RunAttemptId::new(),
+        expected_control_revision: 3,
         message: "continue with validation".to_owned(),
     });
     assert_eq!(
@@ -420,6 +425,8 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
     );
     let run = AgentRunSnapshot {
         id: RunId::new(),
+        attempt_id: loom_core::RunAttemptId::new(),
+        control_revision: 0,
         session_id: AgentSessionId::new(),
         task: "review".to_owned(),
         model: ModelId::new("deterministic/demo"),

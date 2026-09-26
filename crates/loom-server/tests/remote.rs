@@ -638,6 +638,8 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
                 event:
                     AgentEvent::ToolApprovalRequired {
                         run_id: event_run,
+                        attempt_id,
+                        control_revision,
                         call,
                     },
             } = &event.event
@@ -647,6 +649,8 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
                 second
                     .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                         run_id,
+                        attempt_id: *attempt_id,
+                        expected_control_revision: *control_revision,
                         tool_call_id: call.id,
                     }))
                     .await

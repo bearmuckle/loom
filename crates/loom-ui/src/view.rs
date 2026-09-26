@@ -3089,7 +3089,13 @@ impl LoomView {
                 completed: BTreeSet::new(),
                 active: None,
             }),
-            AgentEvent::UserMessage { text, .. } => {
+            AgentEvent::UserMessage {
+                run_id,
+                attempt_id,
+                control_revision,
+                text,
+            } => {
+                self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 if self
                     .optimistic_messages
                     .first()
@@ -3157,7 +3163,13 @@ impl LoomView {
                     });
                 }
             }
-            AgentEvent::ToolApprovalRequired { call, .. } => {
+            AgentEvent::ToolApprovalRequired {
+                run_id,
+                attempt_id,
+                control_revision,
+                call,
+            } => {
+                self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 for item in &mut self.timeline {
                     if let TimelineItem::Approval { active, .. } = item {
                         *active = false;
@@ -3172,7 +3184,13 @@ impl LoomView {
                 }
             }
             AgentEvent::ToolPolicyEvaluated { .. } => {}
-            AgentEvent::ToolApprovalDecided { .. } => {
+            AgentEvent::ToolApprovalDecided {
+                run_id,
+                attempt_id,
+                control_revision,
+                ..
+            } => {
+                self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 self.pending_approval = None;
                 self.approval_request_in_flight = false;
                 for item in &mut self.timeline {
@@ -3209,7 +3227,13 @@ impl LoomView {
                 self.enable_activity_projection();
                 upsert_activity(&mut self.timeline, activity.clone());
             }
-            AgentEvent::NeedsInput { prompt, .. } => {
+            AgentEvent::NeedsInput {
+                run_id,
+                attempt_id,
+                control_revision,
+                prompt,
+            } => {
+                self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 self.pending_input = Some(prompt.clone());
                 self.timeline.push(TimelineItem::NeedsInput(prompt.clone()));
             }
@@ -3246,6 +3270,18 @@ impl LoomView {
                     });
                 }
             }
+        }
+    }
+
+    fn update_active_run_control(
+        &mut self,
+        run_id: RunId,
+        attempt_id: loom_core::RunAttemptId,
+        control_revision: u64,
+    ) {
+        if let Some(run) = self.active_run.as_mut().filter(|run| run.id == run_id) {
+            run.attempt_id = attempt_id;
+            run.control_revision = control_revision;
         }
     }
 
@@ -3587,9 +3623,19 @@ impl LoomView {
             None
         };
         let request = if let Some(run_id) = self.active_run_id {
+            let Some(run) = self.active_run.as_ref().filter(|run| run.id == run_id) else {
+                self.sending_message = false;
+                self.record_backend_error(
+                    "send message",
+                    LoomError::invalid_state("active run control state is unavailable"),
+                );
+                return;
+            };
             self.optimistic_messages.push(message.clone());
             ClientRequest::SendAgentMessage {
                 run_id,
+                attempt_id: run.attempt_id,
+                expected_control_revision: run.control_revision,
                 message: message.clone(),
             }
         } else {
@@ -3693,11 +3739,20 @@ impl LoomView {
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
             return;
         };
+        let Some(run) = self.active_run.as_ref().filter(|run| run.id == run_id) else {
+            self.record_backend_error(
+                "approve action",
+                LoomError::invalid_state("active run control state is unavailable"),
+            );
+            return;
+        };
         self.approval_request_in_flight = true;
         self.dispatch(
             cx,
             ClientRequest::ApproveAgentAction {
                 run_id,
+                attempt_id: run.attempt_id,
+                expected_control_revision: run.control_revision,
                 tool_call_id: call.id,
             },
             |view, response, cx| view.finish_approval_response(response, cx),
@@ -3711,11 +3766,20 @@ impl LoomView {
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
             return;
         };
+        let Some(run) = self.active_run.as_ref().filter(|run| run.id == run_id) else {
+            self.record_backend_error(
+                "reject action",
+                LoomError::invalid_state("active run control state is unavailable"),
+            );
+            return;
+        };
         self.approval_request_in_flight = true;
         self.dispatch(
             cx,
             ClientRequest::RejectAgentAction {
                 run_id,
+                attempt_id: run.attempt_id,
+                expected_control_revision: run.control_revision,
                 tool_call_id: call.id,
                 reason: None,
             },
@@ -10429,6 +10493,8 @@ mod loom_view_render_tests {
             view.apply_run_projection(loom_protocol::AgentRunSnapshotProjection {
                 run: loom_protocol::AgentRunSnapshot {
                     id: RunId::new(),
+                    attempt_id: loom_core::RunAttemptId::new(),
+                    control_revision: 0,
                     session_id: view.active_session.id,
                     task: "inspect the repository".to_owned(),
                     model: ModelId::new("deterministic/demo"),
@@ -10473,6 +10539,8 @@ mod loom_view_render_tests {
             view.apply_run_projection(loom_protocol::AgentRunSnapshotProjection {
                 run: loom_protocol::AgentRunSnapshot {
                     id: RunId::new(),
+                    attempt_id: loom_core::RunAttemptId::new(),
+                    control_revision: 0,
                     session_id: view.active_session.id,
                     task: "task".to_owned(),
                     model: ModelId::new("deterministic/demo"),
@@ -11027,6 +11095,8 @@ mod loom_view_render_tests {
             };
             let snapshot = loom_protocol::AgentRunSnapshot {
                 id: run_id,
+                attempt_id: loom_core::RunAttemptId::new(),
+                control_revision: 0,
                 session_id: view.active_session.id,
                 task: "update the app".to_owned(),
                 model: ModelId::new("deterministic/demo"),
@@ -11077,6 +11147,8 @@ mod loom_view_render_tests {
                 loom_protocol::AgentEvent::ContextInspected { run_id, inspection },
                 loom_protocol::AgentEvent::UserMessage {
                     run_id,
+                    attempt_id: snapshot.attempt_id,
+                    control_revision: 1,
                     text: "new request".to_owned(),
                 },
                 loom_protocol::AgentEvent::AssistantMessageDelta {
@@ -11095,6 +11167,8 @@ mod loom_view_render_tests {
                 },
                 loom_protocol::AgentEvent::ToolApprovalRequired {
                     run_id,
+                    attempt_id: snapshot.attempt_id,
+                    control_revision: 2,
                     call: call.clone(),
                 },
                 loom_protocol::AgentEvent::ToolPolicyEvaluated {
@@ -11121,11 +11195,15 @@ mod loom_view_render_tests {
                 },
                 loom_protocol::AgentEvent::ToolApprovalDecided {
                     run_id,
+                    attempt_id: snapshot.attempt_id,
+                    control_revision: 3,
                     tool_call_id: call.id,
                     decision: loom_protocol::ApprovalDecision::Approved,
                 },
                 loom_protocol::AgentEvent::NeedsInput {
                     run_id,
+                    attempt_id: snapshot.attempt_id,
+                    control_revision: 4,
                     prompt: "Which branch?".to_owned(),
                 },
                 loom_protocol::AgentEvent::RunUsage {
@@ -11249,6 +11327,8 @@ mod loom_view_render_tests {
             let session_id = view.active_session.id;
             let run = loom_protocol::AgentRunSnapshot {
                 id: RunId::new(),
+                attempt_id: loom_core::RunAttemptId::new(),
+                control_revision: 0,
                 session_id,
                 task: "recover the transcript".to_owned(),
                 model: ModelId::new("deterministic/demo"),
@@ -12958,6 +13038,8 @@ mod worker_node_tests {
             session_id_for_request(
                 &ClientRequest::SendAgentMessage {
                     run_id: RunId::new(),
+                    attempt_id: loom_core::RunAttemptId::new(),
+                    expected_control_revision: 0,
                     message: "hello".to_owned(),
                 },
                 active_session_id

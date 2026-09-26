@@ -451,6 +451,8 @@ async fn m4_demo_remote(
                 event:
                     AgentEvent::ToolApprovalRequired {
                         run_id: event_run,
+                        attempt_id,
+                        control_revision,
                         call,
                     },
             } = &event.event
@@ -460,6 +462,8 @@ async fn m4_demo_remote(
                 second
                     .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                         run_id,
+                        attempt_id: *attempt_id,
+                        expected_control_revision: *control_revision,
                         tool_call_id: call.id,
                     }))
                     .await?
@@ -982,6 +986,8 @@ fn stream_run(
                 event:
                     AgentEvent::ToolApprovalRequired {
                         run_id: event_run_id,
+                        attempt_id,
+                        control_revision,
                         call,
                     },
             } = &event.event
@@ -998,11 +1004,15 @@ fn stream_run(
                 let request = if approved {
                     ClientRequest::ApproveAgentAction {
                         run_id,
+                        attempt_id: *attempt_id,
+                        expected_control_revision: *control_revision,
                         tool_call_id: call.id,
                     }
                 } else {
                     ClientRequest::RejectAgentAction {
                         run_id,
+                        attempt_id: *attempt_id,
+                        expected_control_revision: *control_revision,
                         tool_call_id: call.id,
                         reason: Some("denied at the native shell".to_owned()),
                     }
