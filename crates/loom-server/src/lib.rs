@@ -1905,6 +1905,7 @@ impl InProcessBackend {
                     )
                 })?;
             runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
+            runtime_state.activities = persistence.load_run_activities(run_id)?;
             if runtime_state.run.id != run_id {
                 return Err(LoomError::new(
                     ErrorCode::MalformedPayload,
@@ -1993,12 +1994,14 @@ impl InProcessBackend {
             );
         }
         let mut durable_run_messages = BTreeMap::new();
+        let mut durable_run_activities = BTreeMap::new();
         let entity_sections = runs
             .into_iter()
             .map(|(run_id, mut state)| {
                 durable_run_messages
                     .insert(run_id, durable_run_messages_from_runtime(&state.messages));
                 state.messages.clear();
+                durable_run_activities.insert(run_id, std::mem::take(&mut state.activities));
                 Ok((format!("run:{run_id}"), json_value(state)?))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2079,6 +2082,7 @@ impl InProcessBackend {
             idempotency: Some(&idempotency),
             run_summaries: Some(&durable_run_summaries),
             run_messages: Some(&durable_run_messages),
+            run_activities: Some(&durable_run_activities),
             filesystem_records: Some(&filesystem_records),
             records: &entity_sections,
             feed: Some(&feed),
@@ -2549,6 +2553,7 @@ impl InProcessConnection {
             })?;
         state.messages =
             persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
+        state.activities = persistence.load_run_activities(summary.snapshot.id)?;
         Ok(state)
     }
 

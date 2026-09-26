@@ -438,9 +438,14 @@ Implement in this order:
    at negotiation; no legacy protocol adapter is in scope.
    Runtime context checkpoints now include a repaired-prefix digest and
    projection version, and are invalidated when recovered history differs.
+   Schema v19 stores ordered run activities in typed rows with session/time and
+   tool-call indexes; activity data is content-addressed, and runtime section
+   snapshots no longer embed a second copy. Activity rows are written
+   transactionally with run summaries and restored for both restart recovery
+   and on-demand run detail loads.
    Batching fragments at the intended flush thresholds, migration of tools and
-   activities, and loading the canonical context directly from bounded
-   persistence pages remain to be completed.
+   tool-attempt/interaction records, and loading the canonical context directly
+   from bounded persistence pages remain to be completed.
 3. Move execution, approvals, idempotency, and publication to transactional domain
    commands. Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.

@@ -8,12 +8,13 @@ use std::{
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, CheckpointId,
-    ErrorCode, EventSequence, LoomError, RequestId, Result, RunId, Timestamp, UsageSnapshot,
-    WorkspaceId, WorkspaceRecord,
+    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
+    CheckpointId, ErrorCode, EventSequence, LoomError, RequestId, Result, RunId, StepId, Timestamp,
+    UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
+    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
     AgentRunSnapshot, AgentRunState, Checkpoint, CheckpointFile, ServerEventEnvelope,
     WorkspaceConfig, WorkspaceControl,
 };
@@ -25,8 +26,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 18;
-const DATABASE_SCHEMA_VERSION: u32 = 18;
+pub const CURRENT_SCHEMA_VERSION: u32 = 19;
+const DATABASE_SCHEMA_VERSION: u32 = 19;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -95,6 +96,32 @@ CREATE TABLE IF NOT EXISTS run_messages (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS run_messages_by_session
     ON run_messages(session_id, run_id, ordinal);
+CREATE TABLE IF NOT EXISTS run_activities (
+    run_id BLOB NOT NULL,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    activity_id BLOB NOT NULL CHECK(length(activity_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    parent_activity_id BLOB CHECK(parent_activity_id IS NULL OR length(parent_activity_id) = 16),
+    step_id BLOB CHECK(step_id IS NULL OR length(step_id) = 16),
+    tool_call_id BLOB CHECK(tool_call_id IS NULL OR length(tool_call_id) = 16),
+    kind TEXT NOT NULL CHECK(kind IN ('model_turn', 'tool_call', 'file', 'search', 'command')),
+    status TEXT NOT NULL CHECK(status IN (
+        'started', 'completed', 'failed', 'awaiting_approval', 'awaiting_input', 'cancelled'
+    )),
+    started_at INTEGER NOT NULL CHECK(started_at >= 0),
+    completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
+    elapsed_ms INTEGER CHECK(elapsed_ms IS NULL OR elapsed_ms >= 0),
+    data_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE RESTRICT
+        CHECK(length(data_hash) = 32),
+    PRIMARY KEY(run_id, activity_id),
+    UNIQUE(run_id, ordinal),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_activities_by_session_time
+    ON run_activities(session_id, started_at DESC, activity_id DESC);
+CREATE INDEX IF NOT EXISTS run_activities_by_tool_call
+    ON run_activities(run_id, tool_call_id, ordinal) WHERE tool_call_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS run_message_fragments (
     run_id BLOB NOT NULL,
     message_ordinal INTEGER NOT NULL CHECK(message_ordinal >= 0),
@@ -657,6 +684,8 @@ pub struct DurableRunMessageHeader {
     pub tool_calls: Vec<loom_model::ToolCall>,
 }
 
+pub type DurableRunActivities = BTreeMap<RunId, Vec<AgentActivityRecord>>;
+
 #[derive(Clone, Debug)]
 pub struct DurableFilesystemRecord {
     pub session_id: AgentSessionId,
@@ -677,6 +706,7 @@ pub struct DurableStateWrite<'a> {
     pub idempotency: Option<&'a BTreeMap<RequestId, DurableIdempotencyRecord>>,
     pub run_summaries: Option<&'a BTreeMap<RunId, DurableRunSummary>>,
     pub run_messages: Option<&'a BTreeMap<RunId, Vec<DurableRunMessage>>>,
+    pub run_activities: Option<&'a DurableRunActivities>,
     pub filesystem_records: Option<&'a [DurableFilesystemRecord]>,
     pub records: &'a [(String, Value)],
     pub feed: Option<&'a DurableFeedState>,
@@ -1489,6 +1519,129 @@ impl FilePersistence {
             })
         })
         .collect()
+    }
+
+    /// Loads typed activity metadata and its content-addressed activity data.
+    pub fn load_run_activities(&self, run_id: RunId) -> Result<Vec<AgentActivityRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT ordinal, activity_id, parent_activity_id, step_id, tool_call_id,
+                        kind, status, started_at, completed_at, elapsed_ms, data_hash
+                 FROM run_activities WHERE run_id=?1 ORDER BY ordinal",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare run activities: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Vec<u8>>(10)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read run activities: {error}"), true)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                persistence_error(format!("could not read run activity row: {error}"), true)
+            })?;
+        drop(statement);
+
+        let mut activities = Vec::with_capacity(rows.len());
+        for (
+            expected_ordinal,
+            (
+                ordinal,
+                activity_id,
+                parent_activity_id,
+                step_id,
+                tool_call_id,
+                kind,
+                status,
+                started_at,
+                completed_at,
+                elapsed_ms,
+                data_hash,
+            ),
+        ) in rows.into_iter().enumerate()
+        {
+            if ordinal
+                != i64::try_from(expected_ordinal).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted activity ordinal is out of range",
+                        false,
+                    )
+                })?
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted run activity ordinals are not contiguous",
+                    false,
+                ));
+            }
+            let data = decode_content(&connection, &data_hash)?;
+            let data: AgentActivityData = serde_json::from_str(&data).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted activity data is malformed: {error}"),
+                    false,
+                )
+            })?;
+            let tool_call_id = decode_optional_tool_call_id(tool_call_id)?;
+            if activity_data_tool_call_id(&data) != tool_call_id {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted activity tool-call index does not match its data",
+                    false,
+                ));
+            }
+            let kind = parse_activity_kind(&kind)?;
+            if activity_data_kind(&data) != kind {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted activity kind does not match its data",
+                    false,
+                ));
+            }
+            activities.push(AgentActivityRecord {
+                id: ActivityId::from_uuid(decode_uuid(&activity_id, "activity id")?),
+                run_id,
+                parent_id: decode_optional_activity_id(parent_activity_id)?,
+                step_id: decode_optional_step_id(step_id)?,
+                kind,
+                status: parse_activity_status(&status)?,
+                started_at: decode_timestamp(started_at)?,
+                completed_at: completed_at.map(decode_timestamp).transpose()?,
+                elapsed_ms: elapsed_ms
+                    .map(|elapsed| {
+                        u64::try_from(elapsed).map_err(|_| {
+                            LoomError::new(
+                                ErrorCode::MalformedPayload,
+                                "persisted activity elapsed time is negative",
+                                false,
+                            )
+                        })
+                    })
+                    .transpose()?,
+                data,
+            });
+        }
+        Ok(activities)
     }
 
     /// Loads the newest bounded page of message headers. Use the returned
@@ -2350,6 +2503,7 @@ impl FilePersistence {
             idempotency: None,
             run_summaries: None,
             run_messages: None,
+            run_activities: None,
             filesystem_records: None,
             records,
             feed,
@@ -2378,6 +2532,7 @@ impl FilePersistence {
             idempotency: None,
             run_summaries: None,
             run_messages: None,
+            run_activities: None,
             filesystem_records: None,
             records,
             feed,
@@ -2416,6 +2571,9 @@ impl FilePersistence {
         }
         if let Some(run_summaries) = write.run_summaries {
             save_run_summary_rows(&transaction, run_summaries)?;
+        }
+        if let Some(run_activities) = write.run_activities {
+            save_run_activity_rows(&transaction, run_activities)?;
         }
         if let Some(run_messages) = write.run_messages {
             save_run_message_rows(&transaction, run_messages)?;
@@ -2798,6 +2956,9 @@ fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
              ) AND NOT EXISTS (
                 SELECT 1 FROM run_message_fragments
                 WHERE run_message_fragments.content_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_activities
+                WHERE run_activities.data_hash=content_objects.hash
              )",
             [],
         )
@@ -2847,6 +3008,78 @@ fn parse_message_role(role: &str) -> Result<loom_model::MessageRole> {
     }
 }
 
+fn activity_kind_name(kind: AgentActivityKind) -> &'static str {
+    match kind {
+        AgentActivityKind::ModelTurn => "model_turn",
+        AgentActivityKind::ToolCall => "tool_call",
+        AgentActivityKind::File => "file",
+        AgentActivityKind::Search => "search",
+        AgentActivityKind::Command => "command",
+    }
+}
+
+fn parse_activity_kind(kind: &str) -> Result<AgentActivityKind> {
+    match kind {
+        "model_turn" => Ok(AgentActivityKind::ModelTurn),
+        "tool_call" => Ok(AgentActivityKind::ToolCall),
+        "file" => Ok(AgentActivityKind::File),
+        "search" => Ok(AgentActivityKind::Search),
+        "command" => Ok(AgentActivityKind::Command),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted activity has an unknown kind",
+            false,
+        )),
+    }
+}
+
+fn activity_status_name(status: AgentActivityStatus) -> &'static str {
+    match status {
+        AgentActivityStatus::Started => "started",
+        AgentActivityStatus::Completed => "completed",
+        AgentActivityStatus::Failed => "failed",
+        AgentActivityStatus::AwaitingApproval => "awaiting_approval",
+        AgentActivityStatus::AwaitingInput => "awaiting_input",
+        AgentActivityStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_activity_status(status: &str) -> Result<AgentActivityStatus> {
+    match status {
+        "started" => Ok(AgentActivityStatus::Started),
+        "completed" => Ok(AgentActivityStatus::Completed),
+        "failed" => Ok(AgentActivityStatus::Failed),
+        "awaiting_approval" => Ok(AgentActivityStatus::AwaitingApproval),
+        "awaiting_input" => Ok(AgentActivityStatus::AwaitingInput),
+        "cancelled" => Ok(AgentActivityStatus::Cancelled),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted activity has an unknown status",
+            false,
+        )),
+    }
+}
+
+fn activity_data_tool_call_id(data: &AgentActivityData) -> Option<loom_core::ToolCallId> {
+    match data {
+        AgentActivityData::ModelTurn { .. } => None,
+        AgentActivityData::ToolCall { call, .. }
+        | AgentActivityData::File { call, .. }
+        | AgentActivityData::Search { call, .. }
+        | AgentActivityData::Command { call, .. } => Some(call.id),
+    }
+}
+
+fn activity_data_kind(data: &AgentActivityData) -> AgentActivityKind {
+    match data {
+        AgentActivityData::ModelTurn { .. } => AgentActivityKind::ModelTurn,
+        AgentActivityData::ToolCall { .. } => AgentActivityKind::ToolCall,
+        AgentActivityData::File { .. } => AgentActivityKind::File,
+        AgentActivityData::Search { .. } => AgentActivityKind::Search,
+        AgentActivityData::Command { .. } => AgentActivityKind::Command,
+    }
+}
+
 fn decode_optional_tool_call_id(id: Option<Vec<u8>>) -> Result<Option<loom_core::ToolCallId>> {
     id.map(|id| {
         Uuid::from_slice(&id)
@@ -2860,6 +3093,16 @@ fn decode_optional_tool_call_id(id: Option<Vec<u8>>) -> Result<Option<loom_core:
             })
     })
     .transpose()
+}
+
+fn decode_optional_activity_id(id: Option<Vec<u8>>) -> Result<Option<ActivityId>> {
+    id.map(|id| decode_uuid(&id, "parent activity id").map(ActivityId::from_uuid))
+        .transpose()
+}
+
+fn decode_optional_step_id(id: Option<Vec<u8>>) -> Result<Option<StepId>> {
+    id.map(|id| decode_uuid(&id, "activity step id").map(StepId::from_uuid))
+        .transpose()
 }
 
 fn load_run_message_fragments(
@@ -3920,6 +4163,202 @@ fn save_run_summary_rows(
             persistence_error(format!("could not prune run summaries: {error}"), true)
         })?;
     Ok(())
+}
+
+fn save_run_activity_rows(
+    transaction: &Transaction<'_>,
+    activities_by_run: &DurableRunActivities,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_activities (
+                run_id BLOB NOT NULL, activity_id BLOB NOT NULL,
+                PRIMARY KEY(run_id, activity_id)
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_run_activities;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run activities: {error}"), true)
+        })?;
+    for (run_id, activities) in activities_by_run {
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let session_id: Vec<u8> = transaction
+            .query_row(
+                "SELECT session_id FROM run_summaries WHERE run_id=?1",
+                [run_id_bytes.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("run {run_id} has no durable summary for its activities: {error}"),
+                    true,
+                )
+            })?;
+        let mut seen = BTreeSet::new();
+        for (ordinal, activity) in activities.iter().enumerate() {
+            if activity.run_id != *run_id || !seen.insert(activity.id) {
+                return Err(LoomError::invalid_request(
+                    "run activity keys must be unique and match their owning run",
+                ));
+            }
+            if activity.kind != activity_data_kind(&activity.data) {
+                return Err(LoomError::invalid_request(
+                    "run activity kind does not match its data",
+                ));
+            }
+            let ordinal = i64::try_from(ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "run has too many activity records",
+                    false,
+                )
+            })?;
+            let activity_id = activity.id.as_uuid().as_bytes().to_vec();
+            let existing_ordinal: Option<i64> = transaction
+                .query_row(
+                    "SELECT ordinal FROM run_activities
+                     WHERE run_id=?1 AND activity_id=?2",
+                    params![run_id_bytes.as_slice(), activity_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    persistence_error(format!("could not read activity position: {error}"), true)
+                })?;
+            if existing_ordinal.is_some_and(|existing| existing != ordinal) {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted activity order cannot be changed",
+                    false,
+                ));
+            }
+            let occupant: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT activity_id FROM run_activities WHERE run_id=?1 AND ordinal=?2",
+                    params![run_id_bytes.as_slice(), ordinal],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    persistence_error(format!("could not verify activity order: {error}"), true)
+                })?;
+            if occupant
+                .as_ref()
+                .is_some_and(|existing| existing.as_slice() != activity_id.as_slice())
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted activity order cannot be changed",
+                    false,
+                ));
+            }
+
+            let data = serde_json::to_vec(&activity.data).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!("could not encode run activity data: {error}"),
+                    false,
+                )
+            })?;
+            let data_hash = store_content(transaction, &data)?;
+            let parent_activity_id = activity
+                .parent_id
+                .map(|id| id.as_uuid().as_bytes().to_vec());
+            let step_id = activity.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
+            let tool_call_id = activity_data_tool_call_id(&activity.data)
+                .map(|id| id.as_uuid().as_bytes().to_vec());
+            let started_at = i64::try_from(activity.started_at.as_unix_millis())
+                .map_err(|_| LoomError::invalid_request("activity start time is out of range"))?;
+            let completed_at = activity
+                .completed_at
+                .map(|time| {
+                    i64::try_from(time.as_unix_millis()).map_err(|_| {
+                        LoomError::invalid_request("activity end time is out of range")
+                    })
+                })
+                .transpose()?;
+            let elapsed_ms = activity
+                .elapsed_ms
+                .map(|elapsed| {
+                    i64::try_from(elapsed).map_err(|_| {
+                        LoomError::invalid_request("activity duration is out of range")
+                    })
+                })
+                .transpose()?;
+            transaction
+                .execute(
+                    "INSERT INTO run_activities(
+                        run_id, session_id, activity_id, ordinal, parent_activity_id,
+                        step_id, tool_call_id, kind, status, started_at, completed_at,
+                        elapsed_ms, data_hash
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     ON CONFLICT(run_id, activity_id) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        ordinal=excluded.ordinal,
+                        parent_activity_id=excluded.parent_activity_id,
+                        step_id=excluded.step_id,
+                        tool_call_id=excluded.tool_call_id,
+                        kind=excluded.kind,
+                        status=excluded.status,
+                        started_at=excluded.started_at,
+                        completed_at=excluded.completed_at,
+                        elapsed_ms=excluded.elapsed_ms,
+                        data_hash=excluded.data_hash
+                     WHERE run_activities.session_id IS NOT excluded.session_id
+                        OR run_activities.ordinal IS NOT excluded.ordinal
+                        OR run_activities.parent_activity_id IS NOT excluded.parent_activity_id
+                        OR run_activities.step_id IS NOT excluded.step_id
+                        OR run_activities.tool_call_id IS NOT excluded.tool_call_id
+                        OR run_activities.kind IS NOT excluded.kind
+                        OR run_activities.status IS NOT excluded.status
+                        OR run_activities.started_at IS NOT excluded.started_at
+                        OR run_activities.completed_at IS NOT excluded.completed_at
+                        OR run_activities.elapsed_ms IS NOT excluded.elapsed_ms
+                        OR run_activities.data_hash IS NOT excluded.data_hash",
+                    params![
+                        run_id_bytes.as_slice(),
+                        session_id.as_slice(),
+                        activity_id.as_slice(),
+                        ordinal,
+                        parent_activity_id.as_deref(),
+                        step_id.as_deref(),
+                        tool_call_id.as_deref(),
+                        activity_kind_name(activity.kind),
+                        activity_status_name(activity.status),
+                        started_at,
+                        completed_at,
+                        elapsed_ms,
+                        data_hash
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not save run activity: {error}"), true)
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO _loom_wanted_run_activities(run_id, activity_id)
+                     VALUES (?1, ?2)",
+                    params![run_id_bytes.as_slice(), activity_id.as_slice()],
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not stage run activity: {error}"), true)
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_activities
+                 WHERE run_id=?1 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_activities wanted
+                    WHERE wanted.run_id=run_activities.run_id
+                      AND wanted.activity_id=run_activities.activity_id
+                 )",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prune run activities: {error}"), true)
+            })?;
+    }
+    collect_unused_content(transaction)
 }
 
 fn save_filesystem_records(
@@ -5072,6 +5511,27 @@ mod tests {
             },
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
+        let activity_call = loom_model::ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "src/main.rs"}),
+        };
+        let activity = AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id,
+            parent_id: None,
+            step_id: Some(StepId::new()),
+            kind: AgentActivityKind::ToolCall,
+            status: AgentActivityStatus::AwaitingApproval,
+            started_at: Timestamp::from_unix_millis(1500),
+            completed_at: None,
+            elapsed_ms: None,
+            data: AgentActivityData::ToolCall {
+                call: activity_call,
+                result: None,
+            },
+        };
+        let run_activities = BTreeMap::from([(run_id, vec![activity.clone()])]);
         let run_messages = BTreeMap::from([(
             run_id,
             vec![
@@ -5138,6 +5598,7 @@ mod tests {
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
                 run_messages: Some(&run_messages),
+                run_activities: Some(&run_activities),
                 filesystem_records: Some(&filesystem_records),
                 records: &[],
                 feed: None,
@@ -5168,6 +5629,41 @@ mod tests {
             provider_state.health
         );
         assert_eq!(persistence.load_provider_usage().unwrap(), usage);
+        assert_eq!(
+            persistence.load_run_activities(run_id).unwrap(),
+            vec![activity.clone()]
+        );
+        let mut completed_activity = activity.clone();
+        completed_activity.status = AgentActivityStatus::Completed;
+        completed_activity.completed_at = Some(Timestamp::from_unix_millis(1600));
+        completed_activity.elapsed_ms = Some(100);
+        let completed_activities = BTreeMap::from([(run_id, vec![completed_activity])]);
+        let invalid_sections = [("", serde_json::json!({"invalid": true}))];
+        assert!(
+            persistence
+                .save_state(DurableStateWrite {
+                    schema_version: CURRENT_SCHEMA_VERSION,
+                    sessions: &sessions.export_state(),
+                    workspaces: None,
+                    settings: None,
+                    workspace_configs: None,
+                    providers: None,
+                    usage: None,
+                    idempotency: None,
+                    run_summaries: None,
+                    run_messages: None,
+                    run_activities: Some(&completed_activities),
+                    filesystem_records: None,
+                    records: &[],
+                    feed: None,
+                    sections: &invalid_sections,
+                })
+                .is_err()
+        );
+        assert_eq!(
+            persistence.load_run_activities(run_id).unwrap(),
+            vec![activity]
+        );
         let loaded_idempotency = persistence.load_idempotency_records().unwrap();
         assert_eq!(loaded_idempotency.len(), 1);
         let loaded_record = &loaded_idempotency[&request_id];
@@ -5206,6 +5702,7 @@ mod tests {
                     idempotency: Some(&BTreeMap::new()),
                     run_summaries: Some(&BTreeMap::new()),
                     run_messages: None,
+                    run_activities: None,
                     filesystem_records: Some(&[DurableFilesystemRecord {
                         checkpoints: Vec::new(),
                         ..filesystem_records[0].clone()
@@ -5303,15 +5800,27 @@ mod tests {
             run_message_plan.contains("PRIMARY KEY"),
             "{run_message_plan}"
         );
+        let activity_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT activity_id FROM run_activities
+                 WHERE session_id=?1 ORDER BY started_at DESC, activity_id DESC LIMIT 20",
+                [session.id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            activity_plan.contains("run_activities_by_session_time"),
+            "{activity_plan}"
+        );
         let (content_codec, content_count): (i64, i64) = connection
             .query_row(
-                "SELECT MIN(codec), COUNT(*) FROM content_blobs",
+                "SELECT MAX(codec), COUNT(*) FROM content_blobs",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(content_codec, 1);
-        assert_eq!(content_count, 2);
+        assert_eq!(content_count, 3);
         let (filesystem_codec, raw_size, payload_size): (i64, i64, i64) = connection
             .query_row(
                 "SELECT payload_codec, raw_size, length(payload) FROM session_filesystems
@@ -5357,6 +5866,7 @@ mod tests {
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
                 run_messages: None,
+                run_activities: None,
                 filesystem_records: Some(&empty_filesystem_records),
                 records: &[],
                 feed: None,
@@ -5376,8 +5886,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            content_count, 1,
-            "retained run transcript content remains reachable"
+            content_count, 2,
+            "retained transcript and activity content remain reachable"
         );
         drop(connection);
         fs::remove_file(path).unwrap();
@@ -5454,6 +5964,7 @@ mod tests {
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
                 run_messages: Some(&run_messages),
+                run_activities: None,
                 filesystem_records: None,
                 records: &[],
                 feed: None,
@@ -5576,6 +6087,7 @@ mod tests {
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
                 run_messages: Some(&run_messages),
+                run_activities: None,
                 filesystem_records: None,
                 records: &[],
                 feed: None,
@@ -5601,6 +6113,7 @@ mod tests {
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
                 run_messages: Some(&mismatched_messages),
+                run_activities: None,
                 filesystem_records: None,
                 records: &[],
                 feed: None,
@@ -5636,6 +6149,7 @@ mod tests {
                     idempotency: None,
                     run_summaries: Some(&run_summaries),
                     run_messages: Some(&assembled_messages),
+                    run_activities: None,
                     filesystem_records: None,
                     records: &[],
                     feed: None,
@@ -5667,6 +6181,7 @@ mod tests {
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
                 run_messages: Some(&assembled_messages),
+                run_activities: None,
                 filesystem_records: None,
                 records: &[],
                 feed: None,
