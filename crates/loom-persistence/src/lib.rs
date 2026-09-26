@@ -11,7 +11,9 @@ use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ErrorCode,
     EventSequence, LoomError, Result, Timestamp, WorkspaceId, WorkspaceRecord,
 };
+use loom_model::{ProviderHealth, ProviderId};
 use loom_protocol::{ServerEventEnvelope, WorkspaceConfig};
+use loom_providers::ProviderConfig;
 use loom_session::{SessionManagerState, WorkspaceManagerState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -19,8 +21,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
-const DATABASE_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+const DATABASE_SCHEMA_VERSION: u32 = 10;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -66,6 +68,14 @@ CREATE TABLE IF NOT EXISTS workspace_configs (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS workspace_configs_by_revision
     ON workspace_configs(revision DESC, workspace_id);
+CREATE TABLE IF NOT EXISTS provider_configs (
+    provider_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(provider_id)) > 0),
+    config TEXT NOT NULL CHECK(length(config) <= 65536)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS provider_health (
+    provider_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(provider_id)) > 0),
+    health TEXT NOT NULL CHECK(length(health) <= 16384)
+) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS feed_store_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     next_sequence INTEGER NOT NULL CHECK(next_sequence >= 0),
@@ -344,12 +354,19 @@ pub struct DurableSessionSettings {
     pub auto_approve_actions: BTreeMap<AgentSessionId, bool>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct DurableProviderState {
+    pub configs: BTreeMap<ProviderId, ProviderConfig>,
+    pub health: BTreeMap<ProviderId, ProviderHealth>,
+}
+
 pub struct DurableStateWrite<'a> {
     pub schema_version: u32,
     pub sessions: &'a SessionManagerState,
     pub workspaces: Option<&'a WorkspaceManagerState>,
     pub settings: Option<&'a DurableSessionSettings>,
     pub workspace_configs: Option<&'a BTreeMap<WorkspaceId, WorkspaceConfig>>,
+    pub providers: Option<&'a DurableProviderState>,
     pub records: &'a [(String, Value)],
     pub feed: Option<&'a DurableFeedState>,
     pub sections: &'a [(&'a str, Value)],
@@ -797,6 +814,81 @@ impl FilePersistence {
         Ok(configs)
     }
 
+    pub fn load_provider_configs(&self) -> Result<Vec<ProviderConfig>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT provider_id, config FROM provider_configs ORDER BY provider_id")
+            .map_err(|error| {
+                persistence_error(format!("could not prepare provider configs: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read provider configs: {error}"), true)
+            })?;
+        let mut configs = Vec::new();
+        for row in rows {
+            let (provider_id, config) = row.map_err(|error| {
+                persistence_error(format!("could not read provider configs: {error}"), true)
+            })?;
+            let config: ProviderConfig = serde_json::from_str(&config).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted provider configuration is malformed: {error}"),
+                    false,
+                )
+            })?;
+            if config.id.as_str() != provider_id {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "provider configuration id does not match its index",
+                    false,
+                ));
+            }
+            configs.push(config);
+        }
+        Ok(configs)
+    }
+
+    pub fn load_provider_health(&self) -> Result<BTreeMap<ProviderId, ProviderHealth>> {
+        if !self.path.exists() {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT provider_id, health FROM provider_health ORDER BY provider_id")
+            .map_err(|error| {
+                persistence_error(format!("could not prepare provider health: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read provider health: {error}"), true)
+            })?;
+        let mut health = BTreeMap::new();
+        for row in rows {
+            let (provider_id, state) = row.map_err(|error| {
+                persistence_error(format!("could not read provider health: {error}"), true)
+            })?;
+            let state = serde_json::from_str(&state).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted provider health is malformed: {error}"),
+                    false,
+                )
+            })?;
+            health.insert(ProviderId::new(provider_id), state);
+        }
+        Ok(health)
+    }
+
     /// Loads the bounded reconnect feed from sequence-indexed records.
     pub fn load_feed_state(&self) -> Result<Option<DurableFeedState>> {
         if !self.path.exists() {
@@ -981,6 +1073,7 @@ impl FilePersistence {
             workspaces: None,
             settings: None,
             workspace_configs: None,
+            providers: None,
             records,
             feed,
             sections,
@@ -1003,6 +1096,7 @@ impl FilePersistence {
             workspaces: Some(workspaces),
             settings: None,
             workspace_configs: None,
+            providers: None,
             records,
             feed,
             sections,
@@ -1027,6 +1121,10 @@ impl FilePersistence {
         }
         if let Some(workspace_configs) = write.workspace_configs {
             save_workspace_config_rows(&transaction, workspace_configs)?;
+        }
+        if let Some(providers) = write.providers {
+            save_provider_config_rows(&transaction, &providers.configs)?;
+            save_provider_health_rows(&transaction, &providers.health)?;
         }
         if let Some(feed) = write.feed {
             save_feed_rows(&transaction, feed)?;
@@ -1657,6 +1755,107 @@ fn save_workspace_config_rows(
         .map_err(|error| {
             persistence_error(format!("could not prune workspace configs: {error}"), true)
         })?;
+    Ok(())
+}
+
+fn save_provider_config_rows(
+    transaction: &Transaction<'_>,
+    configs: &BTreeMap<ProviderId, ProviderConfig>,
+) -> Result<()> {
+    for (id, config) in configs {
+        if id != &config.id {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "provider config key does not match its id",
+                false,
+            ));
+        }
+    }
+    save_provider_json_rows(
+        transaction,
+        "provider_configs",
+        "config",
+        configs.iter(),
+        65_536,
+    )
+}
+
+fn save_provider_health_rows(
+    transaction: &Transaction<'_>,
+    health: &BTreeMap<ProviderId, ProviderHealth>,
+) -> Result<()> {
+    save_provider_json_rows(
+        transaction,
+        "provider_health",
+        "health",
+        health.iter(),
+        16_384,
+    )
+}
+
+fn save_provider_json_rows<'a, T, I>(
+    transaction: &Transaction<'_>,
+    table: &str,
+    value_column: &str,
+    rows: I,
+    maximum_bytes: usize,
+) -> Result<()>
+where
+    T: Serialize + 'a,
+    I: IntoIterator<Item = (&'a ProviderId, &'a T)>,
+{
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_providers (
+                provider_id TEXT PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_providers;",
+        )
+        .map_err(|error| persistence_error(format!("could not stage {table}: {error}"), true))?;
+    for (id, value) in rows {
+        if id.as_str().trim().is_empty() {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "provider record has an empty id",
+                false,
+            ));
+        }
+        let payload = serde_json::to_string(value).map_err(|error| {
+            persistence_error(format!("could not encode {table} record: {error}"), false)
+        })?;
+        if payload.len() > maximum_bytes {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                format!("{table} record exceeds the maximum supported size"),
+                false,
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_providers(provider_id) VALUES (?1)",
+                [id.as_str()],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not stage {table}: {error}"), true)
+            })?;
+        let upsert = format!(
+            "INSERT INTO {table}(provider_id, {value_column}) VALUES (?1, ?2)
+             ON CONFLICT(provider_id) DO UPDATE SET {value_column}=excluded.{value_column}
+             WHERE {table}.{value_column} IS NOT excluded.{value_column}"
+        );
+        transaction
+            .execute(&upsert, params![id.as_str(), payload])
+            .map_err(|error| persistence_error(format!("could not save {table}: {error}"), true))?;
+    }
+    let prune = format!(
+        "DELETE FROM {table} WHERE NOT EXISTS (
+            SELECT 1 FROM _loom_wanted_providers wanted
+            WHERE wanted.provider_id={table}.provider_id
+        )"
+    );
+    transaction
+        .execute(&prune, [])
+        .map_err(|error| persistence_error(format!("could not prune {table}: {error}"), true))?;
     Ok(())
 }
 
@@ -2359,6 +2558,12 @@ mod tests {
             ..WorkspaceConfig::default()
         };
         let configs = BTreeMap::from([(workspace.id, config.clone())]);
+        let provider_config = ProviderConfig::deterministic();
+        let provider_id = provider_config.id.clone();
+        let provider_state = DurableProviderState {
+            configs: BTreeMap::from([(provider_id.clone(), provider_config.clone())]),
+            health: BTreeMap::from([(provider_id.clone(), ProviderHealth::default())]),
+        };
         persistence
             .save_state(DurableStateWrite {
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -2366,6 +2571,7 @@ mod tests {
                 workspaces: Some(&workspaces.export_state()),
                 settings: Some(&settings),
                 workspace_configs: Some(&configs),
+                providers: Some(&provider_state),
                 records: &[],
                 feed: None,
                 sections: &[],
@@ -2386,6 +2592,14 @@ mod tests {
             settings.auto_approve_actions
         );
         assert_eq!(persistence.load_workspace_configs().unwrap(), configs);
+        assert_eq!(
+            persistence.load_provider_configs().unwrap(),
+            vec![provider_config]
+        );
+        assert_eq!(
+            persistence.load_provider_health().unwrap(),
+            provider_state.health
+        );
 
         assert!(
             persistence
@@ -2395,6 +2609,7 @@ mod tests {
                     workspaces: Some(&workspaces.export_state()),
                     settings: Some(&DurableSessionSettings::default()),
                     workspace_configs: Some(&BTreeMap::new()),
+                    providers: Some(&DurableProviderState::default()),
                     records: &[],
                     feed: None,
                     sections: &[("", serde_json::json!({"invalid": true}))],
@@ -2409,6 +2624,10 @@ mod tests {
             settings.approval_policies
         );
         assert_eq!(persistence.load_workspace_configs().unwrap(), configs);
+        assert_eq!(
+            persistence.load_provider_health().unwrap(),
+            provider_state.health
+        );
 
         let connection = Connection::open(&path).unwrap();
         let plan: String = connection
@@ -2419,6 +2638,14 @@ mod tests {
             )
             .unwrap();
         assert!(plan.contains("PRIMARY KEY"), "{plan}");
+        let config_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT config FROM provider_configs WHERE provider_id=?1",
+                [provider_id.as_str()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(config_plan.contains("PRIMARY KEY"), "{config_plan}");
         drop(connection);
         fs::remove_file(path).unwrap();
     }

@@ -18,8 +18,8 @@ use loom_core::{
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableSessionSettings, DurableStateWrite,
-    FilePersistence,
+    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableProviderState, DurableSessionSettings,
+    DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -1632,8 +1632,8 @@ impl InProcessBackend {
                 .unwrap_or_default(),
             session_policies: session_settings.approval_policies,
             auto_approve_actions: session_settings.auto_approve_actions,
-            provider_configs: from_json(required("provider_configs")?)?,
-            provider_health: from_json(required("provider_health")?)?,
+            provider_configs: persistence.load_provider_configs()?,
+            provider_health: persistence.load_provider_health()?,
             workspace_configs: persistence.load_workspace_configs()?,
             provider_usage: from_json(required("provider_usage")?)?,
             idempotency: from_json(required("idempotency")?)?,
@@ -1864,16 +1864,17 @@ impl InProcessBackend {
             auto_approve_actions: self.auto_approve_actions()?.clone(),
         };
         let workspace_configs = self.workspace_configs()?.clone();
+        let provider_state = DurableProviderState {
+            configs: self
+                .providers
+                .export_configs()?
+                .into_iter()
+                .map(|config| (config.id.clone(), config))
+                .collect(),
+            health: self.providers.export_health()?,
+        };
         let workspace_records = self.workspace_records()?.export_state();
         let sections = [
-            (
-                "provider_configs",
-                json_value(self.providers.export_configs()?)?,
-            ),
-            (
-                "provider_health",
-                json_value(self.providers.export_health()?)?,
-            ),
             ("provider_usage", json_value(self.providers.usage()?)?),
             ("models", json_value(self.models.clone())?),
             ("idempotency", json_value(self.idempotency()?.clone())?),
@@ -1884,6 +1885,7 @@ impl InProcessBackend {
             workspaces: Some(&workspace_records),
             settings: Some(&session_settings),
             workspace_configs: Some(&workspace_configs),
+            providers: Some(&provider_state),
             records: &entity_sections,
             feed: Some(&feed),
             sections: &sections,

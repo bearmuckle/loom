@@ -4294,7 +4294,9 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "loom-core",
+ "loom-model",
  "loom-protocol",
+ "loom-providers",
  "loom-session",
  "rusqlite",
  "serde",
