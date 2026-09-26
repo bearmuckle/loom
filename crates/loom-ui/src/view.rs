@@ -1196,6 +1196,67 @@ enum SessionSourceChoice {
     GitHub,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct SessionListProjection {
+    entries: Vec<(AgentSessionId, String)>,
+    selected_index: Option<usize>,
+}
+
+fn session_list_projection(
+    sessions: &[AgentSessionSnapshot],
+    active_session_id: AgentSessionId,
+) -> SessionListProjection {
+    SessionListProjection {
+        entries: sessions
+            .iter()
+            .map(|session| (session.id, session.name.clone()))
+            .collect(),
+        selected_index: sessions
+            .iter()
+            .position(|session| session.id == active_session_id),
+    }
+}
+
+fn source_dialog_initial_state(
+    purpose: SessionSourceDialogPurpose,
+    local_directory_available: bool,
+) -> SessionSourceChoice {
+    match purpose {
+        SessionSourceDialogPurpose::StartSession => SessionSourceChoice::Empty,
+        SessionSourceDialogPurpose::AddToSession if local_directory_available => {
+            SessionSourceChoice::LocalDirectory
+        }
+        SessionSourceDialogPurpose::AddToSession => SessionSourceChoice::GitHub,
+    }
+}
+
+fn source_choice_is_allowed(
+    purpose: SessionSourceDialogPurpose,
+    local_directory_available: bool,
+    choice: SessionSourceChoice,
+) -> bool {
+    match choice {
+        SessionSourceChoice::Empty => purpose == SessionSourceDialogPurpose::StartSession,
+        SessionSourceChoice::LocalDirectory => local_directory_available,
+        SessionSourceChoice::GitHub => true,
+    }
+}
+
+fn local_source_available(
+    purpose: SessionSourceDialogPurpose,
+    configured: bool,
+    active_node_id: Option<&str>,
+    default_node_id: &str,
+) -> bool {
+    configured
+        && match purpose {
+            SessionSourceDialogPurpose::StartSession => true,
+            SessionSourceDialogPurpose::AddToSession => {
+                active_node_id.is_none_or(|node_id| node_id == default_node_id)
+            }
+        }
+}
+
 enum SessionCreationSource {
     LocalDirectory(String),
     GitHub(GitHubRepository),
@@ -5307,21 +5368,14 @@ impl LoomView {
     }
 
     fn begin_source_dialog(&mut self, purpose: SessionSourceDialogPurpose, cx: &mut Context<Self>) {
-        let local_directory_available = self.local_directory_sources_available
-            && match purpose {
-                SessionSourceDialogPurpose::StartSession => true,
-                SessionSourceDialogPurpose::AddToSession => self
-                    .session_node_ids
-                    .get(&self.active_session.id)
-                    .is_none_or(|node_id| node_id == &self.default_backend_node_id),
-            };
-        let choice = match purpose {
-            SessionSourceDialogPurpose::StartSession => SessionSourceChoice::Empty,
-            SessionSourceDialogPurpose::AddToSession if local_directory_available => {
-                SessionSourceChoice::LocalDirectory
-            }
-            SessionSourceDialogPurpose::AddToSession => SessionSourceChoice::GitHub,
-        };
+        let active_node_id = self.session_node_ids.get(&self.active_session.id);
+        let local_directory_available = local_source_available(
+            purpose,
+            self.local_directory_sources_available,
+            active_node_id.map(String::as_str),
+            &self.default_backend_node_id,
+        );
+        let choice = source_dialog_initial_state(purpose, local_directory_available);
         self.source_dialog = Some(SessionSourceDialog {
             purpose,
             choice,
@@ -5342,18 +5396,10 @@ impl LoomView {
     }
 
     fn choose_source(&mut self, choice: SessionSourceChoice, cx: &mut Context<Self>) {
-        let allowed = choice != SessionSourceChoice::Empty
-            || self
-                .source_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.purpose == SessionSourceDialogPurpose::StartSession);
-        if !allowed
-            || (choice == SessionSourceChoice::LocalDirectory
-                && !self
-                    .source_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.local_directory_available))
-        {
+        let Some(dialog) = self.source_dialog.as_ref() else {
+            return;
+        };
+        if !source_choice_is_allowed(dialog.purpose, dialog.local_directory_available, choice) {
             return;
         }
         if let Some(dialog) = &mut self.source_dialog {
@@ -6072,19 +6118,13 @@ impl LoomView {
     }
 
     pub(crate) fn render_session_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entries = self
-            .sessions
-            .iter()
-            .map(|session| (session.id, session.name.clone()))
-            .collect::<Vec<_>>();
+        let projection = session_list_projection(&self.sessions, self.active_session.id);
+        let entries = projection.entries;
         let tree_items = entries
             .iter()
             .map(|(id, name)| TreeItem::new(id.to_string(), name.clone()))
             .collect::<Vec<_>>();
-        let selected_index = self
-            .sessions
-            .iter()
-            .position(|session| session.id == self.active_session.id);
+        let selected_index = projection.selected_index;
         let tree = if let Some(tree) = self.session_tree.clone() {
             if self.session_tree_entries != entries {
                 tree.update(cx, |state, cx| state.set_items(tree_items, cx));
@@ -9903,13 +9943,17 @@ mod loom_view_render_tests {
     use gpui_kit::{AppContext, TestAppContext, px, size};
     use loom_core::CapabilitySet;
     use loom_core::{ActivityId, ErrorCode, RunId, Timestamp};
-    use loom_model::{ModelId, ToolCall};
+    use loom_model::{
+        ModelCapabilities, ModelDescriptor, ModelId, ProviderHealth, ProviderKind, ProviderSummary,
+        ToolCall,
+    };
     use loom_protocol::ToolResult;
     use loom_protocol::{
         AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
         FileActivityOperation, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
         GitFileStatusKind, GitHubRepository, GitRepositoryStatus, SessionFilesystemChange,
-        WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind,
+        SessionFilesystemFile, SessionRepository, WorkerNodeResources, WorkerNodeStatus,
+        WorkspaceChangeKind,
     };
     use std::collections::BTreeSet;
 
@@ -9990,6 +10034,70 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
+    fn settings_and_provider_dialogs_render_configured_entries(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.settings_open = true;
+            view.browser_startup_error = Some("Workspace setup failed".to_owned());
+            view.worker_nodes.push(WorkerNodeEntry {
+                id: 1,
+                status: WorkerNodeStatus {
+                    node_id: "remote-worker".to_owned(),
+                    name: "Remote worker".to_owned(),
+                    online: false,
+                    capabilities: CapabilitySet::default(),
+                    resources: WorkerNodeResources {
+                        cpu_count: 0,
+                        cpu_usage_percent: None,
+                        memory_usage_percent: None,
+                        memory_total_bytes: None,
+                        memory_available_bytes: None,
+                        disk_total_bytes: None,
+                        disk_available_bytes: None,
+                    },
+                },
+                is_local: false,
+                url: Some("wss://example.test/ws".to_owned()),
+                connection: None,
+                connection_state: WorkerConnectionState::Failed,
+                connection_detail: Some("Connection timed out".to_owned()),
+                severe_load_streak: 0,
+            });
+        });
+
+        render_scenario(cx, |view| {
+            let local_provider_id = loom_model::ProviderId::new("company-gateway");
+            let github_provider_id = loom_model::ProviderId::new("github-copilot");
+            view.providers_open = true;
+            view.github_connected = true;
+            view.providers = vec![
+                ProviderSummary {
+                    id: local_provider_id.clone(),
+                    kind: ProviderKind::OpenAiCompatible,
+                    display_name: "Company gateway".to_owned(),
+                    models: vec![ModelDescriptor {
+                        id: ModelId::new("gateway/model"),
+                        provider: local_provider_id,
+                        display_name: "Gateway model".to_owned(),
+                        context_window: Some(32_000),
+                        capabilities: ModelCapabilities::default(),
+                    }],
+                    credential_id: Some("gateway-key".to_owned()),
+                    health: ProviderHealth::default(),
+                },
+                ProviderSummary {
+                    id: github_provider_id,
+                    kind: ProviderKind::GitHubCopilot,
+                    display_name: "GitHub Copilot".to_owned(),
+                    models: Vec::new(),
+                    credential_id: None,
+                    health: ProviderHealth::default(),
+                },
+            ];
+        });
+    }
+
+    #[gpui_kit::test]
     fn github_login_states_and_phone_session_drawer_render(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         for state in [
@@ -10061,6 +10169,42 @@ mod loom_view_render_tests {
                 error: None,
             });
         });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::StartSession,
+                choice: SessionSourceChoice::GitHub,
+                local_directory_available: true,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: true,
+                error: None,
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::AddToSession,
+                choice: SessionSourceChoice::GitHub,
+                local_directory_available: false,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: false,
+                error: Some("GitHub authentication is required".to_owned()),
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::StartSession,
+                choice: SessionSourceChoice::GitHub,
+                local_directory_available: true,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: false,
+                error: None,
+            });
+        });
     }
 
     #[gpui_kit::test]
@@ -10068,6 +10212,7 @@ mod loom_view_render_tests {
         cx.update(gpui_kit::init);
         render_scenario(cx, |view| {
             view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
             view.review.repositories_loaded = true;
             view.review.changes = vec![SessionFilesystemChange {
                 sequence: loom_core::EventSequence::new(1),
@@ -10130,6 +10275,85 @@ mod loom_view_render_tests {
                 }),
             ];
             view.review.hunk_rows = vec![0];
+        });
+    }
+
+    #[gpui_kit::test]
+    fn review_panel_renders_loading_file_and_binary_diff_states(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = false;
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.review.selected_path = Some("README.md".to_owned());
+            view.review.selected_file = Some(SessionFilesystemFile {
+                session_id: view.active_session.id,
+                path: "README.md".to_owned(),
+                content: "Workspace file contents".to_owned(),
+                revision: "revision-2".to_owned(),
+            });
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.review.selected_path = Some("assets/image.png".to_owned());
+            view.review.selected_diff = Some(GitDiff {
+                path: Some("assets/image.png".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: true,
+                hunks: Vec::new(),
+                truncated: false,
+            });
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.review.selected_path = Some("src/large.rs".to_owned());
+            view.review.selected_diff = Some(GitDiff {
+                path: Some("src/large.rs".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                hunks: Vec::new(),
+                truncated: true,
+            });
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.session_repositories = vec![
+                SessionRepository {
+                    id: loom_core::RepositoryId::new(),
+                    source: "https://github.com/owner/first".to_owned(),
+                    path: "/workspace/first".to_owned(),
+                    revision: None,
+                    attached_at: Timestamp::from_unix_millis(1),
+                },
+                SessionRepository {
+                    id: loom_core::RepositoryId::new(),
+                    source: "https://github.com/owner/second/".to_owned(),
+                    path: "/workspace/second".to_owned(),
+                    revision: None,
+                    attached_at: Timestamp::from_unix_millis(2),
+                },
+            ];
+            view.selected_repository_id = view.session_repositories.first().map(|repo| repo.id);
+            view.review.changes = vec![SessionFilesystemChange {
+                sequence: loom_core::EventSequence::new(2),
+                session_id: view.active_session.id,
+                path: "notes/todo.md".to_owned(),
+                kind: WorkspaceChangeKind::Modified,
+                revision: None,
+            }];
         });
     }
 
@@ -10288,13 +10512,15 @@ mod responsive_layout_tests {
 #[cfg(test)]
 mod worker_node_tests {
     use super::{
-        ACTIVE_BACKEND_NODE_ENTRY_ID, SessionNodeIndicatorState, WorkerConnectionStage,
-        WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold, assigned_node_id,
-        connection_placeholder, format_percentage, format_session_resource_percentages,
-        format_worker_node_resources, initial_worker_nodes, mark_worker_connection_failed,
-        merge_node_sessions, next_severe_load_streak, order_session_nodes,
-        remove_worker_node_entry, safe_worker_url_label, session_id_for_request,
+        ACTIVE_BACKEND_NODE_ENTRY_ID, SessionNodeIndicatorState, SessionSourceChoice,
+        SessionSourceDialogPurpose, WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry,
+        adjusted_cpu_pulse_threshold, assigned_node_id, connection_placeholder, format_percentage,
+        format_session_resource_percentages, format_worker_node_resources, initial_worker_nodes,
+        local_source_available, mark_worker_connection_failed, merge_node_sessions,
+        next_severe_load_streak, order_session_nodes, remove_worker_node_entry,
+        safe_worker_url_label, session_id_for_request, session_list_projection,
         session_node_indicator_state, session_node_pulse, session_owner_status,
+        source_choice_is_allowed, source_dialog_initial_state,
         transition_worker_connection_to_connecting, update_worker_node_status,
         validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
         worker_node_name_for_id, worker_url_embeds_credential,
@@ -10598,6 +10824,94 @@ mod worker_node_tests {
             created_at: Timestamp::from_unix_millis(1),
             updated_at: Timestamp::from_unix_millis(1),
         }
+    }
+
+    #[test]
+    fn session_list_projection_preserves_order_and_selects_active_session() {
+        let first = AgentSessionId::new();
+        let active = AgentSessionId::new();
+        let sessions = vec![session(first, "First"), session(active, "Active")];
+
+        let projection = session_list_projection(&sessions, active);
+
+        assert_eq!(
+            projection.entries,
+            vec![(first, "First".to_owned()), (active, "Active".to_owned())]
+        );
+        assert_eq!(projection.selected_index, Some(1));
+    }
+
+    #[test]
+    fn session_list_projection_has_no_selection_when_active_session_is_missing() {
+        let sessions = vec![session(AgentSessionId::new(), "Only session")];
+
+        let projection = session_list_projection(&sessions, AgentSessionId::new());
+
+        assert_eq!(projection.selected_index, None);
+    }
+
+    #[test]
+    fn source_dialog_initial_choice_tracks_purpose_and_local_availability() {
+        assert_eq!(
+            source_dialog_initial_state(SessionSourceDialogPurpose::StartSession, true),
+            SessionSourceChoice::Empty
+        );
+        assert_eq!(
+            source_dialog_initial_state(SessionSourceDialogPurpose::AddToSession, true),
+            SessionSourceChoice::LocalDirectory
+        );
+        assert_eq!(
+            source_dialog_initial_state(SessionSourceDialogPurpose::AddToSession, false),
+            SessionSourceChoice::GitHub
+        );
+    }
+
+    #[test]
+    fn local_source_availability_respects_backend_and_session_ownership() {
+        use SessionSourceDialogPurpose::{AddToSession, StartSession};
+
+        assert!(local_source_available(
+            StartSession,
+            true,
+            Some("remote"),
+            "local"
+        ));
+        assert!(!local_source_available(StartSession, false, None, "local"));
+        assert!(local_source_available(AddToSession, true, None, "local"));
+        assert!(local_source_available(
+            AddToSession,
+            true,
+            Some("local"),
+            "local"
+        ));
+        assert!(!local_source_available(
+            AddToSession,
+            true,
+            Some("remote"),
+            "local"
+        ));
+        assert!(!local_source_available(
+            AddToSession,
+            false,
+            Some("local"),
+            "local"
+        ));
+    }
+
+    #[test]
+    fn source_choice_validation_rejects_empty_additions_and_unavailable_local_sources() {
+        use SessionSourceChoice::{Empty, GitHub, LocalDirectory};
+        use SessionSourceDialogPurpose::{AddToSession, StartSession};
+
+        assert!(source_choice_is_allowed(StartSession, false, Empty));
+        assert!(!source_choice_is_allowed(AddToSession, true, Empty));
+        assert!(source_choice_is_allowed(AddToSession, true, LocalDirectory));
+        assert!(!source_choice_is_allowed(
+            AddToSession,
+            false,
+            LocalDirectory
+        ));
+        assert!(source_choice_is_allowed(AddToSession, false, GitHub));
     }
 
     #[test]
