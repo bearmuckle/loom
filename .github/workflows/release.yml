@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install native UI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libdbus-1-dev \
+            libxcb1-dev \
+            libfontconfig1-dev \
+            pkg-config \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - name: Build native UI client
+        run: cargo build --release --locked --package loom-ui --target ${{ matrix.target }}
+      - name: Package release archive
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            7z a "dist/loom-ui-${GITHUB_REF_NAME}-${{ matrix.name }}.zip" \
+              "target/${{ matrix.target }}/release/loom-ui.exe" LICENSE-AGPL LICENSES.md
+          else
+            tar -czf "dist/loom-ui-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" \
+              -C "target/${{ matrix.target }}/release" loom-ui \
+              -C "$GITHUB_WORKSPACE" LICENSE-AGPL LICENSES.md
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Create release with generated changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: gh release create "$TAG_NAME" release-assets/* --title "$TAG_NAME" --generate-notes
