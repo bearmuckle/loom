@@ -25,8 +25,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 15;
-const DATABASE_SCHEMA_VERSION: u32 = 15;
+pub const CURRENT_SCHEMA_VERSION: u32 = 16;
+const DATABASE_SCHEMA_VERSION: u32 = 16;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -65,12 +65,31 @@ CREATE TABLE IF NOT EXISTS run_summaries (
     updated_at INTEGER NOT NULL CHECK(updated_at >= started_at),
     completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
     snapshot TEXT NOT NULL CHECK(length(snapshot) <= 1048576),
-    usage TEXT NOT NULL CHECK(length(usage) <= 16384)
+    usage TEXT NOT NULL CHECK(length(usage) <= 16384),
+    UNIQUE(run_id, session_id)
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS runs_by_session_activity
     ON run_summaries(session_id, updated_at DESC, run_id DESC);
 CREATE INDEX IF NOT EXISTS runs_by_state_activity
     ON run_summaries(state, updated_at DESC, run_id DESC);
+CREATE TABLE IF NOT EXISTS run_messages (
+    run_id BLOB NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE
+        CHECK(length(run_id) = 16),
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    role TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant', 'tool')),
+    content_hash BLOB REFERENCES content_blobs(hash) ON DELETE RESTRICT
+        CHECK(content_hash IS NULL OR length(content_hash) = 32),
+    name TEXT,
+    tool_call_id BLOB CHECK(tool_call_id IS NULL OR length(tool_call_id) = 16),
+    tool_calls TEXT NOT NULL CHECK(length(tool_calls) <= 1048576),
+    PRIMARY KEY(run_id, ordinal),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_messages_by_session
+    ON run_messages(session_id, run_id, ordinal);
 CREATE TABLE IF NOT EXISTS session_filesystems (
     session_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
         CHECK(length(session_id) = 16),
@@ -450,6 +469,15 @@ pub struct DurableRunSummary {
     pub usage: UsageSnapshot,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRunMessage {
+    pub role: loom_model::MessageRole,
+    pub content: String,
+    pub name: Option<String>,
+    pub tool_call_id: Option<loom_core::ToolCallId>,
+    pub tool_calls: Vec<loom_model::ToolCall>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DurableFilesystemRecord {
     pub session_id: AgentSessionId,
@@ -469,6 +497,7 @@ pub struct DurableStateWrite<'a> {
     pub usage: Option<&'a UsageLedger>,
     pub idempotency: Option<&'a BTreeMap<RequestId, DurableIdempotencyRecord>>,
     pub run_summaries: Option<&'a BTreeMap<RunId, DurableRunSummary>>,
+    pub run_messages: Option<&'a BTreeMap<RunId, Vec<DurableRunMessage>>>,
     pub filesystem_records: Option<&'a [DurableFilesystemRecord]>,
     pub records: &'a [(String, Value)],
     pub feed: Option<&'a DurableFeedState>,
@@ -1196,6 +1225,73 @@ impl FilePersistence {
         Ok(summaries)
     }
 
+    /// Loads a run's ordered transcript independently of its execution record.
+    pub fn load_run_messages(&self, run_id: RunId) -> Result<Vec<DurableRunMessage>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT role, content_hash, name, tool_call_id, tool_calls
+                      FROM run_messages WHERE run_id=?1 ORDER BY ordinal",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare run messages: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read run messages: {error}"), true)
+            })?;
+        rows.map(|row| {
+            let (role, content_hash, name, tool_call_id, tool_calls) = row.map_err(|error| {
+                persistence_error(format!("could not read run message: {error}"), true)
+            })?;
+            let role = parse_message_role(&role)?;
+            let content = content_hash
+                .map(|hash| decode_content(&connection, &hash))
+                .transpose()?
+                .unwrap_or_default();
+            let tool_calls = serde_json::from_str(&tool_calls).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted tool calls are malformed: {error}"),
+                    false,
+                )
+            })?;
+            let tool_call_id = tool_call_id
+                .map(|id| {
+                    Uuid::from_slice(&id)
+                        .map(loom_core::ToolCallId::from_uuid)
+                        .map_err(|error| {
+                            LoomError::new(
+                                ErrorCode::MalformedPayload,
+                                format!("persisted tool call id is malformed: {error}"),
+                                false,
+                            )
+                        })
+                })
+                .transpose()?;
+            Ok(DurableRunMessage {
+                role,
+                content,
+                name,
+                tool_call_id,
+                tool_calls,
+            })
+        })
+        .collect()
+    }
+
     pub fn list_filesystem_sessions(&self) -> Result<Vec<AgentSessionId>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -1609,6 +1705,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            run_messages: None,
             filesystem_records: None,
             records,
             feed,
@@ -1636,6 +1733,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            run_messages: None,
             filesystem_records: None,
             records,
             feed,
@@ -1674,6 +1772,9 @@ impl FilePersistence {
         }
         if let Some(run_summaries) = write.run_summaries {
             save_run_summary_rows(&transaction, run_summaries)?;
+        }
+        if let Some(run_messages) = write.run_messages {
+            save_run_message_rows(&transaction, run_messages)?;
         }
         if let Some(filesystems) = write.filesystem_records {
             save_filesystem_records(&transaction, filesystems)?;
@@ -2001,6 +2102,9 @@ fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
              ) AND NOT EXISTS (
                 SELECT 1 FROM checkpoint_files
                 WHERE checkpoint_files.content_hash=content_blobs.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_messages
+                WHERE run_messages.content_hash=content_blobs.hash
              )",
             [],
         )
@@ -2011,6 +2115,143 @@ fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
             )
         })?;
     Ok(())
+}
+
+fn message_role_name(role: loom_model::MessageRole) -> &'static str {
+    match role {
+        loom_model::MessageRole::System => "system",
+        loom_model::MessageRole::User => "user",
+        loom_model::MessageRole::Assistant => "assistant",
+        loom_model::MessageRole::Tool => "tool",
+    }
+}
+
+fn parse_message_role(role: &str) -> Result<loom_model::MessageRole> {
+    match role {
+        "system" => Ok(loom_model::MessageRole::System),
+        "user" => Ok(loom_model::MessageRole::User),
+        "assistant" => Ok(loom_model::MessageRole::Assistant),
+        "tool" => Ok(loom_model::MessageRole::Tool),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted message has an unknown role",
+            false,
+        )),
+    }
+}
+
+fn save_run_message_rows(
+    transaction: &Transaction<'_>,
+    messages_by_run: &BTreeMap<RunId, Vec<DurableRunMessage>>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_messages (
+            run_id BLOB NOT NULL, ordinal INTEGER NOT NULL,
+            PRIMARY KEY(run_id, ordinal)
+         ) WITHOUT ROWID, STRICT;
+         DELETE FROM _loom_wanted_run_messages;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run messages: {error}"), true)
+        })?;
+    for (run_id, messages) in messages_by_run {
+        let session_id: Vec<u8> = transaction
+            .query_row(
+                "SELECT session_id FROM run_summaries WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("run {run_id} has no durable summary for its transcript: {error}"),
+                    true,
+                )
+            })?;
+        for (ordinal, message) in messages.iter().enumerate() {
+            let tool_calls = serde_json::to_string(&message.tool_calls).map_err(|error| {
+                persistence_error(
+                    format!("could not encode run message tool calls: {error}"),
+                    false,
+                )
+            })?;
+            if tool_calls.len() > 1024 * 1024 {
+                return Err(LoomError::new(
+                    ErrorCode::Persistence,
+                    "run message tool calls exceed the maximum supported size",
+                    false,
+                ));
+            }
+            let content_hash = if message.content.is_empty() {
+                None
+            } else {
+                Some(store_content(transaction, message.content.as_bytes())?)
+            };
+            let run_id_bytes = run_id.as_uuid().as_bytes();
+            let ordinal = i64::try_from(ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "run transcript has too many messages",
+                    false,
+                )
+            })?;
+            transaction
+                .execute(
+                    "INSERT INTO _loom_wanted_run_messages(run_id, ordinal) VALUES (?1, ?2)",
+                    params![run_id_bytes.as_slice(), ordinal],
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not stage run message: {error}"), true)
+                })?;
+            let tool_call_id = message
+                .tool_call_id
+                .map(|id| id.as_uuid().as_bytes().to_vec());
+            transaction
+                .execute(
+                    "INSERT INTO run_messages(run_id, session_id, ordinal, role, content_hash,
+                    name, tool_call_id, tool_calls)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(run_id, ordinal) DO UPDATE SET
+                    session_id=excluded.session_id, role=excluded.role,
+                    content_hash=excluded.content_hash, name=excluded.name,
+                    tool_call_id=excluded.tool_call_id, tool_calls=excluded.tool_calls
+                 WHERE run_messages.session_id IS NOT excluded.session_id
+                    OR run_messages.role IS NOT excluded.role
+                    OR run_messages.content_hash IS NOT excluded.content_hash
+                    OR run_messages.name IS NOT excluded.name
+                    OR run_messages.tool_call_id IS NOT excluded.tool_call_id
+                    OR run_messages.tool_calls IS NOT excluded.tool_calls",
+                    params![
+                        run_id_bytes.as_slice(),
+                        session_id,
+                        ordinal,
+                        message_role_name(message.role),
+                        content_hash,
+                        message.name,
+                        tool_call_id,
+                        tool_calls
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not save run message: {error}"), true)
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_messages WHERE run_id=?1 AND NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_run_messages wanted
+                WHERE wanted.run_id=run_messages.run_id AND wanted.ordinal=run_messages.ordinal
+             )",
+                [run_id.as_uuid().as_bytes().as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune run messages for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    collect_unused_content(transaction)
 }
 
 fn save_session_rows(transaction: &Transaction<'_>, state: &SessionManagerState) -> Result<()> {
@@ -3808,6 +4049,29 @@ mod tests {
             },
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
+        let run_messages = BTreeMap::from([(
+            run_id,
+            vec![
+                DurableRunMessage {
+                    role: loom_model::MessageRole::User,
+                    content: "large transcript content ".repeat(500),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                DurableRunMessage {
+                    role: loom_model::MessageRole::Assistant,
+                    content: String::new(),
+                    name: Some("assistant".to_owned()),
+                    tool_call_id: None,
+                    tool_calls: vec![loom_model::ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: "inspect".to_owned(),
+                        arguments: serde_json::json!({"path": "src/main.rs"}),
+                    }],
+                },
+            ],
+        )]);
         let checkpoint_id = CheckpointId::new();
         let checkpoint = Checkpoint {
             id: checkpoint_id,
@@ -3850,6 +4114,7 @@ mod tests {
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
+                run_messages: Some(&run_messages),
                 filesystem_records: Some(&filesystem_records),
                 records: &[],
                 feed: None,
@@ -3891,6 +4156,10 @@ mod tests {
         assert_eq!(loaded_record.response, serde_json::json!({"sessions": []}));
         assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
         assert_eq!(
+            persistence.load_run_messages(run_id).unwrap(),
+            run_messages[&run_id]
+        );
+        assert_eq!(
             persistence.list_filesystem_sessions().unwrap(),
             vec![session.id]
         );
@@ -3913,6 +4182,7 @@ mod tests {
                     usage: Some(&UsageLedger::default()),
                     idempotency: Some(&BTreeMap::new()),
                     run_summaries: Some(&BTreeMap::new()),
+                    run_messages: None,
                     filesystem_records: Some(&[DurableFilesystemRecord {
                         checkpoints: Vec::new(),
                         ..filesystem_records[0].clone()
@@ -3998,6 +4268,18 @@ mod tests {
             checkpoint_file_plan.contains("PRIMARY KEY"),
             "{checkpoint_file_plan}"
         );
+        let run_message_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT role, content_hash FROM run_messages
+                 WHERE run_id=?1 ORDER BY ordinal",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            run_message_plan.contains("PRIMARY KEY"),
+            "{run_message_plan}"
+        );
         let (content_codec, content_count): (i64, i64) = connection
             .query_row(
                 "SELECT MIN(codec), COUNT(*) FROM content_blobs",
@@ -4006,7 +4288,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(content_codec, 1);
-        assert_eq!(content_count, 1);
+        assert_eq!(content_count, 2);
         let (filesystem_codec, raw_size, payload_size): (i64, i64, i64) = connection
             .query_row(
                 "SELECT payload_codec, raw_size, length(payload) FROM session_filesystems
@@ -4051,6 +4333,7 @@ mod tests {
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
+                run_messages: None,
                 filesystem_records: Some(&empty_filesystem_records),
                 records: &[],
                 feed: None,
@@ -4069,7 +4352,10 @@ mod tests {
         let content_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(content_count, 0);
+        assert_eq!(
+            content_count, 1,
+            "retained run transcript content remains reachable"
+        );
         drop(connection);
         fs::remove_file(path).unwrap();
     }

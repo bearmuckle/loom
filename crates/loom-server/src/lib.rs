@@ -16,11 +16,11 @@ use loom_core::{
     CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId, Result,
     SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
-use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
+use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
     CURRENT_SCHEMA_VERSION, DurableFeedState, DurableFilesystemRecord, DurableIdempotencyRecord,
-    DurableProviderState, DurableRunSummary, DurableSessionSettings, DurableStateWrite,
-    FilePersistence,
+    DurableProviderState, DurableRunMessage, DurableRunSummary, DurableSessionSettings,
+    DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -624,6 +624,32 @@ struct PersistedRunSummary {
     snapshot: AgentRunSnapshot,
     usage: UsageSnapshot,
     section: String,
+}
+
+fn durable_run_messages_from_runtime(messages: &[ModelMessage]) -> Vec<DurableRunMessage> {
+    messages
+        .iter()
+        .map(|message| DurableRunMessage {
+            role: message.role,
+            content: message.content.clone(),
+            name: message.name.clone(),
+            tool_call_id: message.tool_call_id,
+            tool_calls: message.tool_calls.clone(),
+        })
+        .collect()
+}
+
+fn persisted_run_messages(messages: Vec<DurableRunMessage>) -> Vec<ModelMessage> {
+    messages
+        .into_iter()
+        .map(|message| ModelMessage {
+            role: message.role,
+            content: message.content,
+            name: message.name,
+            tool_call_id: message.tool_call_id,
+            tool_calls: message.tool_calls,
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1750,7 +1776,7 @@ impl InProcessBackend {
             if !active_run {
                 continue;
             }
-            let runtime_state = persistence
+            let mut runtime_state = persistence
                 .load_section::<AgentRuntimeState>(&section, CURRENT_SCHEMA_VERSION)?
                 .ok_or_else(|| {
                     LoomError::new(
@@ -1759,6 +1785,7 @@ impl InProcessBackend {
                         false,
                     )
                 })?;
+            runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
             if runtime_state.run.id != run_id {
                 return Err(LoomError::new(
                     ErrorCode::MalformedPayload,
@@ -1846,9 +1873,15 @@ impl InProcessBackend {
                 },
             );
         }
+        let mut durable_run_messages = BTreeMap::new();
         let entity_sections = runs
             .into_iter()
-            .map(|(run_id, state)| Ok((format!("run:{run_id}"), json_value(state)?)))
+            .map(|(run_id, mut state)| {
+                durable_run_messages
+                    .insert(run_id, durable_run_messages_from_runtime(&state.messages));
+                state.messages.clear();
+                Ok((format!("run:{run_id}"), json_value(state)?))
+            })
             .collect::<Result<Vec<_>>>()?;
         let loaded_repositories = self.session_repositories()?;
         let mut filesystem_records = Vec::new();
@@ -1926,6 +1959,7 @@ impl InProcessBackend {
             usage: Some(&provider_usage),
             idempotency: Some(&idempotency),
             run_summaries: Some(&durable_run_summaries),
+            run_messages: Some(&durable_run_messages),
             filesystem_records: Some(&filesystem_records),
             records: &entity_sections,
             feed: Some(&feed),
@@ -2266,10 +2300,12 @@ impl InProcessConnection {
     }
 
     fn load_persisted_run_state(&self, summary: &PersistedRunSummary) -> Result<AgentRuntimeState> {
-        self.backend
+        let persistence = self
+            .backend
             .persistence
             .as_ref()
-            .ok_or_else(|| LoomError::not_found("agent run", summary.snapshot.id))?
+            .ok_or_else(|| LoomError::not_found("agent run", summary.snapshot.id))?;
+        let mut state = persistence
             .load_section::<AgentRuntimeState>(&summary.section, CURRENT_SCHEMA_VERSION)?
             .ok_or_else(|| {
                 LoomError::new(
@@ -2277,7 +2313,10 @@ impl InProcessConnection {
                     format!("persisted run {} is missing", summary.snapshot.id),
                     true,
                 )
-            })
+            })?;
+        state.messages =
+            persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
+        Ok(state)
     }
 
     fn session_snapshot_projection(

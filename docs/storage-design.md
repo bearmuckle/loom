@@ -1,15 +1,19 @@
 # Proposed durable state model
 
 Status: target design, 2026-09-26. The implementation is in progress: session,
-workspace, and run summaries, bounded session/workspace settings, reconnect
-events, provider usage totals, and filesystem records use indexed rows. Runtime
-details and filesystem snapshots are loaded on demand. Checkpoint headers and
+workspace, and run summaries, ordered run messages, bounded session/workspace
+settings, reconnect events, provider usage totals, and filesystem records use
+indexed rows. Runtime details and filesystem snapshots are loaded on demand.
+Message role, run/session ownership, order, tool-call metadata, and content
+references are stored separately from runtime execution state; nonempty message
+bodies share the compressed, content-addressed blob store. Checkpoint headers and
 file entries use keyed rows; checkpoint file text shares the compressed,
 content-addressed blob store. Remaining filesystem edit/change and repository
 metadata use a compressed, hash-checked per-session payload. Large strings in
 the generic section store are deduplicated and compressed. Provider configuration
 and health use provider-keyed records. Idempotency uses a dedicated table, while
-detailed run payloads remain aggregate state. Provider request-level detail is
+detailed execution state, activities, tool attempts, and per-run message paging
+remain unfinished. Provider request-level detail is
 aggregated by provider/model because no request-level usage history is exposed
 by the current protocol. This
 design replaces the version-2 `sections` container. The release does not import
@@ -411,8 +415,11 @@ Implement in this order:
 
 1. Establish the typed schema/store, ownership guard, and summary queries. Add
    phase timings and row/byte counters.
-2. Migrate messages, tools, activities, and immutable content; add paging and
-   canonical context loading. Make startup and history independent of filesystems.
+2. Finish message-fragment and immutable-content streaming, then migrate tools
+   and activities; add paging and canonical context loading. Make startup and
+   history independent of filesystems. Run messages now have indexed rows, but
+   their durable API currently reads a whole run transcript and does not yet
+   store append-only fragments or expose bounded range queries.
 3. Move execution, approvals, idempotency, and publication to transactional domain
    commands. Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.
