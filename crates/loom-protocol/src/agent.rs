@@ -69,6 +69,41 @@ pub struct AgentExecutionStateRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentToolCallRecord {
+    pub run_id: RunId,
+    pub session_id: AgentSessionId,
+    pub call: ToolCall,
+    pub created_at: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentToolAttemptState {
+    Queued,
+    Running,
+    AwaitingApproval,
+    AwaitingInput,
+    Completed,
+    Failed,
+    Cancelled,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentToolAttemptRecord {
+    pub run_id: RunId,
+    pub session_id: AgentSessionId,
+    /// An activity ID gives each execution of the logical call a stable identity.
+    pub id: loom_core::ActivityId,
+    pub call_id: ToolCallId,
+    pub attempt_number: u32,
+    pub state: AgentToolAttemptState,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
+    pub result: Option<ToolResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentPlan {
     pub steps: Vec<AgentPlanStep>,
 }

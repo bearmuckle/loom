@@ -17,8 +17,8 @@ use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentRunAttemptRecord, AgentRunSnapshot, AgentRunState,
-    ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope, WorkspaceConfig,
-    WorkspaceControl,
+    AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord, ApprovalDecision,
+    Checkpoint, CheckpointFile, ServerEventEnvelope, ToolResult, WorkspaceConfig, WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -28,11 +28,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 23;
-const DATABASE_SCHEMA_VERSION: u32 = 23;
+pub const CURRENT_SCHEMA_VERSION: u32 = 24;
+const DATABASE_SCHEMA_VERSION: u32 = 24;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGE_FRAGMENT_BYTES: usize = 32 * 1024;
 const MAX_CONTENT_RANGE_BYTES: usize =
     loom_protocol::MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES as usize;
@@ -207,6 +208,43 @@ CREATE INDEX IF NOT EXISTS run_activities_by_session_time
     ON run_activities(session_id, started_at DESC, activity_id DESC);
 CREATE INDEX IF NOT EXISTS run_activities_by_tool_call
     ON run_activities(run_id, tool_call_id, ordinal) WHERE tool_call_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS run_tool_calls (
+    run_id BLOB NOT NULL,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    tool_call_id BLOB NOT NULL CHECK(length(tool_call_id) = 16),
+    name TEXT NOT NULL CHECK(length(name) <= 4096),
+    arguments_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE RESTRICT
+        CHECK(length(arguments_hash) = 32),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(run_id, tool_call_id),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS run_tool_attempts (
+    run_id BLOB NOT NULL,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    activity_id BLOB NOT NULL CHECK(length(activity_id) = 16),
+    tool_call_id BLOB NOT NULL CHECK(length(tool_call_id) = 16),
+    attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
+    state TEXT NOT NULL CHECK(state IN (
+        'queued', 'running', 'awaiting_approval', 'awaiting_input',
+        'completed', 'failed', 'cancelled', 'outcome_unknown'
+    )),
+    started_at INTEGER NOT NULL CHECK(started_at >= 0),
+    completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
+    result_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
+        CHECK(result_hash IS NULL OR length(result_hash) = 32),
+    PRIMARY KEY(run_id, activity_id),
+    UNIQUE(run_id, tool_call_id, attempt_number),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY(run_id, tool_call_id)
+        REFERENCES run_tool_calls(run_id, tool_call_id) ON DELETE CASCADE,
+    FOREIGN KEY(run_id, activity_id)
+        REFERENCES run_activities(run_id, activity_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_tool_attempts_by_call
+    ON run_tool_attempts(run_id, tool_call_id, attempt_number);
 CREATE TABLE IF NOT EXISTS run_message_fragments (
     run_id BLOB NOT NULL,
     message_ordinal INTEGER NOT NULL CHECK(message_ordinal >= 0),
@@ -1942,6 +1980,16 @@ impl FilePersistence {
             })?;
         drop(statement);
 
+        let calls = self
+            .load_run_tool_calls(run_id)?
+            .into_iter()
+            .map(|record| (record.call.id, record.call))
+            .collect::<BTreeMap<_, _>>();
+        let attempts = self
+            .load_run_tool_attempts(run_id)?
+            .into_iter()
+            .map(|record| (record.id, record.result))
+            .collect::<BTreeMap<_, _>>();
         let mut activities = Vec::with_capacity(rows.len());
         for (
             expected_ordinal,
@@ -1999,8 +2047,10 @@ impl FilePersistence {
                     false,
                 ));
             }
+            let activity_id = ActivityId::from_uuid(decode_uuid(&activity_id, "activity id")?);
+            let data = restore_activity_tool_data(data, activity_id, &calls, &attempts)?;
             activities.push(AgentActivityRecord {
-                id: ActivityId::from_uuid(decode_uuid(&activity_id, "activity id")?),
+                id: activity_id,
                 run_id,
                 parent_id: decode_optional_activity_id(parent_activity_id)?,
                 step_id: decode_optional_step_id(step_id)?,
@@ -2023,6 +2073,170 @@ impl FilePersistence {
             });
         }
         Ok(activities)
+    }
+
+    /// Loads logical tool calls without requiring transcript or activity data.
+    pub fn load_run_tool_calls(&self, run_id: RunId) -> Result<Vec<AgentToolCallRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, tool_call_id, name, arguments_hash, created_at
+                 FROM run_tool_calls WHERE run_id=?1 ORDER BY created_at, tool_call_id",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare run tool calls: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not query run tool calls: {error}"), true)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                persistence_error(format!("could not read run tool call row: {error}"), true)
+            })?;
+        drop(statement);
+        rows.into_iter()
+            .map(
+                |(session_id, tool_call_id, name, arguments_hash, created_at)| {
+                    let arguments = decode_content(&connection, &arguments_hash)?;
+                    let arguments = serde_json::from_str(&arguments).map_err(|error| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            format!("persisted tool-call arguments are malformed: {error}"),
+                            false,
+                        )
+                    })?;
+                    Ok(AgentToolCallRecord {
+                        run_id,
+                        session_id: AgentSessionId::from_uuid(decode_uuid(
+                            &session_id,
+                            "tool-call session id",
+                        )?),
+                        call: loom_model::ToolCall {
+                            id: loom_core::ToolCallId::from_uuid(decode_uuid(
+                                &tool_call_id,
+                                "tool-call id",
+                            )?),
+                            name,
+                            arguments,
+                        },
+                        created_at: decode_timestamp(created_at)?,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    /// Loads typed tool execution attempts independently of activity payloads.
+    pub fn load_run_tool_attempts(&self, run_id: RunId) -> Result<Vec<AgentToolAttemptRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, activity_id, tool_call_id, attempt_number, state,
+                        started_at, completed_at, result_hash
+                 FROM run_tool_attempts WHERE run_id=?1
+                 ORDER BY started_at, attempt_number",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare run tool attempts: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<Vec<u8>>>(7)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not query run tool attempts: {error}"), true)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read run tool attempt row: {error}"),
+                    true,
+                )
+            })?;
+        drop(statement);
+        rows.into_iter()
+            .map(
+                |(
+                    session_id,
+                    activity_id,
+                    tool_call_id,
+                    attempt_number,
+                    state,
+                    started_at,
+                    completed_at,
+                    result_hash,
+                )| {
+                    let result = result_hash
+                        .as_deref()
+                        .map(|hash| decode_content(&connection, hash))
+                        .transpose()?
+                        .map(|json| {
+                            serde_json::from_str::<ToolResult>(&json).map_err(|error| {
+                                LoomError::new(
+                                    ErrorCode::MalformedPayload,
+                                    format!("persisted tool result is malformed: {error}"),
+                                    false,
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    Ok(AgentToolAttemptRecord {
+                        run_id,
+                        session_id: AgentSessionId::from_uuid(decode_uuid(
+                            &session_id,
+                            "tool-attempt session id",
+                        )?),
+                        id: ActivityId::from_uuid(decode_uuid(
+                            &activity_id,
+                            "tool-attempt activity id",
+                        )?),
+                        call_id: loom_core::ToolCallId::from_uuid(decode_uuid(
+                            &tool_call_id,
+                            "tool-attempt tool-call id",
+                        )?),
+                        attempt_number: u32::try_from(attempt_number).map_err(|_| {
+                            LoomError::new(
+                                ErrorCode::MalformedPayload,
+                                "persisted tool-attempt number is out of range",
+                                false,
+                            )
+                        })?,
+                        state: parse_tool_attempt_state(&state)?,
+                        started_at: decode_timestamp(started_at)?,
+                        completed_at: completed_at.map(decode_timestamp).transpose()?,
+                        result,
+                    })
+                },
+            )
+            .collect()
     }
 
     /// Loads the newest bounded page of message headers. Use the returned
@@ -2957,6 +3171,7 @@ impl FilePersistence {
         }
         if let Some(run_activities) = write.run_activities {
             save_run_activity_rows(&transaction, run_activities)?;
+            save_run_tool_rows(&transaction, run_activities, write.run_summaries)?;
         }
         if let Some(run_messages) = write.run_messages {
             save_run_message_rows(&transaction, run_messages)?;
@@ -3342,6 +3557,12 @@ fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
              ) AND NOT EXISTS (
                 SELECT 1 FROM run_activities
                 WHERE run_activities.data_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_tool_calls
+                WHERE run_tool_calls.arguments_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_tool_attempts
+                WHERE run_tool_attempts.result_hash=content_objects.hash
              )",
             [],
         )
@@ -3424,6 +3645,37 @@ fn activity_status_name(status: AgentActivityStatus) -> &'static str {
         AgentActivityStatus::AwaitingApproval => "awaiting_approval",
         AgentActivityStatus::AwaitingInput => "awaiting_input",
         AgentActivityStatus::Cancelled => "cancelled",
+    }
+}
+
+fn tool_attempt_state_name(state: AgentToolAttemptState) -> &'static str {
+    match state {
+        AgentToolAttemptState::Queued => "queued",
+        AgentToolAttemptState::Running => "running",
+        AgentToolAttemptState::AwaitingApproval => "awaiting_approval",
+        AgentToolAttemptState::AwaitingInput => "awaiting_input",
+        AgentToolAttemptState::Completed => "completed",
+        AgentToolAttemptState::Failed => "failed",
+        AgentToolAttemptState::Cancelled => "cancelled",
+        AgentToolAttemptState::OutcomeUnknown => "outcome_unknown",
+    }
+}
+
+fn parse_tool_attempt_state(state: &str) -> Result<AgentToolAttemptState> {
+    match state {
+        "queued" => Ok(AgentToolAttemptState::Queued),
+        "running" => Ok(AgentToolAttemptState::Running),
+        "awaiting_approval" => Ok(AgentToolAttemptState::AwaitingApproval),
+        "awaiting_input" => Ok(AgentToolAttemptState::AwaitingInput),
+        "completed" => Ok(AgentToolAttemptState::Completed),
+        "failed" => Ok(AgentToolAttemptState::Failed),
+        "cancelled" => Ok(AgentToolAttemptState::Cancelled),
+        "outcome_unknown" => Ok(AgentToolAttemptState::OutcomeUnknown),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted tool-attempt state '{state}' is invalid"),
+            false,
+        )),
     }
 }
 
@@ -5154,7 +5406,8 @@ fn save_run_activity_rows(
                 ));
             }
 
-            let data = serde_json::to_vec(&activity.data).map_err(|error| {
+            let normalized_data = normalize_activity_tool_data(&activity.data);
+            let data = serde_json::to_vec(&normalized_data).map_err(|error| {
                 LoomError::new(
                     ErrorCode::Internal,
                     format!("could not encode run activity data: {error}"),
@@ -5257,6 +5510,389 @@ fn save_run_activity_rows(
             )
             .map_err(|error| {
                 persistence_error(format!("could not prune run activities: {error}"), true)
+            })?;
+    }
+    collect_unused_content(transaction)
+}
+
+fn activity_tool_data(
+    data: &AgentActivityData,
+) -> Option<(&loom_model::ToolCall, Option<&ToolResult>)> {
+    match data {
+        AgentActivityData::ModelTurn { .. } => None,
+        AgentActivityData::ToolCall { call, result }
+        | AgentActivityData::File { call, result, .. }
+        | AgentActivityData::Search { call, result, .. }
+        | AgentActivityData::Command { call, result, .. } => Some((call, result.as_ref())),
+    }
+}
+
+fn normalize_activity_tool_data(data: &AgentActivityData) -> AgentActivityData {
+    let normalize_call = |call: &loom_model::ToolCall| loom_model::ToolCall {
+        id: call.id,
+        name: call.name.clone(),
+        arguments: Value::Null,
+    };
+    match data {
+        AgentActivityData::ModelTurn { model } => AgentActivityData::ModelTurn {
+            model: model.clone(),
+        },
+        AgentActivityData::ToolCall { call, .. } => AgentActivityData::ToolCall {
+            call: normalize_call(call),
+            result: None,
+        },
+        AgentActivityData::File {
+            call,
+            operation,
+            path,
+            ..
+        } => AgentActivityData::File {
+            call: normalize_call(call),
+            operation: *operation,
+            path: path.clone(),
+            result: None,
+        },
+        AgentActivityData::Search {
+            call, query, path, ..
+        } => AgentActivityData::Search {
+            call: normalize_call(call),
+            query: query.clone(),
+            path: path.clone(),
+            result: None,
+        },
+        AgentActivityData::Command {
+            call,
+            command,
+            args,
+            cwd,
+            ..
+        } => AgentActivityData::Command {
+            call: normalize_call(call),
+            command: command.clone(),
+            args: args.clone(),
+            cwd: cwd.clone(),
+            result: None,
+        },
+    }
+}
+
+fn restore_activity_tool_data(
+    data: AgentActivityData,
+    activity_id: ActivityId,
+    calls: &BTreeMap<loom_core::ToolCallId, loom_model::ToolCall>,
+    attempts: &BTreeMap<ActivityId, Option<ToolResult>>,
+) -> Result<AgentActivityData> {
+    let Some((stored_call, _)) = activity_tool_data(&data) else {
+        return Ok(data);
+    };
+    let call = calls.get(&stored_call.id).cloned().ok_or_else(|| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted tool activity has no logical tool-call row",
+            false,
+        )
+    })?;
+    let result = attempts.get(&activity_id).cloned().ok_or_else(|| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted tool activity has no tool-attempt row",
+            false,
+        )
+    })?;
+    Ok(match data {
+        AgentActivityData::ModelTurn { model } => AgentActivityData::ModelTurn { model },
+        AgentActivityData::ToolCall { .. } => AgentActivityData::ToolCall { call, result },
+        AgentActivityData::File {
+            operation, path, ..
+        } => AgentActivityData::File {
+            call,
+            operation,
+            path,
+            result,
+        },
+        AgentActivityData::Search { query, path, .. } => AgentActivityData::Search {
+            call,
+            query,
+            path,
+            result,
+        },
+        AgentActivityData::Command {
+            command, args, cwd, ..
+        } => AgentActivityData::Command {
+            call,
+            command,
+            args,
+            cwd,
+            result,
+        },
+    })
+}
+
+fn save_run_tool_rows(
+    transaction: &Transaction<'_>,
+    activities_by_run: &DurableRunActivities,
+    summaries: Option<&BTreeMap<RunId, DurableRunSummary>>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_tool_calls (
+                run_id BLOB NOT NULL, tool_call_id BLOB NOT NULL,
+                PRIMARY KEY(run_id, tool_call_id)
+             ) WITHOUT ROWID, STRICT;
+             CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_tool_attempts (
+                run_id BLOB NOT NULL, activity_id BLOB NOT NULL,
+                PRIMARY KEY(run_id, activity_id)
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_run_tool_calls;
+             DELETE FROM _loom_wanted_run_tool_attempts;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run tool rows: {error}"), true)
+        })?;
+    for (run_id, activities) in activities_by_run {
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let session_id: Vec<u8> = transaction
+            .query_row(
+                "SELECT session_id FROM run_summaries WHERE run_id=?1",
+                [run_id_bytes.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("run {run_id} has no durable summary for its tool rows: {error}"),
+                    true,
+                )
+            })?;
+        let execution = summaries
+            .and_then(|summaries| summaries.get(run_id))
+            .and_then(|summary| summary.execution_state.as_ref());
+        let mut logical_calls =
+            BTreeMap::<loom_core::ToolCallId, (&loom_model::ToolCall, Timestamp)>::new();
+        let mut attempt_numbers = BTreeMap::<loom_core::ToolCallId, u32>::new();
+        for activity in activities {
+            if activity.run_id != *run_id {
+                return Err(LoomError::invalid_request(
+                    "run tool activity must match its owning run",
+                ));
+            }
+            let Some((call, result)) = activity_tool_data(&activity.data) else {
+                continue;
+            };
+            if let Some((existing, _)) = logical_calls.get(&call.id) {
+                if existing.name != call.name || existing.arguments != call.arguments {
+                    return Err(LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "a logical tool call changed its name or arguments",
+                        false,
+                    ));
+                }
+            } else {
+                logical_calls.insert(call.id, (call, activity.started_at));
+                let arguments = serde_json::to_vec(&call.arguments).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("could not encode tool-call arguments: {error}"),
+                        false,
+                    )
+                })?;
+                if arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+                    return Err(LoomError::new(
+                        ErrorCode::Persistence,
+                        "tool-call arguments exceed the maximum supported size",
+                        false,
+                    ));
+                }
+                let arguments_hash = store_content(transaction, &arguments)?;
+                let created_at = encode_timestamp(activity.started_at)?;
+                let existing: Option<(Vec<u8>, String, Vec<u8>)> = transaction
+                    .query_row(
+                        "SELECT session_id, name, arguments_hash FROM run_tool_calls
+                         WHERE run_id=?1 AND tool_call_id=?2",
+                        params![
+                            run_id_bytes.as_slice(),
+                            call.id.as_uuid().as_bytes().as_slice()
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not read logical tool call: {error}"),
+                            true,
+                        )
+                    })?;
+                if let Some((stored_session, stored_name, stored_arguments_hash)) = existing {
+                    if stored_session != session_id
+                        || stored_name != call.name
+                        || stored_arguments_hash != arguments_hash
+                    {
+                        return Err(LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            "persisted logical tool call is immutable",
+                            false,
+                        ));
+                    }
+                } else {
+                    transaction
+                        .execute(
+                            "INSERT INTO run_tool_calls(
+                                run_id, session_id, tool_call_id, name, arguments_hash, created_at
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                run_id_bytes.as_slice(),
+                                session_id.as_slice(),
+                                call.id.as_uuid().as_bytes().as_slice(),
+                                call.name.as_str(),
+                                arguments_hash,
+                                created_at,
+                            ],
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not save logical tool call {}: {error}", call.id),
+                                true,
+                            )
+                        })?;
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO _loom_wanted_run_tool_calls(run_id, tool_call_id)
+                         VALUES (?1, ?2)",
+                        params![
+                            run_id_bytes.as_slice(),
+                            call.id.as_uuid().as_bytes().as_slice()
+                        ],
+                    )
+                    .map_err(|error| {
+                        persistence_error(format!("could not stage tool call: {error}"), true)
+                    })?;
+            }
+
+            let attempt_number = attempt_numbers.entry(call.id).or_default();
+            *attempt_number = attempt_number.checked_add(1).ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "tool call has too many execution attempts",
+                    false,
+                )
+            })?;
+            let state = match activity.status {
+                AgentActivityStatus::Started
+                    if execution
+                        .and_then(|execution| execution.pending_tool_execution.as_ref())
+                        .is_some_and(|pending| pending.id == call.id) =>
+                {
+                    AgentToolAttemptState::Queued
+                }
+                AgentActivityStatus::Started
+                    if execution
+                        .and_then(|execution| execution.last_failed_call.as_ref())
+                        .is_some_and(|failed| failed.id == call.id) =>
+                {
+                    AgentToolAttemptState::OutcomeUnknown
+                }
+                AgentActivityStatus::Started => AgentToolAttemptState::Running,
+                AgentActivityStatus::Completed => AgentToolAttemptState::Completed,
+                AgentActivityStatus::Failed => AgentToolAttemptState::Failed,
+                AgentActivityStatus::AwaitingApproval => AgentToolAttemptState::AwaitingApproval,
+                AgentActivityStatus::AwaitingInput => AgentToolAttemptState::AwaitingInput,
+                AgentActivityStatus::Cancelled => AgentToolAttemptState::Cancelled,
+            };
+            let result_hash = result
+                .map(|result| {
+                    let result = serde_json::to_vec(result).map_err(|error| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            format!("could not encode tool result: {error}"),
+                            false,
+                        )
+                    })?;
+                    store_content(transaction, &result)
+                })
+                .transpose()?;
+            let started_at = encode_timestamp(activity.started_at)?;
+            let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
+            let activity_id = activity.id.as_uuid().as_bytes();
+            transaction
+                .execute(
+                    "INSERT INTO run_tool_attempts(
+                        run_id, session_id, activity_id, tool_call_id, attempt_number, state,
+                        started_at, completed_at, result_hash
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(run_id, activity_id) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        tool_call_id=excluded.tool_call_id,
+                        attempt_number=excluded.attempt_number,
+                        state=excluded.state,
+                        started_at=excluded.started_at,
+                        completed_at=excluded.completed_at,
+                        result_hash=excluded.result_hash
+                     WHERE run_tool_attempts.session_id IS NOT excluded.session_id
+                        OR run_tool_attempts.tool_call_id IS NOT excluded.tool_call_id
+                        OR run_tool_attempts.attempt_number IS NOT excluded.attempt_number
+                        OR run_tool_attempts.state IS NOT excluded.state
+                        OR run_tool_attempts.started_at IS NOT excluded.started_at
+                        OR run_tool_attempts.completed_at IS NOT excluded.completed_at
+                        OR run_tool_attempts.result_hash IS NOT excluded.result_hash",
+                    params![
+                        run_id_bytes.as_slice(),
+                        session_id.as_slice(),
+                        activity_id,
+                        call.id.as_uuid().as_bytes().as_slice(),
+                        i64::from(*attempt_number),
+                        tool_attempt_state_name(state),
+                        started_at,
+                        completed_at,
+                        result_hash,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save tool attempt {}: {error}", activity.id),
+                        true,
+                    )
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO _loom_wanted_run_tool_attempts(run_id, activity_id)
+                     VALUES (?1, ?2)",
+                    params![run_id_bytes.as_slice(), activity_id],
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not stage tool attempt: {error}"), true)
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_tool_attempts
+                 WHERE run_id=?1 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_tool_attempts wanted
+                    WHERE wanted.run_id=run_tool_attempts.run_id
+                      AND wanted.activity_id=run_tool_attempts.activity_id
+                 )",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune tool attempts for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "DELETE FROM run_tool_calls
+                 WHERE run_id=?1 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_tool_calls wanted
+                    WHERE wanted.run_id=run_tool_calls.run_id
+                      AND wanted.tool_call_id=run_tool_calls.tool_call_id
+                 )",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune tool calls for {run_id}: {error}"),
+                    true,
+                )
             })?;
     }
     collect_unused_content(transaction)
@@ -6452,7 +7088,7 @@ mod tests {
             completed_at: None,
             elapsed_ms: None,
             data: AgentActivityData::ToolCall {
-                call: activity_call,
+                call: activity_call.clone(),
                 result: None,
             },
         };
@@ -6558,10 +7194,43 @@ mod tests {
             persistence.load_run_activities(run_id).unwrap(),
             vec![activity.clone()]
         );
+        assert_eq!(
+            persistence.load_run_tool_calls(run_id).unwrap(),
+            vec![AgentToolCallRecord {
+                run_id,
+                session_id: session.id,
+                call: activity_call.clone(),
+                created_at: Timestamp::from_unix_millis(1500),
+            }]
+        );
+        assert_eq!(
+            persistence.load_run_tool_attempts(run_id).unwrap(),
+            vec![AgentToolAttemptRecord {
+                run_id,
+                session_id: session.id,
+                id: activity.id,
+                call_id: activity_call.id,
+                attempt_number: 1,
+                state: AgentToolAttemptState::AwaitingApproval,
+                started_at: Timestamp::from_unix_millis(1500),
+                completed_at: None,
+                result: None,
+            }]
+        );
         let mut completed_activity = activity.clone();
         completed_activity.status = AgentActivityStatus::Completed;
         completed_activity.completed_at = Some(Timestamp::from_unix_millis(1600));
         completed_activity.elapsed_ms = Some(100);
+        let tool_result = ToolResult {
+            tool_call_id: activity_call.id,
+            name: activity_call.name.clone(),
+            success: true,
+            output: "read result".to_owned(),
+        };
+        completed_activity.data = AgentActivityData::ToolCall {
+            call: activity_call.clone(),
+            result: Some(tool_result.clone()),
+        };
         let completed_activities = BTreeMap::from([(run_id, vec![completed_activity])]);
         let invalid_sections = [("", serde_json::json!({"invalid": true}))];
         assert!(
@@ -6587,7 +7256,44 @@ mod tests {
         );
         assert_eq!(
             persistence.load_run_activities(run_id).unwrap(),
-            vec![activity]
+            vec![activity.clone()]
+        );
+        assert_eq!(
+            persistence.load_run_tool_attempts(run_id).unwrap()[0].state,
+            AgentToolAttemptState::AwaitingApproval
+        );
+        persistence
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &sessions.export_state(),
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: None,
+                run_messages: None,
+                run_activities: Some(&completed_activities),
+                filesystem_records: None,
+                records: &[],
+                feed: None,
+                sections: &[],
+            })
+            .unwrap();
+        assert_eq!(
+            persistence.load_run_tool_attempts(run_id).unwrap(),
+            vec![AgentToolAttemptRecord {
+                run_id,
+                session_id: session.id,
+                id: activity.id,
+                call_id: activity_call.id,
+                attempt_number: 1,
+                state: AgentToolAttemptState::Completed,
+                started_at: Timestamp::from_unix_millis(1500),
+                completed_at: Some(Timestamp::from_unix_millis(1600)),
+                result: Some(tool_result),
+            }]
         );
         let loaded_idempotency = persistence.load_idempotency_records().unwrap();
         assert_eq!(loaded_idempotency.len(), 1);
@@ -6745,7 +7451,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(content_codec, 1);
-        assert_eq!(content_count, 3);
+        assert_eq!(content_count, 5);
         let (filesystem_codec, raw_size, payload_size): (i64, i64, i64) = connection
             .query_row(
                 "SELECT payload_codec, raw_size, length(payload) FROM session_filesystems
@@ -6811,8 +7517,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            content_count, 2,
-            "retained transcript and activity content remain reachable"
+            content_count, 4,
+            "retained transcript, tool-call, and tool-attempt content remain reachable"
         );
         drop(connection);
         fs::remove_file(path).unwrap();

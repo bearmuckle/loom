@@ -25,7 +25,8 @@ pub use activity::{
 pub use agent::{
     AgentEvent, AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
-    AgentRunState, ApprovalDecision,
+    AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
+    ApprovalDecision,
 };
 pub use context::{
     ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
