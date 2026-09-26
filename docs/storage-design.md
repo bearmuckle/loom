@@ -1,10 +1,10 @@
 # Proposed durable state model
 
 Status: target design, 2026-09-26. The implementation is in progress: session
-metadata and reconnect events use indexed rows; run summaries and per-session
-filesystem records are independently stored and loaded on demand; large strings
-are compressed and deduplicated. Auxiliary settings and detailed run/filesystem
-payloads still use the section tree. This
+and workspace catalogs and reconnect events use indexed rows; run summaries
+and per-session filesystem records are independently stored and loaded on
+demand; large strings are compressed and deduplicated. Auxiliary settings and
+detailed run/filesystem payloads still use the section tree. This
 design replaces the version-2 `sections` container. The release does not import
 existing databases: it creates a fresh database and rejects an existing
 unsupported format without changing it.

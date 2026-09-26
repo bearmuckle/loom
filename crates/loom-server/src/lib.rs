@@ -1620,11 +1620,7 @@ impl InProcessBackend {
             .transpose()?;
         let state = PersistedBackendState {
             sessions,
-            workspace_records: persistence
-                .load_section("workspace_records", CURRENT_SCHEMA_VERSION)?
-                .map(from_json)
-                .transpose()?
-                .unwrap_or_default(),
+            workspace_records: persistence.load_workspaces()?.unwrap_or_default(),
             journal: persistence
                 .load_feed_state()?
                 .map(|feed| EventJournal {
@@ -1871,16 +1867,13 @@ impl InProcessBackend {
             retention_limit: journal.retention_limit,
             events: journal.pending_events.clone(),
         };
-        let result = persistence.save_state_with_sessions_entities_and_feed(
+        let result = persistence.save_state_with_catalogs_entities_and_feed(
             CURRENT_SCHEMA_VERSION,
             &sessions,
+            &self.workspace_records()?.export_state(),
             &entity_sections,
             Some(&feed),
             &[
-                (
-                    "workspace_records",
-                    json_value(self.workspace_records()?.export_state())?,
-                ),
                 (
                     "session_approval_policies",
                     json_value(self.session_policies()?.clone())?,

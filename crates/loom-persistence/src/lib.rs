@@ -9,18 +9,18 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence, LoomError,
-    Result, Timestamp, WorkspaceId,
+    Result, Timestamp, WorkspaceId, WorkspaceRecord,
 };
 use loom_protocol::ServerEventEnvelope;
-use loom_session::SessionManagerState;
+use loom_session::{SessionManagerState, WorkspaceManagerState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
-const DATABASE_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+const DATABASE_SCHEMA_VERSION: u32 = 8;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -46,6 +46,14 @@ CREATE INDEX IF NOT EXISTS sessions_visible
     ON sessions(workspace_id, updated_at DESC, id DESC) WHERE state != 'archived';
 CREATE INDEX IF NOT EXISTS sessions_archived
     ON sessions(workspace_id, updated_at DESC, id DESC) WHERE state = 'archived';
+CREATE TABLE IF NOT EXISTS workspaces (
+    id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
+    name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS workspaces_by_activity
+    ON workspaces(updated_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS feed_store_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     next_sequence INTEGER NOT NULL CHECK(next_sequence >= 0),
@@ -611,6 +619,49 @@ impl FilePersistence {
         }))
     }
 
+    /// Loads the small, typed workspace catalog.
+    pub fn load_workspaces(&self) -> Result<Option<WorkspaceManagerState>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT id, name, created_at, updated_at FROM workspaces ORDER BY id")
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare workspace catalog: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read workspace catalog: {error}"), true)
+            })?;
+        let mut workspaces = BTreeMap::new();
+        for row in rows {
+            let (id, name, created_at, updated_at) = row.map_err(|error| {
+                persistence_error(format!("could not read workspace catalog: {error}"), true)
+            })?;
+            let id = WorkspaceId::from_uuid(decode_uuid(&id, "workspace id")?);
+            let workspace = WorkspaceRecord {
+                id,
+                name,
+                created_at: decode_timestamp(created_at)?,
+                updated_at: decode_timestamp(updated_at)?,
+            };
+            workspaces.insert(id, workspace);
+        }
+        Ok(Some(WorkspaceManagerState { workspaces }))
+    }
+
     /// Loads the bounded reconnect feed from sequence-indexed records.
     pub fn load_feed_state(&self) -> Result<Option<DurableFeedState>> {
         if !self.path.exists() {
@@ -789,6 +840,45 @@ impl FilePersistence {
         feed: Option<&DurableFeedState>,
         sections: &[(&str, Value)],
     ) -> Result<()> {
+        self.save_state_with_optional_catalogs_entities_and_feed(
+            schema_version,
+            sessions,
+            None,
+            records,
+            feed,
+            sections,
+        )
+    }
+
+    /// Persists typed session and workspace catalogs with entity records atomically.
+    pub fn save_state_with_catalogs_entities_and_feed(
+        &self,
+        schema_version: u32,
+        sessions: &SessionManagerState,
+        workspaces: &WorkspaceManagerState,
+        records: &[(String, Value)],
+        feed: Option<&DurableFeedState>,
+        sections: &[(&str, Value)],
+    ) -> Result<()> {
+        self.save_state_with_optional_catalogs_entities_and_feed(
+            schema_version,
+            sessions,
+            Some(workspaces),
+            records,
+            feed,
+            sections,
+        )
+    }
+
+    fn save_state_with_optional_catalogs_entities_and_feed(
+        &self,
+        schema_version: u32,
+        sessions: &SessionManagerState,
+        workspaces: Option<&WorkspaceManagerState>,
+        records: &[(String, Value)],
+        feed: Option<&DurableFeedState>,
+        sections: &[(&str, Value)],
+    ) -> Result<()> {
         let connection = self.connection_for_write()?;
         let transaction = connection.unchecked_transaction().map_err(|error| {
             persistence_error(
@@ -797,6 +887,9 @@ impl FilePersistence {
             )
         })?;
         save_session_rows(&transaction, sessions)?;
+        if let Some(workspaces) = workspaces {
+            save_workspace_rows(&transaction, workspaces)?;
+        }
         if let Some(feed) = feed {
             save_feed_rows(&transaction, feed)?;
         }
@@ -1202,6 +1295,73 @@ fn save_session_rows(transaction: &Transaction<'_>, state: &SessionManagerState)
     Ok(())
 }
 
+fn save_workspace_rows(transaction: &Transaction<'_>, state: &WorkspaceManagerState) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_workspaces (
+                id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_workspaces;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage workspace catalog: {error}"), true)
+        })?;
+    for (id, workspace) in &state.workspaces {
+        if *id != workspace.id
+            || workspace.name.trim().is_empty()
+            || workspace.updated_at < workspace.created_at
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "workspace catalog contains an inconsistent record",
+                false,
+            ));
+        }
+        let id_bytes = id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_workspaces(id) VALUES (?1)",
+                [id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not stage workspace catalog: {error}"), true)
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO workspaces(id, name, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at
+                 WHERE workspaces.name IS NOT excluded.name
+                    OR workspaces.created_at IS NOT excluded.created_at
+                    OR workspaces.updated_at IS NOT excluded.updated_at",
+                params![
+                    id_bytes.as_slice(),
+                    workspace.name,
+                    encode_timestamp(workspace.created_at)?,
+                    encode_timestamp(workspace.updated_at)?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save workspace {id}: {error}"), true)
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM workspaces
+             WHERE NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_workspaces wanted WHERE wanted.id=workspaces.id
+             )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prune workspace catalog: {error}"), true)
+        })?;
+    Ok(())
+}
+
 fn save_feed_rows(transaction: &Transaction<'_>, feed: &DurableFeedState) -> Result<()> {
     let next_sequence = i64::try_from(feed.next_sequence.value()).map_err(|_| {
         LoomError::new(
@@ -1451,7 +1611,7 @@ impl MemoryPersistence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_session::SessionManager;
+    use loom_session::{SessionManager, WorkspaceManager};
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
 
@@ -1800,6 +1960,84 @@ mod tests {
             .query_row("SELECT count FROM session_updates", [], |row| row.get(0))
             .unwrap();
         assert_eq!(updates, 0, "unchanged rows must not be rewritten");
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn typed_workspace_catalog_round_trips_and_uses_its_activity_index() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut manager = WorkspaceManager::default();
+        let first = manager.create("First workspace").unwrap();
+        let second = manager.create("Second workspace").unwrap();
+        let state = manager.export_state();
+
+        persistence
+            .save_state_with_catalogs_entities_and_feed(
+                CURRENT_SCHEMA_VERSION,
+                &SessionManager::default().export_state(),
+                &state,
+                &[],
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(persistence.load_workspaces().unwrap().unwrap(), state);
+
+        let mut changed_manager = WorkspaceManager::default();
+        let changed = changed_manager.create("Changed workspace").unwrap();
+        assert!(
+            persistence
+                .save_state_with_catalogs_entities_and_feed(
+                    CURRENT_SCHEMA_VERSION,
+                    &SessionManager::default().export_state(),
+                    &changed_manager.export_state(),
+                    &[],
+                    None,
+                    &[("", serde_json::json!({"invalid": true}))],
+                )
+                .is_err()
+        );
+        assert_eq!(persistence.load_workspaces().unwrap().unwrap(), state);
+        assert!(!state.workspaces.contains_key(&changed.id));
+
+        let connection = Connection::open(&path).unwrap();
+        let plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id, name, updated_at FROM workspaces
+                 ORDER BY updated_at DESC, id DESC LIMIT 20",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("workspaces_by_activity"), "{plan}");
+        connection
+            .execute_batch(
+                "CREATE TABLE workspace_updates(count INTEGER NOT NULL);
+                 INSERT INTO workspace_updates VALUES (0);
+                 CREATE TRIGGER track_workspace_updates AFTER UPDATE ON workspaces BEGIN
+                    UPDATE workspace_updates SET count=count+1;
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+        persistence
+            .save_state_with_catalogs_entities_and_feed(
+                CURRENT_SCHEMA_VERSION,
+                &SessionManager::default().export_state(),
+                &state,
+                &[],
+                None,
+                &[],
+            )
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let updates: i64 = connection
+            .query_row("SELECT count FROM workspace_updates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(updates, 0, "unchanged workspace rows must not be rewritten");
+        assert_ne!(first.id, second.id);
         drop(connection);
         fs::remove_file(path).unwrap();
     }
