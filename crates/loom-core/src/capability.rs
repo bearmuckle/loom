@@ -73,3 +73,41 @@ impl FromIterator<Capability> for CapabilitySet {
         Self::new(iter)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Capability, CapabilitySet};
+
+    #[test]
+    fn capability_sets_deduplicate_and_intersect_in_order() {
+        let first = CapabilitySet::new([
+            Capability::ReadAgentSession,
+            Capability::ReadVcsStatus,
+            Capability::ReadAgentSession,
+        ]);
+        let second = [Capability::ReadVcsStatus, Capability::StartAgentRun]
+            .into_iter()
+            .collect::<CapabilitySet>();
+
+        assert!(first.contains(Capability::ReadAgentSession));
+        assert!(!first.contains(Capability::StartAgentRun));
+        assert_eq!(
+            first
+                .intersection(&second)
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![Capability::ReadVcsStatus]
+        );
+        assert!(CapabilitySet::default().is_empty());
+        assert!(!first.is_empty());
+        assert_eq!(
+            serde_json::from_str::<CapabilitySet>("[\"read_agent_session\"]")
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![Capability::ReadAgentSession]
+        );
+    }
+}

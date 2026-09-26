@@ -14,9 +14,11 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(target_family = "wasm"))]
 use std::{
     sync::mpsc::{self, Sender},
-    thread,
     time::Duration,
 };
+
+#[cfg(all(not(target_family = "wasm"), not(test)))]
+use std::thread;
 
 use futures_channel::oneshot;
 use loom_core::{
@@ -964,19 +966,33 @@ impl PendingResponse {
 pub(crate) struct BackendWorker {
     #[cfg(not(target_family = "wasm"))]
     jobs: Sender<Job>,
+    #[cfg(all(not(target_family = "wasm"), test))]
+    test_connection: Option<ClientConnection>,
     #[cfg(target_family = "wasm")]
     connection: ClientConnection,
     secure_for_secrets: bool,
 }
 
 #[cfg(not(target_family = "wasm"))]
+#[allow(dead_code)]
 struct Job {
     request: RequestEnvelope,
     reply: oneshot::Sender<ResponseEnvelope>,
 }
 
 impl BackendWorker {
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), test))]
+    pub(crate) fn spawn(connection: ClientConnection) -> Self {
+        let secure_for_secrets = connection.secure_for_secrets();
+        let (jobs, _incoming) = mpsc::channel::<Job>();
+        Self {
+            jobs,
+            test_connection: Some(connection),
+            secure_for_secrets,
+        }
+    }
+
+    #[cfg(all(not(target_family = "wasm"), not(test)))]
     pub(crate) fn spawn(connection: ClientConnection) -> Self {
         let secure_for_secrets = connection.secure_for_secrets();
         let (jobs, incoming) = mpsc::channel::<Job>();
@@ -1011,6 +1027,14 @@ impl BackendWorker {
     pub(crate) fn submit(&self, request: RequestEnvelope) -> PendingResponse {
         let request_id = request.request_id;
         let (reply, receiver) = oneshot::channel();
+        #[cfg(test)]
+        if let Some(connection) = &self.test_connection {
+            let _ = reply.send(connection.request(request));
+            return PendingResponse {
+                request_id,
+                reply: receiver,
+            };
+        }
         if self.jobs.send(Job { request, reply }).is_err() {
             // The worker thread is gone; return a receiver that will
             // immediately resolve to the "stopped before answering" error.
@@ -1045,11 +1069,17 @@ impl BackendWorker {
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::{
-        ClientConnection, LoomError, include_discovered_models, negotiate,
-        remote_url_is_secure_for_secrets, worker_node_status,
+        ClientConnection, LoomError, create_session_in_workspace, create_workspace,
+        describe_startup_connection_error, include_discovered_models, list_models,
+        list_provider_ids, list_workspace_sessions, list_workspaces, negotiate, redact_secret,
+        register_workspace, remote_url_is_secure_for_secrets, set_workspace_config,
+        unexpected_response, worker_node_status, workspace_config,
     };
-    use loom_core::ErrorCode;
+    use loom_core::{
+        ErrorCode, LoomError as CoreLoomError, Timestamp, WorkspaceId, WorkspaceRecord,
+    };
     use loom_model::ModelId;
+    use loom_protocol::{ServerResponse, WorkspaceConfig};
     use loom_server::{
         AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
     };
@@ -1062,6 +1092,108 @@ mod tests {
         assert!(remote_url_is_secure_for_secrets("ws://127.0.0.1:8080/ws"));
         assert!(remote_url_is_secure_for_secrets("ws://[::1]:8080/ws"));
         assert!(!remote_url_is_secure_for_secrets("ws://worker.example/ws"));
+    }
+
+    #[test]
+    fn startup_error_messages_are_actionable_and_redact_credentials() {
+        for (code, message, expected) in [
+            (
+                ErrorCode::AuthenticationFailed,
+                "bad token",
+                "worker authentication was denied",
+            ),
+            (
+                ErrorCode::InvalidRequest,
+                "invalid bearer token characters",
+                "unsupported characters",
+            ),
+            (
+                ErrorCode::InvalidRequest,
+                "malformed endpoint",
+                "invalid worker WebSocket URL",
+            ),
+            (ErrorCode::DeadlineExceeded, "timed out", "timed out"),
+            (
+                ErrorCode::ProviderUnavailable,
+                "connection refused",
+                "connection refused",
+            ),
+            (
+                ErrorCode::UnsupportedProtocol,
+                "version mismatch",
+                "protocol negotiation failed",
+            ),
+            (
+                ErrorCode::RequestCancelled,
+                "closed",
+                "closed the connection",
+            ),
+        ] {
+            let error = CoreLoomError::new(code, message, false);
+            assert!(describe_startup_connection_error(&error, "secret-token").contains(expected));
+        }
+        let raw = CoreLoomError::new(ErrorCode::Internal, "failed secret-token", false);
+        let described = describe_startup_connection_error(&raw, "secret-token");
+        assert!(!described.contains("secret-token"));
+        assert_eq!(redact_secret("?token=a%2Fb", "a/b"), "?token=[redacted]");
+        assert_eq!(redact_secret("unchanged", ""), "unchanged");
+        assert!(
+            unexpected_response("probe", ServerResponse::SessionRepositoryDetached)
+                .message
+                .contains("probe")
+        );
+    }
+
+    #[test]
+    fn in_process_connection_exercises_workspace_and_session_client_operations() {
+        let connection = ClientConnection::InProcess(Box::new(InProcessBackend::new().connect()));
+        negotiate(&connection).unwrap();
+        let created = create_workspace(&connection, "client wrapper test").unwrap();
+        assert_eq!(created.name, "client wrapper test");
+        assert!(
+            list_workspaces(&connection)
+                .unwrap()
+                .iter()
+                .any(|workspace| workspace.id == created.id)
+        );
+
+        let config = WorkspaceConfig {
+            revision: 1,
+            cpu_pulse_threshold_percent: 12,
+            ..WorkspaceConfig::default()
+        };
+        set_workspace_config(&connection, created.id, config.clone()).unwrap();
+        assert_eq!(workspace_config(&connection, created.id).unwrap(), config);
+
+        let session =
+            create_session_in_workspace(&connection, created.id, "client session").unwrap();
+        assert_eq!(session.name, "client session");
+        assert_eq!(
+            list_workspace_sessions(&connection, created.id).unwrap(),
+            vec![session.clone()]
+        );
+        assert!(!list_models(&connection).unwrap().is_empty());
+        assert!(!list_provider_ids(&connection).unwrap().is_empty());
+    }
+
+    #[test]
+    fn workspace_client_operations_report_backend_errors_and_register_external_records() {
+        let connection = ClientConnection::InProcess(Box::new(InProcessBackend::new().connect()));
+        negotiate(&connection).unwrap();
+        let timestamp = Timestamp::from_unix_millis(1);
+        let external = WorkspaceRecord {
+            id: WorkspaceId::new(),
+            name: "registered externally".to_owned(),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        register_workspace(&connection, external.clone()).unwrap();
+        assert!(
+            list_workspaces(&connection)
+                .unwrap()
+                .iter()
+                .any(|workspace| workspace == &external)
+        );
     }
 
     #[test]

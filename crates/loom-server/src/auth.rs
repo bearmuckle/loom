@@ -277,3 +277,100 @@ fn auth_internal_error() -> LoomError {
         true,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf};
+
+    use super::*;
+
+    fn temporary_directory(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("loom-auth-{label}-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn authorization_scope_applies_capability_workspace_session_and_source_limits() {
+        let session = AgentSessionId::new();
+        let workspace = WorkspaceId::new();
+        let limited = AuthorizationScope::for_sessions(
+            [session],
+            CapabilitySet::new([Capability::ReadAgentSession]),
+        );
+        assert!(limited.allows_session(session));
+        assert!(!limited.allows_session(AgentSessionId::new()));
+        assert!(limited.allows_capability(Capability::ReadAgentSession));
+        assert!(!limited.allows_capability(Capability::CreateAgentSession));
+        assert!(limited.allows_workspace(workspace));
+        assert!(!limited.allows_repository_source(Path::new("/")));
+
+        let workspace_limited =
+            AuthorizationScope::for_workspaces([workspace], CapabilitySet::default());
+        assert!(workspace_limited.allows_workspace(workspace));
+        assert!(!workspace_limited.allows_workspace(WorkspaceId::new()));
+        assert!(!workspace_limited.allows_capability(Capability::ReadAgentSession));
+        assert!(workspace_limited.allows_session(session));
+
+        let parent = temporary_directory("scope");
+        let allowed = parent.join("allowed");
+        let outside = temporary_directory("outside");
+        fs::create_dir_all(&allowed).unwrap();
+        fs::write(allowed.join("repo.marker"), "repo").unwrap();
+        let scoped = AuthorizationScope::all().with_repository_source_root(&parent);
+        assert!(scoped.allows_repository_source(&allowed));
+        assert!(!scoped.allows_repository_source(&outside));
+        assert!(!scoped.allows_repository_source(parent.join("missing").as_path()));
+        assert!(AuthorizationScope::all().allows_repository_source(Path::new("/missing")));
+        fs::remove_dir_all(parent).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn issued_tokens_authenticate_verify_revoke_and_redact_secrets() {
+        let store = AuthTokenStore::new();
+        let issued = store.issue(AuthorizationScope::all()).unwrap();
+        assert_eq!(issued.to_string(), issued.token);
+        assert!(issued.redacted().starts_with(&issued.token_id[..8]));
+        assert!(!format!("{issued:?}").contains(&issued.token));
+
+        let session = store.authenticate(&issued.token).unwrap();
+        assert_eq!(session.token_id(), issued.token_id);
+        session.verify().unwrap();
+        assert!(!format!("{session:?}").contains(&issued.token));
+        assert_eq!(
+            store.authenticate("  ").unwrap_err().code,
+            ErrorCode::AuthenticationRequired
+        );
+        assert_eq!(
+            store.authenticate("unknown").unwrap_err().code,
+            ErrorCode::AuthenticationFailed
+        );
+
+        assert!(store.revoke(&issued.token_id).unwrap());
+        assert!(store.revoke(&issued.token_id).unwrap());
+        assert!(!store.revoke("missing-token-id").unwrap());
+        assert!(session.verify().is_err());
+
+        let first = store.insert("first", AuthorizationScope::all()).unwrap();
+        let second = store.insert("second", AuthorizationScope::all()).unwrap();
+        store.revoke_all().unwrap();
+        assert!(store.authenticate(&first.token).is_err());
+        assert!(store.authenticate(&second.token).is_err());
+    }
+
+    #[test]
+    fn poisoned_authentication_store_returns_a_retryable_internal_error() {
+        let store = AuthTokenStore::new();
+        let tokens = Arc::clone(&store.tokens);
+        let _ = std::thread::spawn(move || {
+            let _guard = tokens.lock().unwrap();
+            panic!("poison lock for the test");
+        })
+        .join();
+
+        let error = store.issue(AuthorizationScope::all()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.retryable);
+    }
+}

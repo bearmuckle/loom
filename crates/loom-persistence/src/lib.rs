@@ -269,6 +269,68 @@ mod tests {
     }
 
     #[test]
+    fn file_store_reports_missing_schema_and_malformed_sections() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        assert!(
+            store
+                .load_section::<Fixture>("missing", 1)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!store.exists());
+        store
+            .save_sections(1, &[("state", serde_json::json!({"value": "old"}))])
+            .unwrap();
+        assert_eq!(
+            store.load_section::<Fixture>("state", 2).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE sections SET payload = ?1 WHERE name = 'state'",
+                [b"invalid json".as_slice()],
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_section::<Fixture>("state", 1).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn memory_store_round_trips_and_rejects_malformed_values() {
+        let store = MemoryPersistence::default();
+        assert!(store.load::<Fixture>().unwrap().is_none());
+        store
+            .save(&Fixture {
+                value: "memory".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.load::<Fixture>().unwrap(),
+            Some(Fixture {
+                value: "memory".to_owned(),
+            })
+        );
+        store.set_raw(serde_json::json!({"wrong": true})).unwrap();
+        assert_eq!(
+            store.load::<Fixture>().unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+    }
+
+    #[test]
+    fn persistence_rejects_empty_paths() {
+        assert_eq!(
+            FilePersistence::open("").unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
     fn sections_are_updated_without_rewriting_other_sections() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let store = FilePersistence::open(&path).unwrap();

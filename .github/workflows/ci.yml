@@ -21,6 +21,14 @@ jobs:
       # runner's disk on this dependency-heavy (GPUI/wgpu) workspace.
       CARGO_INCREMENTAL: "0"
     steps:
+      - name: Free disk space
+        uses: endersonmenezes/free-disk-space@v4
+        with:
+          remove_android: true
+          remove_dotnet: true
+          remove_haskell: true
+          rm_cmd: "rmz"
+          rmz_version: "3.2.0"
       - uses: actions/checkout@v4
       - name: Install native UI dependencies
         run: |
@@ -35,6 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: taiki-e/install-action@cargo-llvm-cov
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
@@ -43,8 +52,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Run tests
-        run: cargo test --workspace --all-features --locked
+      - name: Run tests and enforce coverage threshold
+        run: cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80 --lcov --output-path lcov.info
       - name: Build application binaries
         if: github.event_name == 'pull_request'
         run: cargo build -p loom-ui -p loom-cli --locked

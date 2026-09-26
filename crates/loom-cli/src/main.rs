@@ -1249,3 +1249,191 @@ const fn run_state_name(state: AgentRunState) -> &'static str {
         AgentRunState::Cancelled => "cancelled",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CliOptions, create_session, create_workspace, demonstrate_m2_services,
+        demonstrate_m3_recovery, negotiate, parse_args, run_m4_demo, start_run, stream_run,
+    };
+    use loom_core::AgentSessionState;
+    use loom_model::ModelId;
+    use loom_server::InProcessBackend;
+    use std::net::SocketAddr;
+
+    fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
+        values.iter().map(|value| (*value).to_owned())
+    }
+
+    fn parse_error(values: &[&str]) -> super::LoomError {
+        parse_args(arguments(values))
+            .err()
+            .expect("arguments should be rejected")
+    }
+
+    #[test]
+    fn parser_keeps_defaults_and_accepts_separate_and_equals_values() {
+        let defaults = parse_args(arguments(&[])).unwrap().unwrap();
+        assert_eq!(defaults.name, "M1 demo");
+        assert_eq!(defaults.model.as_str(), "deterministic/demo");
+        assert_eq!(defaults.bind.to_string(), "127.0.0.1:8765");
+        assert!(!defaults.serve);
+
+        let options = parse_args(arguments(&[
+            "--name",
+            "separate",
+            "--task=inline task",
+            "--model",
+            "model-z",
+            "--root=/tmp/work",
+            "--persistence",
+            "/tmp/loom.db",
+            "--bind=0.0.0.0:9",
+            "--token",
+            "secret",
+            "--login=github-copilot",
+            "--manual-approval",
+            "--m2-demo",
+            "--m3-demo",
+            "--m4-demo",
+            "--serve",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.name, "separate");
+        assert_eq!(options.task, "inline task");
+        assert_eq!(options.model.as_str(), "model-z");
+        assert_eq!(options.root.unwrap().to_str(), Some("/tmp/work"));
+        assert_eq!(options.persistence.unwrap().to_str(), Some("/tmp/loom.db"));
+        assert_eq!(options.bind.to_string(), "0.0.0.0:9");
+        assert_eq!(options.token.as_deref(), Some("secret"));
+        assert_eq!(options.login_provider.as_deref(), Some("github-copilot"));
+        assert!(options.manual_approval && options.m2_demo && options.m3_demo);
+        assert!(options.m4_demo && options.serve);
+    }
+
+    #[test]
+    fn parser_rejects_missing_values_invalid_bind_and_unknown_arguments() {
+        for flag in [
+            "--name",
+            "--task",
+            "--model",
+            "--root",
+            "--bind",
+            "--token",
+            "--login",
+            "--persistence",
+        ] {
+            let error = parse_error(&[flag]);
+            assert!(
+                error.message.contains("requires a value"),
+                "{flag}: {error}"
+            );
+        }
+        for bind in ["bad", "--bind=bad"] {
+            let error = parse_error(&["--bind", bind]);
+            assert!(error.message.contains("socket address"));
+        }
+        assert!(
+            parse_error(&["--mystery"])
+                .message
+                .contains("unknown argument")
+        );
+    }
+
+    #[test]
+    fn help_short_circuits_argument_parsing() {
+        assert!(
+            parse_args(arguments(&["--help", "--invalid"]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_args(arguments(&["-h"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_cli_workflow_uses_the_protocol_for_session_run_and_services() {
+        let connection = InProcessBackend::new().connect();
+        negotiate(&connection).unwrap();
+
+        let workspace = create_workspace(&connection, "CLI test workspace").unwrap();
+        let session = create_session(&connection, workspace.id, "CLI test session").unwrap();
+        assert_eq!(session.state, AgentSessionState::Idle);
+
+        let options = CliOptions {
+            name: "CLI test session".to_owned(),
+            task: "Say hello in one sentence.".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            root: None,
+            manual_approval: true,
+            m2_demo: false,
+            m3_demo: false,
+            persistence: None,
+            serve: false,
+            m4_demo: false,
+            bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            token: None,
+            login_provider: None,
+        };
+        let run_id = start_run(&connection, session.id, &options).unwrap();
+        stream_run(&connection, session.id, run_id, false).unwrap();
+
+        demonstrate_m2_services(&connection, session.id).unwrap();
+    }
+
+    #[test]
+    fn m4_demo_reconnects_a_remote_client_and_resumes_approval() {
+        let root =
+            std::env::temp_dir().join(format!("loom-cli-m4-{}", loom_core::WorkspaceId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let options = CliOptions {
+            name: "M4 test".to_owned(),
+            task: "Say hello in one sentence.".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            root: Some(root.clone()),
+            manual_approval: false,
+            m2_demo: false,
+            m3_demo: false,
+            persistence: None,
+            serve: false,
+            m4_demo: true,
+            bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            token: None,
+            login_provider: None,
+        };
+
+        let result = run_m4_demo(options);
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn m3_demo_recovers_session_run_and_event_history_from_persistence() {
+        let path = std::env::temp_dir().join(format!("loom-cli-m3-{}.db", loom_core::RunId::new()));
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection).unwrap();
+        let workspace = create_workspace(&connection, "M3 test workspace").unwrap();
+        let session = create_session(&connection, workspace.id, "M3 test session").unwrap();
+        let options = CliOptions {
+            name: "M3 test session".to_owned(),
+            task: "Say hello in one sentence.".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            root: None,
+            manual_approval: false,
+            m2_demo: false,
+            m3_demo: true,
+            persistence: Some(path.clone()),
+            serve: false,
+            m4_demo: false,
+            bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            token: None,
+            login_provider: None,
+        };
+        let run_id = start_run(&connection, session.id, &options).unwrap();
+        stream_run(&connection, session.id, run_id, false).unwrap();
+
+        demonstrate_m3_recovery(backend, connection, &path, true, session.id, run_id).unwrap();
+        assert!(!path.exists());
+    }
+}

@@ -1259,6 +1259,65 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn watcher_reports_created_modified_and_deleted_paths_in_sequence() {
+        let (workspace, root) = workspace();
+        let watcher = workspace.watch();
+        assert!(watcher.poll().unwrap().is_empty());
+
+        fs::write(root.join("new.txt"), "created").unwrap();
+        let created = watcher.poll().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].path, "new.txt");
+        assert_eq!(created[0].kind, WorkspaceChangeKind::Created);
+
+        fs::write(root.join("new.txt"), "updated").unwrap();
+        let modified = watcher.events_since(Some(created[0].sequence)).unwrap();
+        assert_eq!(modified.len(), 1);
+        assert_eq!(modified[0].kind, WorkspaceChangeKind::Modified);
+
+        fs::remove_file(root.join("new.txt")).unwrap();
+        let deleted = watcher.poll().unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].kind, WorkspaceChangeKind::Deleted);
+        assert!(deleted[0].revision.is_none());
+        assert!(deleted[0].sequence > modified[0].sequence);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn writes_and_edits_reject_stale_revisions_and_duplicate_text() {
+        let (workspace, root) = workspace();
+        let stale_write = workspace
+            .write_file_bytes("README.md", b"overwrite".to_vec(), Some("stale"))
+            .unwrap_err();
+        assert_eq!(stale_write.code, ErrorCode::ExternalChange);
+
+        let stale_edit = workspace
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: "hello".to_owned(),
+                new_text: "updated".to_owned(),
+                expected_revision: Some("stale".to_owned()),
+            })
+            .unwrap_err();
+        assert_eq!(stale_edit.code, ErrorCode::Conflict);
+
+        let duplicate = workspace
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: "l".to_owned(),
+                new_text: "x".to_owned(),
+                expected_revision: None,
+            })
+            .unwrap_err();
+        assert_eq!(duplicate.code, ErrorCode::Conflict);
+
+        let missing = workspace.read_file("missing.txt").unwrap_err();
+        assert_eq!(missing.code, ErrorCode::NotFound);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn mounted_directory_edits_the_original_and_unmount_keeps_it() {
@@ -1384,6 +1443,126 @@ mod tests {
 
         assert_eq!(restored.control().unwrap(), WorkspaceControl::User);
         assert_eq!(restored.checkpoint(checkpoint.id).unwrap(), checkpoint);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mounts_reject_conflicts_nested_mounts_and_missing_unmounts() {
+        let (workspace, root) = workspace();
+        let source = root.with_extension("mount-source");
+        let second_source = root.with_extension("mount-source-two");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&second_source).unwrap();
+        assert_eq!(
+            workspace
+                .mount_directory("../escape", &source)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            workspace.mount_directory("inside", &root).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            workspace
+                .mount_directory("README.md", &source)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        workspace.mount_directory("attached", &source).unwrap();
+        assert_eq!(
+            workspace
+                .mounted_source_for("attached/nested/file")
+                .unwrap(),
+            Some(fs::canonicalize(&source).unwrap())
+        );
+        assert_eq!(
+            workspace
+                .mount_directory("attached/child", &second_source)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            workspace.unmount_directory("missing").unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            workspace.directory_path("README.md").unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        workspace.unmount_directory("attached").unwrap();
+        assert!(source.is_dir());
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(second_source).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restored_state_rejects_mismatched_identity_and_change_sequences() {
+        let (workspace, root) = workspace();
+        workspace.create_checkpoint("checkpoint").unwrap();
+        let state = workspace.export_state().unwrap();
+        let restored = Workspace::open(workspace.session_id(), &root).unwrap();
+
+        let mut invalid = state.clone();
+        invalid.session_id = AgentSessionId::new();
+        assert_eq!(
+            restored.restore_state(invalid).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+        let mut invalid = state.clone();
+        invalid.root.push_str("-different");
+        assert_eq!(
+            restored.restore_state(invalid).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+        let mut invalid = state.clone();
+        invalid.checkpoints[0].session_id = AgentSessionId::new();
+        assert_eq!(
+            restored.restore_state(invalid).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+
+        let foreign_session = AgentSessionId::new();
+        let mut invalid = state.clone();
+        invalid.changes.push(SessionFilesystemChange {
+            sequence: EventSequence::new(1),
+            session_id: foreign_session,
+            path: "README.md".to_owned(),
+            kind: WorkspaceChangeKind::Modified,
+            revision: None,
+        });
+        invalid.next_sequence = EventSequence::new(1);
+        assert_eq!(
+            restored.restore_state(invalid).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+
+        let mut invalid = state.clone();
+        invalid.changes = vec![
+            SessionFilesystemChange {
+                sequence: EventSequence::new(1),
+                session_id: workspace.session_id(),
+                path: "README.md".to_owned(),
+                kind: WorkspaceChangeKind::Modified,
+                revision: None,
+            },
+            SessionFilesystemChange {
+                sequence: EventSequence::new(1),
+                session_id: workspace.session_id(),
+                path: "src/lib.rs".to_owned(),
+                kind: WorkspaceChangeKind::Modified,
+                revision: None,
+            },
+        ];
+        invalid.next_sequence = EventSequence::new(1);
+        assert_eq!(
+            restored.restore_state(invalid).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

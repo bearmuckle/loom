@@ -129,3 +129,78 @@ impl LoomError {
 }
 
 pub type Result<T> = std::result::Result<T, LoomError>;
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorCode, LoomError};
+
+    #[test]
+    fn error_codes_are_stable_and_errors_display_their_message() {
+        let cases = [
+            (ErrorCode::InvalidRequest, "invalid_request"),
+            (ErrorCode::InvalidState, "invalid_state"),
+            (ErrorCode::MalformedPayload, "malformed_payload"),
+            (ErrorCode::AuthenticationRequired, "authentication_required"),
+            (ErrorCode::AuthenticationFailed, "authentication_failed"),
+            (ErrorCode::AuthorizationDenied, "authorization_denied"),
+            (ErrorCode::NotFound, "not_found"),
+            (ErrorCode::Conflict, "conflict"),
+            (ErrorCode::CapabilityDenied, "capability_denied"),
+            (ErrorCode::ApprovalRequired, "approval_required"),
+            (ErrorCode::WorkspaceAccessDenied, "workspace_access_denied"),
+            (ErrorCode::ProcessCancelled, "process_cancelled"),
+            (ErrorCode::UnsupportedProtocol, "unsupported_protocol"),
+            (ErrorCode::ProviderUnavailable, "provider_unavailable"),
+            (ErrorCode::ProviderAuthentication, "provider_authentication"),
+            (ErrorCode::ProviderRateLimited, "provider_rate_limited"),
+            (
+                ErrorCode::ProviderInvalidResponse,
+                "provider_invalid_response",
+            ),
+            (ErrorCode::ToolExecution, "tool_execution"),
+            (ErrorCode::Persistence, "persistence"),
+            (ErrorCode::ContextLimitExceeded, "context_limit_exceeded"),
+            (ErrorCode::SessionLimitExceeded, "session_limit_exceeded"),
+            (ErrorCode::RecoveryRequired, "recovery_required"),
+            (ErrorCode::UnsupportedCapability, "unsupported_capability"),
+            (ErrorCode::FileTooLarge, "file_too_large"),
+            (ErrorCode::InvalidEncoding, "invalid_encoding"),
+            (ErrorCode::ExternalChange, "external_change"),
+            (ErrorCode::Vcs, "vcs"),
+            (ErrorCode::RequestCancelled, "request_cancelled"),
+            (ErrorCode::DeadlineExceeded, "deadline_exceeded"),
+            (ErrorCode::Backpressure, "backpressure"),
+            (ErrorCode::Internal, "internal"),
+        ];
+        for (code, name) in cases {
+            assert_eq!(code.to_string(), name);
+            assert_eq!(serde_json::to_string(&code).unwrap(), format!("\"{name}\""));
+        }
+
+        let error = LoomError::not_found("run", "abc");
+        assert_eq!(error.to_string(), "not_found: run 'abc' was not found");
+        assert!(!error.retryable);
+        assert!(LoomError::new(ErrorCode::Internal, "oops", true).retryable);
+        assert_eq!(
+            LoomError::invalid_request("bad").code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            LoomError::invalid_state("bad").code,
+            ErrorCode::InvalidState
+        );
+        assert_eq!(
+            LoomError::malformed_payload("bad").code,
+            ErrorCode::MalformedPayload
+        );
+        assert_eq!(
+            LoomError::unsupported_protocol("bad").code,
+            ErrorCode::UnsupportedProtocol
+        );
+        assert_eq!(LoomError::conflict("bad").code, ErrorCode::Conflict);
+        assert_eq!(
+            LoomError::approval_required("bad").code,
+            ErrorCode::ApprovalRequired
+        );
+    }
+}

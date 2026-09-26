@@ -90,3 +90,42 @@ impl fmt::Display for EventSequence {
         self.0.fmt(formatter)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentSessionId, EventSequence};
+    use std::str::FromStr;
+    use uuid::Uuid;
+
+    #[test]
+    fn uuid_ids_round_trip_through_string_and_serde() {
+        let uuid = Uuid::from_u128(42);
+        let id = AgentSessionId::from_uuid(uuid);
+
+        assert_eq!(*id.as_uuid(), uuid);
+        assert_eq!(AgentSessionId::from_str(&id.to_string()).unwrap(), id);
+        assert!(AgentSessionId::from_str("not-a-uuid").is_err());
+        assert_eq!(serde_json::to_string(&id).unwrap(), format!("\"{uuid}\""));
+        assert_eq!(
+            serde_json::from_str::<AgentSessionId>(&format!("\"{uuid}\"")).unwrap(),
+            id
+        );
+        assert_ne!(AgentSessionId::new(), AgentSessionId::new());
+        assert_eq!(AgentSessionId::default().as_uuid().get_version_num(), 4);
+    }
+
+    #[test]
+    fn event_sequence_saturates_and_displays() {
+        assert_eq!(EventSequence::default().value(), 0);
+        assert_eq!(EventSequence::new(7).next(), EventSequence::new(8));
+        assert_eq!(
+            EventSequence::new(u64::MAX).next(),
+            EventSequence::new(u64::MAX)
+        );
+        assert_eq!(EventSequence::new(7).to_string(), "7");
+        assert_eq!(
+            serde_json::from_str::<EventSequence>("9").unwrap().value(),
+            9
+        );
+    }
+}

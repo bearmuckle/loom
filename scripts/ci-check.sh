@@ -6,5 +6,5 @@ cd "$ROOT"
 
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
+cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80
 cargo build --workspace --locked

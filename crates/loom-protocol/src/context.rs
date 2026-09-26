@@ -95,3 +95,62 @@ impl ContextInspection {
             .is_none_or(|budget| self.included_tokens <= budget)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ContextBudget, ContextInspection};
+    use loom_core::ErrorCode;
+
+    #[test]
+    fn context_budget_reserves_output_and_rejects_empty_input_space() {
+        assert_eq!(
+            ContextBudget::new(Some(100), Some(80), 20)
+                .unwrap()
+                .effective_input_tokens,
+            Some(80)
+        );
+        assert_eq!(
+            ContextBudget::new(Some(100), None, 20)
+                .unwrap()
+                .effective_input_tokens,
+            Some(80)
+        );
+        assert_eq!(
+            ContextBudget::new(None, Some(80), 20)
+                .unwrap()
+                .effective_input_tokens,
+            Some(80)
+        );
+        assert_eq!(
+            ContextBudget::new(None, None, 20)
+                .unwrap()
+                .effective_input_tokens,
+            None
+        );
+        assert_eq!(
+            ContextBudget::new(Some(10), None, 10).unwrap_err().code,
+            ErrorCode::ContextLimitExceeded
+        );
+        assert_eq!(
+            ContextBudget::new(None, None, 0).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn inspection_checks_included_tokens_when_a_budget_exists() {
+        let mut inspection = serde_json::from_value::<ContextInspection>(serde_json::json!({
+            "items": [], "total_tokens": 0, "included_tokens": 10,
+            "omitted_tokens": 0, "budget": {
+                "context_window": null, "requested_input_tokens": null,
+                "reserved_output_tokens": 1, "effective_input_tokens": 10
+            }, "compacted": false, "summary": null
+        }))
+        .unwrap();
+        assert!(inspection.within_budget());
+        inspection.included_tokens = 11;
+        assert!(!inspection.within_budget());
+        inspection.budget.effective_input_tokens = None;
+        assert!(inspection.within_budget());
+    }
+}

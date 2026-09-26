@@ -2904,6 +2904,283 @@ mod tests {
     }
 
     #[test]
+    fn request_payloads_preserve_options_and_convert_tool_messages() {
+        let call = ToolCall {
+            id: ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        };
+        let mut assistant = ModelMessage::new(MessageRole::Assistant, "");
+        assistant.tool_calls.push(call.clone());
+        let mut tool = ModelMessage::new(MessageRole::Tool, "file contents");
+        tool.tool_call_id = Some(call.id);
+        let mut request = ModelRequest {
+            model: ModelId::new("gpt-6-luna"),
+            messages: vec![
+                ModelMessage::new(MessageRole::System, "system"),
+                ModelMessage::new(MessageRole::User, "hello"),
+                assistant,
+                tool,
+            ],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        request.options.max_output_tokens = Some(128);
+
+        let payload = responses_request_payload(&request);
+        assert_eq!(payload["max_output_tokens"], 128);
+        assert_eq!(payload["input"][0]["role"], "system");
+        assert_eq!(payload["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(payload["input"][2]["type"], "function_call");
+        assert_eq!(payload["input"][3]["type"], "function_call_output");
+        assert_eq!(payload["input"][3]["output"], "file contents");
+
+        request.model = ModelId::new("fixture/model");
+        request.options.temperature = Some(0.25);
+        request.options.max_output_tokens = Some(64);
+        request.options.stop_sequences = vec!["STOP".to_owned()];
+        let payload = openai_request_payload(&request);
+        assert_eq!(payload["temperature"], 0.25);
+        assert_eq!(payload["max_tokens"], 64);
+        assert_eq!(payload["stop"][0], "STOP");
+        assert_eq!(
+            payload["messages"][2]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+
+        request.tools.push(loom_model::ToolDefinition {
+            name: "search".to_owned(),
+            description: "Search files".to_owned(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        assert_eq!(
+            responses_request_payload(&request)["tools"][0]["name"],
+            "search"
+        );
+        assert_eq!(
+            openai_request_payload(&request)["tools"][0]["function"]["name"],
+            "search"
+        );
+    }
+
+    #[test]
+    fn provider_usage_and_status_helpers_handle_empty_and_extreme_values() {
+        assert_eq!(parse_tool_arguments("  ").unwrap(), serde_json::json!({}));
+        assert_eq!(
+            finish_reason_from_str("function_call"),
+            FinishReason::ToolCall
+        );
+        assert_eq!(finish_reason_from_str("length"), FinishReason::Length);
+        assert_eq!(finish_reason_from_str("cancelled"), FinishReason::Cancelled);
+        assert_eq!(finish_reason_from_str("unexpected"), FinishReason::Error);
+
+        let usage = openai_usage(&serde_json::json!({
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 3}
+        }));
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cached_input_tokens, 3);
+        assert_eq!(
+            responses_usage(&serde_json::json!({"input_tokens": 4, "output_tokens": 2}))
+                .output_tokens,
+            2
+        );
+        assert_eq!(cost_for_usage(&usage, 1_000, 2_000), 28);
+        assert_eq!(cost_for_usage(&usage, u64::MAX, u64::MAX), u64::MAX / 1_000);
+        assert_eq!(
+            health_endpoint("https://example.test/v1/chat/completions"),
+            "https://example.test/v1/models"
+        );
+        assert_eq!(
+            health_endpoint("https://example.test/status"),
+            "https://example.test/status"
+        );
+        assert_eq!(
+            trim_endpoint("https://example.test/api///"),
+            "https://example.test/api"
+        );
+        assert_eq!(
+            ollama_chat_endpoint("http://localhost:11434///".to_owned()),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert_eq!(
+            ollama_chat_endpoint("http://localhost/v1/chat/completions/".to_owned()),
+            "http://localhost/v1/chat/completions"
+        );
+        assert_eq!(bearer_header("secret"), "Bearer secret");
+        let oauth_error = oauth_response_error(OAuthTokenResponse {
+            access_token: None,
+            error: Some("access_denied".to_owned()),
+            error_description: Some("user cancelled".to_owned()),
+        });
+        assert_eq!(oauth_error.code, ErrorCode::ProviderAuthentication);
+        assert!(oauth_error.message.contains("user cancelled"));
+
+        for (status, code, retryable) in [
+            (401, ErrorCode::ProviderAuthentication, false),
+            (425, ErrorCode::ProviderRateLimited, true),
+            (503, ErrorCode::ProviderUnavailable, true),
+            (400, ErrorCode::ProviderInvalidResponse, false),
+        ] {
+            let error = normalize_provider_error("fixture", status);
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable);
+        }
+    }
+
+    #[test]
+    fn responses_stream_decoder_handles_events_and_rejects_malformed_streams() {
+        let mut decoder = StreamDecoder::responses("copilot".to_owned());
+        let mut call_ids = BTreeMap::new();
+        let mut sink = CollectingSink::default();
+
+        assert_eq!(
+            decoder
+                .accept(
+                    &serde_json::json!({"type":"response.output_text.delta", "delta":""}),
+                    &mut call_ids,
+                    &mut sink,
+                )
+                .unwrap(),
+            StreamFlow::Continue
+        );
+        decoder
+            .accept(
+                &serde_json::json!({"type":"response.output_text.delta", "delta":"hello"}),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder
+            .accept(
+                &serde_json::json!({"type":"response.output_item.done"}),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder
+            .accept(
+                &serde_json::json!({"type":"response.output_item.done", "item":{"type":"message"}}),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder
+            .accept(
+                &serde_json::json!({
+                    "type":"response.output_item.done",
+                    "item":{"type":"function_call", "name":"read_file", "call_id":"call-1", "arguments":"{\"path\":\"README.md\"}"}
+                }),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder
+            .accept(
+                &serde_json::json!({
+                    "type":"response.completed",
+                    "response":{"status":"completed", "usage":{"input_tokens":3, "output_tokens":2}}
+                }),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder.finish(&mut sink).unwrap();
+
+        assert!(
+            matches!(sink.events.first(), Some(ModelStreamEvent::TextDelta { text }) if text == "hello")
+        );
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ToolCallDelta { call }
+                if call.name == "read_file" && call.arguments["path"] == "README.md"
+        )));
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::Usage { usage } if usage.input_tokens == 3 && usage.output_tokens == 2
+        )));
+        assert!(matches!(
+            sink.events.last(),
+            Some(ModelStreamEvent::Completed {
+                reason: FinishReason::Stop
+            })
+        ));
+
+        let mut malformed_call = StreamDecoder::responses("copilot".to_owned());
+        assert!(
+            malformed_call
+                .accept(
+                    &serde_json::json!({
+                        "type":"response.output_item.done",
+                        "item":{"type":"function_call", "arguments":"{}"}
+                    }),
+                    &mut BTreeMap::new(),
+                    &mut CollectingSink::default(),
+                )
+                .is_err()
+        );
+        let mut stream_error = StreamDecoder::responses("copilot".to_owned());
+        let error = stream_error
+            .accept(
+                &serde_json::json!({"type":"error", "message":"upstream failed"}),
+                &mut BTreeMap::new(),
+                &mut CollectingSink::default(),
+            )
+            .unwrap_err();
+        assert!(error.message.contains("upstream failed"));
+    }
+
+    #[test]
+    fn chat_stream_decoder_emits_tool_usage_and_completion_or_rejects_bad_arguments() {
+        let mut decoder = StreamDecoder::chat_completions("fixture".to_owned());
+        let mut sink = CollectingSink::default();
+        decoder
+            .accept(
+                &serde_json::json!({
+                    "choices":[{"delta":{"tool_calls":[
+                        {"index":0,"function":{"name":"read_", "arguments":"{\"path\":"}},
+                        {"index":0,"function":{"name":"file", "arguments":"\"README.md\"}"}}
+                    ]}}],
+                    "usage":{"prompt_tokens":5,"completion_tokens":4}
+                }),
+                &mut BTreeMap::new(),
+                &mut sink,
+            )
+            .unwrap();
+        decoder.finish(&mut sink).unwrap();
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ToolCallDelta { call }
+                if call.name == "read_file" && call.arguments["path"] == "README.md"
+        )));
+        assert!(matches!(
+            sink.events.last(),
+            Some(ModelStreamEvent::Completed {
+                reason: FinishReason::ToolCall
+            })
+        ));
+
+        let mut malformed = StreamDecoder::chat_completions("fixture".to_owned());
+        let mut malformed_sink = CollectingSink::default();
+        malformed
+            .accept(
+                &serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{"}}]}}]}),
+                &mut BTreeMap::new(),
+                &mut malformed_sink,
+            )
+            .unwrap();
+        assert!(malformed.finish(&mut malformed_sink).is_err());
+
+        let missing_name = StreamDecoder {
+            tool_calls: BTreeMap::from([(0, PartialToolCall::default())]),
+            ..StreamDecoder::chat_completions("fixture".to_owned())
+        };
+        assert!(missing_name.finish(&mut CollectingSink::default()).is_err());
+    }
+
+    #[test]
     fn github_copilot_discovery_lists_only_models_with_tool_call_support() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3152,6 +3429,104 @@ mod tests {
     }
 
     #[test]
+    fn openai_response_normalization_validates_envelopes_and_argument_shapes() {
+        for body in [
+            serde_json::json!({}),
+            serde_json::json!({"choices": []}),
+            serde_json::json!({"choices": [{}]}),
+        ] {
+            assert_eq!(
+                normalize_openai_response(&body).unwrap_err().code,
+                ErrorCode::ProviderInvalidResponse
+            );
+        }
+        for tool_call in [
+            serde_json::json!({}),
+            serde_json::json!({"function": {}}),
+            serde_json::json!({"function": {"name": "read_file", "arguments": 7}}),
+        ] {
+            let body = serde_json::json!({
+                "choices": [{"message": {"tool_calls": [tool_call]}}]
+            });
+            assert_eq!(
+                normalize_openai_response(&body).unwrap_err().code,
+                ErrorCode::ProviderInvalidResponse
+            );
+        }
+
+        let events = normalize_openai_response(&serde_json::json!({
+            "choices": [{"message": {
+                "content": "",
+                "tool_calls": [{"function": {"name": "read_file"}}]
+            }, "finish_reason": null}]
+        }))
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events.first(),
+            Some(ModelStreamEvent::ToolCallDelta { call })
+                if call.name == "read_file" && call.arguments == serde_json::json!({})
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(ModelStreamEvent::Completed {
+                reason: FinishReason::Stop
+            })
+        ));
+    }
+
+    #[test]
+    fn responses_normalization_covers_text_tool_usage_and_invalid_calls() {
+        let mut call_ids = BTreeMap::new();
+        let events = normalize_responses_response(
+            &serde_json::json!({
+                "status": "completed",
+                "output": [
+                    {"type":"message","content":[{"text":"answer"},{"text": 4}]},
+                    {"type":"function_call","call_id":"call-1","name":"read_file","arguments":"{\"path\":\"README.md\"}"},
+                    {"type":"unknown"}
+                ],
+                "usage":{"input_tokens":10,"output_tokens":3,"input_tokens_details":{"cached_tokens":2}}
+            }),
+            &mut call_ids,
+        )
+        .unwrap();
+        assert!(matches!(events[0], ModelStreamEvent::TextDelta { ref text } if text == "answer"));
+        assert!(
+            matches!(events[1], ModelStreamEvent::ToolCallDelta { ref call } if call.name == "read_file" && call.arguments["path"] == "README.md")
+        );
+        assert!(
+            matches!(events[2], ModelStreamEvent::Usage { ref usage } if usage.cached_input_tokens == 2)
+        );
+        assert!(matches!(
+            events[3],
+            ModelStreamEvent::Completed {
+                reason: FinishReason::Stop
+            }
+        ));
+
+        for output in [
+            serde_json::json!([{"type":"function_call"}]),
+            serde_json::json!([{"type":"function_call","name":"read_file","arguments":"invalid"}]),
+        ] {
+            assert_eq!(
+                normalize_responses_response(&serde_json::json!({"output": output}), &mut call_ids)
+                    .unwrap_err()
+                    .code,
+                ErrorCode::ProviderInvalidResponse
+            );
+        }
+        assert!(matches!(
+            normalize_responses_response(&serde_json::json!({"status":"failed"}), &mut call_ids)
+                .unwrap()
+                .last(),
+            Some(ModelStreamEvent::Completed {
+                reason: FinishReason::Error
+            })
+        ));
+    }
+
+    #[test]
     fn registry_lists_deterministic_and_local_models_without_secrets() {
         let registry = ProviderRegistry::demo();
         let models = registry.list_models().unwrap();
@@ -3167,6 +3542,207 @@ mod tests {
         );
         let serialized = serde_json::to_string(&registry.list_providers().unwrap()).unwrap();
         assert!(!serialized.contains("Bearer"));
+    }
+
+    #[test]
+    fn registry_validates_provider_and_model_configuration_and_supports_catalog_updates() {
+        let registry = ProviderRegistry::new();
+        let credential = CredentialRef::new("fixture-token");
+        let model = ModelDescriptor {
+            id: ModelId::new("fixture/model"),
+            provider: ProviderId::new("fixture"),
+            display_name: "Fixture model".to_owned(),
+            context_window: Some(8_000),
+            capabilities: ModelCapabilities::default(),
+        };
+
+        assert!(
+            registry
+                .register(ProviderConfig::openai_compatible(
+                    "",
+                    "empty",
+                    "http://localhost/v1",
+                    model.clone(),
+                    None
+                ))
+                .is_err()
+        );
+        let mut no_models = ProviderConfig::deterministic();
+        no_models.models.clear();
+        assert!(registry.register(no_models).is_err());
+        assert!(
+            registry
+                .register(ProviderConfig::openai_compatible(
+                    "fixture",
+                    "fixture",
+                    "http://localhost/v1",
+                    model.clone(),
+                    Some(CredentialRef::new("  ")),
+                ))
+                .is_err()
+        );
+        assert!(registry.register(ProviderConfig::deterministic()).is_ok());
+        let mut wrong_deterministic = ProviderConfig::deterministic();
+        wrong_deterministic.models[0].id = ModelId::new("deterministic/other");
+        assert!(registry.register(wrong_deterministic).is_err());
+
+        registry
+            .register(ProviderConfig::openai_compatible(
+                "fixture",
+                "Fixture provider",
+                "http://localhost/v1/chat/completions",
+                model.clone(),
+                Some(credential),
+            ))
+            .unwrap();
+        assert!(
+            registry
+                .add_model(&ProviderId::new("missing"), model.clone())
+                .is_err()
+        );
+        let mut empty_id = model.clone();
+        empty_id.id = ModelId::new(" ");
+        assert!(
+            registry
+                .add_model(&ProviderId::new("fixture"), empty_id)
+                .is_err()
+        );
+        assert!(
+            registry
+                .add_model(&ProviderId::new("fixture"), model.clone())
+                .is_err()
+        );
+        let second = ModelDescriptor {
+            id: ModelId::new("fixture/second"),
+            provider: ProviderId::new("fixture"),
+            display_name: "Second model".to_owned(),
+            context_window: None,
+            capabilities: ModelCapabilities::default(),
+        };
+        registry
+            .add_model(&ProviderId::new("fixture"), second.clone())
+            .unwrap();
+        assert!(registry.describe_model(&second.id).is_ok());
+        assert!(
+            registry
+                .describe_model(&ModelId::new("missing/model"))
+                .is_err()
+        );
+        assert!(registry.pricing(&ModelId::new("fixture/model")).is_ok());
+        assert!(
+            registry
+                .create_provider(&ModelId::new("missing/model"))
+                .is_err()
+        );
+        assert!(
+            registry
+                .health(&ProviderId::new("missing"))
+                .unwrap()
+                .checked_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn registry_restores_copilot_configs_without_trusting_saved_model_lists() {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let registry = ProviderRegistry::with_credentials(credentials.clone());
+        registry
+            .configure_github_copilot("github-secret".to_owned())
+            .unwrap();
+        let copilot_model = ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL);
+        assert_eq!(
+            registry
+                .create_provider(&copilot_model)
+                .unwrap()
+                .descriptor()
+                .id,
+            copilot_model
+        );
+        let mut configs = registry.export_configs().unwrap();
+        let copilot_provider = configs[0].id.clone();
+        configs[0].models.push(ModelDescriptor {
+            id: ModelId::new("untrusted/saved-model"),
+            provider: copilot_provider,
+            display_name: "Untrusted saved model".to_owned(),
+            context_window: None,
+            capabilities: ModelCapabilities::default(),
+        });
+        configs.push(ProviderConfig::github_copilot(CredentialRef::new(
+            "missing",
+        )));
+        configs.push(ProviderConfig::deterministic());
+        registry.restore_configs(configs).unwrap();
+        let restored = registry.export_configs().unwrap();
+        let copilot = restored
+            .iter()
+            .find(|config| config.kind == ProviderKind::GitHubCopilot)
+            .unwrap();
+        assert_eq!(copilot.models.len(), 1);
+        assert!(
+            !copilot
+                .models
+                .iter()
+                .any(|model| model.id.as_str() == "untrusted/saved-model")
+        );
+        assert_eq!(registry.list_providers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn registry_health_check_records_healthy_and_degraded_results() {
+        let registry = ProviderRegistry::new();
+        let provider_id = ProviderId::new("fixture");
+        let model = ModelDescriptor {
+            id: ModelId::new("fixture/model"),
+            provider: provider_id.clone(),
+            display_name: "Fixture model".to_owned(),
+            context_window: None,
+            capabilities: ModelCapabilities::default(),
+        };
+
+        let (endpoint, server) =
+            serve_once(r#"{"data":[{"id":"fixture/model"}]}"#, "application/json");
+        registry
+            .register_openai_compatible(
+                provider_id.clone(),
+                "Fixture",
+                format!("{endpoint}/chat/completions"),
+                model.clone(),
+                None,
+            )
+            .unwrap();
+        let healthy = registry.check_health(&provider_id).unwrap();
+        assert_eq!(healthy.state, ProviderHealthState::Healthy);
+        assert_eq!(healthy.consecutive_failures, 0);
+        server.join().unwrap().unwrap();
+
+        let failed_registry = ProviderRegistry::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable_address = listener.local_addr().unwrap();
+        drop(listener);
+        failed_registry
+            .register_openai_compatible(
+                provider_id.clone(),
+                "Fixture",
+                format!("http://{unavailable_address}/v1/chat/completions"),
+                model,
+                None,
+            )
+            .unwrap();
+        let degraded = failed_registry.check_health(&provider_id).unwrap();
+        assert_eq!(degraded.state, ProviderHealthState::Degraded);
+        assert_eq!(degraded.consecutive_failures, 1);
+        assert!(degraded.last_error.is_some());
+
+        assert!(
+            failed_registry
+                .check_health(&ProviderId::new("missing"))
+                .is_err()
+        );
+        let empty_registry = ProviderRegistry::new();
+        let mut empty_provider = ProviderConfig::ollama("http://127.0.0.1:1", "fixture/model");
+        empty_provider.models.clear();
+        empty_registry.register(empty_provider).unwrap_err();
     }
 
     #[test]
@@ -3310,32 +3886,56 @@ mod tests {
     }
 
     #[test]
+    fn credential_store_handles_missing_entries_removal_and_malformed_files() {
+        let suffix = loom_core::ToolCallId::new().to_string();
+        let directory = std::env::temp_dir().join(format!("loom-credential-errors-{suffix}"));
+        let path = directory.join("credentials.json");
+        let store = FileCredentialStore::open(&path).unwrap();
+        let reference = CredentialRef::new("provider");
+        assert_eq!(
+            store.resolve(&reference).unwrap_err().code,
+            ErrorCode::ProviderAuthentication
+        );
+        assert!(!store.remove(&reference).unwrap());
+        store
+            .insert(reference.clone(), "secret".to_owned())
+            .unwrap();
+        assert!(store.remove(&reference).unwrap());
+        assert_eq!(
+            FileCredentialStore::open(&path)
+                .unwrap()
+                .resolve(&reference)
+                .unwrap_err()
+                .code,
+            ErrorCode::ProviderAuthentication
+        );
+        fs::write(&path, b"not-json").unwrap();
+        assert_eq!(
+            FileCredentialStore::open(&path).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn github_copilot_exchanges_github_token_before_chat_completion() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut token_stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let read = token_stream.read(&mut request).unwrap();
-            let token_request = String::from_utf8_lossy(&request[..read]);
+            let token_request = read_request_headers(&mut token_stream).unwrap();
             assert!(token_request.lines().any(|line| {
                 line.to_ascii_lowercase()
                     .starts_with("authorization: token ")
             }));
             let token_body =
                 format!(r#"{{"token":"copilot-token","endpoints":{{"api":"http://{address}"}}}}"#);
-            write!(
-                token_stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                token_body.len(),
-                token_body
-            )
-            .unwrap();
+            write_response(&mut token_stream, "application/json", &token_body).unwrap();
 
             let (mut chat_stream, _) = listener.accept().unwrap();
-            let read = chat_stream.read(&mut request).unwrap();
-            let chat_request = String::from_utf8_lossy(&request[..read]);
-            let chat_request = chat_request.to_ascii_lowercase();
+            let chat_request = read_request_headers(&mut chat_stream)
+                .unwrap()
+                .to_ascii_lowercase();
             assert!(
                 chat_request
                     .lines()
@@ -3343,13 +3943,7 @@ mod tests {
             );
             assert!(chat_request.contains("editor-version: vscode/1.96.2"));
             let chat_body = r#"{"choices":[{"message":{"content":"copilot response"},"finish_reason":"stop"}]}"#;
-            write!(
-                chat_stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                chat_body.len(),
-                chat_body
-            )
-            .unwrap();
+            write_response(&mut chat_stream, "application/json", chat_body).unwrap();
         });
         let descriptor = ModelDescriptor {
             id: ModelId::new("gpt-4o"),

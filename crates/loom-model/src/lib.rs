@@ -179,3 +179,68 @@ pub enum ModelStreamEvent {
     Usage { usage: TokenUsage },
     Completed { reason: FinishReason },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CompletionOptions, FinishReason, MessageRole, ModelCapabilities, ModelId, ModelMessage,
+        ModelStreamEvent, ProviderId, TokenUsage,
+    };
+
+    #[test]
+    fn identifiers_and_messages_serialize_as_stable_values() {
+        assert_eq!(ModelId::from("model-x").as_str(), "model-x");
+        assert_eq!(
+            ProviderId::from(String::from("provider-y")).as_str(),
+            "provider-y"
+        );
+        let message = ModelMessage::new(MessageRole::User, "hello");
+        assert_eq!(message.content, "hello");
+        assert!(message.name.is_none());
+        assert!(message.tool_calls.is_empty());
+        assert_eq!(serde_json::to_value(&message).unwrap()["role"], "user");
+        assert_eq!(
+            serde_json::from_value::<MessageRole>(serde_json::json!("assistant")).unwrap(),
+            MessageRole::Assistant
+        );
+        assert_eq!(
+            serde_json::to_value(ModelStreamEvent::Completed {
+                reason: FinishReason::ToolCall
+            })
+            .unwrap(),
+            serde_json::json!({ "type": "completed", "data": { "reason": "tool_call" } })
+        );
+    }
+
+    #[test]
+    fn model_capabilities_intersect_every_supported_feature() {
+        let all = ModelCapabilities {
+            streaming: true,
+            tool_calling: true,
+            vision: true,
+            json_mode: true,
+        };
+        let partial = ModelCapabilities {
+            streaming: true,
+            tool_calling: false,
+            vision: true,
+            json_mode: false,
+        };
+        assert_eq!(all.clone().intersection(&partial), partial);
+        assert_eq!(
+            all.intersect(ModelCapabilities::default()),
+            ModelCapabilities::default()
+        );
+        assert_eq!(
+            serde_json::from_value::<CompletionOptions>(serde_json::json!({
+                "stop_sequences": []
+            }))
+            .unwrap(),
+            CompletionOptions {
+                stop_sequences: Vec::new(),
+                ..CompletionOptions::default()
+            }
+        );
+        assert_eq!(TokenUsage::default().cached_input_tokens, 0);
+    }
+}

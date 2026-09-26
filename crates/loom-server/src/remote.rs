@@ -459,12 +459,18 @@ async fn execute_request(
     request_timeout: Duration,
 ) -> ResponseEnvelope {
     let request_id = request.request_id;
-    match timeout(
-        request_timeout,
-        spawn_blocking(move || connection.request(request)),
-    )
+    execute_request_with(request_id, request_timeout, move || {
+        connection.request(request)
+    })
     .await
-    {
+}
+
+async fn execute_request_with(
+    request_id: RequestId,
+    request_timeout: Duration,
+    operation: impl FnOnce() -> ResponseEnvelope + Send + 'static,
+) -> ResponseEnvelope {
+    match timeout(request_timeout, spawn_blocking(operation)).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => ResponseEnvelope::failure(
             request_id,
@@ -813,5 +819,382 @@ fn websocket_connect_error(error: TungsteniteError) -> LoomError {
             "could not open the worker WebSocket; check the URL and network access",
             true,
         )
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::{
+        ConnectionControl, RemoteServer, RemoteServerConfig, WebSocketTransport,
+        auth_error_response, bearer_token, execute_request_with, process_text, request_token,
+        try_send_response, websocket_connect_error,
+    };
+    use axum::{
+        extract::ws::Message,
+        http::{HeaderMap, HeaderValue, header::AUTHORIZATION},
+        response::IntoResponse,
+    };
+    use loom_core::{ErrorCode, RequestId};
+    use loom_protocol::{
+        ClientFrame, ClientRequest, RequestEnvelope, ResponseEnvelope, decode_response,
+        encode_client_frame, encode_request,
+    };
+    use std::{
+        collections::HashMap,
+        io,
+        net::{IpAddr, Ipv6Addr, SocketAddr},
+        time::Duration,
+    };
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::tungstenite::Error as TungsteniteError;
+
+    use super::{AuthTokenStore, InProcessBackend};
+
+    #[test]
+    fn request_auth_prefers_a_valid_bearer_header_and_falls_back_to_query() {
+        let mut headers = HeaderMap::new();
+        let query = HashMap::from([("access_token".to_owned(), "query-secret".to_owned())]);
+        assert_eq!(request_token(&headers, &query).unwrap(), "query-secret");
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer header-secret"),
+        );
+        assert_eq!(bearer_token(&headers).unwrap(), "header-secret");
+        assert_eq!(request_token(&headers, &query).unwrap(), "header-secret");
+    }
+
+    #[test]
+    fn request_auth_rejects_empty_query_and_malformed_or_non_bearer_headers() {
+        let mut headers = HeaderMap::new();
+        let empty_query = HashMap::from([("access_token".to_owned(), String::new())]);
+        assert_eq!(
+            request_token(&headers, &empty_query).unwrap_err().code,
+            ErrorCode::AuthenticationRequired
+        );
+        assert_eq!(
+            bearer_token(&headers).unwrap_err().code,
+            ErrorCode::AuthenticationRequired
+        );
+
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic abc"));
+        assert_eq!(
+            bearer_token(&headers).unwrap_err().code,
+            ErrorCode::AuthenticationFailed
+        );
+        headers.insert(AUTHORIZATION, HeaderValue::from_bytes(&[0x80]).unwrap());
+        assert_eq!(
+            bearer_token(&headers).unwrap_err().message,
+            "authorization header is malformed"
+        );
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        assert_eq!(bearer_token(&headers).unwrap(), "");
+    }
+
+    #[test]
+    fn authentication_response_and_socket_errors_map_to_stable_codes() {
+        let unauthorized = auth_error_response(loom_core::LoomError::new(
+            ErrorCode::AuthenticationRequired,
+            "missing",
+            false,
+        ))
+        .into_response();
+        assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+        let forbidden = auth_error_response(loom_core::LoomError::new(
+            ErrorCode::AuthorizationDenied,
+            "denied",
+            false,
+        ))
+        .into_response();
+        assert_eq!(forbidden.status(), axum::http::StatusCode::FORBIDDEN);
+
+        for (message, code) in [
+            ("timed out", ErrorCode::DeadlineExceeded),
+            ("connection refused", ErrorCode::ProviderUnavailable),
+            ("unexpected network failure", ErrorCode::Internal),
+        ] {
+            assert_eq!(
+                websocket_connect_error(TungsteniteError::Io(io::Error::other(message))).code,
+                code
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_server_rejects_invalid_paths_and_zero_limits() {
+        let backend = InProcessBackend::new();
+        let auth = std::sync::Arc::new(AuthTokenStore::new());
+        let mut config = RemoteServerConfig::local_ephemeral();
+        config.path.clear();
+        let error = RemoteServer::new(backend.clone(), auth.clone(), config)
+            .bind()
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+
+        for field in 0..4 {
+            let mut config = RemoteServerConfig::local_ephemeral();
+            match field {
+                0 => config.heartbeat_interval = Duration::ZERO,
+                1 => config.request_timeout = Duration::ZERO,
+                2 => config.max_frame_bytes = 0,
+                _ => config.outgoing_capacity = 0,
+            }
+            let error = RemoteServer::new(backend.clone(), auth.clone(), config)
+                .bind()
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+        }
+        let mut config = RemoteServerConfig::local_ephemeral();
+        config.path = "ws".to_owned();
+        assert_eq!(
+            RemoteServer::new(backend, auth, config)
+                .bind()
+                .await
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_frame_processing_rejects_large_malformed_and_cancel_frames() {
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        let (outgoing, mut received) = mpsc::channel(4);
+        let (control, _) = mpsc::channel(1);
+        let mut pending = HashMap::new();
+
+        process_text(
+            b"too large",
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            1,
+            Duration::from_secs(1),
+        )
+        .await;
+        let Some(axum::extract::ws::Message::Text(text)) = received.recv().await else {
+            panic!("expected oversized-frame response")
+        };
+        assert_eq!(
+            decode_response(text.as_bytes())
+                .unwrap()
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+
+        process_text(
+            b"invalid",
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            100,
+            Duration::from_secs(1),
+        )
+        .await;
+        let Some(axum::extract::ws::Message::Text(text)) = received.recv().await else {
+            panic!("expected malformed-frame response")
+        };
+        assert_eq!(
+            decode_response(text.as_bytes())
+                .unwrap()
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+
+        let request_id = RequestId::new();
+        let cancel = encode_client_frame(&ClientFrame::Cancel { request_id }).unwrap();
+        process_text(
+            &cancel,
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            100,
+            Duration::from_secs(1),
+        )
+        .await;
+        let Some(axum::extract::ws::Message::Text(text)) = received.recv().await else {
+            panic!("expected cancelled-request response")
+        };
+        let response = decode_response(text.as_bytes()).unwrap();
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(
+            response.result.unwrap_err().code,
+            ErrorCode::RequestCancelled
+        );
+
+        let request = RequestEnvelope::new(ClientRequest::DiscoverCapabilities);
+        let wrapped = encode_client_frame(&ClientFrame::Request(Box::new(request))).unwrap();
+        process_text(
+            &wrapped,
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            1024,
+            Duration::from_secs(1),
+        )
+        .await;
+        let Some(axum::extract::ws::Message::Text(text)) = received.recv().await else {
+            panic!("expected wrapped request response")
+        };
+        assert!(decode_response(text.as_bytes()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn remote_frame_processing_tracks_plain_requests_and_cancels_pending_work() {
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        let (outgoing, mut received) = mpsc::channel(4);
+        let (control, _) = mpsc::channel(1);
+        let mut pending = HashMap::new();
+
+        let request = RequestEnvelope::new(ClientRequest::DiscoverCapabilities);
+        let request_id = request.request_id;
+        process_text(
+            &encode_request(&request).unwrap(),
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            1024,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(pending.len(), 1);
+
+        let cancel = encode_client_frame(&ClientFrame::Cancel { request_id }).unwrap();
+        process_text(
+            &cancel,
+            &connection,
+            &outgoing,
+            &control,
+            &mut pending,
+            1024,
+            Duration::from_secs(1),
+        )
+        .await;
+        let Some(Message::Text(text)) = received.recv().await else {
+            panic!("expected cancellation response")
+        };
+        let response = decode_response(text.as_bytes()).unwrap();
+        assert_eq!(response.request_id, request_id);
+        assert_eq!(
+            response.result.unwrap_err().code,
+            ErrorCode::RequestCancelled
+        );
+        assert!(pending.is_empty());
+
+        let timed_out = execute_request_with(RequestId::new(), Duration::ZERO, || {
+            std::thread::sleep(Duration::from_millis(10));
+            ResponseEnvelope::failure(
+                RequestId::new(),
+                loom_core::LoomError::invalid_request("late response"),
+            )
+        })
+        .await;
+        assert_eq!(
+            timed_out.result.unwrap_err().code,
+            ErrorCode::DeadlineExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn outgoing_backpressure_and_disconnect_are_reported() {
+        let response = ResponseEnvelope::failure(
+            RequestId::new(),
+            loom_core::LoomError::invalid_request("test"),
+        );
+        let (outgoing, received) = mpsc::channel(1);
+        let (control, mut controls) = mpsc::channel(1);
+        outgoing
+            .send(axum::extract::ws::Message::Ping(Vec::new().into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            try_send_response(&outgoing, response.clone(), &control)
+                .unwrap_err()
+                .code,
+            ErrorCode::Backpressure
+        );
+        assert!(matches!(
+            controls.try_recv(),
+            Ok(ConnectionControl::Backpressure)
+        ));
+        drop(received);
+        let (closed_outgoing, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        assert_eq!(
+            try_send_response(&closed_outgoing, response, &control)
+                .unwrap_err()
+                .code,
+            ErrorCode::RequestCancelled
+        );
+    }
+
+    #[test]
+    fn remote_server_accessors_and_transport_configuration_are_available() {
+        let backend = InProcessBackend::new();
+        let auth = std::sync::Arc::new(AuthTokenStore::new());
+        let config = RemoteServerConfig::local_ephemeral();
+        let server = RemoteServer::new(backend.clone(), auth.clone(), config.clone());
+        assert!(std::sync::Arc::ptr_eq(server.backend(), &backend));
+        assert!(std::sync::Arc::ptr_eq(server.auth(), &auth));
+        assert_eq!(server.config().path, config.path);
+
+        let transport = WebSocketTransport::new("ws://worker.example/ws", "private-token");
+        assert_eq!(transport.url(), "ws://worker.example/ws");
+        assert!(!format!("{transport:?}").contains("private-token"));
+        assert_eq!(
+            transport
+                .clone()
+                .with_max_frame_bytes(0)
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            transport.with_max_frame_bytes(16).unwrap().max_frame_bytes,
+            16
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_rejects_invalid_urls_and_bearer_headers() {
+        let invalid_url = WebSocketTransport::new("not a websocket URL", "token");
+        assert_eq!(
+            invalid_url.connect().await.err().unwrap().code,
+            ErrorCode::InvalidRequest
+        );
+        let invalid_token = WebSocketTransport::new("ws://localhost:1/ws", "bad\ntoken");
+        assert_eq!(
+            invalid_token.connect().await.err().unwrap().code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn websocket_urls_format_ipv6_addresses() {
+        let mut config = RemoteServerConfig::local_ephemeral();
+        config.path = "/custom".to_owned();
+        assert_eq!(
+            config.websocket_url(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1234)),
+            "ws://[::1]:1234/custom"
+        );
+        assert!(config.is_local_only());
+        config.bind_addr = SocketAddr::new(IpAddr::V6("2001:db8::1".parse().unwrap()), 1234);
+        assert!(!config.is_local_only());
     }
 }

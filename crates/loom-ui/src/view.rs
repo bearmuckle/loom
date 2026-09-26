@@ -127,6 +127,24 @@ fn responsive_layout(width: Pixels) -> ResponsiveLayout {
     }
 }
 
+fn review_panel_is_visible(
+    layout: ResponsiveLayout,
+    review_open: bool,
+    session_count: usize,
+    settings_open: bool,
+    about_open: bool,
+    providers_open: bool,
+    github_login_open: bool,
+) -> bool {
+    !layout.phone
+        && review_open
+        && session_count > 0
+        && !settings_open
+        && !about_open
+        && !providers_open
+        && !github_login_open
+}
+
 fn session_header_title() -> gpui_kit::Div {
     div().flex().flex_1().min_w(px(0.)).items_center().gap_2()
 }
@@ -1177,6 +1195,67 @@ enum SessionSourceChoice {
     GitHub,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct SessionListProjection {
+    entries: Vec<(AgentSessionId, String)>,
+    selected_index: Option<usize>,
+}
+
+fn session_list_projection(
+    sessions: &[AgentSessionSnapshot],
+    active_session_id: AgentSessionId,
+) -> SessionListProjection {
+    SessionListProjection {
+        entries: sessions
+            .iter()
+            .map(|session| (session.id, session.name.clone()))
+            .collect(),
+        selected_index: sessions
+            .iter()
+            .position(|session| session.id == active_session_id),
+    }
+}
+
+fn source_dialog_initial_state(
+    purpose: SessionSourceDialogPurpose,
+    local_directory_available: bool,
+) -> SessionSourceChoice {
+    match purpose {
+        SessionSourceDialogPurpose::StartSession => SessionSourceChoice::Empty,
+        SessionSourceDialogPurpose::AddToSession if local_directory_available => {
+            SessionSourceChoice::LocalDirectory
+        }
+        SessionSourceDialogPurpose::AddToSession => SessionSourceChoice::GitHub,
+    }
+}
+
+fn source_choice_is_allowed(
+    purpose: SessionSourceDialogPurpose,
+    local_directory_available: bool,
+    choice: SessionSourceChoice,
+) -> bool {
+    match choice {
+        SessionSourceChoice::Empty => purpose == SessionSourceDialogPurpose::StartSession,
+        SessionSourceChoice::LocalDirectory => local_directory_available,
+        SessionSourceChoice::GitHub => true,
+    }
+}
+
+fn local_source_available(
+    purpose: SessionSourceDialogPurpose,
+    configured: bool,
+    active_node_id: Option<&str>,
+    default_node_id: &str,
+) -> bool {
+    configured
+        && match purpose {
+            SessionSourceDialogPurpose::StartSession => true,
+            SessionSourceDialogPurpose::AddToSession => {
+                active_node_id.is_none_or(|node_id| node_id == default_node_id)
+            }
+        }
+}
+
 enum SessionCreationSource {
     LocalDirectory(String),
     GitHub(GitHubRepository),
@@ -1334,6 +1413,106 @@ impl Render for TimelineView {
 }
 
 impl LoomView {
+    #[cfg(test)]
+    fn new_for_test(focus_handle: FocusHandle) -> Self {
+        let connection = ClientConnection::InProcess(Box::new(InProcessBackend::new().connect()));
+        let backend = BackendWorker::spawn(connection.clone());
+        let workspace_id = WorkspaceId::new();
+        let active_session = empty_session_snapshot(workspace_id);
+        let model = ModelId::new("deterministic/demo");
+        let node_id = "test-node".to_owned();
+        let node_backends = BTreeMap::from([(node_id.clone(), backend.clone())]);
+        Self {
+            backend,
+            connection,
+            default_backend_node_id: node_id.clone(),
+            node_backends,
+            node_names: BTreeMap::new(),
+            session_node_ids: BTreeMap::new(),
+            workspace_id,
+            workspaces: Vec::new(),
+            local_directory_sources_available: true,
+            sessions: Vec::new(),
+            session_tree: None,
+            session_tree_entries: Vec::new(),
+            active_session: active_session.clone(),
+            active_run: None,
+            active_run_id: None,
+            default_model: model.clone(),
+            session_models: BTreeMap::new(),
+            agent_mode: AgentMode::Agent,
+            auto_approve_actions: true,
+            session_auto_approve_actions: BTreeMap::new(),
+            session_task_cache: BTreeMap::new(),
+            optimistic_messages: Vec::new(),
+            sending_message: false,
+            model: model.clone(),
+            models: vec![model.clone()],
+            default_models: vec![model.clone()],
+            node_model_catalogs: BTreeMap::from([(node_id.clone(), vec![model])]),
+            model_catalog_node_id: Some(node_id),
+            model_refreshes_in_flight: BTreeSet::new(),
+            model_select: None,
+            default_model_select: None,
+            model_select_subscription: None,
+            default_model_select_subscription: None,
+            model_select_items: Vec::new(),
+            default_model_select_items: Vec::new(),
+            model_select_value: None,
+            default_model_select_value: None,
+            agent_mode_select: None,
+            agent_mode_select_subscription: None,
+            settings_open: false,
+            providers_open: false,
+            about_open: false,
+            providers: Vec::new(),
+            providers_node_id: None,
+            theme_choice: ThemeChoice::System,
+            appearance_subscription: None,
+            after_sequence: None,
+            timeline: Vec::new(),
+            timeline_view: None,
+            activity_records_seen: false,
+            expanded_activities: BTreeSet::new(),
+            approval_request_in_flight: false,
+            approval_settings_request_in_flight: false,
+            archive_request_in_flight: false,
+            pending_approval: None,
+            pending_input: None,
+            composer_input: None,
+            composer_placeholder: None,
+            input_subscriptions: Vec::new(),
+            clear_composer_on_render: false,
+            clear_node_on_render: false,
+            rename_input_state: None,
+            source_path_input: None,
+            repository_filter_input: None,
+            pending_source_path: None,
+            composer_focus_handle: focus_handle,
+            session_state: active_session.state,
+            run_state: None,
+            review: ReviewState::default(),
+            session_repositories: Vec::new(),
+            session_directories: Vec::new(),
+            selected_repository_id: None,
+            session_drawer_open: false,
+            rename_dialog: None,
+            source_dialog: None,
+            demo_workspace: false,
+            login_enabled: false,
+            github_connected: false,
+            github_login: None,
+            next_worker_node_id: 0,
+            worker_nodes: Vec::new(),
+            worker_node_polls_scheduled: BTreeSet::new(),
+            workspace_config: WorkspaceConfig::default(),
+            node_input_initial: String::new(),
+            node_input_state: None,
+            run_poll_scheduled: false,
+            browser_startup_error: None,
+        }
+    }
+
     fn is_connected(&self) -> bool {
         #[cfg(target_family = "wasm")]
         {
@@ -1456,6 +1635,27 @@ impl LoomView {
             info!("negotiating protocol");
             negotiate(&connection)?;
         }
+        Self::initialize_from_connection(
+            options,
+            connection,
+            workspace_root,
+            demo_workspace,
+            remote_cleanup_guard,
+            focus_handle,
+            true,
+        )
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn initialize_from_connection(
+        options: &UiOptions,
+        connection: ClientConnection,
+        workspace_root: PathBuf,
+        demo_workspace: bool,
+        mut remote_cleanup_guard: Option<ConnectionCleanupGuard>,
+        focus_handle: FocusHandle,
+        discover_models: bool,
+    ) -> Result<Self, LoomError> {
         let node_status = worker_node_status(&connection)?;
         let default_backend_node_id = node_status.node_id.clone();
         let mut workspaces = list_workspaces(&connection)?;
@@ -1654,7 +1854,9 @@ impl LoomView {
             run_poll_scheduled: false,
             browser_startup_error: None,
         };
-        view.refresh_models();
+        if discover_models {
+            view.refresh_models();
+        }
         view.refresh_sessions()?;
         let active_session = view.active_session.clone();
         if has_session {
@@ -5184,21 +5386,14 @@ impl LoomView {
     }
 
     fn begin_source_dialog(&mut self, purpose: SessionSourceDialogPurpose, cx: &mut Context<Self>) {
-        let local_directory_available = self.local_directory_sources_available
-            && match purpose {
-                SessionSourceDialogPurpose::StartSession => true,
-                SessionSourceDialogPurpose::AddToSession => self
-                    .session_node_ids
-                    .get(&self.active_session.id)
-                    .is_none_or(|node_id| node_id == &self.default_backend_node_id),
-            };
-        let choice = match purpose {
-            SessionSourceDialogPurpose::StartSession => SessionSourceChoice::Empty,
-            SessionSourceDialogPurpose::AddToSession if local_directory_available => {
-                SessionSourceChoice::LocalDirectory
-            }
-            SessionSourceDialogPurpose::AddToSession => SessionSourceChoice::GitHub,
-        };
+        let active_node_id = self.session_node_ids.get(&self.active_session.id);
+        let local_directory_available = local_source_available(
+            purpose,
+            self.local_directory_sources_available,
+            active_node_id.map(String::as_str),
+            &self.default_backend_node_id,
+        );
+        let choice = source_dialog_initial_state(purpose, local_directory_available);
         self.source_dialog = Some(SessionSourceDialog {
             purpose,
             choice,
@@ -5219,18 +5414,10 @@ impl LoomView {
     }
 
     fn choose_source(&mut self, choice: SessionSourceChoice, cx: &mut Context<Self>) {
-        let allowed = choice != SessionSourceChoice::Empty
-            || self
-                .source_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.purpose == SessionSourceDialogPurpose::StartSession);
-        if !allowed
-            || (choice == SessionSourceChoice::LocalDirectory
-                && !self
-                    .source_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.local_directory_available))
-        {
+        let Some(dialog) = self.source_dialog.as_ref() else {
+            return;
+        };
+        if !source_choice_is_allowed(dialog.purpose, dialog.local_directory_available, choice) {
             return;
         }
         if let Some(dialog) = &mut self.source_dialog {
@@ -5887,19 +6074,13 @@ impl LoomView {
     }
 
     pub(crate) fn render_session_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let entries = self
-            .sessions
-            .iter()
-            .map(|session| (session.id, session.name.clone()))
-            .collect::<Vec<_>>();
+        let projection = session_list_projection(&self.sessions, self.active_session.id);
+        let entries = projection.entries;
         let tree_items = entries
             .iter()
             .map(|(id, name)| TreeItem::new(id.to_string(), name.clone()))
             .collect::<Vec<_>>();
-        let selected_index = self
-            .sessions
-            .iter()
-            .position(|session| session.id == self.active_session.id);
+        let selected_index = projection.selected_index;
         let tree = if let Some(tree) = self.session_tree.clone() {
             if self.session_tree_entries != entries {
                 tree.update(cx, |state, cx| state.set_items(tree_items, cx));
@@ -6169,6 +6350,7 @@ impl LoomView {
             let parent_for_toggle = parent.clone();
             let mut row = div()
                 .id(("activity", ((index as u64) << 32) | activity_index as u64))
+                .test_support()
                 .flex()
                 .flex_col()
                 .cursor_pointer()
@@ -7416,6 +7598,7 @@ impl LoomView {
                     .child(
                         div()
                             .id("cancel-session-source")
+                            .test_support()
                             .px_2()
                             .py_1()
                             .rounded_sm()
@@ -7432,6 +7615,7 @@ impl LoomView {
                     .child(
                         div()
                             .id("confirm-session-source")
+                            .test_support()
                             .px_2()
                             .py_1()
                             .rounded_sm()
@@ -7673,6 +7857,7 @@ impl LoomView {
                     .child(
                         div()
                             .id("close-settings")
+                            .test_support()
                             .w(px(28.))
                             .h(px(28.))
                             .flex()
@@ -8722,13 +8907,15 @@ impl Render for LoomView {
         self.schedule_run_poll(cx);
         let view = cx.entity();
         let layout = responsive_layout(window.bounds().size.width);
-        let review_panel_visible = !layout.phone
-            && self.review.open
-            && !self.sessions.is_empty()
-            && !self.settings_open
-            && !self.about_open
-            && !self.providers_open
-            && self.github_login.is_none();
+        let review_panel_visible = review_panel_is_visible(
+            layout,
+            self.review.open,
+            self.sessions.len(),
+            self.settings_open,
+            self.about_open,
+            self.providers_open,
+            self.github_login.is_some(),
+        );
         let decorations = window.window_decorations();
         let client_decorated = matches!(decorations, Decorations::Client { .. });
         let shadow_size = CLIENT_DECORATION_SHADOW;
@@ -9149,6 +9336,7 @@ impl Render for LoomView {
                         .child(
                             div()
                                 .id("mobile-session-drawer")
+                                .test_support()
                                 .absolute()
                                 .top(px(0.))
                                 .bottom(px(0.))
@@ -9333,6 +9521,256 @@ mod session_name_tests {
         });
         assert_eq!(session_name_for_source(&source), "loom");
     }
+
+    #[test]
+    fn sources_without_a_usable_name_receive_a_safe_fallback() {
+        assert_eq!(
+            session_name_for_source(&SessionCreationSource::LocalDirectory("/".to_owned())),
+            "New session"
+        );
+        assert_eq!(session_name_for_path(Path::new("/")), None);
+        assert_eq!(
+            session_name_for_source(&SessionCreationSource::GitHub(GitHubRepository {
+                full_name: "owner/ ".to_owned(),
+                description: None,
+                clone_url: "https://github.com/owner/repo.git".to_owned(),
+                private: false,
+                default_branch: "main".to_owned(),
+            })),
+            "New session"
+        );
+    }
+}
+
+#[cfg(test)]
+mod display_helper_tests {
+    use super::{
+        AgentActivityData, AgentActivityRecord, AgentActivityStatus, FileActivityOperation,
+        activity_label, activity_marker, activity_output, activity_turn_title, change_kind_label,
+        format_bytes, format_duration, format_percentage, is_redundant_completion_summary,
+        run_state_label, session_state_label,
+    };
+    use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
+    use loom_model::{ModelId, ToolCall};
+    use loom_protocol::{AgentActivityKind, AgentRunState, ToolResult};
+    use serde_json::json;
+
+    fn activity(data: AgentActivityData) -> AgentActivityRecord {
+        AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id: RunId::new(),
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::ToolCall,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::from_unix_millis(0),
+            completed_at: None,
+            elapsed_ms: None,
+            data,
+        }
+    }
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: name.to_owned(),
+            arguments: json!({"path":"src/lib.rs"}),
+        }
+    }
+
+    #[test]
+    fn resource_and_duration_labels_handle_missing_and_boundary_values() {
+        assert_eq!(format_bytes(None), "n/a");
+        assert_eq!(format_bytes(Some(1024)), "1.0 KiB");
+        assert_eq!(format_bytes(Some(1 << 20)), "1.0 MiB");
+        assert_eq!(format_bytes(Some(1 << 30)), "1.0 GiB");
+        assert_eq!(format_percentage(None), "n/a");
+        assert_eq!(format_percentage(Some(100)), "100%");
+        assert_eq!(format_percentage(Some(101)), "n/a");
+        assert_eq!(format_duration(999), "999ms");
+        assert_eq!(format_duration(1_500), "1.5s");
+        assert_eq!(format_duration(61_000), "1m 1s");
+    }
+
+    #[test]
+    fn state_and_activity_labels_cover_every_status_and_activity_kind() {
+        let session_states = [
+            (AgentSessionState::Idle, "Ready"),
+            (AgentSessionState::Queued, "Queued"),
+            (AgentSessionState::Planning, "Planning"),
+            (AgentSessionState::AwaitingApproval, "Needs approval"),
+            (AgentSessionState::Paused, "Paused"),
+            (AgentSessionState::Executing, "Working"),
+            (AgentSessionState::Evaluating, "Reviewing"),
+            (AgentSessionState::NeedsInput, "Needs your input"),
+            (AgentSessionState::Completed, "Complete"),
+            (AgentSessionState::Failed, "Something went wrong"),
+            (AgentSessionState::Cancelled, "Cancelled"),
+            (AgentSessionState::Archived, "Archived"),
+        ];
+        for (state, label) in session_states {
+            assert_eq!(session_state_label(state), label);
+        }
+        assert_eq!(run_state_label(None), "Ready");
+        for (state, label) in [
+            (AgentRunState::Planning, "Planning"),
+            (AgentRunState::Executing, "Working"),
+            (AgentRunState::AwaitingApproval, "Needs approval"),
+            (AgentRunState::Paused, "Paused"),
+            (AgentRunState::NeedsInput, "Needs your input"),
+            (AgentRunState::Evaluating, "Reviewing"),
+            (AgentRunState::Completed, "Complete"),
+            (AgentRunState::Failed, "Something went wrong"),
+            (AgentRunState::Cancelled, "Cancelled"),
+        ] {
+            assert_eq!(run_state_label(Some(state)), label);
+        }
+        for (kind, label) in [
+            (loom_workspace::WorkspaceChangeKind::Created, "New"),
+            (loom_workspace::WorkspaceChangeKind::Deleted, "Removed"),
+            (loom_workspace::WorkspaceChangeKind::Modified, "Updated"),
+        ] {
+            assert_eq!(change_kind_label(kind), label);
+        }
+        for (status, marker) in [
+            (AgentActivityStatus::Started, "›"),
+            (AgentActivityStatus::Completed, "✓"),
+            (AgentActivityStatus::Failed, "×"),
+            (AgentActivityStatus::AwaitingApproval, "!"),
+            (AgentActivityStatus::AwaitingInput, "?"),
+            (AgentActivityStatus::Cancelled, "–"),
+        ] {
+            assert_eq!(activity_marker(status), marker);
+        }
+
+        let model = activity(AgentActivityData::ModelTurn {
+            model: ModelId::new("test-model"),
+        });
+        assert_eq!(
+            activity_label(&model),
+            ("Agent turn · test-model".to_owned(), None)
+        );
+        assert_eq!(activity_output(&model), None);
+
+        let tool = activity(AgentActivityData::ToolCall {
+            call: call("apply_patch"),
+            result: None,
+        });
+        assert_eq!(activity_label(&tool).0, "apply_patch");
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&tool)),
+            "Making changes"
+        );
+
+        let file = activity(AgentActivityData::File {
+            call: call("read_file"),
+            operation: FileActivityOperation::Read,
+            path: None,
+            result: None,
+        });
+        assert_eq!(activity_label(&file).0, "Read file");
+        let listed = activity(AgentActivityData::File {
+            call: call("list_files"),
+            operation: FileActivityOperation::List,
+            path: None,
+            result: Some(ToolResult::success(
+                &call("list_files"),
+                "src/lib.rs".to_owned(),
+            )),
+        });
+        assert_eq!(activity_label(&listed).0, "List files");
+        assert_eq!(activity_output(&listed), Some("src/lib.rs"));
+        let empty_result = activity(AgentActivityData::ToolCall {
+            call: call("inspect"),
+            result: Some(ToolResult::success(&call("inspect"), String::new())),
+        });
+        assert_eq!(activity_output(&empty_result), None);
+        let tool_only = activity(AgentActivityData::ToolCall {
+            call: call("inspect"),
+            result: None,
+        });
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&tool_only)),
+            "Using tools"
+        );
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&file)),
+            "Inspecting the workspace"
+        );
+
+        let write = activity(AgentActivityData::File {
+            call: call("write_file"),
+            operation: FileActivityOperation::Write,
+            path: Some("src/main.rs".to_owned()),
+            result: None,
+        });
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&write)),
+            "Making changes"
+        );
+
+        let search = activity(AgentActivityData::Search {
+            call: call("search"),
+            query: "needle".to_owned(),
+            path: Some("src".to_owned()),
+            result: None,
+        });
+        assert!(activity_label(&search).1.unwrap().contains("in src"));
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&search)),
+            "Searching the codebase"
+        );
+
+        let command = activity(AgentActivityData::Command {
+            call: call("run"),
+            command: "cargo".to_owned(),
+            args: vec!["test".to_owned()],
+            cwd: Some("repo".to_owned()),
+            result: None,
+        });
+        assert_eq!(activity_label(&command).0, "Run command");
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&command)),
+            "Running commands"
+        );
+        assert_eq!(activity_turn_title(&[]), "Working on the task");
+        for data in [
+            AgentActivityData::File {
+                call: call("read_file"),
+                operation: FileActivityOperation::Read,
+                path: Some("src/lib.rs".to_owned()),
+                result: Some(ToolResult::success(
+                    &call("read_file"),
+                    "file output".to_owned(),
+                )),
+            },
+            AgentActivityData::Search {
+                call: call("search"),
+                query: "needle".to_owned(),
+                path: None,
+                result: Some(ToolResult::success(
+                    &call("search"),
+                    "search output".to_owned(),
+                )),
+            },
+            AgentActivityData::Command {
+                call: call("run"),
+                command: "cargo".to_owned(),
+                args: vec!["test".to_owned()],
+                cwd: None,
+                result: Some(ToolResult::success(
+                    &call("run"),
+                    "command output".to_owned(),
+                )),
+            },
+        ] {
+            assert!(activity_output(&activity(data)).is_some());
+        }
+        assert!(is_redundant_completion_summary(
+            "Completed task: fixed the bug"
+        ));
+        assert!(!is_redundant_completion_summary("The task was completed"));
+    }
 }
 
 #[cfg(test)]
@@ -9412,10 +9850,1993 @@ mod session_header_render_tests {
 }
 
 #[cfg(test)]
+mod loom_view_render_tests {
+    use super::{
+        LoomView, SessionSourceChoice, SessionSourceDialog, SessionSourceDialogPurpose,
+        WorkerConnectionState, WorkerNodeEntry,
+    };
+    use crate::state::GitHubLoginState;
+    use crate::state::RenameDialogState;
+    use crate::state::ReviewRow;
+    use crate::state::ThemeChoice;
+    use crate::state::TimelineItem;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{AppContext, TestAppContext, px, size};
+    use loom_core::CapabilitySet;
+    use loom_core::{ActivityId, AgentSessionId, ErrorCode, RunId, Timestamp, ToolCallId};
+    use loom_model::{
+        ModelCapabilities, ModelDescriptor, ModelId, ProviderHealth, ProviderKind, ProviderSummary,
+        ToolCall,
+    };
+    use loom_protocol::ToolResult;
+    use loom_protocol::{
+        AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+        ClientRequest, FileActivityOperation, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind,
+        GitFileStatus, GitFileStatusKind, GitHubRepository, GitRepositoryStatus, RequestEnvelope,
+        ServerResponse, SessionFilesystemChange, SessionFilesystemFile, SessionRepository,
+        WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind,
+    };
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    fn render_scenario(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
+        render_scenario_at(cx, size(px(1280.), px(800.)), configure);
+    }
+
+    fn render_scenario_at(
+        cx: &mut TestAppContext,
+        window_size: gpui_kit::Size<gpui_kit::Pixels>,
+        configure: impl FnOnce(&mut LoomView),
+    ) {
+        let handle = cx.open_window(window_size, |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            configure(&mut view);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn empty_session_view_renders_without_a_backend_round_trip(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |_| {});
+    }
+
+    #[gpui_kit::test]
+    fn startup_rejects_credential_bearing_remote_urls_and_missing_tokens(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let options = |remote: &str, token: Option<&str>| super::UiOptions {
+                workspace: None,
+                task: "startup validation".to_owned(),
+                demo: false,
+                model: ModelId::new("deterministic/demo"),
+                endpoint: None,
+                api_key: None,
+                remote: Some(remote.to_owned()),
+                token: token.map(str::to_owned),
+            };
+            let error = match LoomView::try_new(
+                &options("ws://user:secret@worker.example", Some("token")),
+                cx.focus_handle(),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("credential-bearing URL was accepted"),
+            };
+            assert!(error.message.contains("must not contain credentials"));
+
+            let error =
+                match LoomView::try_new(&options("ws://worker.example", None), cx.focus_handle()) {
+                    Err(error) => error,
+                    Ok(_) => panic!("remote connection without a token was accepted"),
+                };
+            assert!(error.message.contains("require LOOM_TOKEN"));
+
+            let error = match LoomView::try_new(
+                &options("not a WebSocket URL", Some("token")),
+                cx.focus_handle(),
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid remote URL was accepted"),
+            };
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+
+            let invalid_workspace =
+                std::env::temp_dir().join(format!("loom-ui-missing-{}", uuid::Uuid::new_v4()));
+            let local_options = super::UiOptions {
+                workspace: Some(invalid_workspace),
+                task: "startup validation".to_owned(),
+                demo: false,
+                model: ModelId::new("deterministic/demo"),
+                endpoint: None,
+                api_key: None,
+                remote: None,
+                token: None,
+            };
+            let error = match LoomView::try_new(&local_options, cx.focus_handle()) {
+                Err(error) => error,
+                Ok(_) => panic!("missing workspace directory was accepted"),
+            };
+            assert_eq!(error.code, ErrorCode::WorkspaceAccessDenied);
+            LoomView::new_for_test(cx.focus_handle())
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn connection_bootstrap_creates_and_attaches_a_local_workspace_session(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let _handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let options = super::UiOptions {
+                workspace: None,
+                task: "bootstrap test".to_owned(),
+                demo: false,
+                model: ModelId::new("deterministic/demo"),
+                endpoint: None,
+                api_key: None,
+                remote: None,
+                token: None,
+            };
+            let workspace_root =
+                std::env::temp_dir().join(format!("loom-ui-bootstrap-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&workspace_root).unwrap();
+            let connection = super::ClientConnection::InProcess(Box::new(
+                loom_server::InProcessBackend::new().connect(),
+            ));
+            crate::connection::negotiate(&connection).unwrap();
+            let mut view = LoomView::initialize_from_connection(
+                &options,
+                connection,
+                workspace_root.clone(),
+                false,
+                None,
+                cx.focus_handle(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(view.workspaces.len(), 1);
+            assert_eq!(view.sessions.len(), 1);
+            assert!(view.models.contains(&ModelId::new("deterministic/demo")));
+            assert_eq!(view.session_directories.len(), 1);
+            // Avoid starting the live worker's delayed status poll in this synchronous UI test.
+            view.worker_nodes.clear();
+            let _ = std::fs::remove_dir_all(workspace_root);
+            view
+        });
+    }
+
+    #[gpui_kit::test]
+    fn session_list_renders_owner_and_resource_summary(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.active_session.name = "Test session".to_owned();
+            view.sessions = vec![view.active_session.clone()];
+            view.session_node_ids
+                .insert(view.active_session.id, "test-node".to_owned());
+            view.node_names
+                .insert("test-node".to_owned(), "Local worker".to_owned());
+            view.worker_nodes.push(WorkerNodeEntry {
+                id: 0,
+                status: WorkerNodeStatus {
+                    node_id: "test-node".to_owned(),
+                    name: "Local worker".to_owned(),
+                    online: true,
+                    capabilities: CapabilitySet::default(),
+                    resources: WorkerNodeResources {
+                        cpu_count: 4,
+                        cpu_usage_percent: Some(45),
+                        memory_usage_percent: Some(61),
+                        memory_total_bytes: Some(8 * 1024 * 1024 * 1024),
+                        memory_available_bytes: Some(3 * 1024 * 1024 * 1024),
+                        disk_total_bytes: Some(64 * 1024 * 1024 * 1024),
+                        disk_available_bytes: Some(32 * 1024 * 1024 * 1024),
+                    },
+                },
+                is_local: true,
+                url: None,
+                connection: None,
+                connection_state: WorkerConnectionState::Connected,
+                connection_detail: None,
+                severe_load_streak: 0,
+            });
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find(("session-tree-root", 0usize)).visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn run_projection_maps_messages_plan_and_completion_evidence(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.sessions = vec![view.active_session.clone()];
+            view.apply_run_projection(loom_protocol::AgentRunSnapshotProjection {
+                run: loom_protocol::AgentRunSnapshot {
+                    id: RunId::new(),
+                    session_id: view.active_session.id,
+                    task: "inspect the repository".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    state: loom_protocol::AgentRunState::Completed,
+                    started_at: Timestamp::from_unix_millis(1),
+                    updated_at: Timestamp::from_unix_millis(2),
+                    completed_at: Some(Timestamp::from_unix_millis(2)),
+                    summary: Some("Reviewed the project".to_owned()),
+                    evidence: vec![loom_core::EvidenceLink {
+                        label: "readme".to_owned(),
+                        uri: "file:///README.md".to_owned(),
+                    }],
+                },
+                plan: vec![loom_protocol::AgentPlanStep {
+                    id: "step-1".to_owned(),
+                    description: "Read the project files".to_owned(),
+                }],
+                messages: vec![
+                    loom_model::ModelMessage::new(loom_model::MessageRole::System, "system"),
+                    loom_model::ModelMessage::new(loom_model::MessageRole::User, "inspect"),
+                    loom_model::ModelMessage::new(loom_model::MessageRole::Assistant, "first"),
+                    loom_model::ModelMessage::new(loom_model::MessageRole::Assistant, "second"),
+                    loom_model::ModelMessage::new(loom_model::MessageRole::Assistant, ""),
+                    loom_model::ModelMessage::new(loom_model::MessageRole::Tool, "tool output"),
+                ],
+                pending_approval: None,
+                pending_input: None,
+                usage: Default::default(),
+                activities: Vec::new(),
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn run_projection_keeps_existing_timeline_and_suppresses_redundant_summary(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.sessions = vec![view.active_session.clone()];
+            view.timeline = vec![TimelineItem::Assistant("existing transcript".to_owned())];
+            view.apply_run_projection(loom_protocol::AgentRunSnapshotProjection {
+                run: loom_protocol::AgentRunSnapshot {
+                    id: RunId::new(),
+                    session_id: view.active_session.id,
+                    task: "task".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    state: loom_protocol::AgentRunState::Completed,
+                    started_at: Timestamp::from_unix_millis(1),
+                    updated_at: Timestamp::from_unix_millis(2),
+                    completed_at: Some(Timestamp::from_unix_millis(2)),
+                    summary: Some("Completed task: task".to_owned()),
+                    evidence: Vec::new(),
+                },
+                plan: Vec::new(),
+                messages: vec![loom_model::ModelMessage::new(
+                    loom_model::MessageRole::User,
+                    "do not duplicate",
+                )],
+                pending_approval: None,
+                pending_input: None,
+                usage: Default::default(),
+                activities: Vec::new(),
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn session_activation_resets_projection_and_resolves_backend_ownership(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let session_id = loom_core::AgentSessionId::new();
+            let model = ModelId::new("deterministic/next");
+            view.session_models.insert(session_id, model.clone());
+            view.session_auto_approve_actions.insert(session_id, false);
+            view.timeline
+                .push(TimelineItem::Status("old status".to_owned()));
+            view.pending_input = Some("old prompt".to_owned());
+            view.active_run_id = Some(RunId::new());
+            view.review.selected_path = Some("old.rs".to_owned());
+            view.session_node_ids
+                .insert(session_id, view.default_backend_node_id.clone());
+
+            view.activate_session(loom_core::AgentSessionSnapshot {
+                id: session_id,
+                workspace_id: view.workspace_id,
+                name: "Next session".to_owned(),
+                state: loom_core::AgentSessionState::Idle,
+                created_at: Timestamp::from_unix_millis(1),
+                updated_at: Timestamp::from_unix_millis(1),
+            });
+
+            assert_eq!(view.model, model);
+            assert!(!view.auto_approve_actions);
+            assert!(view.timeline.is_empty());
+            assert!(view.pending_input.is_none());
+            assert!(view.active_run_id.is_none());
+            assert!(view.review.selected_path.is_none());
+            assert!(
+                view.backend_for_request(&loom_protocol::ClientRequest::GetAgentSessionSnapshot {
+                    session_id,
+                })
+                .is_ok()
+            );
+            assert!(
+                view.backend_for_request(&loom_protocol::ClientRequest::ListProviders)
+                    .is_ok()
+            );
+
+            view.review.rows = vec![
+                ReviewRow::Hunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                },
+                ReviewRow::Line(GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "added".to_owned(),
+                }),
+                ReviewRow::Line(GitDiffLine {
+                    kind: GitDiffLineKind::Removed,
+                    old_line: Some(1),
+                    new_line: None,
+                    content: "removed".to_owned(),
+                }),
+                ReviewRow::Line(GitDiffLine {
+                    kind: GitDiffLineKind::Context,
+                    old_line: Some(2),
+                    new_line: Some(2),
+                    content: "context".to_owned(),
+                }),
+            ];
+            for index in 0..=view.review.rows.len() {
+                let _ = view.render_review_row(index);
+            }
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn settings_about_and_providers_dialogs_render(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| view.settings_open = true);
+        render_scenario(cx, |view| view.about_open = true);
+        render_scenario(cx, |view| view.providers_open = true);
+    }
+
+    #[gpui_kit::test]
+    fn settings_dialog_close_control_handles_a_real_click(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            LoomView::new_for_test(cx.focus_handle())
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings-button", cx);
+            window.render_frame(cx);
+            assert!(
+                window
+                    .within("settings-dialog")
+                    .find("close-settings")
+                    .visible()
+            );
+            window
+                .within("settings-dialog")
+                .click("cpu-pulse-threshold-decrease", cx);
+            window
+                .within("settings-dialog")
+                .click("cpu-pulse-threshold-increase", cx);
+            window
+                .within("settings-dialog")
+                .click("session-auto-approve-toggle", cx);
+            window.within("settings-dialog").click("close-settings", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("settings-dialog").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn session_source_dialog_choices_and_cancel_are_clickable(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            LoomView::new_for_test(cx.focus_handle())
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("start-first-session", cx);
+            window.render_frame(cx);
+            assert!(
+                window
+                    .within("session-source-dialog")
+                    .find("source-empty")
+                    .visible()
+            );
+            window
+                .within("session-source-dialog")
+                .click("source-empty", cx);
+            window
+                .within("session-source-dialog")
+                .click("source-local-directory", cx);
+            window
+                .within("session-source-dialog")
+                .click("source-github", cx);
+            window
+                .within("session-source-dialog")
+                .click("cancel-session-source", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("session-source-dialog").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn session_source_and_review_actions_cover_empty_invalid_and_missing_states(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+
+            view.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
+            view.choose_source(SessionSourceChoice::LocalDirectory, cx);
+            view.confirm_source_dialog(cx);
+            assert!(view.source_dialog.is_some());
+            assert!(
+                view.timeline
+                    .iter()
+                    .any(|item| matches!(item, TimelineItem::Status(_)))
+            );
+
+            view.choose_source(SessionSourceChoice::GitHub, cx);
+            view.choose_source(SessionSourceChoice::Empty, cx);
+            view.confirm_source_dialog(cx);
+            assert!(view.source_dialog.is_none());
+
+            view.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
+            view.choose_source(SessionSourceChoice::GitHub, cx);
+            view.confirm_source_dialog(cx);
+            assert!(view.source_dialog.is_some());
+
+            view.review.open = false;
+            view.toggle_review_pane(cx);
+            assert!(view.review.open);
+            view.jump_review_hunk(true, cx);
+            view.review.hunk_rows = vec![2, 5];
+            view.jump_review_hunk(true, cx);
+            assert_eq!(view.review.selected_hunk, 0);
+            view.jump_review_hunk(false, cx);
+            assert_eq!(view.review.selected_hunk, 0);
+            view.open_review_diff("missing.txt".to_owned(), false, cx);
+            assert!(view.review.selected_path.is_none());
+            view.open_review_file("missing.txt".to_owned(), cx);
+            assert_eq!(view.review.selected_path.as_deref(), Some("missing.txt"));
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn account_views_and_theme_actions_update_the_view_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.review.open = true;
+            view.settings_open = true;
+            view.github_login = Some(GitHubLoginState::Starting);
+            view.open_about_from_menu(cx);
+            assert!(view.about_open);
+            assert!(!view.settings_open);
+            assert!(!view.review.open);
+            assert!(view.github_login.is_none());
+
+            view.open_providers_from_menu(cx);
+            assert!(view.providers_open);
+            assert!(!view.about_open);
+            assert_eq!(view.providers_node_id.as_deref(), Some("test-node"));
+
+            view.observe_system_appearance(window, cx);
+            view.observe_system_appearance(window, cx);
+            view.select_theme(ThemeChoice::Light, window, cx);
+            assert_eq!(view.theme_choice, ThemeChoice::Light);
+            view.select_theme(ThemeChoice::Dark, window, cx);
+            assert_eq!(view.theme_choice, ThemeChoice::Dark);
+            view.select_theme(ThemeChoice::System, window, cx);
+            assert_eq!(view.theme_choice, ThemeChoice::System);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn github_login_failures_update_account_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.handle_github_device_code(
+                Err(loom_core::LoomError::new(
+                    ErrorCode::ProviderUnavailable,
+                    "device failed",
+                    true,
+                )),
+                cx,
+            );
+            assert!(matches!(
+                view.github_login,
+                Some(GitHubLoginState::Error(_))
+            ));
+            view.finish_github_login(
+                Err(loom_core::LoomError::new(
+                    ErrorCode::ProviderUnavailable,
+                    "poll failed",
+                    true,
+                )),
+                cx,
+            );
+            assert!(matches!(
+                view.github_login,
+                Some(GitHubLoginState::Error(_))
+            ));
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn worker_connection_rejects_empty_credentialed_and_duplicate_inputs(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.connect_worker_node(cx);
+            view.node_input_initial = "wss://user:secret@worker.example/ws token".to_owned();
+            view.connect_worker_node(cx);
+            assert_eq!(view.worker_nodes.len(), 1);
+            assert_eq!(
+                view.worker_nodes[0].connection_state,
+                WorkerConnectionState::Failed
+            );
+            assert!(
+                view.worker_nodes[0]
+                    .connection_detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("Do not include credentials")
+            );
+            view.connect_worker_node(cx);
+            assert_eq!(view.worker_nodes.len(), 1);
+            view.node_input_initial = "wss://worker-without-token.example/ws".to_owned();
+            view.connect_worker_node(cx);
+            assert_eq!(view.worker_nodes.len(), 2);
+            assert!(
+                view.worker_nodes[1]
+                    .connection_detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("URL followed by its access token")
+            );
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn worker_connection_failure_after_valid_input_is_reported(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.node_input_initial = "ws://127.0.0.1:1/ws test-token".to_owned();
+            view.connect_worker_node(cx);
+            assert_eq!(view.worker_nodes.len(), 1);
+            view
+        });
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window.root::<LoomView>().flatten().is_some_and(|view| {
+                let view = view.read(cx);
+                view.worker_nodes.iter().any(|node| {
+                    node.url.as_deref() == Some("ws://127.0.0.1:1/ws")
+                        && node.connection_state == WorkerConnectionState::Failed
+                        && node.connection.is_none()
+                })
+            })
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    fn reconnect_rejects_saved_url_credentials_and_worker_can_be_removed(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.worker_nodes.push(super::connection_placeholder(
+                9,
+                "wss://user:secret@worker.example/ws".to_owned(),
+                WorkerConnectionState::Failed,
+                None,
+            ));
+            view.reconnect_configured_worker_nodes(cx);
+            assert_eq!(
+                view.worker_nodes[0].connection_state,
+                WorkerConnectionState::Failed
+            );
+            assert!(
+                view.worker_nodes[0]
+                    .connection_detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("credentials")
+            );
+            view.remove_worker_node(9, cx);
+            assert!(view.worker_nodes.is_empty());
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn activity_rows_toggle_details_and_offer_approval_actions(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            let call = ToolCall {
+                id: ToolCallId::new(),
+                name: "write_file".to_owned(),
+                arguments: serde_json::json!({"path": "src/lib.rs"}),
+            };
+            let record = AgentActivityRecord {
+                id: ActivityId::new(),
+                run_id: RunId::new(),
+                parent_id: None,
+                step_id: None,
+                kind: AgentActivityKind::File,
+                status: AgentActivityStatus::AwaitingApproval,
+                started_at: Timestamp::from_unix_millis(1),
+                completed_at: None,
+                elapsed_ms: None,
+                data: AgentActivityData::File {
+                    call: call.clone(),
+                    operation: FileActivityOperation::Write,
+                    path: Some("src/lib.rs".to_owned()),
+                    result: None,
+                },
+            };
+            view.timeline = vec![TimelineItem::ActivitySection {
+                activities: vec![record],
+            }];
+            view.active_run_id = Some(RunId::new());
+            view.pending_approval = Some(call);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .within(("activity-section", 0usize))
+                .click(("activity", 0u64), cx);
+            window.render_frame(cx);
+            window.click(("approve-activity", 0u64), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn agent_event_projection_handles_the_run_lifecycle_and_tool_fallback(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let run_id = RunId::new();
+            let call = ToolCall {
+                id: ToolCallId::new(),
+                name: "write_file".to_owned(),
+                arguments: serde_json::json!({"path": "src/main.rs"}),
+            };
+            let snapshot = loom_protocol::AgentRunSnapshot {
+                id: run_id,
+                session_id: view.active_session.id,
+                task: "update the app".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                state: loom_protocol::AgentRunState::Executing,
+                started_at: Timestamp::from_unix_millis(1),
+                updated_at: Timestamp::from_unix_millis(2),
+                completed_at: None,
+                summary: None,
+                evidence: Vec::new(),
+            };
+            let inspection = loom_protocol::ContextInspection {
+                items: Vec::new(),
+                total_tokens: 0,
+                included_tokens: 0,
+                omitted_tokens: 0,
+                budget: loom_protocol::ContextBudget {
+                    context_window: None,
+                    requested_input_tokens: None,
+                    reserved_output_tokens: 0,
+                    effective_input_tokens: None,
+                },
+                compacted: false,
+                summary: None,
+            };
+            for event in [
+                loom_protocol::AgentEvent::RunStarted {
+                    snapshot: snapshot.clone(),
+                },
+                loom_protocol::AgentEvent::PlanProposed {
+                    run_id,
+                    plan: loom_protocol::AgentPlan {
+                        steps: vec![loom_protocol::AgentPlanStep {
+                            id: "edit".to_owned(),
+                            description: "Edit the app".to_owned(),
+                        }],
+                    },
+                },
+                loom_protocol::AgentEvent::StepStarted {
+                    run_id,
+                    step_id: loom_core::StepId::new(),
+                    index: 0,
+                },
+                loom_protocol::AgentEvent::StepCompleted {
+                    run_id,
+                    step_id: loom_core::StepId::new(),
+                    index: 0,
+                },
+                loom_protocol::AgentEvent::ContextInspected { run_id, inspection },
+                loom_protocol::AgentEvent::UserMessage {
+                    run_id,
+                    text: "new request".to_owned(),
+                },
+                loom_protocol::AgentEvent::AssistantMessageDelta {
+                    run_id,
+                    message_id: 1,
+                    text: "The change ".to_owned(),
+                },
+                loom_protocol::AgentEvent::AssistantMessageDelta {
+                    run_id,
+                    message_id: 1,
+                    text: "is ready.".to_owned(),
+                },
+                loom_protocol::AgentEvent::ToolCallRequested {
+                    run_id,
+                    call: call.clone(),
+                },
+                loom_protocol::AgentEvent::ToolApprovalRequired {
+                    run_id,
+                    call: call.clone(),
+                },
+                loom_protocol::AgentEvent::ToolPolicyEvaluated {
+                    run_id,
+                    call: call.clone(),
+                    evaluation: loom_core::PolicyEvaluation {
+                        action: loom_core::ActionKind::Write,
+                        decision: loom_core::PolicyDecision::RequireApproval,
+                        reason: "user approval is required".to_owned(),
+                    },
+                },
+                loom_protocol::AgentEvent::ToolCallStarted {
+                    run_id,
+                    call: call.clone(),
+                },
+                loom_protocol::AgentEvent::ToolOutputChunk {
+                    run_id,
+                    tool_call_id: call.id,
+                    chunk: "file updated".to_owned(),
+                },
+                loom_protocol::AgentEvent::ToolCallCompleted {
+                    run_id,
+                    result: ToolResult::success(&call, "done".to_owned()),
+                },
+                loom_protocol::AgentEvent::ToolApprovalDecided {
+                    run_id,
+                    tool_call_id: call.id,
+                    decision: loom_protocol::ApprovalDecision::Approved,
+                },
+                loom_protocol::AgentEvent::NeedsInput {
+                    run_id,
+                    prompt: "Which branch?".to_owned(),
+                },
+                loom_protocol::AgentEvent::RunUsage {
+                    run_id,
+                    usage: Default::default(),
+                },
+                loom_protocol::AgentEvent::RunUsageUpdated {
+                    run_id,
+                    usage: Default::default(),
+                },
+                loom_protocol::AgentEvent::RunLimitReached {
+                    run_id,
+                    status: loom_core::LimitStatus::new(
+                        loom_core::SessionLimits::default(),
+                        loom_core::UsageSnapshot::default(),
+                    ),
+                },
+                loom_protocol::AgentEvent::RecoveryRequired {
+                    run_id,
+                    reason: "resume the session".to_owned(),
+                },
+                loom_protocol::AgentEvent::RunStateChanged {
+                    run_id,
+                    state: loom_protocol::AgentRunState::Paused,
+                },
+                loom_protocol::AgentEvent::ProviderError {
+                    run_id,
+                    error: loom_core::LoomError::new(ErrorCode::Internal, "provider failed", true),
+                },
+                loom_protocol::AgentEvent::ContextError {
+                    run_id,
+                    error: loom_core::LoomError::new(ErrorCode::Internal, "context failed", false),
+                },
+                loom_protocol::AgentEvent::RunCompleted {
+                    snapshot: loom_protocol::AgentRunSnapshot {
+                        state: loom_protocol::AgentRunState::Completed,
+                        summary: Some("Finished the app update".to_owned()),
+                        ..snapshot
+                    },
+                },
+            ] {
+                view.consume_agent_event(&event);
+            }
+            assert_eq!(
+                view.run_state,
+                Some(loom_protocol::AgentRunState::Completed)
+            );
+            assert!(view.pending_approval.is_none());
+            assert_eq!(view.pending_input.as_deref(), Some("Which branch?"));
+            assert!(
+                view.timeline
+                    .iter()
+                    .any(|item| matches!(item, TimelineItem::Summary { .. }))
+            );
+
+            view.activity_records_seen = true;
+            view.consume_agent_event(&loom_protocol::AgentEvent::ToolCallRequested {
+                run_id,
+                call: call.clone(),
+            });
+            view.consume_agent_event(&loom_protocol::AgentEvent::ToolCallStarted { run_id, call });
+            view.consume_agent_event(&loom_protocol::AgentEvent::ToolOutputChunk {
+                run_id,
+                tool_call_id: ToolCallId::new(),
+                chunk: "suppressed fallback".to_owned(),
+            });
+            view.consume_agent_event(&loom_protocol::AgentEvent::ToolCallCompleted {
+                run_id,
+                result: ToolResult::success(
+                    &ToolCall {
+                        id: ToolCallId::new(),
+                        name: "read_file".to_owned(),
+                        arguments: serde_json::Value::Null,
+                    },
+                    "done".to_owned(),
+                ),
+            });
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn startup_session_load_restores_snapshot_and_source_lists(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            view.refresh_models();
+            assert!(!view.default_models.is_empty());
+            let workspace =
+                crate::connection::create_workspace(&view.connection, "Loaded workspace").unwrap();
+            let session = crate::connection::create_session_in_workspace(
+                &view.connection,
+                workspace.id,
+                "Loaded session",
+            )
+            .unwrap();
+            view.workspace_id = workspace.id;
+            view.workspaces.push(workspace);
+            view.refresh_sessions().unwrap();
+            assert_eq!(view.sessions.len(), 1);
+            view.load_session(session.clone());
+            assert_eq!(view.active_session.id, session.id);
+            assert_eq!(view.active_session.name, "Loaded session");
+            assert!(view.after_sequence.is_some());
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn async_session_load_falls_back_to_run_projection_and_ignores_stale_responses(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let session_id = view.active_session.id;
+            let run = loom_protocol::AgentRunSnapshot {
+                id: RunId::new(),
+                session_id,
+                task: "recover the transcript".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                state: loom_protocol::AgentRunState::Completed,
+                started_at: Timestamp::from_unix_millis(1),
+                updated_at: Timestamp::from_unix_millis(2),
+                completed_at: Some(Timestamp::from_unix_millis(2)),
+                summary: Some("Recovered run".to_owned()),
+                evidence: Vec::new(),
+            };
+            let projection = loom_protocol::AgentRunSnapshotProjection {
+                run: run.clone(),
+                plan: Vec::new(),
+                messages: vec![loom_model::ModelMessage::new(
+                    loom_model::MessageRole::User,
+                    "recover the transcript",
+                )],
+                pending_approval: None,
+                pending_input: None,
+                usage: Default::default(),
+                activities: Vec::new(),
+            };
+            let snapshot = loom_protocol::AgentSessionSnapshotProjection {
+                session: view.active_session.clone(),
+                active_run: Some(projection),
+                latest_sequence: loom_core::EventSequence::new(7),
+                approval_policy: Default::default(),
+                auto_approve_actions: false,
+            };
+            view.finish_async_session_load(
+                session_id,
+                loom_protocol::ResponseEnvelope::success(
+                    loom_core::RequestId::new(),
+                    loom_protocol::ServerResponse::AgentSessionSnapshot(snapshot),
+                ),
+                loom_protocol::ResponseEnvelope::success(
+                    loom_core::RequestId::new(),
+                    loom_protocol::ServerResponse::SessionEvents { events: Vec::new() },
+                ),
+                cx,
+            );
+            assert_eq!(view.active_run_id, Some(run.id));
+            assert!(!view.auto_approve_actions);
+            assert!(view.timeline.iter().any(
+                |item| matches!(item, TimelineItem::Summary { text, .. } if text == "Recovered run")
+            ));
+
+            let old_timeline_len = view.timeline.len();
+            view.finish_async_session_load(
+                AgentSessionId::new(),
+                loom_protocol::ResponseEnvelope::failure(
+                    loom_core::RequestId::new(),
+                    loom_core::LoomError::new(ErrorCode::Internal, "stale", false),
+                ),
+                loom_protocol::ResponseEnvelope::failure(
+                    loom_core::RequestId::new(),
+                    loom_core::LoomError::new(ErrorCode::Internal, "stale", false),
+                ),
+                cx,
+            );
+            assert_eq!(view.timeline.len(), old_timeline_len);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn composer_commands_and_failed_run_responses_are_projected(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.session_node_ids
+                .insert(view.active_session.id, view.default_backend_node_id.clone());
+            view.submit_composer(cx);
+            view.run_slash_command("/help", cx);
+            view.run_slash_command("/unknown", cx);
+            view.run_slash_command("/repo", cx);
+            assert!(view.source_dialog.is_some());
+            view.source_dialog = None;
+            view.run_slash_command("/review", cx);
+            assert!(view.review.open);
+            view.approve_pending_action(cx);
+            view.reject_pending_action(cx);
+
+            view.model = ModelId::new("worker/uncached-model");
+            view.model_catalog_node_id = None;
+            view.send_message("uncached model task".to_owned(), cx);
+            assert!(view.timeline.iter().any(|item| matches!(
+                item,
+                TimelineItem::Error { operation, error }
+                    if operation == "start run" && error.message.contains("has not been refreshed")
+            )));
+
+            view.model = ModelId::new("deterministic/demo");
+            view.send_message("try a task".to_owned(), cx);
+            assert!(!view.sending_message);
+            assert!(
+                !view
+                    .timeline
+                    .iter()
+                    .any(|item| matches!(item, TimelineItem::User(_)))
+            );
+            view.sending_message = true;
+            view.finish_send_response(
+                loom_protocol::ResponseEnvelope::failure(
+                    loom_core::RequestId::new(),
+                    loom_core::LoomError::new(ErrorCode::ProviderUnavailable, "offline", true),
+                ),
+                cx,
+            );
+            assert!(!view.sending_message);
+            view.approval_request_in_flight = true;
+            view.finish_approval_response(
+                loom_protocol::ResponseEnvelope::failure(
+                    loom_core::RequestId::new(),
+                    loom_core::LoomError::new(ErrorCode::InvalidState, "approval expired", false),
+                ),
+                cx,
+            );
+            assert!(!view.approval_request_in_flight);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn server_event_projection_updates_session_and_ignores_service_streams(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            let snapshot = view.active_session.clone();
+            let session_id = snapshot.id;
+            view.consume_event(&loom_protocol::ServerEvent::AgentSessionCreated {
+                snapshot: snapshot.clone(),
+            });
+            view.consume_event(&loom_protocol::ServerEvent::AgentSessionForked {
+                source_session_id: session_id,
+                snapshot: snapshot.clone(),
+            });
+            view.consume_event(&loom_protocol::ServerEvent::AgentSessionStateChanged {
+                previous: loom_core::AgentSessionState::Idle,
+                current: loom_core::AgentSessionState::Executing,
+            });
+            view.consume_event(&loom_protocol::ServerEvent::AgentSessionRenamed {
+                session_id,
+                name: "Renamed from event".to_owned(),
+            });
+            view.consume_event(&loom_protocol::ServerEvent::AgentSessionArchived { session_id });
+            view.consume_event(&loom_protocol::ServerEvent::SessionFilesystemChanged {
+                change: SessionFilesystemChange {
+                    sequence: loom_core::EventSequence::new(1),
+                    session_id,
+                    path: "README.md".to_owned(),
+                    kind: WorkspaceChangeKind::Modified,
+                    revision: None,
+                },
+            });
+            view.consume_event(&loom_protocol::ServerEvent::Terminal {
+                event: loom_protocol::TerminalEventRecord {
+                    sequence: loom_core::EventSequence::new(1),
+                    terminal_id: loom_core::TerminalId::new(),
+                    event: loom_protocol::TerminalEvent::StateChanged {
+                        status: loom_protocol::TerminalStatus::Exited,
+                    },
+                },
+            });
+            view.consume_event(&loom_protocol::ServerEvent::Task {
+                event: loom_protocol::TaskEventRecord {
+                    sequence: loom_core::EventSequence::new(1),
+                    task_id: loom_core::TaskId::new(),
+                    event: loom_protocol::TaskEvent::StateChanged {
+                        status: loom_protocol::TaskStatus::Completed,
+                    },
+                },
+            });
+            view.consume_event(&loom_protocol::ServerEvent::ProviderHealthChanged {
+                provider_id: loom_model::ProviderId::new("test-provider"),
+                health: ProviderHealth::default(),
+            });
+            assert_eq!(view.session_state, loom_core::AgentSessionState::Archived);
+            assert!(
+                view.timeline
+                    .iter()
+                    .any(|item| matches!(item, TimelineItem::Status(_)))
+            );
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn settings_and_provider_dialogs_render_configured_entries(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.settings_open = true;
+            view.browser_startup_error = Some("Workspace setup failed".to_owned());
+            view.worker_nodes.push(WorkerNodeEntry {
+                id: 1,
+                status: WorkerNodeStatus {
+                    node_id: "remote-worker".to_owned(),
+                    name: "Remote worker".to_owned(),
+                    online: false,
+                    capabilities: CapabilitySet::default(),
+                    resources: WorkerNodeResources {
+                        cpu_count: 0,
+                        cpu_usage_percent: None,
+                        memory_usage_percent: None,
+                        memory_total_bytes: None,
+                        memory_available_bytes: None,
+                        disk_total_bytes: None,
+                        disk_available_bytes: None,
+                    },
+                },
+                is_local: false,
+                url: Some("wss://example.test/ws".to_owned()),
+                connection: None,
+                connection_state: WorkerConnectionState::Failed,
+                connection_detail: Some("Connection timed out".to_owned()),
+                severe_load_streak: 0,
+            });
+            for (id, state, online) in [
+                (2, WorkerConnectionState::Disconnected, false),
+                (3, WorkerConnectionState::Connecting, false),
+                (4, WorkerConnectionState::Connected, true),
+                (5, WorkerConnectionState::Connected, false),
+            ] {
+                view.worker_nodes.push(WorkerNodeEntry {
+                    id,
+                    status: WorkerNodeStatus {
+                        node_id: format!("worker-{id}"),
+                        name: format!("Worker {id}"),
+                        online,
+                        capabilities: CapabilitySet::default(),
+                        resources: WorkerNodeResources {
+                            cpu_count: 2,
+                            cpu_usage_percent: Some(50),
+                            memory_usage_percent: Some(75),
+                            memory_total_bytes: Some(8 * 1024 * 1024),
+                            memory_available_bytes: Some(2 * 1024 * 1024),
+                            disk_total_bytes: None,
+                            disk_available_bytes: None,
+                        },
+                    },
+                    is_local: false,
+                    url: Some(format!("wss://worker-{id}.example.test/ws")),
+                    connection: None,
+                    connection_state: state,
+                    connection_detail: None,
+                    severe_load_streak: 0,
+                });
+            }
+        });
+
+        render_scenario(cx, |view| {
+            let local_provider_id = loom_model::ProviderId::new("company-gateway");
+            let github_provider_id = loom_model::ProviderId::new("github-copilot");
+            view.providers_open = true;
+            view.github_connected = true;
+            view.providers = vec![
+                ProviderSummary {
+                    id: local_provider_id.clone(),
+                    kind: ProviderKind::OpenAiCompatible,
+                    display_name: "Company gateway".to_owned(),
+                    models: vec![ModelDescriptor {
+                        id: ModelId::new("gateway/model"),
+                        provider: local_provider_id,
+                        display_name: "Gateway model".to_owned(),
+                        context_window: Some(32_000),
+                        capabilities: ModelCapabilities::default(),
+                    }],
+                    credential_id: Some("gateway-key".to_owned()),
+                    health: ProviderHealth::default(),
+                },
+                ProviderSummary {
+                    id: github_provider_id,
+                    kind: ProviderKind::GitHubCopilot,
+                    display_name: "GitHub Copilot".to_owned(),
+                    models: Vec::new(),
+                    credential_id: None,
+                    health: ProviderHealth::default(),
+                },
+                ProviderSummary {
+                    id: loom_model::ProviderId::new("empty-ollama"),
+                    kind: ProviderKind::Ollama,
+                    display_name: "Ollama".to_owned(),
+                    models: Vec::new(),
+                    credential_id: None,
+                    health: ProviderHealth::default(),
+                },
+            ];
+        });
+    }
+
+    #[gpui_kit::test]
+    fn github_login_states_and_phone_session_drawer_render(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for state in [
+            GitHubLoginState::Starting,
+            GitHubLoginState::Awaiting {
+                verification_uri: "https://github.com/login/device".to_owned(),
+                user_code: "ABCD-EFGH".to_owned(),
+                expires_in: 600,
+            },
+            GitHubLoginState::Success,
+            GitHubLoginState::Error("Unable to connect".to_owned()),
+        ] {
+            render_scenario(cx, |view| view.github_login = Some(state));
+        }
+        render_scenario_at(cx, size(px(390.), px(844.)), |view| {
+            view.session_drawer_open = true;
+            view.sessions = vec![view.active_session.clone()];
+        });
+    }
+
+    #[gpui_kit::test]
+    fn phone_drawer_and_review_sidebar_controls_toggle_panels(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(390.), px(844.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("open-session-drawer", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("mobile-session-drawer").visible());
+            assert!(
+                window
+                    .within("mobile-session-drawer")
+                    .find(("session-tree-root", 0usize))
+                    .visible()
+            );
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.session_drawer_open = false;
+                    cx.notify();
+                });
+            window.render_frame(cx);
+            assert!(window.try_find("mobile-session-drawer").is_none());
+            window.click("toggle-review-sidebar", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("toggle-review-sidebar-close").visible());
+            window.click("toggle-review-sidebar-close", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("toggle-review-sidebar-close").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn session_creation_uses_worker_model_catalog_and_selects_the_created_session(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            let workspace =
+                crate::connection::create_workspace(&view.connection, "Session creation").unwrap();
+            view.workspace_id = workspace.id;
+            view.workspaces.push(workspace);
+            view
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.create_session_on_node_with_source(
+                        view.default_backend_node_id.clone(),
+                        "Created session".to_owned(),
+                        None,
+                        cx,
+                    );
+                });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window
+                .root::<LoomView>()
+                .flatten()
+                .is_some_and(|view| view.read(cx).sessions.len() == 1)
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn asynchronous_model_refresh_updates_the_active_worker_catalog(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            view.session_node_ids
+                .insert(view.active_session.id, view.default_backend_node_id.clone());
+            view
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.refresh_models_for_node_async(view.default_backend_node_id.clone(), cx);
+                    view.refresh_models_for_node_async("missing-node".to_owned(), cx);
+                });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window.root::<LoomView>().flatten().is_some_and(|view| {
+                let view = view.read(cx);
+                view.model_catalog_node_id.as_deref() == Some("test-node")
+                    && !view.models.is_empty()
+                    && view.model_refreshes_in_flight.is_empty()
+            })
+        })
+        .await;
+    }
+
+    #[gpui_kit::test]
+    async fn session_creation_attaches_a_local_source_before_selecting_it(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let source = std::env::temp_dir().join(format!("loom-ui-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("README.md"), "local source").unwrap();
+        let source_path = source.to_string_lossy().to_string();
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            let workspace =
+                crate::connection::create_workspace(&view.connection, "Local source").unwrap();
+            view.workspace_id = workspace.id;
+            view.workspaces.push(workspace);
+            view
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.create_session_on_node_with_source(
+                        view.default_backend_node_id.clone(),
+                        "Source session".to_owned(),
+                        Some(super::SessionCreationSource::LocalDirectory(
+                            source_path.clone(),
+                        )),
+                        cx,
+                    );
+                });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window
+                .root::<LoomView>()
+                .flatten()
+                .is_some_and(|view| view.read(cx).sessions.len() == 1)
+        })
+        .await;
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.refresh_review(cx);
+                });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window.root::<LoomView>().flatten().is_some_and(|view| {
+                let view = view.read(cx);
+                view.review.repositories_loaded && view.session_directories.len() == 1
+            })
+        })
+        .await;
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window.root::<LoomView>().unwrap().unwrap();
+            view.update(cx, |view, cx| {
+                let path = format!("{}/README.md", view.session_directories[0].path);
+                view.open_review_file(path, cx);
+            });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window.root::<LoomView>().flatten().is_some_and(|view| {
+                view.read(cx)
+                    .review
+                    .selected_file
+                    .as_ref()
+                    .is_some_and(|file| file.content == "local source")
+            })
+        })
+        .await;
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.add_source_to_active_session(
+                        super::SessionCreationSource::LocalDirectory(source_path.clone()),
+                        cx,
+                    );
+                });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window
+                .root::<LoomView>()
+                .flatten()
+                .is_some_and(|view| view.read(cx).session_directories.len() == 2)
+        })
+        .await;
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window.root::<LoomView>().unwrap().unwrap();
+            view.update(cx, |view, cx| {
+                assert!(
+                    view.session_directories[0]
+                        .source
+                        .contains("loom-ui-source-")
+                );
+                view.detach_session_directory(view.session_directories[0].path.clone(), cx);
+            });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window
+                .root::<LoomView>()
+                .flatten()
+                .is_some_and(|view| view.read(cx).session_directories.len() == 1)
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window.root::<LoomView>().unwrap().unwrap();
+            view.update(cx, |view, cx| {
+                view.detach_session_directory(view.session_directories[0].path.clone(), cx);
+            });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window
+                .root::<LoomView>()
+                .flatten()
+                .is_some_and(|view| view.read(cx).session_directories.is_empty())
+        })
+        .await;
+        std::fs::remove_dir_all(source).unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn repository_review_loads_git_status_diff_and_detaches_the_repository(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let source = std::env::temp_dir().join(format!("loom-ui-repo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("README.md"), "before\n").unwrap();
+        for arguments in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "loom@example.test"],
+            vec!["config", "user.name", "Loom Test"],
+            vec!["add", "README.md"],
+            vec!["commit", "-qm", "initial"],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(arguments)
+                    .current_dir(&source)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let source_path = source.to_string_lossy().to_string();
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            let workspace =
+                crate::connection::create_workspace(&view.connection, "Repository review").unwrap();
+            let session = crate::connection::create_session_in_workspace(
+                &view.connection,
+                workspace.id,
+                "Review session",
+            )
+            .unwrap();
+            let repository = crate::connection::attach_session_repository(
+                &view.connection,
+                session.id,
+                &source_path,
+                "repo",
+            )
+            .unwrap();
+            let edit = view.connection.request(RequestEnvelope::new(
+                ClientRequest::ApplySessionFilesystemEdit {
+                    session_id: session.id,
+                    edit: loom_workspace::WorkspaceEdit {
+                        path: "repo/README.md".to_owned(),
+                        old_text: "before".to_owned(),
+                        new_text: "after".to_owned(),
+                        expected_revision: None,
+                    },
+                },
+            ));
+            assert!(matches!(
+                edit.result,
+                Ok(ServerResponse::WorkspaceEditApplied(_))
+            ));
+            view.workspace_id = workspace.id;
+            view.workspaces.push(workspace);
+            view.active_session = session.clone();
+            view.sessions.push(session.clone());
+            view.session_node_ids
+                .insert(session.id, view.default_backend_node_id.clone());
+            view.session_repositories.push(repository.clone());
+            view.selected_repository_id = Some(repository.id);
+            view
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    let repository_id = view.selected_repository_id.unwrap();
+                    view.select_session_repository(repository_id, cx);
+                    view.open_review_diff("README.md".to_owned(), false, cx);
+                });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window.root::<LoomView>().flatten().is_some_and(|view| {
+                let view = view.read(cx);
+                view.review.vcs.is_some()
+                    && view
+                        .review
+                        .selected_diff
+                        .as_ref()
+                        .is_some_and(|diff| !diff.hunks.is_empty())
+            })
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.jump_review_hunk(true, cx);
+                    view.jump_review_hunk(false, cx);
+                    view.detach_session_repository(view.selected_repository_id.unwrap(), cx);
+                });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window
+                .root::<LoomView>()
+                .flatten()
+                .is_some_and(|view| view.read(cx).session_repositories.is_empty())
+        })
+        .await;
+        std::fs::remove_dir_all(source).unwrap();
+    }
+
+    #[gpui_kit::test]
+    async fn github_source_selection_reports_unconfigured_provider_and_requires_a_repository(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            view.session_node_ids
+                .insert(view.active_session.id, view.default_backend_node_id.clone());
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
+                    view.choose_source(SessionSourceChoice::GitHub, cx);
+                });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window.root::<LoomView>().flatten().is_some_and(|view| {
+                view.read(cx)
+                    .source_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| !dialog.repositories_loading && dialog.error.is_some())
+            })
+        })
+        .await;
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.confirm_source_dialog(cx);
+                    assert!(view.source_dialog.is_some());
+                    assert!(view.timeline.iter().any(|item| matches!(
+                        item,
+                        TimelineItem::Status(status) if status == "Choose a GitHub repository"
+                    )));
+                });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.rename_dialog = Some(RenameDialogState {
+                session: view.active_session.clone(),
+                input: "Renamed session".to_owned(),
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::StartSession,
+                choice: SessionSourceChoice::Empty,
+                local_directory_available: true,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: false,
+                error: None,
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::AddToSession,
+                choice: SessionSourceChoice::LocalDirectory,
+                local_directory_available: true,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: false,
+                error: Some("directory does not exist".to_owned()),
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::StartSession,
+                choice: SessionSourceChoice::GitHub,
+                local_directory_available: false,
+                filter_subscription: None,
+                repositories: vec![GitHubRepository {
+                    full_name: "owner/project".to_owned(),
+                    description: Some("example repository".to_owned()),
+                    clone_url: "https://github.com/owner/project.git".to_owned(),
+                    private: false,
+                    default_branch: "main".to_owned(),
+                }],
+                selected_repository: Some("owner/project".to_owned()),
+                repositories_loading: false,
+                error: None,
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::StartSession,
+                choice: SessionSourceChoice::GitHub,
+                local_directory_available: true,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: true,
+                error: None,
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::AddToSession,
+                choice: SessionSourceChoice::GitHub,
+                local_directory_available: false,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: false,
+                error: Some("GitHub authentication is required".to_owned()),
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::StartSession,
+                choice: SessionSourceChoice::GitHub,
+                local_directory_available: true,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: false,
+                error: None,
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn review_panel_renders_workspace_and_git_changes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.review.changes = vec![SessionFilesystemChange {
+                sequence: loom_core::EventSequence::new(1),
+                session_id: view.active_session.id,
+                path: "src/new.rs".to_owned(),
+                kind: WorkspaceChangeKind::Created,
+                revision: Some("revision-1".to_owned()),
+            }];
+            view.review.vcs = Some(GitRepositoryStatus {
+                root: "/workspace".to_owned(),
+                branch: Some("main".to_owned()),
+                head: Some("abc123".to_owned()),
+                files: vec![GitFileStatus {
+                    path: "src/lib.rs".to_owned(),
+                    original_path: None,
+                    index: GitFileStatusKind::Modified,
+                    worktree: GitFileStatusKind::Modified,
+                    conflicted: false,
+                    index_additions: 1,
+                    index_deletions: 0,
+                    worktree_additions: 2,
+                    worktree_deletions: 1,
+                }],
+                conflicts: Vec::new(),
+                clean: false,
+                captured_at: Timestamp::from_unix_millis(0),
+            });
+            view.review.selected_path = Some("src/lib.rs".to_owned());
+            view.review.selected_diff = Some(GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                hunks: vec![GitDiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 2,
+                    lines: vec![GitDiffLine {
+                        kind: GitDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "new line".to_owned(),
+                    }],
+                }],
+                truncated: false,
+            });
+            view.review.rows = vec![
+                ReviewRow::Hunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 2,
+                },
+                ReviewRow::Line(GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "new line".to_owned(),
+                }),
+            ];
+            view.review.hunk_rows = vec![0];
+        });
+    }
+
+    #[gpui_kit::test]
+    fn review_panel_renders_loading_file_and_binary_diff_states(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = false;
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.review.selected_path = Some("README.md".to_owned());
+            view.review.selected_file = Some(SessionFilesystemFile {
+                session_id: view.active_session.id,
+                path: "README.md".to_owned(),
+                content: "Workspace file contents".to_owned(),
+                revision: "revision-2".to_owned(),
+            });
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.review.selected_path = Some("assets/image.png".to_owned());
+            view.review.selected_diff = Some(GitDiff {
+                path: Some("assets/image.png".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: true,
+                hunks: Vec::new(),
+                truncated: false,
+            });
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.review.selected_path = Some("src/large.rs".to_owned());
+            view.review.selected_diff = Some(GitDiff {
+                path: Some("src/large.rs".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                hunks: Vec::new(),
+                truncated: true,
+            });
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.session_repositories = vec![
+                SessionRepository {
+                    id: loom_core::RepositoryId::new(),
+                    source: "https://github.com/owner/first".to_owned(),
+                    path: "/workspace/first".to_owned(),
+                    revision: None,
+                    attached_at: Timestamp::from_unix_millis(1),
+                },
+                SessionRepository {
+                    id: loom_core::RepositoryId::new(),
+                    source: "https://github.com/owner/second/".to_owned(),
+                    path: "/workspace/second".to_owned(),
+                    revision: None,
+                    attached_at: Timestamp::from_unix_millis(2),
+                },
+            ];
+            view.selected_repository_id = view.session_repositories.first().map(|repo| repo.id);
+            view.review.changes = vec![SessionFilesystemChange {
+                sequence: loom_core::EventSequence::new(2),
+                session_id: view.active_session.id,
+                path: "notes/todo.md".to_owned(),
+                kind: WorkspaceChangeKind::Modified,
+                revision: None,
+            }];
+        });
+    }
+
+    #[gpui_kit::test]
+    fn transcript_renders_all_message_and_activity_variants(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let call = ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "write_file".to_owned(),
+            arguments: serde_json::json!({"path":"src/lib.rs"}),
+        };
+        let activity = AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id: RunId::new(),
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::File,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::from_unix_millis(0),
+            completed_at: None,
+            elapsed_ms: Some(1500),
+            data: AgentActivityData::File {
+                call: call.clone(),
+                operation: FileActivityOperation::Write,
+                path: Some("src/lib.rs".to_owned()),
+                result: Some(ToolResult::success(&call, "updated file".to_owned())),
+            },
+        };
+        render_scenario(cx, |view| {
+            view.activity_records_seen = true;
+            view.expanded_activities.insert(activity.id);
+            view.timeline = vec![
+                TimelineItem::User("Please update the file".to_owned()),
+                TimelineItem::Assistant("# Done\nThe file is updated.".to_owned()),
+                TimelineItem::ActivitySection {
+                    activities: vec![activity],
+                },
+                TimelineItem::Plan {
+                    steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
+                    completed: BTreeSet::from([0]),
+                    active: Some(1),
+                },
+                TimelineItem::ToolRequested {
+                    name: "write_file".to_owned(),
+                    arguments: "{\"path\":\"src/lib.rs\"}".to_owned(),
+                },
+                TimelineItem::Approval {
+                    name: "write_file".to_owned(),
+                    active: true,
+                },
+                TimelineItem::ToolStarted("write_file".to_owned()),
+                TimelineItem::ToolOutput("updated file".to_owned()),
+                TimelineItem::ToolCompleted {
+                    name: "write_file".to_owned(),
+                    success: true,
+                },
+                TimelineItem::ToolCompleted {
+                    name: "run_tests".to_owned(),
+                    success: false,
+                },
+                TimelineItem::Status("Working".to_owned()),
+                TimelineItem::Error {
+                    operation: "save".to_owned(),
+                    error: loom_core::LoomError::new(ErrorCode::Persistence, "write failed", true),
+                },
+                TimelineItem::NeedsInput("Which branch should I use?".to_owned()),
+                TimelineItem::Summary {
+                    text: "Completed task: updated the file".to_owned(),
+                    evidence: vec!["src/lib.rs".to_owned()],
+                },
+            ];
+            view.pending_input = Some("Which branch should I use?".to_owned());
+            view.pending_approval = Some(call);
+            view.model = ModelId::new("deterministic/demo");
+        });
+    }
+}
+
+#[cfg(test)]
 mod responsive_layout_tests {
     use super::{
         COMPACT_REVIEW_WIDTH, COMPACT_SIDEBAR_WIDTH, FULL_REVIEW_WIDTH, FULL_SIDEBAR_WIDTH,
-        PHONE_SIDEBAR_WIDTH, responsive_layout,
+        PHONE_SIDEBAR_WIDTH, responsive_layout, review_panel_is_visible,
     };
     use gpui_kit::px;
 
@@ -9451,20 +11872,59 @@ mod responsive_layout_tests {
         assert_eq!(layout.sidebar_width, px(280.));
         assert_eq!(layout.review_width, px(280.));
     }
+
+    #[test]
+    fn review_panel_visibility_is_a_pure_layout_decision() {
+        let desktop = responsive_layout(px(1280.));
+        assert!(review_panel_is_visible(
+            desktop, true, 1, false, false, false, false
+        ));
+        assert!(!review_panel_is_visible(
+            desktop, false, 1, false, false, false, false
+        ));
+        assert!(!review_panel_is_visible(
+            desktop, true, 0, false, false, false, false
+        ));
+        for modal_open in 0..4 {
+            let mut blockers = [false; 4];
+            blockers[modal_open] = true;
+            assert!(!review_panel_is_visible(
+                desktop,
+                true,
+                1,
+                blockers[0],
+                blockers[1],
+                blockers[2],
+                blockers[3]
+            ));
+        }
+        assert!(!review_panel_is_visible(
+            responsive_layout(px(390.)),
+            true,
+            1,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
 }
 
 #[cfg(test)]
 mod worker_node_tests {
     use super::{
-        ACTIVE_BACKEND_NODE_ENTRY_ID, SessionNodeIndicatorState, WorkerConnectionStage,
-        WorkerConnectionState, WorkerNodeEntry, adjusted_cpu_pulse_threshold, assigned_node_id,
-        format_percentage, format_session_resource_percentages, format_worker_node_resources,
-        mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
-        order_session_nodes, remove_worker_node_entry, safe_worker_url_label,
-        session_id_for_request, session_node_indicator_state, session_node_pulse,
-        session_owner_status, transition_worker_connection_to_connecting,
-        update_worker_node_status, validate_model_for_node, worker_connection_failure_detail,
-        worker_node_display_name, worker_node_name_for_id, worker_url_embeds_credential,
+        ACTIVE_BACKEND_NODE_ENTRY_ID, SessionNodeIndicatorState, SessionSourceChoice,
+        SessionSourceDialogPurpose, WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry,
+        adjusted_cpu_pulse_threshold, assigned_node_id, connection_placeholder, format_percentage,
+        format_session_resource_percentages, format_worker_node_resources, initial_worker_nodes,
+        local_source_available, mark_worker_connection_failed, merge_node_sessions,
+        next_severe_load_streak, order_session_nodes, remove_worker_node_entry,
+        safe_worker_url_label, session_id_for_request, session_list_projection,
+        session_node_indicator_state, session_node_pulse, session_owner_status,
+        source_choice_is_allowed, source_dialog_initial_state,
+        transition_worker_connection_to_connecting, update_worker_node_status,
+        validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
+        worker_node_name_for_id, worker_url_embeds_credential,
     };
     use loom_core::{
         AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, RunId, Timestamp,
@@ -9578,6 +12038,48 @@ mod worker_node_tests {
         );
         assert!(bootstrap_save.contains("browser could not save"));
         assert!(!bootstrap_save.contains("secret"));
+
+        let input = worker_connection_failure_detail(
+            WorkerConnectionStage::InputValidation,
+            &LoomError::invalid_request("empty input"),
+            None,
+        );
+        assert!(input.contains("URL followed by its access token"));
+        let cancelled = worker_connection_failure_detail(
+            WorkerConnectionStage::Negotiation,
+            &LoomError::new(ErrorCode::RequestCancelled, "closed", false),
+            None,
+        );
+        assert!(cancelled.contains("before negotiation completed"));
+        let cancelled_status = worker_connection_failure_detail(
+            WorkerConnectionStage::Status,
+            &LoomError::new(ErrorCode::RequestCancelled, "closed", false),
+            None,
+        );
+        assert!(cancelled_status.contains("before returning status"));
+        let token = worker_connection_failure_detail(
+            WorkerConnectionStage::Transport,
+            &LoomError::invalid_request("invalid bearer token"),
+            None,
+        );
+        assert!(token.contains("unsupported characters"));
+        let timeout_text = worker_connection_failure_detail(
+            WorkerConnectionStage::Negotiation,
+            &LoomError::new(ErrorCode::Internal, "gateway timeout", false),
+            None,
+        );
+        assert!(timeout_text.contains("timed out"));
+        #[cfg(target_family = "wasm")]
+        let bootstrap_stage = worker_connection_failure_detail(
+            WorkerConnectionStage::Bootstrap,
+            &LoomError::new(ErrorCode::Internal, "failed with secret", false),
+            Some("secret"),
+        );
+        #[cfg(target_family = "wasm")]
+        {
+            assert!(bootstrap_stage.contains("could not open its workspace"));
+            assert!(!bootstrap_stage.contains("secret"));
+        }
     }
 
     #[test]
@@ -9603,6 +12105,90 @@ mod worker_node_tests {
             ),
             "wss://worker.example/ws"
         );
+        assert_eq!(
+            safe_worker_url_label("user@host/path?secret=value"),
+            "host/path"
+        );
+        assert_eq!(
+            safe_worker_url_label("wss://user:pass@worker.example"),
+            "wss://worker.example"
+        );
+        assert_eq!(
+            safe_worker_url_label("wss://worker.example/ws#secret"),
+            "wss://worker.example/ws"
+        );
+        assert!(!worker_url_embeds_credential(
+            "worker.example/ws?token=hidden"
+        ));
+        for key in [
+            "token",
+            "access_token",
+            "auth",
+            "authorization",
+            "bearer",
+            "key",
+            "api_key",
+            "password",
+            "secret",
+            "client_secret",
+        ] {
+            assert!(
+                worker_url_embeds_credential(&format!("wss://worker.example/ws?{key}=hidden")),
+                "{key}"
+            );
+        }
+        assert!(!worker_url_embeds_credential(
+            "wss://worker.example/ws?theme=dark"
+        ));
+    }
+
+    #[test]
+    fn worker_node_fixtures_preserve_local_connection_and_hide_url_credentials() {
+        let placeholder = connection_placeholder(
+            7,
+            "wss://user:secret@worker.example/ws?token=hidden".to_owned(),
+            WorkerConnectionState::Disconnected,
+            Some("offline".to_owned()),
+        );
+        assert_eq!(placeholder.status.name, "wss://worker.example/ws");
+        assert_eq!(
+            placeholder.status.node_id,
+            "wss://user:secret@worker.example/ws?token=hidden"
+        );
+        assert!(!placeholder.status.online);
+        assert_eq!(placeholder.connection_detail.as_deref(), Some("offline"));
+
+        let local_status = node(ACTIVE_BACKEND_NODE_ENTRY_ID, true).status;
+        let local_connection = super::ClientConnection::InProcess(Box::new(
+            loom_server::InProcessBackend::new().connect(),
+        ));
+        let config = loom_protocol::WorkspaceConfig {
+            worker_nodes: vec![
+                loom_protocol::WorkerNodeConfig {
+                    url: "ws://local-worker/ws".to_owned(),
+                },
+                loom_protocol::WorkerNodeConfig {
+                    url: "wss://remote-worker/ws".to_owned(),
+                },
+            ],
+            ..loom_protocol::WorkspaceConfig::default()
+        };
+        let nodes = initial_worker_nodes(
+            local_status,
+            local_connection,
+            &config,
+            Some("ws://local-worker/ws"),
+        );
+        assert_eq!(nodes.len(), 2);
+        assert!(nodes[0].is_local);
+        assert_eq!(nodes[0].connection_state, WorkerConnectionState::Connected);
+        assert_eq!(nodes[1].id, 1);
+        assert_eq!(nodes[1].url.as_deref(), Some("wss://remote-worker/ws"));
+        assert_eq!(
+            nodes[1].connection_state,
+            WorkerConnectionState::Disconnected
+        );
+        assert!(nodes[1].connection.is_none());
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -9642,6 +12228,94 @@ mod worker_node_tests {
     }
 
     #[test]
+    fn session_list_projection_preserves_order_and_selects_active_session() {
+        let first = AgentSessionId::new();
+        let active = AgentSessionId::new();
+        let sessions = vec![session(first, "First"), session(active, "Active")];
+
+        let projection = session_list_projection(&sessions, active);
+
+        assert_eq!(
+            projection.entries,
+            vec![(first, "First".to_owned()), (active, "Active".to_owned())]
+        );
+        assert_eq!(projection.selected_index, Some(1));
+    }
+
+    #[test]
+    fn session_list_projection_has_no_selection_when_active_session_is_missing() {
+        let sessions = vec![session(AgentSessionId::new(), "Only session")];
+
+        let projection = session_list_projection(&sessions, AgentSessionId::new());
+
+        assert_eq!(projection.selected_index, None);
+    }
+
+    #[test]
+    fn source_dialog_initial_choice_tracks_purpose_and_local_availability() {
+        assert_eq!(
+            source_dialog_initial_state(SessionSourceDialogPurpose::StartSession, true),
+            SessionSourceChoice::Empty
+        );
+        assert_eq!(
+            source_dialog_initial_state(SessionSourceDialogPurpose::AddToSession, true),
+            SessionSourceChoice::LocalDirectory
+        );
+        assert_eq!(
+            source_dialog_initial_state(SessionSourceDialogPurpose::AddToSession, false),
+            SessionSourceChoice::GitHub
+        );
+    }
+
+    #[test]
+    fn local_source_availability_respects_backend_and_session_ownership() {
+        use SessionSourceDialogPurpose::{AddToSession, StartSession};
+
+        assert!(local_source_available(
+            StartSession,
+            true,
+            Some("remote"),
+            "local"
+        ));
+        assert!(!local_source_available(StartSession, false, None, "local"));
+        assert!(local_source_available(AddToSession, true, None, "local"));
+        assert!(local_source_available(
+            AddToSession,
+            true,
+            Some("local"),
+            "local"
+        ));
+        assert!(!local_source_available(
+            AddToSession,
+            true,
+            Some("remote"),
+            "local"
+        ));
+        assert!(!local_source_available(
+            AddToSession,
+            false,
+            Some("local"),
+            "local"
+        ));
+    }
+
+    #[test]
+    fn source_choice_validation_rejects_empty_additions_and_unavailable_local_sources() {
+        use SessionSourceChoice::{Empty, GitHub, LocalDirectory};
+        use SessionSourceDialogPurpose::{AddToSession, StartSession};
+
+        assert!(source_choice_is_allowed(StartSession, false, Empty));
+        assert!(!source_choice_is_allowed(AddToSession, true, Empty));
+        assert!(source_choice_is_allowed(AddToSession, true, LocalDirectory));
+        assert!(!source_choice_is_allowed(
+            AddToSession,
+            false,
+            LocalDirectory
+        ));
+        assert!(source_choice_is_allowed(AddToSession, false, GitHub));
+    }
+
+    #[test]
     fn local_worker_node_cannot_be_removed() {
         let mut nodes = vec![node(0, true)];
 
@@ -9659,6 +12333,7 @@ mod worker_node_tests {
         assert_eq!(removed.id, 1);
         assert_eq!(nodes.len(), 1);
         assert!(nodes[0].is_local());
+        assert!(remove_worker_node_entry(&mut nodes, 999).is_none());
     }
 
     #[test]
@@ -9694,6 +12369,18 @@ mod worker_node_tests {
         assert!(updated_summary.contains("CPU 31% of 8 cores"));
         assert!(updated_summary.contains("RAM 50% of 16.0 GiB"));
         assert!(updated_summary.contains("disk 512.0 MiB available"));
+        assert!(
+            format_worker_node_resources(&WorkerNodeResources {
+                cpu_count: 0,
+                cpu_usage_percent: None,
+                memory_usage_percent: None,
+                memory_total_bytes: None,
+                memory_available_bytes: None,
+                disk_total_bytes: None,
+                disk_available_bytes: None,
+            })
+            .starts_with("CPU n/a · RAM")
+        );
     }
 
     #[test]
@@ -9716,11 +12403,15 @@ mod worker_node_tests {
         let mut refreshed = nodes[0].status.clone();
         refreshed.resources.cpu_usage_percent = Some(25);
         refreshed.resources.memory_usage_percent = Some(50);
-        assert_eq!(update_worker_node_status(&mut nodes, 1, refreshed), None);
+        assert_eq!(
+            update_worker_node_status(&mut nodes, 1, refreshed.clone()),
+            None
+        );
 
         let summary = format_worker_node_resources(&nodes[0].status.resources);
         assert!(summary.contains("CPU 25% of 4 cores · RAM 50% of 8.0 GiB"));
         assert!(summary.contains("disk 50.0 GiB available"));
+        assert_eq!(update_worker_node_status(&mut nodes, 999, refreshed), None);
     }
 
     #[test]
@@ -9789,6 +12480,250 @@ mod worker_node_tests {
                 AgentSessionId::new()
             ),
             Some(active_session_id)
+        );
+    }
+
+    #[test]
+    fn session_request_routing_covers_explicit_active_and_non_session_requests() {
+        let session = AgentSessionId::new();
+        let active = AgentSessionId::new();
+        let repository = loom_core::RepositoryId::new();
+        let terminal = loom_core::TerminalId::new();
+        let task = loom_core::TaskId::new();
+        let checkpoint = loom_core::CheckpointId::new();
+        let explicit_requests = vec![
+            ClientRequest::GetAgentSession {
+                session_id: session,
+            },
+            ClientRequest::GetAgentSessionSnapshot {
+                session_id: session,
+            },
+            ClientRequest::RenameAgentSession {
+                session_id: session,
+                name: "renamed".into(),
+            },
+            ClientRequest::ArchiveAgentSession {
+                session_id: session,
+            },
+            ClientRequest::GetRecentSessionEvents {
+                session_id: session,
+                limit: 5,
+            },
+            ClientRequest::StartSessionAgentRun {
+                session_id: session,
+                task: "task".into(),
+                model: ModelId::new("model"),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+            ClientRequest::StartSessionAgentRunWithOptions {
+                session_id: session,
+                task: "task".into(),
+                model: ModelId::new("model"),
+                system_instructions: None,
+                repository_instructions: None,
+                limits: loom_core::SessionLimits::default(),
+                context: loom_protocol::ContextAssemblyOptions::default(),
+            },
+            ClientRequest::AttachSessionRepository {
+                session_id: session,
+                source: "/repo".into(),
+                path: "repo".into(),
+                revision: None,
+            },
+            ClientRequest::AttachSessionDirectory {
+                session_id: session,
+                source: "/folder".into(),
+                path: "folder".into(),
+            },
+            ClientRequest::ListSessionDirectories {
+                session_id: session,
+            },
+            ClientRequest::DetachSessionDirectory {
+                session_id: session,
+                path: "folder".into(),
+            },
+            ClientRequest::ListSessionRepositories {
+                session_id: session,
+            },
+            ClientRequest::DetachSessionRepository {
+                session_id: session,
+                repository_id: repository,
+            },
+            ClientRequest::GetSessionFilesystemSnapshot {
+                session_id: session,
+            },
+            ClientRequest::GetSessionFilesystemChanges {
+                session_id: session,
+                after_sequence: None,
+            },
+            ClientRequest::ReadSessionFile {
+                session_id: session,
+                path: "file".into(),
+            },
+            ClientRequest::ApplySessionFilesystemEdit {
+                session_id: session,
+                edit: loom_protocol::WorkspaceEdit {
+                    path: "file".into(),
+                    old_text: "old".into(),
+                    new_text: "new".into(),
+                    expected_revision: None,
+                },
+            },
+            ClientRequest::TakeSessionFilesystemControl {
+                session_id: session,
+                control: loom_protocol::WorkspaceControl::Agent,
+            },
+            ClientRequest::CreateSessionCheckpoint {
+                session_id: session,
+                label: "checkpoint".into(),
+            },
+            ClientRequest::RevertSessionCheckpoint {
+                session_id: session,
+                checkpoint_id: checkpoint,
+            },
+            ClientRequest::UndoSessionEdit {
+                session_id: session,
+            },
+            ClientRequest::GetSessionContextFiles {
+                session_id: session,
+            },
+            ClientRequest::GetSessionVcsStatus {
+                session_id: session,
+                repository_id: repository,
+            },
+            ClientRequest::GetSessionVcsDiff {
+                session_id: session,
+                repository_id: repository,
+                path: None,
+                staged: false,
+            },
+            ClientRequest::GetSessionVcsBranches {
+                session_id: session,
+                repository_id: repository,
+            },
+            ClientRequest::GetSessionVcsConflicts {
+                session_id: session,
+                repository_id: repository,
+            },
+            ClientRequest::OpenSessionTerminal {
+                session_id: session,
+                command: "sh".into(),
+                args: Vec::new(),
+                cwd: None,
+            },
+            ClientRequest::WriteSessionTerminalInput {
+                session_id: session,
+                terminal_id: terminal,
+                input: "exit".into(),
+            },
+            ClientRequest::ResizeSessionTerminal {
+                session_id: session,
+                terminal_id: terminal,
+                rows: 24,
+                columns: 80,
+            },
+            ClientRequest::GetSessionTerminalEvents {
+                session_id: session,
+                terminal_id: terminal,
+                after_sequence: None,
+            },
+            ClientRequest::CancelSessionTerminal {
+                session_id: session,
+                terminal_id: terminal,
+            },
+            ClientRequest::StartSessionTask {
+                session_id: session,
+                spec: loom_protocol::TaskSpec {
+                    kind: loom_protocol::TaskKind::Test,
+                    label: "test".into(),
+                    command: "cargo".into(),
+                    args: vec!["test".into()],
+                    cwd: None,
+                    output_limit_bytes: None,
+                    artifact_paths: Vec::new(),
+                },
+            },
+            ClientRequest::ListSessionTasks {
+                session_id: session,
+            },
+            ClientRequest::GetSessionTask {
+                session_id: session,
+                task_id: task,
+            },
+            ClientRequest::GetSessionTaskEvents {
+                session_id: session,
+                task_id: task,
+                after_sequence: None,
+            },
+            ClientRequest::CancelSessionTask {
+                session_id: session,
+                task_id: task,
+            },
+            ClientRequest::GetSessionTaskEvidence {
+                session_id: session,
+                task_id: task,
+            },
+            ClientRequest::SetSessionApprovalPolicy {
+                session_id: session,
+                policy: loom_core::ApprovalPolicy::default(),
+                auto_approve_actions: None,
+            },
+            ClientRequest::ForkAgentSession {
+                session_id: session,
+                name: "fork".into(),
+            },
+            ClientRequest::GetSessionUsage {
+                session_id: session,
+            },
+        ];
+        assert!(
+            explicit_requests
+                .iter()
+                .all(|request| { session_id_for_request(request, active) == Some(session) })
+        );
+
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::GetSessionEvents {
+                    session_id: None,
+                    after_sequence: None
+                },
+                active
+            ),
+            Some(active)
+        );
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::GetSessionEvents {
+                    session_id: Some(session),
+                    after_sequence: None
+                },
+                active
+            ),
+            Some(session)
+        );
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::GetAgentRun {
+                    run_id: RunId::new()
+                },
+                active
+            ),
+            Some(active)
+        );
+        assert_eq!(
+            session_id_for_request(
+                &ClientRequest::GetRunUsage {
+                    run_id: RunId::new()
+                },
+                active
+            ),
+            Some(active)
+        );
+        assert_eq!(
+            session_id_for_request(&ClientRequest::ListWorkspaces, active),
+            None
         );
     }
 
@@ -9870,6 +12805,10 @@ mod worker_node_tests {
         assert!(validate_model_for_node(&catalogs, "local", &local_model).is_ok());
         assert!(validate_model_for_node(&catalogs, "worker", &local_model).is_err());
         assert!(validate_model_for_node(&catalogs, "worker", &worker_model).is_ok());
+        assert_eq!(
+            validate_model_for_node(&catalogs, "missing", &worker_model),
+            Err("model availability has not been checked".to_owned())
+        );
     }
 
     #[test]
@@ -9904,6 +12843,7 @@ mod worker_node_tests {
         assert_eq!(adjusted_cpu_pulse_threshold(0, -1), 0);
         assert_eq!(adjusted_cpu_pulse_threshold(100, 1), 100);
         assert_eq!(adjusted_cpu_pulse_threshold(99, 1), 100);
+        assert_eq!(adjusted_cpu_pulse_threshold(255, 0), 100);
     }
 
     #[test]
@@ -9924,6 +12864,7 @@ mod worker_node_tests {
             session_node_indicator_state(Some(&status), third),
             SessionNodeIndicatorState::Severe
         );
+        assert_eq!(next_severe_load_streak(u8::MAX, &status.resources), u8::MAX);
 
         status.resources.cpu_usage_percent = Some(90);
         assert_eq!(next_severe_load_streak(third, &status.resources), 0);
