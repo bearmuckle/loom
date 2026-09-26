@@ -110,6 +110,7 @@ query indexes listed below.
 | `sessions` | `id`, `workspace_id`, `name`, `archived_at`, `deleted_at`, `last_activity_at`, `latest_local_run_id`, provenance IDs |
 | `session_settings` | Session, policy revision, current approval policy, auto-approval flag, bounded options; attempts capture their effective policy |
 | `runs` | `id`, `session_id`, `state`, `current_attempt_id`, model/provider IDs, task/instruction content references, `record_kind` (`local`/`inherited`) |
+| `run_summaries` | Indexed session/state/activity summary plus typed input/output/cached-token, tool-call, cost, and elapsed counters; usage totals aggregate in SQLite without decoding summary JSON |
 | `run_attempts` | Run, attempt number, state, checkpoint ID, start/end times, immutable effective policy/options and pricing |
 | `execution_state` | One row per resumable local attempt: phase, step number, provider cursor, pending interaction ID, last failed call ID, active message ID, control revision |
 | `steps`, `plan_steps`, `evidence` | Attempt, ordered step/plan entries and evidence links; rows rather than embedded growing vectors |
@@ -470,8 +471,8 @@ Implement in this order:
    persist a pending execution intent and started activity before the next
    worker step can perform an effect. Recovery never replays a persisted
    in-flight tool automatically; it marks the run failed with an unknown
-   external outcome and requires an explicit retry. Typed tool-attempt records,
-   further execution-state normalization, and crash-injection coverage remain.
+   external outcome and requires an explicit retry. Further execution-state
+   normalization and crash-injection coverage remain.
    Schema v22 stores ordered run-attempt identity, state, checkpoint, and timing
    records separately; checkpoint retry adds a new row while earlier attempts
    remain queryable. These rows are written transactionally with the run
@@ -483,8 +484,11 @@ Implement in this order:
    active message ID, and failed-call retry metadata in an explicit
    `run_execution_state` row, written atomically with its owning attempt and
    run summary. Tool-call/tool-attempt records now have typed indexed rows
-   derived from activity records. Normalized steps/evidence and crash-injection
-   coverage remain. Test crash boundaries before switching live writes.
+   derived from activity records. Schema v25 stores run usage as typed integer
+   counters; session totals are computed with an indexed SQLite aggregate while
+   live runs are overlaid from memory. Normalized steps/evidence and
+   crash-injection coverage remain. Test crash boundaries before switching live
+   writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
    exports and their mirrored in-memory journals completely.

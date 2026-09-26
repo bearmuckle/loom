@@ -4151,24 +4151,27 @@ impl InProcessConnection {
             }
             ClientRequest::GetSessionUsage { session_id } => {
                 self.backend.sessions()?.get(session_id)?;
-                let mut usage = loom_core::UsageSnapshot::default();
                 let loaded_ids = {
+                    let runs = self.backend.runs()?;
+                    runs.iter()
+                        .filter(|(_, handle)| handle.session_id == session_id)
+                        .map(|(run_id, _)| *run_id)
+                        .collect::<BTreeSet<_>>()
+                };
+                let mut usage = self
+                    .backend
+                    .persistence
+                    .as_ref()
+                    .map(|persistence| persistence.load_session_usage(session_id, &loaded_ids))
+                    .transpose()?
+                    .unwrap_or_default();
+                {
                     let runs = self.backend.runs()?;
                     for handle in runs
                         .values()
                         .filter(|handle| handle.session_id == session_id)
                     {
                         add_usage(&mut usage, &handle.state().usage);
-                    }
-                    runs.keys().copied().collect::<BTreeSet<_>>()
-                };
-                if let Some(persistence) = &self.backend.persistence {
-                    for summary in persistence
-                        .load_run_summaries_for_session(session_id)?
-                        .values()
-                        .filter(|summary| !loaded_ids.contains(&summary.snapshot.id))
-                    {
-                        add_usage(&mut usage, &summary.usage);
                     }
                 }
                 Ok(ServerResponse::SessionUsage {

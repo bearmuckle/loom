@@ -28,8 +28,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 24;
-const DATABASE_SCHEMA_VERSION: u32 = 24;
+pub const CURRENT_SCHEMA_VERSION: u32 = 25;
+const DATABASE_SCHEMA_VERSION: u32 = 25;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -74,7 +74,12 @@ CREATE TABLE IF NOT EXISTS run_summaries (
     updated_at INTEGER NOT NULL CHECK(updated_at >= started_at),
     completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
     snapshot TEXT NOT NULL CHECK(length(snapshot) <= 1048576),
-    usage TEXT NOT NULL CHECK(length(usage) <= 16384),
+    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
+    tool_calls INTEGER NOT NULL CHECK(tool_calls >= 0),
+    cost_micros INTEGER NOT NULL CHECK(cost_micros >= 0),
+    elapsed_ms INTEGER NOT NULL CHECK(elapsed_ms >= 0),
     UNIQUE(run_id, session_id)
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS runs_by_session_activity
@@ -1541,6 +1546,69 @@ impl FilePersistence {
             .next())
     }
 
+    /// Aggregates typed per-run usage in SQLite, optionally excluding runs whose
+    /// live in-memory counters are newer than the persisted summary rows.
+    pub fn load_session_usage(
+        &self,
+        session_id: AgentSessionId,
+        excluded_runs: &BTreeSet<RunId>,
+    ) -> Result<UsageSnapshot> {
+        if !self.path.exists() {
+            return Ok(UsageSnapshot::default());
+        }
+        let mut sql = "SELECT COALESCE(SUM(input_tokens), 0),
+                              COALESCE(SUM(output_tokens), 0),
+                              COALESCE(SUM(cached_input_tokens), 0),
+                              COALESCE(SUM(tool_calls), 0),
+                              COALESCE(SUM(cost_micros), 0),
+                              COALESCE(MAX(elapsed_ms), 0)
+                       FROM run_summaries WHERE session_id=?1"
+            .to_owned();
+        let mut values = vec![rusqlite::types::Value::Blob(
+            session_id.as_uuid().as_bytes().to_vec(),
+        )];
+        if !excluded_runs.is_empty() {
+            sql.push_str(" AND run_id NOT IN (");
+            for (index, run_id) in excluded_runs.iter().enumerate() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+                sql.push_str(&(index + 2).to_string());
+                values.push(rusqlite::types::Value::Blob(
+                    run_id.as_uuid().as_bytes().to_vec(),
+                ));
+            }
+            sql.push(')');
+        }
+        let connection = self.connection()?;
+        let counters = connection
+            .query_row(&sql, rusqlite::params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not aggregate session run usage: {error}"),
+                    true,
+                )
+            })?;
+        Ok(UsageSnapshot {
+            input_tokens: decode_counter(counters.0, "input token total")?,
+            output_tokens: decode_counter(counters.1, "output token total")?,
+            cached_input_tokens: decode_counter(counters.2, "cached input token total")?,
+            tool_calls: decode_counter(counters.3, "tool call total")?,
+            cost_micros: decode_counter(counters.4, "cost total")?,
+            elapsed_ms: decode_counter(counters.5, "elapsed time")?,
+        })
+    }
+
     fn load_run_summaries_matching<P: rusqlite::Params>(
         &self,
         predicate: &str,
@@ -1554,7 +1622,8 @@ impl FilePersistence {
         let mut statement = connection
             .prepare(&format!(
                 "SELECT run_id, session_id, state, started_at, updated_at, completed_at,
-                        snapshot, usage
+                        snapshot, input_tokens, output_tokens, cached_input_tokens,
+                        tool_calls, cost_micros, elapsed_ms
                  FROM run_summaries {predicate}
                  ORDER BY updated_at DESC, run_id DESC {limit}"
             ))
@@ -1571,7 +1640,12 @@ impl FilePersistence {
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
                 ))
             })
             .map_err(|error| {
@@ -1579,10 +1653,23 @@ impl FilePersistence {
             })?;
         let mut summaries = BTreeMap::new();
         for row in rows {
-            let (run_id, session_id, state, started, updated, completed, snapshot, usage) = row
-                .map_err(|error| {
-                    persistence_error(format!("could not read run summaries: {error}"), true)
-                })?;
+            let (
+                run_id,
+                session_id,
+                state,
+                started,
+                updated,
+                completed,
+                snapshot,
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                tool_calls,
+                cost_micros,
+                elapsed_ms,
+            ) = row.map_err(|error| {
+                persistence_error(format!("could not read run summaries: {error}"), true)
+            })?;
             let run_id = RunId::from_uuid(decode_uuid(&run_id, "run id")?);
             let session_id = AgentSessionId::from_uuid(decode_uuid(&session_id, "run session id")?);
             let snapshot: AgentRunSnapshot = serde_json::from_str(&snapshot).map_err(|error| {
@@ -1592,13 +1679,14 @@ impl FilePersistence {
                     false,
                 )
             })?;
-            let usage: UsageSnapshot = serde_json::from_str(&usage).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    format!("persisted run usage is malformed: {error}"),
-                    false,
-                )
-            })?;
+            let usage = UsageSnapshot {
+                input_tokens: decode_counter(input_tokens, "input tokens")?,
+                output_tokens: decode_counter(output_tokens, "output tokens")?,
+                cached_input_tokens: decode_counter(cached_input_tokens, "cached input tokens")?,
+                tool_calls: decode_counter(tool_calls, "tool calls")?,
+                cost_micros: decode_counter(cost_micros, "cost")?,
+                elapsed_ms: decode_counter(elapsed_ms, "elapsed time")?,
+            };
             let completed = completed.map(decode_timestamp).transpose()?;
             if snapshot.id != run_id
                 || snapshot.session_id != session_id
@@ -4831,10 +4919,7 @@ fn save_run_summary_rows(
         let snapshot = serde_json::to_string(&summary.snapshot).map_err(|error| {
             persistence_error(format!("could not encode run summary: {error}"), false)
         })?;
-        let usage = serde_json::to_string(&summary.usage).map_err(|error| {
-            persistence_error(format!("could not encode run usage: {error}"), false)
-        })?;
-        if snapshot.len() > 1024 * 1024 || usage.len() > 16 * 1024 {
+        if snapshot.len() > 1024 * 1024 {
             return Err(LoomError::new(
                 ErrorCode::Persistence,
                 "run summary exceeds its maximum supported size",
@@ -4846,8 +4931,9 @@ fn save_run_summary_rows(
         transaction
             .execute(
                 "INSERT INTO run_summaries(
-                    run_id, session_id, state, started_at, updated_at, completed_at, snapshot, usage
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    run_id, session_id, state, started_at, updated_at, completed_at, snapshot,
+                    input_tokens, output_tokens, cached_input_tokens, tool_calls, cost_micros, elapsed_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(run_id) DO UPDATE SET
                     session_id=excluded.session_id,
                     state=excluded.state,
@@ -4855,14 +4941,24 @@ fn save_run_summary_rows(
                     updated_at=excluded.updated_at,
                     completed_at=excluded.completed_at,
                     snapshot=excluded.snapshot,
-                    usage=excluded.usage
+                    input_tokens=excluded.input_tokens,
+                    output_tokens=excluded.output_tokens,
+                    cached_input_tokens=excluded.cached_input_tokens,
+                    tool_calls=excluded.tool_calls,
+                    cost_micros=excluded.cost_micros,
+                    elapsed_ms=excluded.elapsed_ms
                  WHERE run_summaries.session_id IS NOT excluded.session_id
                     OR run_summaries.state IS NOT excluded.state
                     OR run_summaries.started_at IS NOT excluded.started_at
                     OR run_summaries.updated_at IS NOT excluded.updated_at
                     OR run_summaries.completed_at IS NOT excluded.completed_at
                     OR run_summaries.snapshot IS NOT excluded.snapshot
-                    OR run_summaries.usage IS NOT excluded.usage",
+                    OR run_summaries.input_tokens IS NOT excluded.input_tokens
+                    OR run_summaries.output_tokens IS NOT excluded.output_tokens
+                    OR run_summaries.cached_input_tokens IS NOT excluded.cached_input_tokens
+                    OR run_summaries.tool_calls IS NOT excluded.tool_calls
+                    OR run_summaries.cost_micros IS NOT excluded.cost_micros
+                    OR run_summaries.elapsed_ms IS NOT excluded.elapsed_ms",
                 params![
                     run_id_bytes.as_slice(),
                     session_id_bytes.as_slice(),
@@ -4875,7 +4971,12 @@ fn save_run_summary_rows(
                         .map(encode_timestamp)
                         .transpose()?,
                     snapshot,
-                    usage,
+                    encode_counter(summary.usage.input_tokens, "input token count")?,
+                    encode_counter(summary.usage.output_tokens, "output token count")?,
+                    encode_counter(summary.usage.cached_input_tokens, "cached input token count")?,
+                    encode_counter(summary.usage.tool_calls, "tool call count")?,
+                    encode_counter(summary.usage.cost_micros, "cost")?,
+                    encode_counter(summary.usage.elapsed_ms, "elapsed time")?,
                 ],
             )
             .map_err(|error| {
@@ -7332,6 +7433,18 @@ mod tests {
         assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
         assert_eq!(
             persistence
+                .load_session_usage(session.id, &BTreeSet::new())
+                .unwrap(),
+            run_summaries[&run_id].usage
+        );
+        assert_eq!(
+            persistence
+                .load_session_usage(session.id, &BTreeSet::from([run_id]))
+                .unwrap(),
+            UsageSnapshot::default()
+        );
+        assert_eq!(
+            persistence
                 .load_active_run_summaries()
                 .unwrap()
                 .keys()
@@ -7438,6 +7551,17 @@ mod tests {
             )
             .unwrap();
         assert!(plan.contains("PRIMARY KEY"), "{plan}");
+        let usage_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT SUM(input_tokens) FROM run_summaries WHERE session_id=?1",
+                [session.id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            usage_plan.contains("runs_by_session_activity"),
+            "{usage_plan}"
+        );
         let idempotency_plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT request_id FROM idempotency_records
