@@ -1073,7 +1073,6 @@ pub(crate) struct LoomView {
     /// Sessions stay pinned to the node that created them.
     session_node_ids: BTreeMap<AgentSessionId, String>,
     pub(crate) workspace_id: WorkspaceId,
-    workspace_name: String,
     workspaces: Vec<WorkspaceRecord>,
     local_directory_sources_available: bool,
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
@@ -1567,7 +1566,6 @@ impl LoomView {
             node_names,
             session_node_ids,
             workspace_id,
-            workspace_name: workspace.name,
             workspaces,
             local_directory_sources_available: options.remote.is_none(),
             sessions: if has_session {
@@ -1697,7 +1695,6 @@ impl LoomView {
             node_names: BTreeMap::new(),
             session_node_ids: BTreeMap::new(),
             workspace_id,
-            workspace_name: "No workspace".to_owned(),
             workspaces: Vec::new(),
             local_directory_sources_available: false,
             sessions: Vec::new(),
@@ -1894,7 +1891,6 @@ impl LoomView {
             node_names,
             session_node_ids,
             workspace_id,
-            workspace_name: workspace.name,
             workspaces,
             local_directory_sources_available: false,
             sessions: if has_session {
@@ -5453,86 +5449,6 @@ impl LoomView {
             .tooltip("Start a session")
             .on_click(cx.listener(Self::new_session))
             .into_any_element()
-    }
-
-    fn select_workspace(&mut self, workspace: WorkspaceRecord, cx: &mut Context<Self>) {
-        if workspace.id == self.workspace_id {
-            return;
-        }
-        let workspace_id = workspace.id;
-        self.dispatch(
-            cx,
-            ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
-            |view, response, _| match response.result {
-                Ok(ServerResponse::WorkspaceConfig(config)) => view.workspace_config = config,
-                Err(error) => view.record_backend_error("workspace config", error),
-                Ok(response) => view.record_backend_error(
-                    "workspace config",
-                    unexpected_response("workspace config", response),
-                ),
-            },
-        );
-        self.dispatch(
-            cx,
-            ClientRequest::ListWorkspaceSessions {
-                workspace_id,
-                include_archived: false,
-            },
-            move |view, response, cx| match response.result {
-                Ok(ServerResponse::AgentSessions { sessions }) => {
-                    view.workspace_id = workspace_id;
-                    view.workspace_name = workspace.name.clone();
-                    view.sessions = sessions;
-                    for session in &view.sessions {
-                        view.session_node_ids
-                            .insert(session.id, view.default_backend_node_id.clone());
-                    }
-                    if let Some(session) = view.sessions.first().cloned() {
-                        view.select_session(session, cx);
-                    } else {
-                        view.activate_session(empty_session_snapshot(workspace_id));
-                        view.review.open = false;
-                        cx.notify();
-                    }
-                }
-                Err(error) => view.record_backend_error("workspace session list", error),
-                Ok(response) => view.record_backend_error(
-                    "workspace session list",
-                    unexpected_response("workspace session list", response),
-                ),
-            },
-        );
-    }
-
-    fn create_workspace_container(&mut self, cx: &mut Context<Self>) {
-        let name = format!("Workspace {}", self.workspaces.len().saturating_add(1));
-        self.dispatch(
-            cx,
-            ClientRequest::CreateWorkspace { name },
-            |view, response, cx| match response.result {
-                Ok(ServerResponse::WorkspaceCreated(workspace)) => {
-                    view.workspace_id = workspace.id;
-                    view.workspace_name = workspace.name.clone();
-                    view.workspaces.push(workspace);
-                    view.sessions.clear();
-                    view.create_session_async("New session".to_owned(), cx);
-                }
-                Err(error) => view.record_backend_error("workspace creation", error),
-                Ok(response) => view.record_backend_error(
-                    "workspace creation",
-                    unexpected_response("workspace creation", response),
-                ),
-            },
-        );
-    }
-
-    /// Creates a session through the selected node and pins it to that node.
-    pub(crate) fn create_session_async(&mut self, name: String, cx: &mut Context<Self>) {
-        self.create_session_on_node(self.default_backend_node_id.clone(), name, cx);
-    }
-
-    fn create_session_on_node(&mut self, node_id: String, name: String, cx: &mut Context<Self>) {
-        self.create_session_on_node_with_source(node_id, name, None, cx);
     }
 
     fn create_session_on_node_with_source(
