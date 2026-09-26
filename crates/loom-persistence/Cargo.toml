@@ -9,6 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 loom-core.workspace = true
+loom-session.workspace = true
+loom-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

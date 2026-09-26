@@ -7,18 +7,58 @@ use std::{
 };
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
-use loom_core::{ErrorCode, LoomError, Result};
+use loom_core::{
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence, LoomError,
+    Result, Timestamp, WorkspaceId,
+};
+use loom_protocol::ServerEventEnvelope;
+use loom_session::SessionManagerState;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
-const DATABASE_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+const DATABASE_SCHEMA_VERSION: u32 = 7;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
+const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_DURABLE_FEED_BYTES: usize = 16 * 1024 * 1024;
 
 const DATABASE_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS session_store_meta (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    next_sequence INTEGER NOT NULL CHECK(next_sequence >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS sessions (
+    id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
+    workspace_id BLOB NOT NULL CHECK(length(workspace_id) = 16),
+    name TEXT NOT NULL CHECK(length(trim(name)) > 0),
+    state TEXT NOT NULL CHECK(state IN (
+        'idle', 'queued', 'planning', 'awaiting_approval', 'paused', 'executing',
+        'evaluating', 'needs_input', 'completed', 'failed', 'cancelled', 'archived'
+    )),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS sessions_visible
+    ON sessions(workspace_id, updated_at DESC, id DESC) WHERE state != 'archived';
+CREATE INDEX IF NOT EXISTS sessions_archived
+    ON sessions(workspace_id, updated_at DESC, id DESC) WHERE state = 'archived';
+CREATE TABLE IF NOT EXISTS feed_store_meta (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    next_sequence INTEGER NOT NULL CHECK(next_sequence >= 0),
+    retention_limit INTEGER NOT NULL CHECK(retention_limit >= 0)
+) STRICT;
+CREATE TABLE IF NOT EXISTS feed_events (
+    sequence INTEGER PRIMARY KEY CHECK(sequence > 0),
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    payload_codec INTEGER NOT NULL CHECK(payload_codec IN (0, 1)),
+    payload BLOB NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS feed_events_by_session_sequence
+    ON feed_events(session_id, sequence);
 CREATE TABLE IF NOT EXISTS section_meta (
     name TEXT PRIMARY KEY NOT NULL,
     schema_version INTEGER NOT NULL
@@ -271,6 +311,13 @@ pub struct FilePersistence {
     path: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+pub struct DurableFeedState {
+    pub next_sequence: EventSequence,
+    pub retention_limit: usize,
+    pub events: Vec<ServerEventEnvelope>,
+}
+
 impl FilePersistence {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
         Self::open(path)
@@ -369,6 +416,407 @@ impl FilePersistence {
                 })
             })
             .map(Some)
+    }
+
+    /// Loads one subtree from a section without decoding sibling records.
+    pub fn load_section_path<T: DeserializeOwned>(
+        &self,
+        section: &str,
+        path: &str,
+        expected_version: u32,
+    ) -> Result<Option<T>> {
+        if !path.is_empty() && !path.starts_with('/') {
+            return Err(LoomError::invalid_request(
+                "persistence subtree path must be empty or start with '/'",
+            ));
+        }
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let version = connection
+            .query_row(
+                "SELECT schema_version FROM section_meta WHERE name=?1",
+                [section],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect section '{section}': {error}"),
+                    true,
+                )
+            })?;
+        let Some(version) = version else {
+            return Ok(None);
+        };
+        if version != expected_version {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!(
+                    "unsupported persistence schema version {version} (expected {expected_version})"
+                ),
+                false,
+            ));
+        }
+        let mut root = RestoreNode::default();
+        let mut found = false;
+        {
+            let mut statement = connection
+                .prepare(
+                    "SELECT path, node_kind, scalar, content_hash FROM state_nodes
+                     WHERE section=?1 AND (path=?2 OR substr(path, 1, length(?2)+1)=?2 || '/')
+                     ORDER BY path",
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not prepare section '{section}': {error}"),
+                        true,
+                    )
+                })?;
+            let rows = statement
+                .query_map(params![section, path], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                })
+                .map_err(|error| {
+                    persistence_error(format!("could not read section '{section}': {error}"), true)
+                })?;
+            for row in rows {
+                let (stored_path, kind, scalar, content_hash) = row.map_err(|error| {
+                    persistence_error(format!("could not read section '{section}': {error}"), true)
+                })?;
+                found = true;
+                let relative_path = &stored_path[path.len()..];
+                insert_restore_node(&mut root, relative_path, kind, scalar, content_hash)?;
+            }
+        }
+        if !found {
+            return Ok(None);
+        }
+        let value = root.into_value(&connection, path)?;
+        serde_json::from_value(value).map(Some).map_err(|error| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persistence subtree '{section}{path}' has invalid data: {error}"),
+                false,
+            )
+        })
+    }
+
+    /// Lists section names in a namespace, such as individually persisted runs.
+    pub fn list_sections_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM section_meta WHERE substr(name, 1, length(?1))=?1 ORDER BY name",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not list persistence sections: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map([prefix], |row| row.get(0))
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not list persistence sections: {error}"),
+                    true,
+                )
+            })?;
+        rows.collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not list persistence sections: {error}"),
+                    true,
+                )
+            })
+    }
+
+    /// Loads the indexed session catalog and its lifecycle sequence cursor.
+    pub fn load_sessions(&self) -> Result<Option<SessionManagerState>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let next_sequence = connection
+            .query_row(
+                "SELECT next_sequence FROM session_store_meta WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not read session catalog: {error}"), true)
+            })?;
+        let Some(next_sequence) = next_sequence else {
+            return Ok(None);
+        };
+        let mut statement = connection
+            .prepare(
+                "SELECT id, workspace_id, name, state, created_at, updated_at
+                 FROM sessions ORDER BY id",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare session catalog: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read session catalog: {error}"), true)
+            })?;
+        let mut sessions = BTreeMap::new();
+        for row in rows {
+            let (id, workspace_id, name, state, created_at, updated_at) = row.map_err(|error| {
+                persistence_error(format!("could not read session catalog: {error}"), true)
+            })?;
+            let id = AgentSessionId::from_uuid(decode_uuid(&id, "session id")?);
+            let workspace_id = WorkspaceId::from_uuid(decode_uuid(&workspace_id, "workspace id")?);
+            let snapshot = AgentSessionSnapshot {
+                id,
+                workspace_id,
+                name,
+                state: parse_session_state(&state)?,
+                created_at: decode_timestamp(created_at)?,
+                updated_at: decode_timestamp(updated_at)?,
+            };
+            sessions.insert(id, snapshot);
+        }
+        Ok(Some(SessionManagerState {
+            sessions,
+            next_sequence: EventSequence::new(u64::try_from(next_sequence).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted session sequence is negative",
+                    false,
+                )
+            })?),
+        }))
+    }
+
+    /// Loads the bounded reconnect feed from sequence-indexed records.
+    pub fn load_feed_state(&self) -> Result<Option<DurableFeedState>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let meta = connection
+            .query_row(
+                "SELECT next_sequence, retention_limit FROM feed_store_meta WHERE singleton=1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not read event feed: {error}"), true)
+            })?;
+        let Some((next_sequence, retention_limit)) = meta else {
+            return Ok(None);
+        };
+        let encoded_bytes: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(length(payload)), 0) FROM feed_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not validate event feed size: {error}"), true)
+            })?;
+        if encoded_bytes < 0 || encoded_bytes > MAX_DURABLE_FEED_BYTES as i64 {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted event feed exceeds its byte limit",
+                false,
+            ));
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, session_id, payload_codec, payload
+                 FROM feed_events ORDER BY sequence",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare event feed: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read event feed: {error}"), true)
+            })?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (sequence, session_id, payload_codec, payload) = row.map_err(|error| {
+                persistence_error(format!("could not read event feed: {error}"), true)
+            })?;
+            let payload = match payload_codec {
+                0 => payload,
+                1 => {
+                    let mut decoded = Vec::new();
+                    ZlibDecoder::new(payload.as_slice())
+                        .take(MAX_FEED_EVENT_BYTES as u64 + 1)
+                        .read_to_end(&mut decoded)
+                        .map_err(|error| {
+                            LoomError::new(
+                                ErrorCode::MalformedPayload,
+                                format!("persisted event feed entry is malformed: {error}"),
+                                false,
+                            )
+                        })?;
+                    decoded
+                }
+                _ => {
+                    return Err(LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted event feed entry uses an unsupported codec",
+                        false,
+                    ));
+                }
+            };
+            if payload.len() > MAX_FEED_EVENT_BYTES {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted event feed entry exceeds the maximum supported size",
+                    false,
+                ));
+            }
+            let event: ServerEventEnvelope = serde_json::from_slice(&payload).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted event feed entry is malformed: {error}"),
+                    false,
+                )
+            })?;
+            if sequence < 0
+                || event.sequence.value() != sequence as u64
+                || event.session_id.as_uuid().as_bytes().as_slice() != session_id.as_slice()
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted event feed index does not match its payload",
+                    false,
+                ));
+            }
+            events.push(event);
+        }
+        let next_sequence = u64::try_from(next_sequence).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted event cursor is negative",
+                false,
+            )
+        })?;
+        let retention_limit = usize::try_from(retention_limit).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted event retention is invalid",
+                false,
+            )
+        })?;
+        if events.len() > retention_limit
+            || events
+                .last()
+                .is_some_and(|event| event.sequence.value() > next_sequence)
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted event feed exceeds its cursor or retention limit",
+                false,
+            ));
+        }
+        Ok(Some(DurableFeedState {
+            next_sequence: EventSequence::new(next_sequence),
+            retention_limit,
+            events,
+        }))
+    }
+
+    /// Persists typed session rows and the remaining bounded state snapshot atomically.
+    pub fn save_state_with_sessions(
+        &self,
+        schema_version: u32,
+        sessions: &SessionManagerState,
+        sections: &[(&str, Value)],
+    ) -> Result<()> {
+        self.save_state_with_sessions_and_entities(schema_version, sessions, &[], sections)
+    }
+
+    /// Persists session rows, individual entity records, and auxiliary state atomically.
+    pub fn save_state_with_sessions_and_entities(
+        &self,
+        schema_version: u32,
+        sessions: &SessionManagerState,
+        records: &[(String, Value)],
+        sections: &[(&str, Value)],
+    ) -> Result<()> {
+        self.save_state_with_sessions_entities_and_feed(
+            schema_version,
+            sessions,
+            records,
+            None,
+            sections,
+        )
+    }
+
+    /// Persists catalog rows, entity records, the event feed, and auxiliary state atomically.
+    pub fn save_state_with_sessions_entities_and_feed(
+        &self,
+        schema_version: u32,
+        sessions: &SessionManagerState,
+        records: &[(String, Value)],
+        feed: Option<&DurableFeedState>,
+        sections: &[(&str, Value)],
+    ) -> Result<()> {
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin persistence transaction: {error}"),
+                true,
+            )
+        })?;
+        save_session_rows(&transaction, sessions)?;
+        if let Some(feed) = feed {
+            save_feed_rows(&transaction, feed)?;
+        }
+        for (name, value) in sections {
+            save_section_nodes(&transaction, name, schema_version, value)?;
+        }
+        for (name, value) in records {
+            if !name.starts_with("run:") && !name.starts_with("filesystem:") {
+                return Err(LoomError::invalid_request(
+                    "individually stored entity must use a supported section prefix",
+                ));
+            }
+            save_section_nodes(&transaction, name, schema_version, value)?;
+        }
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit persistence transaction: {error}"),
+                true,
+            )
+        })
     }
 
     pub fn save_sections(&self, schema_version: u32, sections: &[(&str, Value)]) -> Result<()> {
@@ -663,6 +1111,276 @@ fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8
     Ok(hash)
 }
 
+fn save_session_rows(transaction: &Transaction<'_>, state: &SessionManagerState) -> Result<()> {
+    let next_sequence = i64::try_from(state.next_sequence.value()).map_err(|_| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            "session lifecycle sequence exceeds SQLite's integer range",
+            false,
+        )
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO session_store_meta(singleton, next_sequence) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET next_sequence=excluded.next_sequence
+             WHERE session_store_meta.next_sequence IS NOT excluded.next_sequence",
+            [next_sequence],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not save session sequence: {error}"), true)
+        })?;
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_sessions (
+                id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_sessions;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage session catalog: {error}"), true)
+        })?;
+    for (id, session) in &state.sessions {
+        if *id != session.id {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "session key does not match its snapshot id",
+                false,
+            ));
+        }
+        let id = session.id.as_uuid().as_bytes();
+        let workspace_id = session.workspace_id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_sessions(id) VALUES (?1)",
+                [id.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not stage session catalog: {error}"), true)
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                    workspace_id=excluded.workspace_id,
+                    name=excluded.name,
+                    state=excluded.state,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at
+                 WHERE sessions.workspace_id IS NOT excluded.workspace_id
+                    OR sessions.name IS NOT excluded.name
+                    OR sessions.state IS NOT excluded.state
+                    OR sessions.created_at IS NOT excluded.created_at
+                    OR sessions.updated_at IS NOT excluded.updated_at",
+                params![
+                    id.as_slice(),
+                    workspace_id.as_slice(),
+                    session.name,
+                    session_state_name(session.state),
+                    encode_timestamp(session.created_at)?,
+                    encode_timestamp(session.updated_at)?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save session {}: {error}", session.id),
+                    true,
+                )
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM sessions
+             WHERE NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_sessions wanted WHERE wanted.id=sessions.id
+             )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prune session catalog: {error}"), true)
+        })?;
+    Ok(())
+}
+
+fn save_feed_rows(transaction: &Transaction<'_>, feed: &DurableFeedState) -> Result<()> {
+    let next_sequence = i64::try_from(feed.next_sequence.value()).map_err(|_| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            "event sequence exceeds SQLite's integer range",
+            false,
+        )
+    })?;
+    let retention_limit = i64::try_from(feed.retention_limit).map_err(|_| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            "event retention limit exceeds SQLite's integer range",
+            false,
+        )
+    })?;
+    let mut previous = 0;
+    for event in &feed.events {
+        let sequence = i64::try_from(event.sequence.value()).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "event sequence exceeds SQLite's integer range",
+                false,
+            )
+        })?;
+        if sequence <= previous || sequence > next_sequence {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "event feed sequences are invalid",
+                false,
+            ));
+        }
+        previous = sequence;
+        let raw_payload = serde_json::to_vec(event).map_err(|error| {
+            persistence_error(format!("could not encode event feed entry: {error}"), false)
+        })?;
+        if raw_payload.len() > MAX_FEED_EVENT_BYTES {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "event feed entry exceeds the maximum supported size",
+                false,
+            ));
+        }
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&raw_payload).map_err(|error| {
+            persistence_error(
+                format!("could not compress event feed entry: {error}"),
+                false,
+            )
+        })?;
+        let compressed = encoder.finish().map_err(|error| {
+            persistence_error(
+                format!("could not compress event feed entry: {error}"),
+                false,
+            )
+        })?;
+        let (payload_codec, payload) = if compressed.len() < raw_payload.len() {
+            (1_i64, compressed)
+        } else {
+            (0_i64, raw_payload)
+        };
+        transaction
+            .execute(
+                "INSERT INTO feed_events(sequence, session_id, payload_codec, payload)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(sequence) DO NOTHING",
+                params![
+                    sequence,
+                    event.session_id.as_uuid().as_bytes().as_slice(),
+                    payload_codec,
+                    payload
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save event feed entry: {error}"), true)
+            })?;
+    }
+    transaction
+        .execute(
+            "INSERT INTO feed_store_meta(singleton, next_sequence, retention_limit)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+                next_sequence=excluded.next_sequence,
+                retention_limit=excluded.retention_limit
+             WHERE feed_store_meta.next_sequence IS NOT excluded.next_sequence
+                OR feed_store_meta.retention_limit IS NOT excluded.retention_limit",
+            params![next_sequence, retention_limit],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not save event feed cursor: {error}"), true)
+        })?;
+    transaction
+        .execute(
+            "WITH ranked AS (
+                SELECT sequence,
+                       SUM(length(payload)) OVER (ORDER BY sequence DESC) AS retained_bytes
+                FROM feed_events
+             )
+             DELETE FROM feed_events
+             WHERE sequence IN (SELECT sequence FROM ranked WHERE retained_bytes > ?1)
+                OR sequence NOT IN (
+                    SELECT sequence FROM feed_events ORDER BY sequence DESC LIMIT ?2
+                )",
+            params![MAX_DURABLE_FEED_BYTES as i64, retention_limit],
+        )
+        .map_err(|error| persistence_error(format!("could not prune event feed: {error}"), true))?;
+    Ok(())
+}
+
+fn session_state_name(state: AgentSessionState) -> &'static str {
+    match state {
+        AgentSessionState::Idle => "idle",
+        AgentSessionState::Queued => "queued",
+        AgentSessionState::Planning => "planning",
+        AgentSessionState::AwaitingApproval => "awaiting_approval",
+        AgentSessionState::Paused => "paused",
+        AgentSessionState::Executing => "executing",
+        AgentSessionState::Evaluating => "evaluating",
+        AgentSessionState::NeedsInput => "needs_input",
+        AgentSessionState::Completed => "completed",
+        AgentSessionState::Failed => "failed",
+        AgentSessionState::Cancelled => "cancelled",
+        AgentSessionState::Archived => "archived",
+    }
+}
+
+fn parse_session_state(state: &str) -> Result<AgentSessionState> {
+    match state {
+        "idle" => Ok(AgentSessionState::Idle),
+        "queued" => Ok(AgentSessionState::Queued),
+        "planning" => Ok(AgentSessionState::Planning),
+        "awaiting_approval" => Ok(AgentSessionState::AwaitingApproval),
+        "paused" => Ok(AgentSessionState::Paused),
+        "executing" => Ok(AgentSessionState::Executing),
+        "evaluating" => Ok(AgentSessionState::Evaluating),
+        "needs_input" => Ok(AgentSessionState::NeedsInput),
+        "completed" => Ok(AgentSessionState::Completed),
+        "failed" => Ok(AgentSessionState::Failed),
+        "cancelled" => Ok(AgentSessionState::Cancelled),
+        "archived" => Ok(AgentSessionState::Archived),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted session has an unknown state '{state}'"),
+            false,
+        )),
+    }
+}
+
+fn encode_timestamp(timestamp: Timestamp) -> Result<i64> {
+    i64::try_from(timestamp.as_unix_millis()).map_err(|_| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            "timestamp exceeds SQLite's integer range",
+            false,
+        )
+    })
+}
+
+fn decode_timestamp(timestamp: i64) -> Result<Timestamp> {
+    u64::try_from(timestamp)
+        .map(Timestamp::from_unix_millis)
+        .map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted timestamp is negative",
+                false,
+            )
+        })
+}
+
+fn decode_uuid(bytes: &[u8], field: &str) -> Result<Uuid> {
+    Uuid::from_slice(bytes).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted {field} is invalid: {error}"),
+            false,
+        )
+    })
+}
+
 fn persistence_error(message: String, retryable: bool) -> LoomError {
     LoomError::new(ErrorCode::Persistence, message, retryable)
 }
@@ -733,6 +1451,7 @@ impl MemoryPersistence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loom_session::SessionManager;
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
 
@@ -1020,6 +1739,199 @@ mod tests {
                 .unwrap()["content"],
             text
         );
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn typed_session_catalog_round_trips_and_uses_the_picker_index() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut manager = SessionManager::default();
+        let (first, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "First session")
+            .unwrap();
+        let (second, _) = manager
+            .create_in_workspace(first.workspace_id, "Second session")
+            .unwrap();
+        manager.archive(first.id).unwrap();
+        let state = manager.export_state();
+
+        persistence
+            .save_state_with_sessions(CURRENT_SCHEMA_VERSION, &state, &[])
+            .unwrap();
+        let restored = persistence.load_sessions().unwrap().unwrap();
+        assert_eq!(restored, state);
+        assert_eq!(
+            SessionManager::from_state(restored)
+                .unwrap()
+                .get(second.id)
+                .unwrap(),
+            second
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        let plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT id, name, updated_at FROM sessions
+                 WHERE workspace_id = ?1 AND state != 'archived'
+                 ORDER BY updated_at DESC, id DESC LIMIT 20",
+                [second.workspace_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("sessions_visible"), "{plan}");
+        connection
+            .execute_batch(
+                "CREATE TABLE session_updates(count INTEGER NOT NULL);
+                 INSERT INTO session_updates VALUES (0);
+                 CREATE TRIGGER track_session_updates AFTER UPDATE ON sessions BEGIN
+                    UPDATE session_updates SET count=count+1;
+                 END;",
+            )
+            .unwrap();
+        drop(connection);
+        persistence
+            .save_state_with_sessions(CURRENT_SCHEMA_VERSION, &state, &[])
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let updates: i64 = connection
+            .query_row("SELECT count FROM session_updates", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(updates, 0, "unchanged rows must not be rewritten");
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn typed_session_rows_roll_back_with_the_rest_of_the_state_write() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut manager = SessionManager::default();
+        manager
+            .create_in_workspace(WorkspaceId::new(), "Atomic session")
+            .unwrap();
+        let state = manager.export_state();
+
+        assert!(
+            persistence
+                .save_state_with_sessions(
+                    CURRENT_SCHEMA_VERSION,
+                    &state,
+                    &[("", serde_json::json!({"invalid": true}))],
+                )
+                .is_err()
+        );
+        assert!(persistence.load_sessions().unwrap().is_none());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn run_sections_can_be_listed_and_loaded_by_subtree() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        let first = format!("run:{}", Uuid::new_v4());
+        let second = format!("run:{}", Uuid::new_v4());
+        store
+            .save_sections(
+                CURRENT_SCHEMA_VERSION,
+                &[
+                    (
+                        &first,
+                        serde_json::json!({
+                            "run": {"state": "completed"},
+                            "messages": ["small summary", "large transcript".repeat(1_000)]
+                        }),
+                    ),
+                    (
+                        &second,
+                        serde_json::json!({"run": {"state": "failed"}, "messages": []}),
+                    ),
+                ],
+            )
+            .unwrap();
+        assert_eq!(store.list_sections_with_prefix("run:").unwrap().len(), 2);
+        assert_eq!(
+            store
+                .load_section_path::<Value>(&first, "/krun", CURRENT_SCHEMA_VERSION)
+                .unwrap()
+                .unwrap(),
+            serde_json::json!({"state": "completed"})
+        );
+        assert!(
+            store
+                .load_section_path::<Value>(&first, "/kmissing", CURRENT_SCHEMA_VERSION)
+                .unwrap()
+                .is_none()
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reconnect_feed_is_indexed_bounded_and_atomic_with_catalog_writes() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        let session_id = AgentSessionId::new();
+        let workspace_id = WorkspaceId::new();
+        let snapshot = AgentSessionSnapshot {
+            id: session_id,
+            workspace_id,
+            name: "Feed test".to_owned(),
+            state: AgentSessionState::Idle,
+            created_at: Timestamp::from_unix_millis(10),
+            updated_at: Timestamp::from_unix_millis(10),
+        };
+        let mut manager = SessionManager::default();
+        manager
+            .create_in_workspace_with_id(workspace_id, session_id, "Feed test")
+            .unwrap();
+        let sessions = manager.export_state();
+        let feed = DurableFeedState {
+            next_sequence: EventSequence::new(3),
+            retention_limit: 2,
+            events: (1..=3)
+                .map(|sequence| ServerEventEnvelope {
+                    protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(sequence),
+                    session_id,
+                    event: loom_protocol::ServerEvent::AgentSessionCreated {
+                        snapshot: snapshot.clone(),
+                    },
+                })
+                .collect(),
+        };
+        store
+            .save_state_with_sessions_entities_and_feed(
+                CURRENT_SCHEMA_VERSION,
+                &sessions,
+                &[],
+                Some(&feed),
+                &[],
+            )
+            .unwrap();
+        let loaded = store.load_feed_state().unwrap().unwrap();
+        assert_eq!(loaded.next_sequence, EventSequence::new(3));
+        assert_eq!(loaded.retention_limit, 2);
+        assert_eq!(
+            loaded
+                .events
+                .iter()
+                .map(|event| event.sequence.value())
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        let plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT sequence FROM feed_events
+                 WHERE session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 20",
+                params![session_id.as_uuid().as_bytes().as_slice(), 0_i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("feed_events_by_session_sequence"), "{plan}");
         drop(connection);
         fs::remove_file(path).unwrap();
     }

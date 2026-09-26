@@ -14,10 +14,10 @@ use loom_agent::{
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Capability,
     CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId, Result,
-    SessionEventRecord, Timestamp, WorkspaceId, WorkspaceRecord,
+    SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
-use loom_persistence::{CURRENT_SCHEMA_VERSION, FilePersistence};
+use loom_persistence::{CURRENT_SCHEMA_VERSION, DurableFeedState, FilePersistence};
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
@@ -506,6 +506,8 @@ fn github_copilot_credentials() -> Result<Arc<FileCredentialStore>> {
 struct EventJournal {
     next_sequence: EventSequence,
     events: Vec<ServerEventEnvelope>,
+    #[serde(skip)]
+    pending_events: Vec<ServerEventEnvelope>,
     #[serde(default = "default_event_retention")]
     retention_limit: usize,
 }
@@ -513,18 +515,17 @@ struct EventJournal {
 impl EventJournal {
     fn append_session(&mut self, record: SessionEventRecord) {
         let sequence = self.next();
-        self.events.push(ServerEventEnvelope::from_session_event(
-            sequence,
-            record.session_id,
-            record.event,
-        ));
+        let event =
+            ServerEventEnvelope::from_session_event(sequence, record.session_id, record.event);
+        self.events.push(event.clone());
+        self.pending_events.push(event);
     }
 
     fn append_agent(&mut self, session_id: AgentSessionId, event: AgentEvent) {
         let sequence = self.next();
-        self.events.push(ServerEventEnvelope::from_agent_event(
-            sequence, session_id, event,
-        ));
+        let event = ServerEventEnvelope::from_agent_event(sequence, session_id, event);
+        self.events.push(event.clone());
+        self.pending_events.push(event);
     }
 
     fn next(&mut self) -> EventSequence {
@@ -604,8 +605,6 @@ struct PersistedBackendState {
     sessions: loom_session::SessionManagerState,
     workspace_records: loom_session::WorkspaceManagerState,
     journal: EventJournal,
-    runs: BTreeMap<loom_core::RunId, AgentRuntimeState>,
-    session_filesystems: BTreeMap<AgentSessionId, PersistedSessionFilesystem>,
     session_policies: BTreeMap<AgentSessionId, ApprovalPolicy>,
     auto_approve_actions: BTreeMap<AgentSessionId, bool>,
     provider_configs: Vec<ProviderConfig>,
@@ -613,6 +612,13 @@ struct PersistedBackendState {
     workspace_configs: BTreeMap<WorkspaceId, WorkspaceConfig>,
     provider_usage: UsageLedger,
     idempotency: BTreeMap<loom_core::RequestId, IdempotencyRecord>,
+}
+
+#[derive(Clone)]
+struct PersistedRunSummary {
+    snapshot: AgentRunSnapshot,
+    usage: UsageSnapshot,
+    section: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -836,8 +842,11 @@ pub struct InProcessBackend {
     sessions: Mutex<SessionManager>,
     workspace_records: Mutex<loom_session::WorkspaceManager>,
     runs: Mutex<BTreeMap<loom_core::RunId, Arc<RunHandle>>>,
+    persisted_runs: Mutex<BTreeMap<loom_core::RunId, PersistedRunSummary>>,
     journal: Mutex<EventJournal>,
     session_filesystems: Mutex<BTreeMap<AgentSessionId, Workspace>>,
+    persisted_session_filesystems: Mutex<BTreeMap<AgentSessionId, String>>,
+    session_filesystem_restore: Mutex<()>,
     session_repositories:
         Mutex<BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>,
     session_vcs: Mutex<BTreeMap<(AgentSessionId, RepositoryId), GitService>>,
@@ -1161,8 +1170,11 @@ impl InProcessBackend {
             sessions: Mutex::new(SessionManager::default()),
             workspace_records: Mutex::new(loom_session::WorkspaceManager::default()),
             runs: Mutex::new(BTreeMap::new()),
+            persisted_runs: Mutex::new(BTreeMap::new()),
             journal: Mutex::new(EventJournal::default()),
             session_filesystems: Mutex::new(BTreeMap::new()),
+            persisted_session_filesystems: Mutex::new(BTreeMap::new()),
+            session_filesystem_restore: Mutex::new(()),
             session_repositories: Mutex::new(BTreeMap::new()),
             session_vcs: Mutex::new(BTreeMap::new()),
             session_task_supervisors: Mutex::new(BTreeMap::new()),
@@ -1285,6 +1297,130 @@ impl InProcessBackend {
         })
     }
 
+    fn persisted_session_filesystems(
+        &self,
+    ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, String>>> {
+        self.persisted_session_filesystems.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "persisted session filesystem manager lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn restore_session_filesystem(&self, session_id: AgentSessionId) -> Result<Workspace> {
+        if let Some(filesystem) = self.session_filesystems()?.get(&session_id).cloned() {
+            return Ok(filesystem);
+        }
+        let _restore_guard = self.session_filesystem_restore.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "session filesystem restore lock was poisoned",
+                true,
+            )
+        })?;
+        if let Some(filesystem) = self.session_filesystems()?.get(&session_id).cloned() {
+            return Ok(filesystem);
+        }
+        let section = self
+            .persisted_session_filesystems()?
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("filesystem for session {session_id} is unavailable"),
+                    true,
+                )
+            })?;
+        let persisted = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("filesystem for session {session_id} has no persistence store"),
+                    true,
+                )
+            })?
+            .load_section::<PersistedSessionFilesystem>(&section, CURRENT_SCHEMA_VERSION)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted filesystem section '{section}' is missing"),
+                    false,
+                )
+            })?;
+        let session = self.sessions()?.get(session_id)?;
+        let expected_root = self
+            .session_root_base
+            .join(session.workspace_id.to_string())
+            .join(session_id.to_string())
+            .join("fs");
+        let canonical_expected_root = fs::canonicalize(&expected_root).map_err(|error| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("session filesystem root for {session_id} is unavailable: {error}"),
+                true,
+            )
+        })?;
+        if Path::new(&persisted.filesystem.root) != canonical_expected_root {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted filesystem root for session {session_id} is invalid"),
+                false,
+            ));
+        }
+        let filesystem = Workspace::open_for_restore(session_id, &canonical_expected_root)?;
+        for directory in &persisted.directories {
+            filesystem.mount_directory(&directory.path, &directory.source)?;
+        }
+        filesystem.restore_state(persisted.filesystem)?;
+        for (repository_id, repository) in &persisted.repositories {
+            if *repository_id != repository.id {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("repository key does not match repository {}", repository.id),
+                    false,
+                ));
+            }
+            let path = filesystem.directory_path(&repository.path)?;
+            let service = GitService::open(path)?;
+            self.session_vcs()?
+                .insert((session_id, *repository_id), service);
+        }
+        self.session_repositories()?
+            .insert(session_id, persisted.repositories);
+        self.session_filesystems()?
+            .insert(session_id, filesystem.clone());
+        self.persisted_session_filesystems()?.remove(&session_id);
+        Ok(filesystem)
+    }
+
+    fn persisted_filesystem_record(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Option<PersistedSessionFilesystem>> {
+        let Some(section) = self
+            .persisted_session_filesystems()?
+            .get(&session_id)
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("filesystem for session {session_id} has no persistence store"),
+                    true,
+                )
+            })?
+            .load_section::<PersistedSessionFilesystem>(&section, CURRENT_SCHEMA_VERSION)
+    }
+
     fn session_repositories(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>>
@@ -1338,6 +1474,18 @@ impl InProcessBackend {
         self.runs
             .lock()
             .map_err(|_| LoomError::new(ErrorCode::Internal, "agent run lock was poisoned", true))
+    }
+
+    fn persisted_runs(
+        &self,
+    ) -> Result<MutexGuard<'_, BTreeMap<loom_core::RunId, PersistedRunSummary>>> {
+        self.persisted_runs.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "persisted run summary lock was poisoned",
+                true,
+            )
+        })
     }
 
     fn journal(&self) -> Result<MutexGuard<'_, EventJournal>> {
@@ -1452,11 +1600,7 @@ impl InProcessBackend {
             return Ok(());
         };
         let mut needs_persist = false;
-        let Some(sessions) = persistence.load_section::<loom_session::SessionManagerState>(
-            "sessions",
-            CURRENT_SCHEMA_VERSION,
-        )?
-        else {
+        let Some(sessions) = persistence.load_sessions()? else {
             return Ok(());
         };
         let required = |name: &str| -> Result<Value> {
@@ -1481,12 +1625,14 @@ impl InProcessBackend {
                 .map(from_json)
                 .transpose()?
                 .unwrap_or_default(),
-            journal: from_json(required("journal")?)?,
-            runs: from_json(required("runs")?)?,
-            session_filesystems: persistence
-                .load_section("session_filesystems", CURRENT_SCHEMA_VERSION)?
-                .map(from_json)
-                .transpose()?
+            journal: persistence
+                .load_feed_state()?
+                .map(|feed| EventJournal {
+                    next_sequence: feed.next_sequence,
+                    events: feed.events,
+                    pending_events: Vec::new(),
+                    retention_limit: feed.retention_limit,
+                })
                 .unwrap_or_default(),
             session_policies: session_policies.unwrap_or_default(),
             auto_approve_actions: persistence
@@ -1551,74 +1697,94 @@ impl InProcessBackend {
         *self.workspace_records()? =
             loom_session::WorkspaceManager::from_state(state.workspace_records)?;
 
-        let mut session_filesystems = self.session_filesystems()?;
-        let mut session_repositories = self.session_repositories()?;
-        for (session_id, persisted) in state.session_filesystems {
-            let session = self.sessions()?.get(session_id)?;
-            let expected_root = self
-                .session_root_base
-                .join(session.workspace_id.to_string())
-                .join(session_id.to_string())
-                .join("fs");
-            let canonical_expected_root = fs::canonicalize(&expected_root).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::RecoveryRequired,
-                    format!("session filesystem root for {session_id} is unavailable: {error}"),
-                    true,
-                )
-            })?;
-            if Path::new(&persisted.filesystem.root) != canonical_expected_root {
-                return Err(LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    format!("persisted filesystem root for session {session_id} is invalid"),
-                    false,
-                ));
-            }
-            let filesystem = Workspace::open_for_restore(session_id, &canonical_expected_root)?;
-            for directory in &persisted.directories {
-                filesystem.mount_directory(&directory.path, &directory.source)?;
-            }
-            filesystem.restore_state(persisted.filesystem)?;
-            for (repository_id, repository) in &persisted.repositories {
-                if *repository_id != repository.id {
-                    return Err(LoomError::new(
+        for section in persistence.list_sections_with_prefix("filesystem:")? {
+            let session_id = section
+                .strip_prefix("filesystem:")
+                .and_then(|value| value.parse::<AgentSessionId>().ok())
+                .ok_or_else(|| {
+                    LoomError::new(
                         ErrorCode::MalformedPayload,
-                        format!("repository key does not match repository {}", repository.id),
+                        format!("persisted filesystem section '{section}' has an invalid id"),
                         false,
-                    ));
-                }
-                let path = filesystem.directory_path(&repository.path)?;
-                let service = GitService::open(path)?;
-                self.session_vcs()?
-                    .insert((session_id, *repository_id), service);
-            }
-            session_filesystems.insert(session_id, filesystem);
-            session_repositories.insert(session_id, persisted.repositories);
+                    )
+                })?;
+            self.sessions()?.get(session_id)?;
+            self.persisted_session_filesystems()?
+                .insert(session_id, section);
         }
-        drop(session_repositories);
-        drop(session_filesystems);
 
+        let mut run_summaries = BTreeMap::new();
         let mut restored_runs = BTreeMap::new();
-        for (run_id, runtime_state) in state.runs {
-            if run_id != runtime_state.run.id {
+        for section in persistence.list_sections_with_prefix("run:")? {
+            let run_id = section
+                .strip_prefix("run:")
+                .and_then(|value| value.parse::<loom_core::RunId>().ok())
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted run section '{section}' has an invalid id"),
+                        false,
+                    )
+                })?;
+            let snapshot = persistence
+                .load_section_path::<AgentRunSnapshot>(&section, "/krun", CURRENT_SCHEMA_VERSION)?
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted run section '{section}' has no snapshot"),
+                        false,
+                    )
+                })?;
+            let usage = persistence
+                .load_section_path::<UsageSnapshot>(&section, "/kusage", CURRENT_SCHEMA_VERSION)?
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted run section '{section}' has no usage"),
+                        false,
+                    )
+                })?;
+            if run_id != snapshot.id {
                 return Err(LoomError::new(
                     ErrorCode::MalformedPayload,
                     format!("persisted run key does not match run snapshot {run_id}"),
                     false,
                 ));
             }
-            let session = self.sessions()?.get(runtime_state.session_id)?;
-            let workspace = self
-                .session_filesystems()?
-                .get(&session.id)
-                .cloned()
+            self.sessions()?.get(snapshot.session_id)?;
+            let active_run = !matches!(
+                snapshot.state,
+                AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+            );
+            run_summaries.insert(
+                run_id,
+                PersistedRunSummary {
+                    snapshot,
+                    usage,
+                    section: section.clone(),
+                },
+            );
+            if !active_run {
+                continue;
+            }
+            let runtime_state = persistence
+                .load_section::<AgentRuntimeState>(&section, CURRENT_SCHEMA_VERSION)?
                 .ok_or_else(|| {
                     LoomError::new(
-                        ErrorCode::RecoveryRequired,
-                        format!("filesystem for persisted run {run_id} is unavailable"),
-                        true,
+                        ErrorCode::MalformedPayload,
+                        format!("persisted run section '{section}' is empty"),
+                        false,
                     )
                 })?;
+            if runtime_state.run.id != run_id {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted run key does not match runtime state {run_id}"),
+                    false,
+                ));
+            }
+            let session = self.sessions()?.get(runtime_state.session_id)?;
+            let workspace = self.restore_session_filesystem(session.id)?;
             let mut recovery_reason = None;
             let provider =
                 match self.provider_at(&runtime_state.task.model, runtime_state.provider_cursor) {
@@ -1658,6 +1824,7 @@ impl InProcessBackend {
                 needs_persist = true;
             }
         }
+        *self.persisted_runs()? = run_summaries;
         *self.runs()? = restored_runs;
         if needs_persist {
             self.persist_state()?;
@@ -1674,42 +1841,46 @@ impl InProcessBackend {
             .iter()
             .map(|(run_id, handle)| (*run_id, handle.state()))
             .collect();
-        let session_filesystems = self
-            .session_filesystems()?
-            .iter()
-            .map(|(session_id, filesystem)| {
-                Ok((
-                    *session_id,
-                    PersistedSessionFilesystem {
-                        filesystem: filesystem.export_state()?,
-                        repositories: self
-                            .session_repositories()?
-                            .get(session_id)
-                            .cloned()
-                            .unwrap_or_default(),
-                        directories: filesystem
-                            .mounted_directories()?
-                            .into_iter()
-                            .map(|(path, source)| SessionDirectory {
-                                path,
-                                source: source.display().to_string(),
-                            })
-                            .collect(),
-                    },
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
-        persistence.save_sections(
+        let mut entity_sections = runs
+            .into_iter()
+            .map(|(run_id, state)| Ok((format!("run:{run_id}"), json_value(state)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let loaded_repositories = self.session_repositories()?;
+        for (session_id, filesystem) in self.session_filesystems()?.iter() {
+            let persisted = PersistedSessionFilesystem {
+                filesystem: filesystem.export_state()?,
+                repositories: loaded_repositories
+                    .get(session_id)
+                    .cloned()
+                    .unwrap_or_default(),
+                directories: filesystem
+                    .mounted_directories()?
+                    .into_iter()
+                    .map(|(path, source)| SessionDirectory {
+                        path,
+                        source: source.display().to_string(),
+                    })
+                    .collect(),
+            };
+            entity_sections.push((format!("filesystem:{session_id}"), json_value(persisted)?));
+        }
+        let sessions = self.sessions()?.export_state();
+        let mut journal = self.journal()?;
+        let feed = DurableFeedState {
+            next_sequence: journal.next_sequence,
+            retention_limit: journal.retention_limit,
+            events: journal.pending_events.clone(),
+        };
+        let result = persistence.save_state_with_sessions_entities_and_feed(
             CURRENT_SCHEMA_VERSION,
+            &sessions,
+            &entity_sections,
+            Some(&feed),
             &[
-                ("sessions", json_value(self.sessions()?.export_state())?),
                 (
                     "workspace_records",
                     json_value(self.workspace_records()?.export_state())?,
                 ),
-                ("journal", json_value(self.journal()?.clone())?),
-                ("runs", json_value(runs)?),
-                ("session_filesystems", json_value(session_filesystems)?),
                 (
                     "session_approval_policies",
                     json_value(self.session_policies()?.clone())?,
@@ -1734,7 +1905,11 @@ impl InProcessBackend {
                 ("models", json_value(self.models.clone())?),
                 ("idempotency", json_value(self.idempotency()?.clone())?),
             ],
-        )
+        );
+        if result.is_ok() {
+            journal.pending_events.clear();
+        }
+        result
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -1951,7 +2126,12 @@ impl InProcessConnection {
         &self,
         run_id: loom_core::RunId,
     ) -> Result<AgentRunSnapshotProjection> {
-        Ok(run_snapshot_projection(&self.run_handle(run_id)?.state()))
+        if let Some(handle) = self.backend.runs()?.get(&run_id).cloned() {
+            return Ok(run_snapshot_projection(&handle.state()));
+        }
+        let summary = self.run_summary(run_id)?;
+        let state = self.load_persisted_run_state(&summary)?;
+        Ok(run_snapshot_projection(&state))
     }
 
     fn disk_resources(root: &Path) -> (Option<u64>, Option<u64>) {
@@ -1986,16 +2166,82 @@ impl InProcessConnection {
 
     /// Looks a run up without touching its runtime lock.
     fn run_handle(&self, run_id: loom_core::RunId) -> Result<Arc<RunHandle>> {
-        let handle = self
+        if let Some(handle) = self.backend.runs()?.get(&run_id).cloned() {
+            if let Some(error) = handle.take_failure() {
+                return Err(error);
+            }
+            return Ok(handle);
+        }
+        let summary = self.run_summary(run_id)?;
+        let state = self.load_persisted_run_state(&summary)?;
+        if state.run.id != run_id || state.session_id != summary.snapshot.session_id {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted run {run_id} does not match its summary"),
+                false,
+            ));
+        }
+        let workspace = self.backend.restore_session_filesystem(state.session_id)?;
+        let provider = match self
             .backend
-            .runs()?
-            .get(&run_id)
-            .cloned()
-            .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
+            .provider_at(&state.task.model, state.provider_cursor)
+        {
+            Ok(provider) => provider,
+            Err(error) => {
+                let descriptor = self
+                    .backend
+                    .providers
+                    .describe_model(&state.task.model)
+                    .unwrap_or_else(|_| ModelDescriptor {
+                        id: state.task.model.clone(),
+                        provider: ProviderId::new("recovered"),
+                        display_name: "Unavailable persisted model".to_owned(),
+                        context_window: None,
+                        capabilities: ModelCapabilities::default(),
+                    });
+                Box::new(UnavailableProvider::new(descriptor, error))
+            }
+        };
+        let tools = ToolExecutor::new_with_workspace(workspace)
+            .with_github_token(self.backend.providers.github_account_token().ok());
+        let runtime = AgentRuntime::from_state(state, provider, tools)?;
+        let handle = self.backend.register_runtime(runtime);
+        self.backend.runs()?.insert(run_id, Arc::clone(&handle));
         if let Some(error) = handle.take_failure() {
             return Err(error);
         }
         Ok(handle)
+    }
+
+    fn run_summary(&self, run_id: loom_core::RunId) -> Result<PersistedRunSummary> {
+        if let Some(handle) = self.backend.runs()?.get(&run_id) {
+            let state = handle.state();
+            return Ok(PersistedRunSummary {
+                snapshot: state.run,
+                usage: state.usage,
+                section: format!("run:{run_id}"),
+            });
+        }
+        self.backend
+            .persisted_runs()?
+            .get(&run_id)
+            .cloned()
+            .ok_or_else(|| LoomError::not_found("agent run", run_id))
+    }
+
+    fn load_persisted_run_state(&self, summary: &PersistedRunSummary) -> Result<AgentRuntimeState> {
+        self.backend
+            .persistence
+            .as_ref()
+            .ok_or_else(|| LoomError::not_found("agent run", summary.snapshot.id))?
+            .load_section::<AgentRuntimeState>(&summary.section, CURRENT_SCHEMA_VERSION)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("persisted run {} is missing", summary.snapshot.id),
+                    true,
+                )
+            })
     }
 
     fn session_snapshot_projection(
@@ -2003,15 +2249,39 @@ impl InProcessConnection {
         session_id: AgentSessionId,
     ) -> Result<AgentSessionSnapshotProjection> {
         let session = self.backend.sessions()?.get(session_id)?;
-        let active_run = self
+        let (loaded_ids, latest_loaded) = {
+            let runs = self.backend.runs()?;
+            let loaded_ids = runs.keys().copied().collect::<BTreeSet<_>>();
+            let latest = runs
+                .values()
+                .filter(|handle| handle.session_id == session_id)
+                .map(|handle| handle.state())
+                .max_by_key(|state| state.run.updated_at);
+            (loaded_ids, latest)
+        };
+        let latest_persisted = self
             .backend
-            .runs()?
+            .persisted_runs()?
             .values()
-            .filter(|handle| handle.session_id == session_id)
-            .map(|handle| handle.state())
-            .max_by_key(|state| state.run.updated_at)
-            .as_ref()
-            .map(run_snapshot_projection);
+            .filter(|summary| {
+                summary.snapshot.session_id == session_id
+                    && !loaded_ids.contains(&summary.snapshot.id)
+            })
+            .max_by_key(|summary| summary.snapshot.updated_at)
+            .cloned();
+        let active_run = match (latest_loaded, latest_persisted) {
+            (Some(state), Some(summary)) if state.run.updated_at >= summary.snapshot.updated_at => {
+                Some(run_snapshot_projection(&state))
+            }
+            (Some(_), Some(summary)) => Some(run_snapshot_projection(
+                &self.load_persisted_run_state(&summary)?,
+            )),
+            (Some(state), None) => Some(run_snapshot_projection(&state)),
+            (None, Some(summary)) => Some(run_snapshot_projection(
+                &self.load_persisted_run_state(&summary)?,
+            )),
+            (None, None) => None,
+        };
         let latest_sequence = self
             .backend
             .journal()?
@@ -2074,17 +2344,7 @@ impl InProcessConnection {
     }
 
     fn session_filesystem(&self, session_id: AgentSessionId) -> Result<Workspace> {
-        self.backend
-            .session_filesystems()?
-            .get(&session_id)
-            .cloned()
-            .ok_or_else(|| {
-                LoomError::new(
-                    ErrorCode::RecoveryRequired,
-                    format!("filesystem for session {session_id} is unavailable"),
-                    true,
-                )
-            })
+        self.backend.restore_session_filesystem(session_id)
     }
 
     fn import_session_directory(
@@ -2473,6 +2733,7 @@ impl InProcessConnection {
                 "repositories cannot be detached while a session is active",
             ));
         }
+        let filesystem = self.session_filesystem(session_id)?;
         let repository = self
             .backend
             .session_repositories()?
@@ -2480,7 +2741,6 @@ impl InProcessConnection {
             .and_then(|repositories| repositories.get(&repository_id))
             .cloned()
             .ok_or_else(|| LoomError::not_found("session repository", repository_id))?;
-        let filesystem = self.session_filesystem(session_id)?;
         if filesystem.mounted_source_for(&repository.path)?.is_none() {
             let path = filesystem.directory_path(&repository.path)?;
             fs::remove_dir_all(&path).map_err(|error| {
@@ -2515,6 +2775,7 @@ impl InProcessConnection {
         {
             return Ok(service);
         }
+        let _filesystem = self.session_filesystem(session_id)?;
         let repository = self
             .backend
             .session_repositories()?
@@ -2820,14 +3081,20 @@ impl InProcessConnection {
             ClientRequest::ListGitHubRepositories => self.list_github_repositories(),
             ClientRequest::ListSessionRepositories { session_id } => {
                 self.backend.sessions()?.get(session_id)?;
-                Ok(ServerResponse::SessionRepositories {
-                    repositories: self
+                let repositories = self
+                    .backend
+                    .session_repositories()?
+                    .get(&session_id)
+                    .map(|repositories| repositories.values().cloned().collect());
+                let repositories = match repositories {
+                    Some(repositories) => repositories,
+                    None => self
                         .backend
-                        .session_repositories()?
-                        .get(&session_id)
-                        .map(|repositories| repositories.values().cloned().collect())
+                        .persisted_filesystem_record(session_id)?
+                        .map(|persisted| persisted.repositories.into_values().collect())
                         .unwrap_or_default(),
-                })
+                };
+                Ok(ServerResponse::SessionRepositories { repositories })
             }
             ClientRequest::DetachSessionRepository {
                 session_id,
@@ -2919,9 +3186,9 @@ impl InProcessConnection {
                     ..Default::default()
                 },
             }),
-            ClientRequest::GetAgentRun { run_id } => Ok(ServerResponse::AgentRun(
-                self.run_handle(run_id)?.snapshot(),
-            )),
+            ClientRequest::GetAgentRun { run_id } => {
+                Ok(ServerResponse::AgentRun(self.run_summary(run_id)?.snapshot))
+            }
             ClientRequest::GetAgentRunSnapshot { run_id } => Ok(ServerResponse::AgentRunSnapshot(
                 self.run_snapshot_projection(run_id)?,
             )),
@@ -3113,36 +3380,36 @@ impl InProcessConnection {
                 self.backend.providers.check_health(&provider_id)?,
             )),
             ClientRequest::GetRunUsage { run_id } => {
-                let state = self.run_handle(run_id)?.state();
+                let summary = self.run_summary(run_id)?;
                 let provider = self
                     .backend
                     .providers
                     .usage()?
-                    .summary(None, Some(&state.run.model));
+                    .summary(None, Some(&summary.snapshot.model));
                 Ok(ServerResponse::RunUsage {
-                    usage: state.usage,
+                    usage: summary.usage,
                     provider,
                 })
             }
             ClientRequest::GetSessionUsage { session_id } => {
                 self.backend.sessions()?.get(session_id)?;
-                let usage = self
-                    .backend
-                    .runs()?
-                    .values()
-                    .filter(|handle| handle.session_id == session_id)
-                    .fold(loom_core::UsageSnapshot::default(), |mut total, handle| {
-                        let current = handle.state().usage;
-                        total.add_tokens(
-                            current.input_tokens,
-                            current.output_tokens,
-                            current.cached_input_tokens,
-                        );
-                        total.tool_calls = total.tool_calls.saturating_add(current.tool_calls);
-                        total.cost_micros = total.cost_micros.saturating_add(current.cost_micros);
-                        total.elapsed_ms = total.elapsed_ms.max(current.elapsed_ms);
-                        total
-                    });
+                let mut usage = loom_core::UsageSnapshot::default();
+                let loaded_ids = {
+                    let runs = self.backend.runs()?;
+                    for handle in runs
+                        .values()
+                        .filter(|handle| handle.session_id == session_id)
+                    {
+                        add_usage(&mut usage, &handle.state().usage);
+                    }
+                    runs.keys().copied().collect::<BTreeSet<_>>()
+                };
+                for summary in self.backend.persisted_runs()?.values().filter(|summary| {
+                    summary.snapshot.session_id == session_id
+                        && !loaded_ids.contains(&summary.snapshot.id)
+                }) {
+                    add_usage(&mut usage, &summary.usage);
+                }
                 Ok(ServerResponse::SessionUsage {
                     usage,
                     provider: self.backend.providers.usage()?.summary(None, None),
@@ -3922,12 +4189,7 @@ impl InProcessConnection {
         }
 
         if let Some(run_id) = run_id {
-            let session_id = self
-                .backend
-                .runs()?
-                .get(&run_id)
-                .ok_or_else(|| LoomError::not_found("agent run", run_id))?
-                .session_id;
+            let session_id = self.run_summary(run_id)?.snapshot.session_id;
             if !auth.scope().allows_session(session_id) {
                 return Err(unauthorized_session(session_id));
             }
@@ -4195,6 +4457,17 @@ fn run_snapshot_projection(state: &AgentRuntimeState) -> AgentRunSnapshotProject
         usage: state.usage.clone(),
         activities: state.activities.clone(),
     }
+}
+
+fn add_usage(total: &mut UsageSnapshot, current: &UsageSnapshot) {
+    total.add_tokens(
+        current.input_tokens,
+        current.output_tokens,
+        current.cached_input_tokens,
+    );
+    total.tool_calls = total.tool_calls.saturating_add(current.tool_calls);
+    total.cost_micros = total.cost_micros.saturating_add(current.cost_micros);
+    total.elapsed_ms = total.elapsed_ms.max(current.elapsed_ms);
 }
 
 fn unauthorized_session(session_id: AgentSessionId) -> LoomError {
@@ -5156,6 +5429,79 @@ mod tests {
     }
 
     #[test]
+    fn persisted_session_filesystems_restore_lazily_and_survive_unrelated_writes() {
+        let persistence =
+            std::env::temp_dir().join(format!("loom-server-state-{}.db", WorkspaceId::new()));
+        let session_root_base;
+        let (workspace_id, session_id) = {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            session_root_base = backend.session_root_base.clone();
+            let connection = backend.connect();
+            negotiate_m3(&connection);
+            let workspace =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Lazy restore workspace".to_owned(),
+                }));
+            let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            let session = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Archived history".to_owned(),
+                },
+            ));
+            let ServerResponse::AgentSessionCreated(session) = session.result.unwrap() else {
+                panic!("unexpected session response");
+            };
+            let root = session_root_base
+                .join(workspace.id.to_string())
+                .join(session.id.to_string())
+                .join("fs");
+            fs::write(root.join("retained.txt"), "retained content\n").unwrap();
+            backend.flush().unwrap();
+            (workspace.id, session.id)
+        };
+
+        let filesystem_root = session_root_base
+            .join(workspace_id.to_string())
+            .join(session_id.to_string())
+            .join("fs");
+        let parked_root = filesystem_root.with_extension("parked");
+        fs::rename(&filesystem_root, &parked_root).unwrap();
+        {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let connection = backend.connect();
+            negotiate_m3(&connection);
+            let renamed =
+                connection.request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                    session_id,
+                    name: "Still lazy".to_owned(),
+                }));
+            assert!(matches!(
+                renamed.result,
+                Ok(ServerResponse::AgentSessionRenamed(_))
+            ));
+        }
+        fs::rename(&parked_root, &filesystem_root).unwrap();
+        {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let connection = backend.connect();
+            negotiate_m3(&connection);
+            let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+                session_id,
+                path: "retained.txt".to_owned(),
+            }));
+            let ServerResponse::SessionFilesystemFile(file) = file.result.unwrap() else {
+                panic!("unexpected filesystem response");
+            };
+            assert_eq!(file.content, "retained content\n");
+            fs::remove_dir_all(&backend.session_root_base).unwrap();
+        }
+        let _ = fs::remove_file(&persistence);
+    }
+
+    #[test]
     fn m5_session_projections_reconnect_and_archive_authoritatively() {
         let root = git_repository();
         let backend = InProcessBackend::new();
@@ -6037,6 +6383,77 @@ mod tests {
         );
         fs::remove_file(persistence).unwrap();
         fs::remove_dir_all(session_root_base).unwrap();
+    }
+
+    #[test]
+    fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
+        let persistence =
+            std::env::temp_dir().join(format!("loom-server-state-{}.db", WorkspaceId::new()));
+        let (run_id, session_root_base) = {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let session_root_base = backend.session_root_base.clone();
+            let connection = backend.connect();
+            negotiate_m3(&connection);
+            let workspace =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Run summary workspace".to_owned(),
+                }));
+            let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            let session = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Completed history".to_owned(),
+                },
+            ));
+            let ServerResponse::AgentSessionCreated(session) = session.result.unwrap() else {
+                panic!("unexpected session response");
+            };
+            let started =
+                connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                    session_id: session.id,
+                    task: "answer briefly".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    system_instructions: None,
+                    repository_instructions: None,
+                }));
+            let run_id = match started.result.unwrap() {
+                ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+                response => panic!("unexpected response: {response:?}"),
+            };
+            let settled = await_settled_run(&connection, run_id);
+            assert_eq!(settled.state, AgentRunState::Completed);
+            backend.flush().unwrap();
+            (run_id, session_root_base)
+        };
+
+        let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+        assert!(backend.runs().unwrap().is_empty());
+        assert_eq!(
+            backend.persisted_runs().unwrap()[&run_id].snapshot.state,
+            AgentRunState::Completed
+        );
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let response =
+            connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+        assert!(matches!(
+            response.result,
+            Ok(ServerResponse::AgentRun(snapshot)) if snapshot.state == AgentRunState::Completed
+        ));
+        let projection =
+            connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+                run_id,
+            }));
+        assert!(matches!(
+            projection.result,
+            Ok(ServerResponse::AgentRunSnapshot(snapshot))
+                if snapshot.run.state == AgentRunState::Completed && !snapshot.messages.is_empty()
+        ));
+        assert!(backend.runs().unwrap().is_empty());
+        fs::remove_dir_all(session_root_base).unwrap();
+        let _ = fs::remove_file(persistence);
     }
 
     #[test]

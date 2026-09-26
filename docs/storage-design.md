@@ -1,8 +1,13 @@
 # Proposed durable state model
 
-Status: design proposal, 2026-09-26. This replaces the version-2 `sections`
-container. This release does not import existing databases: it creates a fresh
-database and rejects an existing unsupported format without changing it.
+Status: target design, 2026-09-26. The implementation is in progress: session
+metadata and reconnect events use indexed rows; run summaries and per-session
+filesystem records are independently stored and loaded on demand; large strings
+are compressed and deduplicated. Auxiliary settings and detailed run/filesystem
+payloads still use the section tree. This
+design replaces the version-2 `sections` container. The release does not import
+existing databases: it creates a fresh database and rejects an existing
+unsupported format without changing it.
 See the [investigation](storage-investigation.md) for measurements and code evidence.
 
 ## Decision
