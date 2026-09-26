@@ -18,6 +18,9 @@ members = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+gpui-pre-web = { path = "vendor/gpui-pre-web" }
+
 # CI builds the full GPUI/wgpu stack in debug mode, which produces very large
 # incremental artifacts and can exhaust the CI runner's disk. Line-tables-only
 # debug info keeps panic backtraces useful while cutting target/ size sharply.
