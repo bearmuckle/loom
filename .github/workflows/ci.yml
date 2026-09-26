@@ -11,6 +11,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  browser-entry:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Test browser entry point
+        run: node --experimental-vm-modules --test scripts/browser-entry.test.mjs
+
   rust:
     runs-on: ubuntu-latest
     permissions:
