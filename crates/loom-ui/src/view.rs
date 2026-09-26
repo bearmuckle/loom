@@ -611,10 +611,13 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
         || text.contains("](");
 
     if !has_markdown {
-        div()
+        // TextView owns the copy/select-all key handlers as well as the
+        // selection participant. SelectableText alone only paints and tracks
+        // the selection; it does not install clipboard actions.
+        TextView::markdown(id, text)
+            .selectable(true)
             .w_full()
             .text_color(rgb(color))
-            .child(SelectableText::new(id, text))
             .into_any()
     } else {
         TextView::markdown(id, text)
@@ -9147,6 +9150,8 @@ impl Render for LoomView {
             .bg(rgb(0x111318))
             .text_color(rgb(0xe5e7eb))
             .text_size(px(13.))
+            // Initializes the per-frame selection registry before selectable
+            // text participants prepaint and register themselves.
             .child(TextSelectionLayer)
             .child(
                 div()
