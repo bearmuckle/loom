@@ -1081,6 +1081,8 @@ fn initial_worker_nodes(
 pub(crate) struct LoomView {
     #[cfg(target_family = "wasm")]
     connected: bool,
+    #[cfg(target_family = "wasm")]
+    browser_demo_mode: bool,
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
     /// Used for every request made once the view is interactive.
@@ -1882,10 +1884,16 @@ impl LoomView {
         let backend = BackendWorker::spawn(connection.clone());
         let workspace_id = WorkspaceId::new();
         let timestamp = loom_core::Timestamp::from_unix_millis(0);
+        let demo_mode = options.demo();
         let active_session = AgentSessionSnapshot {
             id: AgentSessionId::new(),
             workspace_id,
-            name: "No worker connected".to_owned(),
+            name: if demo_mode {
+                "Demo conversation"
+            } else {
+                "No worker connected"
+            }
+            .to_owned(),
             state: AgentSessionState::Idle,
             created_at: timestamp,
             updated_at: timestamp,
@@ -1895,7 +1903,8 @@ impl LoomView {
             .to_owned();
 
         Self {
-            connected: false,
+            connected: demo_mode,
+            browser_demo_mode: demo_mode,
             backend,
             connection,
             default_backend_node_id: String::new(),
@@ -1905,14 +1914,22 @@ impl LoomView {
             workspace_id,
             workspaces: Vec::new(),
             local_directory_sources_available: false,
-            sessions: Vec::new(),
+            sessions: if demo_mode {
+                vec![active_session.clone()]
+            } else {
+                Vec::new()
+            },
             session_tree: None,
             session_tree_entries: Vec::new(),
             active_session,
             active_run: None,
             active_run_id: None,
             context_inspection: None,
-            default_model: ModelId::new("default"),
+            default_model: if demo_mode {
+                ModelId::new("deterministic/demo")
+            } else {
+                ModelId::new("default")
+            },
             session_models: BTreeMap::new(),
             agent_mode: AgentMode::Agent,
             auto_approve_actions: true,
@@ -1920,9 +1937,21 @@ impl LoomView {
             session_task_cache: BTreeMap::new(),
             optimistic_messages: Vec::new(),
             sending_message: false,
-            model: ModelId::new("default"),
-            models: Vec::new(),
-            default_models: Vec::new(),
+            model: if demo_mode {
+                ModelId::new("deterministic/demo")
+            } else {
+                ModelId::new("default")
+            },
+            models: if demo_mode {
+                vec![ModelId::new("deterministic/demo")]
+            } else {
+                Vec::new()
+            },
+            default_models: if demo_mode {
+                vec![ModelId::new("deterministic/demo")]
+            } else {
+                Vec::new()
+            },
             node_model_catalogs: BTreeMap::new(),
             model_catalog_node_id: None,
             model_refreshes_in_flight: BTreeSet::new(),
@@ -1944,7 +1973,14 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
-            timeline: Vec::new(),
+            timeline: if demo_mode {
+                vec![
+                    TimelineItem::User("What can Loom do?".to_owned()),
+                    TimelineItem::Assistant("Loom gives you a workspace for steering coding agents. Connect a backend to work with a real repository, run tools, and keep sessions available across clients. This browser demo is a static preview.".to_owned()),
+                ]
+            } else {
+                Vec::new()
+            },
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
@@ -1972,7 +2008,7 @@ impl LoomView {
             session_drawer_open: false,
             rename_dialog: None,
             source_dialog: None,
-            demo_workspace: false,
+            demo_workspace: demo_mode,
             login_enabled: false,
             github_connected: false,
             github_login: None,
@@ -2093,6 +2129,7 @@ impl LoomView {
 
         let view = Self {
             connected: true,
+            browser_demo_mode: false,
             backend,
             connection: connection.clone(),
             default_backend_node_id: default_backend_node_id.clone(),
@@ -3347,6 +3384,16 @@ impl LoomView {
     }
 
     pub(crate) fn send_message(&mut self, message: String, cx: &mut Context<Self>) {
+        #[cfg(target_family = "wasm")]
+        if self.browser_demo_mode {
+            self.timeline.push(TimelineItem::User(message));
+            self.timeline.push(TimelineItem::Assistant(
+                "This is demo mode. The browser client needs to connect to a backend to work."
+                    .to_owned(),
+            ));
+            cx.notify();
+            return;
+        }
         let backend = match self.backend_for_session(self.active_session.id) {
             Ok(backend) => backend,
             Err(error) => {
@@ -3573,6 +3620,11 @@ impl LoomView {
             return;
         }
         self.clear_composer_on_render = true;
+        #[cfg(target_family = "wasm")]
+        if self.browser_demo_mode {
+            self.send_message(text, cx);
+            return;
+        }
         if text.starts_with('/') {
             self.run_slash_command(&text, cx);
             return;
