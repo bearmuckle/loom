@@ -165,7 +165,7 @@ fn start_browser_client(cx: &mut App) {
         }
     };
     let focus_handle = cx.focus_handle();
-    let auto_connect = options.is_configured();
+    let auto_connect = options.is_configured() && !options.demo();
     let view = LoomView::new_browser_disconnected(&options, startup_error, focus_handle);
     let window = match cx.open_window(Default::default(), |_, cx| cx.new(|_| view)) {
         Ok(window) => window,

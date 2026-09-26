@@ -30,6 +30,7 @@ pub(crate) struct BrowserOptions {
     token: String,
     workspace: Option<String>,
     model: Option<ModelId>,
+    demo: bool,
 }
 
 impl BrowserOptions {
@@ -39,6 +40,7 @@ impl BrowserOptions {
             token: String::new(),
             workspace: None,
             model: None,
+            demo: false,
         }
     }
 
@@ -53,6 +55,7 @@ impl BrowserOptions {
             token,
             workspace,
             model,
+            demo: false,
         }
     }
 
@@ -62,6 +65,18 @@ impl BrowserOptions {
         let search = window.location().search().unwrap_or_default();
         let params = UrlSearchParams::new_with_str(&search)
             .map_err(|_| LoomError::invalid_request("could not parse the page's query string"))?;
+        let demo = params.get("demo").is_some_and(|value| {
+            value.is_empty() || matches!(value.as_str(), "1" | "true" | "yes")
+        });
+        if demo {
+            return Ok(Self {
+                remote: String::new(),
+                token: String::new(),
+                workspace: None,
+                model: Some(ModelId::new("deterministic/demo")),
+                demo: true,
+            });
+        }
         let query_remote = params.get("remote").unwrap_or_default();
         let query_token = params.get("token").unwrap_or_default();
         let storage = browser_storage()?;
@@ -88,6 +103,7 @@ impl BrowserOptions {
             },
             workspace: None,
             model: saved_model,
+            demo: false,
         })
     }
 
@@ -105,6 +121,10 @@ impl BrowserOptions {
 
     pub(crate) fn model(&self) -> Option<&ModelId> {
         self.model.as_ref()
+    }
+
+    pub(crate) fn demo(&self) -> bool {
+        self.demo
     }
 
     pub(crate) fn is_configured(&self) -> bool {
