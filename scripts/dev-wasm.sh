@@ -81,6 +81,7 @@ FRONTEND_URL="http://${FRONTEND_HOST}:${FRONTEND_PORT}/?remote=${REMOTE_QUERY}&t
 
 echo "Starting Loom WASM frontend from crates/loom-ui..."
 echo "Open ${FRONTEND_URL}"
+echo "Local development only: the URL contains a bearer token. Keep both listeners on loopback."
 (
     cd "$ROOT/crates/loom-ui"
     exec env RUSTC_BOOTSTRAP="${RUSTC_BOOTSTRAP:-1}" \
