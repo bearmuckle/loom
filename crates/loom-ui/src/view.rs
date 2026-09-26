@@ -1076,7 +1076,6 @@ pub(crate) struct LoomView {
     /// Sessions stay pinned to the node that created them.
     session_node_ids: BTreeMap<AgentSessionId, String>,
     pub(crate) workspace_id: WorkspaceId,
-    workspace_name: String,
     workspaces: Vec<WorkspaceRecord>,
     local_directory_sources_available: bool,
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
@@ -1570,7 +1569,6 @@ impl LoomView {
             node_names,
             session_node_ids,
             workspace_id,
-            workspace_name: workspace.name,
             workspaces,
             local_directory_sources_available: options.remote.is_none(),
             sessions: if has_session {
@@ -1700,7 +1698,6 @@ impl LoomView {
             node_names: BTreeMap::new(),
             session_node_ids: BTreeMap::new(),
             workspace_id,
-            workspace_name: "No workspace".to_owned(),
             workspaces: Vec::new(),
             local_directory_sources_available: false,
             sessions: Vec::new(),
@@ -1897,7 +1894,6 @@ impl LoomView {
             node_names,
             session_node_ids,
             workspace_id,
-            workspace_name: workspace.name,
             workspaces,
             local_directory_sources_available: false,
             sessions: if has_session {
@@ -5458,86 +5454,6 @@ impl LoomView {
             .into_any_element()
     }
 
-    fn select_workspace(&mut self, workspace: WorkspaceRecord, cx: &mut Context<Self>) {
-        if workspace.id == self.workspace_id {
-            return;
-        }
-        let workspace_id = workspace.id;
-        self.dispatch(
-            cx,
-            ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
-            |view, response, _| match response.result {
-                Ok(ServerResponse::WorkspaceConfig(config)) => view.workspace_config = config,
-                Err(error) => view.record_backend_error("workspace config", error),
-                Ok(response) => view.record_backend_error(
-                    "workspace config",
-                    unexpected_response("workspace config", response),
-                ),
-            },
-        );
-        self.dispatch(
-            cx,
-            ClientRequest::ListWorkspaceSessions {
-                workspace_id,
-                include_archived: false,
-            },
-            move |view, response, cx| match response.result {
-                Ok(ServerResponse::AgentSessions { sessions }) => {
-                    view.workspace_id = workspace_id;
-                    view.workspace_name = workspace.name.clone();
-                    view.sessions = sessions;
-                    for session in &view.sessions {
-                        view.session_node_ids
-                            .insert(session.id, view.default_backend_node_id.clone());
-                    }
-                    if let Some(session) = view.sessions.first().cloned() {
-                        view.select_session(session, cx);
-                    } else {
-                        view.activate_session(empty_session_snapshot(workspace_id));
-                        view.review.open = false;
-                        cx.notify();
-                    }
-                }
-                Err(error) => view.record_backend_error("workspace session list", error),
-                Ok(response) => view.record_backend_error(
-                    "workspace session list",
-                    unexpected_response("workspace session list", response),
-                ),
-            },
-        );
-    }
-
-    fn create_workspace_container(&mut self, cx: &mut Context<Self>) {
-        let name = format!("Workspace {}", self.workspaces.len().saturating_add(1));
-        self.dispatch(
-            cx,
-            ClientRequest::CreateWorkspace { name },
-            |view, response, cx| match response.result {
-                Ok(ServerResponse::WorkspaceCreated(workspace)) => {
-                    view.workspace_id = workspace.id;
-                    view.workspace_name = workspace.name.clone();
-                    view.workspaces.push(workspace);
-                    view.sessions.clear();
-                    view.create_session_async("New session".to_owned(), cx);
-                }
-                Err(error) => view.record_backend_error("workspace creation", error),
-                Ok(response) => view.record_backend_error(
-                    "workspace creation",
-                    unexpected_response("workspace creation", response),
-                ),
-            },
-        );
-    }
-
-    /// Creates a session through the selected node and pins it to that node.
-    pub(crate) fn create_session_async(&mut self, name: String, cx: &mut Context<Self>) {
-        self.create_session_on_node(self.default_backend_node_id.clone(), name, cx);
-    }
-
-    fn create_session_on_node(&mut self, node_id: String, name: String, cx: &mut Context<Self>) {
-        self.create_session_on_node_with_source(node_id, name, None, cx);
-    }
-
     fn create_session_on_node_with_source(
         &mut self,
         node_id: String,
@@ -7940,7 +7856,7 @@ impl LoomView {
                                 .text_xs()
                                 .text_color(rgb(0x8f98a6))
                                 .child(
-                                    "No worker connected. Add one below to load your workspace.",
+                                    "No worker connected. Add one below to load your sessions.",
                                 ),
                         )
                     })
@@ -8151,7 +8067,7 @@ impl LoomView {
                         div()
                             .text_sm()
                             .text_color(rgb(0x8f98a6))
-                            .child("Local agent workspace"),
+                            .child("Local agent"),
                     )
                     .child(
                         div()
@@ -8362,40 +8278,6 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        Button::new("workspace-picker")
-                            .label(self.workspace_name.clone())
-                            .ghost()
-                            .small()
-                            .dropdown_menu({
-                                let workspaces = self.workspaces.clone();
-                                let view = view.clone();
-                                move |mut menu, _, _| {
-                                    for workspace in workspaces.clone() {
-                                        let select_view = view.clone();
-                                        let selected = workspace.clone();
-                                        menu = menu.item(
-                                            PopupMenuItem::new(workspace.name.clone()).on_click(
-                                                move |_, _, cx| {
-                                                    let workspace = selected.clone();
-                                                    select_view.update(cx, |view, cx| {
-                                                        view.select_workspace(workspace, cx);
-                                                    });
-                                                },
-                                            ),
-                                        );
-                                    }
-                                    let create_view = view.clone();
-                                    menu.item(PopupMenuItem::new("New workspace").on_click(
-                                        move |_, _, cx| {
-                                            create_view.update(cx, |view, cx| {
-                                                view.create_workspace_container(cx);
-                                            });
-                                        },
-                                    ))
-                                }
-                            }),
-                    )
                     .when(layout.phone, |element| {
                         element.child(
                             Button::new("close-session-drawer")
@@ -8526,7 +8408,7 @@ impl LoomView {
                                         div()
                                             .text_sm()
                                             .text_color(rgb(0xf3f4f6))
-                                            .child("Workspace"),
+                                            .child("Sessions"),
                                     ),
                             )
                             .child(
@@ -8624,14 +8506,14 @@ impl LoomView {
                                                 div()
                                                     .text_base()
                                                     .text_color(rgb(0xf3f4f6))
-                                                    .child("Your workspace is ready"),
+                                                    .child("You’re ready to go"),
                                             )
                                             .child(
                                                 div()
                                                     .mt_2()
                                                     .text_sm()
                                                     .text_color(rgb(0x8f98a6))
-                                                    .child("Connect a Loom worker from Settings to load your sessions, models, and workspace."),
+                                                    .child("Connect a Loom worker from Settings to load your sessions and models."),
                                             )
                                             .child(
                                                 Button::new("disconnected-connect-worker")
@@ -8829,7 +8711,6 @@ impl Render for LoomView {
             && !self.about_open
             && !self.providers_open
             && self.github_login.is_none();
-        let workspace_name = self.workspace_name.clone();
         let decorations = window.window_decorations();
         let client_decorated = matches!(decorations, Decorations::Client { .. });
         let shadow_size = CLIENT_DECORATION_SHADOW;
@@ -9181,15 +9062,13 @@ impl Render for LoomView {
                                     window.start_window_move();
                                 }
                             })
-                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(format!(
-                                "{}  ·  {}",
-                                workspace_name,
+                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
                                 if self.sessions.is_empty() {
-                                    "No session"
+                                    "No session".to_owned()
                                 } else {
-                                    &self.active_session.name
-                                }
-                            ))),
+                                    self.active_session.name.clone()
+                                },
+                            )),
                     )
                     .when(!cfg!(target_family = "wasm"), |element| {
                         element.child(
@@ -9292,11 +9171,7 @@ impl Render for LoomView {
                             session_state_label(self.session_state)
                         },
                         self.timeline.len(),
-                        if self.demo_workspace {
-                            "Demo workspace"
-                        } else {
-                            "Workspace"
-                        }
+                        if self.demo_workspace { "Demo" } else { "Local" }
                     )),
             );
         let content = content.rounded_client_corners(client_decorated, tiling);
