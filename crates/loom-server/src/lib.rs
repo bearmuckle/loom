@@ -2190,15 +2190,11 @@ impl InProcessBackend {
 
         let mut run_summaries = BTreeMap::new();
         let mut restored_runs = BTreeMap::new();
-        for (run_id, summary) in persistence.load_run_summaries()? {
+        for (run_id, summary) in persistence.load_active_run_summaries()? {
             let snapshot = summary.snapshot;
             let usage = summary.usage;
             let section = format!("run:{run_id}");
             self.sessions()?.get(snapshot.session_id)?;
-            let active_run = !matches!(
-                snapshot.state,
-                AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
-            );
             run_summaries.insert(
                 run_id,
                 PersistedRunSummary {
@@ -2207,9 +2203,6 @@ impl InProcessBackend {
                     section: section.clone(),
                 },
             );
-            if !active_run {
-                continue;
-            }
             let mut runtime_state = persistence
                 .load_section::<AgentRuntimeState>(&section, CURRENT_SCHEMA_VERSION)?
                 .ok_or_else(|| {
@@ -2805,10 +2798,21 @@ impl InProcessConnection {
                 section: format!("run:{run_id}"),
             });
         }
-        self.backend
-            .persisted_runs()?
-            .get(&run_id)
-            .cloned()
+        if let Some(summary) = self.backend.persisted_runs()?.get(&run_id).cloned() {
+            return Ok(summary);
+        }
+        let persistence = self
+            .backend
+            .persistence
+            .as_ref()
+            .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
+        persistence
+            .load_run_summary(run_id)?
+            .map(|summary| PersistedRunSummary {
+                snapshot: summary.snapshot,
+                usage: summary.usage,
+                section: format!("run:{run_id}"),
+            })
             .ok_or_else(|| LoomError::not_found("agent run", run_id))
     }
 
@@ -2977,16 +2981,20 @@ impl InProcessConnection {
                 .max_by_key(|state| state.run.updated_at);
             (loaded_ids, latest)
         };
-        let latest_persisted = self
-            .backend
-            .persisted_runs()?
-            .values()
-            .filter(|summary| {
-                summary.snapshot.session_id == session_id
-                    && !loaded_ids.contains(&summary.snapshot.id)
-            })
-            .max_by_key(|summary| summary.snapshot.updated_at)
-            .cloned();
+        let latest_persisted = match &self.backend.persistence {
+            Some(persistence) => persistence
+                .load_latest_run_summary_for_session(session_id)?
+                .map(|summary| {
+                    let run_id = summary.snapshot.id;
+                    PersistedRunSummary {
+                        snapshot: summary.snapshot,
+                        usage: summary.usage,
+                        section: format!("run:{run_id}"),
+                    }
+                })
+                .filter(|summary| !loaded_ids.contains(&summary.snapshot.id)),
+            None => None,
+        };
         let active_run = match (latest_loaded, latest_persisted) {
             (Some(state), Some(summary)) if state.run.updated_at >= summary.snapshot.updated_at => {
                 Some(run_snapshot_projection(&state))
@@ -4154,11 +4162,14 @@ impl InProcessConnection {
                     }
                     runs.keys().copied().collect::<BTreeSet<_>>()
                 };
-                for summary in self.backend.persisted_runs()?.values().filter(|summary| {
-                    summary.snapshot.session_id == session_id
-                        && !loaded_ids.contains(&summary.snapshot.id)
-                }) {
-                    add_usage(&mut usage, &summary.usage);
+                if let Some(persistence) = &self.backend.persistence {
+                    for summary in persistence
+                        .load_run_summaries_for_session(session_id)?
+                        .values()
+                        .filter(|summary| !loaded_ids.contains(&summary.snapshot.id))
+                    {
+                        add_usage(&mut usage, &summary.usage);
+                    }
                 }
                 Ok(ServerResponse::SessionUsage {
                     usage,
@@ -7557,10 +7568,7 @@ mod tests {
 
         let backend = InProcessBackend::new_persistent(&persistence).unwrap();
         assert!(backend.runs().unwrap().is_empty());
-        assert_eq!(
-            backend.persisted_runs().unwrap()[&run_id].snapshot.state,
-            AgentRunState::Completed
-        );
+        assert!(backend.persisted_runs().unwrap().is_empty());
         let connection = backend.connect();
         negotiate_m3(&connection);
         let response =

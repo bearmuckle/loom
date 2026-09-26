@@ -1488,23 +1488,81 @@ impl FilePersistence {
         Ok(records)
     }
 
-    /// Loads indexed run summaries without reading runtime details or transcripts.
+    /// Loads all indexed run summaries without reading runtime details or transcripts.
     pub fn load_run_summaries(&self) -> Result<BTreeMap<RunId, DurableRunSummary>> {
+        self.load_run_summaries_matching("", [], "")
+    }
+
+    /// Loads only resumable run summaries for startup recovery.
+    pub fn load_active_run_summaries(&self) -> Result<BTreeMap<RunId, DurableRunSummary>> {
+        self.load_run_summaries_matching(
+            "WHERE state NOT IN ('completed', 'failed', 'cancelled')",
+            [],
+            "",
+        )
+    }
+
+    /// Loads summaries belonging to one session, on demand.
+    pub fn load_run_summaries_for_session(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<BTreeMap<RunId, DurableRunSummary>> {
+        self.load_run_summaries_matching(
+            "WHERE session_id=?1",
+            [session_id.as_uuid().as_bytes().as_slice()],
+            "",
+        )
+    }
+
+    /// Loads one run summary without scanning unrelated run history.
+    pub fn load_run_summary(&self, run_id: RunId) -> Result<Option<DurableRunSummary>> {
+        Ok(self
+            .load_run_summaries_matching(
+                "WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                "LIMIT 1",
+            )?
+            .into_values()
+            .next())
+    }
+
+    /// Loads the latest summary for a session through its activity index.
+    pub fn load_latest_run_summary_for_session(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Option<DurableRunSummary>> {
+        Ok(self
+            .load_run_summaries_matching(
+                "WHERE session_id=?1",
+                [session_id.as_uuid().as_bytes().as_slice()],
+                "LIMIT 1",
+            )?
+            .into_values()
+            .next())
+    }
+
+    fn load_run_summaries_matching<P: rusqlite::Params>(
+        &self,
+        predicate: &str,
+        params: P,
+        limit: &str,
+    ) -> Result<BTreeMap<RunId, DurableRunSummary>> {
         if !self.path.exists() {
             return Ok(BTreeMap::new());
         }
         let connection = self.connection()?;
         let mut statement = connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT run_id, session_id, state, started_at, updated_at, completed_at,
                         snapshot, usage
-                 FROM run_summaries ORDER BY updated_at DESC, run_id DESC",
-            )
+                 FROM run_summaries {predicate}
+                 ORDER BY updated_at DESC, run_id DESC {limit}"
+            ))
             .map_err(|error| {
                 persistence_error(format!("could not prepare run summaries: {error}"), true)
             })?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(params, |row| {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
@@ -4762,16 +4820,6 @@ fn save_run_summary_rows(
     transaction: &Transaction<'_>,
     summaries: &BTreeMap<RunId, DurableRunSummary>,
 ) -> Result<()> {
-    transaction
-        .execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_runs (
-                run_id BLOB PRIMARY KEY NOT NULL
-             ) WITHOUT ROWID, STRICT;
-             DELETE FROM _loom_wanted_runs;",
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not stage run summaries: {error}"), true)
-        })?;
     for (run_id, summary) in summaries {
         if summary.snapshot.id != *run_id {
             return Err(LoomError::new(
@@ -4795,17 +4843,6 @@ fn save_run_summary_rows(
         }
         let run_id_bytes = run_id.as_uuid().as_bytes();
         let session_id_bytes = summary.snapshot.session_id.as_uuid().as_bytes();
-        transaction
-            .execute(
-                "INSERT INTO _loom_wanted_runs(run_id) VALUES (?1)",
-                [run_id_bytes.as_slice()],
-            )
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not stage run summary {run_id}: {error}"),
-                    true,
-                )
-            })?;
         transaction
             .execute(
                 "INSERT INTO run_summaries(
@@ -4849,18 +4886,6 @@ fn save_run_summary_rows(
             })?;
     }
     save_run_interaction_rows(transaction, summaries)?;
-    transaction
-        .execute(
-            "DELETE FROM run_summaries
-             WHERE NOT EXISTS (
-                SELECT 1 FROM _loom_wanted_runs wanted
-                WHERE wanted.run_id=run_summaries.run_id
-             )",
-            [],
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not prune run summaries: {error}"), true)
-        })?;
     Ok(())
 }
 
@@ -7306,6 +7331,44 @@ mod tests {
         assert_eq!(loaded_record.response, serde_json::json!({"sessions": []}));
         assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
         assert_eq!(
+            persistence
+                .load_active_run_summaries()
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            run_summaries
+                .iter()
+                .filter(|(_, summary)| !matches!(
+                    summary.snapshot.state,
+                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                ))
+                .map(|(run_id, _)| *run_id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            persistence.load_run_summary(run_id).unwrap(),
+            run_summaries.get(&run_id).cloned()
+        );
+        assert_eq!(
+            persistence
+                .load_latest_run_summary_for_session(session.id)
+                .unwrap()
+                .as_ref()
+                .map(|summary| summary.snapshot.session_id),
+            Some(session.id)
+        );
+        assert_eq!(
+            persistence
+                .load_run_summaries_for_session(session.id)
+                .unwrap()
+                .len(),
+            run_summaries
+                .values()
+                .filter(|summary| summary.snapshot.session_id == session.id)
+                .count()
+        );
+        assert_eq!(
             persistence.load_run_messages(run_id).unwrap(),
             run_messages[&run_id]
         );
@@ -8206,6 +8269,209 @@ mod tests {
         assert_eq!(
             persistence.load_run_execution_state(run_id).unwrap(),
             Some(execution)
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn tool_attempt_state_storage_tracks_activity_outcomes_and_intents() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut sessions = SessionManager::default();
+        let (session, _) = sessions
+            .create_in_workspace(WorkspaceId::new(), "Tool attempt owner")
+            .unwrap();
+        let run_id = RunId::new();
+        let attempt_id = RunAttemptId::new();
+        let started_at = Timestamp::from_unix_millis(1000);
+        let queued_call = loom_model::ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "queued"}),
+        };
+        let unknown_call = loom_model::ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "write_file".to_owned(),
+            arguments: serde_json::json!({"path": "unknown"}),
+        };
+        let statuses = [
+            (queued_call.clone(), AgentActivityStatus::Started),
+            (unknown_call.clone(), AgentActivityStatus::Started),
+            (
+                loom_model::ToolCall {
+                    id: loom_core::ToolCallId::new(),
+                    name: "inspect".to_owned(),
+                    arguments: serde_json::json!({}),
+                },
+                AgentActivityStatus::Started,
+            ),
+            (
+                loom_model::ToolCall {
+                    id: loom_core::ToolCallId::new(),
+                    name: "failed".to_owned(),
+                    arguments: serde_json::json!({}),
+                },
+                AgentActivityStatus::Failed,
+            ),
+            (
+                loom_model::ToolCall {
+                    id: loom_core::ToolCallId::new(),
+                    name: "ask_user".to_owned(),
+                    arguments: serde_json::json!({}),
+                },
+                AgentActivityStatus::AwaitingInput,
+            ),
+            (
+                loom_model::ToolCall {
+                    id: loom_core::ToolCallId::new(),
+                    name: "cancelled".to_owned(),
+                    arguments: serde_json::json!({}),
+                },
+                AgentActivityStatus::Cancelled,
+            ),
+        ];
+        let mut activities = statuses
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (call, status))| AgentActivityRecord {
+                id: ActivityId::new(),
+                run_id,
+                parent_id: None,
+                step_id: None,
+                kind: AgentActivityKind::ToolCall,
+                status,
+                started_at: Timestamp::from_unix_millis(1000 + ordinal as u64),
+                completed_at: None,
+                elapsed_ms: None,
+                data: AgentActivityData::ToolCall { call, result: None },
+            })
+            .collect::<Vec<_>>();
+
+        let completed_call = loom_model::ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "completed".to_owned(),
+            arguments: serde_json::json!({}),
+        };
+        let completed_call_id = completed_call.id;
+        activities.push(AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id,
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::ToolCall,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::from_unix_millis(1100),
+            completed_at: Some(Timestamp::from_unix_millis(1200)),
+            elapsed_ms: Some(100),
+            data: AgentActivityData::ToolCall {
+                call: completed_call,
+                result: Some(ToolResult {
+                    tool_call_id: completed_call_id,
+                    name: "completed".to_owned(),
+                    success: true,
+                    output: "done".to_owned(),
+                }),
+            },
+        });
+
+        let summary = DurableRunSummary {
+            snapshot: AgentRunSnapshot {
+                id: run_id,
+                attempt_id,
+                control_revision: 3,
+                session_id: session.id,
+                task: "Exercise tool-attempt states".to_owned(),
+                model: ModelId::new("deterministic-model"),
+                state: AgentRunState::Executing,
+                started_at,
+                updated_at: Timestamp::from_unix_millis(1200),
+                completed_at: None,
+                summary: None,
+                evidence: Vec::new(),
+            },
+            usage: UsageSnapshot::default(),
+            attempts: Some(vec![AgentRunAttemptRecord {
+                run_id,
+                session_id: session.id,
+                id: attempt_id,
+                number: 1,
+                state: AgentRunState::Executing,
+                checkpoint_id: None,
+                started_at,
+                completed_at: None,
+            }]),
+            execution_state: Some(AgentExecutionStateRecord {
+                run_id,
+                session_id: session.id,
+                attempt_id,
+                control_revision: 3,
+                state: AgentRunState::Executing,
+                step_id: None,
+                step_index: 0,
+                provider_cursor: 0,
+                next_message_id: 0,
+                active_message_id: None,
+                pending_tool_execution: Some(queued_call.clone()),
+                pending_approval: None,
+                pending_input: None,
+                last_failed_call: Some(unknown_call.clone()),
+            }),
+            interactions: None,
+        };
+        let summaries = BTreeMap::from([(run_id, summary)]);
+        let activities = BTreeMap::from([(run_id, activities)]);
+        persistence
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &sessions.export_state(),
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&summaries),
+                run_messages: None,
+                run_activities: Some(&activities),
+                filesystem_records: None,
+                records: &[],
+                feed: None,
+                sections: &[],
+            })
+            .unwrap();
+
+        let attempts = persistence.load_run_tool_attempts(run_id).unwrap();
+        assert_eq!(attempts.len(), 7);
+        assert_eq!(
+            attempts
+                .iter()
+                .find(|attempt| attempt.call_id == queued_call.id)
+                .unwrap()
+                .state,
+            AgentToolAttemptState::Queued
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .find(|attempt| attempt.call_id == unknown_call.id)
+                .unwrap()
+                .state,
+            AgentToolAttemptState::OutcomeUnknown
+        );
+        assert_eq!(
+            attempts
+                .iter()
+                .map(|attempt| attempt.state)
+                .collect::<Vec<_>>(),
+            vec![
+                AgentToolAttemptState::Queued,
+                AgentToolAttemptState::OutcomeUnknown,
+                AgentToolAttemptState::Running,
+                AgentToolAttemptState::Failed,
+                AgentToolAttemptState::AwaitingInput,
+                AgentToolAttemptState::Cancelled,
+                AgentToolAttemptState::Completed,
+            ]
         );
         fs::remove_file(path).unwrap();
     }

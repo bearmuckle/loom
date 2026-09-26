@@ -475,13 +475,16 @@ Implement in this order:
    Schema v22 stores ordered run-attempt identity, state, checkpoint, and timing
    records separately; checkpoint retry adds a new row while earlier attempts
    remain queryable. These rows are written transactionally with the run
-   summary, interaction history, and feed. Schema v23 stores the current
+   summary, interaction history, and feed. Startup now loads resumable runs
+   only; terminal summaries are fetched by run/session index when requested,
+   and summary writes upsert supplied rows without pruning the rest of history.
+   Schema v23 stores the current
    continuation cursor, control revision, pending tool/approval/input state,
    active message ID, and failed-call retry metadata in an explicit
    `run_execution_state` row, written atomically with its owning attempt and
-   run summary. Tool-call/tool-attempt records, normalized steps/evidence, and
-   crash-injection coverage remain.
-   Test crash boundaries before switching live writes.
+   run summary. Tool-call/tool-attempt records now have typed indexed rows
+   derived from activity records. Normalized steps/evidence and crash-injection
+   coverage remain. Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
    exports and their mirrored in-memory journals completely.
@@ -496,8 +499,8 @@ design's implementation scope.
 
 - Increasing archived history from 100 MB to 10 GB does not make session listing
   read content blobs or create filesystem/provider services.
-- Startup reads one bounded summary page and indexed interrupted-run metadata;
-  initial rendering does not wait for recovery, catalog refresh, or scans.
+- Startup loads resumable run metadata only; terminal run summaries use indexed
+  point/session queries. Session catalog paging and deferred recovery remain.
 - Rename/archive updates a bounded set of records and never exports all sessions.
 - Transcript/output queries have bounded page/range sizes; query-plan checks
   confirm the intended indexes on populated fixtures.
