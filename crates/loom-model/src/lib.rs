@@ -154,7 +154,7 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     Stop,
@@ -162,6 +162,7 @@ pub enum FinishReason {
     Length,
     Cancelled,
     Error,
+    ErrorWithMessage { message: String },
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

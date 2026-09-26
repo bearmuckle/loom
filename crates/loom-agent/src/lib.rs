@@ -1537,6 +1537,16 @@ impl AgentRuntime {
                         ctx.events.extend(self.finish_completed());
                     } else if matches!(reason, loom_model::FinishReason::Cancelled) {
                         ctx.events.extend(self.finish_cancelled());
+                    } else if let loom_model::FinishReason::ErrorWithMessage { message } = reason {
+                        ctx.events.extend(self.finish_failed(message));
+                    } else if matches!(reason, loom_model::FinishReason::Error) {
+                        log::error!(
+                            "model stream ended with an error finish reason and no provider details (run {})",
+                            self.run.id
+                        );
+                        ctx.events.extend(self.finish_failed(
+                            "the model reported an error, but the provider supplied no details",
+                        ));
                     } else {
                         ctx.events
                             .extend(self.finish_failed(format!("model finished with {reason:?}")));
