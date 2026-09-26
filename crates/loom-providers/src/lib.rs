@@ -2904,6 +2904,113 @@ mod tests {
     }
 
     #[test]
+    fn request_payloads_preserve_options_and_convert_tool_messages() {
+        let call = ToolCall {
+            id: ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path":"README.md"}),
+        };
+        let mut assistant = ModelMessage::new(MessageRole::Assistant, "");
+        assistant.tool_calls.push(call.clone());
+        let mut tool = ModelMessage::new(MessageRole::Tool, "file contents");
+        tool.tool_call_id = Some(call.id);
+        let mut request = ModelRequest {
+            model: ModelId::new("gpt-6-luna"),
+            messages: vec![
+                ModelMessage::new(MessageRole::System, "system"),
+                ModelMessage::new(MessageRole::User, "hello"),
+                assistant,
+                tool,
+            ],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        request.options.max_output_tokens = Some(128);
+
+        let payload = responses_request_payload(&request);
+        assert_eq!(payload["max_output_tokens"], 128);
+        assert_eq!(payload["input"][0]["role"], "system");
+        assert_eq!(payload["input"][1]["content"][0]["type"], "input_text");
+        assert_eq!(payload["input"][2]["type"], "function_call");
+        assert_eq!(payload["input"][3]["type"], "function_call_output");
+        assert_eq!(payload["input"][3]["output"], "file contents");
+
+        request.model = ModelId::new("fixture/model");
+        request.options.temperature = Some(0.25);
+        request.options.max_output_tokens = Some(64);
+        request.options.stop_sequences = vec!["STOP".to_owned()];
+        let payload = openai_request_payload(&request);
+        assert_eq!(payload["temperature"], 0.25);
+        assert_eq!(payload["max_tokens"], 64);
+        assert_eq!(payload["stop"][0], "STOP");
+        assert_eq!(
+            payload["messages"][2]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+
+        request.tools.push(loom_model::ToolDefinition {
+            name: "search".to_owned(),
+            description: "Search files".to_owned(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        assert_eq!(
+            responses_request_payload(&request)["tools"][0]["name"],
+            "search"
+        );
+        assert_eq!(
+            openai_request_payload(&request)["tools"][0]["function"]["name"],
+            "search"
+        );
+    }
+
+    #[test]
+    fn provider_usage_and_status_helpers_handle_empty_and_extreme_values() {
+        assert_eq!(parse_tool_arguments("  ").unwrap(), serde_json::json!({}));
+        assert_eq!(
+            finish_reason_from_str("function_call"),
+            FinishReason::ToolCall
+        );
+        assert_eq!(finish_reason_from_str("length"), FinishReason::Length);
+        assert_eq!(finish_reason_from_str("cancelled"), FinishReason::Cancelled);
+        assert_eq!(finish_reason_from_str("unexpected"), FinishReason::Error);
+
+        let usage = openai_usage(&serde_json::json!({
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "prompt_tokens_details": {"cached_tokens": 3}
+        }));
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cached_input_tokens, 3);
+        assert_eq!(
+            responses_usage(&serde_json::json!({"input_tokens": 4, "output_tokens": 2}))
+                .output_tokens,
+            2
+        );
+        assert_eq!(cost_for_usage(&usage, 1_000, 2_000), 28);
+        assert_eq!(cost_for_usage(&usage, u64::MAX, u64::MAX), u64::MAX / 1_000);
+        assert_eq!(
+            health_endpoint("https://example.test/v1/chat/completions"),
+            "https://example.test/v1/models"
+        );
+        assert_eq!(
+            health_endpoint("https://example.test/status"),
+            "https://example.test/status"
+        );
+
+        for (status, code, retryable) in [
+            (401, ErrorCode::ProviderAuthentication, false),
+            (425, ErrorCode::ProviderRateLimited, true),
+            (503, ErrorCode::ProviderUnavailable, true),
+            (400, ErrorCode::ProviderInvalidResponse, false),
+        ] {
+            let error = normalize_provider_error("fixture", status);
+            assert_eq!(error.code, code);
+            assert_eq!(error.retryable, retryable);
+        }
+    }
+
+    #[test]
     fn github_copilot_discovery_lists_only_models_with_tool_call_support() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -3315,27 +3422,19 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut token_stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let read = token_stream.read(&mut request).unwrap();
-            let token_request = String::from_utf8_lossy(&request[..read]);
+            let token_request = read_request_headers(&mut token_stream).unwrap();
             assert!(token_request.lines().any(|line| {
                 line.to_ascii_lowercase()
                     .starts_with("authorization: token ")
             }));
             let token_body =
                 format!(r#"{{"token":"copilot-token","endpoints":{{"api":"http://{address}"}}}}"#);
-            write!(
-                token_stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                token_body.len(),
-                token_body
-            )
-            .unwrap();
+            write_response(&mut token_stream, "application/json", &token_body).unwrap();
 
             let (mut chat_stream, _) = listener.accept().unwrap();
-            let read = chat_stream.read(&mut request).unwrap();
-            let chat_request = String::from_utf8_lossy(&request[..read]);
-            let chat_request = chat_request.to_ascii_lowercase();
+            let chat_request = read_request_headers(&mut chat_stream)
+                .unwrap()
+                .to_ascii_lowercase();
             assert!(
                 chat_request
                     .lines()
@@ -3343,13 +3442,7 @@ mod tests {
             );
             assert!(chat_request.contains("editor-version: vscode/1.96.2"));
             let chat_body = r#"{"choices":[{"message":{"content":"copilot response"},"finish_reason":"stop"}]}"#;
-            write!(
-                chat_stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                chat_body.len(),
-                chat_body
-            )
-            .unwrap();
+            write_response(&mut chat_stream, "application/json", chat_body).unwrap();
         });
         let descriptor = ModelDescriptor {
             id: ModelId::new("gpt-4o"),

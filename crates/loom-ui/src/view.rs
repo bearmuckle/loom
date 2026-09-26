@@ -1335,6 +1335,107 @@ impl Render for TimelineView {
 }
 
 impl LoomView {
+    #[cfg(test)]
+    fn new_for_test(focus_handle: FocusHandle) -> Self {
+        let connection = ClientConnection::InProcess(Box::new(InProcessBackend::new().connect()));
+        let backend = BackendWorker::spawn(connection.clone());
+        let workspace_id = WorkspaceId::new();
+        let active_session = empty_session_snapshot(workspace_id);
+        let model = ModelId::new("deterministic/demo");
+        let node_id = "test-node".to_owned();
+        let node_backends = BTreeMap::from([(node_id.clone(), backend.clone())]);
+        Self {
+            backend,
+            connection,
+            default_backend_node_id: node_id.clone(),
+            node_backends,
+            node_names: BTreeMap::new(),
+            session_node_ids: BTreeMap::new(),
+            workspace_id,
+            workspace_name: "Test workspace".to_owned(),
+            workspaces: Vec::new(),
+            local_directory_sources_available: true,
+            sessions: Vec::new(),
+            session_tree: None,
+            session_tree_entries: Vec::new(),
+            active_session: active_session.clone(),
+            active_run: None,
+            active_run_id: None,
+            default_model: model.clone(),
+            session_models: BTreeMap::new(),
+            agent_mode: AgentMode::Agent,
+            auto_approve_actions: true,
+            session_auto_approve_actions: BTreeMap::new(),
+            session_task_cache: BTreeMap::new(),
+            optimistic_messages: Vec::new(),
+            sending_message: false,
+            model: model.clone(),
+            models: vec![model.clone()],
+            default_models: vec![model.clone()],
+            node_model_catalogs: BTreeMap::from([(node_id.clone(), vec![model])]),
+            model_catalog_node_id: Some(node_id),
+            model_refreshes_in_flight: BTreeSet::new(),
+            model_select: None,
+            default_model_select: None,
+            model_select_subscription: None,
+            default_model_select_subscription: None,
+            model_select_items: Vec::new(),
+            default_model_select_items: Vec::new(),
+            model_select_value: None,
+            default_model_select_value: None,
+            agent_mode_select: None,
+            agent_mode_select_subscription: None,
+            settings_open: false,
+            providers_open: false,
+            about_open: false,
+            providers: Vec::new(),
+            providers_node_id: None,
+            theme_choice: ThemeChoice::System,
+            appearance_subscription: None,
+            after_sequence: None,
+            timeline: Vec::new(),
+            timeline_view: None,
+            activity_records_seen: false,
+            expanded_activities: BTreeSet::new(),
+            approval_request_in_flight: false,
+            approval_settings_request_in_flight: false,
+            archive_request_in_flight: false,
+            pending_approval: None,
+            pending_input: None,
+            composer_input: None,
+            composer_placeholder: None,
+            input_subscriptions: Vec::new(),
+            clear_composer_on_render: false,
+            clear_node_on_render: false,
+            rename_input_state: None,
+            source_path_input: None,
+            repository_filter_input: None,
+            pending_source_path: None,
+            composer_focus_handle: focus_handle,
+            session_state: active_session.state,
+            run_state: None,
+            review: ReviewState::default(),
+            session_repositories: Vec::new(),
+            session_directories: Vec::new(),
+            selected_repository_id: None,
+            session_drawer_open: false,
+            rename_dialog: None,
+            source_dialog: None,
+            demo_workspace: false,
+            login_enabled: false,
+            github_connected: false,
+            github_login: None,
+            next_worker_node_id: 0,
+            worker_nodes: Vec::new(),
+            worker_node_polls_scheduled: BTreeSet::new(),
+            workspace_config: WorkspaceConfig::default(),
+            node_input_initial: String::new(),
+            node_input_state: None,
+            run_poll_scheduled: false,
+            browser_startup_error: None,
+        }
+    }
+
     fn is_connected(&self) -> bool {
         #[cfg(target_family = "wasm")]
         {
@@ -9685,6 +9786,294 @@ mod session_header_render_tests {
                 .is_some_and(|tooltip| tooltip.visible())
         })
         .await;
+    }
+}
+
+#[cfg(test)]
+mod loom_view_render_tests {
+    use super::{
+        LoomView, SessionSourceChoice, SessionSourceDialog, SessionSourceDialogPurpose,
+        WorkerConnectionState, WorkerNodeEntry,
+    };
+    use crate::state::RenameDialogState;
+    use crate::state::ReviewRow;
+    use crate::state::TimelineItem;
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{AppContext, TestAppContext, px, size};
+    use loom_core::CapabilitySet;
+    use loom_core::{ActivityId, ErrorCode, RunId, Timestamp};
+    use loom_model::{ModelId, ToolCall};
+    use loom_protocol::ToolResult;
+    use loom_protocol::{
+        AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+        FileActivityOperation, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
+        GitFileStatusKind, GitHubRepository, GitRepositoryStatus, SessionFilesystemChange,
+        WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind,
+    };
+    use std::collections::BTreeSet;
+
+    fn render_scenario(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            configure(&mut view);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn empty_session_view_renders_without_a_backend_round_trip(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |_| {});
+    }
+
+    #[gpui_kit::test]
+    fn session_list_renders_owner_and_resource_summary(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.active_session.name = "Test session".to_owned();
+            view.sessions = vec![view.active_session.clone()];
+            view.session_node_ids
+                .insert(view.active_session.id, "test-node".to_owned());
+            view.node_names
+                .insert("test-node".to_owned(), "Local worker".to_owned());
+            view.worker_nodes.push(WorkerNodeEntry {
+                id: 0,
+                status: WorkerNodeStatus {
+                    node_id: "test-node".to_owned(),
+                    name: "Local worker".to_owned(),
+                    online: true,
+                    capabilities: CapabilitySet::default(),
+                    resources: WorkerNodeResources {
+                        cpu_count: 4,
+                        cpu_usage_percent: Some(45),
+                        memory_usage_percent: Some(61),
+                        memory_total_bytes: Some(8 * 1024 * 1024 * 1024),
+                        memory_available_bytes: Some(3 * 1024 * 1024 * 1024),
+                        disk_total_bytes: Some(64 * 1024 * 1024 * 1024),
+                        disk_available_bytes: Some(32 * 1024 * 1024 * 1024),
+                    },
+                },
+                is_local: true,
+                url: None,
+                connection: None,
+                connection_state: WorkerConnectionState::Connected,
+                connection_detail: None,
+                severe_load_streak: 0,
+            });
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find(("session-tree-root", 0usize)).visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn settings_about_and_providers_dialogs_render(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| view.settings_open = true);
+        render_scenario(cx, |view| view.about_open = true);
+        render_scenario(cx, |view| view.providers_open = true);
+    }
+
+    #[gpui_kit::test]
+    fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.rename_dialog = Some(RenameDialogState {
+                session: view.active_session.clone(),
+                input: "Renamed session".to_owned(),
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::StartSession,
+                choice: SessionSourceChoice::Empty,
+                local_directory_available: true,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: false,
+                error: None,
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::AddToSession,
+                choice: SessionSourceChoice::LocalDirectory,
+                local_directory_available: true,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: false,
+                error: Some("directory does not exist".to_owned()),
+            });
+        });
+        render_scenario(cx, |view| {
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::StartSession,
+                choice: SessionSourceChoice::GitHub,
+                local_directory_available: false,
+                filter_subscription: None,
+                repositories: vec![GitHubRepository {
+                    full_name: "owner/project".to_owned(),
+                    description: Some("example repository".to_owned()),
+                    clone_url: "https://github.com/owner/project.git".to_owned(),
+                    private: false,
+                    default_branch: "main".to_owned(),
+                }],
+                selected_repository: Some("owner/project".to_owned()),
+                repositories_loading: false,
+                error: None,
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn review_panel_renders_workspace_and_git_changes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.review.repositories_loaded = true;
+            view.review.changes = vec![SessionFilesystemChange {
+                sequence: loom_core::EventSequence::new(1),
+                session_id: view.active_session.id,
+                path: "src/new.rs".to_owned(),
+                kind: WorkspaceChangeKind::Created,
+                revision: Some("revision-1".to_owned()),
+            }];
+            view.review.vcs = Some(GitRepositoryStatus {
+                root: "/workspace".to_owned(),
+                branch: Some("main".to_owned()),
+                head: Some("abc123".to_owned()),
+                files: vec![GitFileStatus {
+                    path: "src/lib.rs".to_owned(),
+                    original_path: None,
+                    index: GitFileStatusKind::Modified,
+                    worktree: GitFileStatusKind::Modified,
+                    conflicted: false,
+                    index_additions: 1,
+                    index_deletions: 0,
+                    worktree_additions: 2,
+                    worktree_deletions: 1,
+                }],
+                conflicts: Vec::new(),
+                clean: false,
+                captured_at: Timestamp::from_unix_millis(0),
+            });
+            view.review.selected_path = Some("src/lib.rs".to_owned());
+            view.review.selected_diff = Some(GitDiff {
+                path: Some("src/lib.rs".to_owned()),
+                staged: false,
+                patch: String::new(),
+                binary: false,
+                hunks: vec![GitDiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 2,
+                    lines: vec![GitDiffLine {
+                        kind: GitDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "new line".to_owned(),
+                    }],
+                }],
+                truncated: false,
+            });
+            view.review.rows = vec![
+                ReviewRow::Hunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 2,
+                },
+                ReviewRow::Line(GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "new line".to_owned(),
+                }),
+            ];
+            view.review.hunk_rows = vec![0];
+        });
+    }
+
+    #[gpui_kit::test]
+    fn transcript_renders_all_message_and_activity_variants(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let call = ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "write_file".to_owned(),
+            arguments: serde_json::json!({"path":"src/lib.rs"}),
+        };
+        let activity = AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id: RunId::new(),
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::File,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::from_unix_millis(0),
+            completed_at: None,
+            elapsed_ms: Some(1500),
+            data: AgentActivityData::File {
+                call: call.clone(),
+                operation: FileActivityOperation::Write,
+                path: Some("src/lib.rs".to_owned()),
+                result: Some(ToolResult::success(&call, "updated file".to_owned())),
+            },
+        };
+        render_scenario(cx, |view| {
+            view.activity_records_seen = true;
+            view.expanded_activities.insert(activity.id);
+            view.timeline = vec![
+                TimelineItem::User("Please update the file".to_owned()),
+                TimelineItem::Assistant("# Done\nThe file is updated.".to_owned()),
+                TimelineItem::ActivitySection {
+                    activities: vec![activity],
+                },
+                TimelineItem::Plan {
+                    steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
+                    completed: BTreeSet::from([0]),
+                    active: Some(1),
+                },
+                TimelineItem::ToolRequested {
+                    name: "write_file".to_owned(),
+                    arguments: "{\"path\":\"src/lib.rs\"}".to_owned(),
+                },
+                TimelineItem::Approval {
+                    name: "write_file".to_owned(),
+                    active: false,
+                },
+                TimelineItem::ToolStarted("write_file".to_owned()),
+                TimelineItem::ToolOutput("updated file".to_owned()),
+                TimelineItem::ToolCompleted {
+                    name: "write_file".to_owned(),
+                    success: true,
+                },
+                TimelineItem::ToolCompleted {
+                    name: "run_tests".to_owned(),
+                    success: false,
+                },
+                TimelineItem::Status("Working".to_owned()),
+                TimelineItem::Error {
+                    operation: "save".to_owned(),
+                    error: loom_core::LoomError::new(ErrorCode::Persistence, "write failed", true),
+                },
+                TimelineItem::NeedsInput("Which branch should I use?".to_owned()),
+                TimelineItem::Summary {
+                    text: "Completed task: updated the file".to_owned(),
+                    evidence: vec!["src/lib.rs".to_owned()],
+                },
+            ];
+            view.pending_input = Some("Which branch should I use?".to_owned());
+            view.model = ModelId::new("deterministic/demo");
+        });
     }
 }
 
