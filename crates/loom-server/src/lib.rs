@@ -17,7 +17,10 @@ use loom_core::{
     SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
-use loom_persistence::{CURRENT_SCHEMA_VERSION, DurableFeedState, FilePersistence};
+use loom_persistence::{
+    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableSessionSettings, DurableStateWrite,
+    FilePersistence,
+};
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
@@ -1614,10 +1617,7 @@ impl InProcessBackend {
                     )
                 })
         };
-        let session_policies = persistence
-            .load_section("session_approval_policies", CURRENT_SCHEMA_VERSION)?
-            .map(from_json)
-            .transpose()?;
+        let session_settings = persistence.load_session_settings()?;
         let state = PersistedBackendState {
             sessions,
             workspace_records: persistence.load_workspaces()?.unwrap_or_default(),
@@ -1630,19 +1630,11 @@ impl InProcessBackend {
                     retention_limit: feed.retention_limit,
                 })
                 .unwrap_or_default(),
-            session_policies: session_policies.unwrap_or_default(),
-            auto_approve_actions: persistence
-                .load_section("auto_approve_actions", CURRENT_SCHEMA_VERSION)?
-                .map(from_json)
-                .transpose()?
-                .unwrap_or_default(),
+            session_policies: session_settings.approval_policies,
+            auto_approve_actions: session_settings.auto_approve_actions,
             provider_configs: from_json(required("provider_configs")?)?,
             provider_health: from_json(required("provider_health")?)?,
-            workspace_configs: persistence
-                .load_section("workspace_configs", CURRENT_SCHEMA_VERSION)?
-                .map(from_json)
-                .transpose()?
-                .unwrap_or_default(),
+            workspace_configs: persistence.load_workspace_configs()?,
             provider_usage: from_json(required("provider_usage")?)?,
             idempotency: from_json(required("idempotency")?)?,
         };
@@ -1867,38 +1859,35 @@ impl InProcessBackend {
             retention_limit: journal.retention_limit,
             events: journal.pending_events.clone(),
         };
-        let result = persistence.save_state_with_catalogs_entities_and_feed(
-            CURRENT_SCHEMA_VERSION,
-            &sessions,
-            &self.workspace_records()?.export_state(),
-            &entity_sections,
-            Some(&feed),
-            &[
-                (
-                    "session_approval_policies",
-                    json_value(self.session_policies()?.clone())?,
-                ),
-                (
-                    "auto_approve_actions",
-                    json_value(self.auto_approve_actions()?.clone())?,
-                ),
-                (
-                    "workspace_configs",
-                    json_value(self.workspace_configs()?.clone())?,
-                ),
-                (
-                    "provider_configs",
-                    json_value(self.providers.export_configs()?)?,
-                ),
-                (
-                    "provider_health",
-                    json_value(self.providers.export_health()?)?,
-                ),
-                ("provider_usage", json_value(self.providers.usage()?)?),
-                ("models", json_value(self.models.clone())?),
-                ("idempotency", json_value(self.idempotency()?.clone())?),
-            ],
-        );
+        let session_settings = DurableSessionSettings {
+            approval_policies: self.session_policies()?.clone(),
+            auto_approve_actions: self.auto_approve_actions()?.clone(),
+        };
+        let workspace_configs = self.workspace_configs()?.clone();
+        let workspace_records = self.workspace_records()?.export_state();
+        let sections = [
+            (
+                "provider_configs",
+                json_value(self.providers.export_configs()?)?,
+            ),
+            (
+                "provider_health",
+                json_value(self.providers.export_health()?)?,
+            ),
+            ("provider_usage", json_value(self.providers.usage()?)?),
+            ("models", json_value(self.models.clone())?),
+            ("idempotency", json_value(self.idempotency()?.clone())?),
+        ];
+        let result = persistence.save_state(DurableStateWrite {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            sessions: &sessions,
+            workspaces: Some(&workspace_records),
+            settings: Some(&session_settings),
+            workspace_configs: Some(&workspace_configs),
+            records: &entity_sections,
+            feed: Some(&feed),
+            sections: &sections,
+        });
         if result.is_ok() {
             journal.pending_events.clear();
         }

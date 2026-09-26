@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -8,10 +8,10 @@ use std::{
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ErrorCode, EventSequence, LoomError,
-    Result, Timestamp, WorkspaceId, WorkspaceRecord,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ErrorCode,
+    EventSequence, LoomError, Result, Timestamp, WorkspaceId, WorkspaceRecord,
 };
-use loom_protocol::ServerEventEnvelope;
+use loom_protocol::{ServerEventEnvelope, WorkspaceConfig};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -19,8 +19,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
-const DATABASE_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+const DATABASE_SCHEMA_VERSION: u32 = 9;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -54,6 +54,18 @@ CREATE TABLE IF NOT EXISTS workspaces (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS workspaces_by_activity
     ON workspaces(updated_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS session_settings (
+    session_id BLOB PRIMARY KEY NOT NULL CHECK(length(session_id) = 16),
+    approval_policy TEXT NOT NULL CHECK(length(approval_policy) <= 16384),
+    auto_approve_actions INTEGER NOT NULL CHECK(auto_approve_actions IN (0, 1))
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS workspace_configs (
+    workspace_id BLOB PRIMARY KEY NOT NULL CHECK(length(workspace_id) = 16),
+    revision INTEGER NOT NULL CHECK(revision >= 0),
+    config TEXT NOT NULL CHECK(length(config) <= 16384)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS workspace_configs_by_revision
+    ON workspace_configs(revision DESC, workspace_id);
 CREATE TABLE IF NOT EXISTS feed_store_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     next_sequence INTEGER NOT NULL CHECK(next_sequence >= 0),
@@ -324,6 +336,23 @@ pub struct DurableFeedState {
     pub next_sequence: EventSequence,
     pub retention_limit: usize,
     pub events: Vec<ServerEventEnvelope>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DurableSessionSettings {
+    pub approval_policies: BTreeMap<AgentSessionId, ApprovalPolicy>,
+    pub auto_approve_actions: BTreeMap<AgentSessionId, bool>,
+}
+
+pub struct DurableStateWrite<'a> {
+    pub schema_version: u32,
+    pub sessions: &'a SessionManagerState,
+    pub workspaces: Option<&'a WorkspaceManagerState>,
+    pub settings: Option<&'a DurableSessionSettings>,
+    pub workspace_configs: Option<&'a BTreeMap<WorkspaceId, WorkspaceConfig>>,
+    pub records: &'a [(String, Value)],
+    pub feed: Option<&'a DurableFeedState>,
+    pub sections: &'a [(&'a str, Value)],
 }
 
 impl FilePersistence {
@@ -662,6 +691,112 @@ impl FilePersistence {
         Ok(Some(WorkspaceManagerState { workspaces }))
     }
 
+    /// Loads policy and auto-approval settings by session key.
+    pub fn load_session_settings(&self) -> Result<DurableSessionSettings> {
+        if !self.path.exists() {
+            return Ok(DurableSessionSettings::default());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT session_id, approval_policy, auto_approve_actions FROM session_settings ORDER BY session_id")
+            .map_err(|error| {
+                persistence_error(format!("could not prepare session settings: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read session settings: {error}"), true)
+            })?;
+        let mut settings = DurableSessionSettings::default();
+        for row in rows {
+            let (id, policy, auto_approve) = row.map_err(|error| {
+                persistence_error(format!("could not read session settings: {error}"), true)
+            })?;
+            let id = AgentSessionId::from_uuid(decode_uuid(&id, "session id")?);
+            let policy = serde_json::from_str(&policy).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted approval policy is malformed: {error}"),
+                    false,
+                )
+            })?;
+            let auto_approve = match auto_approve {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted auto-approval flag is invalid",
+                        false,
+                    ));
+                }
+            };
+            settings.approval_policies.insert(id, policy);
+            settings.auto_approve_actions.insert(id, auto_approve);
+        }
+        Ok(settings)
+    }
+
+    /// Loads bounded workspace configuration records by workspace key.
+    pub fn load_workspace_configs(&self) -> Result<BTreeMap<WorkspaceId, WorkspaceConfig>> {
+        if !self.path.exists() {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT workspace_id, revision, config FROM workspace_configs ORDER BY workspace_id")
+            .map_err(|error| {
+                persistence_error(format!("could not prepare workspace configs: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read workspace configs: {error}"), true)
+            })?;
+        let mut configs = BTreeMap::new();
+        for row in rows {
+            let (id, revision, config) = row.map_err(|error| {
+                persistence_error(format!("could not read workspace configs: {error}"), true)
+            })?;
+            let id = WorkspaceId::from_uuid(decode_uuid(&id, "workspace id")?);
+            let revision = u64::try_from(revision).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted workspace configuration revision is negative",
+                    false,
+                )
+            })?;
+            let config: WorkspaceConfig = serde_json::from_str(&config).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted workspace configuration is malformed: {error}"),
+                    false,
+                )
+            })?;
+            if config.revision != revision {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "workspace configuration revision does not match its index",
+                    false,
+                ));
+            }
+            configs.insert(id, config);
+        }
+        Ok(configs)
+    }
+
     /// Loads the bounded reconnect feed from sequence-indexed records.
     pub fn load_feed_state(&self) -> Result<Option<DurableFeedState>> {
         if !self.path.exists() {
@@ -840,14 +975,16 @@ impl FilePersistence {
         feed: Option<&DurableFeedState>,
         sections: &[(&str, Value)],
     ) -> Result<()> {
-        self.save_state_with_optional_catalogs_entities_and_feed(
+        self.save_state(DurableStateWrite {
             schema_version,
             sessions,
-            None,
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
             records,
             feed,
             sections,
-        )
+        })
     }
 
     /// Persists typed session and workspace catalogs with entity records atomically.
@@ -860,25 +997,20 @@ impl FilePersistence {
         feed: Option<&DurableFeedState>,
         sections: &[(&str, Value)],
     ) -> Result<()> {
-        self.save_state_with_optional_catalogs_entities_and_feed(
+        self.save_state(DurableStateWrite {
             schema_version,
             sessions,
-            Some(workspaces),
+            workspaces: Some(workspaces),
+            settings: None,
+            workspace_configs: None,
             records,
             feed,
             sections,
-        )
+        })
     }
 
-    fn save_state_with_optional_catalogs_entities_and_feed(
-        &self,
-        schema_version: u32,
-        sessions: &SessionManagerState,
-        workspaces: Option<&WorkspaceManagerState>,
-        records: &[(String, Value)],
-        feed: Option<&DurableFeedState>,
-        sections: &[(&str, Value)],
-    ) -> Result<()> {
+    /// Persists catalogs and settings with entity records and the feed atomically.
+    pub fn save_state(&self, write: DurableStateWrite<'_>) -> Result<()> {
         let connection = self.connection_for_write()?;
         let transaction = connection.unchecked_transaction().map_err(|error| {
             persistence_error(
@@ -886,23 +1018,29 @@ impl FilePersistence {
                 true,
             )
         })?;
-        save_session_rows(&transaction, sessions)?;
-        if let Some(workspaces) = workspaces {
+        save_session_rows(&transaction, write.sessions)?;
+        if let Some(workspaces) = write.workspaces {
             save_workspace_rows(&transaction, workspaces)?;
         }
-        if let Some(feed) = feed {
+        if let Some(settings) = write.settings {
+            save_session_settings_rows(&transaction, settings)?;
+        }
+        if let Some(workspace_configs) = write.workspace_configs {
+            save_workspace_config_rows(&transaction, workspace_configs)?;
+        }
+        if let Some(feed) = write.feed {
             save_feed_rows(&transaction, feed)?;
         }
-        for (name, value) in sections {
-            save_section_nodes(&transaction, name, schema_version, value)?;
+        for (name, value) in write.sections {
+            save_section_nodes(&transaction, name, write.schema_version, value)?;
         }
-        for (name, value) in records {
+        for (name, value) in write.records {
             if !name.starts_with("run:") && !name.starts_with("filesystem:") {
                 return Err(LoomError::invalid_request(
                     "individually stored entity must use a supported section prefix",
                 ));
             }
-            save_section_nodes(&transaction, name, schema_version, value)?;
+            save_section_nodes(&transaction, name, write.schema_version, value)?;
         }
         transaction.commit().map_err(|error| {
             persistence_error(
@@ -1358,6 +1496,166 @@ fn save_workspace_rows(transaction: &Transaction<'_>, state: &WorkspaceManagerSt
         )
         .map_err(|error| {
             persistence_error(format!("could not prune workspace catalog: {error}"), true)
+        })?;
+    Ok(())
+}
+
+fn save_session_settings_rows(
+    transaction: &Transaction<'_>,
+    settings: &DurableSessionSettings,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_session_settings (
+                session_id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_session_settings;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage session settings: {error}"), true)
+        })?;
+    let ids = settings
+        .approval_policies
+        .keys()
+        .chain(settings.auto_approve_actions.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for id in ids {
+        let policy = settings
+            .approval_policies
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        let auto_approve = settings
+            .auto_approve_actions
+            .get(&id)
+            .copied()
+            .unwrap_or_default();
+        let policy = serde_json::to_string(&policy).map_err(|error| {
+            persistence_error(format!("could not encode approval policy: {error}"), false)
+        })?;
+        if policy.len() > 16_384 {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "approval policy exceeds the maximum supported size",
+                false,
+            ));
+        }
+        let session_id = id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_session_settings(session_id) VALUES (?1)",
+                [session_id.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not stage session settings: {error}"), true)
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO session_settings(session_id, approval_policy, auto_approve_actions)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    approval_policy=excluded.approval_policy,
+                    auto_approve_actions=excluded.auto_approve_actions
+                 WHERE session_settings.approval_policy IS NOT excluded.approval_policy
+                    OR session_settings.auto_approve_actions IS NOT excluded.auto_approve_actions",
+                params![session_id.as_slice(), policy, auto_approve],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save settings for session {id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM session_settings
+             WHERE NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_session_settings wanted
+                WHERE wanted.session_id=session_settings.session_id
+             )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prune session settings: {error}"), true)
+        })?;
+    Ok(())
+}
+
+fn save_workspace_config_rows(
+    transaction: &Transaction<'_>,
+    configs: &BTreeMap<WorkspaceId, WorkspaceConfig>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_workspace_configs (
+                workspace_id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_workspace_configs;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage workspace configs: {error}"), true)
+        })?;
+    for (id, config) in configs {
+        let revision = i64::try_from(config.revision).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "workspace configuration revision exceeds SQLite's integer range",
+                false,
+            )
+        })?;
+        let payload = serde_json::to_string(config).map_err(|error| {
+            persistence_error(
+                format!("could not encode workspace configuration: {error}"),
+                false,
+            )
+        })?;
+        if payload.len() > 16_384 {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "workspace configuration exceeds the maximum supported size",
+                false,
+            ));
+        }
+        let id_bytes = id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_workspace_configs(workspace_id) VALUES (?1)",
+                [id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not stage workspace configs: {error}"), true)
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO workspace_configs(workspace_id, revision, config)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(workspace_id) DO UPDATE SET
+                    revision=excluded.revision,
+                    config=excluded.config
+                 WHERE workspace_configs.revision IS NOT excluded.revision
+                    OR workspace_configs.config IS NOT excluded.config",
+                params![id_bytes.as_slice(), revision, payload],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save config for workspace {id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM workspace_configs
+             WHERE NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_workspace_configs wanted
+                WHERE wanted.workspace_id=workspace_configs.workspace_id
+             )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prune workspace configs: {error}"), true)
         })?;
     Ok(())
 }
@@ -2038,6 +2336,89 @@ mod tests {
             .unwrap();
         assert_eq!(updates, 0, "unchanged workspace rows must not be rewritten");
         assert_ne!(first.id, second.id);
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut sessions = SessionManager::default();
+        let (session, _) = sessions
+            .create_in_workspace(WorkspaceId::new(), "Settings owner")
+            .unwrap();
+        let mut workspaces = WorkspaceManager::default();
+        let workspace = workspaces.create("Configured workspace").unwrap();
+        let settings = DurableSessionSettings {
+            approval_policies: BTreeMap::from([(session.id, ApprovalPolicy::default())]),
+            auto_approve_actions: BTreeMap::from([(session.id, true)]),
+        };
+        let config = WorkspaceConfig {
+            revision: 4,
+            ..WorkspaceConfig::default()
+        };
+        let configs = BTreeMap::from([(workspace.id, config.clone())]);
+        persistence
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &sessions.export_state(),
+                workspaces: Some(&workspaces.export_state()),
+                settings: Some(&settings),
+                workspace_configs: Some(&configs),
+                records: &[],
+                feed: None,
+                sections: &[],
+            })
+            .unwrap();
+        assert_eq!(
+            persistence
+                .load_session_settings()
+                .unwrap()
+                .approval_policies,
+            settings.approval_policies
+        );
+        assert_eq!(
+            persistence
+                .load_session_settings()
+                .unwrap()
+                .auto_approve_actions,
+            settings.auto_approve_actions
+        );
+        assert_eq!(persistence.load_workspace_configs().unwrap(), configs);
+
+        assert!(
+            persistence
+                .save_state(DurableStateWrite {
+                    schema_version: CURRENT_SCHEMA_VERSION,
+                    sessions: &sessions.export_state(),
+                    workspaces: Some(&workspaces.export_state()),
+                    settings: Some(&DurableSessionSettings::default()),
+                    workspace_configs: Some(&BTreeMap::new()),
+                    records: &[],
+                    feed: None,
+                    sections: &[("", serde_json::json!({"invalid": true}))],
+                })
+                .is_err()
+        );
+        assert_eq!(
+            persistence
+                .load_session_settings()
+                .unwrap()
+                .approval_policies,
+            settings.approval_policies
+        );
+        assert_eq!(persistence.load_workspace_configs().unwrap(), configs);
+
+        let connection = Connection::open(&path).unwrap();
+        let plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT revision, config FROM workspace_configs WHERE workspace_id=?1",
+                [workspace.id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("PRIMARY KEY"), "{plan}");
         drop(connection);
         fs::remove_file(path).unwrap();
     }
