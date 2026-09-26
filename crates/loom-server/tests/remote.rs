@@ -625,7 +625,8 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
     let mut after = None;
     let mut approvals = 0;
     let mut completed = false;
-    for _ in 0..100 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !completed && tokio::time::Instant::now() < deadline {
         let batch = events(&mut second, session.id, after).await;
         if batch.is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;

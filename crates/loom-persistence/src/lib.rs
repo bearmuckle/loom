@@ -13,7 +13,9 @@ use loom_core::{
     WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
-use loom_protocol::{AgentRunSnapshot, AgentRunState, ServerEventEnvelope, WorkspaceConfig};
+use loom_protocol::{
+    AgentRunSnapshot, AgentRunState, ServerEventEnvelope, WorkspaceConfig, WorkspaceControl,
+};
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -22,8 +24,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 13;
-const DATABASE_SCHEMA_VERSION: u32 = 13;
+pub const CURRENT_SCHEMA_VERSION: u32 = 14;
+const DATABASE_SCHEMA_VERSION: u32 = 14;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -68,6 +70,16 @@ CREATE INDEX IF NOT EXISTS runs_by_session_activity
     ON run_summaries(session_id, updated_at DESC, run_id DESC);
 CREATE INDEX IF NOT EXISTS runs_by_state_activity
     ON run_summaries(state, updated_at DESC, run_id DESC);
+CREATE TABLE IF NOT EXISTS session_filesystems (
+    session_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    root TEXT NOT NULL,
+    control TEXT NOT NULL CHECK(control IN ('agent', 'user')),
+    payload_hash BLOB NOT NULL CHECK(length(payload_hash) = 32),
+    raw_size INTEGER NOT NULL CHECK(raw_size >= 0 AND raw_size <= 536870912),
+    payload_codec INTEGER NOT NULL CHECK(payload_codec IN (0, 1)),
+    payload BLOB NOT NULL CHECK(length(payload) <= 536870912)
+) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS workspaces (
     id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
     name TEXT NOT NULL CHECK(length(trim(name)) > 0),
@@ -412,6 +424,14 @@ pub struct DurableRunSummary {
     pub usage: UsageSnapshot,
 }
 
+#[derive(Clone, Debug)]
+pub struct DurableFilesystemRecord {
+    pub session_id: AgentSessionId,
+    pub root: String,
+    pub control: WorkspaceControl,
+    pub payload: Value,
+}
+
 pub struct DurableStateWrite<'a> {
     pub schema_version: u32,
     pub sessions: &'a SessionManagerState,
@@ -422,6 +442,7 @@ pub struct DurableStateWrite<'a> {
     pub usage: Option<&'a UsageLedger>,
     pub idempotency: Option<&'a BTreeMap<RequestId, DurableIdempotencyRecord>>,
     pub run_summaries: Option<&'a BTreeMap<RunId, DurableRunSummary>>,
+    pub filesystem_records: Option<&'a [DurableFilesystemRecord]>,
     pub records: &'a [(String, Value)],
     pub feed: Option<&'a DurableFeedState>,
     pub sections: &'a [(&'a str, Value)],
@@ -1148,6 +1169,141 @@ impl FilePersistence {
         Ok(summaries)
     }
 
+    pub fn list_filesystem_sessions(&self) -> Result<Vec<AgentSessionId>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT session_id FROM session_filesystems ORDER BY session_id")
+            .map_err(|error| {
+                persistence_error(format!("could not prepare filesystem index: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| {
+                persistence_error(format!("could not read filesystem index: {error}"), true)
+            })?;
+        rows.map(|row| {
+            row.map_err(|error| {
+                persistence_error(format!("could not read filesystem index: {error}"), true)
+            })
+            .and_then(|id| decode_uuid(&id, "filesystem session id"))
+            .map(AgentSessionId::from_uuid)
+        })
+        .collect()
+    }
+
+    pub fn load_filesystem_record(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Option<DurableFilesystemRecord>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT root, control, payload_hash, raw_size, payload_codec, payload
+                 FROM session_filesystems WHERE session_id=?1",
+                [session_id.as_uuid().as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not read filesystem record: {error}"), true)
+            })?;
+        let Some((root, control, hash, raw_size, codec, payload)) = row else {
+            return Ok(None);
+        };
+        let control = parse_workspace_control(&control)?;
+        let raw_size = usize::try_from(raw_size).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted filesystem payload has an invalid size",
+                false,
+            )
+        })?;
+        if raw_size > MAX_CONTENT_BYTES {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted filesystem payload exceeds the maximum supported size",
+                false,
+            ));
+        }
+        let raw = match codec {
+            0 => payload,
+            1 => {
+                let mut decoded = Vec::with_capacity(raw_size);
+                ZlibDecoder::new(payload.as_slice())
+                    .take((raw_size as u64).saturating_add(1))
+                    .read_to_end(&mut decoded)
+                    .map_err(|error| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            format!("persisted filesystem payload is malformed: {error}"),
+                            false,
+                        )
+                    })?;
+                decoded
+            }
+            _ => {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted filesystem payload uses an unsupported codec",
+                    false,
+                ));
+            }
+        };
+        if raw.len() != raw_size || Sha256::digest(&raw).as_slice() != hash {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted filesystem payload failed its length or hash check",
+                false,
+            ));
+        }
+        let payload: Value = serde_json::from_slice(&raw).map_err(|error| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted filesystem payload is malformed: {error}"),
+                false,
+            )
+        })?;
+        let filesystem = payload.get("filesystem").ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted filesystem payload has no workspace snapshot",
+                false,
+            )
+        })?;
+        let payload_root = filesystem.get("root").and_then(Value::as_str);
+        let payload_control = filesystem.get("control").and_then(Value::as_str);
+        if payload_root != Some(root.as_str())
+            || payload_control != Some(workspace_control_name(control))
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "filesystem index columns do not match the payload",
+                false,
+            ));
+        }
+        Ok(Some(DurableFilesystemRecord {
+            session_id,
+            root,
+            control,
+            payload,
+        }))
+    }
+
     /// Loads the bounded reconnect feed from sequence-indexed records.
     pub fn load_feed_state(&self) -> Result<Option<DurableFeedState>> {
         if !self.path.exists() {
@@ -1336,6 +1492,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            filesystem_records: None,
             records,
             feed,
             sections,
@@ -1362,6 +1519,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            filesystem_records: None,
             records,
             feed,
             sections,
@@ -1400,6 +1558,9 @@ impl FilePersistence {
         if let Some(run_summaries) = write.run_summaries {
             save_run_summary_rows(&transaction, run_summaries)?;
         }
+        if let Some(filesystems) = write.filesystem_records {
+            save_filesystem_records(&transaction, filesystems)?;
+        }
         if let Some(feed) = write.feed {
             save_feed_rows(&transaction, feed)?;
         }
@@ -1407,9 +1568,9 @@ impl FilePersistence {
             save_section_nodes(&transaction, name, write.schema_version, value)?;
         }
         for (name, value) in write.records {
-            if !name.starts_with("run:") && !name.starts_with("filesystem:") {
+            if !name.starts_with("run:") {
                 return Err(LoomError::invalid_request(
-                    "individually stored entity must use a supported section prefix",
+                    "individually stored run detail must use the run section prefix",
                 ));
             }
             save_section_nodes(&transaction, name, write.schema_version, value)?;
@@ -2359,6 +2520,98 @@ fn save_run_summary_rows(
     Ok(())
 }
 
+fn save_filesystem_records(
+    transaction: &Transaction<'_>,
+    records: &[DurableFilesystemRecord],
+) -> Result<()> {
+    for record in records {
+        let raw = serde_json::to_vec(&record.payload).map_err(|error| {
+            persistence_error(
+                format!("could not encode filesystem record: {error}"),
+                false,
+            )
+        })?;
+        if raw.len() > MAX_CONTENT_BYTES {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "filesystem record exceeds the maximum supported size",
+                false,
+            ));
+        }
+        let hash = Sha256::digest(&raw);
+        let unchanged = transaction
+            .query_row(
+                "SELECT payload_hash FROM session_filesystems WHERE session_id=?1",
+                [record.session_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not compare filesystem record: {error}"),
+                    true,
+                )
+            })?
+            .is_some_and(|existing| existing == hash.as_slice());
+        if unchanged {
+            continue;
+        }
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&raw).map_err(|error| {
+            persistence_error(
+                format!("could not compress filesystem record: {error}"),
+                false,
+            )
+        })?;
+        let compressed = encoder.finish().map_err(|error| {
+            persistence_error(
+                format!("could not compress filesystem record: {error}"),
+                false,
+            )
+        })?;
+        let (codec, payload) = if compressed.len() < raw.len() {
+            (1_i64, compressed)
+        } else {
+            (0_i64, raw.clone())
+        };
+        transaction
+            .execute(
+                "INSERT INTO session_filesystems(
+                    session_id, root, control, payload_hash, raw_size, payload_codec, payload
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    root=excluded.root,
+                    control=excluded.control,
+                    payload_hash=excluded.payload_hash,
+                    raw_size=excluded.raw_size,
+                    payload_codec=excluded.payload_codec,
+                    payload=excluded.payload
+                 WHERE session_filesystems.root IS NOT excluded.root
+                    OR session_filesystems.control IS NOT excluded.control
+                    OR session_filesystems.payload_hash IS NOT excluded.payload_hash",
+                params![
+                    record.session_id.as_uuid().as_bytes().as_slice(),
+                    record.root,
+                    workspace_control_name(record.control),
+                    hash.as_slice(),
+                    raw.len() as i64,
+                    codec,
+                    payload,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!(
+                        "could not save filesystem record for {}: {error}",
+                        record.session_id
+                    ),
+                    true,
+                )
+            })?;
+    }
+    Ok(())
+}
+
 fn save_provider_json_rows<'a, T, I>(
     transaction: &Transaction<'_>,
     table: &str,
@@ -2561,6 +2814,25 @@ fn run_state_name(state: AgentRunState) -> &'static str {
         AgentRunState::Completed => "completed",
         AgentRunState::Failed => "failed",
         AgentRunState::Cancelled => "cancelled",
+    }
+}
+
+fn workspace_control_name(control: WorkspaceControl) -> &'static str {
+    match control {
+        WorkspaceControl::Agent => "agent",
+        WorkspaceControl::User => "user",
+    }
+}
+
+fn parse_workspace_control(control: &str) -> Result<WorkspaceControl> {
+    match control {
+        "agent" => Ok(WorkspaceControl::Agent),
+        "user" => Ok(WorkspaceControl::User),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted filesystem has an unknown control state",
+            false,
+        )),
     }
 }
 
@@ -3216,6 +3488,19 @@ mod tests {
             },
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
+        let filesystem_records = [DurableFilesystemRecord {
+            session_id: session.id,
+            root: "/tmp/loom-session-fs".to_owned(),
+            control: WorkspaceControl::Agent,
+            payload: serde_json::json!({
+                "filesystem": {
+                    "session_id": session.id,
+                    "root": "/tmp/loom-session-fs",
+                    "control": "agent"
+                },
+                "details": "checkpoint state ".repeat(500)
+            }),
+        }];
         persistence
             .save_state(DurableStateWrite {
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -3227,6 +3512,7 @@ mod tests {
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
+                filesystem_records: Some(&filesystem_records),
                 records: &[],
                 feed: None,
                 sections: &[],
@@ -3266,6 +3552,18 @@ mod tests {
         );
         assert_eq!(loaded_record.response, serde_json::json!({"sessions": []}));
         assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
+        assert_eq!(
+            persistence.list_filesystem_sessions().unwrap(),
+            vec![session.id]
+        );
+        assert_eq!(
+            persistence
+                .load_filesystem_record(session.id)
+                .unwrap()
+                .unwrap()
+                .payload,
+            filesystem_records[0].payload
+        );
 
         assert!(
             persistence
@@ -3279,6 +3577,7 @@ mod tests {
                     usage: Some(&UsageLedger::default()),
                     idempotency: Some(&BTreeMap::new()),
                     run_summaries: Some(&BTreeMap::new()),
+                    filesystem_records: None,
                     records: &[],
                     feed: None,
                     sections: &[("", serde_json::json!({"invalid": true}))],
@@ -3300,6 +3599,14 @@ mod tests {
         assert_eq!(persistence.load_provider_usage().unwrap(), usage);
         assert_eq!(persistence.load_idempotency_records().unwrap(), idempotency);
         assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
+        assert_eq!(
+            persistence
+                .load_filesystem_record(session.id)
+                .unwrap()
+                .unwrap()
+                .payload,
+            filesystem_records[0].payload
+        );
 
         let connection = Connection::open(&path).unwrap();
         let plan: String = connection
@@ -3331,6 +3638,24 @@ mod tests {
             )
             .unwrap();
         assert!(run_plan.contains("runs_by_session_activity"), "{run_plan}");
+        let filesystem_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT payload FROM session_filesystems WHERE session_id=?1",
+                [session.id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(filesystem_plan.contains("PRIMARY KEY"), "{filesystem_plan}");
+        let (filesystem_codec, raw_size, payload_size): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT payload_codec, raw_size, length(payload) FROM session_filesystems
+                 WHERE session_id=?1",
+                [session.id.as_uuid().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(filesystem_codec, 1);
+        assert!(payload_size < raw_size);
         let config_plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT config FROM provider_configs WHERE provider_id=?1",

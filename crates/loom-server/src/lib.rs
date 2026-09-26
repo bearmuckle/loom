@@ -18,8 +18,9 @@ use loom_core::{
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableIdempotencyRecord, DurableProviderState,
-    DurableRunSummary, DurableSessionSettings, DurableStateWrite, FilePersistence,
+    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableFilesystemRecord, DurableIdempotencyRecord,
+    DurableProviderState, DurableRunSummary, DurableSessionSettings, DurableStateWrite,
+    FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -849,7 +850,7 @@ pub struct InProcessBackend {
     persisted_runs: Mutex<BTreeMap<loom_core::RunId, PersistedRunSummary>>,
     journal: Mutex<EventJournal>,
     session_filesystems: Mutex<BTreeMap<AgentSessionId, Workspace>>,
-    persisted_session_filesystems: Mutex<BTreeMap<AgentSessionId, String>>,
+    persisted_session_filesystems: Mutex<BTreeSet<AgentSessionId>>,
     session_filesystem_restore: Mutex<()>,
     session_repositories:
         Mutex<BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>,
@@ -1177,7 +1178,7 @@ impl InProcessBackend {
             persisted_runs: Mutex::new(BTreeMap::new()),
             journal: Mutex::new(EventJournal::default()),
             session_filesystems: Mutex::new(BTreeMap::new()),
-            persisted_session_filesystems: Mutex::new(BTreeMap::new()),
+            persisted_session_filesystems: Mutex::new(BTreeSet::new()),
             session_filesystem_restore: Mutex::new(()),
             session_repositories: Mutex::new(BTreeMap::new()),
             session_vcs: Mutex::new(BTreeMap::new()),
@@ -1301,9 +1302,7 @@ impl InProcessBackend {
         })
     }
 
-    fn persisted_session_filesystems(
-        &self,
-    ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, String>>> {
+    fn persisted_session_filesystems(&self) -> Result<MutexGuard<'_, BTreeSet<AgentSessionId>>> {
         self.persisted_session_filesystems.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -1327,18 +1326,14 @@ impl InProcessBackend {
         if let Some(filesystem) = self.session_filesystems()?.get(&session_id).cloned() {
             return Ok(filesystem);
         }
-        let section = self
-            .persisted_session_filesystems()?
-            .get(&session_id)
-            .cloned()
-            .ok_or_else(|| {
-                LoomError::new(
-                    ErrorCode::RecoveryRequired,
-                    format!("filesystem for session {session_id} is unavailable"),
-                    true,
-                )
-            })?;
-        let persisted = self
+        if !self.persisted_session_filesystems()?.contains(&session_id) {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("filesystem for session {session_id} is unavailable"),
+                true,
+            ));
+        }
+        let durable = self
             .persistence
             .as_ref()
             .ok_or_else(|| {
@@ -1348,14 +1343,26 @@ impl InProcessBackend {
                     true,
                 )
             })?
-            .load_section::<PersistedSessionFilesystem>(&section, CURRENT_SCHEMA_VERSION)?
+            .load_filesystem_record(session_id)?
             .ok_or_else(|| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
-                    format!("persisted filesystem section '{section}' is missing"),
+                    format!("persisted filesystem record for session {session_id} is missing"),
                     false,
                 )
             })?;
+        let persisted: PersistedSessionFilesystem = from_json(durable.payload)?;
+        if durable.session_id != session_id
+            || persisted.filesystem.session_id != session_id
+            || persisted.filesystem.root != durable.root
+            || persisted.filesystem.control != durable.control
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted filesystem identity for session {session_id} is invalid"),
+                false,
+            ));
+        }
         let session = self.sessions()?.get(session_id)?;
         let expected_root = self
             .session_root_base
@@ -1406,14 +1413,11 @@ impl InProcessBackend {
         &self,
         session_id: AgentSessionId,
     ) -> Result<Option<PersistedSessionFilesystem>> {
-        let Some(section) = self
-            .persisted_session_filesystems()?
-            .get(&session_id)
-            .cloned()
-        else {
+        if !self.persisted_session_filesystems()?.contains(&session_id) {
             return Ok(None);
-        };
-        self.persistence
+        }
+        let Some(record) = self
+            .persistence
             .as_ref()
             .ok_or_else(|| {
                 LoomError::new(
@@ -1422,7 +1426,23 @@ impl InProcessBackend {
                     true,
                 )
             })?
-            .load_section::<PersistedSessionFilesystem>(&section, CURRENT_SCHEMA_VERSION)
+            .load_filesystem_record(session_id)?
+        else {
+            return Ok(None);
+        };
+        let persisted: PersistedSessionFilesystem = from_json(record.payload)?;
+        if record.session_id != session_id
+            || persisted.filesystem.session_id != session_id
+            || persisted.filesystem.root != record.root
+            || persisted.filesystem.control != record.control
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted filesystem identity for session {session_id} is invalid"),
+                false,
+            ));
+        }
+        Ok(Some(persisted))
     }
 
     fn session_repositories(
@@ -1699,20 +1719,9 @@ impl InProcessBackend {
         *self.workspace_records()? =
             loom_session::WorkspaceManager::from_state(state.workspace_records)?;
 
-        for section in persistence.list_sections_with_prefix("filesystem:")? {
-            let session_id = section
-                .strip_prefix("filesystem:")
-                .and_then(|value| value.parse::<AgentSessionId>().ok())
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("persisted filesystem section '{section}' has an invalid id"),
-                        false,
-                    )
-                })?;
+        for session_id in persistence.list_filesystem_sessions()? {
             self.sessions()?.get(session_id)?;
-            self.persisted_session_filesystems()?
-                .insert(session_id, section);
+            self.persisted_session_filesystems()?.insert(session_id);
         }
 
         let mut run_summaries = BTreeMap::new();
@@ -1833,11 +1842,12 @@ impl InProcessBackend {
                 },
             );
         }
-        let mut entity_sections = runs
+        let entity_sections = runs
             .into_iter()
             .map(|(run_id, state)| Ok((format!("run:{run_id}"), json_value(state)?)))
             .collect::<Result<Vec<_>>>()?;
         let loaded_repositories = self.session_repositories()?;
+        let mut filesystem_records = Vec::new();
         for (session_id, filesystem) in self.session_filesystems()?.iter() {
             let persisted = PersistedSessionFilesystem {
                 filesystem: filesystem.export_state()?,
@@ -1854,7 +1864,12 @@ impl InProcessBackend {
                     })
                     .collect(),
             };
-            entity_sections.push((format!("filesystem:{session_id}"), json_value(persisted)?));
+            filesystem_records.push(DurableFilesystemRecord {
+                session_id: *session_id,
+                root: persisted.filesystem.root.clone(),
+                control: persisted.filesystem.control,
+                payload: json_value(persisted)?,
+            });
         }
         let sessions = self.sessions()?.export_state();
         let mut journal = self.journal()?;
@@ -1904,6 +1919,7 @@ impl InProcessBackend {
             usage: Some(&provider_usage),
             idempotency: Some(&idempotency),
             run_summaries: Some(&durable_run_summaries),
+            filesystem_records: Some(&filesystem_records),
             records: &entity_sections,
             feed: Some(&feed),
             sections: &sections,

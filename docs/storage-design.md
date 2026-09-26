@@ -2,11 +2,12 @@
 
 Status: target design, 2026-09-26. The implementation is in progress: session,
 workspace, and run summaries, bounded session/workspace settings, reconnect
-events, and provider usage totals use indexed rows. Detailed run payloads and
-per-session filesystem records are independently stored and loaded on demand;
-large strings are compressed and deduplicated. Provider configuration and
-health use provider-keyed records. Idempotency uses a dedicated table; detailed
-run payloads and per-session filesystem records still use the section tree.
+events, provider usage totals, and filesystem records use indexed rows. Runtime
+details and filesystem snapshots are loaded on demand; filesystem payloads are
+compressed and hash-checked. Large strings in the generic section store are
+deduplicated and compressed. Provider configuration and health use
+provider-keyed records. Idempotency uses a dedicated table, while detailed run
+payloads and filesystem checkpoint/edit collections still use aggregate payloads.
 Provider request-level detail is aggregated by provider/model because no
 request-level usage history is exposed by the current protocol. This
 design replaces the version-2 `sections` container. The release does not import
