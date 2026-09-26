@@ -180,10 +180,7 @@ mod tests {
         let error = LoomError::not_found("run", "abc");
         assert_eq!(error.to_string(), "not_found: run 'abc' was not found");
         assert!(!error.retryable);
-        assert_eq!(
-            LoomError::new(ErrorCode::Internal, "oops", true).retryable,
-            true
-        );
+        assert!(LoomError::new(ErrorCode::Internal, "oops", true).retryable);
         assert_eq!(
             LoomError::invalid_request("bad").code,
             ErrorCode::InvalidRequest

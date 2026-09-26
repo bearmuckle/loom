@@ -1114,7 +1114,7 @@ mod tests {
                 assert_eq!(current.status, TaskStatus::Failed);
                 assert!(!current.artifacts[0].exists);
                 assert_eq!(current.artifacts[0].size, 0);
-                assert_eq!(current.evidence[0].exists, false);
+                assert!(!current.evidence[0].exists);
                 assert_eq!(
                     supervisor.cancel(task.id).unwrap_err().code,
                     ErrorCode::InvalidState

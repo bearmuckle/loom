@@ -2381,6 +2381,10 @@ impl InProcessConnection {
             .ok()
             .filter(|url| url.scheme() == "https" && url.host_str() == Some("github.com"))
             .and_then(|_| self.backend.providers.github_account_token().ok());
+        log::info!(
+            "[loom-server] cloning repository {source_name} for session {session_id} into {}",
+            destination.display()
+        );
         let cloned = match GitService::clone_from_authenticated(
             &source,
             &temporary,
@@ -2389,6 +2393,10 @@ impl InProcessConnection {
         ) {
             Ok(cloned) => cloned,
             Err(error) => {
+                log::warn!(
+                    "[loom-server] clone failed for repository {source_name} in session {session_id}: {}",
+                    error.message
+                );
                 if temporary.exists() {
                     fs::remove_dir_all(&temporary).map_err(|cleanup_error| {
                         LoomError::new(
@@ -2404,6 +2412,9 @@ impl InProcessConnection {
             }
         };
         drop(cloned);
+        log::info!(
+            "[loom-server] clone completed for repository {source_name}; installing checkout"
+        );
         if let Err(error) = fs::rename(&temporary, &destination) {
             let cleanup = fs::remove_dir_all(&temporary);
             if let Err(cleanup_error) = cleanup {
@@ -2424,7 +2435,7 @@ impl InProcessConnection {
         let service = GitService::open(&destination)?;
         let repository = SessionRepository {
             id: repository_id,
-            source: source_name,
+            source: source_name.clone(),
             path: relative_path,
             revision: service.status()?.head,
             attached_at: Timestamp::now(),
@@ -2437,6 +2448,7 @@ impl InProcessConnection {
             .entry(session_id)
             .or_default()
             .insert(repository_id, repository.clone());
+        log::info!("repository {source_name} attached to session {session_id}");
         Ok(repository)
     }
 
