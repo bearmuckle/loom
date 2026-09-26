@@ -1,6 +1,6 @@
 # Agent instructions
 
-- Keep PR verification sections terse: list each verification command once, with a brief pass or fail result. Do not include verbose test output.
+- Include a PR verification section only when there are meaningful checks to report. List each relevant command once with a brief result; omit trivial hygiene checks and do not include verbose test output.
 - For UI work, prefer existing `gpui-kit` components when they fit the interaction; build custom controls only when the component library does not provide a suitable option.
 - Before opening a PR, check workspace line coverage locally with `cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80`; coverage must be at least 80%.
 - Before pushing a PR or PR update, run reasonable checks for the changed code, following `.github/workflows/ci.yml` and any relevant build workflow. For Rust changes, run formatting, Clippy, and tests for the affected scope; include relevant native or wasm builds when those targets are affected. Report checks that cannot be run.
