@@ -20,10 +20,6 @@ jobs:
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
-          - name: macos-x86_64
-            os: macos-13
-            target: x86_64-apple-darwin
-            archive: tar.gz
           - name: macos-aarch64
             os: macos-14
             target: aarch64-apple-darwin
