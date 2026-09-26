@@ -3243,6 +3243,34 @@ impl InProcessConnection {
                 let mut diff = self
                     .session_git(session_id, repository_id)?
                     .diff(path.as_deref(), staged)?;
+                let mut remaining = MAX_REVIEW_DIFF_BYTES;
+                let mut truncated = false;
+                for hunk in &mut diff.hunks {
+                    if truncated {
+                        hunk.lines.clear();
+                        continue;
+                    }
+                    let keep = hunk
+                        .lines
+                        .iter()
+                        .take_while(|line| {
+                            let size = line.content.len() + 32;
+                            if size > remaining {
+                                truncated = true;
+                                false
+                            } else {
+                                remaining -= size;
+                                true
+                            }
+                        })
+                        .count();
+                    if keep < hunk.lines.len() {
+                        truncated = true;
+                        hunk.lines.truncate(keep);
+                    }
+                }
+                diff.hunks.retain(|hunk| !hunk.lines.is_empty());
+                diff.truncated = truncated;
                 diff.patch = bounded_review_text(&diff.patch, MAX_REVIEW_DIFF_BYTES);
                 Ok(ServerResponse::VcsDiff(diff))
             }

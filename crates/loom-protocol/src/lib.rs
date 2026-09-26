@@ -35,7 +35,10 @@ pub use process::{
     TerminalStream,
 };
 pub use tool::ToolResult;
-pub use vcs::{GitBranch, GitDiff, GitFileStatus, GitFileStatusKind, GitRepositoryStatus};
+pub use vcs::{
+    GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
+    GitFileStatusKind, GitRepositoryStatus,
+};
 pub use workspace::{
     Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, GitHubRepository,
     RevertResult, SessionDirectory, SessionFilesystemChange, SessionFilesystemFile,

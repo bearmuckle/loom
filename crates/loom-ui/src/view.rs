@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    rc::Rc,
     time::Duration,
 };
 
@@ -16,8 +17,9 @@ use gpui_kit::component::input::{
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{
-    Icon, IconName, IndexPath, Sizable,
+    Icon, IconName, IndexPath, Sizable, h_resizable,
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
+    resizable_panel,
     select::{SearchableVec, Select, SelectEvent, SelectState},
     text::TextView,
     tree::{Tree as KitTree, TreeItem, TreeState},
@@ -39,9 +41,9 @@ use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
-    GitHubRepository, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse,
-    SessionDirectory, SessionRepository, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus,
-    WorkspaceConfig,
+    GitDiffLineKind, GitFileStatusKind, GitHubRepository, RequestEnvelope, ResponseEnvelope,
+    ServerEvent, ServerResponse, SessionDirectory, SessionRepository, WorkerNodeConfig,
+    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode};
@@ -54,9 +56,9 @@ use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
-        AgentMode, GitHubLoginState, RenameDialogState, ReviewPanel, ReviewState, ThemeChoice,
-        TimelineItem, activity_status_label, bounded, bounded_to, session_state_for_run,
-        session_title_from_task, upsert_activity,
+        AgentMode, GitHubLoginState, RenameDialogState, ReviewPanel, ReviewRow, ReviewState,
+        ThemeChoice, TimelineItem, activity_status_label, bounded, bounded_to,
+        session_state_for_run, session_title_from_task, upsert_activity,
     },
     theme::{
         CLIENT_DECORATION_SHADOW, ClientCorners, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
@@ -80,12 +82,12 @@ use crate::connection::{
 use crate::connection::{redact_secret, unexpected_response};
 
 const COMPACT_LAYOUT_WIDTH: Pixels = px(960.);
-const PHONE_LAYOUT_WIDTH: Pixels = px(640.);
+const PHONE_LAYOUT_WIDTH: Pixels = px(700.);
 const COMPACT_SIDEBAR_WIDTH: Pixels = px(200.);
 const FULL_SIDEBAR_WIDTH: Pixels = px(250.);
 const PHONE_SIDEBAR_WIDTH: Pixels = px(300.);
-const COMPACT_REVIEW_WIDTH: Pixels = px(280.);
-const FULL_REVIEW_WIDTH: Pixels = px(340.);
+const COMPACT_REVIEW_WIDTH: Pixels = px(440.);
+const FULL_REVIEW_WIDTH: Pixels = px(600.);
 const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(760.);
 
 #[derive(Clone, Copy, Debug)]
@@ -110,13 +112,17 @@ fn responsive_layout(width: Pixels) -> ResponsiveLayout {
         ResponsiveLayout {
             phone: false,
             sidebar_width: COMPACT_SIDEBAR_WIDTH,
-            review_width: COMPACT_REVIEW_WIDTH,
+            review_width: (width - COMPACT_SIDEBAR_WIDTH - px(220.))
+                .max(px(300.))
+                .min(COMPACT_REVIEW_WIDTH),
         }
     } else {
         ResponsiveLayout {
             phone: false,
             sidebar_width: FULL_SIDEBAR_WIDTH,
-            review_width: FULL_REVIEW_WIDTH,
+            review_width: (width - FULL_SIDEBAR_WIDTH - px(280.))
+                .max(px(360.))
+                .min(FULL_REVIEW_WIDTH),
         }
     }
 }
@@ -564,6 +570,12 @@ fn change_kind_label(kind: loom_workspace::WorkspaceChangeKind) -> &'static str 
         loom_workspace::WorkspaceChangeKind::Deleted => "Removed",
         loom_workspace::WorkspaceChangeKind::Modified => "Updated",
     }
+}
+
+fn belongs_to_repository(path: &str, repositories: &[SessionRepository]) -> bool {
+    repositories.iter().any(|repository| {
+        path == repository.path || path.starts_with(&format!("{}/", repository.path))
+    })
 }
 
 fn activity_marker(status: AgentActivityStatus) -> &'static str {
@@ -1763,6 +1775,7 @@ impl LoomView {
             worker_node_polls_scheduled: BTreeSet::new(),
             workspace_config: WorkspaceConfig::default(),
             node_input_initial,
+            node_input_state: None,
             run_poll_scheduled: false,
             browser_workspace: options.workspace().map(str::to_owned),
             browser_model: options.model().cloned(),
@@ -2389,8 +2402,16 @@ impl LoomView {
             .unwrap_or_else(|| self.default_model.clone());
         self.reset_projection();
         self.review.selected_file = None;
+        self.review.selected_path = None;
+        self.review.selected_staged = false;
+        self.review.selected_diff = None;
+        self.review.selected_file = None;
+        self.review.rows.clear();
+        self.review.hunk_rows.clear();
+        self.review.list_state.reset(0);
         self.review.changes.clear();
         self.review.vcs = None;
+        self.review.repositories_loaded = false;
     }
 
     /// Loads a session synchronously.
@@ -2916,6 +2937,7 @@ impl LoomView {
 
     /// Loads the review projections through the connection worker.
     pub(crate) fn refresh_review(&mut self, cx: &mut Context<Self>) {
+        self.review.repositories_loaded = false;
         self.dispatch(
             cx,
             ClientRequest::ListSessionDirectories {
@@ -2932,83 +2954,108 @@ impl LoomView {
                 ),
             },
         );
+        let session_id = self.active_session.id;
         self.dispatch(
             cx,
             ClientRequest::GetSessionFilesystemChanges {
-                session_id: self.active_session.id,
+                session_id,
                 after_sequence: None,
             },
-            |view, response, _| match response.result {
-                Ok(ServerResponse::SessionFilesystemChanges { changes, truncated }) => {
-                    let mut seen = BTreeSet::new();
-                    view.review.changes = changes
-                        .into_iter()
-                        .rev()
-                        .filter(|change| seen.insert(change.path.clone()))
-                        .take(MAX_REVIEW_CHANGES)
-                        .collect();
-                    if truncated {
-                        view.record_status(
-                            "Workspace review is showing the most recent changes".to_owned(),
-                        );
-                    }
+            move |view, response, _| {
+                if view.active_session.id != session_id {
+                    return;
                 }
-                Err(error) => view.record_backend_error("workspace review refresh", error),
-                Ok(response) => view.record_backend_error(
-                    "workspace review refresh",
-                    unexpected_response("workspace changes", response),
-                ),
+                match response.result {
+                    Ok(ServerResponse::SessionFilesystemChanges { changes, truncated }) => {
+                        let mut seen = BTreeSet::new();
+                        view.review.changes = changes
+                            .into_iter()
+                            .rev()
+                            .filter(|change| seen.insert(change.path.clone()))
+                            .take(MAX_REVIEW_CHANGES)
+                            .collect();
+                        if truncated {
+                            view.record_status(
+                                "Workspace review is showing the most recent changes".to_owned(),
+                            );
+                        }
+                    }
+                    Err(error) => view.record_backend_error("workspace review refresh", error),
+                    Ok(response) => view.record_backend_error(
+                        "workspace review refresh",
+                        unexpected_response("workspace changes", response),
+                    ),
+                }
             },
         );
+        let session_id = self.active_session.id;
         self.dispatch(
             cx,
-            ClientRequest::ListSessionRepositories {
-                session_id: self.active_session.id,
-            },
-            |view, response, cx| match response.result {
-                Ok(ServerResponse::SessionRepositories { repositories }) => {
-                    let repository = repositories
-                        .iter()
-                        .find(|repository| Some(repository.id) == view.selected_repository_id)
-                        .or_else(|| repositories.first())
-                        .cloned();
-                    view.session_repositories = repositories;
-                    view.selected_repository_id =
-                        repository.as_ref().map(|repository| repository.id);
-                    if let Some(repository) = repository {
-                        view.dispatch(
-                            cx,
-                            ClientRequest::GetSessionVcsStatus {
-                                session_id: view.active_session.id,
-                                repository_id: repository.id,
-                            },
-                            |view, response, _| match response.result {
-                                Ok(ServerResponse::VcsStatus(status)) => {
-                                    view.review.vcs = Some(status)
-                                }
-                                Err(error) => {
-                                    view.review.vcs = None;
-                                    view.record_status(format!("VCS review unavailable: {error}"));
-                                }
-                                Ok(response) => view.record_backend_error(
-                                    "VCS review refresh",
-                                    unexpected_response("VCS status", response),
-                                ),
-                            },
+            ClientRequest::ListSessionRepositories { session_id },
+            move |view, response, cx| {
+                if view.active_session.id != session_id {
+                    return;
+                }
+                match response.result {
+                    Ok(ServerResponse::SessionRepositories { repositories }) => {
+                        view.review.repositories_loaded = true;
+                        let repository = repositories
+                            .iter()
+                            .find(|repository| Some(repository.id) == view.selected_repository_id)
+                            .or_else(|| repositories.first())
+                            .cloned();
+                        view.session_repositories = repositories;
+                        view.selected_repository_id =
+                            repository.as_ref().map(|repository| repository.id);
+                        if let Some(repository) = repository {
+                            let repository_id = repository.id;
+                            let session_id = view.active_session.id;
+                            view.dispatch(
+                                cx,
+                                ClientRequest::GetSessionVcsStatus {
+                                    session_id,
+                                    repository_id,
+                                },
+                                move |view, response, _| {
+                                    if view.active_session.id != session_id
+                                        || view.selected_repository_id != Some(repository_id)
+                                    {
+                                        return;
+                                    }
+                                    match response.result {
+                                        Ok(ServerResponse::VcsStatus(status)) => {
+                                            view.review.vcs = Some(status)
+                                        }
+                                        Err(error) => {
+                                            view.review.vcs = None;
+                                            view.record_status(format!(
+                                                "VCS review unavailable: {error}"
+                                            ));
+                                        }
+                                        Ok(response) => view.record_backend_error(
+                                            "VCS review refresh",
+                                            unexpected_response("VCS status", response),
+                                        ),
+                                    }
+                                },
+                            );
+                        } else {
+                            view.review.vcs = None;
+                        }
+                    }
+                    Err(error) => {
+                        view.review.repositories_loaded = true;
+                        view.review.vcs = None;
+                        view.record_status(format!("VCS review unavailable: {error}"));
+                    }
+                    Ok(response) => {
+                        view.review.repositories_loaded = true;
+                        view.record_backend_error(
+                            "VCS review refresh",
+                            unexpected_response("session repository list", response),
                         );
-                    } else {
-                        view.review.vcs = None;
-                        view.review.vcs = None;
                     }
                 }
-                Err(error) => {
-                    view.review.vcs = None;
-                    view.record_status(format!("VCS review unavailable: {error}"));
-                }
-                Ok(response) => view.record_backend_error(
-                    "VCS review refresh",
-                    unexpected_response("session repository list", response),
-                ),
             },
         );
     }
@@ -5662,25 +5709,42 @@ impl LoomView {
     }
 
     fn select_session_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
+        let session_id = self.active_session.id;
         self.selected_repository_id = Some(repository_id);
+        self.review.selected_path = None;
+        self.review.selected_diff = None;
+        self.review.selected_file = None;
+        self.review.rows.clear();
+        self.review.hunk_rows.clear();
+        self.review.list_state.reset(0);
+        self.review.selection_revision += 1;
+        self.review.vcs = None;
         self.dispatch(
             cx,
             ClientRequest::GetSessionVcsStatus {
-                session_id: self.active_session.id,
+                session_id,
                 repository_id,
             },
-            |view, response, _| match response.result {
-                Ok(ServerResponse::VcsStatus(status)) => view.review.vcs = Some(status),
-                Err(error) => {
-                    view.review.vcs = None;
-                    view.record_status(format!("VCS review unavailable: {error}"));
+            move |view, response, _| {
+                if view.active_session.id != session_id
+                    || view.selected_repository_id != Some(repository_id)
+                {
+                    return;
                 }
-                Ok(response) => view.record_backend_error(
-                    "VCS review refresh",
-                    unexpected_response("VCS status", response),
-                ),
+                match response.result {
+                    Ok(ServerResponse::VcsStatus(status)) => view.review.vcs = Some(status),
+                    Err(error) => {
+                        view.review.vcs = None;
+                        view.record_status(format!("VCS review unavailable: {error}"));
+                    }
+                    Ok(response) => view.record_backend_error(
+                        "VCS review refresh",
+                        unexpected_response("VCS status", response),
+                    ),
+                }
             },
         );
+        cx.notify();
     }
 
     fn detach_session_repository(&mut self, repository_id: RepositoryId, cx: &mut Context<Self>) {
@@ -5761,31 +5825,128 @@ impl LoomView {
     }
 
     pub(crate) fn open_review_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.review.selected_path = Some(path.clone());
+        self.review.selection_revision += 1;
+        let selection_revision = self.review.selection_revision;
+        self.review.selected_staged = false;
+        self.review.selected_diff = None;
+        self.review.rows.clear();
+        self.review.hunk_rows.clear();
+        self.review.list_state.reset(0);
+        self.review.loading_diff = true;
+        self.review.diff_error = None;
+        let session_id = self.active_session.id;
+        let requested_path = path.clone();
         self.dispatch(
             cx,
-            ClientRequest::ReadSessionFile {
-                session_id: self.active_session.id,
-                path,
-            },
-            |view, response, _| match response.result {
-                Ok(ServerResponse::SessionFilesystemFile(mut file)) => {
-                    file.content = bounded_to(&file.content, MAX_REVIEW_DIFF);
-                    view.review.selected_file = Some(loom_protocol::SessionFilesystemFile {
-                        session_id: file.session_id,
-                        path: file.path,
-                        content: file.content,
-                        revision: file.revision,
-                    });
-                    view.review.open = true;
-                    view.review.panel = ReviewPanel::Changes;
+            ClientRequest::ReadSessionFile { session_id, path },
+            move |view, response, _| {
+                if view.active_session.id != session_id
+                    || view.review.selected_path.as_deref() != Some(&requested_path)
+                    || view.review.selected_staged
+                    || view.review.selection_revision != selection_revision
+                {
+                    return;
                 }
-                Err(error) => view.record_backend_error("read review file", error),
-                Ok(response) => view.record_backend_error(
-                    "read review file",
-                    unexpected_response("workspace file", response),
-                ),
+                match response.result {
+                    Ok(ServerResponse::SessionFilesystemFile(mut file)) => {
+                        file.content = bounded_to(&file.content, MAX_REVIEW_DIFF);
+                        view.review.selected_file = Some(loom_protocol::SessionFilesystemFile {
+                            session_id: file.session_id,
+                            path: file.path,
+                            content: file.content,
+                            revision: file.revision,
+                        });
+                        view.review.open = true;
+                        view.review.panel = ReviewPanel::Changes;
+                        view.review.loading_diff = false;
+                    }
+                    Err(error) => {
+                        view.review.loading_diff = false;
+                        view.review.diff_error = Some(error.to_string());
+                    }
+                    Ok(response) => {
+                        view.review.loading_diff = false;
+                        view.review.diff_error =
+                            Some(unexpected_response("workspace file", response).to_string());
+                    }
+                }
             },
         );
+    }
+
+    fn jump_review_hunk(&mut self, forward: bool, cx: &mut Context<Self>) {
+        if self.review.hunk_rows.is_empty() {
+            return;
+        }
+        let visible_row = self.review.list_state.logical_scroll_top().item_ix;
+        self.review.selected_hunk = if forward {
+            self.review
+                .hunk_rows
+                .iter()
+                .position(|row| *row > visible_row)
+                .unwrap_or(self.review.hunk_rows.len() - 1)
+        } else {
+            self.review
+                .hunk_rows
+                .iter()
+                .rposition(|row| *row < visible_row)
+                .unwrap_or(0)
+        };
+        self.review.list_state.scroll_to(gpui_kit::ListOffset {
+            item_ix: self.review.hunk_rows[self.review.selected_hunk],
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+    }
+
+    fn open_review_diff(&mut self, path: String, staged: bool, cx: &mut Context<Self>) {
+        let Some(repository_id) = self.selected_repository_id else {
+            return;
+        };
+        self.review.selected_path = Some(path.clone());
+        self.review.selection_revision += 1;
+        let selection_revision = self.review.selection_revision;
+        self.review.selected_staged = staged;
+        self.review.selected_file = None;
+        self.review.selected_diff = None;
+        self.review.rows.clear();
+        self.review.hunk_rows.clear();
+        self.review.list_state.reset(0);
+        self.review.loading_diff = true;
+        self.review.diff_error = None;
+        let session_id = self.active_session.id;
+        self.dispatch(
+            cx,
+            ClientRequest::GetSessionVcsDiff {
+                session_id,
+                repository_id,
+                path: Some(path.clone()),
+                staged,
+            },
+            move |view, response, _| {
+                if view.active_session.id != session_id
+                    || view.review.selected_path.as_deref() != Some(&path)
+                    || view.review.selected_staged != staged
+                    || view.review.selection_revision != selection_revision
+                {
+                    return;
+                }
+                match response.result {
+                    Ok(ServerResponse::VcsDiff(diff)) => view.review.show_diff(diff),
+                    Err(error) => {
+                        view.review.loading_diff = false;
+                        view.review.diff_error = Some(error.to_string());
+                    }
+                    Ok(response) => {
+                        view.review.loading_diff = false;
+                        view.review.diff_error =
+                            Some(unexpected_response("VCS diff", response).to_string());
+                    }
+                }
+            },
+        );
+        cx.notify();
     }
 
     pub(crate) fn render_session_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6452,9 +6613,22 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let layout = responsive_layout(window.bounds().size.width);
-        let title = "Changed files";
+        let title = "Changes";
         let mut body = div()
-            .flex_1()
+            .when(!layout.phone, |element| {
+                element
+                    .w(px(220.))
+                    .h_full()
+                    .border_r_1()
+                    .border_color(rgb(0x30343f))
+            })
+            .when(layout.phone, |element| {
+                element
+                    .h(px(170.))
+                    .w_full()
+                    .border_b_1()
+                    .border_color(rgb(0x30343f))
+            })
             .id("changes-sidebar-scroll")
             .overflow_y_scroll()
             .flex()
@@ -6463,15 +6637,118 @@ impl LoomView {
             .p_2();
         match self.review.panel {
             ReviewPanel::Changes => {
-                if self.review.changes.is_empty() {
+                if self.session_repositories.len() > 1 {
                     body = body.child(
                         div()
-                            .text_sm()
-                            .text_color(rgb(0x8f98a6))
-                            .child("No workspace changes recorded"),
+                            .text_xs()
+                            .text_color(rgb(0x93c5fd))
+                            .child("REPOSITORIES"),
+                    );
+                    for (index, repository) in self.session_repositories.iter().enumerate() {
+                        let selected = self.selected_repository_id == Some(repository.id);
+                        let repository_id = repository.id;
+                        let name = repository
+                            .source
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("Repository");
+                        body = body.child(
+                            div()
+                                .id(("review-repository", index))
+                                .p_1()
+                                .cursor_pointer()
+                                .when(selected, |element| element.bg(rgb(0x293244)))
+                                .text_sm()
+                                .child(name.to_owned())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.select_session_repository(repository_id, cx);
+                                })),
+                        );
+                    }
+                }
+                if let Some(status) = &self.review.vcs {
+                    body = body.child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(rgb(0x93c5fd))
+                            .child("REPOSITORY CHANGES"),
+                    );
+                    for (index, file) in status.files.iter().enumerate() {
+                        let path = file.path.clone();
+                        let staged = matches!(
+                            file.worktree,
+                            GitFileStatusKind::Unknown | GitFileStatusKind::Ignored
+                        );
+                        let selected = self.review.selected_path.as_deref() == Some(&file.path)
+                            && self.review.selected_staged == staged;
+                        let (additions, deletions) = if staged {
+                            (file.index_additions, file.index_deletions)
+                        } else {
+                            (file.worktree_additions, file.worktree_deletions)
+                        };
+                        body = body.child(
+                            div()
+                                .id(("git-file", index))
+                                .p_1()
+                                .when(selected, |element| element.bg(rgb(0x293244)))
+                                .text_sm()
+                                .text_color(rgb(0xfef3c7))
+                                .cursor_pointer()
+                                .child(format!(
+                                    "{:?}  {}  +{} −{}",
+                                    if staged { file.index } else { file.worktree },
+                                    file.path,
+                                    additions,
+                                    deletions
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_review_diff(path.clone(), staged, cx);
+                                })),
+                        );
+                        if !staged && file.index != GitFileStatusKind::Unknown {
+                            let path = file.path.clone();
+                            body = body.child(
+                                div()
+                                    .id(("git-staged-file", index))
+                                    .p_1()
+                                    .pl_3()
+                                    .text_xs()
+                                    .text_color(rgb(0x93c5fd))
+                                    .cursor_pointer()
+                                    .child(format!(
+                                        "Staged  +{} −{}",
+                                        file.index_additions, file.index_deletions
+                                    ))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_review_diff(path.clone(), true, cx);
+                                    })),
+                            );
+                        }
+                    }
+                }
+                let workspace_changes = self
+                    .review
+                    .changes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, change)| {
+                        self.review.repositories_loaded
+                            && !belongs_to_repository(&change.path, &self.session_repositories)
+                    })
+                    .collect::<Vec<_>>();
+                if !workspace_changes.is_empty() {
+                    body = body.child(
+                        div()
+                            .mt_2()
+                            .text_xs()
+                            .text_color(rgb(0x93c5fd))
+                            .child("OTHER WORKSPACE FILES"),
                     );
                 }
-                for (index, change) in self.review.changes.iter().take(24).enumerate() {
+                for (index, change) in workspace_changes {
                     let path = change.path.clone();
                     body = body.child(
                         div()
@@ -6490,60 +6767,161 @@ impl LoomView {
                             })),
                     );
                 }
-                if let Some(status) = &self.review.vcs {
-                    let repository_prefix = self
-                        .session_repositories
-                        .iter()
-                        .find(|repository| Some(repository.id) == self.selected_repository_id)
-                        .map(|repository| format!("{}/", repository.path))
-                        .unwrap_or_default();
-                    for (index, file) in status.files.iter().take(24).enumerate() {
-                        let path = format!("{repository_prefix}{}", file.path);
-                        body = body.child(
-                            div()
-                                .id(("git-file", index))
-                                .text_sm()
-                                .text_color(rgb(0xfef3c7))
-                                .cursor_pointer()
-                                .child(format!("Git · {:?}  {}", file.worktree, file.path))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_review_file(path.clone(), cx);
-                                    cx.notify();
-                                })),
-                        );
-                    }
-                }
-                if let Some(file) = &self.review.selected_file {
+                if !self.review.repositories_loaded {
                     body = body.child(
                         div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(rgb(0x93c5fd))
-                            .child(format!("READ-ONLY FILE  {}", file.path)),
+                            .text_sm()
+                            .text_color(rgb(0x8f98a6))
+                            .child("Loading repositories…"),
                     );
+                } else if self.review.changes.is_empty()
+                    && self
+                        .review
+                        .vcs
+                        .as_ref()
+                        .is_none_or(|status| status.files.is_empty())
+                {
                     body = body.child(
                         div()
-                            .p_2()
-                            .bg(rgb(0x0f1115))
-                            .text_xs()
-                            .text_color(rgb(0xcbd5e1))
-                            .child(file.content.clone()),
+                            .text_sm()
+                            .text_color(rgb(0x8f98a6))
+                            .child("No changed files"),
                     );
                 }
             }
         }
+        let parent = cx.entity();
+        let diff_list = list(self.review.list_state.clone(), move |index, _window, cx| {
+            let view = parent.read(cx);
+            view.render_review_row(index).into_any()
+        })
+        .size_full();
+        let mut detail = div().flex_1().min_w(px(0.)).flex().flex_col();
+        if let Some(path) = &self.review.selected_path {
+            detail = detail.child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(0x30343f))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .min_w(px(0.))
+                            .flex()
+                            .flex_col()
+                            .child(div().text_sm().child(path.clone()))
+                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                                if self.review.selected_file.is_some() {
+                                    "Current file · no repository diff"
+                                } else if self.review.selected_staged {
+                                    "Staged changes · read only"
+                                } else {
+                                    "Working changes · read only"
+                                },
+                            )),
+                    )
+                    .when(!self.review.hunk_rows.is_empty(), |header| {
+                        header.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new("previous-review-hunk")
+                                        .label("Previous hunk")
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.jump_review_hunk(false, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("next-review-hunk")
+                                        .label("Next hunk")
+                                        .ghost()
+                                        .xsmall()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.jump_review_hunk(true, cx)
+                                        })),
+                                ),
+                        )
+                    }),
+            );
+        }
+        if self.review.loading_diff {
+            detail = detail.child(div().p_3().text_sm().child("Loading diff…"));
+        } else if let Some(error) = &self.review.diff_error {
+            detail = detail.child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .text_color(rgb(0xfca5a5))
+                    .child(error.clone()),
+            );
+        } else if let Some(diff) = &self.review.selected_diff {
+            if diff.binary {
+                detail = detail.child(
+                    div()
+                        .p_3()
+                        .text_sm()
+                        .child("Binary file: no text diff is available."),
+                );
+            } else if self.review.rows.is_empty() {
+                detail = detail.child(div().p_3().text_sm().child(if diff.truncated {
+                    "The first changed line exceeds the review size limit."
+                } else {
+                    "No line changes in this version of the file."
+                }));
+            } else {
+                detail = detail.child(diff_list);
+            }
+            if diff.truncated {
+                detail =
+                    detail.child(
+                        div().p_2().text_xs().text_color(rgb(0xfef3c7)).child(
+                            "Diff exceeds the review size limit; showing the beginning only.",
+                        ),
+                    );
+            }
+        } else if let Some(file) = &self.review.selected_file {
+            detail = detail.child(
+                div()
+                    .flex_1()
+                    .id("review-file-scroll")
+                    .overflow_y_scroll()
+                    .p_3()
+                    .child(SelectableText::new(
+                        "review-file-content",
+                        file.content.clone(),
+                    )),
+            );
+        } else {
+            detail = detail.child(
+                div()
+                    .p_3()
+                    .text_sm()
+                    .text_color(rgb(0x8f98a6))
+                    .child("Select a changed file to review its diff."),
+            );
+        }
+        let content = div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .when(layout.phone, |element| element.flex_col())
+            .child(body)
+            .child(detail);
         div()
             .when(layout.phone, |element| {
                 element.size_full().absolute().top(px(0.)).left(px(0.))
             })
-            .when(!layout.phone, |element| {
-                element.w(layout.review_width).h_full()
-            })
+            .when(!layout.phone, |element| element.size_full())
             .flex()
             .flex_col()
             .bg(rgb(0x17191f))
-            .border_l_1()
-            .border_color(rgb(0x30343f))
             .child(
                 div()
                     .w_full()
@@ -6598,7 +6976,64 @@ impl LoomView {
                             ),
                     ),
             )
-            .child(body)
+            .child(content)
+    }
+
+    fn render_review_row(&self, index: usize) -> gpui_kit::Div {
+        let Some(row) = self.review.rows.get(index) else {
+            return div().w_full().min_h(px(22.));
+        };
+        match row {
+            ReviewRow::Hunk {
+                old_start,
+                old_lines,
+                new_start,
+                new_lines,
+            } => div()
+                .w_full()
+                .px_2()
+                .py_1()
+                .bg(rgb(0x293b56))
+                .text_xs()
+                .text_color(rgb(0x93c5fd))
+                .child(format!(
+                    "@@ -{old_start},{old_lines} +{new_start},{new_lines} @@"
+                )),
+            ReviewRow::Line(line) => {
+                let (marker, background, foreground) = match line.kind {
+                    GitDiffLineKind::Added => ("+", 0x263d36, 0xbbf7d0),
+                    GitDiffLineKind::Removed => ("−", 0x452b36, 0xfecaca),
+                    GitDiffLineKind::Context => (" ", 0x17191f, 0xcbd5e1),
+                };
+                div()
+                    .w_full()
+                    .min_h(px(22.))
+                    .flex()
+                    .items_start()
+                    .bg(rgb(background))
+                    .text_xs()
+                    .text_color(rgb(foreground))
+                    .child(
+                        div()
+                            .w(px(40.))
+                            .flex_shrink_0()
+                            .text_color(rgb(0x8f98a6))
+                            .child(line.old_line.map(|n| n.to_string()).unwrap_or_default()),
+                    )
+                    .child(
+                        div()
+                            .w(px(40.))
+                            .flex_shrink_0()
+                            .text_color(rgb(0x8f98a6))
+                            .child(line.new_line.map(|n| n.to_string()).unwrap_or_default()),
+                    )
+                    .child(div().w(px(18.)).flex_shrink_0().child(marker))
+                    .child(div().flex_1().min_w(px(0.)).child(SelectableText::new(
+                        ("review-line", index),
+                        line.content.clone(),
+                    )))
+            }
+        }
     }
 
     fn render_composer(
@@ -7911,7 +8346,7 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
-            .w(layout.sidebar_width)
+            .w_full()
             .h_full()
             .relative()
             .p_2()
@@ -7919,8 +8354,6 @@ impl LoomView {
             .flex_col()
             .gap_2()
             .bg(rgb(0x17191f))
-            .border_r_1()
-            .border_color(rgb(0x30343f))
             .child(
                 div()
                     .flex()
@@ -8253,10 +8686,6 @@ impl LoomView {
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         #[cfg(target_family = "wasm")]
-        if !self.connected {
-            return self.render_disconnected(window, cx);
-        }
-        #[cfg(target_family = "wasm")]
         if !self.browser_window_initialized {
             self.browser_window_initialized = true;
             self.observe_system_appearance(window, cx);
@@ -8303,6 +8732,10 @@ impl Render for LoomView {
                 input.update(cx, |state, cx| state.set_value("", window, cx));
             }
             self.clear_node_on_render = false;
+        }
+        #[cfg(target_family = "wasm")]
+        if !self.connected {
+            return self.render_disconnected(window, cx);
         }
         if self.rename_dialog.is_some() && self.rename_input_state.is_none() {
             let initial_value = self
@@ -8386,7 +8819,14 @@ impl Render for LoomView {
         self.schedule_run_poll(cx);
         let view = cx.entity();
         let layout = responsive_layout(window.bounds().size.width);
-        let workspace_name = self.workspace_name.as_str();
+        let review_panel_visible = !layout.phone
+            && self.review.open
+            && !self.sessions.is_empty()
+            && !self.settings_open
+            && !self.about_open
+            && !self.providers_open
+            && self.github_login.is_none();
+        let workspace_name = self.workspace_name.clone();
         let decorations = window.window_decorations();
         let client_decorated = matches!(decorations, Decorations::Client { .. });
         let shadow_size = CLIENT_DECORATION_SHADOW;
@@ -8405,6 +8845,300 @@ impl Render for LoomView {
         if client_decorated {
             window.set_client_inset(shadow_size);
         }
+        let panel_layout = h_resizable("loom-workspace-panels")
+            .with_handle_appearance(Rc::new(|handle, _, _| {
+                let active = handle.is_active();
+                let line = div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(2.))
+                    .w(px(1.))
+                    .bg(rgb(0x30343f));
+                let grip = div()
+                    .w(px(5.))
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(rgb(0x60a5fa))
+                    .opacity(0.)
+                    .group_hover("handle", |element| element.opacity(1.))
+                    .when(active, |element| element.opacity(1.).h(px(40.)));
+                Some(
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .relative()
+                                .w(px(5.))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(line)
+                                .child(grip),
+                        )
+                        .into_any(),
+                )
+            }))
+            .children([
+                resizable_panel()
+                    .size(layout.sidebar_width)
+                    .size_range(px(150.)..px(420.))
+                    .flex_none()
+                    .visible(!layout.phone)
+                    .child(div().size_full().when(!layout.phone, |element| {
+                        element.child(self.render_session_sidebar(&view, layout, cx))
+                    })),
+                resizable_panel().min_w(px(0.)).child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                div()
+                    .w_full()
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .bg(rgb(0x14161a))
+                    .border_b_1()
+                    .border_color(rgb(0x30343f))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(layout.phone, |element| {
+                                element.child(
+                                    Button::new("open-session-drawer")
+                                        .label("Sessions")
+                                        .small()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.session_drawer_open = true;
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .flex_col()
+                                    .child(self.active_session.name.clone())
+                                    .when(!layout.phone, |element| {
+                                        element.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x8f98a6))
+                                                .child(format!(
+                                                    "{}  ·  {}  ·  {} model{}",
+                                                    run_state_label(self.run_state),
+                                                    self.model.as_str(),
+                                                    self.models.len(),
+                                                    if self.models.len() == 1 {
+                                                        ""
+                                                    } else {
+                                                        "s"
+                                                    }
+                                                )),
+                                        )
+                                    }),
+                            ),
+                    )
+                    .child(
+                        session_header_actions()
+                            .child(header_tooltip("session-sources-tooltip", "Session sources",
+                        Button::new("session-sources")
+                            .icon(Icon::new(AssetIconName::ListTree))
+                            .ghost()
+                            .small()
+                            .dropdown_menu({
+                                let view = view.clone();
+                                let repositories = self.session_repositories.clone();
+                                let directories = self.session_directories.clone();
+                                let selected_repository_id = self.selected_repository_id;
+                                move |mut menu, window, cx| {
+                                    menu = menu.label("Session sources");
+                                    let add_view = view.clone();
+                                    menu = menu.item(PopupMenuItem::new("Add source…").on_click(
+                                        move |_, _, cx| {
+                                            add_view.update(cx, |this, cx| {
+                                                this.begin_source_dialog(
+                                                    SessionSourceDialogPurpose::AddToSession,
+                                                    cx,
+                                                );
+                                            });
+                                        },
+                                    ));
+                                    if directories.is_empty() && repositories.is_empty() {
+                                        menu = menu.separator().label("No sources attached");
+                                    } else {
+                                        menu = menu.separator();
+                                    }
+                                    for directory in &directories {
+                                        let detach_view = view.clone();
+                                        let path = directory.path.clone();
+                                        let root_repository = repositories.iter().find(|repository| repository.path == directory.path);
+                                        let name = Path::new(&directory.source)
+                                            .file_name()
+                                            .map(|name| name.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| directory.source.clone());
+                                        let label = if root_repository.is_some() {
+                                            format!("Git repository: {name}")
+                                        } else {
+                                            format!("Folder: {name}")
+                                        };
+                                        let source_menu = PopupMenu::build(window, cx, |mut menu, _, _| {
+                                            menu = menu.label(directory.source.clone());
+                                            if let Some(repository) = root_repository {
+                                                let repository_id = repository.id;
+                                                let select_view = view.clone();
+                                                menu = menu.item(
+                                                    PopupMenuItem::new("Select for review")
+                                                        .checked(selected_repository_id == Some(repository_id))
+                                                        .on_click(move |_, _, cx| {
+                                                            select_view.update(cx, |this, cx| {
+                                                                this.select_session_repository(repository_id, cx);
+                                                            });
+                                                        }),
+                                                );
+                                            }
+                                            menu.item(PopupMenuItem::new("Detach source")
+                                                .on_click(move |_, _, cx| {
+                                                    detach_view.update(cx, |this, cx| {
+                                                        this.detach_session_directory(path.clone(), cx);
+                                                    });
+                                                }))
+                                        });
+                                        menu = menu.item(PopupMenuItem::submenu(
+                                            label, source_menu,
+                                        ));
+                                    }
+                                    let other_repositories = repositories.iter().filter(|repository| {
+                                        !directories.iter().any(|directory| directory.path == repository.path)
+                                    }).collect::<Vec<_>>();
+                                    if !other_repositories.is_empty() {
+                                        menu = menu.separator().label("Git repositories");
+                                        for repository in other_repositories {
+                                            let repository_id = repository.id;
+                                            let select_view = view.clone();
+                                            let detach_view = view.clone();
+                                            let source_menu = PopupMenu::build(window, cx, |menu, _, _| {
+                                                menu.label(repository.source.clone()).item(
+                                                    PopupMenuItem::new("Select for review")
+                                                        .checked(selected_repository_id == Some(repository_id))
+                                                        .on_click(move |_, _, cx| {
+                                                            select_view.update(cx, |this, cx| {
+                                                                this.select_session_repository(repository_id, cx);
+                                                            });
+                                                        }),
+                                                )
+                                                .item(
+                                                    PopupMenuItem::new("Detach source")
+                                                        .on_click(move |_, _, cx| {
+                                                            detach_view.update(cx, |this, cx| {
+                                                                this.detach_session_repository(repository_id, cx);
+                                                            });
+                                                        }),
+                                                )
+                                            });
+                                            let name = Path::new(&repository.source)
+                                                .file_name()
+                                                .map(|name| name.to_string_lossy().into_owned())
+                                                .unwrap_or_else(|| repository.source.clone());
+                                            menu = menu.item(PopupMenuItem::submenu(name, source_menu));
+                                        }
+                                    }
+                                    menu
+                                }
+                            }),
+                            ))
+                            .child(header_tooltip("toggle-review-sidebar-tooltip", "Toggle side panel",
+                        Button::new("toggle-review-sidebar")
+                            .icon(Icon::new(if self.review.open {
+                                IconName::PanelRightClose
+                            } else {
+                                IconName::PanelRightOpen
+                            }))
+                            .ghost()
+                            .small()
+                            .when(self.review.open, |button| button.secondary())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_review_pane(cx);
+                            })),
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .id("timeline-scroll")
+                    .overflow_hidden()
+                    .child(self.timeline_entity(cx)),
+            )
+            .child(self.render_composer(layout, window, cx))
+            .when(self.sessions.is_empty(), |element| {
+                element.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .bg(rgb(0x111318))
+                        .child(div().text_base().child("No sessions"))
+                        .child(
+                            Button::new("start-first-session")
+                                .label("Start a session")
+                                .on_click(cx.listener(Self::new_session)),
+                        ),
+                )
+            })
+            .when(self.rename_dialog.is_some(), |element| {
+                element.child(self.render_rename_dialog(cx))
+            })
+            .when(self.source_dialog.is_some(), |element| {
+                element.child(self.render_source_dialog(cx))
+            })
+            .when(self.settings_open, |element| {
+                element.child(self.render_settings_dialog(cx))
+            })
+            .when(self.about_open, |element| {
+                element.child(self.render_about_dialog(cx))
+            })
+            .when(
+                self.providers_open && self.github_login.is_none(),
+                |element| element.child(self.render_providers_dialog(cx)),
+            )
+            .when(self.github_login.is_some(), |element| {
+                element.child(self.render_github_login_dialog(cx))
+            }),
+            ),
+                resizable_panel()
+                    .size(layout.review_width)
+                    .size_range(px(340.)..px(900.))
+                    .flex_none()
+                    .visible(review_panel_visible)
+                    .child(div().size_full().when(review_panel_visible, |element| {
+                        element.child(self.render_review(window, cx))
+                    })),
+            ]);
         let content = div()
             .size_full()
             .relative()
@@ -8495,245 +9229,7 @@ impl Render for LoomView {
                     .flex()
                     .relative()
                     .overflow_hidden()
-                    .when(!layout.phone, |row| {
-                        row.child(self.render_session_sidebar(&view, layout, cx))
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .relative()
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .px_3()
-                                    .py_2()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .bg(rgb(0x14161a))
-                                    .border_b_1()
-                                    .border_color(rgb(0x30343f))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .when(layout.phone, |element| {
-                                                element.child(
-                                                    Button::new("open-session-drawer")
-                                                        .label("Sessions")
-                                                        .small()
-                                                        .on_click(cx.listener(|this, _, _, cx| {
-                                                            this.session_drawer_open = true;
-                                                            cx.notify();
-                                                        })),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .flex_1()
-                                                    .min_w(px(0.))
-                                                    .flex_col()
-                                                    .child(self.active_session.name.clone())
-                                                    .when(!layout.phone, |element| {
-                                                        element.child(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(rgb(0x8f98a6))
-                                                                .child(format!(
-                                                                    "{}  ·  {}  ·  {} model{}",
-                                                                    run_state_label(self.run_state),
-                                                                    self.model.as_str(),
-                                                                    self.models.len(),
-                                                                    if self.models.len() == 1 {
-                                                                        ""
-                                                                    } else {
-                                                                        "s"
-                                                                    }
-                                                                )),
-                                                        )
-                                                    }),
-                                            ),
-                                    )
-                                    .child(
-                                        session_header_actions()
-                                            .child(header_tooltip("session-sources-tooltip", "Session sources",
-                                        Button::new("session-sources")
-                                            .icon(Icon::new(AssetIconName::ListTree))
-                                            .ghost()
-                                            .small()
-                                            .dropdown_menu({
-                                                let view = view.clone();
-                                                let repositories = self.session_repositories.clone();
-                                                let directories = self.session_directories.clone();
-                                                let selected_repository_id = self.selected_repository_id;
-                                                move |mut menu, window, cx| {
-                                                    menu = menu.label("Session sources");
-                                                    let add_view = view.clone();
-                                                    menu = menu.item(PopupMenuItem::new("Add source…").on_click(
-                                                        move |_, _, cx| {
-                                                            add_view.update(cx, |this, cx| {
-                                                                this.begin_source_dialog(
-                                                                    SessionSourceDialogPurpose::AddToSession,
-                                                                    cx,
-                                                                );
-                                                            });
-                                                        },
-                                                    ));
-                                                    if directories.is_empty() && repositories.is_empty() {
-                                                        menu = menu.separator().label("No sources attached");
-                                                    } else {
-                                                        menu = menu.separator();
-                                                    }
-                                                    for directory in &directories {
-                                                        let detach_view = view.clone();
-                                                        let path = directory.path.clone();
-                                                        let root_repository = repositories.iter().find(|repository| repository.path == directory.path);
-                                                        let name = Path::new(&directory.source)
-                                                            .file_name()
-                                                            .map(|name| name.to_string_lossy().into_owned())
-                                                            .unwrap_or_else(|| directory.source.clone());
-                                                        let label = if root_repository.is_some() {
-                                                            format!("Git repository: {name}")
-                                                        } else {
-                                                            format!("Folder: {name}")
-                                                        };
-                                                        let source_menu = PopupMenu::build(window, cx, |mut menu, _, _| {
-                                                            menu = menu.label(directory.source.clone());
-                                                            if let Some(repository) = root_repository {
-                                                                let repository_id = repository.id;
-                                                                let select_view = view.clone();
-                                                                menu = menu.item(
-                                                                    PopupMenuItem::new("Select for review")
-                                                                        .checked(selected_repository_id == Some(repository_id))
-                                                                        .on_click(move |_, _, cx| {
-                                                                            select_view.update(cx, |this, cx| {
-                                                                                this.select_session_repository(repository_id, cx);
-                                                                            });
-                                                                        }),
-                                                                );
-                                                            }
-                                                            menu.item(PopupMenuItem::new("Detach source")
-                                                                .on_click(move |_, _, cx| {
-                                                                    detach_view.update(cx, |this, cx| {
-                                                                        this.detach_session_directory(path.clone(), cx);
-                                                                    });
-                                                                }))
-                                                        });
-                                                        menu = menu.item(PopupMenuItem::submenu(
-                                                            label, source_menu,
-                                                        ));
-                                                    }
-                                                    let other_repositories = repositories.iter().filter(|repository| {
-                                                        !directories.iter().any(|directory| directory.path == repository.path)
-                                                    }).collect::<Vec<_>>();
-                                                    if !other_repositories.is_empty() {
-                                                        menu = menu.separator().label("Git repositories");
-                                                        for repository in other_repositories {
-                                                            let repository_id = repository.id;
-                                                            let select_view = view.clone();
-                                                            let detach_view = view.clone();
-                                                            let source_menu = PopupMenu::build(window, cx, |menu, _, _| {
-                                                                menu.label(repository.source.clone()).item(
-                                                                    PopupMenuItem::new("Select for review")
-                                                                        .checked(selected_repository_id == Some(repository_id))
-                                                                        .on_click(move |_, _, cx| {
-                                                                            select_view.update(cx, |this, cx| {
-                                                                                this.select_session_repository(repository_id, cx);
-                                                                            });
-                                                                        }),
-                                                                )
-                                                                .item(
-                                                                    PopupMenuItem::new("Detach source")
-                                                                        .on_click(move |_, _, cx| {
-                                                                            detach_view.update(cx, |this, cx| {
-                                                                                this.detach_session_repository(repository_id, cx);
-                                                                            });
-                                                                        }),
-                                                                )
-                                                            });
-                                                            let name = Path::new(&repository.source)
-                                                                .file_name()
-                                                                .map(|name| name.to_string_lossy().into_owned())
-                                                                .unwrap_or_else(|| repository.source.clone());
-                                                            menu = menu.item(PopupMenuItem::submenu(name, source_menu));
-                                                        }
-                                                    }
-                                                    menu
-                                                }
-                                            }),
-                                            ))
-                                            .child(header_tooltip("toggle-review-sidebar-tooltip", "Toggle side panel",
-                                        Button::new("toggle-review-sidebar")
-                                            .icon(Icon::new(if self.review.open {
-                                                IconName::PanelRightClose
-                                            } else {
-                                                IconName::PanelRightOpen
-                                            }))
-                                            .ghost()
-                                            .small()
-                                            .when(self.review.open, |button| button.secondary())
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.toggle_review_pane(cx);
-                                            })),
-                                            )),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .id("timeline-scroll")
-                                    .overflow_hidden()
-                                    .child(self.timeline_entity(cx)),
-                            )
-                            .child(self.render_composer(layout, window, cx))
-                            .when(self.sessions.is_empty(), |element| {
-                                element.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(0.))
-                                        .right(px(0.))
-                                        .bottom(px(0.))
-                                        .left(px(0.))
-                                        .flex()
-                                        .flex_col()
-                                        .items_center()
-                                        .justify_center()
-                                        .gap_3()
-                                        .bg(rgb(0x111318))
-                                        .child(div().text_base().child("No sessions"))
-                                        .child(
-                                            Button::new("start-first-session")
-                                                .label("Start a session")
-                                                .on_click(cx.listener(Self::new_session)),
-                                        ),
-                                )
-                            })
-                            .when(self.rename_dialog.is_some(), |element| {
-                                element.child(self.render_rename_dialog(cx))
-                            })
-                            .when(self.source_dialog.is_some(), |element| {
-                                element.child(self.render_source_dialog(cx))
-                            })
-                            .when(self.settings_open, |element| {
-                                element.child(self.render_settings_dialog(cx))
-                            })
-                            .when(self.about_open, |element| {
-                                element.child(self.render_about_dialog(cx))
-                            })
-                            .when(
-                                self.providers_open && self.github_login.is_none(),
-                                |element| element.child(self.render_providers_dialog(cx)),
-                            )
-                            .when(self.github_login.is_some(), |element| {
-                                element.child(self.render_github_login_dialog(cx))
-                            }),
-                    )
+                    .child(panel_layout)
                     .when(layout.phone && self.session_drawer_open, |row| {
                         row.child(
                             div()
@@ -8760,7 +9256,8 @@ impl Render for LoomView {
                         )
                     })
                     .when(
-                        self.review.open
+                        layout.phone
+                            && self.review.open
                             && !self.sessions.is_empty()
                             && !self.settings_open
                             && !self.about_open
@@ -8873,6 +9370,40 @@ impl Render for LoomView {
                 }),
         }
         .into_any()
+    }
+}
+
+#[cfg(test)]
+mod review_path_tests {
+    use super::belongs_to_repository;
+    use loom_core::{RepositoryId, Timestamp};
+    use loom_protocol::SessionRepository;
+
+    #[test]
+    fn mounted_repository_activity_does_not_appear_as_other_workspace_files() {
+        let repositories = ["repositories/first-id", "sources/local/second-id"]
+            .into_iter()
+            .map(|path| SessionRepository {
+                id: RepositoryId::new(),
+                source: "/code/project".to_owned(),
+                path: path.to_owned(),
+                revision: None,
+                attached_at: Timestamp::from_unix_millis(0),
+            })
+            .collect::<Vec<_>>();
+        assert!(belongs_to_repository(
+            "repositories/first-id/src/lib.rs",
+            &repositories
+        ));
+        assert!(belongs_to_repository(
+            "sources/local/second-id/README.md",
+            &repositories
+        ));
+        assert!(!belongs_to_repository(
+            "repositories/first-id-extra/file",
+            &repositories
+        ));
+        assert!(!belongs_to_repository("notes/todo.md", &repositories));
     }
 }
 
@@ -9002,7 +9533,9 @@ mod responsive_layout_tests {
         let layout = responsive_layout(px(960.));
         assert!(!layout.phone);
         assert_eq!(layout.sidebar_width, FULL_SIDEBAR_WIDTH);
-        assert_eq!(layout.review_width, FULL_REVIEW_WIDTH);
+        assert_eq!(layout.review_width, px(430.));
+        let wide_layout = responsive_layout(px(1400.));
+        assert_eq!(wide_layout.review_width, FULL_REVIEW_WIDTH);
     }
 
     #[test]

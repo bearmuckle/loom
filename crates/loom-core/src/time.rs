@@ -1,3 +1,4 @@
+#[cfg(not(target_family = "wasm"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -16,9 +17,21 @@ impl Timestamp {
     }
 
     pub fn now() -> Self {
-        let duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock is before the Unix epoch");
-        Self(duration.as_millis().try_into().unwrap_or(u64::MAX))
+        #[cfg(target_family = "wasm")]
+        {
+            let millis = js_sys::Date::now();
+            return Self(if millis.is_finite() && millis > 0. {
+                millis as u64
+            } else {
+                0
+            });
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let duration = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before the Unix epoch");
+            Self(duration.as_millis().try_into().unwrap_or(u64::MAX))
+        }
     }
 }
