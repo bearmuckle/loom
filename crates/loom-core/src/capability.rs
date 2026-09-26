@@ -11,6 +11,7 @@ pub enum Capability {
     SubscribeSessionEvents,
     StartAgentRun,
     ReadAgentRun,
+    ReadAgentRunMessages,
     ControlAgentRun,
     PauseAgentRun,
     ResumeAgentRun,

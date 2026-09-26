@@ -426,9 +426,13 @@ Implement in this order:
    assistant fragments and exposes bounded keyset pages and byte-range reads.
    Completed content is stored as immutable 256 KiB chunks, so a bounded range
    read decodes only the chunks intersecting that range. Protocol-level
-   conversation paging, batching fragments at the intended flush thresholds,
-   migration of tools and activities, and canonical context loading remain to
-   be completed.
+   conversation paging and content ranges use protocol 3.0's separately
+   negotiated `read_agent_run_messages` capability. Native and browser clients
+   share these request/response types through the common client transport; this
+   adds an API surface, not a new transcript UI. Protocol 2.x peers are rejected
+   at negotiation; no legacy protocol adapter is in scope.
+   Batching fragments at the intended flush thresholds, migration of tools and
+   activities, and canonical context loading remain to be completed.
 3. Move execution, approvals, idempotency, and publication to transactional domain
    commands. Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.

@@ -31,8 +31,9 @@ const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
 const MAX_MESSAGE_FRAGMENT_BYTES: usize = 32 * 1024;
-const MAX_CONTENT_RANGE_BYTES: usize = 256 * 1024;
-const MAX_RUN_MESSAGE_PAGE_SIZE: usize = 100;
+const MAX_CONTENT_RANGE_BYTES: usize =
+    loom_protocol::MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES as usize;
+const MAX_RUN_MESSAGE_PAGE_SIZE: usize = loom_protocol::MAX_AGENT_RUN_MESSAGE_PAGE_SIZE as usize;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DURABLE_FEED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
@@ -5407,6 +5408,7 @@ mod tests {
             usage: UsageSnapshot::default(),
         };
         let run_summaries = BTreeMap::from([(run_id, summary)]);
+        let large_content = "0123456789".repeat(60_000);
         let run_messages = BTreeMap::from([(
             run_id,
             vec![
@@ -5433,7 +5435,7 @@ mod tests {
                 },
                 DurableRunMessage {
                     role: loom_model::MessageRole::User,
-                    content: "0123456789".repeat(60_000),
+                    content: large_content.clone(),
                     name: None,
                     tool_call_id: None,
                     tool_calls: Vec::new(),
@@ -5486,6 +5488,12 @@ mod tests {
                 .unwrap(),
             b"1234567890"
         );
+        assert!(
+            persistence
+                .load_run_message_content_range(run_id, 3, 0, 0)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             persistence.load_run_messages(run_id).unwrap()[1].content,
             "seedhello world"
@@ -5533,6 +5541,10 @@ mod tests {
         assert_eq!(
             persistence.load_run_messages(run_id).unwrap()[2].content,
             "partial"
+        );
+        assert_eq!(
+            persistence.load_run_messages(run_id).unwrap()[3].content,
+            large_content
         );
         assert_eq!(
             persistence
@@ -5726,7 +5738,27 @@ mod tests {
             content_range_plan.contains("content_hash=? AND byte_offset<?"),
             "{content_range_plan}"
         );
+        let large_content_hash: Vec<u8> = connection
+            .query_row(
+                "SELECT content_hash FROM run_messages WHERE run_id=?1 AND ordinal=3",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM content_parts WHERE content_hash=?1 AND ordinal=1",
+                [large_content_hash],
+            )
+            .unwrap();
         drop(connection);
+        assert_eq!(
+            persistence
+                .load_run_message_content_range(run_id, 3, CONTENT_PART_BYTES as u64 + 1, 8)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
         fs::remove_file(path).unwrap();
     }
 

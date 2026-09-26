@@ -24,9 +24,10 @@ use loom_persistence::{
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
-    AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
-    ClientRequest, GitHubCopilotLoginStatus, GitHubRepository, NegotiationResult, RequestEnvelope,
-    ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionDirectory,
+    AgentRunMessageHeader, AgentRunSnapshotProjection, AgentSessionSnapshotProjection,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, GitHubCopilotLoginStatus, GitHubRepository,
+    MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, NegotiationResult,
+    RequestEnvelope, ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionDirectory,
     SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
     WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, unsupported_version_error,
 };
@@ -1339,6 +1340,7 @@ impl InProcessBackend {
                 Capability::SubscribeSessionEvents,
                 Capability::StartAgentRun,
                 Capability::ReadAgentRun,
+                Capability::ReadAgentRunMessages,
                 Capability::ControlAgentRun,
                 Capability::PauseAgentRun,
                 Capability::ResumeAgentRun,
@@ -2426,6 +2428,110 @@ impl InProcessConnection {
             .ok_or_else(|| LoomError::not_found("agent run", run_id))
     }
 
+    fn run_message_page(
+        &self,
+        run_id: loom_core::RunId,
+        before_ordinal: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<AgentRunMessageHeader>> {
+        if !(1..=MAX_AGENT_RUN_MESSAGE_PAGE_SIZE).contains(&limit) {
+            return Err(LoomError::invalid_request(format!(
+                "run message page size must be between 1 and {MAX_AGENT_RUN_MESSAGE_PAGE_SIZE}"
+            )));
+        }
+        if let Some(persistence) = &self.backend.persistence {
+            return persistence
+                .load_run_message_page(run_id, before_ordinal, limit as usize)
+                .map(|messages| {
+                    messages
+                        .into_iter()
+                        .map(|message| AgentRunMessageHeader {
+                            ordinal: message.ordinal,
+                            role: message.role,
+                            content_bytes: message.content_bytes,
+                            name: message.name,
+                            tool_call_id: message.tool_call_id,
+                            tool_calls: message.tool_calls,
+                        })
+                        .collect()
+                });
+        }
+
+        let state = self.run_handle(run_id)?.state();
+        let end = before_ordinal
+            .and_then(|ordinal| usize::try_from(ordinal).ok())
+            .unwrap_or(state.messages.len())
+            .min(state.messages.len());
+        let start = end.saturating_sub(limit as usize);
+        state.messages[start..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(relative_ordinal, message)| {
+                let ordinal = start + relative_ordinal;
+                Ok(AgentRunMessageHeader {
+                    ordinal: u64::try_from(ordinal).map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            "run message ordinal is out of range",
+                            false,
+                        )
+                    })?,
+                    role: message.role,
+                    content_bytes: u64::try_from(message.content.len()).map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            "run message content size is out of range",
+                            false,
+                        )
+                    })?,
+                    name: message.name.clone(),
+                    tool_call_id: message.tool_call_id,
+                    tool_calls: message.tool_calls.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn run_message_content_range(
+        &self,
+        run_id: loom_core::RunId,
+        message_ordinal: u64,
+        byte_offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>> {
+        if length > MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES {
+            return Err(LoomError::invalid_request(format!(
+                "message content range exceeds {MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES} bytes"
+            )));
+        }
+        if let Some(persistence) = &self.backend.persistence {
+            return persistence.load_run_message_content_range(
+                run_id,
+                message_ordinal,
+                byte_offset,
+                length as usize,
+            );
+        }
+
+        let state = self.run_handle(run_id)?.state();
+        let ordinal = usize::try_from(message_ordinal)
+            .map_err(|_| LoomError::invalid_request("message ordinal is out of range"))?;
+        let message = state
+            .messages
+            .get(ordinal)
+            .ok_or_else(|| LoomError::not_found("run message", message_ordinal))?;
+        let start = usize::try_from(byte_offset)
+            .map_err(|_| LoomError::invalid_request("message byte offset is out of range"))?;
+        if start >= message.content.len() {
+            return Ok(Vec::new());
+        }
+        let end = start
+            .saturating_add(length as usize)
+            .min(message.content.len());
+        Ok(message.content.as_bytes()[start..end].to_vec())
+    }
+
     fn load_persisted_run_state(&self, summary: &PersistedRunSummary) -> Result<AgentRuntimeState> {
         let persistence = self
             .backend
@@ -3391,6 +3497,30 @@ impl InProcessConnection {
             ClientRequest::GetAgentRun { run_id } => {
                 Ok(ServerResponse::AgentRun(self.run_summary(run_id)?.snapshot))
             }
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal,
+                limit,
+            } => Ok(ServerResponse::AgentRunMessagePage {
+                run_id,
+                messages: self.run_message_page(run_id, before_ordinal, limit)?,
+            }),
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal,
+                byte_offset,
+                length,
+            } => Ok(ServerResponse::AgentRunMessageContentRange {
+                run_id,
+                message_ordinal,
+                byte_offset,
+                content: self.run_message_content_range(
+                    run_id,
+                    message_ordinal,
+                    byte_offset,
+                    length,
+                )?,
+            }),
             ClientRequest::GetAgentRunSnapshot { run_id } => Ok(ServerResponse::AgentRunSnapshot(
                 self.run_snapshot_projection(run_id)?,
             )),
@@ -4280,6 +4410,14 @@ impl InProcessConnection {
             } => session_id = Some(*requested_session),
             ClientRequest::GetAgentRun {
                 run_id: requested_run,
+            }
+            | ClientRequest::GetAgentRunMessagePage {
+                run_id: requested_run,
+                ..
+            }
+            | ClientRequest::GetAgentRunMessageContentRange {
+                run_id: requested_run,
+                ..
             }
             | ClientRequest::GetAgentRunSnapshot {
                 run_id: requested_run,
@@ -6006,6 +6144,89 @@ mod tests {
             panic!("unexpected response");
         };
         assert_eq!(snapshot.state, AgentRunState::Completed);
+        let page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: 2,
+            },
+        ));
+        let ServerResponse::AgentRunMessagePage { messages, .. } = page.result.unwrap() else {
+            panic!("unexpected run message page response");
+        };
+        let oldest_ordinal = messages.last().unwrap().ordinal;
+        let previous_page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: Some(oldest_ordinal),
+                limit: 1,
+            },
+        ));
+        let ServerResponse::AgentRunMessagePage {
+            messages: previous_messages,
+            ..
+        } = previous_page.result.unwrap()
+        else {
+            panic!("unexpected previous run message page response");
+        };
+        assert!(
+            previous_messages
+                .iter()
+                .all(|message| message.ordinal < oldest_ordinal)
+        );
+        let header = messages
+            .iter()
+            .find(|message| message.content_bytes > 0)
+            .unwrap();
+        let length = header.content_bytes.min(32) as u32;
+        let content = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: header.ordinal,
+                byte_offset: 0,
+                length,
+            },
+        ));
+        let ServerResponse::AgentRunMessageContentRange { content, .. } = content.result.unwrap()
+        else {
+            panic!("unexpected run message content response");
+        };
+        assert_eq!(content.len(), length as usize);
+        let beyond_content = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: header.ordinal,
+                byte_offset: u64::MAX,
+                length: 8,
+            },
+        ));
+        assert!(matches!(
+            beyond_content.result,
+            Ok(ServerResponse::AgentRunMessageContentRange { content, .. }) if content.is_empty()
+        ));
+        let missing_message = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: oldest_ordinal + 1000,
+                byte_offset: 0,
+                length: 8,
+            },
+        ));
+        assert_eq!(
+            missing_message.result.unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        let empty_page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: Some(0),
+                limit: 1,
+            },
+        ));
+        assert!(matches!(
+            empty_page.result,
+            Ok(ServerResponse::AgentRunMessagePage { messages, .. }) if messages.is_empty()
+        ));
         let history = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: None,
@@ -6513,6 +6734,119 @@ mod tests {
                 .activities
                 .iter()
                 .any(|activity| activity.status == AgentActivityStatus::AwaitingApproval)
+        );
+        let page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
+            },
+        ));
+        let ServerResponse::AgentRunMessagePage {
+            run_id: page_run_id,
+            messages,
+        } = page.result.unwrap()
+        else {
+            panic!("unexpected run message page response");
+        };
+        assert_eq!(page_run_id, run_id);
+        assert!(!messages.is_empty());
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| pair[0].ordinal > pair[1].ordinal),
+            "message page must be in descending keyset order"
+        );
+        let oversized_page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE + 1,
+            },
+        ));
+        assert_eq!(
+            oversized_page.result.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let message_header = messages
+            .iter()
+            .find(|message| message.content_bytes > 0)
+            .unwrap();
+        let range = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: message_header.ordinal,
+                byte_offset: 0,
+                length: message_header.content_bytes.min(32) as u32,
+            },
+        ));
+        let ServerResponse::AgentRunMessageContentRange {
+            run_id: range_run_id,
+            message_ordinal,
+            byte_offset,
+            content,
+        } = range.result.unwrap()
+        else {
+            panic!("unexpected run message content response");
+        };
+        assert_eq!(range_run_id, run_id);
+        assert_eq!(message_ordinal, message_header.ordinal);
+        assert_eq!(byte_offset, 0);
+        assert!(!content.is_empty());
+        let expected_content = projection.messages[message_ordinal as usize]
+            .content
+            .as_bytes();
+        assert_eq!(content, expected_content[..content.len()]);
+        let oversized_range = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal,
+                byte_offset: 0,
+                length: MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES + 1,
+            },
+        ));
+        assert_eq!(
+            oversized_range.result.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let legacy_connection = backend.connect();
+        let legacy_negotiation =
+            legacy_connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+                client_version: ProtocolVersion::new(2, 0),
+                capabilities: backend.supported_capabilities.clone(),
+            }));
+        assert_eq!(
+            legacy_negotiation.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
+
+        let capability_limited_connection = backend.connect();
+        let capability_limited = CapabilitySet::new(
+            backend
+                .supported_capabilities
+                .iter()
+                .copied()
+                .filter(|capability| *capability != Capability::ReadAgentRunMessages),
+        );
+        let current_negotiation =
+            capability_limited_connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: capability_limited,
+            }));
+        assert!(matches!(
+            current_negotiation.result,
+            Ok(ServerResponse::Negotiated(_))
+        ));
+        let unsupported_page = capability_limited_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
+            },
+        ));
+        assert_eq!(
+            unsupported_page.result.unwrap_err().code,
+            ErrorCode::CapabilityDenied
         );
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),

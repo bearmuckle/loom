@@ -333,7 +333,7 @@ fn m3_run_options_provider_and_context_contracts_round_trip() {
 #[test]
 fn capability_discovery_accepts_current_major_and_rejects_old_major() {
     let request = RequestEnvelope::with_version(
-        ProtocolVersion::new(2, 0),
+        ProtocolVersion::new(3, 0),
         ClientRequest::DiscoverCapabilities,
     );
     assert_eq!(
@@ -345,6 +345,7 @@ fn capability_discovery_accepts_current_major_and_rejects_old_major() {
             .protocol_version
             .is_compatible_with(CURRENT_PROTOCOL_VERSION)
     );
+    assert!(!ProtocolVersion::new(2, 9).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(1, 7).is_compatible_with(CURRENT_PROTOCOL_VERSION));
 }
 

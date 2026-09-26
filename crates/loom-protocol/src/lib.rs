@@ -47,7 +47,9 @@ pub use workspace::{
     WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(3, 0);
+pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
+pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerNodeResources {
@@ -98,6 +100,16 @@ pub struct AgentRunSnapshotProjection {
     pub usage: UsageSnapshot,
     #[serde(default)]
     pub activities: Vec<AgentActivityRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentRunMessageHeader {
+    pub ordinal: u64,
+    pub role: loom_model::MessageRole,
+    pub content_bytes: u64,
+    pub name: Option<String>,
+    pub tool_call_id: Option<loom_core::ToolCallId>,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -360,6 +372,17 @@ pub enum ClientRequest {
     GetAgentRun {
         run_id: RunId,
     },
+    GetAgentRunMessagePage {
+        run_id: RunId,
+        before_ordinal: Option<u64>,
+        limit: u32,
+    },
+    GetAgentRunMessageContentRange {
+        run_id: RunId,
+        message_ordinal: u64,
+        byte_offset: u64,
+        length: u32,
+    },
     GetAgentRunSnapshot {
         run_id: RunId,
     },
@@ -492,6 +515,9 @@ impl ClientRequest {
             }
             Self::GetAgentRun { .. } | Self::GetAgentRunSnapshot { .. } => {
                 Some(Capability::ReadAgentRun)
+            }
+            Self::GetAgentRunMessagePage { .. } | Self::GetAgentRunMessageContentRange { .. } => {
+                Some(Capability::ReadAgentRunMessages)
             }
             Self::GetRunCheckpoint { .. } => Some(Capability::ReadAgentRun),
             Self::ApproveAgentAction { .. } | Self::RejectAgentAction { .. } => {
@@ -630,6 +656,16 @@ pub enum ServerResponse {
     AgentRunStarted(AgentRunSnapshot),
     AgentRun(AgentRunSnapshot),
     AgentRunSnapshot(AgentRunSnapshotProjection),
+    AgentRunMessagePage {
+        run_id: RunId,
+        messages: Vec<AgentRunMessageHeader>,
+    },
+    AgentRunMessageContentRange {
+        run_id: RunId,
+        message_ordinal: u64,
+        byte_offset: u64,
+        content: Vec<u8>,
+    },
     RunCheckpoint(Checkpoint),
     SessionEvents {
         events: Vec<ServerEventEnvelope>,
@@ -896,4 +932,74 @@ pub fn unsupported_version_error(requested: ProtocolVersion) -> LoomError {
         CURRENT_PROTOCOL_VERSION.major,
         CURRENT_PROTOCOL_VERSION.minor
     ))
+}
+
+#[cfg(test)]
+mod run_message_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn transcript_page_and_range_frames_round_trip_with_their_capability() {
+        let run_id = RunId::new();
+        let page_request = ClientRequest::GetAgentRunMessagePage {
+            run_id,
+            before_ordinal: Some(12),
+            limit: 32,
+        };
+        assert_eq!(
+            page_request.required_capability(),
+            Some(Capability::ReadAgentRunMessages)
+        );
+        assert_eq!(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: 12,
+                byte_offset: 0,
+                length: 1,
+            }
+            .required_capability(),
+            Some(Capability::ReadAgentRunMessages)
+        );
+        let encoded = encode_request(&RequestEnvelope::new(page_request)).unwrap();
+        let decoded = decode_request(&encoded).unwrap();
+        assert_eq!(
+            decoded.request,
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: Some(12),
+                limit: 32
+            }
+        );
+
+        let page_response = ResponseEnvelope::success(
+            RequestId::new(),
+            ServerResponse::AgentRunMessagePage {
+                run_id,
+                messages: vec![AgentRunMessageHeader {
+                    ordinal: 11,
+                    role: loom_model::MessageRole::Assistant,
+                    content_bytes: 18,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                }],
+            },
+        );
+        assert_eq!(
+            decode_response(&encode_response(&page_response).unwrap()).unwrap(),
+            page_response
+        );
+
+        let response = ResponseEnvelope::success(
+            RequestId::new(),
+            ServerResponse::AgentRunMessageContentRange {
+                run_id,
+                message_ordinal: 12,
+                byte_offset: 256,
+                content: b"bounded transcript".to_vec(),
+            },
+        );
+        let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+        assert_eq!(decoded, response);
+    }
 }
