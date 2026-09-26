@@ -11,6 +11,7 @@ use gpui_kit::TestSupportExt as _;
 use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::base::{Disableable, SelectableText, TextSelectionLayer};
 use gpui_kit::component::button::{Button, ButtonVariants};
+use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{
     Input as KitInput, InputEvent, InputState, Textarea, TextareaState,
 };
@@ -1165,6 +1166,8 @@ pub(crate) struct LoomView {
     session_drawer_open: bool,
     pub(crate) rename_dialog: Option<RenameDialogState>,
     source_dialog: Option<SessionSourceDialog>,
+    #[cfg(target_family = "wasm")]
+    welcome_dialog_dismissed: bool,
     pub(crate) demo_workspace: bool,
     pub(crate) login_enabled: bool,
     pub(crate) github_connected: bool,
@@ -1502,6 +1505,8 @@ impl LoomView {
             session_drawer_open: false,
             rename_dialog: None,
             source_dialog: None,
+            #[cfg(target_family = "wasm")]
+            welcome_dialog_dismissed: false,
             demo_workspace: false,
             login_enabled: false,
             github_connected: false,
@@ -1846,6 +1851,8 @@ impl LoomView {
             session_drawer_open: false,
             rename_dialog: None,
             source_dialog: None,
+            #[cfg(target_family = "wasm")]
+            welcome_dialog_dismissed: false,
             demo_workspace,
             login_enabled: true,
             github_connected: false,
@@ -2008,6 +2015,8 @@ impl LoomView {
             session_drawer_open: false,
             rename_dialog: None,
             source_dialog: None,
+            #[cfg(target_family = "wasm")]
+            welcome_dialog_dismissed: false,
             demo_workspace: demo_mode,
             login_enabled: false,
             github_connected: false,
@@ -2210,6 +2219,8 @@ impl LoomView {
             session_drawer_open: false,
             rename_dialog: None,
             source_dialog: None,
+            #[cfg(target_family = "wasm")]
+            welcome_dialog_dismissed: false,
             demo_workspace: false,
             login_enabled: true,
             github_connected: false,
@@ -7281,6 +7292,7 @@ impl LoomView {
             })
             .child(
                 div()
+                    .id("session-source-dialog")
                     .w_full()
                     .min_h(px(46.))
                     .p_3()
@@ -7598,133 +7610,116 @@ impl LoomView {
             );
         }
 
-        div()
-            .id("session-source-dialog")
-            .absolute()
-            .top(px(80.))
-            .left(px(220.))
+        Dialog::new(cx)
+            .title(if is_start {
+                "Start a session"
+            } else {
+                "Add to this session"
+            })
+            .on_close(cx.listener(|this, _, _, cx| {
+                this.source_dialog = None;
+                cx.notify();
+            }))
+            .keyboard(false)
+            .overlay_closable(false)
             .w(px(560.))
             .max_h(px(600.))
-            .overflow_y_scroll()
-            .p_4()
-            .rounded_lg()
-            .bg(rgb(0x1b1d24))
-            .border_1()
-            .border_color(rgb(0x3b4555))
-            .shadow_lg()
             .text_color(rgb(0xe5e7eb))
             .child(
                 div()
-                    .text_sm()
-                    .text_color(rgb(0xf3f4f6))
-                    .child(if is_start {
-                        "Start a session"
-                    } else {
-                        "Add to this session"
-                    }),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_xs()
-                    .text_color(rgb(0x8f98a6))
-                    .child(if is_start {
-                        "Choose what the new session starts with."
-                    } else {
-                        "Choose a repository or folder to add to the active session."
-                    }),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .flex()
-                    .gap_1()
-                    .when(is_start, |row| {
-                        row.child(
-                            Button::new("source-empty")
-                                .label("Empty session")
-                                .small()
-                                .when(dialog.choice == SessionSourceChoice::Empty, |button| {
-                                    button.primary()
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.choose_source(SessionSourceChoice::Empty, cx)
-                                })),
-                        )
-                    })
-                    .when(dialog.local_directory_available, |row| {
-                        row.child(
-                            Button::new("source-local-directory")
-                                .label("Local folder")
-                                .small()
-                                .when(
-                                    dialog.choice == SessionSourceChoice::LocalDirectory,
-                                    |button| button.primary(),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.choose_source(SessionSourceChoice::LocalDirectory, cx)
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("source-github")
-                            .label("GitHub repository")
-                            .small()
-                            .when(dialog.choice == SessionSourceChoice::GitHub, |button| {
-                                button.primary()
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.choose_source(SessionSourceChoice::GitHub, cx)
-                            })),
-                    ),
-            )
-            .child(dialog_body)
-            .child(
-                div()
-                    .mt_3()
-                    .flex()
-                    .justify_end()
-                    .gap_1()
+                    .w_full()
+                    .overflow_y_scrollbar()
                     .child(
                         div()
-                            .id("cancel-session-source")
-                            .test_support()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(0x242833))
-                            .hover(|style| style.bg(rgb(0x293244)))
-                            .text_sm()
-                            .cursor_pointer()
-                            .child("Cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.source_dialog = None;
-                                cx.notify();
-                            })),
+                            .text_xs()
+                            .text_color(rgb(0x8f98a6))
+                            .child(if is_start {
+                                "Choose what the new session starts with."
+                            } else {
+                                "Choose a repository or folder to add to the active session."
+                            }),
                     )
                     .child(
                         div()
-                            .id("confirm-session-source")
-                            .test_support()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(0x2563eb))
-                            .text_sm()
-                            .text_color(rgb(0xffffff))
-                            .cursor_pointer()
-                            .child(if is_start {
-                                "Start session"
-                            } else {
-                                "Add to session"
+                            .mt_3()
+                            .flex()
+                            .gap_1()
+                            .when(is_start, |row| {
+                                row.child(
+                                    Button::new("source-empty")
+                                        .label("Empty session")
+                                        .small()
+                                        .when(
+                                            dialog.choice == SessionSourceChoice::Empty,
+                                            |button| button.primary(),
+                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.choose_source(SessionSourceChoice::Empty, cx)
+                                        })),
+                                )
                             })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.confirm_source_dialog(cx);
-                                cx.notify();
-                            })),
+                            .when(dialog.local_directory_available, |row| {
+                                row.child(
+                                    Button::new("source-local-directory")
+                                        .label("Local folder")
+                                        .small()
+                                        .when(
+                                            dialog.choice == SessionSourceChoice::LocalDirectory,
+                                            |button| button.primary(),
+                                        )
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.choose_source(
+                                                SessionSourceChoice::LocalDirectory,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                            })
+                            .child(
+                                Button::new("source-github")
+                                    .label("GitHub repository")
+                                    .small()
+                                    .when(dialog.choice == SessionSourceChoice::GitHub, |button| {
+                                        button.primary()
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.choose_source(SessionSourceChoice::GitHub, cx)
+                                    })),
+                            ),
+                    )
+                    .child(dialog_body)
+                    .child(
+                        div()
+                            .mt_3()
+                            .flex()
+                            .justify_end()
+                            .gap_1()
+                            .child(
+                                Button::new("cancel-session-source")
+                                    .label("Cancel")
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.source_dialog = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("confirm-session-source")
+                                    .label(if is_start {
+                                        "Start session"
+                                    } else {
+                                        "Add to session"
+                                    })
+                                    .small()
+                                    .primary()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_source_dialog(cx);
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
-            .into_any()
+            .into_any_element()
     }
 
     pub(crate) fn render_github_login_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -8654,6 +8649,7 @@ impl LoomView {
     }
 
     #[cfg(target_family = "wasm")]
+    #[cfg(target_family = "wasm")]
     fn render_disconnected(&self, window: &Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let layout = responsive_layout(window.bounds().size.width);
         div()
@@ -8681,66 +8677,59 @@ impl LoomView {
                     .flex()
                     .relative()
                     .overflow_hidden()
-                    .when(!layout.phone, |row| row.child(
-                        div()
-                            .w(layout.sidebar_width)
-                            .h_full()
-                            .p_2()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .bg(rgb(0x17191f))
-                            .border_r_1()
-                            .border_color(rgb(0x30343f))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .text_color(rgb(0xf3f4f6))
-                                            .child("Sessions"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(rgb(0x8f98a6))
-                                    .child("Sessions"),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .p_3()
-                                    .rounded_lg()
-                                    .bg(rgb(0x111318))
-                                    .border_1()
-                                    .border_color(rgb(0x293244))
-                                    .text_sm()
-                                    .text_color(rgb(0x64748b))
-                                    .child("Connect a worker to load sessions."),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_end()
-                                    .border_t_1()
-                                    .border_color(rgb(0x30343f))
-                                    .pt_2()
-                                    .child(
-                                        Button::new("disconnected-settings")
-                                            .icon(Icon::new(IconName::Settings))
-                                            .ghost()
-                                            .xsmall()
-                                            .on_click(cx.listener(|view, _, _, cx| {
-                                                view.open_settings_from_menu(cx);
-                                            })),
-                                    ),
-                            ),
-                    ))
+                    .when(!layout.phone, |row| {
+                        row.child(
+                            div()
+                                .w(layout.sidebar_width)
+                                .h_full()
+                                .p_2()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .bg(rgb(0x17191f))
+                                .border_r_1()
+                                .border_color(rgb(0x30343f))
+                                .child(div().flex().items_center().justify_between().child(
+                                    div().text_sm().text_color(rgb(0xf3f4f6)).child("Sessions"),
+                                ))
+                                .child(
+                                    div()
+                                        .mt_1()
+                                        .text_xs()
+                                        .text_color(rgb(0x8f98a6))
+                                        .child("Sessions"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .p_3()
+                                        .rounded_lg()
+                                        .bg(rgb(0x111318))
+                                        .border_1()
+                                        .border_color(rgb(0x293244))
+                                        .text_sm()
+                                        .text_color(rgb(0x64748b))
+                                        .child("Connect a worker to load sessions."),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .border_t_1()
+                                        .border_color(rgb(0x30343f))
+                                        .pt_2()
+                                        .child(
+                                            Button::new("disconnected-settings")
+                                                .icon(Icon::new(IconName::Settings))
+                                                .ghost()
+                                                .xsmall()
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    view.open_settings_from_menu(cx);
+                                                })),
+                                        ),
+                                ),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -8760,16 +8749,12 @@ impl LoomView {
                                     .border_b_1()
                                     .border_color(rgb(0x30343f))
                                     .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .child("No worker connected")
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(0x8f98a6))
-                                                    .child("Connect a worker in Settings to begin."),
-                                            ),
+                                        div().flex().flex_col().child("No worker connected").child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(0x8f98a6))
+                                                .child("Connect a worker in Settings to begin."),
+                                        ),
                                     )
                                     .child(
                                         Button::new("disconnected-open-settings")
@@ -8781,45 +8766,7 @@ impl LoomView {
                                             })),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        div()
-                                            .max_w(px(460.))
-                                            .p_6()
-                                            .rounded_lg()
-                                            .bg(rgb(0x171c25))
-                                            .border_1()
-                                            .border_color(rgb(0x293244))
-                                            .child(
-                                                div()
-                                                    .text_base()
-                                                    .text_color(rgb(0xf3f4f6))
-                                                    .child("You’re ready to go"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .mt_2()
-                                                    .text_sm()
-                                                    .text_color(rgb(0x8f98a6))
-                                                    .child("Connect a Loom worker from Settings to load your sessions and models."),
-                                            )
-                                            .child(
-                                                Button::new("disconnected-connect-worker")
-                                                    .label("Open Settings")
-                                                    .small()
-                                                    .on_click(cx.listener(
-                                                        |view, _, _, cx| {
-                                                            view.open_settings_from_menu(cx);
-                                                        },
-                                                    )),
-                                            ),
-                                    ),
-                            )
+                            .child(div().flex_1().flex().items_center().justify_center())
                             .child(
                                 div()
                                     .px_4()
@@ -8856,6 +8803,33 @@ impl LoomView {
                     .text_xs()
                     .text_color(rgb(0x8f98a6))
                     .child("Not connected  ·  Connect a worker in Settings"),
+            )
+            .when(
+                !self.settings_open && !self.welcome_dialog_dismissed,
+                |element| {
+                    element.child(
+                    Dialog::new(cx)
+                        .title("You’re ready to go")
+                        .on_close(cx.listener(|view, _, _, cx| {
+                            view.welcome_dialog_dismissed = true;
+                            cx.notify();
+                        }))
+                        .keyboard(false)
+                        .overlay_closable(false)
+                        .w(px(460.))
+                        .child(div().text_sm().text_color(rgb(0x8f98a6)).child(
+                            "Connect a Loom worker from Settings to load your sessions and models.",
+                        ))
+                        .child(
+                            Button::new("disconnected-connect-worker")
+                                .label("Open Settings")
+                                .small()
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.open_settings_from_menu(cx);
+                                })),
+                        ),
+                )
+                },
             )
             .into_any()
     }
@@ -9292,9 +9266,6 @@ impl Render for LoomView {
             .when(self.rename_dialog.is_some(), |element| {
                 element.child(self.render_rename_dialog(cx))
             })
-            .when(self.source_dialog.is_some(), |element| {
-                element.child(self.render_source_dialog(cx))
-            })
             .when(self.settings_open, |element| {
                 element.child(self.render_settings_dialog(cx))
             })
@@ -9329,6 +9300,9 @@ impl Render for LoomView {
             // Initializes the per-frame selection registry before selectable
             // text participants prepaint and register themselves.
             .child(TextSelectionLayer)
+            .when(self.source_dialog.is_some(), |element| {
+                element.child(self.render_source_dialog(cx))
+            })
             .child(
                 div()
                     .h(px(30.))
@@ -9978,10 +9952,13 @@ mod loom_view_render_tests {
         window_size: gpui_kit::Size<gpui_kit::Pixels>,
         configure: impl FnOnce(&mut LoomView),
     ) {
-        let handle = cx.open_window(window_size, |_, cx| {
-            let mut view = LoomView::new_for_test(cx.focus_handle());
-            configure(&mut view);
-            view
+        let handle = cx.open_window(window_size, |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = LoomView::new_for_test(cx.focus_handle());
+                configure(&mut view);
+                view
+            });
+            gpui_kit::component::Root::new(view, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
             .unwrap();
@@ -10339,35 +10316,34 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
-    fn session_source_dialog_choices_and_cancel_are_clickable(cx: &mut TestAppContext) {
+    fn session_source_dialog_choices_and_close_button_work(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
-            LoomView::new_for_test(cx.focus_handle())
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = LoomView::new_for_test(cx.focus_handle());
+                view.source_dialog = Some(SessionSourceDialog {
+                    purpose: SessionSourceDialogPurpose::StartSession,
+                    choice: SessionSourceChoice::Empty,
+                    local_directory_available: true,
+                    filter_subscription: None,
+                    repositories: Vec::new(),
+                    selected_repository: None,
+                    repositories_loading: false,
+                    error: None,
+                });
+                view
+            });
+            gpui_kit::component::Root::new(view, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            window.click("start-first-session", cx);
             window.render_frame(cx);
-            assert!(
-                window
-                    .within("session-source-dialog")
-                    .find("source-empty")
-                    .visible()
-            );
-            window
-                .within("session-source-dialog")
-                .click("source-empty", cx);
-            window
-                .within("session-source-dialog")
-                .click("source-local-directory", cx);
-            window
-                .within("session-source-dialog")
-                .click("source-github", cx);
-            window
-                .within("session-source-dialog")
-                .click("cancel-session-source", cx);
+            assert!(window.find("source-local-directory").visible());
+            window.click("source-local-directory", cx);
+            window.click("source-github", cx);
+            window.click("close", cx);
             window.render_frame(cx);
-            assert!(window.try_find("session-source-dialog").is_none());
+            assert!(window.try_find("source-local-directory").is_none());
         })
         .unwrap();
     }
@@ -10377,43 +10353,46 @@ mod loom_view_render_tests {
         cx: &mut TestAppContext,
     ) {
         cx.update(gpui_kit::init);
-        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
-            let mut view = LoomView::new_for_test(cx.focus_handle());
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = LoomView::new_for_test(cx.focus_handle());
 
-            view.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
-            view.choose_source(SessionSourceChoice::LocalDirectory, cx);
-            view.confirm_source_dialog(cx);
-            assert!(view.source_dialog.is_some());
-            assert!(
-                view.timeline
-                    .iter()
-                    .any(|item| matches!(item, TimelineItem::Status(_)))
-            );
+                view.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
+                view.choose_source(SessionSourceChoice::LocalDirectory, cx);
+                view.confirm_source_dialog(cx);
+                assert!(view.source_dialog.is_some());
+                assert!(
+                    view.timeline
+                        .iter()
+                        .any(|item| matches!(item, TimelineItem::Status(_)))
+                );
 
-            view.choose_source(SessionSourceChoice::GitHub, cx);
-            view.choose_source(SessionSourceChoice::Empty, cx);
-            view.confirm_source_dialog(cx);
-            assert!(view.source_dialog.is_none());
+                view.choose_source(SessionSourceChoice::GitHub, cx);
+                view.choose_source(SessionSourceChoice::Empty, cx);
+                view.confirm_source_dialog(cx);
+                assert!(view.source_dialog.is_none());
 
-            view.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
-            view.choose_source(SessionSourceChoice::GitHub, cx);
-            view.confirm_source_dialog(cx);
-            assert!(view.source_dialog.is_some());
+                view.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
+                view.choose_source(SessionSourceChoice::GitHub, cx);
+                view.confirm_source_dialog(cx);
+                assert!(view.source_dialog.is_some());
 
-            view.review.open = false;
-            view.toggle_review_pane(cx);
-            assert!(view.review.open);
-            view.jump_review_hunk(true, cx);
-            view.review.hunk_rows = vec![2, 5];
-            view.jump_review_hunk(true, cx);
-            assert_eq!(view.review.selected_hunk, 0);
-            view.jump_review_hunk(false, cx);
-            assert_eq!(view.review.selected_hunk, 0);
-            view.open_review_diff("missing.txt".to_owned(), false, cx);
-            assert!(view.review.selected_path.is_none());
-            view.open_review_file("missing.txt".to_owned(), cx);
-            assert_eq!(view.review.selected_path.as_deref(), Some("missing.txt"));
-            view
+                view.review.open = false;
+                view.toggle_review_pane(cx);
+                assert!(view.review.open);
+                view.jump_review_hunk(true, cx);
+                view.review.hunk_rows = vec![2, 5];
+                view.jump_review_hunk(true, cx);
+                assert_eq!(view.review.selected_hunk, 0);
+                view.jump_review_hunk(false, cx);
+                assert_eq!(view.review.selected_hunk, 0);
+                view.open_review_diff("missing.txt".to_owned(), false, cx);
+                assert!(view.review.selected_path.is_none());
+                view.open_review_file("missing.txt".to_owned(), cx);
+                assert_eq!(view.review.selected_path.as_deref(), Some("missing.txt"));
+                view
+            });
+            gpui_kit::component::Root::new(view, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
             .unwrap();
@@ -11593,45 +11572,69 @@ mod loom_view_render_tests {
         cx: &mut TestAppContext,
     ) {
         cx.update(gpui_kit::init);
-        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
-            let mut view = LoomView::new_for_test(cx.focus_handle());
-            crate::connection::negotiate(&view.connection).unwrap();
-            view.session_node_ids
-                .insert(view.active_session.id, view.default_backend_node_id.clone());
-            view
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = LoomView::new_for_test(cx.focus_handle());
+                crate::connection::negotiate(&view.connection).unwrap();
+                view.session_node_ids
+                    .insert(view.active_session.id, view.default_backend_node_id.clone());
+                view
+            });
+            gpui_kit::component::Root::new(view, window, cx)
         });
         cx.update_window(handle.into(), |_, window, cx| {
             window
-                .root::<LoomView>()
+                .root::<gpui_kit::component::Root>()
                 .unwrap()
                 .unwrap()
-                .update(cx, |view, cx| {
-                    view.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
-                    view.choose_source(SessionSourceChoice::GitHub, cx);
+                .update(cx, |root, cx| {
+                    root.view()
+                        .clone()
+                        .downcast::<LoomView>()
+                        .unwrap()
+                        .update(cx, |view, cx| {
+                            view.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
+                            view.choose_source(SessionSourceChoice::GitHub, cx);
+                        });
                 });
         })
         .unwrap();
         cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
-            window.root::<LoomView>().flatten().is_some_and(|view| {
-                view.read(cx)
-                    .source_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| !dialog.repositories_loading && dialog.error.is_some())
-            })
+            window
+                .root::<gpui_kit::component::Root>()
+                .flatten()
+                .is_some_and(|root| {
+                    root.read(cx)
+                        .view()
+                        .clone()
+                        .downcast::<LoomView>()
+                        .ok()
+                        .is_some_and(|view| {
+                            view.read(cx).source_dialog.as_ref().is_some_and(|dialog| {
+                                !dialog.repositories_loading && dialog.error.is_some()
+                            })
+                        })
+                })
         })
         .await;
         cx.update_window(handle.into(), |_, window, cx| {
             window
-                .root::<LoomView>()
+                .root::<gpui_kit::component::Root>()
                 .unwrap()
                 .unwrap()
-                .update(cx, |view, cx| {
-                    view.confirm_source_dialog(cx);
-                    assert!(view.source_dialog.is_some());
-                    assert!(view.timeline.iter().any(|item| matches!(
+                .update(cx, |root, cx| {
+                    root.view()
+                        .clone()
+                        .downcast::<LoomView>()
+                        .unwrap()
+                        .update(cx, |view, cx| {
+                            view.confirm_source_dialog(cx);
+                            assert!(view.source_dialog.is_some());
+                            assert!(view.timeline.iter().any(|item| matches!(
                         item,
                         TimelineItem::Status(status) if status == "Choose a GitHub repository"
                     )));
+                        });
                 });
         })
         .unwrap();

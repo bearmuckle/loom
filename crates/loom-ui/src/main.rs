@@ -111,7 +111,10 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| view),
+                |window, cx| {
+                    let view = cx.new(|_| view);
+                    cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
+                },
             ) {
                 Ok(window) => window,
                 Err(error) => {
@@ -121,11 +124,17 @@ fn main() {
                 }
             };
             info!("Loom window opened");
-            if let Err(error) = window.update(cx, |view, window, cx| {
-                view.reconnect_configured_worker_nodes(cx);
-                view.observe_system_appearance(window, cx);
-                view.select_theme(crate::state::ThemeChoice::System, window, cx);
-                view.composer_focus_handle.focus(window, cx);
+            if let Err(error) = window.update(cx, |root, window, cx| {
+                root.view()
+                    .clone()
+                    .downcast::<LoomView>()
+                    .unwrap()
+                    .update(cx, |view, cx| {
+                        view.reconnect_configured_worker_nodes(cx);
+                        view.observe_system_appearance(window, cx);
+                        view.select_theme(crate::state::ThemeChoice::System, window, cx);
+                        view.composer_focus_handle.focus(window, cx);
+                    });
                 cx.activate(true);
             }) {
                 error!("failed to focus Loom composer: {error}");
@@ -167,20 +176,29 @@ fn start_browser_client(cx: &mut App) {
     let focus_handle = cx.focus_handle();
     let auto_connect = options.is_configured() && !options.demo();
     let view = LoomView::new_browser_disconnected(&options, startup_error, focus_handle);
-    let window = match cx.open_window(Default::default(), |_, cx| cx.new(|_| view)) {
+    let window = match cx.open_window(Default::default(), |window, cx| {
+        let view = cx.new(|_| view);
+        cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
+    }) {
         Ok(window) => window,
         Err(error) => {
             return log_error("failed to open Loom window", error);
         }
     };
-    if let Err(error) = window.update(cx, |view, window, cx| {
-        view.observe_system_appearance(window, cx);
-        view.composer_focus_handle.focus(window, cx);
-        view.select_theme(crate::state::ThemeChoice::System, window, cx);
+    if let Err(error) = window.update(cx, |root, window, cx| {
+        root.view()
+            .clone()
+            .downcast::<LoomView>()
+            .unwrap()
+            .update(cx, |view, cx| {
+                view.observe_system_appearance(window, cx);
+                view.composer_focus_handle.focus(window, cx);
+                view.select_theme(crate::state::ThemeChoice::System, window, cx);
+                if auto_connect {
+                    view.connect_worker_node(cx);
+                }
+            });
         cx.activate(true);
-        if auto_connect {
-            view.connect_worker_node(cx);
-        }
     }) {
         log_error("failed to finish initializing the Loom window", error);
     }
