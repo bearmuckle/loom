@@ -1166,6 +1166,8 @@ pub(crate) struct LoomView {
     session_drawer_open: bool,
     pub(crate) rename_dialog: Option<RenameDialogState>,
     source_dialog: Option<SessionSourceDialog>,
+    #[cfg(target_family = "wasm")]
+    welcome_dialog_dismissed: bool,
     pub(crate) demo_workspace: bool,
     pub(crate) login_enabled: bool,
     pub(crate) github_connected: bool,
@@ -1503,6 +1505,8 @@ impl LoomView {
             session_drawer_open: false,
             rename_dialog: None,
             source_dialog: None,
+            #[cfg(target_family = "wasm")]
+            welcome_dialog_dismissed: false,
             demo_workspace: false,
             login_enabled: false,
             github_connected: false,
@@ -1847,6 +1851,8 @@ impl LoomView {
             session_drawer_open: false,
             rename_dialog: None,
             source_dialog: None,
+            #[cfg(target_family = "wasm")]
+            welcome_dialog_dismissed: false,
             demo_workspace,
             login_enabled: true,
             github_connected: false,
@@ -2009,6 +2015,8 @@ impl LoomView {
             session_drawer_open: false,
             rename_dialog: None,
             source_dialog: None,
+            #[cfg(target_family = "wasm")]
+            welcome_dialog_dismissed: false,
             demo_workspace: demo_mode,
             login_enabled: false,
             github_connected: false,
@@ -2211,6 +2219,8 @@ impl LoomView {
             session_drawer_open: false,
             rename_dialog: None,
             source_dialog: None,
+            #[cfg(target_family = "wasm")]
+            welcome_dialog_dismissed: false,
             demo_workspace: false,
             login_enabled: true,
             github_connected: false,
@@ -7606,6 +7616,10 @@ impl LoomView {
             } else {
                 "Add to this session"
             })
+            .on_close(cx.listener(|this, _, _, cx| {
+                this.source_dialog = None;
+                cx.notify();
+            }))
             .keyboard(false)
             .overlay_closable(false)
             .w(px(560.))
@@ -8635,6 +8649,7 @@ impl LoomView {
     }
 
     #[cfg(target_family = "wasm")]
+    #[cfg(target_family = "wasm")]
     fn render_disconnected(&self, window: &Window, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let layout = responsive_layout(window.bounds().size.width);
         div()
@@ -8789,10 +8804,16 @@ impl LoomView {
                     .text_color(rgb(0x8f98a6))
                     .child("Not connected  ·  Connect a worker in Settings"),
             )
-            .when(!self.settings_open, |element| {
-                element.child(
+            .when(
+                !self.settings_open && !self.welcome_dialog_dismissed,
+                |element| {
+                    element.child(
                     Dialog::new(cx)
                         .title("You’re ready to go")
+                        .on_close(cx.listener(|view, _, _, cx| {
+                            view.welcome_dialog_dismissed = true;
+                            cx.notify();
+                        }))
                         .keyboard(false)
                         .overlay_closable(false)
                         .w(px(460.))
@@ -8808,7 +8829,8 @@ impl LoomView {
                                 })),
                         ),
                 )
-            })
+                },
+            )
             .into_any()
     }
 }
@@ -10294,7 +10316,7 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
-    fn session_source_dialog_choices_and_cancel_are_clickable(cx: &mut TestAppContext) {
+    fn session_source_dialog_choices_and_close_button_work(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
             let view = cx.new(|cx| {
@@ -10319,7 +10341,7 @@ mod loom_view_render_tests {
             assert!(window.find("source-local-directory").visible());
             window.click("source-local-directory", cx);
             window.click("source-github", cx);
-            window.click("cancel-session-source", cx);
+            window.click("close", cx);
             window.render_frame(cx);
             assert!(window.try_find("source-local-directory").is_none());
         })
