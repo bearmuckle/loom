@@ -12,6 +12,8 @@ canonical message body; mismatched snapshots preserve the prior base and
 committed fragments rather than replacing either. Bounded
 keyset pages and byte-range reads are available from persistence. Completed
 nonempty message bodies share the compressed, content-addressed blob store.
+The server batches streamed assistant fragments at 50 ms or 32 KiB and flushes
+before durable run-state writes and at completion.
 Checkpoint headers and file entries use keyed rows; checkpoint file text shares the compressed,
 content-addressed blob store. Remaining filesystem edit/change and repository
 metadata use a compressed, hash-checked per-session payload. Large strings in
@@ -443,9 +445,11 @@ Implement in this order:
    snapshots no longer embed a second copy. Activity rows are written
    transactionally with run summaries and restored for both restart recovery
    and on-demand run detail loads.
-   Batching fragments at the intended flush thresholds, migration of tools and
-   tool-attempt records, and loading the canonical context directly
-   from bounded persistence pages remain to be completed.
+   Server-side fragment buffering now flushes at the 50 ms / 32 KiB thresholds,
+   on step persistence, and at run completion; time- and byte-threshold tests
+   cover durable partial output and UTF-8-safe chunking. Migration of tools and
+   tool-attempt records and loading the canonical context directly from bounded
+   persistence pages remain to be completed.
 3. Move execution, approvals, idempotency, and publication to transactional domain
    commands. Protocol 4.0 approval and input commands now carry the run-attempt
    identity and expected control revision, and stale commands are rejected;

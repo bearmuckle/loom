@@ -673,6 +673,7 @@ struct RunHandle {
     control: RunControl,
     state: Mutex<AgentRuntimeState>,
     message_fragments: Mutex<MessageFragmentState>,
+    fragment_wake: Condvar,
     running: Mutex<bool>,
     idle: Condvar,
     failure: Mutex<Option<LoomError>>,
@@ -682,6 +683,15 @@ struct RunHandle {
 struct MessageFragmentState {
     active_message_ordinal: Option<u64>,
     positions: BTreeMap<u64, MessageFragmentPosition>,
+    pending: BTreeMap<u64, PendingMessageFragments>,
+    pending_bytes: usize,
+    pending_since: Option<Instant>,
+}
+
+#[derive(Default)]
+struct PendingMessageFragments {
+    content: String,
+    committed_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -704,6 +714,10 @@ const CONTROL_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// that is already finishing. A run that is genuinely busy is reported as a
 /// retryable conflict instead.
 const ENTRY_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Batch streamed transcript writes until this amount is buffered or the
+/// oldest pending bytes have waited this long.
+const MESSAGE_FRAGMENT_BATCH_BYTES: usize = 32 * 1024;
+const MESSAGE_FRAGMENT_BATCH_INTERVAL: Duration = Duration::from_millis(50);
 
 impl RunHandle {
     fn new(runtime: AgentRuntime) -> Self {
@@ -713,6 +727,7 @@ impl RunHandle {
             control: runtime.control(),
             state: Mutex::new(runtime.export_state()),
             message_fragments: Mutex::new(MessageFragmentState::default()),
+            fragment_wake: Condvar::new(),
             runtime: Mutex::new(runtime),
             running: Mutex::new(false),
             idle: Condvar::new(),
@@ -733,11 +748,14 @@ impl RunHandle {
     }
 
     fn refresh(&self, runtime: &AgentRuntime) {
-        *self.locked_state() = runtime.export_state();
-        self.message_fragments
+        let state = runtime.export_state();
+        let mut fragments = self
+            .message_fragments
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .active_message_ordinal = None;
+            .unwrap_or_else(PoisonError::into_inner);
+        *self.locked_state() = state;
+        fragments.active_message_ordinal = None;
+        self.fragment_wake.notify_all();
     }
 
     fn append_message_delta(&self, persistence: &FilePersistence, text: &str) -> Result<()> {
@@ -786,56 +804,210 @@ impl RunHandle {
                 byte_offset,
             });
         }
-        let position = fragments.positions.get_mut(&ordinal).ok_or_else(|| {
+        let pending_bytes = fragments
+            .pending_bytes
+            .checked_add(text.len())
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "pending run message content is too large",
+                    false,
+                )
+            })?;
+        let now = Instant::now();
+        if fragments.pending_bytes == 0 {
+            fragments.pending_since = Some(now);
+        }
+        fragments
+            .pending
+            .entry(ordinal)
+            .or_default()
+            .content
+            .push_str(text);
+        fragments.pending_bytes = pending_bytes;
+        let interval_elapsed = fragments.pending_since.is_some_and(|pending_since| {
+            now.saturating_duration_since(pending_since) >= MESSAGE_FRAGMENT_BATCH_INTERVAL
+        });
+        if fragments.pending_bytes >= MESSAGE_FRAGMENT_BATCH_BYTES || interval_elapsed {
+            self.flush_message_fragments_locked(persistence, &mut fragments)?;
+        }
+        self.fragment_wake.notify_one();
+        Ok(())
+    }
+
+    fn flush_message_fragments(&self, persistence: &FilePersistence) -> Result<()> {
+        let mut fragments = self.message_fragments.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
-                "streamed message fragment cursor is missing",
-                false,
+                "run message fragment lock was poisoned",
+                true,
             )
         })?;
-        let mut start = 0;
-        while start < text.len() {
-            let mut end = (start + 32 * 1024).min(text.len());
-            while !text.is_char_boundary(end) {
-                end -= 1;
+        self.flush_message_fragments_locked(persistence, &mut fragments)
+    }
+
+    fn flush_message_fragments_locked(
+        &self,
+        persistence: &FilePersistence,
+        fragments: &mut MessageFragmentState,
+    ) -> Result<()> {
+        let ordinals = fragments.pending.keys().copied().collect::<Vec<_>>();
+        for ordinal in ordinals {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                fragments.positions.entry(ordinal)
+            {
+                let (fragment_ordinal, byte_offset) =
+                    persistence.next_run_message_fragment_position(self.run_id, ordinal)?;
+                entry.insert(MessageFragmentPosition {
+                    ordinal,
+                    fragment_ordinal,
+                    byte_offset,
+                });
             }
-            let next_fragment_ordinal =
-                position.fragment_ordinal.checked_add(1).ok_or_else(|| {
+            loop {
+                let (start, end, content) = {
+                    let pending = fragments.pending.get(&ordinal).ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "pending run message fragment buffer is missing",
+                            false,
+                        )
+                    })?;
+                    let start = pending.committed_bytes;
+                    if start >= pending.content.len() {
+                        break;
+                    }
+                    let mut end = (start + MESSAGE_FRAGMENT_BATCH_BYTES).min(pending.content.len());
+                    while !pending.content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    (start, end, pending.content.as_bytes()[start..end].to_vec())
+                };
+                let position = fragments.positions.get(&ordinal).copied().ok_or_else(|| {
                     LoomError::new(
-                        ErrorCode::Persistence,
-                        "run message has too many persisted fragments",
+                        ErrorCode::Internal,
+                        "streamed message fragment cursor is missing",
                         false,
                     )
                 })?;
-            let next_byte_offset = position
-                .byte_offset
-                .checked_add(u64::try_from(end - start).map_err(|_| {
+                let next_fragment_ordinal =
+                    position.fragment_ordinal.checked_add(1).ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::Persistence,
+                            "run message has too many persisted fragments",
+                            false,
+                        )
+                    })?;
+                let next_byte_offset = position
+                    .byte_offset
+                    .checked_add(u64::try_from(content.len()).map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::Persistence,
+                            "run message fragment length is out of range",
+                            false,
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::Persistence,
+                            "run message content is too large",
+                            false,
+                        )
+                    })?;
+                persistence.append_run_message_fragment(
+                    self.run_id,
+                    self.session_id,
+                    position.ordinal,
+                    position.fragment_ordinal,
+                    position.byte_offset,
+                    &content,
+                )?;
+                let position = fragments.positions.get_mut(&ordinal).ok_or_else(|| {
                     LoomError::new(
-                        ErrorCode::Persistence,
-                        "run message fragment length is out of range",
-                        false,
-                    )
-                })?)
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::Persistence,
-                        "run message content is too large",
+                        ErrorCode::Internal,
+                        "streamed message fragment cursor is missing",
                         false,
                     )
                 })?;
-            persistence.append_run_message_fragment(
-                self.run_id,
-                self.session_id,
-                position.ordinal,
-                position.fragment_ordinal,
-                position.byte_offset,
-                &text.as_bytes()[start..end],
-            )?;
-            position.fragment_ordinal = next_fragment_ordinal;
-            position.byte_offset = next_byte_offset;
-            start = end;
+                position.fragment_ordinal = next_fragment_ordinal;
+                position.byte_offset = next_byte_offset;
+                let pending = fragments.pending.get_mut(&ordinal).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Internal,
+                        "pending run message fragment buffer is missing",
+                        false,
+                    )
+                })?;
+                pending.committed_bytes = end;
+                fragments.pending_bytes = fragments
+                    .pending_bytes
+                    .checked_sub(end - start)
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "pending run message byte count is inconsistent",
+                            false,
+                        )
+                    })?;
+            }
+            if fragments
+                .pending
+                .get(&ordinal)
+                .is_some_and(|pending| pending.committed_bytes == pending.content.len())
+            {
+                fragments.pending.remove(&ordinal);
+            }
+        }
+        if fragments.pending_bytes == 0 {
+            fragments.pending_since = None;
         }
         Ok(())
+    }
+
+    fn flush_message_fragments_until_stopped(handle: Weak<Self>, persistence: FilePersistence) {
+        loop {
+            let Some(handle) = handle.upgrade() else {
+                return;
+            };
+            let mut fragments = handle
+                .message_fragments
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if fragments.pending_bytes == 0 {
+                if !handle.is_running() {
+                    return;
+                }
+                let (guard, _) = handle
+                    .fragment_wake
+                    .wait_timeout(fragments, Duration::from_secs(1))
+                    .unwrap_or_else(PoisonError::into_inner);
+                fragments = guard;
+                if fragments.pending_bytes == 0 && !handle.is_running() {
+                    return;
+                }
+                continue;
+            }
+            let deadline = fragments
+                .pending_since
+                .map(|pending_since| pending_since + MESSAGE_FRAGMENT_BATCH_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+                if let Err(error) =
+                    handle.flush_message_fragments_locked(&persistence, &mut fragments)
+                {
+                    drop(fragments);
+                    handle.record_failure(error);
+                    handle.control.request_interrupt();
+                    return;
+                }
+                continue;
+            };
+            let (guard, _) = handle
+                .fragment_wake
+                .wait_timeout(fragments, wait)
+                .unwrap_or_else(PoisonError::into_inner);
+            drop(guard);
+        }
     }
 
     /// Keeps the cached run state current while a step is still executing.
@@ -915,6 +1087,14 @@ impl RunHandle {
     fn set_running(&self, running: bool) {
         *self.running.lock().unwrap_or_else(PoisonError::into_inner) = running;
         self.idle.notify_all();
+        self.fragment_wake.notify_all();
+    }
+
+    fn failure(&self) -> Option<LoomError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Locks the runtime for an operation that requires exclusive access.
@@ -1997,6 +2177,10 @@ impl InProcessBackend {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
+        let handles = self.runs()?.values().cloned().collect::<Vec<_>>();
+        for handle in handles {
+            handle.flush_message_fragments(persistence)?;
+        }
         let runs: BTreeMap<loom_core::RunId, AgentRuntimeState> = self
             .runs()?
             .iter()
@@ -2233,6 +2417,9 @@ impl InProcessBackend {
                     Some(persistence),
                     Some(handle),
                 ) => handle.append_message_delta(persistence, text),
+                (AgentEvent::RunCompleted { .. }, Some(persistence), Some(handle)) => {
+                    handle.flush_message_fragments(persistence)
+                }
                 _ => Ok(()),
             };
             let recorded = fragment_result
@@ -2261,6 +2448,12 @@ impl InProcessBackend {
         handle.set_running(true);
         let backend = Arc::clone(self);
         std::thread::spawn(move || {
+            let fragment_flusher = backend.persistence.clone().map(|persistence| {
+                let handle = Arc::downgrade(&handle);
+                thread::spawn(move || {
+                    RunHandle::flush_message_fragments_until_stopped(handle, persistence)
+                })
+            });
             loop {
                 let progress = {
                     let mut runtime = handle
@@ -2271,8 +2464,17 @@ impl InProcessBackend {
                     handle.refresh(&runtime);
                     progress
                 };
+                if handle.failure().is_some() {
+                    break;
+                }
                 match progress {
                     Ok(progress) => {
+                        if let Some(persistence) = backend.persistence.as_ref()
+                            && let Err(error) = handle.flush_message_fragments(persistence)
+                        {
+                            handle.record_failure(error);
+                            break;
+                        }
                         if let Err(error) = backend.persist_state() {
                             handle.record_failure(error);
                             break;
@@ -2282,12 +2484,18 @@ impl InProcessBackend {
                         }
                     }
                     Err(error) => {
-                        handle.record_failure(error);
+                        let flush_error = backend.persistence.as_ref().and_then(|persistence| {
+                            handle.flush_message_fragments(persistence).err()
+                        });
+                        handle.record_failure(flush_error.unwrap_or(error));
                         break;
                     }
                 }
             }
             handle.set_running(false);
+            if fragment_flusher.is_some_and(|flusher| flusher.join().is_err()) {
+                log::error!("run message fragment flusher thread panicked");
+            }
         });
     }
 
@@ -7810,6 +8018,274 @@ mod tests {
             }
         });
         (format!("http://{address}/v1/chat/completions"), receiver)
+    }
+
+    fn gated_model_endpoint(
+        first_content: &str,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (first_sender, first_receiver) = std::sync::mpsc::channel();
+        let (second_sender, second_receiver) = std::sync::mpsc::channel();
+        let (second_gate_sender, second_gate_receiver) = std::sync::mpsc::channel();
+        let (finish_gate_sender, finish_gate_receiver) = std::sync::mpsc::channel();
+        let first_event = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+            serde_json::to_string(first_content).unwrap()
+        );
+        thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request);
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .is_err()
+                || stream.write_all(first_event.as_bytes()).is_err()
+                || stream.flush().is_err()
+            {
+                return;
+            }
+            let _ = first_sender.send(());
+            if second_gate_receiver.recv().is_err() {
+                return;
+            }
+            if stream
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n")
+                .is_err()
+                || stream.flush().is_err()
+            {
+                return;
+            }
+            let _ = second_sender.send(());
+            if finish_gate_receiver.recv().is_err() {
+                return;
+            }
+            let _ = stream.write_all(b"data: [DONE]\n\n");
+            let _ = stream.flush();
+        });
+        (
+            format!("http://{address}/v1/chat/completions"),
+            first_receiver,
+            second_gate_sender,
+            second_receiver,
+            finish_gate_sender,
+        )
+    }
+
+    #[test]
+    fn streamed_message_fragments_batch_until_the_time_threshold() {
+        let (endpoint, first_delta, release_second, second_delta, finish) =
+            gated_model_endpoint("first");
+        let persistence =
+            std::env::temp_dir().join(format!("loom-server-batched-{}.db", WorkspaceId::new()));
+        let backend = InProcessBackend::with_openai_compatible_persistent(
+            endpoint,
+            "key",
+            ModelId::new("slow/model"),
+            &persistence,
+        )
+        .unwrap();
+        let session_root_base = backend.session_root_base.clone();
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Batched transcript workspace".to_owned(),
+        }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "batched transcript".to_owned(),
+            },
+        ));
+        let session_id = match session.result.unwrap() {
+            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id,
+                task: "stream a response".to_owned(),
+                model: ModelId::new("slow/model"),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
+        let run_id = match started.result.unwrap() {
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        first_delta
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first model delta");
+
+        let handle = backend.runs().unwrap().get(&run_id).cloned().unwrap();
+        for _ in 0..200 {
+            if handle.message_fragments.lock().unwrap().pending_bytes == "first".len() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            handle.message_fragments.lock().unwrap().pending_bytes,
+            "first".len()
+        );
+        assert!(
+            backend
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_messages(run_id)
+                .unwrap()
+                .iter()
+                .all(|message| message.content != "first")
+        );
+
+        thread::sleep(MESSAGE_FRAGMENT_BATCH_INTERVAL + Duration::from_millis(10));
+        let mut flushed_prefix = None;
+        for _ in 0..200 {
+            flushed_prefix = backend
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_messages(run_id)
+                .unwrap()
+                .into_iter()
+                .find(|message| message.role == loom_model::MessageRole::Assistant)
+                .map(|message| message.content);
+            if flushed_prefix.as_deref() == Some("first") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(flushed_prefix.as_deref(), Some("first"));
+
+        release_second.send(()).unwrap();
+        second_delta
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second model delta");
+        let transcript = backend.persistence.as_ref().unwrap();
+        let mut persisted_content = None;
+        for _ in 0..200 {
+            persisted_content = transcript
+                .load_run_messages(run_id)
+                .unwrap()
+                .into_iter()
+                .find(|message| message.role == loom_model::MessageRole::Assistant)
+                .map(|message| message.content);
+            if persisted_content.as_deref() == Some("firstsecond") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(persisted_content.as_deref(), Some("firstsecond"));
+        assert_eq!(handle.message_fragments.lock().unwrap().pending_bytes, 0);
+
+        finish.send(()).unwrap();
+        await_settled_run(&connection, run_id);
+        drop(connection);
+        drop(backend);
+        fs::remove_dir_all(session_root_base).unwrap();
+        let _ = fs::remove_file(&persistence);
+        let _ = fs::remove_file(persistence.with_extension("db-shm"));
+        let _ = fs::remove_file(persistence.with_extension("db-wal"));
+    }
+
+    #[test]
+    fn streamed_message_fragments_flush_at_the_byte_threshold_without_splitting_utf8() {
+        let content = format!(
+            "{}é",
+            "a".repeat(MESSAGE_FRAGMENT_BATCH_BYTES.saturating_sub(1))
+        );
+        let (endpoint, first_delta, release_second, second_delta, finish) =
+            gated_model_endpoint(&content);
+        let persistence =
+            std::env::temp_dir().join(format!("loom-server-large-delta-{}.db", WorkspaceId::new()));
+        let backend = InProcessBackend::with_openai_compatible_persistent(
+            endpoint,
+            "key",
+            ModelId::new("slow/model"),
+            &persistence,
+        )
+        .unwrap();
+        let session_root_base = backend.session_root_base.clone();
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Large transcript workspace".to_owned(),
+        }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "large transcript".to_owned(),
+            },
+        ));
+        let session_id = match session.result.unwrap() {
+            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id,
+                task: "stream a large response".to_owned(),
+                model: ModelId::new("slow/model"),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
+        let run_id = match started.result.unwrap() {
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        first_delta
+            .recv_timeout(Duration::from_secs(10))
+            .expect("large model delta");
+
+        let transcript = backend.persistence.as_ref().unwrap();
+        let mut persisted_content = None;
+        for _ in 0..200 {
+            persisted_content = transcript
+                .load_run_messages(run_id)
+                .unwrap()
+                .into_iter()
+                .find(|message| message.role == loom_model::MessageRole::Assistant)
+                .map(|message| message.content);
+            if persisted_content.as_deref() == Some(content.as_str()) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(persisted_content.as_deref(), Some(content.as_str()));
+
+        release_second.send(()).unwrap();
+        second_delta
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second model delta");
+        finish.send(()).unwrap();
+        await_settled_run(&connection, run_id);
+        drop(connection);
+        drop(backend);
+        fs::remove_dir_all(session_root_base).unwrap();
+        let _ = fs::remove_file(&persistence);
+        let _ = fs::remove_file(persistence.with_extension("db-shm"));
+        let _ = fs::remove_file(persistence.with_extension("db-wal"));
     }
 
     #[test]
