@@ -113,7 +113,7 @@ fn main() {
                 },
                 |window, cx| {
                     let view = cx.new(|_| view);
-                    cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
+                    cx.new(|cx| gpui_kit::component::Root::new(view, window, cx).bordered(false))
                 },
             ) {
                 Ok(window) => window,
@@ -178,7 +178,7 @@ fn start_browser_client(cx: &mut App) {
     let view = LoomView::new_browser_disconnected(&options, startup_error, focus_handle);
     let window = match cx.open_window(Default::default(), |window, cx| {
         let view = cx.new(|_| view);
-        cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
+        cx.new(|cx| gpui_kit::component::Root::new(view, window, cx).bordered(false))
     }) {
         Ok(window) => window,
         Err(error) => {
