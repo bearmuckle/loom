@@ -22,6 +22,9 @@ pub use loom_protocol::{
 };
 use loom_tools::{ToolExecutor, ToolKind, ToolResult, tool_definitions};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+const CONTEXT_PROJECTION_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTask {
@@ -1746,10 +1749,19 @@ impl AgentRuntime {
         // Repair legacy transcripts before budgeting, so repair cannot reinsert
         // an oversized output after the assembler has removed it.
         let conversation = repair_tool_transcript(source.to_vec(), source);
-        let checkpoint = self
-            .context_checkpoint
-            .as_ref()
-            .filter(|summary| summary.source_message_count <= conversation.len());
+        let checkpoint = match self.context_checkpoint.as_ref() {
+            Some(summary)
+                if summary.projection_version == CONTEXT_PROJECTION_VERSION
+                    && summary.source_message_count <= conversation.len()
+                    && summary.source_digest
+                        == context_projection_digest(
+                            &conversation[..summary.source_message_count],
+                        )? =>
+            {
+                Some(summary)
+            }
+            _ => None,
+        };
         let boundary = checkpoint.map_or(0, |summary| summary.source_message_count);
         let mut options = self.options.context.clone();
         // Explicit overrides may lower, but never raise, a known model limit.
@@ -1852,6 +1864,9 @@ impl AgentRuntime {
             .max(request_tokens);
         if let Some(summary) = &mut inspection.summary {
             summary.source_message_count += boundary;
+            summary.projection_version = CONTEXT_PROJECTION_VERSION;
+            summary.source_digest =
+                context_projection_digest(&conversation[..summary.source_message_count])?;
         }
         if provider.descriptor().context_window.is_none()
             && self.options.context.context_window.is_none()
@@ -2116,6 +2131,24 @@ fn initial_messages(task: &AgentTask) -> Vec<ModelMessage> {
 
 /// Keeps Responses API function calls paired with their tool outputs after
 /// context assembly or recovery from an older persisted runtime state.
+fn context_projection_digest(messages: &[ModelMessage]) -> Result<String> {
+    let projection = serde_json::to_vec(messages).map_err(|error| {
+        LoomError::new(
+            ErrorCode::Internal,
+            format!("failed to encode context projection: {error}"),
+            false,
+        )
+    })?;
+    let digest = Sha256::digest(projection);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(encoded)
+}
+
 fn repair_tool_transcript(
     messages: Vec<ModelMessage>,
     source_messages: &[ModelMessage],
@@ -2921,6 +2954,18 @@ mod tests {
             MessageRole::User,
             "Keep all public signatures unchanged.",
         ));
+        let missing_output_call = ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "archive.rs"}),
+        };
+        runtime.messages.push(ModelMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            name: None,
+            tool_call_id: None,
+            tool_calls: vec![missing_output_call],
+        });
         for i in 0..30 {
             runtime.messages.push(ModelMessage::new(
                 MessageRole::Assistant,
@@ -2933,7 +2978,28 @@ mod tests {
         let (request, inspection) = runtime.model_request().unwrap();
         assert!(inspection.compacted);
         let boundary = inspection.summary.as_ref().unwrap().source_message_count;
-        assert!(boundary > 0);
+        assert!(boundary >= 3);
+        let initial_count = initial_messages(&runtime.task).len();
+        let source = &runtime.messages[initial_count..];
+        let repaired = repair_tool_transcript(source.to_vec(), source);
+        assert!(repaired[..boundary].iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.content
+                    == "No tool output was recorded; continue from the current state."
+        }));
+        assert_eq!(
+            inspection.summary.as_ref().unwrap().projection_version,
+            CONTEXT_PROJECTION_VERSION
+        );
+        assert!(
+            !inspection
+                .summary
+                .as_ref()
+                .unwrap()
+                .source_digest
+                .is_empty()
+        );
+        let digest = inspection.summary.as_ref().unwrap().source_digest.clone();
         runtime.context_checkpoint = inspection.summary.clone();
         runtime.context_inspection = Some(inspection);
         let state = runtime.export_state();
@@ -2950,6 +3016,7 @@ mod tests {
             next.summary.as_ref().unwrap().source_message_count,
             boundary
         );
+        assert_eq!(next.summary.as_ref().unwrap().source_digest, digest);
         assert_eq!(next_request.messages, request.messages);
         assert!(
             next_request
@@ -2982,6 +3049,44 @@ mod tests {
                 .unwrap()
                 .context_checkpoint
                 .is_none()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_context_checkpoint_is_rebuilt_from_repaired_history() {
+        let root = workspace();
+        let mut runtime = context_runtime(&root);
+        runtime.options.context.max_input_tokens = Some(4_000);
+        runtime.messages.push(ModelMessage::new(
+            MessageRole::User,
+            "Preserve the existing public API.",
+        ));
+        for i in 0..30 {
+            runtime.messages.push(ModelMessage::new(
+                MessageRole::Assistant,
+                format!("Step {i}: {}", "work details ".repeat(100)),
+            ));
+        }
+        runtime
+            .messages
+            .push(ModelMessage::new(MessageRole::Assistant, "latest result"));
+        let (_, inspection) = runtime.model_request().unwrap();
+        let checkpoint = inspection.summary.unwrap();
+        assert!(checkpoint.source_message_count > 0);
+
+        let first_conversation_index = initial_messages(&runtime.task).len();
+        runtime.messages[first_conversation_index].content =
+            "Revised canonical request. ".to_owned() + &"updated details ".repeat(100);
+        runtime.context_checkpoint = Some(checkpoint.clone());
+
+        let (_, rebuilt) = runtime.model_request().unwrap();
+        assert!(rebuilt.compacted);
+        let rebuilt_summary = rebuilt.summary.unwrap();
+        assert_ne!(rebuilt_summary.source_digest, checkpoint.source_digest);
+        assert_eq!(
+            rebuilt_summary.projection_version,
+            CONTEXT_PROJECTION_VERSION
         );
         fs::remove_dir_all(root).unwrap();
     }

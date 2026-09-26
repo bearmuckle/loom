@@ -43,6 +43,12 @@ pub struct ContextInspection {
 pub struct ContextSummary {
     pub text: String,
     pub source_message_count: usize,
+    /// Version of the deterministic repaired-history projection covered by this summary.
+    #[serde(default)]
+    pub projection_version: u32,
+    /// SHA-256 of the ordered projected messages before `source_message_count`.
+    #[serde(default)]
+    pub source_digest: String,
     pub created_at: Timestamp,
 }
 
@@ -98,7 +104,7 @@ impl ContextInspection {
 
 #[cfg(test)]
 mod tests {
-    use super::{ContextBudget, ContextInspection};
+    use super::{ContextBudget, ContextInspection, ContextSummary};
     use loom_core::ErrorCode;
 
     #[test]
@@ -152,5 +158,27 @@ mod tests {
         assert!(!inspection.within_budget());
         inspection.budget.effective_input_tokens = None;
         assert!(inspection.within_budget());
+    }
+
+    #[test]
+    fn context_summary_projection_metadata_defaults_for_older_serialized_values() {
+        let current = ContextSummary {
+            text: "summary".to_owned(),
+            source_message_count: 3,
+            projection_version: 1,
+            source_digest: "digest".to_owned(),
+            created_at: loom_core::Timestamp::now(),
+        };
+        let mut value = serde_json::to_value(&current).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("projection_version");
+        object.remove("source_digest");
+
+        let legacy = serde_json::from_value::<ContextSummary>(value).unwrap();
+        assert_eq!(legacy.text, current.text);
+        assert_eq!(legacy.source_message_count, current.source_message_count);
+        assert_eq!(legacy.projection_version, 0);
+        assert!(legacy.source_digest.is_empty());
+        assert_eq!(legacy.created_at, current.created_at);
     }
 }

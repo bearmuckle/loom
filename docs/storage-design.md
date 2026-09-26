@@ -137,6 +137,11 @@ transcript or use a mutable array index as the only durable boundary. Model inpu
 loads the summary and required suffix for that attempt. Provider-history repair
 must operate on a deterministic projection with a matching boundary.
 
+The runtime binds each saved compaction boundary to the SHA-256 digest of its
+ordered, repaired message prefix and a projection version. Recovery accepts the
+summary only when both still match; otherwise it rebuilds context from the
+canonical repaired transcript instead of applying a stale boundary.
+
 ## Queries and indexes
 
 These are representative index definitions, assuming the columns above. Use
@@ -431,8 +436,11 @@ Implement in this order:
    share these request/response types through the common client transport; this
    adds an API surface, not a new transcript UI. Protocol 2.x peers are rejected
    at negotiation; no legacy protocol adapter is in scope.
+   Runtime context checkpoints now include a repaired-prefix digest and
+   projection version, and are invalidated when recovered history differs.
    Batching fragments at the intended flush thresholds, migration of tools and
-   activities, and canonical context loading remain to be completed.
+   activities, and loading the canonical context directly from bounded
+   persistence pages remain to be completed.
 3. Move execution, approvals, idempotency, and publication to transactional domain
    commands. Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.

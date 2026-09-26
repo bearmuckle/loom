@@ -112,6 +112,8 @@ impl ContextAssembler {
         let mut summary = prior.map(|text| ContextSummary {
             text: text.to_owned(),
             source_message_count: 0,
+            projection_version: 0,
+            source_digest: String::new(),
             created_at: Timestamp::now(),
         });
         if total_tokens > trigger {
@@ -218,6 +220,8 @@ impl ContextAssembler {
                     summary = Some(ContextSummary {
                         text,
                         source_message_count: start,
+                        projection_version: 0,
+                        source_digest: String::new(),
                         created_at: Timestamp::now(),
                     });
                 }
@@ -239,6 +243,8 @@ impl ContextAssembler {
                 summary = prior.map(|text| ContextSummary {
                     text: text.to_owned(),
                     source_message_count: 0,
+                    projection_version: 0,
+                    source_digest: String::new(),
                     created_at: Timestamp::now(),
                 });
             }
@@ -426,6 +432,8 @@ pub fn compact_messages(messages: &[ModelMessage]) -> ContextSummary {
     ContextSummary {
         text: bounded_excerpt(&text, 4_096),
         source_message_count: messages.len(),
+        projection_version: 0,
+        source_digest: String::new(),
         created_at: Timestamp::now(),
     }
 }
