@@ -14,13 +14,16 @@ keyset pages and byte-range reads are available from persistence. Completed
 nonempty message bodies share the compressed, content-addressed blob store.
 The server batches streamed assistant fragments at 50 ms or 32 KiB and flushes
 before durable run-state writes and at completion.
+Run-attempt history and the current continuation cursor, control revision,
+pending input/approval/tool intent, and retry metadata use typed rows.
 Checkpoint headers and file entries use keyed rows; checkpoint file text shares the compressed,
 content-addressed blob store. Remaining filesystem edit/change and repository
 metadata use a compressed, hash-checked per-session payload. Large strings in
 the generic section store are deduplicated and compressed. Provider configuration
-and health use provider-keyed records. Idempotency uses a dedicated table, while
-detailed execution state, activities, tool attempts, and protocol-level
-conversation paging remain unfinished. Provider request-level detail is
+and health use provider-keyed records. Idempotency uses a dedicated table.
+Activities and protocol-level transcript paging are typed; detailed tool-call
+and tool-attempt records, step/evidence rows, and direct page-backed context
+loading remain unfinished. Provider request-level detail is
 aggregated by provider/model because no request-level usage history is exposed
 by the current protocol. This
 design replaces the version-2 `sections` container. The release does not import
@@ -472,7 +475,12 @@ Implement in this order:
    Schema v22 stores ordered run-attempt identity, state, checkpoint, and timing
    records separately; checkpoint retry adds a new row while earlier attempts
    remain queryable. These rows are written transactionally with the run
-   summary, interaction history, and feed.
+   summary, interaction history, and feed. Schema v23 stores the current
+   continuation cursor, control revision, pending tool/approval/input state,
+   active message ID, and failed-call retry metadata in an explicit
+   `run_execution_state` row, written atomically with its owning attempt and
+   run summary. Tool-call/tool-attempt records, normalized steps/evidence, and
+   crash-injection coverage remain.
    Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section

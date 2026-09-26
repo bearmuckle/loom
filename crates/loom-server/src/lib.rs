@@ -24,12 +24,13 @@ use loom_persistence::{
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
-    AgentRunMessageHeader, AgentRunSnapshotProjection, AgentSessionSnapshotProjection,
-    CURRENT_PROTOCOL_VERSION, ClientRequest, GitHubCopilotLoginStatus, GitHubRepository,
-    MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, NegotiationResult,
-    RequestEnvelope, ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionDirectory,
-    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, unsupported_version_error,
+    AgentExecutionStateRecord, AgentRunMessageHeader, AgentRunSnapshotProjection,
+    AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest,
+    GitHubCopilotLoginStatus, GitHubRepository, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES,
+    MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, NegotiationResult, RequestEnvelope, ResponseEnvelope,
+    ServerEventEnvelope, ServerResponse, SessionDirectory, SessionFilesystemChange,
+    SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository, WorkerNodeResources,
+    WorkerNodeStatus, WorkspaceConfig, unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
@@ -680,6 +681,65 @@ fn sync_cached_run_attempt(state: &mut AgentRuntimeState) {
     };
 }
 
+fn execution_state_from_runtime(state: &AgentRuntimeState) -> Result<AgentExecutionStateRecord> {
+    Ok(AgentExecutionStateRecord {
+        run_id: state.run.id,
+        session_id: state.session_id,
+        attempt_id: state.run.attempt_id,
+        control_revision: state.run.control_revision,
+        state: state.run.state,
+        step_id: state.step_id,
+        step_index: state.step_index,
+        provider_cursor: u64::try_from(state.provider_cursor).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "provider cursor is out of range",
+                false,
+            )
+        })?,
+        next_message_id: state.next_message_id,
+        active_message_id: state.active_message_id,
+        pending_tool_execution: state.pending_tool_execution.clone(),
+        pending_approval: state.pending_approval.clone(),
+        pending_input: state.pending_input.clone(),
+        last_failed_call: state.last_failed_call.clone(),
+    })
+}
+
+fn hydrate_runtime_execution_state(
+    state: &mut AgentRuntimeState,
+    execution: AgentExecutionStateRecord,
+) -> Result<()> {
+    if execution.run_id != state.run.id
+        || execution.session_id != state.session_id
+        || execution.attempt_id != state.run.attempt_id
+        || execution.control_revision != state.run.control_revision
+        || execution.state != state.run.state
+    {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted execution state does not match its run snapshot",
+            false,
+        ));
+    }
+    state.step_id = execution.step_id;
+    state.step_index = execution.step_index;
+    state.provider_cursor = usize::try_from(execution.provider_cursor).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted provider cursor is out of range",
+            false,
+        )
+    })?;
+    state.next_message_id = execution.next_message_id;
+    state.active_message_id = execution.active_message_id;
+    state.pending_tool_execution = execution.pending_tool_execution;
+    state.pending_approval = execution.pending_approval;
+    state.pending_input = execution.pending_input;
+    state.last_failed_call = execution.last_failed_call;
+    Ok(())
+}
+
 /// One agent run owned by the backend.
 ///
 /// The runtime lock is held only while a step is executing. Reads and control
@@ -1045,6 +1105,15 @@ impl RunHandle {
             } => {
                 state.run.state = *run_state;
                 state.run.updated_at = Timestamp::now();
+                if !matches!(
+                    run_state,
+                    AgentRunState::AwaitingApproval | AgentRunState::Paused
+                ) {
+                    state.pending_approval = None;
+                }
+                if !matches!(run_state, AgentRunState::NeedsInput | AgentRunState::Paused) {
+                    state.pending_input = None;
+                }
                 let checkpoint_retry_transition = *run_state == AgentRunState::Planning
                     && state.attempts.iter().any(|attempt| {
                         attempt.id == state.run.attempt_id && attempt.completed_at.is_some()
@@ -1091,6 +1160,15 @@ impl RunHandle {
                 state.pending_input = None;
                 state.run.attempt_id = *attempt_id;
                 state.run.control_revision = *control_revision;
+            }
+            AgentEvent::ToolCallStarted { call, .. } => {
+                if state
+                    .pending_tool_execution
+                    .as_ref()
+                    .is_some_and(|pending| pending.id == call.id)
+                {
+                    state.pending_tool_execution = None;
+                }
             }
             AgentEvent::ActivityRecorded { activity, .. } => {
                 if let Some(existing) = state
@@ -2141,6 +2219,17 @@ impl InProcessBackend {
                         false,
                     )
                 })?;
+            let execution_state =
+                persistence
+                    .load_run_execution_state(run_id)?
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::RecoveryRequired,
+                            format!("persisted run {run_id} has no typed execution state"),
+                            true,
+                        )
+                    })?;
+            hydrate_runtime_execution_state(&mut runtime_state, execution_state)?;
             runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
             runtime_state.activities = persistence.load_run_activities(run_id)?;
             runtime_state.attempts = persistence.load_run_attempts(run_id)?;
@@ -2231,6 +2320,7 @@ impl InProcessBackend {
                         snapshot: summary.snapshot.clone(),
                         usage: summary.usage.clone(),
                         attempts: None,
+                        execution_state: None,
                         interactions: None,
                     },
                 )
@@ -2243,6 +2333,7 @@ impl InProcessBackend {
                     snapshot: state.run.clone(),
                     usage: state.usage.clone(),
                     attempts: Some(state.attempts.clone()),
+                    execution_state: Some(execution_state_from_runtime(state)?),
                     interactions: Some(state.interactions.clone()),
                 },
             );
@@ -2255,6 +2346,15 @@ impl InProcessBackend {
                 durable_run_messages
                     .insert(run_id, durable_run_messages_from_runtime(&state.messages));
                 state.messages.clear();
+                state.pending_tool_execution = None;
+                state.pending_approval = None;
+                state.pending_input = None;
+                state.last_failed_call = None;
+                state.next_message_id = 0;
+                state.active_message_id = None;
+                state.provider_cursor = 0;
+                state.step_id = None;
+                state.step_index = 0;
                 durable_run_activities.insert(run_id, std::mem::take(&mut state.activities));
                 state.attempts.clear();
                 state.interactions.clear();
@@ -2831,6 +2931,19 @@ impl InProcessConnection {
                     true,
                 )
             })?;
+        let execution_state = persistence
+            .load_run_execution_state(summary.snapshot.id)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!(
+                        "persisted run {} has no typed execution state",
+                        summary.snapshot.id
+                    ),
+                    true,
+                )
+            })?;
+        hydrate_runtime_execution_state(&mut state, execution_state)?;
         state.messages =
             persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
         state.activities = persistence.load_run_activities(summary.snapshot.id)?;
@@ -5644,12 +5757,14 @@ mod tests {
         connection: &InProcessConnection,
         run_id: loom_core::RunId,
     ) -> loom_agent::AgentRunSnapshot {
+        let mut last_snapshot = None;
         for _ in 0..1_000 {
             let response =
                 connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
             let Ok(ServerResponse::AgentRun(snapshot)) = response.result else {
                 panic!("unexpected run response");
             };
+            last_snapshot = Some(snapshot.clone());
             if !matches!(
                 snapshot.state,
                 AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
@@ -5658,7 +5773,13 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        panic!("agent run did not settle");
+        let failure = connection
+            .backend
+            .runs()
+            .ok()
+            .and_then(|runs| runs.get(&run_id).cloned())
+            .and_then(|handle| handle.failure());
+        panic!("agent run did not settle: {last_snapshot:?}; failure: {failure:?}");
     }
 
     fn workspace() -> PathBuf {

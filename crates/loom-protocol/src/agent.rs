@@ -51,6 +51,24 @@ pub struct AgentRunAttemptRecord {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentExecutionStateRecord {
+    pub run_id: RunId,
+    pub session_id: AgentSessionId,
+    pub attempt_id: RunAttemptId,
+    pub control_revision: u64,
+    pub state: AgentRunState,
+    pub step_id: Option<StepId>,
+    pub step_index: u32,
+    pub provider_cursor: u64,
+    pub next_message_id: u64,
+    pub active_message_id: Option<u64>,
+    pub pending_tool_execution: Option<ToolCall>,
+    pub pending_approval: Option<ToolCall>,
+    pub pending_input: Option<String>,
+    pub last_failed_call: Option<ToolCall>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentPlan {
     pub steps: Vec<AgentPlanStep>,
 }

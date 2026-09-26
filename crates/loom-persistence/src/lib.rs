@@ -15,9 +15,10 @@ use loom_core::{
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
-    AgentInteractionKind, AgentInteractionRecord, AgentInteractionStatus, AgentRunAttemptRecord,
-    AgentRunSnapshot, AgentRunState, ApprovalDecision, Checkpoint, CheckpointFile,
-    ServerEventEnvelope, WorkspaceConfig, WorkspaceControl,
+    AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
+    AgentInteractionStatus, AgentRunAttemptRecord, AgentRunSnapshot, AgentRunState,
+    ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope, WorkspaceConfig,
+    WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -27,8 +28,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 22;
-const DATABASE_SCHEMA_VERSION: u32 = 22;
+pub const CURRENT_SCHEMA_VERSION: u32 = 23;
+const DATABASE_SCHEMA_VERSION: u32 = 23;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -98,6 +99,38 @@ CREATE TABLE IF NOT EXISTS run_attempts (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS run_attempts_by_session
     ON run_attempts(session_id, run_id, attempt_number DESC);
+CREATE TABLE IF NOT EXISTS run_execution_state (
+    run_id BLOB PRIMARY KEY NOT NULL,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+    control_revision INTEGER NOT NULL CHECK(control_revision >= 0),
+    state TEXT NOT NULL CHECK(state IN (
+        'planning', 'executing', 'awaiting_approval', 'paused', 'needs_input',
+        'evaluating', 'completed', 'failed', 'cancelled'
+    )),
+    step_id BLOB CHECK(step_id IS NULL OR length(step_id) = 16),
+    step_index INTEGER NOT NULL CHECK(step_index >= 0),
+    provider_cursor INTEGER NOT NULL CHECK(provider_cursor >= 0),
+    next_message_id INTEGER NOT NULL CHECK(next_message_id >= 0),
+    active_message_id INTEGER CHECK(active_message_id IS NULL OR active_message_id >= 0),
+    pending_tool_execution TEXT CHECK(
+        pending_tool_execution IS NULL OR length(pending_tool_execution) <= 1048576
+    ),
+    pending_approval TEXT CHECK(
+        pending_approval IS NULL OR length(pending_approval) <= 1048576
+    ),
+    pending_input TEXT CHECK(pending_input IS NULL OR length(pending_input) <= 65536),
+    last_failed_call TEXT CHECK(last_failed_call IS NULL OR length(last_failed_call) <= 1048576),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY(run_id, attempt_id)
+        REFERENCES run_attempts(run_id, attempt_id) ON DELETE CASCADE,
+    CHECK(pending_tool_execution IS NULL OR state IN ('executing', 'evaluating')),
+    CHECK(pending_approval IS NULL OR state IN ('awaiting_approval', 'paused')),
+    CHECK(pending_input IS NULL OR state IN ('needs_input', 'paused'))
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_execution_state_by_session
+    ON run_execution_state(session_id, state, run_id);
 CREATE TABLE IF NOT EXISTS run_interactions (
     run_id BLOB NOT NULL,
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -716,6 +749,7 @@ pub struct DurableRunSummary {
     pub snapshot: AgentRunSnapshot,
     pub usage: UsageSnapshot,
     pub attempts: Option<Vec<AgentRunAttemptRecord>>,
+    pub execution_state: Option<AgentExecutionStateRecord>,
     pub interactions: Option<Vec<AgentInteractionRecord>>,
 }
 
@@ -1489,6 +1523,7 @@ impl FilePersistence {
                     snapshot,
                     usage,
                     attempts: None,
+                    execution_state: None,
                     interactions: None,
                 },
             );
@@ -1558,6 +1593,135 @@ impl FilePersistence {
             });
         }
         Ok(attempts)
+    }
+
+    /// Loads the small continuation record needed to restore a run runtime.
+    pub fn load_run_execution_state(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<AgentExecutionStateRecord>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT session_id, attempt_id, control_revision, state, step_id, step_index,
+                        provider_cursor, next_message_id, active_message_id,
+                        pending_tool_execution, pending_approval, pending_input, last_failed_call
+                 FROM run_execution_state WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not read run execution state: {error}"), true)
+            })?;
+        let Some((
+            session_id,
+            attempt_id,
+            control_revision,
+            state,
+            step_id,
+            step_index,
+            provider_cursor,
+            next_message_id,
+            active_message_id,
+            pending_tool_execution,
+            pending_approval,
+            pending_input,
+            last_failed_call,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let decode_tool_call = |json: Option<String>| {
+            json.map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted execution tool call is invalid: {error}"),
+                        false,
+                    )
+                })
+            })
+            .transpose()
+        };
+        Ok(Some(AgentExecutionStateRecord {
+            run_id,
+            session_id: AgentSessionId::from_uuid(decode_uuid(
+                &session_id,
+                "execution-state session id",
+            )?),
+            attempt_id: RunAttemptId::from_uuid(decode_uuid(
+                &attempt_id,
+                "execution-state attempt id",
+            )?),
+            control_revision: u64::try_from(control_revision).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted execution control revision is negative",
+                    false,
+                )
+            })?,
+            state: parse_run_state(&state)?,
+            step_id: step_id
+                .as_deref()
+                .map(|id| decode_uuid(id, "execution-state step id"))
+                .transpose()?
+                .map(StepId::from_uuid),
+            step_index: u32::try_from(step_index).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted execution step index is out of range",
+                    false,
+                )
+            })?,
+            provider_cursor: u64::try_from(provider_cursor).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted provider cursor is out of range",
+                    false,
+                )
+            })?,
+            next_message_id: u64::try_from(next_message_id).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted next message id is out of range",
+                    false,
+                )
+            })?,
+            active_message_id: active_message_id
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted active message id is negative",
+                        false,
+                    )
+                })?,
+            pending_tool_execution: decode_tool_call(pending_tool_execution)?,
+            pending_approval: decode_tool_call(pending_approval)?,
+            pending_input,
+            last_failed_call: decode_tool_call(last_failed_call)?,
+        }))
     }
 
     /// Loads a run's approval and input interaction history independently of
@@ -2789,6 +2953,7 @@ impl FilePersistence {
         if let Some(run_summaries) = write.run_summaries {
             save_run_summary_rows(&transaction, run_summaries)?;
             save_run_attempt_rows(&transaction, run_summaries)?;
+            save_run_execution_state_rows(&transaction, run_summaries)?;
         }
         if let Some(run_activities) = write.run_activities {
             save_run_activity_rows(&transaction, run_activities)?;
@@ -4447,6 +4612,183 @@ fn save_run_summary_rows(
     Ok(())
 }
 
+fn save_run_execution_state_rows(
+    transaction: &Transaction<'_>,
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    for (run_id, summary) in summaries {
+        let Some(execution) = summary.execution_state.as_ref() else {
+            continue;
+        };
+        if execution.run_id != *run_id
+            || execution.session_id != summary.snapshot.session_id
+            || execution.attempt_id != summary.snapshot.attempt_id
+            || execution.control_revision != summary.snapshot.control_revision
+            || execution.state != summary.snapshot.state
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run execution identity and revision do not match its summary",
+                false,
+            ));
+        }
+        if execution
+            .pending_input
+            .as_ref()
+            .is_some_and(|input| input.len() > 65_536)
+            || (execution.pending_tool_execution.is_some()
+                && !matches!(
+                    execution.state,
+                    AgentRunState::Executing | AgentRunState::Evaluating
+                ))
+            || (execution.pending_approval.is_some()
+                && !matches!(
+                    execution.state,
+                    AgentRunState::AwaitingApproval | AgentRunState::Paused
+                ))
+            || (execution.pending_input.is_some()
+                && !matches!(
+                    execution.state,
+                    AgentRunState::NeedsInput | AgentRunState::Paused
+                ))
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!(
+                    "pending execution intent does not match run state {:?} (tool={}, approval={}, input={})",
+                    execution.state,
+                    execution.pending_tool_execution.is_some(),
+                    execution.pending_approval.is_some(),
+                    execution.pending_input.is_some()
+                ),
+                false,
+            ));
+        }
+        let encode_tool_call = |call: &Option<loom_model::ToolCall>| -> Result<Option<String>> {
+            call.as_ref()
+                .map(|call| {
+                    serde_json::to_string(call).map_err(|error| {
+                        persistence_error(
+                            format!("could not encode execution tool call: {error}"),
+                            false,
+                        )
+                    })
+                })
+                .transpose()
+        };
+        let pending_tool_execution = encode_tool_call(&execution.pending_tool_execution)?;
+        let pending_approval = encode_tool_call(&execution.pending_approval)?;
+        let last_failed_call = encode_tool_call(&execution.last_failed_call)?;
+        if [
+            pending_tool_execution.as_ref(),
+            pending_approval.as_ref(),
+            last_failed_call.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|call| call.len() > 1_048_576)
+        {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "execution tool call exceeds the maximum supported size",
+                false,
+            ));
+        }
+        let control_revision = i64::try_from(execution.control_revision).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "execution control revision is out of range",
+                false,
+            )
+        })?;
+        let step_index = i64::from(execution.step_index);
+        let provider_cursor = i64::try_from(execution.provider_cursor).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "provider cursor is out of range",
+                false,
+            )
+        })?;
+        let next_message_id = i64::try_from(execution.next_message_id).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "next message id is out of range",
+                false,
+            )
+        })?;
+        let active_message_id = execution
+            .active_message_id
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "active message id is out of range",
+                    false,
+                )
+            })?;
+        let step_id = execution.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
+        transaction
+            .execute(
+                "INSERT INTO run_execution_state(
+                    run_id, session_id, attempt_id, control_revision, state, step_id, step_index,
+                    provider_cursor, next_message_id, active_message_id, pending_tool_execution,
+                    pending_approval, pending_input, last_failed_call
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    attempt_id=excluded.attempt_id,
+                    control_revision=excluded.control_revision,
+                    state=excluded.state,
+                    step_id=excluded.step_id,
+                    step_index=excluded.step_index,
+                    provider_cursor=excluded.provider_cursor,
+                    next_message_id=excluded.next_message_id,
+                    active_message_id=excluded.active_message_id,
+                    pending_tool_execution=excluded.pending_tool_execution,
+                    pending_approval=excluded.pending_approval,
+                    pending_input=excluded.pending_input,
+                    last_failed_call=excluded.last_failed_call
+                 WHERE run_execution_state.session_id IS NOT excluded.session_id
+                    OR run_execution_state.attempt_id IS NOT excluded.attempt_id
+                    OR run_execution_state.control_revision IS NOT excluded.control_revision
+                    OR run_execution_state.state IS NOT excluded.state
+                    OR run_execution_state.step_id IS NOT excluded.step_id
+                    OR run_execution_state.step_index IS NOT excluded.step_index
+                    OR run_execution_state.provider_cursor IS NOT excluded.provider_cursor
+                    OR run_execution_state.next_message_id IS NOT excluded.next_message_id
+                    OR run_execution_state.active_message_id IS NOT excluded.active_message_id
+                    OR run_execution_state.pending_tool_execution IS NOT excluded.pending_tool_execution
+                    OR run_execution_state.pending_approval IS NOT excluded.pending_approval
+                    OR run_execution_state.pending_input IS NOT excluded.pending_input
+                    OR run_execution_state.last_failed_call IS NOT excluded.last_failed_call",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    execution.session_id.as_uuid().as_bytes().as_slice(),
+                    execution.attempt_id.as_uuid().as_bytes().as_slice(),
+                    control_revision,
+                    run_state_name(execution.state),
+                    step_id,
+                    step_index,
+                    provider_cursor,
+                    next_message_id,
+                    active_message_id,
+                    pending_tool_execution,
+                    pending_approval,
+                    execution.pending_input,
+                    last_failed_call,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save run execution state for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    Ok(())
+}
+
 fn save_run_attempt_rows(
     transaction: &Transaction<'_>,
     summaries: &BTreeMap<RunId, DurableRunSummary>,
@@ -6090,6 +6432,7 @@ mod tests {
                 ..UsageSnapshot::default()
             },
             attempts: None,
+            execution_state: None,
             interactions: None,
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
@@ -6501,6 +6844,7 @@ mod tests {
             },
             usage: UsageSnapshot::default(),
             attempts: None,
+            execution_state: None,
             interactions: None,
         };
         let run_summaries = BTreeMap::from([(run_id, summary)]);
@@ -6950,6 +7294,22 @@ mod tests {
             started_at: created_at,
             completed_at: None,
         };
+        let mut execution = AgentExecutionStateRecord {
+            run_id,
+            session_id: session.id,
+            attempt_id,
+            control_revision: 1,
+            state: AgentRunState::NeedsInput,
+            step_id: None,
+            step_index: 0,
+            provider_cursor: 0,
+            next_message_id: 2,
+            active_message_id: None,
+            pending_tool_execution: None,
+            pending_approval: None,
+            pending_input: Some(prompt.clone()),
+            last_failed_call: None,
+        };
         let mut interaction = AgentInteractionRecord {
             id: interaction_id,
             run_id,
@@ -6981,6 +7341,7 @@ mod tests {
             },
             usage: UsageSnapshot::default(),
             attempts: Some(vec![attempt.clone()]),
+            execution_state: Some(execution.clone()),
             interactions: Some(vec![interaction.clone()]),
         };
         let run_summaries = BTreeMap::from([(run_id, summary.clone())]);
@@ -7029,6 +7390,10 @@ mod tests {
             vec![attempt.clone()]
         );
         assert_eq!(
+            persistence.load_run_execution_state(run_id).unwrap(),
+            Some(execution.clone())
+        );
+        assert_eq!(
             persistence.load_run_interactions(run_id).unwrap(),
             vec![interaction.clone()]
         );
@@ -7042,6 +7407,16 @@ mod tests {
             state: AgentRunState::Executing,
             ..attempt.clone()
         }]);
+        execution.control_revision = 2;
+        execution.state = AgentRunState::Executing;
+        execution.next_message_id = 3;
+        execution.pending_input = None;
+        execution.pending_tool_execution = Some(loom_model::ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "write_file".to_owned(),
+            arguments: serde_json::json!({"path": "src/main.rs", "content": "new"}),
+        });
+        summary.execution_state = Some(execution.clone());
         summary.interactions = Some(vec![interaction.clone()]);
         let resolved_event = loom_protocol::ServerEventEnvelope {
             protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
@@ -7076,6 +7451,17 @@ mod tests {
             persistence.load_run_attempts(run_id).unwrap(),
             vec![attempt.clone()]
         );
+        assert_eq!(
+            persistence.load_run_execution_state(run_id).unwrap(),
+            Some(AgentExecutionStateRecord {
+                control_revision: 1,
+                state: AgentRunState::NeedsInput,
+                next_message_id: 2,
+                pending_input: Some(prompt.clone()),
+                pending_tool_execution: None,
+                ..execution.clone()
+            })
+        );
         let persisted_feed = persistence.load_feed_state().unwrap().unwrap();
         assert_eq!(persisted_feed.next_sequence, EventSequence::new(1));
         assert_eq!(persisted_feed.events, vec![input_event]);
@@ -7086,16 +7472,35 @@ mod tests {
             persistence.load_run_attempts(run_id).unwrap(),
             vec![AgentRunAttemptRecord {
                 state: AgentRunState::Executing,
-                ..attempt
+                ..attempt.clone()
             }]
         );
         assert_eq!(
+            persistence.load_run_execution_state(run_id).unwrap(),
+            Some(execution.clone())
+        );
+        assert_eq!(
             persistence.load_run_interactions(run_id).unwrap(),
-            vec![interaction]
+            vec![interaction.clone()]
         );
         let persisted_feed = persistence.load_feed_state().unwrap().unwrap();
         assert_eq!(persisted_feed.next_sequence, EventSequence::new(2));
         assert_eq!(persisted_feed.events.len(), 2);
+
+        summary.snapshot.state = AgentRunState::Evaluating;
+        summary.snapshot.updated_at = Timestamp::from_unix_millis(3_000);
+        summary.attempts = Some(vec![AgentRunAttemptRecord {
+            state: AgentRunState::Evaluating,
+            ..attempt.clone()
+        }]);
+        execution.state = AgentRunState::Evaluating;
+        summary.execution_state = Some(execution.clone());
+        let evaluating_summaries = BTreeMap::from([(run_id, summary)]);
+        save(&evaluating_summaries, &feed).unwrap();
+        assert_eq!(
+            persistence.load_run_execution_state(run_id).unwrap(),
+            Some(execution)
+        );
         fs::remove_file(path).unwrap();
     }
 

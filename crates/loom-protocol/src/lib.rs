@@ -23,8 +23,9 @@ pub use activity::{
     FileActivityOperation,
 };
 pub use agent::{
-    AgentEvent, AgentInteractionKind, AgentInteractionRecord, AgentInteractionStatus, AgentPlan,
-    AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot, AgentRunState, ApprovalDecision,
+    AgentEvent, AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
+    AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
+    AgentRunState, ApprovalDecision,
 };
 pub use context::{
     ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
