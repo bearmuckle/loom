@@ -111,10 +111,7 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |window, cx| {
-                    let view = cx.new(|_| view);
-                    cx.new(|cx| gpui_kit::component::Root::new(view, window, cx).bordered(false))
-                },
+                |_, cx| cx.new(|_| view),
             ) {
                 Ok(window) => window,
                 Err(error) => {
@@ -124,17 +121,11 @@ fn main() {
                 }
             };
             info!("Loom window opened");
-            if let Err(error) = window.update(cx, |root, window, cx| {
-                root.view()
-                    .clone()
-                    .downcast::<LoomView>()
-                    .unwrap()
-                    .update(cx, |view, cx| {
-                        view.reconnect_configured_worker_nodes(cx);
-                        view.observe_system_appearance(window, cx);
-                        view.select_theme(crate::state::ThemeChoice::System, window, cx);
-                        view.composer_focus_handle.focus(window, cx);
-                    });
+            if let Err(error) = window.update(cx, |view, window, cx| {
+                view.reconnect_configured_worker_nodes(cx);
+                view.observe_system_appearance(window, cx);
+                view.select_theme(crate::state::ThemeChoice::System, window, cx);
+                view.composer_focus_handle.focus(window, cx);
                 cx.activate(true);
             }) {
                 error!("failed to focus Loom composer: {error}");
