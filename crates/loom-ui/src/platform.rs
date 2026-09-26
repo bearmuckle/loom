@@ -144,7 +144,7 @@ impl PeerCredentialBackend for MemoryPeerCredentialBackend {
 
 #[derive(Clone, Debug)]
 pub(crate) struct UiOptions {
-    pub(crate) workspace: Option<PathBuf>,
+    pub(crate) project: Option<PathBuf>,
     pub(crate) task: String,
     pub(crate) demo: bool,
     pub(crate) model: ModelId,
@@ -159,7 +159,7 @@ impl UiOptions {
     where
         I: IntoIterator<Item = String>,
     {
-        let mut workspace = None;
+        let mut project = None;
         let mut task = "make a small repository change and validate it".to_owned();
         let mut demo = false;
         let mut model = env::var("LOOM_MODEL")
@@ -172,11 +172,11 @@ impl UiOptions {
         let mut args = args.into_iter().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
-                "--workspace" => {
+                "--project" => {
                     let value = args
                         .next()
-                        .ok_or_else(|| LoomError::invalid_request("--workspace requires a path"))?;
-                    workspace = Some(PathBuf::from(value));
+                        .ok_or_else(|| LoomError::invalid_request("--project requires a path"))?;
+                    project = Some(PathBuf::from(value));
                     demo = false;
                 }
                 "--task" => {
@@ -223,13 +223,13 @@ impl UiOptions {
                     demo = false;
                 }
                 "--demo" => {
-                    workspace = None;
+                    project = None;
                     demo = true;
                     model = ModelId::new("deterministic/demo");
                 }
                 "--help" | "-h" => {
                     return Err(LoomError::invalid_request(
-                        "usage: loom-ui [--workspace PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] [--remote URL] [--demo]",
+                        "usage: loom-ui [--project PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] [--remote URL] [--demo]",
                     ));
                 }
                 unknown => {
@@ -240,7 +240,7 @@ impl UiOptions {
             }
         }
         Ok(Self {
-            workspace,
+            project,
             task,
             demo,
             model,
@@ -253,21 +253,18 @@ impl UiOptions {
 }
 
 pub(crate) fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomError> {
-    if let Some(workspace) = &options.workspace {
-        let root = fs::canonicalize(workspace).map_err(|error| {
+    if let Some(project) = &options.project {
+        let root = fs::canonicalize(project).map_err(|error| {
             LoomError::new(
                 ErrorCode::WorkspaceAccessDenied,
-                format!(
-                    "could not open workspace '{}': {error}",
-                    workspace.display()
-                ),
+                format!("could not open project '{}': {error}", project.display()),
                 false,
             )
         })?;
         if !root.is_dir() {
             return Err(LoomError::new(
                 ErrorCode::WorkspaceAccessDenied,
-                format!("workspace '{}' is not a directory", root.display()),
+                format!("project '{}' is not a directory", root.display()),
                 false,
             ));
         }
@@ -359,7 +356,7 @@ mod tests {
     fn ui_options_allow_explicit_workspace_and_task() {
         let options = UiOptions::parse([
             "loom-ui".to_owned(),
-            "--workspace".to_owned(),
+            "--project".to_owned(),
             "/tmp/project".to_owned(),
             "--task".to_owned(),
             "fix the agent flow".to_owned(),
@@ -371,7 +368,7 @@ mod tests {
             "ws://127.0.0.1:8080/ws".to_owned(),
         ])
         .unwrap();
-        assert_eq!(options.workspace, Some(PathBuf::from("/tmp/project")));
+        assert_eq!(options.project, Some(PathBuf::from("/tmp/project")));
         assert_eq!(options.task, "fix the agent flow");
         assert_eq!(options.model.as_str(), "gpt-4o-mini");
         assert_eq!(
@@ -385,7 +382,7 @@ mod tests {
     #[test]
     fn ui_options_reject_missing_empty_and_unknown_arguments() {
         for args in [
-            vec!["--workspace"],
+            vec!["--project"],
             vec!["--task"],
             vec!["--task", "   "],
             vec!["--model"],
@@ -414,19 +411,19 @@ mod tests {
         let root = env::temp_dir().join(format!("loom-ui-platform-{}", WorkspaceId::new()));
         fs::create_dir_all(&root).unwrap();
         let mut options = UiOptions::parse(["loom-ui".to_owned()]).unwrap();
-        options.workspace = Some(root.clone());
+        options.project = Some(root.clone());
         let (resolved, demo) = prepare_workspace(&options).unwrap();
         assert_eq!(resolved, fs::canonicalize(&root).unwrap());
         assert!(!demo);
 
-        options.workspace = Some(root.join("missing"));
+        options.project = Some(root.join("missing"));
         assert_eq!(
             prepare_workspace(&options).unwrap_err().code,
             ErrorCode::WorkspaceAccessDenied
         );
         let file = root.join("not-a-directory");
         fs::write(&file, "file").unwrap();
-        options.workspace = Some(file);
+        options.project = Some(file);
         assert_eq!(
             prepare_workspace(&options).unwrap_err().code,
             ErrorCode::WorkspaceAccessDenied

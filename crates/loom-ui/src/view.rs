@@ -1584,7 +1584,7 @@ impl LoomView {
             info!("remote transport connected; negotiating protocol");
             negotiate(&connection)?;
             let workspace_root = options
-                .workspace
+                .project
                 .clone()
                 .map(fs::canonicalize)
                 .transpose()
@@ -9946,7 +9946,7 @@ mod loom_view_render_tests {
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
             let options = |remote: &str, token: Option<&str>| super::UiOptions {
-                workspace: None,
+                project: None,
                 task: "startup validation".to_owned(),
                 demo: false,
                 model: ModelId::new("deterministic/demo"),
@@ -9983,7 +9983,7 @@ mod loom_view_render_tests {
             let invalid_workspace =
                 std::env::temp_dir().join(format!("loom-ui-missing-{}", uuid::Uuid::new_v4()));
             let local_options = super::UiOptions {
-                workspace: Some(invalid_workspace),
+                project: Some(invalid_workspace),
                 task: "startup validation".to_owned(),
                 demo: false,
                 model: ModelId::new("deterministic/demo"),
@@ -10010,7 +10010,7 @@ mod loom_view_render_tests {
         cx.update(gpui_kit::init);
         let _handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
             let options = super::UiOptions {
-                workspace: None,
+                project: None,
                 task: "bootstrap test".to_owned(),
                 demo: false,
                 model: ModelId::new("deterministic/demo"),
