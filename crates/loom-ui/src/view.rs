@@ -9443,6 +9443,176 @@ mod session_name_tests {
 }
 
 #[cfg(test)]
+mod display_helper_tests {
+    use super::{
+        AgentActivityData, AgentActivityRecord, AgentActivityStatus, FileActivityOperation,
+        activity_label, activity_marker, activity_output, activity_turn_title, change_kind_label,
+        format_bytes, format_duration, format_percentage, run_state_label, session_state_label,
+    };
+    use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
+    use loom_model::{ModelId, ToolCall};
+    use loom_protocol::{AgentActivityKind, AgentRunState};
+    use serde_json::json;
+
+    fn activity(data: AgentActivityData) -> AgentActivityRecord {
+        AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id: RunId::new(),
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::ToolCall,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::from_unix_millis(0),
+            completed_at: None,
+            elapsed_ms: None,
+            data,
+        }
+    }
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: name.to_owned(),
+            arguments: json!({"path":"src/lib.rs"}),
+        }
+    }
+
+    #[test]
+    fn resource_and_duration_labels_handle_missing_and_boundary_values() {
+        assert_eq!(format_bytes(None), "n/a");
+        assert_eq!(format_bytes(Some(1024)), "1.0 KiB");
+        assert_eq!(format_bytes(Some(1 << 20)), "1.0 MiB");
+        assert_eq!(format_bytes(Some(1 << 30)), "1.0 GiB");
+        assert_eq!(format_percentage(None), "n/a");
+        assert_eq!(format_percentage(Some(100)), "100%");
+        assert_eq!(format_percentage(Some(101)), "n/a");
+        assert_eq!(format_duration(999), "999ms");
+        assert_eq!(format_duration(1_500), "1.5s");
+        assert_eq!(format_duration(61_000), "1m 1s");
+    }
+
+    #[test]
+    fn state_and_activity_labels_cover_every_status_and_activity_kind() {
+        let session_states = [
+            (AgentSessionState::Idle, "Ready"),
+            (AgentSessionState::Queued, "Queued"),
+            (AgentSessionState::Planning, "Planning"),
+            (AgentSessionState::AwaitingApproval, "Needs approval"),
+            (AgentSessionState::Paused, "Paused"),
+            (AgentSessionState::Executing, "Working"),
+            (AgentSessionState::Evaluating, "Reviewing"),
+            (AgentSessionState::NeedsInput, "Needs your input"),
+            (AgentSessionState::Completed, "Complete"),
+            (AgentSessionState::Failed, "Something went wrong"),
+            (AgentSessionState::Cancelled, "Cancelled"),
+            (AgentSessionState::Archived, "Archived"),
+        ];
+        for (state, label) in session_states {
+            assert_eq!(session_state_label(state), label);
+        }
+        assert_eq!(run_state_label(None), "Ready");
+        for (state, label) in [
+            (AgentRunState::Planning, "Planning"),
+            (AgentRunState::Executing, "Working"),
+            (AgentRunState::AwaitingApproval, "Needs approval"),
+            (AgentRunState::Paused, "Paused"),
+            (AgentRunState::NeedsInput, "Needs your input"),
+            (AgentRunState::Evaluating, "Reviewing"),
+            (AgentRunState::Completed, "Complete"),
+            (AgentRunState::Failed, "Something went wrong"),
+            (AgentRunState::Cancelled, "Cancelled"),
+        ] {
+            assert_eq!(run_state_label(Some(state)), label);
+        }
+        for (kind, label) in [
+            (loom_workspace::WorkspaceChangeKind::Created, "New"),
+            (loom_workspace::WorkspaceChangeKind::Deleted, "Removed"),
+            (loom_workspace::WorkspaceChangeKind::Modified, "Updated"),
+        ] {
+            assert_eq!(change_kind_label(kind), label);
+        }
+        for (status, marker) in [
+            (AgentActivityStatus::Started, "›"),
+            (AgentActivityStatus::Completed, "✓"),
+            (AgentActivityStatus::Failed, "×"),
+            (AgentActivityStatus::AwaitingApproval, "!"),
+            (AgentActivityStatus::AwaitingInput, "?"),
+            (AgentActivityStatus::Cancelled, "–"),
+        ] {
+            assert_eq!(activity_marker(status), marker);
+        }
+
+        let model = activity(AgentActivityData::ModelTurn {
+            model: ModelId::new("test-model"),
+        });
+        assert_eq!(
+            activity_label(&model),
+            ("Agent turn · test-model".to_owned(), None)
+        );
+        assert_eq!(activity_output(&model), None);
+
+        let tool = activity(AgentActivityData::ToolCall {
+            call: call("apply_patch"),
+            result: None,
+        });
+        assert_eq!(activity_label(&tool).0, "apply_patch");
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&tool)),
+            "Making changes"
+        );
+
+        let file = activity(AgentActivityData::File {
+            call: call("read_file"),
+            operation: FileActivityOperation::Read,
+            path: None,
+            result: None,
+        });
+        assert_eq!(activity_label(&file).0, "Read file");
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&file)),
+            "Inspecting the workspace"
+        );
+
+        let write = activity(AgentActivityData::File {
+            call: call("write_file"),
+            operation: FileActivityOperation::Write,
+            path: Some("src/main.rs".to_owned()),
+            result: None,
+        });
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&write)),
+            "Making changes"
+        );
+
+        let search = activity(AgentActivityData::Search {
+            call: call("search"),
+            query: "needle".to_owned(),
+            path: Some("src".to_owned()),
+            result: None,
+        });
+        assert!(activity_label(&search).1.unwrap().contains("in src"));
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&search)),
+            "Searching the codebase"
+        );
+
+        let command = activity(AgentActivityData::Command {
+            call: call("run"),
+            command: "cargo".to_owned(),
+            args: vec!["test".to_owned()],
+            cwd: Some("repo".to_owned()),
+            result: None,
+        });
+        assert_eq!(activity_label(&command).0, "Run command");
+        assert_eq!(
+            activity_turn_title(std::slice::from_ref(&command)),
+            "Running commands"
+        );
+        assert_eq!(activity_turn_title(&[]), "Working on the task");
+    }
+}
+
+#[cfg(test)]
 mod session_header_render_tests {
     use super::{header_tooltip, session_header_actions, session_header_title};
     use gpui_kit::component::button::Button;

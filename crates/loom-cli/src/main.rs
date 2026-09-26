@@ -1249,3 +1249,98 @@ const fn run_state_name(state: AgentRunState) -> &'static str {
         AgentRunState::Cancelled => "cancelled",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
+        values.iter().map(|value| (*value).to_owned())
+    }
+
+    fn parse_error(values: &[&str]) -> super::LoomError {
+        parse_args(arguments(values))
+            .err()
+            .expect("arguments should be rejected")
+    }
+
+    #[test]
+    fn parser_keeps_defaults_and_accepts_separate_and_equals_values() {
+        let defaults = parse_args(arguments(&[])).unwrap().unwrap();
+        assert_eq!(defaults.name, "M1 demo");
+        assert_eq!(defaults.model.as_str(), "deterministic/demo");
+        assert_eq!(defaults.bind.to_string(), "127.0.0.1:8765");
+        assert!(!defaults.serve);
+
+        let options = parse_args(arguments(&[
+            "--name",
+            "separate",
+            "--task=inline task",
+            "--model",
+            "model-z",
+            "--root=/tmp/work",
+            "--persistence",
+            "/tmp/loom.db",
+            "--bind=0.0.0.0:9",
+            "--token",
+            "secret",
+            "--login=github-copilot",
+            "--manual-approval",
+            "--m2-demo",
+            "--m3-demo",
+            "--m4-demo",
+            "--serve",
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.name, "separate");
+        assert_eq!(options.task, "inline task");
+        assert_eq!(options.model.as_str(), "model-z");
+        assert_eq!(options.root.unwrap().to_str(), Some("/tmp/work"));
+        assert_eq!(options.persistence.unwrap().to_str(), Some("/tmp/loom.db"));
+        assert_eq!(options.bind.to_string(), "0.0.0.0:9");
+        assert_eq!(options.token.as_deref(), Some("secret"));
+        assert_eq!(options.login_provider.as_deref(), Some("github-copilot"));
+        assert!(options.manual_approval && options.m2_demo && options.m3_demo);
+        assert!(options.m4_demo && options.serve);
+    }
+
+    #[test]
+    fn parser_rejects_missing_values_invalid_bind_and_unknown_arguments() {
+        for flag in [
+            "--name",
+            "--task",
+            "--model",
+            "--root",
+            "--bind",
+            "--token",
+            "--login",
+            "--persistence",
+        ] {
+            let error = parse_error(&[flag]);
+            assert!(
+                error.message.contains("requires a value"),
+                "{flag}: {error}"
+            );
+        }
+        for bind in ["bad", "--bind=bad"] {
+            let error = parse_error(&["--bind", bind]);
+            assert!(error.message.contains("socket address"));
+        }
+        assert!(
+            parse_error(&["--mystery"])
+                .message
+                .contains("unknown argument")
+        );
+    }
+
+    #[test]
+    fn help_short_circuits_argument_parsing() {
+        assert!(
+            parse_args(arguments(&["--help", "--invalid"]))
+                .unwrap()
+                .is_none()
+        );
+        assert!(parse_args(arguments(&["-h"])).unwrap().is_none());
+    }
+}

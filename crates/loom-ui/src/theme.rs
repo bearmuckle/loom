@@ -418,8 +418,10 @@ mod tests {
     use super::{
         DANGER_SURFACE, DANGER_SURFACE_LATTE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
         ERROR_CARD_SURFACE, INFO_SURFACE, INFO_SURFACE_LATTE, SUCCESS_SURFACE,
-        SUCCESS_SURFACE_LATTE, WARNING_SURFACE, WARNING_SURFACE_LATTE,
+        SUCCESS_SURFACE_LATTE, WARNING_SURFACE, WARNING_SURFACE_LATTE, change_color, latte_theme,
+        mocha_theme, resize_edge,
     };
+    use gpui_kit::{ResizeEdge, point, px, size};
 
     fn luminance(value: f32) -> f32 {
         if value <= 0.04045 {
@@ -461,5 +463,57 @@ mod tests {
         assert!(contrast_ratio(0xb01234, DANGER_SURFACE_LATTE) >= 4.5);
         assert!(contrast_ratio(0x8a5a00, WARNING_SURFACE_LATTE) >= 4.5);
         assert!(contrast_ratio(0x7733d1, INFO_SURFACE_LATTE) >= 4.5);
+    }
+
+    #[test]
+    fn theme_configs_define_distinct_dark_and_light_palettes() {
+        let mocha = mocha_theme();
+        let latte = latte_theme();
+        assert_eq!(mocha.name, "Loom Mocha");
+        assert_eq!(mocha.mode, gpui_kit::component::ThemeMode::Dark);
+        assert_eq!(latte.name, "Loom Latte");
+        assert_eq!(latte.mode, gpui_kit::component::ThemeMode::Light);
+        assert_eq!(mocha.colors.background.as_deref(), Some("#1e1e2e"));
+        assert_eq!(latte.colors.background.as_deref(), Some("#eff1f5"));
+        assert_eq!(mocha.colors.primary.as_deref(), Some("#89b4fa"));
+        assert_eq!(latte.colors.primary.as_deref(), Some("#1e66f5"));
+        assert_eq!(mocha.colors.success.as_deref(), Some("#a6e3a1"));
+        assert_eq!(latte.colors.success.as_deref(), Some("#2c7025"));
+    }
+
+    #[test]
+    fn resize_edges_cover_corners_sides_and_interior() {
+        let inset = px(10.);
+        let bounds = size(px(100.), px(80.));
+        let points = [
+            (point(px(1.), px(1.)), Some(ResizeEdge::TopLeft)),
+            (point(px(99.), px(1.)), Some(ResizeEdge::TopRight)),
+            (point(px(50.), px(1.)), Some(ResizeEdge::Top)),
+            (point(px(1.), px(79.)), Some(ResizeEdge::BottomLeft)),
+            (point(px(99.), px(79.)), Some(ResizeEdge::BottomRight)),
+            (point(px(50.), px(79.)), Some(ResizeEdge::Bottom)),
+            (point(px(1.), px(40.)), Some(ResizeEdge::Left)),
+            (point(px(99.), px(40.)), Some(ResizeEdge::Right)),
+            (point(px(50.), px(40.)), None),
+        ];
+        for (position, expected) in points {
+            assert_eq!(resize_edge(position, inset, bounds), expected);
+        }
+    }
+
+    #[test]
+    fn workspace_change_colors_keep_their_semantic_defaults() {
+        assert_eq!(
+            change_color(loom_workspace::WorkspaceChangeKind::Created),
+            gpui_kit::rgb(0x9ad7bd)
+        );
+        assert_eq!(
+            change_color(loom_workspace::WorkspaceChangeKind::Deleted),
+            gpui_kit::rgb(0xfca5a5)
+        );
+        assert_eq!(
+            change_color(loom_workspace::WorkspaceChangeKind::Modified),
+            gpui_kit::rgb(0xfef3c7)
+        );
     }
 }
