@@ -18,8 +18,8 @@ use loom_core::{
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableProviderState, DurableSessionSettings,
-    DurableStateWrite, FilePersistence,
+    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableIdempotencyRecord, DurableProviderState,
+    DurableSessionSettings, DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -599,6 +599,7 @@ fn default_event_retention() -> usize {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct IdempotencyRecord {
+    created_at: Timestamp,
     request: ClientRequest,
     response: ResponseEnvelope,
 }
@@ -1635,8 +1636,21 @@ impl InProcessBackend {
             provider_configs: persistence.load_provider_configs()?,
             provider_health: persistence.load_provider_health()?,
             workspace_configs: persistence.load_workspace_configs()?,
-            provider_usage: from_json(required("provider_usage")?)?,
-            idempotency: from_json(required("idempotency")?)?,
+            provider_usage: persistence.load_provider_usage()?,
+            idempotency: persistence
+                .load_idempotency_records()?
+                .into_iter()
+                .map(|(id, record)| {
+                    Ok((
+                        id,
+                        IdempotencyRecord {
+                            created_at: record.created_at,
+                            request: from_json(record.request)?,
+                            response: from_json(record.response)?,
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
         };
         let _: Vec<ModelDescriptor> = from_json(required("models")?)?;
         let sessions = SessionManager::from_state(state.sessions)?;
@@ -1874,11 +1888,22 @@ impl InProcessBackend {
             health: self.providers.export_health()?,
         };
         let workspace_records = self.workspace_records()?.export_state();
-        let sections = [
-            ("provider_usage", json_value(self.providers.usage()?)?),
-            ("models", json_value(self.models.clone())?),
-            ("idempotency", json_value(self.idempotency()?.clone())?),
-        ];
+        let provider_usage = self.providers.usage()?;
+        let idempotency = self
+            .idempotency()?
+            .iter()
+            .map(|(id, record)| {
+                Ok((
+                    *id,
+                    DurableIdempotencyRecord {
+                        created_at: record.created_at,
+                        request: json_value(&record.request)?,
+                        response: json_value(&record.response)?,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let sections = [("models", json_value(self.models.clone())?)];
         let result = persistence.save_state(DurableStateWrite {
             schema_version: CURRENT_SCHEMA_VERSION,
             sessions: &sessions,
@@ -1886,6 +1911,8 @@ impl InProcessBackend {
             settings: Some(&session_settings),
             workspace_configs: Some(&workspace_configs),
             providers: Some(&provider_state),
+            usage: Some(&provider_usage),
+            idempotency: Some(&idempotency),
             records: &entity_sections,
             feed: Some(&feed),
             sections: &sections,
@@ -2073,9 +2100,20 @@ impl InProcessBackend {
         response: ResponseEnvelope,
     ) -> Result<()> {
         let mut cache = self.idempotency()?;
-        cache.insert(request_id, IdempotencyRecord { request, response });
+        cache.insert(
+            request_id,
+            IdempotencyRecord {
+                created_at: Timestamp::now(),
+                request,
+                response,
+            },
+        );
         while cache.len() > IDEMPOTENCY_RETENTION {
-            let Some(first) = cache.keys().next().copied() else {
+            let Some(first) = cache
+                .iter()
+                .min_by_key(|(_, record)| record.created_at)
+                .map(|(id, _)| *id)
+            else {
                 break;
             };
             cache.remove(&first);

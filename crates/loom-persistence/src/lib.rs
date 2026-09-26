@@ -9,11 +9,11 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ErrorCode,
-    EventSequence, LoomError, Result, Timestamp, WorkspaceId, WorkspaceRecord,
+    EventSequence, LoomError, RequestId, Result, Timestamp, WorkspaceId, WorkspaceRecord,
 };
-use loom_model::{ProviderHealth, ProviderId};
+use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{ServerEventEnvelope, WorkspaceConfig};
-use loom_providers::ProviderConfig;
+use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Serialize, de::DeserializeOwned};
@@ -21,12 +21,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
-const DATABASE_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 12;
+const DATABASE_SCHEMA_VERSION: u32 = 12;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DURABLE_FEED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
+const MAX_IDEMPOTENCY_PAYLOAD_BYTES: usize = 1024 * 1024;
 
 const DATABASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS session_store_meta (
@@ -76,6 +78,25 @@ CREATE TABLE IF NOT EXISTS provider_health (
     provider_id TEXT PRIMARY KEY NOT NULL CHECK(length(trim(provider_id)) > 0),
     health TEXT NOT NULL CHECK(length(health) <= 16384)
 ) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS provider_usage_totals (
+    provider_id TEXT NOT NULL CHECK(length(trim(provider_id)) > 0),
+    model_id TEXT NOT NULL CHECK(length(trim(model_id)) > 0),
+    requests INTEGER NOT NULL CHECK(requests >= 0),
+    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
+    cost_micros INTEGER NOT NULL CHECK(cost_micros >= 0),
+    PRIMARY KEY(provider_id, model_id)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS idempotency_records (
+    request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id) = 16),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
+    request TEXT NOT NULL CHECK(length(request) <= 1048576),
+    response TEXT NOT NULL CHECK(length(response) <= 1048576)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS idempotency_expiry
+    ON idempotency_records(created_at, request_id);
 CREATE TABLE IF NOT EXISTS feed_store_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     next_sequence INTEGER NOT NULL CHECK(next_sequence >= 0),
@@ -360,6 +381,13 @@ pub struct DurableProviderState {
     pub health: BTreeMap<ProviderId, ProviderHealth>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DurableIdempotencyRecord {
+    pub created_at: Timestamp,
+    pub request: Value,
+    pub response: Value,
+}
+
 pub struct DurableStateWrite<'a> {
     pub schema_version: u32,
     pub sessions: &'a SessionManagerState,
@@ -367,6 +395,8 @@ pub struct DurableStateWrite<'a> {
     pub settings: Option<&'a DurableSessionSettings>,
     pub workspace_configs: Option<&'a BTreeMap<WorkspaceId, WorkspaceConfig>>,
     pub providers: Option<&'a DurableProviderState>,
+    pub usage: Option<&'a UsageLedger>,
+    pub idempotency: Option<&'a BTreeMap<RequestId, DurableIdempotencyRecord>>,
     pub records: &'a [(String, Value)],
     pub feed: Option<&'a DurableFeedState>,
     pub sections: &'a [(&'a str, Value)],
@@ -889,6 +919,138 @@ impl FilePersistence {
         Ok(health)
     }
 
+    pub fn load_provider_usage(&self) -> Result<UsageLedger> {
+        if !self.path.exists() {
+            return Ok(UsageLedger::default());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT provider_id, model_id, requests, input_tokens, output_tokens,
+                        cached_input_tokens, cost_micros
+                 FROM provider_usage_totals ORDER BY provider_id, model_id",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare provider usage totals: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read provider usage totals: {error}"),
+                    true,
+                )
+            })?;
+        let mut ledger = UsageLedger::default();
+        for row in rows {
+            let (provider_id, model_id, requests, input, output, cached, cost) =
+                row.map_err(|error| {
+                    persistence_error(
+                        format!("could not read provider usage totals: {error}"),
+                        true,
+                    )
+                })?;
+            ledger.aggregates.insert(
+                ProviderUsageKey {
+                    provider: ProviderId::new(provider_id),
+                    model: ModelId::new(model_id),
+                },
+                ProviderUsageSummary {
+                    requests: decode_counter(requests, "provider request count")?,
+                    input_tokens: decode_counter(input, "provider input token count")?,
+                    output_tokens: decode_counter(output, "provider output token count")?,
+                    cached_input_tokens: decode_counter(cached, "cached input token count")?,
+                    cost_micros: decode_counter(cost, "provider usage cost")?,
+                },
+            );
+        }
+        Ok(ledger)
+    }
+
+    pub fn load_idempotency_records(
+        &self,
+    ) -> Result<BTreeMap<RequestId, DurableIdempotencyRecord>> {
+        if !self.path.exists() {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT request_id, created_at, request_hash, request, response
+                 FROM idempotency_records ORDER BY created_at, request_id",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare idempotency records: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read idempotency records: {error}"), true)
+            })?;
+        let mut records = BTreeMap::new();
+        for row in rows {
+            let (id, created_at, request_hash, request, response) = row.map_err(|error| {
+                persistence_error(format!("could not read idempotency records: {error}"), true)
+            })?;
+            let id = RequestId::from_uuid(decode_uuid(&id, "request id")?);
+            let actual_hash = Sha256::digest(request.as_bytes());
+            if actual_hash.as_slice() != request_hash {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted idempotency request failed its hash check",
+                    false,
+                ));
+            }
+            let request = serde_json::from_str(&request).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted idempotency request is malformed: {error}"),
+                    false,
+                )
+            })?;
+            let response = serde_json::from_str(&response).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted idempotency response is malformed: {error}"),
+                    false,
+                )
+            })?;
+            records.insert(
+                id,
+                DurableIdempotencyRecord {
+                    created_at: decode_timestamp(created_at)?,
+                    request,
+                    response,
+                },
+            );
+        }
+        Ok(records)
+    }
+
     /// Loads the bounded reconnect feed from sequence-indexed records.
     pub fn load_feed_state(&self) -> Result<Option<DurableFeedState>> {
         if !self.path.exists() {
@@ -1074,6 +1236,8 @@ impl FilePersistence {
             settings: None,
             workspace_configs: None,
             providers: None,
+            usage: None,
+            idempotency: None,
             records,
             feed,
             sections,
@@ -1097,6 +1261,8 @@ impl FilePersistence {
             settings: None,
             workspace_configs: None,
             providers: None,
+            usage: None,
+            idempotency: None,
             records,
             feed,
             sections,
@@ -1125,6 +1291,12 @@ impl FilePersistence {
         if let Some(providers) = write.providers {
             save_provider_config_rows(&transaction, &providers.configs)?;
             save_provider_health_rows(&transaction, &providers.health)?;
+        }
+        if let Some(usage) = write.usage {
+            save_usage_totals(&transaction, usage)?;
+        }
+        if let Some(idempotency) = write.idempotency {
+            save_idempotency_rows(&transaction, idempotency)?;
         }
         if let Some(feed) = write.feed {
             save_feed_rows(&transaction, feed)?;
@@ -1793,6 +1965,193 @@ fn save_provider_health_rows(
     )
 }
 
+fn save_usage_totals(transaction: &Transaction<'_>, ledger: &UsageLedger) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_usage_totals (
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                PRIMARY KEY(provider_id, model_id)
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_usage_totals;",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not stage provider usage totals: {error}"),
+                true,
+            )
+        })?;
+    for (key, summary) in &ledger.aggregates {
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_usage_totals(provider_id, model_id) VALUES (?1, ?2)",
+                params![key.provider.as_str(), key.model.as_str()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not stage provider usage totals: {error}"),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO provider_usage_totals(
+                    provider_id, model_id, requests, input_tokens, output_tokens,
+                    cached_input_tokens, cost_micros
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(provider_id, model_id) DO UPDATE SET
+                    requests=excluded.requests,
+                    input_tokens=excluded.input_tokens,
+                    output_tokens=excluded.output_tokens,
+                    cached_input_tokens=excluded.cached_input_tokens,
+                    cost_micros=excluded.cost_micros
+                 WHERE provider_usage_totals.requests IS NOT excluded.requests
+                    OR provider_usage_totals.input_tokens IS NOT excluded.input_tokens
+                    OR provider_usage_totals.output_tokens IS NOT excluded.output_tokens
+                    OR provider_usage_totals.cached_input_tokens IS NOT excluded.cached_input_tokens
+                    OR provider_usage_totals.cost_micros IS NOT excluded.cost_micros",
+                params![
+                    key.provider.as_str(),
+                    key.model.as_str(),
+                    encode_counter(summary.requests, "provider request count")?,
+                    encode_counter(summary.input_tokens, "provider input token count")?,
+                    encode_counter(summary.output_tokens, "provider output token count")?,
+                    encode_counter(summary.cached_input_tokens, "cached input token count")?,
+                    encode_counter(summary.cost_micros, "provider usage cost")?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save provider usage totals: {error}"),
+                    true,
+                )
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM provider_usage_totals
+             WHERE NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_usage_totals wanted
+                WHERE wanted.provider_id=provider_usage_totals.provider_id
+                  AND wanted.model_id=provider_usage_totals.model_id
+             )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prune provider usage totals: {error}"),
+                true,
+            )
+        })?;
+    Ok(())
+}
+
+fn save_idempotency_rows(
+    transaction: &Transaction<'_>,
+    records: &BTreeMap<RequestId, DurableIdempotencyRecord>,
+) -> Result<()> {
+    if records.len() > MAX_IDEMPOTENCY_RECORDS {
+        return Err(LoomError::new(
+            ErrorCode::Persistence,
+            "idempotency cache exceeds its configured record limit",
+            false,
+        ));
+    }
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_idempotency (
+                request_id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_idempotency;",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not stage idempotency records: {error}"),
+                true,
+            )
+        })?;
+    for (id, record) in records {
+        let request = serde_json::to_string(&record.request).map_err(|error| {
+            persistence_error(
+                format!("could not encode idempotency request: {error}"),
+                false,
+            )
+        })?;
+        let response = serde_json::to_string(&record.response).map_err(|error| {
+            persistence_error(
+                format!("could not encode idempotency response: {error}"),
+                false,
+            )
+        })?;
+        if request.len() > MAX_IDEMPOTENCY_PAYLOAD_BYTES
+            || response.len() > MAX_IDEMPOTENCY_PAYLOAD_BYTES
+        {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "idempotency request or response exceeds the maximum supported size",
+                false,
+            ));
+        }
+        let id_bytes = id.as_uuid().as_bytes();
+        let request_hash = Sha256::digest(request.as_bytes());
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_idempotency(request_id) VALUES (?1)",
+                [id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not stage idempotency records: {error}"),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO idempotency_records(
+                    request_id, created_at, request_hash, request, response
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(request_id) DO UPDATE SET
+                    created_at=excluded.created_at,
+                    request_hash=excluded.request_hash,
+                    request=excluded.request,
+                    response=excluded.response
+                 WHERE idempotency_records.created_at IS NOT excluded.created_at
+                    OR idempotency_records.request_hash IS NOT excluded.request_hash
+                    OR idempotency_records.request IS NOT excluded.request
+                    OR idempotency_records.response IS NOT excluded.response",
+                params![
+                    id_bytes.as_slice(),
+                    encode_timestamp(record.created_at)?,
+                    request_hash.as_slice(),
+                    request,
+                    response,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save idempotency record {id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM idempotency_records
+             WHERE NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_idempotency wanted
+                WHERE wanted.request_id=idempotency_records.request_id
+             )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prune idempotency records: {error}"),
+                true,
+            )
+        })?;
+    Ok(())
+}
+
 fn save_provider_json_rows<'a, T, I>(
     transaction: &Transaction<'_>,
     table: &str,
@@ -2011,6 +2370,26 @@ fn encode_timestamp(timestamp: Timestamp) -> Result<i64> {
         LoomError::new(
             ErrorCode::Persistence,
             "timestamp exceeds SQLite's integer range",
+            false,
+        )
+    })
+}
+
+fn encode_counter(counter: u64, field: &str) -> Result<i64> {
+    i64::try_from(counter).map_err(|_| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            format!("{field} exceeds SQLite's integer range"),
+            false,
+        )
+    })
+}
+
+fn decode_counter(counter: i64, field: &str) -> Result<u64> {
+    u64::try_from(counter).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted {field} is negative"),
             false,
         )
     })
@@ -2564,6 +2943,37 @@ mod tests {
             configs: BTreeMap::from([(provider_id.clone(), provider_config.clone())]),
             health: BTreeMap::from([(provider_id.clone(), ProviderHealth::default())]),
         };
+        let model_id = ModelId::new("deterministic-model");
+        let mut usage = UsageLedger::default();
+        usage.record(
+            provider_id.clone(),
+            model_id.clone(),
+            loom_model::TokenUsage {
+                input_tokens: 3,
+                output_tokens: 5,
+                cached_input_tokens: 1,
+            },
+            17,
+        );
+        usage.record(
+            provider_id.clone(),
+            model_id.clone(),
+            loom_model::TokenUsage {
+                input_tokens: 4,
+                output_tokens: 2,
+                cached_input_tokens: 0,
+            },
+            9,
+        );
+        let request_id = RequestId::new();
+        let idempotency = BTreeMap::from([(
+            request_id,
+            DurableIdempotencyRecord {
+                created_at: Timestamp::from_unix_millis(1234),
+                request: serde_json::json!({"method": "list_sessions"}),
+                response: serde_json::json!({"sessions": []}),
+            },
+        )]);
         persistence
             .save_state(DurableStateWrite {
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -2572,6 +2982,8 @@ mod tests {
                 settings: Some(&settings),
                 workspace_configs: Some(&configs),
                 providers: Some(&provider_state),
+                usage: Some(&usage),
+                idempotency: Some(&idempotency),
                 records: &[],
                 feed: None,
                 sections: &[],
@@ -2600,6 +3012,16 @@ mod tests {
             persistence.load_provider_health().unwrap(),
             provider_state.health
         );
+        assert_eq!(persistence.load_provider_usage().unwrap(), usage);
+        let loaded_idempotency = persistence.load_idempotency_records().unwrap();
+        assert_eq!(loaded_idempotency.len(), 1);
+        let loaded_record = &loaded_idempotency[&request_id];
+        assert_eq!(loaded_record.created_at, Timestamp::from_unix_millis(1234));
+        assert_eq!(
+            loaded_record.request,
+            serde_json::json!({"method": "list_sessions"})
+        );
+        assert_eq!(loaded_record.response, serde_json::json!({"sessions": []}));
 
         assert!(
             persistence
@@ -2610,6 +3032,8 @@ mod tests {
                     settings: Some(&DurableSessionSettings::default()),
                     workspace_configs: Some(&BTreeMap::new()),
                     providers: Some(&DurableProviderState::default()),
+                    usage: Some(&UsageLedger::default()),
+                    idempotency: Some(&BTreeMap::new()),
                     records: &[],
                     feed: None,
                     sections: &[("", serde_json::json!({"invalid": true}))],
@@ -2628,6 +3052,8 @@ mod tests {
             persistence.load_provider_health().unwrap(),
             provider_state.health
         );
+        assert_eq!(persistence.load_provider_usage().unwrap(), usage);
+        assert_eq!(persistence.load_idempotency_records().unwrap(), idempotency);
 
         let connection = Connection::open(&path).unwrap();
         let plan: String = connection
@@ -2638,6 +3064,18 @@ mod tests {
             )
             .unwrap();
         assert!(plan.contains("PRIMARY KEY"), "{plan}");
+        let idempotency_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT request_id FROM idempotency_records
+                 WHERE created_at<?1 ORDER BY created_at, request_id LIMIT 32",
+                [Timestamp::now().as_unix_millis() as i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            idempotency_plan.contains("idempotency_expiry"),
+            "{idempotency_plan}"
+        );
         let config_plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT config FROM provider_configs WHERE provider_id=?1",
@@ -2646,6 +3084,15 @@ mod tests {
             )
             .unwrap();
         assert!(config_plan.contains("PRIMARY KEY"), "{config_plan}");
+        let usage_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT requests FROM provider_usage_totals
+                 WHERE provider_id=?1 AND model_id=?2",
+                params![provider_id.as_str(), model_id.as_str()],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(usage_plan.contains("PRIMARY KEY"), "{usage_plan}");
         drop(connection);
         fs::remove_file(path).unwrap();
     }

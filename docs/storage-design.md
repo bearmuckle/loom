@@ -2,11 +2,12 @@
 
 Status: target design, 2026-09-26. The implementation is in progress: session
 and workspace catalogs, bounded session/workspace settings, and reconnect
-events use indexed rows; run summaries and per-session filesystem records are
+events and provider usage totals use indexed rows; run summaries and per-session filesystem records are
 independently stored and loaded on demand; large strings are compressed and
 deduplicated. Provider configuration and health now use provider-keyed records,
-while usage, idempotency, and detailed run/filesystem payloads still use the
-section tree. This
+while idempotency and detailed run/filesystem payloads still use the section
+tree. Provider request-level detail is aggregated by provider/model because no
+request-level usage history is exposed by the current protocol. This
 design replaces the version-2 `sections` container. The release does not import
 existing databases: it creates a fresh database and rejects an existing
 unsupported format without changing it.
