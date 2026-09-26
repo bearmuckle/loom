@@ -1252,7 +1252,14 @@ const fn run_state_name(state: AgentRunState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_args;
+    use super::{
+        CliOptions, create_session, create_workspace, demonstrate_m2_services,
+        demonstrate_m3_recovery, negotiate, parse_args, run_m4_demo, start_run, stream_run,
+    };
+    use loom_core::AgentSessionState;
+    use loom_model::ModelId;
+    use loom_server::InProcessBackend;
+    use std::net::SocketAddr;
 
     fn arguments<'a>(values: &'a [&str]) -> impl Iterator<Item = String> + 'a {
         values.iter().map(|value| (*value).to_owned())
@@ -1342,5 +1349,91 @@ mod tests {
                 .is_none()
         );
         assert!(parse_args(arguments(&["-h"])).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_cli_workflow_uses_the_protocol_for_session_run_and_services() {
+        let connection = InProcessBackend::new().connect();
+        negotiate(&connection).unwrap();
+
+        let workspace = create_workspace(&connection, "CLI test workspace").unwrap();
+        let session = create_session(&connection, workspace.id, "CLI test session").unwrap();
+        assert_eq!(session.state, AgentSessionState::Idle);
+
+        let options = CliOptions {
+            name: "CLI test session".to_owned(),
+            task: "Say hello in one sentence.".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            root: None,
+            manual_approval: true,
+            m2_demo: false,
+            m3_demo: false,
+            persistence: None,
+            serve: false,
+            m4_demo: false,
+            bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            token: None,
+            login_provider: None,
+        };
+        let run_id = start_run(&connection, session.id, &options).unwrap();
+        stream_run(&connection, session.id, run_id, false).unwrap();
+
+        demonstrate_m2_services(&connection, session.id).unwrap();
+    }
+
+    #[test]
+    fn m4_demo_reconnects_a_remote_client_and_resumes_approval() {
+        let root =
+            std::env::temp_dir().join(format!("loom-cli-m4-{}", loom_core::WorkspaceId::new()));
+        std::fs::create_dir_all(&root).unwrap();
+        let options = CliOptions {
+            name: "M4 test".to_owned(),
+            task: "Say hello in one sentence.".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            root: Some(root.clone()),
+            manual_approval: false,
+            m2_demo: false,
+            m3_demo: false,
+            persistence: None,
+            serve: false,
+            m4_demo: true,
+            bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            token: None,
+            login_provider: None,
+        };
+
+        let result = run_m4_demo(options);
+        std::fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn m3_demo_recovers_session_run_and_event_history_from_persistence() {
+        let path = std::env::temp_dir().join(format!("loom-cli-m3-{}.db", loom_core::RunId::new()));
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection).unwrap();
+        let workspace = create_workspace(&connection, "M3 test workspace").unwrap();
+        let session = create_session(&connection, workspace.id, "M3 test session").unwrap();
+        let options = CliOptions {
+            name: "M3 test session".to_owned(),
+            task: "Say hello in one sentence.".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            root: None,
+            manual_approval: false,
+            m2_demo: false,
+            m3_demo: true,
+            persistence: Some(path.clone()),
+            serve: false,
+            m4_demo: false,
+            bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
+            token: None,
+            login_provider: None,
+        };
+        let run_id = start_run(&connection, session.id, &options).unwrap();
+        stream_run(&connection, session.id, run_id, false).unwrap();
+
+        demonstrate_m3_recovery(backend, connection, &path, true, session.id, run_id).unwrap();
+        assert!(!path.exists());
     }
 }

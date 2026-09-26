@@ -117,6 +117,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn usage_counts_saturate_and_unlimited_limits_are_detected() {
+        assert!(SessionLimits::default().is_unlimited());
+        assert!(
+            !SessionLimits {
+                max_cost_micros: Some(1),
+                ..Default::default()
+            }
+            .is_unlimited()
+        );
+        let mut usage = UsageSnapshot {
+            input_tokens: u64::MAX,
+            tool_calls: u64::MAX,
+            cost_micros: u64::MAX,
+            ..Default::default()
+        };
+        usage.add_tokens(1, 4, 2);
+        usage.add_tool_call();
+        usage.add_cost_micros(1);
+        assert_eq!(usage.input_tokens, u64::MAX);
+        assert_eq!(usage.tool_calls, u64::MAX);
+        assert_eq!(usage.cost_micros, u64::MAX);
+        assert_eq!(usage.total_tokens(), u64::MAX);
+        assert_eq!(usage.cached_input_tokens, 2);
+    }
+
+    #[test]
+    fn limit_status_checks_duration_and_each_usage_budget() {
+        let status = LimitStatus::new(
+            SessionLimits {
+                max_duration_ms: Some(5),
+                max_input_tokens: Some(3),
+                max_output_tokens: Some(4),
+                max_tool_calls: Some(2),
+                max_cost_micros: Some(9),
+            },
+            UsageSnapshot {
+                elapsed_ms: 5,
+                input_tokens: 3,
+                output_tokens: 4,
+                tool_calls: 2,
+                cost_micros: 9,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            status.exceeded,
+            vec![
+                LimitKind::Duration,
+                LimitKind::InputTokens,
+                LimitKind::OutputTokens,
+                LimitKind::ToolCalls,
+                LimitKind::Cost,
+            ]
+        );
+        assert!(status.is_exceeded());
+        assert!(
+            !LimitStatus::new(SessionLimits::default(), UsageSnapshot::default()).is_exceeded()
+        );
+    }
+
+    #[test]
     fn limit_status_reports_each_explicitly_exceeded_budget() {
         let limits = SessionLimits {
             max_input_tokens: Some(2),

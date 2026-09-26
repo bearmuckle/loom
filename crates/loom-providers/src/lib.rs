@@ -2997,6 +2997,26 @@ mod tests {
             health_endpoint("https://example.test/status"),
             "https://example.test/status"
         );
+        assert_eq!(
+            trim_endpoint("https://example.test/api///"),
+            "https://example.test/api"
+        );
+        assert_eq!(
+            ollama_chat_endpoint("http://localhost:11434///".to_owned()),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert_eq!(
+            ollama_chat_endpoint("http://localhost/v1/chat/completions/".to_owned()),
+            "http://localhost/v1/chat/completions"
+        );
+        assert_eq!(bearer_header("secret"), "Bearer secret");
+        let oauth_error = oauth_response_error(OAuthTokenResponse {
+            access_token: None,
+            error: Some("access_denied".to_owned()),
+            error_description: Some("user cancelled".to_owned()),
+        });
+        assert_eq!(oauth_error.code, ErrorCode::ProviderAuthentication);
+        assert!(oauth_error.message.contains("user cancelled"));
 
         for (status, code, retryable) in [
             (401, ErrorCode::ProviderAuthentication, false),
@@ -3008,6 +3028,156 @@ mod tests {
             assert_eq!(error.code, code);
             assert_eq!(error.retryable, retryable);
         }
+    }
+
+    #[test]
+    fn responses_stream_decoder_handles_events_and_rejects_malformed_streams() {
+        let mut decoder = StreamDecoder::responses("copilot".to_owned());
+        let mut call_ids = BTreeMap::new();
+        let mut sink = CollectingSink::default();
+
+        assert_eq!(
+            decoder
+                .accept(
+                    &serde_json::json!({"type":"response.output_text.delta", "delta":""}),
+                    &mut call_ids,
+                    &mut sink,
+                )
+                .unwrap(),
+            StreamFlow::Continue
+        );
+        decoder
+            .accept(
+                &serde_json::json!({"type":"response.output_text.delta", "delta":"hello"}),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder
+            .accept(
+                &serde_json::json!({"type":"response.output_item.done"}),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder
+            .accept(
+                &serde_json::json!({"type":"response.output_item.done", "item":{"type":"message"}}),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder
+            .accept(
+                &serde_json::json!({
+                    "type":"response.output_item.done",
+                    "item":{"type":"function_call", "name":"read_file", "call_id":"call-1", "arguments":"{\"path\":\"README.md\"}"}
+                }),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder
+            .accept(
+                &serde_json::json!({
+                    "type":"response.completed",
+                    "response":{"status":"completed", "usage":{"input_tokens":3, "output_tokens":2}}
+                }),
+                &mut call_ids,
+                &mut sink,
+            )
+            .unwrap();
+        decoder.finish(&mut sink).unwrap();
+
+        assert!(
+            matches!(sink.events.first(), Some(ModelStreamEvent::TextDelta { text }) if text == "hello")
+        );
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ToolCallDelta { call }
+                if call.name == "read_file" && call.arguments["path"] == "README.md"
+        )));
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::Usage { usage } if usage.input_tokens == 3 && usage.output_tokens == 2
+        )));
+        assert!(matches!(
+            sink.events.last(),
+            Some(ModelStreamEvent::Completed {
+                reason: FinishReason::Stop
+            })
+        ));
+
+        let mut malformed_call = StreamDecoder::responses("copilot".to_owned());
+        assert!(
+            malformed_call
+                .accept(
+                    &serde_json::json!({
+                        "type":"response.output_item.done",
+                        "item":{"type":"function_call", "arguments":"{}"}
+                    }),
+                    &mut BTreeMap::new(),
+                    &mut CollectingSink::default(),
+                )
+                .is_err()
+        );
+        let mut stream_error = StreamDecoder::responses("copilot".to_owned());
+        let error = stream_error
+            .accept(
+                &serde_json::json!({"type":"error", "message":"upstream failed"}),
+                &mut BTreeMap::new(),
+                &mut CollectingSink::default(),
+            )
+            .unwrap_err();
+        assert!(error.message.contains("upstream failed"));
+    }
+
+    #[test]
+    fn chat_stream_decoder_emits_tool_usage_and_completion_or_rejects_bad_arguments() {
+        let mut decoder = StreamDecoder::chat_completions("fixture".to_owned());
+        let mut sink = CollectingSink::default();
+        decoder
+            .accept(
+                &serde_json::json!({
+                    "choices":[{"delta":{"tool_calls":[
+                        {"index":0,"function":{"name":"read_", "arguments":"{\"path\":"}},
+                        {"index":0,"function":{"name":"file", "arguments":"\"README.md\"}"}}
+                    ]}}],
+                    "usage":{"prompt_tokens":5,"completion_tokens":4}
+                }),
+                &mut BTreeMap::new(),
+                &mut sink,
+            )
+            .unwrap();
+        decoder.finish(&mut sink).unwrap();
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ToolCallDelta { call }
+                if call.name == "read_file" && call.arguments["path"] == "README.md"
+        )));
+        assert!(matches!(
+            sink.events.last(),
+            Some(ModelStreamEvent::Completed {
+                reason: FinishReason::ToolCall
+            })
+        ));
+
+        let mut malformed = StreamDecoder::chat_completions("fixture".to_owned());
+        let mut malformed_sink = CollectingSink::default();
+        malformed
+            .accept(
+                &serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{"}}]}}]}),
+                &mut BTreeMap::new(),
+                &mut malformed_sink,
+            )
+            .unwrap();
+        assert!(malformed.finish(&mut malformed_sink).is_err());
+
+        let missing_name = StreamDecoder {
+            tool_calls: BTreeMap::from([(0, PartialToolCall::default())]),
+            ..StreamDecoder::chat_completions("fixture".to_owned())
+        };
+        assert!(missing_name.finish(&mut CollectingSink::default()).is_err());
     }
 
     #[test]
@@ -3372,6 +3542,207 @@ mod tests {
         );
         let serialized = serde_json::to_string(&registry.list_providers().unwrap()).unwrap();
         assert!(!serialized.contains("Bearer"));
+    }
+
+    #[test]
+    fn registry_validates_provider_and_model_configuration_and_supports_catalog_updates() {
+        let registry = ProviderRegistry::new();
+        let credential = CredentialRef::new("fixture-token");
+        let model = ModelDescriptor {
+            id: ModelId::new("fixture/model"),
+            provider: ProviderId::new("fixture"),
+            display_name: "Fixture model".to_owned(),
+            context_window: Some(8_000),
+            capabilities: ModelCapabilities::default(),
+        };
+
+        assert!(
+            registry
+                .register(ProviderConfig::openai_compatible(
+                    "",
+                    "empty",
+                    "http://localhost/v1",
+                    model.clone(),
+                    None
+                ))
+                .is_err()
+        );
+        let mut no_models = ProviderConfig::deterministic();
+        no_models.models.clear();
+        assert!(registry.register(no_models).is_err());
+        assert!(
+            registry
+                .register(ProviderConfig::openai_compatible(
+                    "fixture",
+                    "fixture",
+                    "http://localhost/v1",
+                    model.clone(),
+                    Some(CredentialRef::new("  ")),
+                ))
+                .is_err()
+        );
+        assert!(registry.register(ProviderConfig::deterministic()).is_ok());
+        let mut wrong_deterministic = ProviderConfig::deterministic();
+        wrong_deterministic.models[0].id = ModelId::new("deterministic/other");
+        assert!(registry.register(wrong_deterministic).is_err());
+
+        registry
+            .register(ProviderConfig::openai_compatible(
+                "fixture",
+                "Fixture provider",
+                "http://localhost/v1/chat/completions",
+                model.clone(),
+                Some(credential),
+            ))
+            .unwrap();
+        assert!(
+            registry
+                .add_model(&ProviderId::new("missing"), model.clone())
+                .is_err()
+        );
+        let mut empty_id = model.clone();
+        empty_id.id = ModelId::new(" ");
+        assert!(
+            registry
+                .add_model(&ProviderId::new("fixture"), empty_id)
+                .is_err()
+        );
+        assert!(
+            registry
+                .add_model(&ProviderId::new("fixture"), model.clone())
+                .is_err()
+        );
+        let second = ModelDescriptor {
+            id: ModelId::new("fixture/second"),
+            provider: ProviderId::new("fixture"),
+            display_name: "Second model".to_owned(),
+            context_window: None,
+            capabilities: ModelCapabilities::default(),
+        };
+        registry
+            .add_model(&ProviderId::new("fixture"), second.clone())
+            .unwrap();
+        assert!(registry.describe_model(&second.id).is_ok());
+        assert!(
+            registry
+                .describe_model(&ModelId::new("missing/model"))
+                .is_err()
+        );
+        assert!(registry.pricing(&ModelId::new("fixture/model")).is_ok());
+        assert!(
+            registry
+                .create_provider(&ModelId::new("missing/model"))
+                .is_err()
+        );
+        assert!(
+            registry
+                .health(&ProviderId::new("missing"))
+                .unwrap()
+                .checked_at
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn registry_restores_copilot_configs_without_trusting_saved_model_lists() {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let registry = ProviderRegistry::with_credentials(credentials.clone());
+        registry
+            .configure_github_copilot("github-secret".to_owned())
+            .unwrap();
+        let copilot_model = ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL);
+        assert_eq!(
+            registry
+                .create_provider(&copilot_model)
+                .unwrap()
+                .descriptor()
+                .id,
+            copilot_model
+        );
+        let mut configs = registry.export_configs().unwrap();
+        let copilot_provider = configs[0].id.clone();
+        configs[0].models.push(ModelDescriptor {
+            id: ModelId::new("untrusted/saved-model"),
+            provider: copilot_provider,
+            display_name: "Untrusted saved model".to_owned(),
+            context_window: None,
+            capabilities: ModelCapabilities::default(),
+        });
+        configs.push(ProviderConfig::github_copilot(CredentialRef::new(
+            "missing",
+        )));
+        configs.push(ProviderConfig::deterministic());
+        registry.restore_configs(configs).unwrap();
+        let restored = registry.export_configs().unwrap();
+        let copilot = restored
+            .iter()
+            .find(|config| config.kind == ProviderKind::GitHubCopilot)
+            .unwrap();
+        assert_eq!(copilot.models.len(), 1);
+        assert!(
+            !copilot
+                .models
+                .iter()
+                .any(|model| model.id.as_str() == "untrusted/saved-model")
+        );
+        assert_eq!(registry.list_providers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn registry_health_check_records_healthy_and_degraded_results() {
+        let registry = ProviderRegistry::new();
+        let provider_id = ProviderId::new("fixture");
+        let model = ModelDescriptor {
+            id: ModelId::new("fixture/model"),
+            provider: provider_id.clone(),
+            display_name: "Fixture model".to_owned(),
+            context_window: None,
+            capabilities: ModelCapabilities::default(),
+        };
+
+        let (endpoint, server) =
+            serve_once(r#"{"data":[{"id":"fixture/model"}]}"#, "application/json");
+        registry
+            .register_openai_compatible(
+                provider_id.clone(),
+                "Fixture",
+                format!("{endpoint}/chat/completions"),
+                model.clone(),
+                None,
+            )
+            .unwrap();
+        let healthy = registry.check_health(&provider_id).unwrap();
+        assert_eq!(healthy.state, ProviderHealthState::Healthy);
+        assert_eq!(healthy.consecutive_failures, 0);
+        server.join().unwrap().unwrap();
+
+        let failed_registry = ProviderRegistry::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable_address = listener.local_addr().unwrap();
+        drop(listener);
+        failed_registry
+            .register_openai_compatible(
+                provider_id.clone(),
+                "Fixture",
+                format!("http://{unavailable_address}/v1/chat/completions"),
+                model,
+                None,
+            )
+            .unwrap();
+        let degraded = failed_registry.check_health(&provider_id).unwrap();
+        assert_eq!(degraded.state, ProviderHealthState::Degraded);
+        assert_eq!(degraded.consecutive_failures, 1);
+        assert!(degraded.last_error.is_some());
+
+        assert!(
+            failed_registry
+                .check_health(&ProviderId::new("missing"))
+                .is_err()
+        );
+        let empty_registry = ProviderRegistry::new();
+        let mut empty_provider = ProviderConfig::ollama("http://127.0.0.1:1", "fixture/model");
+        empty_provider.models.clear();
+        empty_registry.register(empty_provider).unwrap_err();
     }
 
     #[test]

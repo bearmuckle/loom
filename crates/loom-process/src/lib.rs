@@ -919,6 +919,13 @@ mod tests {
         let finished = wait_terminal(&manager, terminal.id);
         assert_eq!(finished.status, TerminalStatus::Exited);
         let events = manager.events_since(terminal.id, None).unwrap();
+        assert!(
+            manager
+                .events_since(terminal.id, Some(EventSequence::new(1)))
+                .unwrap()
+                .len()
+                < events.len()
+        );
         assert!(events.iter().any(|event| {
             matches!(
                 event.event,
@@ -934,6 +941,35 @@ mod tests {
                 }
             )
         }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn terminal_rejects_invalid_commands_dimensions_and_unknown_ids() {
+        let root = std::env::temp_dir().join(format!("loom-process-{}", AgentSessionId::new()));
+        fs::create_dir_all(&root).unwrap();
+        let manager = TerminalManager::new();
+        assert_eq!(
+            manager.open("  ", Vec::new(), &root).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            manager
+                .open("sh", Vec::new(), root.join("missing"))
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        let unknown = TerminalId::new();
+        assert_eq!(manager.get(unknown).unwrap_err().code, ErrorCode::NotFound);
+        assert_eq!(
+            manager.events_since(unknown, None).unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            manager.resize(unknown, 0, 80).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1020,5 +1056,113 @@ mod tests {
                 .code,
             ErrorCode::WorkspaceAccessDenied
         );
+    }
+
+    #[test]
+    fn tasks_report_spawn_failures_and_failed_exit_without_claiming_missing_artifacts() {
+        let root = std::env::temp_dir().join(format!("loom-task-{}", AgentSessionId::new()));
+        fs::create_dir_all(&root).unwrap();
+        let supervisor = TaskSupervisor::new(&root).unwrap();
+        let invalid_command = TaskSpec {
+            kind: TaskKind::Test,
+            label: String::new(),
+            command: "  ".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            output_limit_bytes: None,
+            artifact_paths: Vec::new(),
+        };
+        assert_eq!(
+            supervisor.start(invalid_command).unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let missing_program = TaskSpec {
+            kind: TaskKind::Test,
+            label: String::new(),
+            command: "loom-command-that-does-not-exist".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            output_limit_bytes: None,
+            artifact_paths: Vec::new(),
+        };
+        assert_eq!(
+            supervisor.start(missing_program).unwrap_err().code,
+            ErrorCode::ToolExecution
+        );
+        let (program, args) = command(if cfg!(windows) {
+            "echo failed & exit /b 7"
+        } else {
+            "printf failed; exit 7"
+        });
+        let task = supervisor
+            .start(TaskSpec {
+                kind: TaskKind::Test,
+                label: String::new(),
+                command: program,
+                args,
+                cwd: None,
+                output_limit_bytes: Some(32),
+                artifact_paths: vec!["missing.txt".to_owned()],
+            })
+            .unwrap();
+        for _ in 0..100 {
+            let current = supervisor.get(task.id).unwrap();
+            if matches!(
+                current.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            ) {
+                assert_eq!(current.status, TaskStatus::Failed);
+                assert!(!current.artifacts[0].exists);
+                assert_eq!(current.artifacts[0].size, 0);
+                assert_eq!(current.evidence[0].exists, false);
+                assert_eq!(
+                    supervisor.cancel(task.id).unwrap_err().code,
+                    ErrorCode::InvalidState
+                );
+                fs::remove_dir_all(root).unwrap();
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("task did not finish");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_working_directory_can_use_an_explicitly_allowed_external_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("loom-task-{}", AgentSessionId::new()));
+        let external = std::env::temp_dir().join(format!("loom-task-{}", AgentSessionId::new()));
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        symlink(&external, root.join("mounted")).unwrap();
+        let supervisor = TaskSupervisor::new(&root).unwrap();
+        supervisor
+            .set_allowed_roots(vec![external.clone()])
+            .unwrap();
+        let (program, args) = command("pwd");
+        let task = supervisor
+            .start(TaskSpec {
+                kind: TaskKind::Test,
+                label: "external root".to_owned(),
+                command: program,
+                args,
+                cwd: Some("mounted".to_owned()),
+                output_limit_bytes: None,
+                artifact_paths: Vec::new(),
+            })
+            .unwrap();
+        for _ in 0..100 {
+            let current = supervisor.get(task.id).unwrap();
+            if current.status == TaskStatus::Completed {
+                assert!(current.output.contains(external.to_str().unwrap()));
+                fs::remove_dir_all(root).unwrap();
+                fs::remove_dir_all(external).unwrap();
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("task did not finish");
     }
 }

@@ -544,4 +544,151 @@ mod tests {
         assert!(git.branches().unwrap().iter().any(|branch| branch.current));
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn repository_open_init_and_clone_failures_are_structured() {
+        let root = std::env::temp_dir().join(format!("loom-git-errors-{}", AgentSessionId::new()));
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("not-a-directory");
+        fs::write(&file, "file").unwrap();
+        assert_eq!(
+            GitService::init(&file).unwrap_err().code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        assert_eq!(
+            GitService::open(&file).unwrap_err().code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        assert_eq!(GitService::open(&root).unwrap_err().code, ErrorCode::Vcs);
+
+        let destination = root.join("already-exists");
+        fs::create_dir(&destination).unwrap();
+        assert_eq!(
+            GitService::clone_from("missing", &destination, None)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        fs::remove_dir(&destination).unwrap();
+        assert_eq!(
+            GitService::clone_from("/path/that/does/not/exist", &destination, None)
+                .unwrap_err()
+                .code,
+            ErrorCode::Vcs
+        );
+        let (source, source_root) = repository();
+        assert_eq!(
+            GitService::clone_from(
+                source.root().to_string_lossy(),
+                &destination,
+                Some("missing-ref")
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::Vcs
+        );
+        fs::remove_dir_all(&destination).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn init_supports_an_empty_repository_and_staged_diffs() {
+        let root = std::env::temp_dir().join(format!("loom-git-init-{}", AgentSessionId::new()));
+        fs::create_dir_all(&root).unwrap();
+        let git = GitService::init(&root).unwrap();
+        assert_eq!(git.current_branch().unwrap(), None);
+        assert!(git.branches().unwrap().is_empty());
+        fs::write(root.join("new.txt"), "added\n").unwrap();
+        run(&root, &["add", "--", "new.txt"]);
+        let diff = git.diff(Some("new.txt"), true).unwrap();
+        assert!(diff.staged);
+        assert!(diff.patch.contains("+added"));
+        assert_eq!(
+            git.validate_path("nested\\file.txt").unwrap(),
+            "nested/file.txt"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn status_kinds_cover_index_and_worktree_states() {
+        assert_eq!(
+            status_kind(Status::CONFLICTED, false),
+            GitFileStatusKind::Conflicted
+        );
+        assert_eq!(
+            status_kind(Status::IGNORED, false),
+            GitFileStatusKind::Ignored
+        );
+        assert_eq!(
+            status_kind(Status::INDEX_RENAMED, true),
+            GitFileStatusKind::Renamed
+        );
+        assert_eq!(
+            status_kind(Status::INDEX_NEW, true),
+            GitFileStatusKind::Added
+        );
+        assert_eq!(
+            status_kind(Status::INDEX_MODIFIED, true),
+            GitFileStatusKind::Modified
+        );
+        assert_eq!(
+            status_kind(Status::INDEX_DELETED, true),
+            GitFileStatusKind::Deleted
+        );
+        assert_eq!(
+            status_kind(Status::WT_RENAMED, false),
+            GitFileStatusKind::Renamed
+        );
+        assert_eq!(
+            status_kind(Status::WT_NEW, false),
+            GitFileStatusKind::Untracked
+        );
+        assert_eq!(
+            status_kind(Status::WT_MODIFIED, false),
+            GitFileStatusKind::Modified
+        );
+        assert_eq!(
+            status_kind(Status::WT_DELETED, false),
+            GitFileStatusKind::Deleted
+        );
+        assert_eq!(
+            status_kind(Status::CURRENT, true),
+            GitFileStatusKind::Unknown
+        );
+        assert_eq!(
+            status_kind(Status::CURRENT, false),
+            GitFileStatusKind::Unknown
+        );
+    }
+
+    #[test]
+    fn clone_can_check_out_a_requested_revision() {
+        let (source, source_root) = repository();
+        let destination = std::env::temp_dir().join(format!(
+            "loom-git-revision-{}",
+            loom_core::RepositoryId::new()
+        ));
+        let cloned =
+            GitService::clone_from(source.root().to_string_lossy(), &destination, Some("HEAD"))
+                .unwrap();
+        assert_eq!(cloned.current_branch().unwrap(), None);
+        assert!(cloned.status().unwrap().clean);
+        fs::remove_dir_all(destination).unwrap();
+        fs::remove_dir_all(source_root).unwrap();
+    }
+
+    #[test]
+    fn validates_empty_absolute_and_parent_paths() {
+        let (git, root) = repository();
+        for path in ["", "   ", "/etc/passwd", "../secret"] {
+            assert_eq!(
+                git.diff(Some(path), false).unwrap_err().code,
+                ErrorCode::WorkspaceAccessDenied,
+                "path should be rejected: {path:?}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -14,9 +14,11 @@ use std::sync::{Arc, Mutex};
 #[cfg(not(target_family = "wasm"))]
 use std::{
     sync::mpsc::{self, Sender},
-    thread,
     time::Duration,
 };
+
+#[cfg(all(not(target_family = "wasm"), not(test)))]
+use std::thread;
 
 use futures_channel::oneshot;
 use loom_core::{
@@ -964,19 +966,33 @@ impl PendingResponse {
 pub(crate) struct BackendWorker {
     #[cfg(not(target_family = "wasm"))]
     jobs: Sender<Job>,
+    #[cfg(all(not(target_family = "wasm"), test))]
+    test_connection: Option<ClientConnection>,
     #[cfg(target_family = "wasm")]
     connection: ClientConnection,
     secure_for_secrets: bool,
 }
 
 #[cfg(not(target_family = "wasm"))]
+#[allow(dead_code)]
 struct Job {
     request: RequestEnvelope,
     reply: oneshot::Sender<ResponseEnvelope>,
 }
 
 impl BackendWorker {
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(not(target_family = "wasm"), test))]
+    pub(crate) fn spawn(connection: ClientConnection) -> Self {
+        let secure_for_secrets = connection.secure_for_secrets();
+        let (jobs, _incoming) = mpsc::channel::<Job>();
+        Self {
+            jobs,
+            test_connection: Some(connection),
+            secure_for_secrets,
+        }
+    }
+
+    #[cfg(all(not(target_family = "wasm"), not(test)))]
     pub(crate) fn spawn(connection: ClientConnection) -> Self {
         let secure_for_secrets = connection.secure_for_secrets();
         let (jobs, incoming) = mpsc::channel::<Job>();
@@ -1011,6 +1027,14 @@ impl BackendWorker {
     pub(crate) fn submit(&self, request: RequestEnvelope) -> PendingResponse {
         let request_id = request.request_id;
         let (reply, receiver) = oneshot::channel();
+        #[cfg(test)]
+        if let Some(connection) = &self.test_connection {
+            let _ = reply.send(connection.request(request));
+            return PendingResponse {
+                request_id,
+                reply: receiver,
+            };
+        }
         if self.jobs.send(Job { request, reply }).is_err() {
             // The worker thread is gone; return a receiver that will
             // immediately resolve to the "stopped before answering" error.

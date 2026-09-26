@@ -61,6 +61,51 @@ struct GitHubApiRepository {
     default_branch: String,
 }
 
+fn fetch_github_repositories(token: &str, endpoint: &str) -> Result<Vec<GitHubRepository>> {
+    let mut repositories = Vec::new();
+    for page in 1..=100 {
+        let url = format!("{endpoint}?per_page=100&sort=updated&page={page}");
+        let mut response = ureq::get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", &format!("Bearer {token}"))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "Loom")
+            .call()
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::ProviderAuthentication,
+                    format!("could not list GitHub repositories: {error}"),
+                    true,
+                )
+            })?;
+        let page_repositories: Vec<GitHubApiRepository> =
+            response.body_mut().read_json().map_err(|error| {
+                LoomError::new(
+                    ErrorCode::ProviderInvalidResponse,
+                    format!("GitHub returned an invalid repository list: {error}"),
+                    false,
+                )
+            })?;
+        let page_len = page_repositories.len();
+        repositories.extend(
+            page_repositories
+                .into_iter()
+                .map(|repository| GitHubRepository {
+                    full_name: repository.full_name,
+                    description: repository.description,
+                    clone_url: repository.clone_url,
+                    private: repository.private,
+                    default_branch: repository.default_branch,
+                }),
+        );
+        if page_len < 100 {
+            break;
+        }
+    }
+    repositories.sort_by(|left, right| left.full_name.cmp(&right.full_name));
+    Ok(repositories)
+}
+
 fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {
     let source = fs::canonicalize(source).map_err(|error| {
         LoomError::new(
@@ -2257,48 +2302,7 @@ impl InProcessConnection {
 
     fn list_github_repositories(&self) -> Result<ServerResponse> {
         let token = self.backend.providers.github_account_token()?;
-        let mut repositories = Vec::new();
-        for page in 1..=100 {
-            let url =
-                format!("https://api.github.com/user/repos?per_page=100&sort=updated&page={page}");
-            let mut response = ureq::get(&url)
-                .header("Accept", "application/vnd.github+json")
-                .header("Authorization", &format!("Bearer {token}"))
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .header("User-Agent", "Loom")
-                .call()
-                .map_err(|error| {
-                    LoomError::new(
-                        ErrorCode::ProviderAuthentication,
-                        format!("could not list GitHub repositories: {error}"),
-                        true,
-                    )
-                })?;
-            let page_repositories: Vec<GitHubApiRepository> =
-                response.body_mut().read_json().map_err(|error| {
-                    LoomError::new(
-                        ErrorCode::ProviderInvalidResponse,
-                        format!("GitHub returned an invalid repository list: {error}"),
-                        false,
-                    )
-                })?;
-            let page_len = page_repositories.len();
-            repositories.extend(
-                page_repositories
-                    .into_iter()
-                    .map(|repository| GitHubRepository {
-                        full_name: repository.full_name,
-                        description: repository.description,
-                        clone_url: repository.clone_url,
-                        private: repository.private,
-                        default_branch: repository.default_branch,
-                    }),
-            );
-            if page_len < 100 {
-                break;
-            }
-        }
-        repositories.sort_by(|left, right| left.full_name.cmp(&right.full_name));
+        let repositories = fetch_github_repositories(&token, "https://api.github.com/user/repos")?;
         Ok(ServerResponse::GitHubRepositories { repositories })
     }
 
@@ -4206,7 +4210,15 @@ impl InProcessConnection {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, process::Command, thread, time::Duration};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        path::PathBuf,
+        process::Command,
+        thread,
+        time::Duration,
+    };
 
     use loom_context::ContextAssemblyOptions;
     use loom_core::{AgentSessionId, CapabilitySet, PolicyDecision, ToolCallId, WorkspaceId};
@@ -4237,6 +4249,272 @@ mod tests {
 
     fn negotiate_m5(connection: &InProcessConnection) {
         negotiate(connection);
+    }
+
+    fn respond_http(mut stream: TcpStream, status: &str, body: &str) {
+        let mut request = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        let request = String::from_utf8_lossy(&request);
+        let headers = request.to_ascii_lowercase();
+        assert!(headers.contains("authorization: bearer fixture-token"));
+        assert!(headers.contains("x-github-api-version: 2022-11-28"));
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    }
+
+    fn github_repository_json(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "full_name": name,
+            "description": null,
+            "clone_url": format!("https://github.com/{name}.git"),
+            "private": false,
+            "default_branch": "main"
+        })
+    }
+
+    #[test]
+    fn github_repository_fetch_paginates_sorts_and_maps_api_records() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (first, _) = listener.accept().unwrap();
+            let page_one = (0..100)
+                .map(|index| github_repository_json(&format!("owner/repo-{index:03}")))
+                .collect::<Vec<_>>();
+            respond_http(first, "200 OK", &serde_json::to_string(&page_one).unwrap());
+            let (second, _) = listener.accept().unwrap();
+            respond_http(
+                second,
+                "200 OK",
+                &serde_json::to_string(&vec![github_repository_json("owner/aaa")]).unwrap(),
+            );
+        });
+
+        let repositories =
+            fetch_github_repositories("fixture-token", &format!("http://{address}/user/repos"))
+                .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(repositories.len(), 101);
+        assert_eq!(repositories.first().unwrap().full_name, "owner/aaa");
+        assert_eq!(repositories.last().unwrap().full_name, "owner/repo-099");
+        assert_eq!(
+            repositories[1].clone_url,
+            "https://github.com/owner/repo-000.git"
+        );
+        assert_eq!(repositories[1].default_branch, "main");
+    }
+
+    #[test]
+    fn github_repository_fetch_normalizes_transport_and_payload_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (invalid_json, _) = listener.accept().unwrap();
+            respond_http(invalid_json, "200 OK", "not-json");
+            let (unauthorized, _) = listener.accept().unwrap();
+            respond_http(unauthorized, "401 Unauthorized", "{}");
+        });
+
+        let endpoint = format!("http://{address}/user/repos");
+        let malformed = fetch_github_repositories("fixture-token", &endpoint).unwrap_err();
+        assert_eq!(malformed.code, ErrorCode::ProviderInvalidResponse);
+        let unauthorized = fetch_github_repositories("fixture-token", &endpoint).unwrap_err();
+        assert_eq!(unauthorized.code, ErrorCode::ProviderAuthentication);
+        assert!(unauthorized.retryable);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn filesystem_and_repository_helpers_reject_unsafe_inputs_and_copy_trees() {
+        assert_eq!(
+            checked_session_relative_path("nested/file.txt").unwrap(),
+            PathBuf::from("nested/file.txt")
+        );
+        for invalid in [
+            "",
+            "  ",
+            ".",
+            "..",
+            "../secret",
+            "/absolute",
+            "nested\\file",
+        ] {
+            assert!(
+                checked_session_relative_path(invalid).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        for (url, safe) in [
+            ("wss://worker.example/ws", true),
+            ("ws://localhost:9000/", true),
+            ("https://worker.example/ws", false),
+            ("wss://", false),
+            ("wss://user@worker.example/ws", false),
+            ("wss://user:secret@worker.example/ws", false),
+            ("wss://worker.example/ws#fragment", false),
+            ("wss://worker.example/ws?access_TOKEN=secret", false),
+        ] {
+            assert_eq!(worker_node_url_is_safe(url), safe, "{url}");
+        }
+
+        assert_eq!(
+            repository_display_name("https://github.com/owner/project.git").unwrap(),
+            "project"
+        );
+        assert_eq!(
+            repository_display_name("ssh://git@github.com/owner/project.git").unwrap(),
+            "project"
+        );
+        for unsafe_source in [
+            "relative/path",
+            "http://github.com/owner/project",
+            "https://user:secret@github.com/owner/project",
+            "https://github.com/owner/project?access_token=secret",
+        ] {
+            assert!(
+                repository_display_name(unsafe_source).is_err(),
+                "{unsafe_source}"
+            );
+        }
+
+        let source = workspace();
+        let destination = workspace();
+        fs::create_dir(source.join("nested")).unwrap();
+        fs::write(source.join("nested/file.txt"), "copy me").unwrap();
+        copy_filesystem_tree(&source, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/file.txt")).unwrap(),
+            "copy me"
+        );
+        assert_eq!(
+            checked_session_path(&destination, "nested/file.txt").unwrap(),
+            fs::canonicalize(destination.join("nested/file.txt")).unwrap()
+        );
+        assert!(checked_session_path(&destination, "../outside").is_err());
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+
+        let repository = git_repository();
+        assert_eq!(
+            repository_display_name(repository.to_str().unwrap()).unwrap(),
+            repository.file_name().unwrap().to_string_lossy()
+        );
+        fs::remove_dir_all(repository).unwrap();
+    }
+
+    #[test]
+    fn local_directory_import_copies_tree_and_rejects_unsafe_sources() {
+        let source = workspace();
+        let target_root = workspace();
+        fs::create_dir(source.join("nested")).unwrap();
+        fs::write(source.join("nested/file.txt"), "copied content").unwrap();
+        let destination = target_root.join("imported");
+        copy_directory_contents(&source, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/file.txt")).unwrap(),
+            "copied content"
+        );
+        assert_eq!(
+            copy_directory_contents(&source, &destination)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+
+        let inside_source = source.join("session/imported");
+        assert_eq!(
+            copy_directory_contents(&source, &inside_source)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        let file_source = source.join("nested/file.txt");
+        assert_eq!(
+            copy_directory_contents(&file_source, &target_root.join("file"))
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            copy_directory_contents(&source.join("missing"), &target_root.join("missing"))
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(target_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_directory_import_rejects_symlinks_that_escape_source() {
+        use std::os::unix::fs::symlink;
+
+        let source = workspace();
+        let outside = workspace();
+        let destination_root = workspace();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        symlink(outside.join("secret.txt"), source.join("escape")).unwrap();
+        assert_eq!(
+            copy_directory_contents(&source, &destination_root.join("import"))
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        assert_eq!(fs::read_dir(&destination_root).unwrap().count(), 0);
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+        fs::remove_dir_all(destination_root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_copy_preserves_symlinks_and_checked_paths_reject_escape() {
+        use std::os::unix::fs::symlink;
+
+        let source = workspace();
+        let destination = workspace();
+        let outside = workspace();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        symlink(outside.join("secret.txt"), source.join("outside-link")).unwrap();
+        copy_filesystem_tree(&source, &destination).unwrap();
+        assert!(
+            fs::symlink_metadata(destination.join("outside-link"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(checked_session_path(&destination, "outside-link").is_err());
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn bounded_review_text_is_unicode_safe_and_session_auth_errors_are_structured() {
+        assert_eq!(bounded_review_text("short", 5), "short");
+        assert_eq!(
+            bounded_review_text("éclair", 2),
+            "é\n...[review output truncated]"
+        );
+        assert_eq!(
+            bounded_review_text("éclair", 1),
+            "\n...[review output truncated]"
+        );
+        let error = unauthorized_session(AgentSessionId::new());
+        assert_eq!(error.code, ErrorCode::AuthorizationDenied);
+        assert!(!error.retryable);
+        assert!(error.message.contains("not authorized for session"));
     }
 
     #[test]
@@ -6063,6 +6341,287 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("task evidence fixture did not finish");
+    }
+
+    #[test]
+    fn protocol_filesystem_requests_cover_snapshots_edits_checkpoints_and_undo() {
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        negotiate_m5(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Filesystem protocol".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let session_id = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Filesystem session".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+
+        let created = connection.request(RequestEnvelope::new(
+            ClientRequest::ApplySessionFilesystemEdit {
+                session_id,
+                edit: WorkspaceEdit {
+                    path: "notes/plan.md".to_owned(),
+                    old_text: String::new(),
+                    new_text: "first version".to_owned(),
+                    expected_revision: None,
+                },
+            },
+        ));
+        assert!(matches!(
+            created.result,
+            Ok(ServerResponse::WorkspaceEditApplied(_))
+        ));
+        let checkpoint_id = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateSessionCheckpoint {
+                    session_id,
+                    label: "before update".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::CheckpointCreated(checkpoint) => checkpoint.id,
+            response => panic!("unexpected checkpoint response: {response:?}"),
+        };
+        let read = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+            session_id,
+            path: "notes/plan.md".to_owned(),
+        }));
+        let revision = match read.result.unwrap() {
+            ServerResponse::SessionFilesystemFile(file) => {
+                assert_eq!(file.content, "first version");
+                file.revision
+            }
+            response => panic!("unexpected file response: {response:?}"),
+        };
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::RevertSessionCheckpoint {
+                        session_id,
+                        checkpoint_id,
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::CheckpointReverted(_))
+        ));
+        let updated = connection.request(RequestEnvelope::new(
+            ClientRequest::ApplySessionFilesystemEdit {
+                session_id,
+                edit: WorkspaceEdit {
+                    path: "notes/plan.md".to_owned(),
+                    old_text: "first".to_owned(),
+                    new_text: "second".to_owned(),
+                    expected_revision: Some(revision),
+                },
+            },
+        ));
+        assert!(matches!(
+            updated.result,
+            Ok(ServerResponse::WorkspaceEditApplied(_))
+        ));
+        let undo = connection.request(RequestEnvelope::new(ClientRequest::UndoSessionEdit {
+            session_id,
+        }));
+        assert_eq!(undo.result.unwrap_err().code, ErrorCode::InvalidState);
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::GetSessionFilesystemSnapshot { session_id },
+                ))
+                .result,
+            Ok(ServerResponse::SessionFilesystemSnapshot(_))
+        ));
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::GetSessionFilesystemChanges {
+                        session_id,
+                        after_sequence: None,
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::SessionFilesystemChanges { .. })
+        ));
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::GetSessionContextFiles { session_id }
+                ))
+                .result,
+            Ok(ServerResponse::ContextFiles { .. })
+        ));
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
+    }
+
+    #[test]
+    fn session_scoped_tokens_are_limited_to_their_sessions_and_source_roots() {
+        let backend = InProcessBackend::new();
+        let unrestricted = backend.connect();
+        negotiate(&unrestricted);
+        let workspace = match unrestricted
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Scoped access".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let session_id = match unrestricted
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Authorized session".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+
+        assert!(matches!(
+            unrestricted
+                .request(RequestEnvelope::new(ClientRequest::ListWorkspaces))
+                .result,
+            Ok(ServerResponse::Workspaces { .. })
+        ));
+        assert!(matches!(
+            unrestricted
+                .request(RequestEnvelope::new(
+                    ClientRequest::GetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::WorkspaceConfig(_))
+        ));
+        assert!(matches!(
+            unrestricted
+                .request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                        config: WorkspaceConfig::default(),
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::WorkspaceConfigUpdated)
+        ));
+        assert!(matches!(
+            unrestricted
+                .request(RequestEnvelope::new(ClientRequest::RenameWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Renamed workspace".to_owned(),
+                }))
+                .result,
+            Ok(ServerResponse::WorkspaceRenamed(_))
+        ));
+        assert!(matches!(
+            unrestricted
+                .request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+                    workspace_id: workspace.id,
+                    include_archived: false,
+                }))
+                .result,
+            Ok(ServerResponse::AgentSessions { .. })
+        ));
+
+        let tokens = AuthTokenStore::new();
+        let issued = tokens
+            .issue(AuthorizationScope::for_sessions(
+                [session_id],
+                backend.supported_capabilities.clone(),
+            ))
+            .unwrap();
+        let scoped = backend.connect_authenticated(tokens.authenticate(&issued.token).unwrap());
+        negotiate(&scoped);
+        assert!(matches!(
+            scoped
+                .request(RequestEnvelope::new(ClientRequest::GetAgentSession {
+                    session_id
+                }))
+                .result,
+            Ok(ServerResponse::AgentSession(_))
+        ));
+        assert_eq!(
+            scoped
+                .request(RequestEnvelope::new(ClientRequest::GetAgentSession {
+                    session_id: AgentSessionId::new(),
+                }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+        assert_eq!(
+            scoped
+                .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Denied workspace".to_owned(),
+                }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+        assert_eq!(
+            scoped
+                .request(RequestEnvelope::new(
+                    ClientRequest::CreateAgentSessionInWorkspace {
+                        workspace_id: workspace.id,
+                        name: "Denied session".to_owned(),
+                    },
+                ))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+        assert_eq!(
+            scoped
+                .request(RequestEnvelope::new(
+                    ClientRequest::AttachSessionDirectory {
+                        session_id,
+                        source: std::env::temp_dir().display().to_string(),
+                        path: "sources/local".to_owned(),
+                    }
+                ))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        assert_eq!(
+            scoped
+                .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: None,
+                    after_sequence: None,
+                }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
     }
 
     /// Serves an event stream that keeps a completion open until the client

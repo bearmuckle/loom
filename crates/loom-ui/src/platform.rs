@@ -338,6 +338,23 @@ fn state_root() -> PathBuf {
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct FailingCredentialBackend;
+
+    impl PeerCredentialBackend for FailingCredentialBackend {
+        fn get(&self, _: &str) -> SecretResult<Option<String>> {
+            Err("read failed".to_owned())
+        }
+
+        fn set(&self, _: &str, _: &str) -> SecretResult<()> {
+            Err("save failed".to_owned())
+        }
+
+        fn delete(&self, _: &str) -> SecretResult<()> {
+            Err("remove failed".to_owned())
+        }
+    }
+
     #[test]
     fn ui_options_allow_explicit_workspace_and_task() {
         let options = UiOptions::parse([
@@ -363,6 +380,58 @@ mod tests {
         );
         assert_eq!(options.remote.as_deref(), Some("ws://127.0.0.1:8080/ws"));
         assert!(!options.demo);
+    }
+
+    #[test]
+    fn ui_options_reject_missing_empty_and_unknown_arguments() {
+        for args in [
+            vec!["--workspace"],
+            vec!["--task"],
+            vec!["--task", "   "],
+            vec!["--model"],
+            vec!["--model", "  "],
+            vec!["--endpoint"],
+            vec!["--endpoint", "  "],
+            vec!["--remote"],
+            vec!["--remote", "  "],
+            vec!["--unknown"],
+            vec!["--help"],
+        ] {
+            let result = UiOptions::parse(
+                std::iter::once("loom-ui".to_owned())
+                    .chain(args.iter().copied().map(str::to_owned)),
+            );
+            assert!(result.is_err(), "accepted arguments: {args:?}");
+            assert_eq!(result.unwrap_err().code, ErrorCode::InvalidRequest);
+        }
+        let demo = UiOptions::parse(["loom-ui".to_owned(), "--demo".to_owned()]).unwrap();
+        assert!(demo.demo);
+        assert_eq!(demo.model.as_str(), "deterministic/demo");
+    }
+
+    #[test]
+    fn workspace_preparation_validates_and_initializes_a_repository() {
+        let root = env::temp_dir().join(format!("loom-ui-platform-{}", WorkspaceId::new()));
+        fs::create_dir_all(&root).unwrap();
+        let mut options = UiOptions::parse(["loom-ui".to_owned()]).unwrap();
+        options.workspace = Some(root.clone());
+        let (resolved, demo) = prepare_workspace(&options).unwrap();
+        assert_eq!(resolved, fs::canonicalize(&root).unwrap());
+        assert!(!demo);
+
+        options.workspace = Some(root.join("missing"));
+        assert_eq!(
+            prepare_workspace(&options).unwrap_err().code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        let file = root.join("not-a-directory");
+        fs::write(&file, "file").unwrap();
+        options.workspace = Some(file);
+        assert_eq!(
+            prepare_workspace(&options).unwrap_err().code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -396,5 +465,32 @@ mod tests {
         );
         store.delete(workspace_id, first_url).unwrap();
         assert_eq!(store.get(workspace_id, first_url).unwrap(), None);
+    }
+
+    #[test]
+    fn peer_credential_errors_are_wrapped_with_the_operation_name() {
+        let store = PeerCredentialStore::with_backend(Arc::new(FailingCredentialBackend));
+        let workspace_id = WorkspaceId::new();
+        assert!(
+            store
+                .get(workspace_id, "wss://worker.example/ws")
+                .unwrap_err()
+                .message
+                .contains("read worker-node credential")
+        );
+        assert!(
+            store
+                .set(workspace_id, "wss://worker.example/ws", "secret")
+                .unwrap_err()
+                .message
+                .contains("save worker-node credential")
+        );
+        assert!(
+            store
+                .delete(workspace_id, "wss://worker.example/ws")
+                .unwrap_err()
+                .message
+                .contains("remove worker-node credential")
+        );
     }
 }
