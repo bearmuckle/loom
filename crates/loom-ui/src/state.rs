@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use gpui_kit::{ListAlignment, ListState, px};
 use loom_core::{AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError};
 use loom_protocol::{
-    AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitDiffLine,
-    GitRepositoryStatus, SessionFilesystemChange, SessionFilesystemFile,
+    AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff,
+    GitDiffLine, GitRepositoryStatus, SessionFilesystemChange, SessionFilesystemFile,
 };
 
 use crate::MAX_TIMELINE_OUTPUT;
@@ -202,29 +202,46 @@ pub(crate) enum TimelineItem {
     },
 }
 
+/// Project consecutive commands into one section, including commands from different
+/// model turns. Other tools, transcript messages, and run boundaries break a group.
+/// Updates replace records in place so late results never reorder the transcript.
 pub(crate) fn upsert_activity(timeline: &mut Vec<TimelineItem>, activity: AgentActivityRecord) {
-    if let Some((_, section)) = timeline.iter_mut().enumerate().find_map(|(index, item)| {
-        let TimelineItem::ActivitySection { activities } = item else {
-            return None;
+    for item in timeline.iter_mut() {
+        if let TimelineItem::ActivitySection { activities } = item
+            && let Some(existing) = activities.iter_mut().find(|item| item.id == activity.id)
+        {
+            *existing = activity;
+            return;
+        }
+    }
+
+    if let Some(TimelineItem::ActivitySection { activities }) = timeline.last_mut() {
+        let same_run = activities.iter().all(|item| item.run_id == activity.run_id);
+        let commands_or_turns = activities.iter().all(|item| {
+            matches!(
+                item.data,
+                AgentActivityData::Command { .. } | AgentActivityData::ModelTurn { .. }
+            )
+        });
+        let compatible = match &activity.data {
+            AgentActivityData::ModelTurn { .. } | AgentActivityData::Command { .. } => {
+                commands_or_turns
+            }
+            _ => {
+                !activities
+                    .iter()
+                    .any(|item| matches!(item.data, AgentActivityData::Command { .. }))
+                    && activity.parent_id.is_some_and(|parent| {
+                        activities
+                            .iter()
+                            .any(|item| item.id == parent || item.parent_id == Some(parent))
+                    })
+            }
         };
-        if let Some(existing) = activities
-            .iter_mut()
-            .find(|existing| existing.id == activity.id)
-        {
-            *existing = activity.clone();
-            return Some((index, activities));
+        if same_run && compatible {
+            activities.push(activity);
+            return;
         }
-        if activity
-            .parent_id
-            .is_some_and(|parent_id| activities.iter().any(|existing| existing.id == parent_id))
-        {
-            activities.push(activity.clone());
-            return Some((index, activities));
-        }
-        None
-    }) {
-        let _ = section;
-        return;
     }
     timeline.push(TimelineItem::ActivitySection {
         activities: vec![activity],
@@ -371,6 +388,124 @@ mod tests {
             AgentMode::AutoApprove.approval_policy(false),
             ApprovalPolicy::auto_approve()
         );
+    }
+
+    fn turn(run_id: RunId) -> AgentActivityRecord {
+        AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id,
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::ModelTurn,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::from_unix_millis(1),
+            completed_at: None,
+            elapsed_ms: None,
+            data: AgentActivityData::ModelTurn {
+                model: ModelId::new("test/model"),
+            },
+        }
+    }
+
+    fn command(parent: &AgentActivityRecord) -> AgentActivityRecord {
+        AgentActivityRecord {
+            id: ActivityId::new(),
+            parent_id: Some(parent.id),
+            kind: AgentActivityKind::Command,
+            data: AgentActivityData::Command {
+                call: ToolCall {
+                    id: ToolCallId::new(),
+                    name: "run_command".to_owned(),
+                    arguments: serde_json::json!({}),
+                },
+                command: "cargo".to_owned(),
+                args: vec!["test".to_owned()],
+                cwd: None,
+                result: None,
+            },
+            ..parent.clone()
+        }
+    }
+
+    #[test]
+    fn consecutive_commands_span_turns_and_keep_late_results_in_place() {
+        let run_id = RunId::new();
+        let first_turn = turn(run_id);
+        let first = command(&first_turn);
+        let second_turn = turn(run_id);
+        let second = command(&second_turn);
+        let records = [first_turn, first.clone(), second_turn, second.clone()];
+        let mut timeline = Vec::new();
+        for record in &records {
+            upsert_activity(&mut timeline, record.clone());
+        }
+        assert_eq!(timeline.len(), 1);
+        timeline.push(TimelineItem::Assistant("Finished checks".to_owned()));
+        let mut finished = first.clone();
+        finished.status = AgentActivityStatus::Failed;
+        if let AgentActivityData::Command { call, result, .. } = &mut finished.data {
+            *result = Some(loom_protocol::ToolResult::failure(call, "test failed"));
+        }
+        upsert_activity(&mut timeline, finished.clone());
+        let TimelineItem::ActivitySection { activities } = &timeline[0] else {
+            panic!("expected group")
+        };
+        assert_eq!(
+            activities,
+            &[records[0].clone(), finished, records[2].clone(), second]
+        );
+        assert_eq!(timeline.len(), 2);
+
+        // Snapshot replay takes the same path as streamed activity records.
+        let mut restored = Vec::new();
+        for record in records {
+            upsert_activity(&mut restored, record);
+        }
+        assert_eq!(restored.len(), 1);
+    }
+
+    #[test]
+    fn commands_do_not_cross_messages_tools_or_run_boundaries() {
+        for separator in [
+            TimelineItem::Assistant("Checking another area".to_owned()),
+            TimelineItem::User("Next task".to_owned()),
+            TimelineItem::Status("Paused".to_owned()),
+        ] {
+            let parent = turn(RunId::new());
+            let mut timeline = Vec::new();
+            upsert_activity(&mut timeline, parent.clone());
+            upsert_activity(&mut timeline, command(&parent));
+            timeline.push(separator);
+            upsert_activity(&mut timeline, command(&parent));
+            assert_eq!(timeline.len(), 3);
+        }
+        let parent = turn(RunId::new());
+        let mut timeline = Vec::new();
+        upsert_activity(&mut timeline, parent.clone());
+        upsert_activity(&mut timeline, command(&parent));
+        let other_tool = AgentActivityRecord {
+            id: ActivityId::new(),
+            parent_id: Some(parent.id),
+            kind: AgentActivityKind::ToolCall,
+            data: AgentActivityData::ToolCall {
+                call: ToolCall {
+                    id: ToolCallId::new(),
+                    name: "read_file".to_owned(),
+                    arguments: serde_json::json!({}),
+                },
+                result: None,
+            },
+            ..parent.clone()
+        };
+        upsert_activity(&mut timeline, other_tool.clone());
+        upsert_activity(&mut timeline, command(&parent));
+        assert_eq!(timeline.len(), 3);
+        let other_run = turn(RunId::new());
+        upsert_activity(&mut timeline, other_run.clone());
+        upsert_activity(&mut timeline, command(&other_run));
+        assert_eq!(timeline.len(), 4);
+        upsert_activity(&mut timeline, other_tool);
+        assert_eq!(timeline.len(), 4);
     }
 
     #[test]

@@ -18,7 +18,9 @@ use gpui_kit::component::input::{
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{
-    Icon, IconName, IndexPath, Sizable, h_resizable,
+    Icon, IconName, IndexPath, Sizable,
+    collapsible::Collapsible,
+    h_resizable,
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     resizable_panel,
     select::{SearchableVec, Select, SelectEvent, SelectState},
@@ -700,27 +702,11 @@ fn activity_label(activity: &AgentActivityRecord) -> (String, Option<String>) {
             )),
         ),
         AgentActivityData::Command {
-            call,
-            command,
-            args,
-            cwd,
-            ..
-        } => {
-            let command_line = std::iter::once(command.as_str())
-                .chain(args.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" ");
-            (
-                "Run command".to_owned(),
-                Some(format!(
-                    "{}{} · {}",
-                    bounded_to(&command_line, 180),
-                    cwd.as_deref()
-                        .map_or_else(String::new, |cwd| format!(" in {cwd}")),
-                    compact_arguments(call)
-                )),
-            )
-        }
+            command, args, cwd, ..
+        } => (
+            compact_activity_text(&command_line(command, args), 180),
+            cwd.as_ref().map(|cwd| format!("Directory: {cwd}")),
+        ),
     }
 }
 
@@ -737,7 +723,7 @@ fn activity_output(activity: &AgentActivityRecord) -> Option<&str> {
     }
 }
 
-fn activity_turn_title(activities: &[AgentActivityRecord]) -> &'static str {
+fn activity_turn_title(activities: &[AgentActivityRecord]) -> String {
     if activities.iter().any(|activity| {
         matches!(
             &activity.data,
@@ -750,30 +736,164 @@ fn activity_turn_title(activities: &[AgentActivityRecord]) -> &'static str {
             AgentActivityData::ToolCall { call, .. } if call.name == "apply_patch"
         )
     }) {
-        "Making changes"
+        "Making changes".to_owned()
     } else if activities
         .iter()
         .any(|activity| matches!(&activity.data, AgentActivityData::Command { .. }))
     {
-        "Running commands"
+        command_group_title(activities)
     } else if activities
         .iter()
         .any(|activity| matches!(&activity.data, AgentActivityData::Search { .. }))
     {
-        "Searching the codebase"
+        "Searching the codebase".to_owned()
     } else if activities
         .iter()
         .any(|activity| matches!(&activity.data, AgentActivityData::File { .. }))
     {
-        "Inspecting the workspace"
+        "Inspecting the workspace".to_owned()
     } else if activities
         .iter()
         .any(|activity| matches!(&activity.data, AgentActivityData::ToolCall { .. }))
     {
-        "Using tools"
+        "Using tools".to_owned()
     } else {
-        "Working on the task"
+        "Working on the task".to_owned()
     }
+}
+
+fn compact_activity_text(value: &str, limit: usize) -> String {
+    let mut chars = value.chars();
+    let mut label = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        label.push('…');
+    }
+    label
+}
+
+fn command_line(command: &str, args: &[String]) -> String {
+    std::iter::once(command.to_owned())
+        .chain(args.iter().map(|arg| {
+            if !arg.is_empty()
+                && arg
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || "-_/.:=".contains(c))
+            {
+                arg.clone()
+            } else {
+                format!("'{}'", arg.replace('\'', "'\\''"))
+            }
+        }))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn command_purpose(command: &str, args: &[String]) -> String {
+    let executable = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    // Shell wrappers are common; use their script to recognize familiar work.
+    if matches!(executable, "sh" | "bash" | "zsh")
+        && let Some(script) = args
+            .windows(2)
+            .find_map(|pair| matches!(pair[0].as_str(), "-c" | "-lc").then_some(pair[1].as_str()))
+    {
+        let mut words = script.split_whitespace();
+        if let Some(program) = words.next() {
+            return command_purpose(program, &words.map(str::to_owned).collect::<Vec<_>>());
+        }
+    }
+    let action = args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(String::as_str);
+    match (executable, action) {
+        ("cargo", Some("test" | "llvm-cov")) => "Run tests".to_owned(),
+        ("cargo", Some("clippy")) => "Check code quality".to_owned(),
+        ("cargo", Some("fmt")) if args.iter().any(|arg| arg == "--check") => {
+            "Check formatting".to_owned()
+        }
+        ("cargo", Some("fmt")) => "Format code".to_owned(),
+        ("cargo", Some("build" | "check")) => "Check the build".to_owned(),
+        ("npm" | "pnpm" | "yarn", Some("test")) | ("pytest", _) => "Run tests".to_owned(),
+        ("git", Some("status" | "diff" | "log" | "show")) => {
+            "Inspect repository changes".to_owned()
+        }
+        ("rg" | "grep" | "find", _) => "Search the workspace".to_owned(),
+        ("ls" | "cat" | "sed" | "head" | "tail" | "pwd", _) => "Inspect workspace files".to_owned(),
+        _ => {
+            let program = if executable.is_empty() {
+                "command"
+            } else {
+                executable
+            };
+            let detail = action.map_or_else(String::new, |action| format!(" {action}"));
+            format!(
+                "Run {}",
+                compact_activity_text(&format!("{program}{detail}"), 40)
+            )
+        }
+    }
+}
+
+fn command_group_title(activities: &[AgentActivityRecord]) -> String {
+    let mut purposes = Vec::new();
+    for activity in activities {
+        if let AgentActivityData::Command { command, args, .. } = &activity.data {
+            let purpose = command_purpose(command, args);
+            if !purposes.contains(&purpose) {
+                purposes.push(purpose);
+            }
+        }
+    }
+    let title = match purposes.as_slice() {
+        [] => "Inspect the workspace".to_owned(),
+        [purpose] => purpose.clone(),
+        [first, second] => format!("{first} · {second}"),
+        [first, second, ..] => format!("{first} · {second} · More work"),
+    };
+    compact_activity_text(&title, 72)
+}
+
+fn command_group_status(activities: &[AgentActivityRecord]) -> AgentActivityStatus {
+    // Actionable and active work stays visible even after another command fails.
+    for status in [
+        AgentActivityStatus::AwaitingApproval,
+        AgentActivityStatus::AwaitingInput,
+        AgentActivityStatus::Started,
+        AgentActivityStatus::Failed,
+        AgentActivityStatus::Cancelled,
+    ] {
+        if activities.iter().any(|activity| {
+            matches!(activity.data, AgentActivityData::Command { .. }) && activity.status == status
+        }) {
+            return status;
+        }
+    }
+    AgentActivityStatus::Completed
+}
+
+fn command_output_summary(output: &str) -> String {
+    let lines = output.lines().collect::<Vec<_>>();
+    if lines.len() <= 8 && output.len() <= 420 {
+        return output.trim().to_owned();
+    }
+    let head = lines.iter().take(3).copied().collect::<Vec<_>>().join("\n");
+    let tail = lines
+        .iter()
+        .skip(lines.len().saturating_sub(4))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    // Keep the end, where build/test summaries and failure messages usually live.
+    let tail_start = tail
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| tail.len() - index <= 240)
+        .unwrap_or(tail.len());
+    format!(
+        "{}\n… output abbreviated …\n{}",
+        bounded_to(&head, 140),
+        &tail[tail_start..]
+    )
 }
 
 fn is_redundant_completion_summary(summary: &str) -> bool {
@@ -1142,6 +1262,7 @@ pub(crate) struct LoomView {
     timeline_view: Option<Entity<TimelineView>>,
     pub(crate) activity_records_seen: bool,
     pub(crate) expanded_activities: BTreeSet<ActivityId>,
+    expanded_command_groups: BTreeSet<ActivityId>,
     pub(crate) approval_request_in_flight: bool,
     approval_settings_request_in_flight: bool,
     pub(crate) archive_request_in_flight: bool,
@@ -1481,6 +1602,7 @@ impl LoomView {
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
+            expanded_command_groups: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -1827,6 +1949,7 @@ impl LoomView {
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
+            expanded_command_groups: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -1991,6 +2114,7 @@ impl LoomView {
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
+            expanded_command_groups: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -2195,6 +2319,7 @@ impl LoomView {
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
+            expanded_command_groups: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -2611,6 +2736,7 @@ impl LoomView {
         self.timeline.clear();
         self.activity_records_seen = false;
         self.expanded_activities.clear();
+        self.expanded_command_groups.clear();
         self.approval_request_in_flight = false;
         self.pending_approval = None;
         self.pending_input = None;
@@ -6356,6 +6482,68 @@ impl LoomView {
         index: usize,
         parent: &Entity<LoomView>,
     ) -> gpui_kit::AnyElement {
+        let mut rows = div().flex().flex_col().gap_1();
+        for (activity_index, activity) in activities.iter().enumerate() {
+            if !matches!(activity.data, AgentActivityData::ModelTurn { .. }) {
+                rows =
+                    rows.child(self.render_activity_row(activity, index, activity_index, parent));
+            }
+        }
+        if let Some(first_command) = activities
+            .iter()
+            .find(|activity| matches!(activity.data, AgentActivityData::Command { .. }))
+        {
+            let group_id = first_command.id;
+            let status = command_group_status(activities);
+            let expanded = self.expanded_command_groups.contains(&group_id)
+                || matches!(
+                    status,
+                    AgentActivityStatus::AwaitingApproval | AgentActivityStatus::AwaitingInput
+                );
+            let count = activities
+                .iter()
+                .filter(|activity| matches!(activity.data, AgentActivityData::Command { .. }))
+                .count();
+            let parent_for_toggle = parent.clone();
+            // Collapsible owns visibility; the first command gives the group a
+            // stable identity as more turns and results arrive.
+            return div()
+                .id(("activity-section", index))
+                .w_full()
+                .min_w_0()
+                .mx_2()
+                .my_1()
+                .pl_3()
+                .border_l_1()
+                .border_color(rgb(0x3b4555))
+                .child(
+                    Collapsible::new()
+                        .open(expanded)
+                        .child(
+                            Button::new(("command-group", index))
+                                .w_full()
+                                .ghost()
+                                .small()
+                                .label(format!(
+                                    "{} {} · {count} {} · {}",
+                                    if expanded { "⌄" } else { "›" },
+                                    command_group_title(activities),
+                                    if count == 1 { "command" } else { "commands" },
+                                    activity_status_label(status)
+                                ))
+                                .on_click(move |_, _, cx| {
+                                    parent_for_toggle.update(cx, |this, cx| {
+                                        if !this.expanded_command_groups.remove(&group_id) {
+                                            this.expanded_command_groups.insert(group_id);
+                                        }
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                        .content(rows),
+                )
+                .into_any();
+        }
         let model = activities.iter().find_map(|activity| match &activity.data {
             AgentActivityData::ModelTurn { model } => Some(model.as_str().to_owned()),
             _ => None,
@@ -6404,134 +6592,148 @@ impl LoomView {
                             .child(div().text_color(rgb(0x94a3b8)).child(status))
                     }),
             );
-        for (activity_index, activity) in activities.iter().enumerate() {
-            if matches!(activity.data, AgentActivityData::ModelTurn { .. }) {
-                continue;
+        section = section.child(rows);
+        section.into_any()
+    }
+
+    fn render_activity_row(
+        &self,
+        activity: &AgentActivityRecord,
+        index: usize,
+        activity_index: usize,
+        parent: &Entity<LoomView>,
+    ) -> gpui_kit::AnyElement {
+        let (label, detail) = activity_label(activity);
+        let duration = activity.elapsed_ms.map(format_duration);
+        let output = activity_output(activity);
+        let is_command = matches!(activity.data, AgentActivityData::Command { .. });
+        let expanded = is_command || self.expanded_activities.contains(&activity.id);
+        let status_color = match activity.status {
+            AgentActivityStatus::Failed => rgb(0xfca5a5),
+            AgentActivityStatus::Completed => rgb(0x9ad7bd),
+            AgentActivityStatus::AwaitingApproval | AgentActivityStatus::AwaitingInput => {
+                rgb(0xfef3c7)
             }
-            let (label, detail) = activity_label(activity);
-            let duration = activity.elapsed_ms.map(format_duration);
-            let output = activity_output(activity);
-            let expanded = self.expanded_activities.contains(&activity.id);
-            let status_color = match activity.status {
-                AgentActivityStatus::Failed => rgb(0xfca5a5),
-                AgentActivityStatus::Completed => rgb(0x9ad7bd),
-                AgentActivityStatus::AwaitingApproval | AgentActivityStatus::AwaitingInput => {
-                    rgb(0xfef3c7)
-                }
-                AgentActivityStatus::Started => rgb(0x93c5fd),
-                AgentActivityStatus::Cancelled => rgb(0x94a3b8),
-            };
-            let activity_id = activity.id;
-            let parent_for_toggle = parent.clone();
-            let mut row = div()
-                .id(("activity", ((index as u64) << 32) | activity_index as u64))
-                .test_support()
-                .flex()
-                .flex_col()
-                .cursor_pointer()
-                .text_xs()
-                .text_color(rgb(0xcbd5e1))
-                .on_click(move |_, _, cx| {
+            AgentActivityStatus::Started => rgb(0x93c5fd),
+            AgentActivityStatus::Cancelled => rgb(0x94a3b8),
+        };
+        let activity_id = activity.id;
+        let parent_for_toggle = parent.clone();
+        let mut row = div()
+            .id(("activity", ((index as u64) << 32) | activity_index as u64))
+            .test_support()
+            .flex()
+            .flex_col()
+            .text_xs()
+            .text_color(rgb(0xcbd5e1))
+            .when(!is_command, |row| {
+                row.cursor_pointer().on_click(move |_, _, cx| {
                     parent_for_toggle.update(cx, |this, cx| this.toggle_activity(activity_id, cx));
                 })
-                .child(
-                    session_header_title()
-                        .child(
-                            div()
-                                .w(px(12.))
-                                .text_color(status_color)
-                                .child(activity_marker(activity.status)),
-                        )
-                        .child(if expanded { "⌄" } else { "›" })
-                        .child(label)
-                        .flex_1()
-                        .child(
-                            div()
-                                .text_color(status_color)
-                                .child(activity_status_label(activity.status)),
-                        )
-                        .when_some(duration, |element, duration| {
-                            element
-                                .text_color(rgb(0x64748b))
-                                .child(format!(" · {duration}"))
-                        }),
-                );
-            if expanded {
-                if let Some(detail) = detail {
-                    row = row.child(
+            })
+            .child(
+                session_header_title()
+                    .child(
                         div()
-                            .ml(px(26.))
-                            .max_w(px(560.))
-                            .text_color(rgb(0x94a3b8))
-                            .child(detail),
-                    );
-                }
-                if let Some(output) = output {
-                    row = row.child(
+                            .w(px(12.))
+                            .text_color(status_color)
+                            .child(activity_marker(activity.status)),
+                    )
+                    .when(!is_command, |header| {
+                        header.child(if expanded { "⌄" } else { "›" })
+                    })
+                    .child(label)
+                    .flex_1()
+                    .child(
                         div()
-                            .ml(px(26.))
-                            .max_w(px(560.))
-                            .border_l_1()
-                            .border_color(rgb(0x30343f))
-                            .pl_2()
-                            .text_color(rgb(0x8f98a6))
-                            .child(bounded_to(output, 420)),
-                    );
-                }
-            }
-            if activity.status == AgentActivityStatus::AwaitingApproval
-                && self.pending_approval.is_some()
-                && !self.approval_request_in_flight
-            {
-                let parent_for_approve = parent.clone();
-                let parent_for_reject = parent.clone();
+                            .text_color(status_color)
+                            .child(activity_status_label(activity.status)),
+                    )
+                    .when_some(duration, |element, duration| {
+                        element
+                            .text_color(rgb(0x64748b))
+                            .child(format!(" · {duration}"))
+                    }),
+            );
+        if expanded {
+            if let Some(detail) = detail {
                 row = row.child(
                     div()
                         .ml(px(26.))
-                        .mt_1()
-                        .flex()
-                        .gap_2()
+                        .max_w(px(560.))
+                        .text_color(rgb(0x94a3b8))
+                        .child(detail),
+                );
+            }
+            if let Some(output) = output {
+                row = row.child(
+                    div()
+                        .ml(px(26.))
+                        .max_w(px(560.))
+                        .border_l_1()
+                        .border_color(rgb(0x30343f))
+                        .pl_2()
+                        .text_color(rgb(0x8f98a6))
                         .child(
-                            Button::new((
-                                "approve-activity",
-                                ((index as u64) << 32) | activity_index as u64,
-                            ))
-                            .label("Approve")
-                            .success()
-                            .small()
-                            .on_click(move |_, _, cx| {
-                                parent_for_approve
-                                    .update(cx, |this, cx| this.approve_pending_action(cx));
-                            }),
-                        )
-                        .child(
-                            Button::new((
-                                "reject-activity",
-                                ((index as u64) << 32) | activity_index as u64,
-                            ))
-                            .label("Reject")
-                            .danger()
-                            .small()
-                            .on_click(move |_, _, cx| {
-                                parent_for_reject
-                                    .update(cx, |this, cx| this.reject_pending_action(cx));
-                            }),
+                            if matches!(activity.data, AgentActivityData::Command { .. }) {
+                                command_output_summary(output)
+                            } else {
+                                bounded_to(output, 420)
+                            },
                         ),
                 );
-            } else if activity.status == AgentActivityStatus::AwaitingApproval
-                && self.approval_request_in_flight
-            {
-                row = row.child(
-                    div()
-                        .ml(px(26.))
-                        .mt_1()
-                        .text_color(rgb(0x94a3b8))
-                        .child("Submitting approval..."),
-                );
             }
-            section = section.child(row);
         }
-        section.into_any()
+        if activity.status == AgentActivityStatus::AwaitingApproval
+            && self.pending_approval.is_some()
+            && !self.approval_request_in_flight
+        {
+            let parent_for_approve = parent.clone();
+            let parent_for_reject = parent.clone();
+            row = row.child(
+                div()
+                    .ml(px(26.))
+                    .mt_1()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new((
+                            "approve-activity",
+                            ((index as u64) << 32) | activity_index as u64,
+                        ))
+                        .label("Approve")
+                        .success()
+                        .small()
+                        .on_click(move |_, _, cx| {
+                            parent_for_approve
+                                .update(cx, |this, cx| this.approve_pending_action(cx));
+                        }),
+                    )
+                    .child(
+                        Button::new((
+                            "reject-activity",
+                            ((index as u64) << 32) | activity_index as u64,
+                        ))
+                        .label("Reject")
+                        .danger()
+                        .small()
+                        .on_click(move |_, _, cx| {
+                            parent_for_reject.update(cx, |this, cx| this.reject_pending_action(cx));
+                        }),
+                    ),
+            );
+        } else if activity.status == AgentActivityStatus::AwaitingApproval
+            && self.approval_request_in_flight
+        {
+            row = row.child(
+                div()
+                    .ml(px(26.))
+                    .mt_1()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Submitting approval..."),
+            );
+        }
+        row.into_any()
     }
 
     fn toggle_activity(&mut self, activity_id: ActivityId, cx: &mut Context<Self>) {
@@ -9611,8 +9813,9 @@ mod display_helper_tests {
     use super::{
         AgentActivityData, AgentActivityRecord, AgentActivityStatus, FileActivityOperation,
         activity_label, activity_marker, activity_output, activity_turn_title, change_kind_label,
-        format_bytes, format_duration, format_percentage, is_redundant_completion_summary,
-        run_state_label, session_state_label,
+        command_group_status, command_group_title, command_line, command_output_summary,
+        command_purpose, format_bytes, format_duration, format_percentage,
+        is_redundant_completion_summary, run_state_label, session_state_label,
     };
     use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
     use loom_model::{ModelId, ToolCall};
@@ -9654,6 +9857,104 @@ mod display_helper_tests {
         assert_eq!(format_duration(999), "999ms");
         assert_eq!(format_duration(1_500), "1.5s");
         assert_eq!(format_duration(61_000), "1m 1s");
+    }
+
+    #[test]
+    fn command_groups_describe_work_and_preserve_result_summaries() {
+        let command = |program: &str, args: &[&str]| {
+            activity(AgentActivityData::Command {
+                call: call("run_command"),
+                command: program.to_owned(),
+                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                cwd: None,
+                result: None,
+            })
+        };
+        let test = command("cargo", &["test"]);
+        let fmt = command("cargo", &["fmt", "--all", "--", "--check"]);
+        assert_eq!(
+            command_group_title(&[fmt, test.clone()]),
+            "Check formatting · Run tests"
+        );
+        assert_eq!(
+            command_group_title(&[test.clone(), test.clone()]),
+            "Run tests"
+        );
+        assert_eq!(
+            command_group_title(&[command("/usr/bin/bash", &["-lc", "cargo test --workspace"])]),
+            "Run tests"
+        );
+        for (program, args, expected) in [
+            ("cargo", vec!["clippy"], "Check code quality"),
+            ("cargo", vec!["fmt"], "Format code"),
+            ("cargo", vec!["check"], "Check the build"),
+            ("git", vec!["diff"], "Inspect repository changes"),
+            ("rg", vec!["needle"], "Search the workspace"),
+            ("cat", vec!["src/lib.rs"], "Inspect workspace files"),
+            ("/usr/bin/custom", vec![], "Run custom"),
+        ] {
+            assert_eq!(
+                command_purpose(
+                    program,
+                    &args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>()
+                ),
+                expected
+            );
+        }
+        assert_eq!(
+            command_line(
+                "echo",
+                &["two words".to_owned(), "it's".to_owned(), "".to_owned()]
+            ),
+            "echo 'two words' 'it'\\''s' ''"
+        );
+        assert_eq!(command_output_summary("test result: ok"), "test result: ok");
+        let output = format!(
+            "Starting checks\n{}\nerror: test failed",
+            "Compiling dependency\n".repeat(100)
+        );
+        let summary = command_output_summary(&output);
+        assert!(summary.starts_with("Starting checks"));
+        assert!(summary.ends_with("error: test failed"));
+        assert!(summary.contains("output abbreviated"));
+        assert!(summary.len() < 450);
+        let unicode = format!("{}final result", "界".repeat(1000));
+        assert!(command_output_summary(&unicode).ends_with("final result"));
+        assert_eq!(
+            command_group_status(std::slice::from_ref(&test)),
+            AgentActivityStatus::Completed
+        );
+        let failed = AgentActivityRecord {
+            status: AgentActivityStatus::Failed,
+            ..test.clone()
+        };
+        assert_eq!(
+            command_group_status(&[test.clone(), failed.clone()]),
+            AgentActivityStatus::Failed
+        );
+        for status in [
+            AgentActivityStatus::AwaitingApproval,
+            AgentActivityStatus::AwaitingInput,
+            AgentActivityStatus::Started,
+        ] {
+            assert_eq!(
+                command_group_status(&[
+                    failed.clone(),
+                    AgentActivityRecord {
+                        status,
+                        ..test.clone()
+                    }
+                ]),
+                status
+            );
+        }
+        assert_eq!(
+            command_group_status(&[AgentActivityRecord {
+                status: AgentActivityStatus::Cancelled,
+                ..test
+            }]),
+            AgentActivityStatus::Cancelled
+        );
     }
 
     #[test]
@@ -9723,7 +10024,7 @@ mod display_helper_tests {
         assert_eq!(activity_label(&tool).0, "apply_patch");
         assert_eq!(
             activity_turn_title(std::slice::from_ref(&tool)),
-            "Making changes"
+            "Making changes".to_owned()
         );
 
         let file = activity(AgentActivityData::File {
@@ -9755,11 +10056,11 @@ mod display_helper_tests {
         });
         assert_eq!(
             activity_turn_title(std::slice::from_ref(&tool_only)),
-            "Using tools"
+            "Using tools".to_owned()
         );
         assert_eq!(
             activity_turn_title(std::slice::from_ref(&file)),
-            "Inspecting the workspace"
+            "Inspecting the workspace".to_owned()
         );
 
         let write = activity(AgentActivityData::File {
@@ -9770,7 +10071,7 @@ mod display_helper_tests {
         });
         assert_eq!(
             activity_turn_title(std::slice::from_ref(&write)),
-            "Making changes"
+            "Making changes".to_owned()
         );
 
         let search = activity(AgentActivityData::Search {
@@ -9782,7 +10083,7 @@ mod display_helper_tests {
         assert!(activity_label(&search).1.unwrap().contains("in src"));
         assert_eq!(
             activity_turn_title(std::slice::from_ref(&search)),
-            "Searching the codebase"
+            "Searching the codebase".to_owned()
         );
 
         let command = activity(AgentActivityData::Command {
@@ -9792,10 +10093,10 @@ mod display_helper_tests {
             cwd: Some("repo".to_owned()),
             result: None,
         });
-        assert_eq!(activity_label(&command).0, "Run command");
+        assert_eq!(activity_label(&command).0, "cargo test");
         assert_eq!(
             activity_turn_title(std::slice::from_ref(&command)),
-            "Running commands"
+            "Run tests"
         );
         assert_eq!(activity_turn_title(&[]), "Working on the task");
         for data in [
@@ -10556,6 +10857,85 @@ mod loom_view_render_tests {
         });
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
             .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn command_groups_expand_keep_new_results_and_show_approvals(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let group_id = ActivityId::new();
+        let run_id = RunId::new();
+        let call = ToolCall {
+            id: ToolCallId::new(),
+            name: "run_command".to_owned(),
+            arguments: serde_json::json!({"command": "cargo", "args": ["test"]}),
+        };
+        let record = AgentActivityRecord {
+            id: group_id,
+            run_id,
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::Command,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::from_unix_millis(1),
+            completed_at: None,
+            elapsed_ms: Some(10),
+            data: AgentActivityData::Command {
+                call: call.clone(),
+                command: "cargo".to_owned(),
+                args: vec!["test".to_owned()],
+                cwd: Some("repo".to_owned()),
+                result: Some(ToolResult::success(&call, "test result: ok".to_owned())),
+            },
+        };
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            view.timeline = vec![TimelineItem::ActivitySection {
+                activities: vec![record.clone()],
+            }];
+            view
+        });
+        cx.update_window(handle.into(), |view, window, cx| {
+            let view = view.downcast::<LoomView>().unwrap();
+            window.render_frame(cx);
+            assert!(window.try_find(("activity", 0u64)).is_none());
+            window.click(("command-group", 0usize), cx);
+            window.render_frame(cx);
+            assert!(window.try_find(("activity", 0u64)).is_some());
+            view.update(cx, |view, _| {
+                assert!(view.expanded_command_groups.contains(&group_id));
+                view.consume_agent_event(&loom_protocol::AgentEvent::ActivityRecorded {
+                    run_id,
+                    activity: AgentActivityRecord {
+                        id: ActivityId::new(),
+                        ..record.clone()
+                    },
+                });
+            });
+            window.render_frame(cx);
+            assert!(window.try_find(("activity", 1u64)).is_some());
+            window.click(("command-group", 0usize), cx);
+            window.render_frame(cx);
+            assert!(window.try_find(("activity", 0u64)).is_none());
+            view.update(cx, |view, cx| {
+                view.pending_approval = Some(call.clone());
+                view.active_run_id = Some(run_id);
+                view.consume_agent_event(&loom_protocol::AgentEvent::ActivityRecorded {
+                    run_id,
+                    activity: AgentActivityRecord {
+                        status: AgentActivityStatus::AwaitingApproval,
+                        ..record.clone()
+                    },
+                });
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.try_find(("approve-activity", 0u64)).is_some());
+            assert!(window.try_find(("reject-activity", 0u64)).is_some());
+            window.click(("approve-activity", 0u64), cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
