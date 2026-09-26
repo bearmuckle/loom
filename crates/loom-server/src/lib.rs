@@ -1638,7 +1638,8 @@ impl InProcessBackend {
                         Box::new(UnavailableProvider::new(descriptor, error))
                     }
                 };
-            let tools = ToolExecutor::new_with_workspace(workspace);
+            let tools = ToolExecutor::new_with_workspace(workspace)
+                .with_github_token(self.providers.github_account_token().ok());
             let mut runtime = AgentRuntime::from_state(runtime_state, provider, tools)?;
             if runtime.session_id() != session.id {
                 return Err(LoomError::new(
@@ -3980,7 +3981,8 @@ impl InProcessConnection {
         }
         let checkpoint = workspace.create_checkpoint("before agent run")?;
         input.options.checkpoint_id = Some(checkpoint.id);
-        let tools = ToolExecutor::new_with_workspace(workspace);
+        let tools = ToolExecutor::new_with_workspace(workspace)
+            .with_github_token(self.backend.providers.github_account_token().ok());
         let policy = self.policy(session.id)?;
         let mut agent_task = AgentTask::new(input.task, input.model)?;
         agent_task.system_instructions = input.system_instructions;

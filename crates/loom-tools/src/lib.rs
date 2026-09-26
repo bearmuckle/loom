@@ -26,6 +26,9 @@ pub enum ToolKind {
     AskUser,
     ApplyPatch,
     RunCommand,
+    GitHubListPullRequests,
+    GitHubGetPullRequest,
+    GitHubCreatePullRequest,
 }
 
 impl ToolKind {
@@ -39,6 +42,9 @@ impl ToolKind {
             "ask_user" => Some(Self::AskUser),
             "apply_patch" => Some(Self::ApplyPatch),
             "run_command" => Some(Self::RunCommand),
+            "github_list_pull_requests" => Some(Self::GitHubListPullRequests),
+            "github_get_pull_request" => Some(Self::GitHubGetPullRequest),
+            "github_create_pull_request" => Some(Self::GitHubCreatePullRequest),
             _ => None,
         }
     }
@@ -53,11 +59,22 @@ impl ToolKind {
             Self::AskUser => "ask_user",
             Self::ApplyPatch => "apply_patch",
             Self::RunCommand => "run_command",
+            Self::GitHubListPullRequests => "github_list_pull_requests",
+            Self::GitHubGetPullRequest => "github_get_pull_request",
+            Self::GitHubCreatePullRequest => "github_create_pull_request",
         }
     }
 
     pub const fn requires_approval(self) -> bool {
-        matches!(self, Self::ApplyPatch | Self::RunCommand | Self::WebSearch)
+        matches!(
+            self,
+            Self::ApplyPatch
+                | Self::RunCommand
+                | Self::WebSearch
+                | Self::GitHubListPullRequests
+                | Self::GitHubGetPullRequest
+                | Self::GitHubCreatePullRequest
+        )
     }
 
     pub const fn action_kind(self) -> ActionKind {
@@ -67,7 +84,10 @@ impl ToolKind {
             | Self::SearchText
             | Self::ProposePlan
             | Self::AskUser => ActionKind::Read,
-            Self::WebSearch => ActionKind::Network,
+            Self::WebSearch | Self::GitHubListPullRequests | Self::GitHubGetPullRequest => {
+                ActionKind::Network
+            }
+            Self::GitHubCreatePullRequest => ActionKind::Write,
             Self::ApplyPatch => ActionKind::Write,
             Self::RunCommand => ActionKind::Command,
         }
@@ -217,6 +237,7 @@ pub struct ToolExecutor {
     max_output_bytes: usize,
     workspace: Workspace,
     web_search_provider: Option<Arc<dyn WebSearchProvider>>,
+    github_token: Option<String>,
 }
 
 impl ToolExecutor {
@@ -232,11 +253,17 @@ impl ToolExecutor {
             max_output_bytes: 64 * 1024,
             workspace,
             web_search_provider: None,
+            github_token: None,
         }
     }
 
     pub fn with_web_search_provider(mut self, provider: Arc<dyn WebSearchProvider>) -> Self {
         self.web_search_provider = Some(provider);
+        self
+    }
+
+    pub fn with_github_token(mut self, token: Option<String>) -> Self {
+        self.github_token = token.filter(|token| !token.trim().is_empty());
         self
     }
 
@@ -278,6 +305,9 @@ impl ToolExecutor {
             ),
             ToolKind::ApplyPatch => self.apply_patch(call),
             ToolKind::RunCommand => self.run_command(call),
+            ToolKind::GitHubListPullRequests => self.github_list_pull_requests(call),
+            ToolKind::GitHubGetPullRequest => self.github_get_pull_request(call),
+            ToolKind::GitHubCreatePullRequest => self.github_create_pull_request(call),
         }
     }
 
@@ -500,6 +530,152 @@ impl ToolExecutor {
         }
     }
 
+    fn github_list_pull_requests(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GitHubPullRequestListArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let state = arguments.state.as_deref().unwrap_or("open");
+        if !matches!(state, "open" | "closed" | "all") {
+            return ToolResult::failure(call, "state must be open, closed, or all");
+        }
+        match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!("pulls?state={state}&per_page=30"),
+            None,
+        ) {
+            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_get_pull_request(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GitHubPullRequestArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let pull_request = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!("pulls/{}", arguments.number),
+            None,
+        ) {
+            Ok(value) => value,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let Some(head_sha) = pull_request
+            .pointer("/head/sha")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return ToolResult::failure(
+                call,
+                "GitHub pull request response did not include its head commit",
+            );
+        };
+        let check_runs = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!("commits/{head_sha}/check-runs"),
+            None,
+        ) {
+            Ok(value) => value,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let commit_status = match self.github_api(
+            "GET",
+            &arguments.repository,
+            &format!("commits/{head_sha}/status"),
+            None,
+        ) {
+            Ok(value) => value,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let result = serde_json::json!({
+            "pull_request": pull_request,
+            "check_runs": check_runs,
+            "commit_status": commit_status,
+        });
+        ToolResult::success(call, self.limit_output(result.to_string()))
+    }
+
+    fn github_create_pull_request(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GitHubCreatePullRequestArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        if arguments.title.trim().is_empty()
+            || arguments.head.trim().is_empty()
+            || arguments.base.trim().is_empty()
+        {
+            return ToolResult::failure(call, "title, head, and base must not be empty");
+        }
+        let body = serde_json::json!({
+            "title": arguments.title,
+            "body": arguments.body.unwrap_or_default(),
+            "head": arguments.head,
+            "base": arguments.base,
+            "draft": arguments.draft.unwrap_or(false),
+        });
+        match self.github_api("POST", &arguments.repository, "pulls", Some(body)) {
+            Ok(value) => ToolResult::success(call, self.limit_output(value.to_string())),
+            Err(error) => ToolResult::failure(call, error),
+        }
+    }
+
+    fn github_api(
+        &self,
+        method: &str,
+        repository: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let token = self.github_token.as_deref().ok_or_else(|| {
+            "GitHub is not connected; connect a GitHub account in Loom settings".to_owned()
+        })?;
+        if !valid_github_repository(repository) {
+            return Err("repository must be in owner/name format".to_owned());
+        }
+        let url = format!("https://api.github.com/repos/{repository}/{path}");
+        let response = match method {
+            "GET" => ureq::get(&url)
+                .header("Accept", "application/vnd.github+json")
+                .header("Authorization", &format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "Loom")
+                .config()
+                .timeout_global(Some(Duration::from_secs(15)))
+                .http_status_as_error(false)
+                .build()
+                .call(),
+            "POST" => ureq::post(&url)
+                .header("Accept", "application/vnd.github+json")
+                .header("Authorization", &format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "Loom")
+                .config()
+                .timeout_global(Some(Duration::from_secs(15)))
+                .http_status_as_error(false)
+                .build()
+                .send_json(body.unwrap_or(serde_json::Value::Null)),
+            _ => return Err("unsupported GitHub API method".to_owned()),
+        }
+        .map_err(|error| format!("GitHub request failed: {error}"))?;
+        let status = response.status().as_u16();
+        let mut response = response;
+        if status >= 400 {
+            let detail = response.body_mut().read_to_string().unwrap_or_default();
+            return Err(format!(
+                "GitHub API returned HTTP {status}: {}",
+                truncate_text(&detail, 1024)
+            ));
+        }
+        response
+            .body_mut()
+            .read_json()
+            .map_err(|error| format!("GitHub returned an invalid response: {error}"))
+    }
+
     fn resolve_relative(&self, relative: &str) -> std::result::Result<PathBuf, String> {
         let path = Path::new(relative);
         if path.is_absolute() {
@@ -640,6 +816,45 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("invalid arguments for '{}': {error}", call.name))
 }
 
+fn valid_github_repository(repository: &str) -> bool {
+    let mut parts = repository.split('/');
+    let Some(owner) = parts.next() else {
+        return false;
+    };
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !owner.is_empty()
+        && !name.is_empty()
+        && [owner, name].iter().all(|part| {
+            part.bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPullRequestListArguments {
+    repository: String,
+    state: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPullRequestArguments {
+    repository: String,
+    number: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubCreatePullRequestArguments {
+    repository: String,
+    title: String,
+    head: String,
+    base: String,
+    body: Option<String>,
+    draft: Option<bool>,
+}
+
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -749,6 +964,49 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "cwd": {"type": "string"}
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubListPullRequests.name().to_owned(),
+            description: "List pull requests for a GitHub repository. Requires a connected GitHub account and approval for network access.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "state": {"type": "string", "enum": ["open", "closed", "all"]}
+                },
+                "required": ["repository"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubGetPullRequest.name().to_owned(),
+            description: "Read a pull request's details and merge status. Requires a connected GitHub account and approval for network access.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "number": {"type": "integer", "minimum": 1}
+                },
+                "required": ["repository", "number"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubCreatePullRequest.name().to_owned(),
+            description: "Create a pull request in a GitHub repository. The branch must already be pushed. Requires explicit write approval.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format."},
+                    "title": {"type": "string"},
+                    "head": {"type": "string", "description": "Source branch, optionally owner:branch."},
+                    "base": {"type": "string", "description": "Target branch."},
+                    "body": {"type": "string"},
+                    "draft": {"type": "boolean"}
+                },
+                "required": ["repository", "title", "head", "base"],
                 "additionalProperties": false
             }),
         },
