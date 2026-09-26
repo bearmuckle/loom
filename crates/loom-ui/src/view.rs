@@ -7937,7 +7937,7 @@ impl LoomView {
                                 .text_xs()
                                 .text_color(rgb(0x8f98a6))
                                 .child(
-                                    "No worker connected. Add one below to load your workspace.",
+                                    "No worker connected. Add one below to load your sessions.",
                                 ),
                         )
                     })
@@ -8148,7 +8148,7 @@ impl LoomView {
                         div()
                             .text_sm()
                             .text_color(rgb(0x8f98a6))
-                            .child("Local agent workspace"),
+                            .child("Local agent"),
                     )
                     .child(
                         div()
@@ -8359,40 +8359,6 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(
-                        Button::new("workspace-picker")
-                            .label(self.workspace_name.clone())
-                            .ghost()
-                            .small()
-                            .dropdown_menu({
-                                let workspaces = self.workspaces.clone();
-                                let view = view.clone();
-                                move |mut menu, _, _| {
-                                    for workspace in workspaces.clone() {
-                                        let select_view = view.clone();
-                                        let selected = workspace.clone();
-                                        menu = menu.item(
-                                            PopupMenuItem::new(workspace.name.clone()).on_click(
-                                                move |_, _, cx| {
-                                                    let workspace = selected.clone();
-                                                    select_view.update(cx, |view, cx| {
-                                                        view.select_workspace(workspace, cx);
-                                                    });
-                                                },
-                                            ),
-                                        );
-                                    }
-                                    let create_view = view.clone();
-                                    menu.item(PopupMenuItem::new("New workspace").on_click(
-                                        move |_, _, cx| {
-                                            create_view.update(cx, |view, cx| {
-                                                view.create_workspace_container(cx);
-                                            });
-                                        },
-                                    ))
-                                }
-                            }),
-                    )
                     .when(layout.phone, |element| {
                         element.child(
                             Button::new("close-session-drawer")
@@ -8523,7 +8489,7 @@ impl LoomView {
                                         div()
                                             .text_sm()
                                             .text_color(rgb(0xf3f4f6))
-                                            .child("Workspace"),
+                                            .child("Sessions"),
                                     ),
                             )
                             .child(
@@ -8621,14 +8587,14 @@ impl LoomView {
                                                 div()
                                                     .text_base()
                                                     .text_color(rgb(0xf3f4f6))
-                                                    .child("Your workspace is ready"),
+                                                    .child("You’re ready to go"),
                                             )
                                             .child(
                                                 div()
                                                     .mt_2()
                                                     .text_sm()
                                                     .text_color(rgb(0x8f98a6))
-                                                    .child("Connect a Loom worker from Settings to load your sessions, models, and workspace."),
+                                                    .child("Connect a Loom worker from Settings to load your sessions and models."),
                                             )
                                             .child(
                                                 Button::new("disconnected-connect-worker")
@@ -8826,7 +8792,6 @@ impl Render for LoomView {
             && !self.about_open
             && !self.providers_open
             && self.github_login.is_none();
-        let workspace_name = self.workspace_name.clone();
         let decorations = window.window_decorations();
         let client_decorated = matches!(decorations, Decorations::Client { .. });
         let shadow_size = CLIENT_DECORATION_SHADOW;
@@ -9176,15 +9141,13 @@ impl Render for LoomView {
                                     window.start_window_move();
                                 }
                             })
-                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(format!(
-                                "{}  ·  {}",
-                                workspace_name,
+                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
                                 if self.sessions.is_empty() {
-                                    "No session"
+                                    "No session".to_owned()
                                 } else {
-                                    &self.active_session.name
-                                }
-                            ))),
+                                    self.active_session.name.clone()
+                                },
+                            )),
                     )
                     .when(!cfg!(target_family = "wasm"), |element| {
                         element.child(
@@ -9287,11 +9250,7 @@ impl Render for LoomView {
                             session_state_label(self.session_state)
                         },
                         self.timeline.len(),
-                        if self.demo_workspace {
-                            "Demo workspace"
-                        } else {
-                            "Workspace"
-                        }
+                        if self.demo_workspace { "Demo" } else { "Local" }
                     )),
             );
         let content = content.rounded_client_corners(client_decorated, tiling);
