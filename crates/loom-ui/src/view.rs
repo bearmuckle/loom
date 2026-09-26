@@ -5461,6 +5461,16 @@ impl LoomView {
         source: Option<SessionCreationSource>,
         cx: &mut Context<Self>,
     ) {
+        let creation_status = match source.as_ref() {
+            Some(SessionCreationSource::GitHub(repository)) => {
+                format!("Creating session and cloning {}…", repository.full_name)
+            }
+            Some(SessionCreationSource::LocalDirectory(_)) => {
+                "Creating session and attaching directory…".to_owned()
+            }
+            None => "Creating session…".to_owned(),
+        };
+        self.record_status(creation_status);
         let Some(backend) = self.node_backends.get(&node_id).cloned() else {
             self.record_backend_error(
                 "create session",
@@ -5529,6 +5539,7 @@ impl LoomView {
                 return;
             }
             let result = async {
+                log::info!("registering workspace before session creation");
                 let registered = backend
                     .submit(RequestEnvelope::new(ClientRequest::RegisterWorkspace {
                         workspace: workspace.clone(),
@@ -5551,6 +5562,7 @@ impl LoomView {
                     ServerResponse::AgentSessionCreated(snapshot) => snapshot,
                     response => return Err(unexpected_response("session creation", response)),
                 };
+                log::info!("created session {}; attaching source", snapshot.id);
                 let setup = match source {
                     None => Ok(()),
                     Some(SessionCreationSource::LocalDirectory(source)) => {
@@ -5568,6 +5580,7 @@ impl LoomView {
                         }
                     }
                     Some(SessionCreationSource::GitHub(repository)) => {
+                        log::info!("cloning GitHub repository {} into session {}", repository.full_name, snapshot.id);
                         let repository_id = RepositoryId::new();
                         let response = backend
                             .submit(RequestEnvelope::new(ClientRequest::AttachSessionRepository {
@@ -5585,6 +5598,7 @@ impl LoomView {
                     }
                 };
                 if let Err(error) = setup {
+                    log::error!("session source setup failed: {}", error.message);
                     let _ = backend
                         .submit(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
                             session_id: snapshot.id,
@@ -5598,6 +5612,7 @@ impl LoomView {
             .await;
             view.update(cx, |view, cx| match result {
                 Ok(snapshot) => {
+                    view.record_status("Session created successfully");
                     view.node_model_catalogs
                         .insert(node_id.clone(), models);
                     view.session_models.insert(snapshot.id, model);
@@ -5606,7 +5621,10 @@ impl LoomView {
                     view.sessions.push(snapshot.clone());
                     view.select_session(snapshot, cx);
                 }
-                Err(error) => view.record_backend_error("create session", error),
+                Err(error) => {
+                    log::error!("session creation failed: {}", error.message);
+                    view.record_backend_error("create session", error)
+                },
             })
             .ok();
         })
