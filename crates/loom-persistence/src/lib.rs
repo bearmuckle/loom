@@ -25,10 +25,13 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 16;
-const DATABASE_SCHEMA_VERSION: u32 = 16;
+pub const CURRENT_SCHEMA_VERSION: u32 = 17;
+const DATABASE_SCHEMA_VERSION: u32 = 17;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
+const MAX_MESSAGE_FRAGMENT_BYTES: usize = 32 * 1024;
+const MAX_CONTENT_RANGE_BYTES: usize = 256 * 1024;
+const MAX_RUN_MESSAGE_PAGE_SIZE: usize = 100;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DURABLE_FEED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
@@ -90,6 +93,21 @@ CREATE TABLE IF NOT EXISTS run_messages (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS run_messages_by_session
     ON run_messages(session_id, run_id, ordinal);
+CREATE TABLE IF NOT EXISTS run_message_fragments (
+    run_id BLOB NOT NULL,
+    message_ordinal INTEGER NOT NULL CHECK(message_ordinal >= 0),
+    fragment_ordinal INTEGER NOT NULL CHECK(fragment_ordinal >= 0),
+    byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
+    byte_length INTEGER NOT NULL CHECK(byte_length > 0 AND byte_length <= 32768),
+    content_hash BLOB NOT NULL REFERENCES content_blobs(hash) ON DELETE RESTRICT
+        CHECK(length(content_hash) = 32),
+    PRIMARY KEY(run_id, message_ordinal, fragment_ordinal),
+    UNIQUE(run_id, message_ordinal, byte_offset),
+    FOREIGN KEY(run_id, message_ordinal)
+        REFERENCES run_messages(run_id, ordinal) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_message_fragments_by_range
+    ON run_message_fragments(run_id, message_ordinal, byte_offset);
 CREATE TABLE IF NOT EXISTS session_filesystems (
     session_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
         CHECK(length(session_id) = 16),
@@ -473,6 +491,16 @@ pub struct DurableRunSummary {
 pub struct DurableRunMessage {
     pub role: loom_model::MessageRole,
     pub content: String,
+    pub name: Option<String>,
+    pub tool_call_id: Option<loom_core::ToolCallId>,
+    pub tool_calls: Vec<loom_model::ToolCall>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRunMessageHeader {
+    pub ordinal: u64,
+    pub role: loom_model::MessageRole,
+    pub content_bytes: u64,
     pub name: Option<String>,
     pub tool_call_id: Option<loom_core::ToolCallId>,
     pub tool_calls: Vec<loom_model::ToolCall>,
@@ -1233,7 +1261,7 @@ impl FilePersistence {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT role, content_hash, name, tool_call_id, tool_calls
+                "SELECT ordinal, role, content_hash, name, tool_call_id, tool_calls
                       FROM run_messages WHERE run_id=?1 ORDER BY ordinal",
             )
             .map_err(|error| {
@@ -1242,25 +1270,57 @@ impl FilePersistence {
         let rows = statement
             .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(|error| {
                 persistence_error(format!("could not read run messages: {error}"), true)
             })?;
         rows.map(|row| {
-            let (role, content_hash, name, tool_call_id, tool_calls) = row.map_err(|error| {
-                persistence_error(format!("could not read run message: {error}"), true)
-            })?;
+            let (ordinal, role, content_hash, name, tool_call_id, tool_calls) =
+                row.map_err(|error| {
+                    persistence_error(format!("could not read run message: {error}"), true)
+                })?;
             let role = parse_message_role(&role)?;
-            let content = content_hash
+            let ordinal = u64::try_from(ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted message ordinal is negative",
+                    false,
+                )
+            })?;
+            let mut content = content_hash
                 .map(|hash| decode_content(&connection, &hash))
                 .transpose()?
                 .unwrap_or_default();
+            let fragment_offset = u64::try_from(content.len()).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted message content is too large",
+                    false,
+                )
+            })?;
+            let fragments = load_run_message_fragments(
+                &connection,
+                run_id,
+                ordinal,
+                fragment_offset,
+                usize::MAX,
+            )?;
+            if !fragments.is_empty() {
+                content.push_str(&String::from_utf8(fragments).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted assistant fragments are not valid UTF-8: {error}"),
+                        false,
+                    )
+                })?);
+            }
             let tool_calls = serde_json::from_str(&tool_calls).map_err(|error| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
@@ -1268,19 +1328,7 @@ impl FilePersistence {
                     false,
                 )
             })?;
-            let tool_call_id = tool_call_id
-                .map(|id| {
-                    Uuid::from_slice(&id)
-                        .map(loom_core::ToolCallId::from_uuid)
-                        .map_err(|error| {
-                            LoomError::new(
-                                ErrorCode::MalformedPayload,
-                                format!("persisted tool call id is malformed: {error}"),
-                                false,
-                            )
-                        })
-                })
-                .transpose()?;
+            let tool_call_id = decode_optional_tool_call_id(tool_call_id)?;
             Ok(DurableRunMessage {
                 role,
                 content,
@@ -1290,6 +1338,437 @@ impl FilePersistence {
             })
         })
         .collect()
+    }
+
+    /// Loads the newest bounded page of message headers. Use the returned
+    /// ordinal as `before_ordinal` to continue toward earlier conversation items.
+    pub fn load_run_message_page(
+        &self,
+        run_id: RunId,
+        before_ordinal: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<DurableRunMessageHeader>> {
+        if !(1..=MAX_RUN_MESSAGE_PAGE_SIZE).contains(&limit) {
+            return Err(LoomError::invalid_request(format!(
+                "run message page size must be between 1 and {MAX_RUN_MESSAGE_PAGE_SIZE}"
+            )));
+        }
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let before_ordinal = before_ordinal
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| LoomError::invalid_request("message cursor is out of range"))?;
+        let limit = i64::try_from(limit)
+            .map_err(|_| LoomError::invalid_request("message page size is out of range"))?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT m.ordinal, m.role,
+                        MAX(
+                            COALESCE(
+                                (SELECT raw_size FROM content_blobs WHERE hash=m.content_hash),
+                                0
+                            ),
+                            COALESCE(
+                                (SELECT MAX(fragment.byte_offset + fragment.byte_length)
+                                 FROM run_message_fragments fragment
+                                 WHERE fragment.run_id=m.run_id
+                                   AND fragment.message_ordinal=m.ordinal),
+                                0
+                            )
+                        ),
+                        m.name, m.tool_call_id, m.tool_calls
+                 FROM run_messages m
+                 WHERE m.run_id=?1 AND (?2 IS NULL OR m.ordinal < ?2)
+                 ORDER BY m.ordinal DESC LIMIT ?3",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare run message page: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map(
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    before_ordinal,
+                    limit
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not query run message page: {error}"), true)
+            })?;
+        rows.map(|row| {
+            let (ordinal, role, content_bytes, name, tool_call_id, tool_calls) =
+                row.map_err(|error| {
+                    persistence_error(format!("could not read run message header: {error}"), true)
+                })?;
+            let tool_calls = serde_json::from_str(&tool_calls).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted tool calls are malformed: {error}"),
+                    false,
+                )
+            })?;
+            Ok(DurableRunMessageHeader {
+                ordinal: u64::try_from(ordinal).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted message ordinal is negative",
+                        false,
+                    )
+                })?,
+                role: parse_message_role(&role)?,
+                content_bytes: u64::try_from(content_bytes).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted message content size is negative",
+                        false,
+                    )
+                })?,
+                name,
+                tool_call_id: decode_optional_tool_call_id(tool_call_id)?,
+                tool_calls,
+            })
+        })
+        .collect()
+    }
+
+    /// Appends an immutable byte fragment to an assistant message. Repeating an
+    /// identical fragment is safe; gaps, overlaps, and conflicting retries fail.
+    pub fn append_run_message_fragment(
+        &self,
+        run_id: RunId,
+        session_id: AgentSessionId,
+        message_ordinal: u64,
+        fragment_ordinal: u64,
+        byte_offset: u64,
+        content: &[u8],
+    ) -> Result<()> {
+        if content.is_empty() || content.len() > MAX_MESSAGE_FRAGMENT_BYTES {
+            return Err(LoomError::invalid_request(format!(
+                "message fragments must contain between 1 and {MAX_MESSAGE_FRAGMENT_BYTES} bytes"
+            )));
+        }
+        if std::str::from_utf8(content).is_err() {
+            return Err(LoomError::invalid_request(
+                "message fragments must end on UTF-8 character boundaries",
+            ));
+        }
+        let message_ordinal = i64::try_from(message_ordinal)
+            .map_err(|_| LoomError::invalid_request("message ordinal is out of range"))?;
+        let fragment_ordinal = i64::try_from(fragment_ordinal)
+            .map_err(|_| LoomError::invalid_request("fragment ordinal is out of range"))?;
+        let byte_offset = i64::try_from(byte_offset)
+            .map_err(|_| LoomError::invalid_request("message byte offset is out of range"))?;
+        let byte_length = i64::try_from(content.len())
+            .map_err(|_| LoomError::invalid_request("message fragment is too large"))?;
+        byte_offset
+            .checked_add(byte_length)
+            .ok_or_else(|| LoomError::invalid_request("message byte range overflows"))?;
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin message fragment transaction: {error}"),
+                true,
+            )
+        })?;
+        let owner: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT session_id FROM run_summaries WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not verify message run: {error}"), true)
+            })?;
+        if owner.as_deref() != Some(session_id.as_uuid().as_bytes().as_slice()) {
+            return Err(LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                "message fragment does not belong to the run's session",
+                false,
+            ));
+        }
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let session_id_bytes = session_id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "INSERT INTO run_messages(
+                    run_id, session_id, ordinal, role, content_hash, name, tool_call_id, tool_calls
+                 ) VALUES (?1, ?2, ?3, 'assistant', NULL, NULL, NULL, '[]')
+                 ON CONFLICT(run_id, ordinal) DO NOTHING",
+                params![
+                    run_id_bytes.as_slice(),
+                    session_id_bytes.as_slice(),
+                    message_ordinal
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not create streamed message: {error}"), true)
+            })?;
+        let role: String = transaction
+            .query_row(
+                "SELECT role FROM run_messages WHERE run_id=?1 AND ordinal=?2",
+                params![run_id_bytes.as_slice(), message_ordinal],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not verify streamed message: {error}"), true)
+            })?;
+        if role != "assistant" {
+            return Err(LoomError::invalid_request(
+                "message fragments can only be appended to assistant messages",
+            ));
+        }
+        let base_size: Option<i64> = transaction
+            .query_row(
+                "SELECT COALESCE(content.raw_size, 0)
+                 FROM run_messages message
+                 LEFT JOIN content_blobs content ON content.hash=message.content_hash
+                 WHERE message.run_id=?1 AND message.ordinal=?2",
+                params![run_id_bytes.as_slice(), message_ordinal],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read message content size: {error}"),
+                    true,
+                )
+            })?;
+        let base_offset = base_size.unwrap_or(0);
+        let content_hash = store_content(&transaction, content)?;
+        let existing: Option<(i64, i64, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT byte_offset, byte_length, content_hash
+                 FROM run_message_fragments
+                 WHERE run_id=?1 AND message_ordinal=?2 AND fragment_ordinal=?3",
+                params![run_id_bytes.as_slice(), message_ordinal, fragment_ordinal],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not check message fragment: {error}"), true)
+            })?;
+        if let Some((existing_offset, existing_length, existing_hash)) = existing {
+            if existing_offset == byte_offset
+                && existing_length == byte_length
+                && existing_hash == content_hash
+            {
+                transaction.commit().map_err(|error| {
+                    persistence_error(
+                        format!("could not commit repeated message fragment: {error}"),
+                        true,
+                    )
+                })?;
+                return Ok(());
+            }
+            return Err(LoomError::invalid_request(
+                "message fragment retry conflicts with the committed fragment",
+            ));
+        }
+        let expected: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT fragment_ordinal, byte_offset + byte_length
+                 FROM run_message_fragments
+                 WHERE run_id=?1 AND message_ordinal=?2
+                 ORDER BY fragment_ordinal DESC LIMIT 1",
+                params![run_id_bytes.as_slice(), message_ordinal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read message fragment tail: {error}"),
+                    true,
+                )
+            })?;
+        if expected.is_some_and(|(ordinal, offset)| {
+            ordinal.checked_add(1) != Some(fragment_ordinal) || offset != byte_offset
+        }) || (expected.is_none() && (fragment_ordinal != 0 || byte_offset != base_offset))
+        {
+            return Err(LoomError::invalid_request(
+                "message fragments must be appended contiguously in order",
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO run_message_fragments(
+                    run_id, message_ordinal, fragment_ordinal, byte_offset, byte_length, content_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    run_id_bytes.as_slice(),
+                    message_ordinal,
+                    fragment_ordinal,
+                    byte_offset,
+                    byte_length,
+                    content_hash
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not append message fragment: {error}"), true)
+            })?;
+        transaction.commit().map_err(|error| {
+            persistence_error(format!("could not commit message fragment: {error}"), true)
+        })
+    }
+
+    /// Returns the next sequence and byte offset for appending to an assistant
+    /// message, including fragments committed before a process restart.
+    pub fn next_run_message_fragment_position(
+        &self,
+        run_id: RunId,
+        message_ordinal: u64,
+    ) -> Result<(u64, u64)> {
+        let message_ordinal = i64::try_from(message_ordinal)
+            .map_err(|_| LoomError::invalid_request("message ordinal is out of range"))?;
+        let connection = self.connection()?;
+        let tail: Option<(i64, i64)> = connection
+            .query_row(
+                "SELECT fragment_ordinal, byte_offset + byte_length
+                 FROM run_message_fragments
+                 WHERE run_id=?1 AND message_ordinal=?2
+                 ORDER BY fragment_ordinal DESC LIMIT 1",
+                params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read message fragment cursor: {error}"),
+                    true,
+                )
+            })?;
+        if let Some((fragment_ordinal, byte_offset)) = tail {
+            return Ok((
+                u64::try_from(fragment_ordinal)
+                    .ok()
+                    .and_then(|ordinal| ordinal.checked_add(1))
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            "persisted message fragment ordinal is out of range",
+                            false,
+                        )
+                    })?,
+                u64::try_from(byte_offset).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted message fragment offset is out of range",
+                        false,
+                    )
+                })?,
+            ));
+        }
+        let base_size: Option<i64> = connection
+            .query_row(
+                "SELECT COALESCE(content.raw_size, 0)
+                 FROM run_messages message
+                 LEFT JOIN content_blobs content ON content.hash=message.content_hash
+                 WHERE message.run_id=?1 AND message.ordinal=?2",
+                params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read message content size: {error}"),
+                    true,
+                )
+            })?;
+        let byte_offset = base_size.unwrap_or(0);
+        Ok((
+            0,
+            u64::try_from(byte_offset).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted message content size is negative",
+                    false,
+                )
+            })?,
+        ))
+    }
+
+    /// Reads a bounded byte range from a completed message or its committed
+    /// fragments, without returning the rest of the conversation.
+    pub fn load_run_message_content_range(
+        &self,
+        run_id: RunId,
+        message_ordinal: u64,
+        byte_offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        if length > MAX_CONTENT_RANGE_BYTES {
+            return Err(LoomError::invalid_request(format!(
+                "message content range exceeds {MAX_CONTENT_RANGE_BYTES} bytes"
+            )));
+        }
+        let message_ordinal = i64::try_from(message_ordinal)
+            .map_err(|_| LoomError::invalid_request("message ordinal is out of range"))?;
+        let byte_offset_bytes = byte_offset;
+        let byte_offset = i64::try_from(byte_offset_bytes)
+            .map_err(|_| LoomError::invalid_request("message byte offset is out of range"))?;
+        let connection = self.connection()?;
+        let content_hash: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT content_hash FROM run_messages WHERE run_id=?1 AND ordinal=?2",
+                params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not locate message content: {error}"), true)
+            })?
+            .ok_or_else(|| LoomError::invalid_request("run message does not exist"))?;
+        if let Some(content_hash) = content_hash {
+            let content = decode_content(&connection, &content_hash)?;
+            let start = usize::try_from(byte_offset)
+                .map_err(|_| LoomError::invalid_request("message byte offset is out of range"))?;
+            let mut output = if start < content.len() {
+                content.as_bytes()[start..start.saturating_add(length).min(content.len())].to_vec()
+            } else {
+                Vec::new()
+            };
+            if output.len() < length {
+                let content_end = u64::try_from(content.len()).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted message content is too large",
+                        false,
+                    )
+                })?;
+                let fragment_start = byte_offset_bytes.max(content_end);
+                output.extend(load_run_message_fragments(
+                    &connection,
+                    run_id,
+                    u64::try_from(message_ordinal).map_err(|_| {
+                        LoomError::invalid_request("message ordinal is out of range")
+                    })?,
+                    fragment_start,
+                    length - output.len(),
+                )?);
+            }
+            return Ok(output);
+        }
+        load_run_message_fragments(
+            &connection,
+            run_id,
+            u64::try_from(message_ordinal)
+                .map_err(|_| LoomError::invalid_request("message ordinal is out of range"))?,
+            byte_offset_bytes,
+            length,
+        )
     }
 
     pub fn list_filesystem_sessions(&self) -> Result<Vec<AgentSessionId>> {
@@ -2105,6 +2584,9 @@ fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
              ) AND NOT EXISTS (
                 SELECT 1 FROM run_messages
                 WHERE run_messages.content_hash=content_blobs.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_message_fragments
+                WHERE run_message_fragments.content_hash=content_blobs.hash
              )",
             [],
         )
@@ -2138,6 +2620,282 @@ fn parse_message_role(role: &str) -> Result<loom_model::MessageRole> {
             false,
         )),
     }
+}
+
+fn decode_optional_tool_call_id(id: Option<Vec<u8>>) -> Result<Option<loom_core::ToolCallId>> {
+    id.map(|id| {
+        Uuid::from_slice(&id)
+            .map(loom_core::ToolCallId::from_uuid)
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted tool call id is malformed: {error}"),
+                    false,
+                )
+            })
+    })
+    .transpose()
+}
+
+fn load_run_message_fragments(
+    connection: &Connection,
+    run_id: RunId,
+    message_ordinal: u64,
+    byte_offset: u64,
+    length: usize,
+) -> Result<Vec<u8>> {
+    let message_ordinal = i64::try_from(message_ordinal).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted message ordinal is out of range",
+            false,
+        )
+    })?;
+    let total: Option<i64> = connection
+        .query_row(
+            "SELECT MAX(byte_offset + byte_length) FROM run_message_fragments
+             WHERE run_id=?1 AND message_ordinal=?2",
+            params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read message fragment size: {error}"),
+                true,
+            )
+        })?;
+    let Some(total) = total else {
+        return Ok(Vec::new());
+    };
+    let total = u64::try_from(total).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted message fragment size is negative",
+            false,
+        )
+    })?;
+    if byte_offset >= total {
+        return Ok(Vec::new());
+    }
+    let requested_length = u64::try_from(length)
+        .map_err(|_| LoomError::invalid_request("message content range length is out of range"))?;
+    let end = byte_offset.saturating_add(requested_length).min(total);
+    let capacity = usize::try_from(end.saturating_sub(byte_offset)).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted message content range is too large",
+            false,
+        )
+    })?;
+    let mut output = Vec::with_capacity(capacity);
+    if end == byte_offset {
+        return Ok(output);
+    }
+    let start_i64 = i64::try_from(byte_offset)
+        .map_err(|_| LoomError::invalid_request("message byte offset is out of range"))?;
+    let end_i64 = i64::try_from(end).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "message size is out of range",
+            false,
+        )
+    })?;
+    let mut statement = connection
+        .prepare(
+            "SELECT byte_offset, byte_length, content_hash
+             FROM run_message_fragments
+             WHERE run_id=?1 AND message_ordinal=?2
+               AND byte_offset < ?4 AND byte_offset + byte_length > ?3
+             ORDER BY byte_offset",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prepare message content range: {error}"),
+                true,
+            )
+        })?;
+    let rows = statement
+        .query_map(
+            params![
+                run_id.as_uuid().as_bytes().as_slice(),
+                message_ordinal,
+                start_i64,
+                end_i64
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not query message content range: {error}"),
+                true,
+            )
+        })?;
+    let mut cursor = byte_offset;
+    for row in rows {
+        let (fragment_offset, fragment_length, hash) = row.map_err(|error| {
+            persistence_error(
+                format!("could not read message content range: {error}"),
+                true,
+            )
+        })?;
+        let fragment_offset = u64::try_from(fragment_offset).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted fragment offset is negative",
+                false,
+            )
+        })?;
+        let fragment_length = usize::try_from(fragment_length).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted fragment length is invalid",
+                false,
+            )
+        })?;
+        let fragment = decode_content(connection, &hash)?.into_bytes();
+        if fragment.len() != fragment_length || fragment_offset > cursor {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted message fragments contain a gap or invalid length",
+                false,
+            ));
+        }
+        let fragment_end = fragment_offset
+            .checked_add(u64::try_from(fragment_length).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted fragment length is out of range",
+                    false,
+                )
+            })?)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted message fragment range overflows",
+                    false,
+                )
+            })?;
+        let copy_start = cursor.max(fragment_offset);
+        let copy_end = end.min(fragment_end);
+        let local_start = usize::try_from(copy_start - fragment_offset).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted fragment range is out of bounds",
+                false,
+            )
+        })?;
+        let local_end = usize::try_from(copy_end - fragment_offset).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted fragment range is out of bounds",
+                false,
+            )
+        })?;
+        output.extend_from_slice(&fragment[local_start..local_end]);
+        cursor = copy_end;
+        if cursor == end {
+            break;
+        }
+    }
+    if cursor != end {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted message fragments do not cover the requested byte range",
+            false,
+        ));
+    }
+    Ok(output)
+}
+
+fn run_message_fragments_match(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    message_ordinal: i64,
+    canonical_content: &[u8],
+) -> Result<Option<bool>> {
+    let fragments = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT byte_offset, content_hash
+                 FROM run_message_fragments
+                 WHERE run_id=?1 AND message_ordinal=?2
+                 ORDER BY fragment_ordinal",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare message fragment consolidation: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map(
+                params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not query message fragments for consolidation: {error}"),
+                    true,
+                )
+            })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read message fragments for consolidation: {error}"),
+                    true,
+                )
+            })?
+    };
+    if fragments.is_empty() {
+        return Ok(None);
+    }
+    for (byte_offset, content_hash) in fragments {
+        let byte_offset = usize::try_from(byte_offset).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted fragment offset is out of range",
+                false,
+            )
+        })?;
+        let fragment = decode_content(transaction, &content_hash)?.into_bytes();
+        let Some(fragment_end) = byte_offset.checked_add(fragment.len()) else {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted fragment range overflows",
+                false,
+            ));
+        };
+        if canonical_content.get(byte_offset..fragment_end) != Some(fragment.as_slice()) {
+            return Ok(Some(false));
+        }
+    }
+    Ok(Some(true))
+}
+
+fn delete_run_message_fragments(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    message_ordinal: i64,
+) -> Result<()> {
+    transaction
+        .execute(
+            "DELETE FROM run_message_fragments
+             WHERE run_id=?1 AND message_ordinal=?2",
+            params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not consolidate run message fragments: {error}"),
+                true,
+            )
+        })?;
+    Ok(())
 }
 
 fn save_run_message_rows(
@@ -2182,11 +2940,6 @@ fn save_run_message_rows(
                     false,
                 ));
             }
-            let content_hash = if message.content.is_empty() {
-                None
-            } else {
-                Some(store_content(transaction, message.content.as_bytes())?)
-            };
             let run_id_bytes = run_id.as_uuid().as_bytes();
             let ordinal = i64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
@@ -2195,6 +2948,44 @@ fn save_run_message_rows(
                     false,
                 )
             })?;
+            let fragments_match = run_message_fragments_match(
+                transaction,
+                *run_id,
+                ordinal,
+                message.content.as_bytes(),
+            )?;
+            let content_hash = match fragments_match {
+                Some(false) => {
+                    let existing: Option<Option<Vec<u8>>> = transaction
+                        .query_row(
+                            "SELECT content_hash FROM run_messages
+                             WHERE run_id=?1 AND ordinal=?2",
+                            params![run_id_bytes.as_slice(), ordinal],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not preserve fragmented message base: {error}"),
+                                true,
+                            )
+                        })?;
+                    existing.ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            "fragmented message has no base record",
+                            false,
+                        )
+                    })?
+                }
+                Some(true) | None => {
+                    if message.content.is_empty() {
+                        None
+                    } else {
+                        Some(store_content(transaction, message.content.as_bytes())?)
+                    }
+                }
+            };
             transaction
                 .execute(
                     "INSERT INTO _loom_wanted_run_messages(run_id, ordinal) VALUES (?1, ?2)",
@@ -2235,13 +3026,20 @@ fn save_run_message_rows(
                 .map_err(|error| {
                     persistence_error(format!("could not save run message: {error}"), true)
                 })?;
+            if fragments_match == Some(true) {
+                delete_run_message_fragments(transaction, *run_id, ordinal)?;
+            }
         }
         transaction
             .execute(
                 "DELETE FROM run_messages WHERE run_id=?1 AND NOT EXISTS (
                 SELECT 1 FROM _loom_wanted_run_messages wanted
                 WHERE wanted.run_id=run_messages.run_id AND wanted.ordinal=run_messages.ordinal
-             )",
+                ) AND NOT EXISTS (
+                   SELECT 1 FROM run_message_fragments fragment
+                   WHERE fragment.run_id=run_messages.run_id
+                     AND fragment.message_ordinal=run_messages.ordinal
+                )",
                 [run_id.as_uuid().as_bytes().as_slice()],
             )
             .map_err(|error| {
@@ -4355,6 +5153,324 @@ mod tests {
         assert_eq!(
             content_count, 1,
             "retained run transcript content remains reachable"
+        );
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn streamed_messages_are_append_only_and_paged_by_keyset() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut manager = SessionManager::default();
+        let (session, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Streamed messages")
+            .unwrap();
+        let run_id = RunId::new();
+        let summary = DurableRunSummary {
+            snapshot: AgentRunSnapshot {
+                id: run_id,
+                session_id: session.id,
+                task: "stream fragments".to_owned(),
+                model: ModelId::new("deterministic-model"),
+                state: AgentRunState::Executing,
+                started_at: Timestamp::from_unix_millis(1000),
+                updated_at: Timestamp::from_unix_millis(1000),
+                completed_at: None,
+                summary: None,
+                evidence: Vec::new(),
+            },
+            usage: UsageSnapshot::default(),
+        };
+        let run_summaries = BTreeMap::from([(run_id, summary)]);
+        let run_messages = BTreeMap::from([(
+            run_id,
+            vec![
+                DurableRunMessage {
+                    role: loom_model::MessageRole::User,
+                    content: "question".to_owned(),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                DurableRunMessage {
+                    role: loom_model::MessageRole::Assistant,
+                    content: "seed".to_owned(),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                DurableRunMessage {
+                    role: loom_model::MessageRole::Assistant,
+                    content: String::new(),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+            ],
+        )]);
+        persistence
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &manager.export_state(),
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&run_summaries),
+                run_messages: Some(&run_messages),
+                filesystem_records: None,
+                records: &[],
+                feed: None,
+                sections: &[],
+            })
+            .unwrap();
+
+        persistence
+            .append_run_message_fragment(run_id, session.id, 1, 0, 4, b"hello ")
+            .unwrap();
+        persistence
+            .append_run_message_fragment(run_id, session.id, 1, 0, 4, b"hello ")
+            .unwrap();
+        persistence
+            .append_run_message_fragment(run_id, session.id, 1, 1, 10, b"world")
+            .unwrap();
+        let newest_page = persistence
+            .load_run_message_page(run_id, Some(2), 1)
+            .unwrap();
+        assert_eq!(newest_page.len(), 1);
+        assert_eq!(newest_page[0].ordinal, 1);
+        assert_eq!(newest_page[0].content_bytes, 15);
+        assert_eq!(
+            persistence
+                .load_run_message_content_range(run_id, 1, 7, 5)
+                .unwrap(),
+            b"lo wo"
+        );
+        assert_eq!(
+            persistence.load_run_messages(run_id).unwrap()[1].content,
+            "seedhello world"
+        );
+        assert_eq!(
+            persistence
+                .load_run_message_page(run_id, Some(1), 1)
+                .unwrap()[0]
+                .ordinal,
+            0
+        );
+        assert!(
+            persistence
+                .append_run_message_fragment(run_id, session.id, 1, 2, 12, b"!")
+                .is_err()
+        );
+        assert_eq!(
+            persistence
+                .next_run_message_fragment_position(run_id, 1)
+                .unwrap(),
+            (2, 15)
+        );
+        persistence
+            .append_run_message_fragment(run_id, session.id, 1, 2, 15, b"!")
+            .unwrap();
+        persistence
+            .append_run_message_fragment(run_id, session.id, 2, 0, 0, b"part")
+            .unwrap();
+        persistence
+            .append_run_message_fragment(run_id, session.id, 2, 1, 4, b"ial")
+            .unwrap();
+        drop(persistence);
+        let persistence = FilePersistence::open(&path).unwrap();
+        let newest_page = persistence.load_run_message_page(run_id, None, 1).unwrap();
+        assert_eq!(newest_page[0].ordinal, 2);
+        assert_eq!(newest_page[0].content_bytes, 7);
+        assert_eq!(
+            persistence
+                .load_run_message_content_range(run_id, 2, 2, 4)
+                .unwrap(),
+            b"rtia"
+        );
+        assert_eq!(
+            persistence.load_run_messages(run_id).unwrap()[2].content,
+            "partial"
+        );
+        assert_eq!(
+            persistence
+                .load_run_message_page(run_id, Some(2), 1)
+                .unwrap()[0]
+                .ordinal,
+            1
+        );
+        assert_eq!(
+            persistence
+                .load_run_message_page(run_id, Some(1), 1)
+                .unwrap()[0]
+                .ordinal,
+            0
+        );
+        assert_eq!(
+            persistence.load_run_messages(run_id).unwrap()[1].content,
+            "seedhello world!"
+        );
+        persistence
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &manager.export_state(),
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&run_summaries),
+                run_messages: Some(&run_messages),
+                filesystem_records: None,
+                records: &[],
+                feed: None,
+                sections: &[],
+            })
+            .unwrap();
+        let after_stale_snapshot = persistence.load_run_messages(run_id).unwrap();
+        assert_eq!(after_stale_snapshot[1].content, "seedhello world!");
+        assert_eq!(after_stale_snapshot[2].content, "partial");
+
+        let mut mismatched_messages = run_messages.clone();
+        mismatched_messages.get_mut(&run_id).unwrap()[1].content = "replacement base".to_owned();
+        mismatched_messages.get_mut(&run_id).unwrap()[2].content = "replacement tail".to_owned();
+        persistence
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &manager.export_state(),
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&run_summaries),
+                run_messages: Some(&mismatched_messages),
+                filesystem_records: None,
+                records: &[],
+                feed: None,
+                sections: &[],
+            })
+            .unwrap();
+        let after_mismatch = persistence.load_run_messages(run_id).unwrap();
+        assert_eq!(after_mismatch[1].content, "seedhello world!");
+        assert_eq!(after_mismatch[2].content, "partial");
+        let fragments_after_mismatch: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM run_message_fragments WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fragments_after_mismatch, 5);
+
+        let mut assembled_messages = run_messages.clone();
+        assembled_messages.get_mut(&run_id).unwrap()[1].content = "seedhello world!".to_owned();
+        assembled_messages.get_mut(&run_id).unwrap()[2].content = "partial".to_owned();
+        assert!(
+            persistence
+                .save_state(DurableStateWrite {
+                    schema_version: CURRENT_SCHEMA_VERSION,
+                    sessions: &manager.export_state(),
+                    workspaces: None,
+                    settings: None,
+                    workspace_configs: None,
+                    providers: None,
+                    usage: None,
+                    idempotency: None,
+                    run_summaries: Some(&run_summaries),
+                    run_messages: Some(&assembled_messages),
+                    filesystem_records: None,
+                    records: &[],
+                    feed: None,
+                    sections: &[("", serde_json::json!({"invalid": true}))],
+                })
+                .is_err()
+        );
+        let after_rollback = persistence.load_run_messages(run_id).unwrap();
+        assert_eq!(after_rollback[1].content, "seedhello world!");
+        assert_eq!(after_rollback[2].content, "partial");
+        let retained_fragments: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM run_message_fragments WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_fragments, 5);
+        persistence
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &manager.export_state(),
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&run_summaries),
+                run_messages: Some(&assembled_messages),
+                filesystem_records: None,
+                records: &[],
+                feed: None,
+                sections: &[],
+            })
+            .unwrap();
+        let after_consolidation = persistence.load_run_messages(run_id).unwrap();
+        assert_eq!(after_consolidation[1].content, "seedhello world!");
+        assert_eq!(after_consolidation[2].content, "partial");
+        let remaining_fragments: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM run_message_fragments WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_fragments, 0);
+        assert!(
+            persistence
+                .load_run_message_page(run_id, None, 101)
+                .is_err()
+        );
+        assert!(
+            persistence
+                .load_run_message_content_range(
+                    run_id,
+                    1,
+                    0,
+                    MAX_CONTENT_RANGE_BYTES.saturating_add(1)
+                )
+                .is_err()
+        );
+        let connection = Connection::open(&path).unwrap();
+        let page_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT ordinal FROM run_messages
+                 WHERE run_id=?1 AND ordinal<?2 ORDER BY ordinal DESC LIMIT 20",
+                params![run_id.as_uuid().as_bytes().as_slice(), 2_i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(page_plan.contains("PRIMARY KEY"), "{page_plan}");
+        let range_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT byte_offset FROM run_message_fragments
+                 WHERE run_id=?1 AND message_ordinal=?2 AND byte_offset<?3
+                 ORDER BY byte_offset",
+                params![run_id.as_uuid().as_bytes().as_slice(), 2_i64, 6_i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            range_plan.contains("run_message_fragments_by_range"),
+            "{range_plan}"
         );
         drop(connection);
         fs::remove_file(path).unwrap();

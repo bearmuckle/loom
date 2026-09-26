@@ -671,9 +671,23 @@ struct RunHandle {
     runtime: Mutex<AgentRuntime>,
     control: RunControl,
     state: Mutex<AgentRuntimeState>,
+    message_fragments: Mutex<MessageFragmentState>,
     running: Mutex<bool>,
     idle: Condvar,
     failure: Mutex<Option<LoomError>>,
+}
+
+#[derive(Default)]
+struct MessageFragmentState {
+    active_message_ordinal: Option<u64>,
+    positions: BTreeMap<u64, MessageFragmentPosition>,
+}
+
+#[derive(Clone, Copy)]
+struct MessageFragmentPosition {
+    ordinal: u64,
+    fragment_ordinal: u64,
+    byte_offset: u64,
 }
 
 /// Whether a control request pauses a run or ends it.
@@ -697,6 +711,7 @@ impl RunHandle {
             session_id: runtime.session_id(),
             control: runtime.control(),
             state: Mutex::new(runtime.export_state()),
+            message_fragments: Mutex::new(MessageFragmentState::default()),
             runtime: Mutex::new(runtime),
             running: Mutex::new(false),
             idle: Condvar::new(),
@@ -718,6 +733,108 @@ impl RunHandle {
 
     fn refresh(&self, runtime: &AgentRuntime) {
         *self.locked_state() = runtime.export_state();
+        self.message_fragments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active_message_ordinal = None;
+    }
+
+    fn append_message_delta(&self, persistence: &FilePersistence, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let mut fragments = self.message_fragments.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "run message fragment lock was poisoned",
+                true,
+            )
+        })?;
+        let ordinal = match fragments.active_message_ordinal {
+            Some(ordinal) => ordinal,
+            None => {
+                let state = self.locked_state();
+                let message_count = u64::try_from(state.messages.len()).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "run transcript has too many messages",
+                        false,
+                    )
+                })?;
+                let ordinal = if state
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.role == loom_model::MessageRole::Assistant)
+                {
+                    message_count.saturating_sub(1)
+                } else {
+                    message_count
+                };
+                fragments.active_message_ordinal = Some(ordinal);
+                ordinal
+            }
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            fragments.positions.entry(ordinal)
+        {
+            let (fragment_ordinal, byte_offset) =
+                persistence.next_run_message_fragment_position(self.run_id, ordinal)?;
+            entry.insert(MessageFragmentPosition {
+                ordinal,
+                fragment_ordinal,
+                byte_offset,
+            });
+        }
+        let position = fragments.positions.get_mut(&ordinal).ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "streamed message fragment cursor is missing",
+                false,
+            )
+        })?;
+        let mut start = 0;
+        while start < text.len() {
+            let mut end = (start + 32 * 1024).min(text.len());
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let next_fragment_ordinal =
+                position.fragment_ordinal.checked_add(1).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "run message has too many persisted fragments",
+                        false,
+                    )
+                })?;
+            let next_byte_offset = position
+                .byte_offset
+                .checked_add(u64::try_from(end - start).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "run message fragment length is out of range",
+                        false,
+                    )
+                })?)
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "run message content is too large",
+                        false,
+                    )
+                })?;
+            persistence.append_run_message_fragment(
+                self.run_id,
+                self.session_id,
+                position.ordinal,
+                position.fragment_ordinal,
+                position.byte_offset,
+                &text.as_bytes()[start..end],
+            )?;
+            position.fragment_ordinal = next_fragment_ordinal;
+            position.byte_offset = next_byte_offset;
+            start = end;
+        }
+        Ok(())
     }
 
     /// Keeps the cached run state current while a step is still executing.
@@ -2069,8 +2186,18 @@ impl InProcessBackend {
             let Some(backend) = backend.upgrade() else {
                 return;
             };
-            let recorded = backend.record_agent_event(session_id, event.clone());
-            if let Some(handle) = handle.upgrade() {
+            let handle = handle.upgrade();
+            let fragment_result = match (event, backend.persistence.as_ref(), handle.as_ref()) {
+                (
+                    AgentEvent::AssistantMessageDelta { text, .. },
+                    Some(persistence),
+                    Some(handle),
+                ) => handle.append_message_delta(persistence, text),
+                _ => Ok(()),
+            };
+            let recorded = fragment_result
+                .and_then(|()| backend.record_agent_event(session_id, event.clone()));
+            if let Some(handle) = handle {
                 handle.apply_event(event);
                 if let Err(error) = recorded {
                     handle.record_failure(error);
@@ -4343,6 +4470,7 @@ impl InProcessConnection {
             handle.refresh(&runtime);
             progress?
         };
+        self.backend.persist_state()?;
         if progress.continues {
             self.backend.spawn_run_worker(Arc::clone(&handle));
         }
