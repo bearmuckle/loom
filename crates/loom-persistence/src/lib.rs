@@ -9,13 +9,14 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
-    CheckpointId, ErrorCode, EventSequence, LoomError, RequestId, Result, RunId, StepId, Timestamp,
-    UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    CheckpointId, ErrorCode, EventSequence, InteractionId, LoomError, RequestId, Result,
+    RunAttemptId, RunId, StepId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
-    AgentRunSnapshot, AgentRunState, Checkpoint, CheckpointFile, ServerEventEnvelope,
+    AgentInteractionKind, AgentInteractionRecord, AgentInteractionStatus, AgentRunSnapshot,
+    AgentRunState, ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope,
     WorkspaceConfig, WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
@@ -26,8 +27,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 20;
-const DATABASE_SCHEMA_VERSION: u32 = 20;
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
+const DATABASE_SCHEMA_VERSION: u32 = 21;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -78,6 +79,38 @@ CREATE INDEX IF NOT EXISTS runs_by_session_activity
     ON run_summaries(session_id, updated_at DESC, run_id DESC);
 CREATE INDEX IF NOT EXISTS runs_by_state_activity
     ON run_summaries(state, updated_at DESC, run_id DESC);
+CREATE TABLE IF NOT EXISTS run_interactions (
+    run_id BLOB NOT NULL,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    interaction_id BLOB NOT NULL CHECK(length(interaction_id) = 16),
+    attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+    control_revision INTEGER NOT NULL CHECK(control_revision >= 0),
+    kind TEXT NOT NULL CHECK(kind IN ('tool_approval', 'user_input')),
+    status TEXT NOT NULL CHECK(status IN (
+        'pending', 'approved', 'rejected', 'answered', 'abandoned'
+    )),
+    tool_call_id BLOB CHECK(tool_call_id IS NULL OR length(tool_call_id) = 16),
+    prompt TEXT NOT NULL CHECK(length(prompt) <= 65536),
+    decision TEXT CHECK(decision IS NULL OR decision IN ('approved', 'rejected')),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    resolved_at INTEGER CHECK(resolved_at IS NULL OR resolved_at >= created_at),
+    PRIMARY KEY(run_id, interaction_id),
+    UNIQUE(run_id, attempt_id, control_revision),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE,
+    CHECK((kind = 'tool_approval' AND tool_call_id IS NOT NULL)
+        OR (kind = 'user_input' AND tool_call_id IS NULL)),
+    CHECK((status = 'pending' AND resolved_at IS NULL AND decision IS NULL)
+        OR (status = 'approved' AND resolved_at IS NOT NULL AND decision = 'approved')
+        OR (status = 'rejected' AND resolved_at IS NOT NULL AND decision = 'rejected')
+        OR (status IN ('answered', 'abandoned') AND resolved_at IS NOT NULL AND decision IS NULL)),
+    CHECK(kind = 'tool_approval' OR status NOT IN ('approved', 'rejected')),
+    CHECK(kind = 'user_input' OR status != 'answered')
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_interactions_pending
+    ON run_interactions(session_id, created_at, interaction_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS run_interactions_by_attempt
+    ON run_interactions(run_id, attempt_id, control_revision);
 CREATE TABLE IF NOT EXISTS run_messages (
     run_id BLOB NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE
         CHECK(length(run_id) = 16),
@@ -663,6 +696,7 @@ pub struct DurableIdempotencyRecord {
 pub struct DurableRunSummary {
     pub snapshot: AgentRunSnapshot,
     pub usage: UsageSnapshot,
+    pub interactions: Option<Vec<AgentInteractionRecord>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1429,9 +1463,107 @@ impl FilePersistence {
                     false,
                 ));
             }
-            summaries.insert(run_id, DurableRunSummary { snapshot, usage });
+            summaries.insert(
+                run_id,
+                DurableRunSummary {
+                    snapshot,
+                    usage,
+                    interactions: None,
+                },
+            );
         }
         Ok(summaries)
+    }
+
+    /// Loads a run's approval and input interaction history independently of
+    /// its summary and runtime section.
+    pub fn load_run_interactions(&self, run_id: RunId) -> Result<Vec<AgentInteractionRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, interaction_id, attempt_id, control_revision, kind, status,
+                        tool_call_id, prompt, decision, created_at, resolved_at
+                 FROM run_interactions WHERE run_id=?1
+                 ORDER BY attempt_id, control_revision",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare run interactions: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read run interactions: {error}"), true)
+            })?;
+        let mut interactions = Vec::new();
+        for row in rows {
+            let (
+                session_id,
+                interaction_id,
+                attempt_id,
+                control_revision,
+                kind,
+                status,
+                tool_call_id,
+                prompt,
+                decision,
+                created_at,
+                resolved_at,
+            ) = row.map_err(|error| {
+                persistence_error(format!("could not read run interaction row: {error}"), true)
+            })?;
+            let control_revision = u64::try_from(control_revision).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted interaction revision is negative",
+                    false,
+                )
+            })?;
+            interactions.push(AgentInteractionRecord {
+                id: InteractionId::from_uuid(decode_uuid(&interaction_id, "interaction id")?),
+                run_id,
+                session_id: AgentSessionId::from_uuid(decode_uuid(
+                    &session_id,
+                    "interaction session id",
+                )?),
+                attempt_id: RunAttemptId::from_uuid(decode_uuid(
+                    &attempt_id,
+                    "interaction attempt id",
+                )?),
+                control_revision,
+                kind: parse_interaction_kind(&kind)?,
+                status: parse_interaction_status(&status)?,
+                tool_call_id: tool_call_id
+                    .as_deref()
+                    .map(|id| decode_uuid(id, "interaction tool call id"))
+                    .transpose()?
+                    .map(loom_core::ToolCallId::from_uuid),
+                prompt,
+                decision: decision
+                    .as_deref()
+                    .map(parse_approval_decision)
+                    .transpose()?,
+                created_at: decode_timestamp(created_at)?,
+                resolved_at: resolved_at.map(decode_timestamp).transpose()?,
+            });
+        }
+        Ok(interactions)
     }
 
     /// Loads a run's ordered transcript independently of its execution record.
@@ -3044,6 +3176,69 @@ fn activity_status_name(status: AgentActivityStatus) -> &'static str {
     }
 }
 
+fn parse_interaction_kind(kind: &str) -> Result<AgentInteractionKind> {
+    match kind {
+        "tool_approval" => Ok(AgentInteractionKind::ToolApproval),
+        "user_input" => Ok(AgentInteractionKind::UserInput),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted interaction kind '{kind}' is invalid"),
+            false,
+        )),
+    }
+}
+
+fn parse_interaction_status(status: &str) -> Result<AgentInteractionStatus> {
+    match status {
+        "pending" => Ok(AgentInteractionStatus::Pending),
+        "approved" => Ok(AgentInteractionStatus::Approved),
+        "rejected" => Ok(AgentInteractionStatus::Rejected),
+        "answered" => Ok(AgentInteractionStatus::Answered),
+        "abandoned" => Ok(AgentInteractionStatus::Abandoned),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted interaction status '{status}' is invalid"),
+            false,
+        )),
+    }
+}
+
+fn parse_approval_decision(decision: &str) -> Result<ApprovalDecision> {
+    match decision {
+        "approved" => Ok(ApprovalDecision::Approved),
+        "rejected" => Ok(ApprovalDecision::Rejected),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted approval decision '{decision}' is invalid"),
+            false,
+        )),
+    }
+}
+
+fn interaction_kind_name(kind: AgentInteractionKind) -> &'static str {
+    match kind {
+        AgentInteractionKind::ToolApproval => "tool_approval",
+        AgentInteractionKind::UserInput => "user_input",
+    }
+}
+
+fn interaction_status_name(status: AgentInteractionStatus) -> &'static str {
+    match status {
+        AgentInteractionStatus::Pending => "pending",
+        AgentInteractionStatus::Approved => "approved",
+        AgentInteractionStatus::Rejected => "rejected",
+        AgentInteractionStatus::Answered => "answered",
+        AgentInteractionStatus::Abandoned => "abandoned",
+    }
+}
+
+fn approval_decision_name(decision: ApprovalDecision) -> &'static str {
+    match decision {
+        ApprovalDecision::Approved => "approved",
+        ApprovalDecision::Rejected => "rejected",
+    }
+}
+
 fn parse_activity_status(status: &str) -> Result<AgentActivityStatus> {
     match status {
         "started" => Ok(AgentActivityStatus::Started),
@@ -4150,6 +4345,7 @@ fn save_run_summary_rows(
                 )
             })?;
     }
+    save_run_interaction_rows(transaction, summaries)?;
     transaction
         .execute(
             "DELETE FROM run_summaries
@@ -4162,6 +4358,140 @@ fn save_run_summary_rows(
         .map_err(|error| {
             persistence_error(format!("could not prune run summaries: {error}"), true)
         })?;
+    Ok(())
+}
+
+fn save_run_interaction_rows(
+    transaction: &Transaction<'_>,
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_interactions (
+                interaction_id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run interactions: {error}"), true)
+        })?;
+    for (run_id, summary) in summaries {
+        let Some(interactions) = summary.interactions.as_ref() else {
+            continue;
+        };
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let session_id = summary.snapshot.session_id;
+        transaction
+            .execute("DELETE FROM _loom_wanted_run_interactions", [])
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not reset staged interactions: {error}"),
+                    true,
+                )
+            })?;
+        let mut seen_ids = BTreeSet::new();
+        let mut seen_revisions = BTreeSet::new();
+        for interaction in interactions {
+            if interaction.run_id != *run_id
+                || interaction.session_id != session_id
+                || !seen_ids.insert(interaction.id)
+                || !seen_revisions.insert((interaction.attempt_id, interaction.control_revision))
+                || interaction.prompt.len() > 65_536
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "run interaction ownership, identity, revision, or prompt is invalid",
+                    false,
+                ));
+            }
+            let interaction_id = interaction.id.as_uuid().as_bytes();
+            let attempt_id = interaction.attempt_id.as_uuid().as_bytes();
+            let tool_call_id = interaction
+                .tool_call_id
+                .map(|id| id.as_uuid().as_bytes().to_vec());
+            let control_revision = i64::try_from(interaction.control_revision).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "run interaction revision is out of range",
+                    false,
+                )
+            })?;
+            let decision = interaction.decision.map(approval_decision_name);
+            transaction
+                .execute(
+                    "INSERT INTO _loom_wanted_run_interactions(interaction_id) VALUES (?1)",
+                    [interaction_id.as_slice()],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not stage interaction {}: {error}", interaction.id),
+                        true,
+                    )
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO run_interactions(
+                        run_id, session_id, interaction_id, attempt_id, control_revision,
+                        kind, status, tool_call_id, prompt, decision, created_at, resolved_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(run_id, interaction_id) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        attempt_id=excluded.attempt_id,
+                        control_revision=excluded.control_revision,
+                        kind=excluded.kind,
+                        status=excluded.status,
+                        tool_call_id=excluded.tool_call_id,
+                        prompt=excluded.prompt,
+                        decision=excluded.decision,
+                        created_at=excluded.created_at,
+                        resolved_at=excluded.resolved_at
+                     WHERE run_interactions.session_id IS NOT excluded.session_id
+                        OR run_interactions.attempt_id IS NOT excluded.attempt_id
+                        OR run_interactions.control_revision IS NOT excluded.control_revision
+                        OR run_interactions.kind IS NOT excluded.kind
+                        OR run_interactions.status IS NOT excluded.status
+                        OR run_interactions.tool_call_id IS NOT excluded.tool_call_id
+                        OR run_interactions.prompt IS NOT excluded.prompt
+                        OR run_interactions.decision IS NOT excluded.decision
+                        OR run_interactions.created_at IS NOT excluded.created_at
+                        OR run_interactions.resolved_at IS NOT excluded.resolved_at",
+                    params![
+                        run_id_bytes.as_slice(),
+                        session_id.as_uuid().as_bytes().as_slice(),
+                        interaction_id.as_slice(),
+                        attempt_id.as_slice(),
+                        control_revision,
+                        interaction_kind_name(interaction.kind),
+                        interaction_status_name(interaction.status),
+                        tool_call_id,
+                        interaction.prompt.as_str(),
+                        decision,
+                        encode_timestamp(interaction.created_at)?,
+                        interaction.resolved_at.map(encode_timestamp).transpose()?,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save interaction {}: {error}", interaction.id),
+                        true,
+                    )
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_interactions
+                 WHERE run_id=?1 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_interactions wanted
+                    WHERE wanted.interaction_id=run_interactions.interaction_id
+                 )",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune run interactions for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
     Ok(())
 }
 
@@ -5511,6 +5841,7 @@ mod tests {
                 output_tokens: 7,
                 ..UsageSnapshot::default()
             },
+            interactions: None,
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
         let activity_call = loom_model::ToolCall {
@@ -5920,6 +6251,7 @@ mod tests {
                 evidence: Vec::new(),
             },
             usage: UsageSnapshot::default(),
+            interactions: None,
         };
         let run_summaries = BTreeMap::from([(run_id, summary)]);
         let large_content = "0123456789".repeat(60_000);
@@ -6342,6 +6674,148 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn run_interactions_round_trip_and_commit_atomically_with_the_feed() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut manager = SessionManager::default();
+        let (session, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Run interactions")
+            .unwrap();
+        let run_id = RunId::new();
+        let attempt_id = RunAttemptId::new();
+        let interaction_id = InteractionId::new();
+        let prompt = "Which branch should I use?".to_owned();
+        let created_at = Timestamp::from_unix_millis(1_000);
+        let mut interaction = AgentInteractionRecord {
+            id: interaction_id,
+            run_id,
+            session_id: session.id,
+            attempt_id,
+            control_revision: 1,
+            kind: AgentInteractionKind::UserInput,
+            status: AgentInteractionStatus::Pending,
+            tool_call_id: None,
+            prompt: prompt.clone(),
+            decision: None,
+            created_at,
+            resolved_at: None,
+        };
+        let mut summary = DurableRunSummary {
+            snapshot: AgentRunSnapshot {
+                id: run_id,
+                attempt_id,
+                control_revision: 1,
+                session_id: session.id,
+                task: "choose a branch".to_owned(),
+                model: ModelId::new("deterministic-model"),
+                state: AgentRunState::NeedsInput,
+                started_at: created_at,
+                updated_at: created_at,
+                completed_at: None,
+                summary: None,
+                evidence: Vec::new(),
+            },
+            usage: UsageSnapshot::default(),
+            interactions: Some(vec![interaction.clone()]),
+        };
+        let run_summaries = BTreeMap::from([(run_id, summary.clone())]);
+        let input_event = loom_protocol::ServerEventEnvelope {
+            protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(1),
+            session_id: session.id,
+            event: loom_protocol::ServerEvent::Agent {
+                event: loom_protocol::AgentEvent::NeedsInput {
+                    run_id,
+                    attempt_id,
+                    control_revision: 1,
+                    interaction_id,
+                    prompt: prompt.clone(),
+                },
+            },
+        };
+        let mut feed = DurableFeedState {
+            next_sequence: EventSequence::new(1),
+            retention_limit: 16,
+            events: vec![input_event.clone()],
+        };
+        let save =
+            |summary: &BTreeMap<RunId, DurableRunSummary>, feed: &DurableFeedState| -> Result<()> {
+                persistence.save_state(DurableStateWrite {
+                    schema_version: CURRENT_SCHEMA_VERSION,
+                    sessions: &manager.export_state(),
+                    workspaces: None,
+                    settings: None,
+                    workspace_configs: None,
+                    providers: None,
+                    usage: None,
+                    idempotency: None,
+                    run_summaries: Some(summary),
+                    run_messages: None,
+                    run_activities: None,
+                    filesystem_records: None,
+                    records: &[],
+                    feed: Some(feed),
+                    sections: &[],
+                })
+            };
+        save(&run_summaries, &feed).unwrap();
+        assert_eq!(
+            persistence.load_run_interactions(run_id).unwrap(),
+            vec![interaction.clone()]
+        );
+
+        interaction.status = AgentInteractionStatus::Answered;
+        interaction.resolved_at = Some(Timestamp::from_unix_millis(2_000));
+        summary.snapshot.state = AgentRunState::Executing;
+        summary.snapshot.control_revision = 2;
+        summary.snapshot.updated_at = Timestamp::from_unix_millis(2_000);
+        summary.interactions = Some(vec![interaction.clone()]);
+        let resolved_event = loom_protocol::ServerEventEnvelope {
+            protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(2),
+            session_id: session.id,
+            event: loom_protocol::ServerEvent::Agent {
+                event: loom_protocol::AgentEvent::UserMessage {
+                    run_id,
+                    attempt_id,
+                    control_revision: 2,
+                    interaction_id: Some(interaction_id),
+                    text: "Use the release branch.".to_owned(),
+                },
+            },
+        };
+        feed.events.push(resolved_event);
+        feed.next_sequence = EventSequence::new(0);
+        let resolved_summaries = BTreeMap::from([(run_id, summary.clone())]);
+        assert_eq!(
+            save(&resolved_summaries, &feed).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+        assert_eq!(
+            persistence.load_run_interactions(run_id).unwrap(),
+            vec![AgentInteractionRecord {
+                status: AgentInteractionStatus::Pending,
+                resolved_at: None,
+                ..interaction.clone()
+            }]
+        );
+        let persisted_feed = persistence.load_feed_state().unwrap().unwrap();
+        assert_eq!(persisted_feed.next_sequence, EventSequence::new(1));
+        assert_eq!(persisted_feed.events, vec![input_event]);
+
+        feed.next_sequence = EventSequence::new(2);
+        save(&resolved_summaries, &feed).unwrap();
+        assert_eq!(
+            persistence.load_run_interactions(run_id).unwrap(),
+            vec![interaction]
+        );
+        let persisted_feed = persistence.load_feed_state().unwrap().unwrap();
+        assert_eq!(persisted_feed.next_sequence, EventSequence::new(2));
+        assert_eq!(persisted_feed.events.len(), 2);
         fs::remove_file(path).unwrap();
     }
 

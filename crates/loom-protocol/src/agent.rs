@@ -1,6 +1,6 @@
 use loom_core::{
-    AgentSessionId, EvidenceLink, LimitStatus, LoomError, PolicyEvaluation, RunAttemptId, RunId,
-    StepId, Timestamp, ToolCallId, UsageSnapshot,
+    AgentSessionId, EvidenceLink, InteractionId, LimitStatus, LoomError, PolicyEvaluation,
+    RunAttemptId, RunId, StepId, Timestamp, ToolCallId, UsageSnapshot,
 };
 use loom_model::{ModelId, TokenUsage, ToolCall};
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,39 @@ pub enum ApprovalDecision {
     Rejected,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInteractionKind {
+    ToolApproval,
+    UserInput,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInteractionStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Answered,
+    Abandoned,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentInteractionRecord {
+    pub id: InteractionId,
+    pub run_id: RunId,
+    pub session_id: AgentSessionId,
+    pub attempt_id: RunAttemptId,
+    pub control_revision: u64,
+    pub kind: AgentInteractionKind,
+    pub status: AgentInteractionStatus,
+    pub tool_call_id: Option<ToolCallId>,
+    pub prompt: String,
+    pub decision: Option<ApprovalDecision>,
+    pub created_at: Timestamp,
+    pub resolved_at: Option<Timestamp>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
@@ -98,12 +131,14 @@ pub enum AgentEvent {
         run_id: RunId,
         attempt_id: RunAttemptId,
         control_revision: u64,
+        interaction_id: Option<InteractionId>,
         text: String,
     },
     NeedsInput {
         run_id: RunId,
         attempt_id: RunAttemptId,
         control_revision: u64,
+        interaction_id: InteractionId,
         prompt: String,
     },
     ToolCallRequested {
@@ -114,6 +149,7 @@ pub enum AgentEvent {
         run_id: RunId,
         attempt_id: RunAttemptId,
         control_revision: u64,
+        interaction_id: InteractionId,
         call: ToolCall,
     },
     ToolPolicyEvaluated {
@@ -125,6 +161,7 @@ pub enum AgentEvent {
         run_id: RunId,
         attempt_id: RunAttemptId,
         control_revision: u64,
+        interaction_id: InteractionId,
         tool_call_id: ToolCallId,
         decision: ApprovalDecision,
     },

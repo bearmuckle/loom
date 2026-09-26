@@ -1,6 +1,7 @@
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, Capability, CapabilitySet,
-    EventSequence, ProtocolVersion, RunId, SessionLimits, StepId, Timestamp, WorkspaceId,
+    EventSequence, InteractionId, ProtocolVersion, RunId, SessionLimits, StepId, Timestamp,
+    WorkspaceId,
 };
 use loom_model::{ModelId, ToolCall};
 use loom_protocol::{
@@ -214,6 +215,37 @@ fn agent_event_json_round_trip_preserves_run_identity() {
 
     assert_eq!(decoded, event);
     assert_eq!(run.state, AgentRunState::Executing);
+}
+
+#[test]
+fn approval_interaction_event_round_trip_preserves_revision_identity() {
+    let run_id = RunId::new();
+    let attempt_id = loom_core::RunAttemptId::new();
+    let interaction_id = InteractionId::new();
+    let tool_call_id = loom_core::ToolCallId::new();
+    let event = ServerEventEnvelope {
+        protocol_version: CURRENT_PROTOCOL_VERSION,
+        sequence: EventSequence::new(9),
+        session_id: AgentSessionId::new(),
+        event: ServerEvent::Agent {
+            event: AgentEvent::ToolApprovalRequired {
+                run_id,
+                attempt_id,
+                control_revision: 4,
+                interaction_id,
+                call: ToolCall {
+                    id: tool_call_id,
+                    name: "write_file".to_owned(),
+                    arguments: serde_json::json!({"path": "src/lib.rs"}),
+                },
+            },
+        },
+    };
+
+    let encoded = encode_event(&event).unwrap();
+    let decoded = decode_event(&encoded).unwrap();
+
+    assert_eq!(decoded, event);
 }
 
 #[test]

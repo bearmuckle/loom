@@ -641,6 +641,7 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
                         attempt_id,
                         control_revision,
                         call,
+                        ..
                     },
             } = &event.event
                 && *event_run == run_id

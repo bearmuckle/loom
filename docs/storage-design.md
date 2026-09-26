@@ -444,14 +444,24 @@ Implement in this order:
    transactionally with run summaries and restored for both restart recovery
    and on-demand run detail loads.
    Batching fragments at the intended flush thresholds, migration of tools and
-   tool-attempt/interaction records, and loading the canonical context directly
+   tool-attempt records, and loading the canonical context directly
    from bounded persistence pages remain to be completed.
 3. Move execution, approvals, idempotency, and publication to transactional domain
    commands. Protocol 4.0 approval and input commands now carry the run-attempt
    identity and expected control revision, and stale commands are rejected;
    the run snapshot persists those guards across recovery. Typed interaction rows,
-   atomic decision/feed transactions, and crash-boundary tests are still
-   required. Test crash boundaries before switching live writes.
+   keyed by run and interaction with attempt/revision, status, prompt, decision,
+   and time columns, are now persisted separately from runtime sections.
+   Interaction rows, run summaries, and the reconnect feed share one SQLite
+   transaction; history is loaded on demand and pending interactions are
+   restored before guarded commands are accepted. A command's decision is
+   committed before the run worker starts. Tool dispatch and explicit retry
+   persist a pending execution intent and started activity before the next
+   worker step can perform an effect. Recovery never replays a persisted
+   in-flight tool automatically; it marks the run failed with an unknown
+   external outcome and requires an explicit retry. Typed tool-attempt records,
+   further execution-state normalization, and crash-injection coverage remain.
+   Test crash boundaries before switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
    exports and their mirrored in-memory journals completely.

@@ -8,8 +8,9 @@ use std::{
 
 use loom_context::{ContextAssembler, ContextAssemblyOptions, ContextInput, ContextInspection};
 use loom_core::{
-    ActivityId, AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink, LimitKind, LimitStatus,
-    LoomError, PolicyEvaluation, Result, RunId, SessionLimits, StepId, Timestamp, UsageSnapshot,
+    ActivityId, AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink, InteractionId, LimitKind,
+    LimitStatus, LoomError, PolicyEvaluation, Result, RunId, SessionLimits, StepId, Timestamp,
+    UsageSnapshot,
 };
 use loom_model::{
     CancellationToken, CompletionOptions, MessageRole, ModelId, ModelMessage, ModelProvider,
@@ -17,14 +18,15 @@ use loom_model::{
 };
 pub use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
-    AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState, ApprovalDecision,
-    FileActivityOperation,
+    AgentInteractionRecord, AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState,
+    ApprovalDecision, FileActivityOperation,
 };
 use loom_tools::{ToolExecutor, ToolKind, ToolResult, tool_definitions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const CONTEXT_PROJECTION_VERSION: u32 = 1;
+const MAX_INTERACTION_PROMPT_BYTES: usize = 65_536;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTask {
@@ -52,6 +54,8 @@ pub struct AgentRuntimeState {
     pub messages: Vec<ModelMessage>,
     pub pending_approval: Option<ToolCall>,
     #[serde(default)]
+    pub pending_tool_execution: Option<ToolCall>,
+    #[serde(default)]
     pub pending_input: Option<String>,
     pub last_failed_call: Option<ToolCall>,
     pub next_message_id: u64,
@@ -68,6 +72,8 @@ pub struct AgentRuntimeState {
     pub step_index: u32,
     #[serde(default)]
     pub activities: Vec<AgentActivityRecord>,
+    #[serde(default)]
+    pub interactions: Vec<AgentInteractionRecord>,
 }
 
 impl AgentTask {
@@ -230,6 +236,7 @@ pub struct AgentRuntime {
     tools: ToolExecutor,
     messages: Vec<ModelMessage>,
     pending_approval: Option<PendingApproval>,
+    pending_tool_execution: Option<ToolCall>,
     pending_input: Option<String>,
     last_failed_call: Option<ToolCall>,
     next_message_id: u64,
@@ -243,6 +250,7 @@ pub struct AgentRuntime {
     step_id: Option<StepId>,
     step_index: u32,
     activities: Vec<AgentActivityRecord>,
+    interactions: Vec<AgentInteractionRecord>,
     control: RunControl,
     observer: Option<AgentEventObserver>,
     flush_offset: usize,
@@ -299,6 +307,7 @@ impl AgentRuntime {
             tools,
             messages,
             pending_approval: None,
+            pending_tool_execution: None,
             pending_input: None,
             last_failed_call: None,
             next_message_id: 0,
@@ -312,6 +321,7 @@ impl AgentRuntime {
             step_id: None,
             step_index: 0,
             activities: Vec::new(),
+            interactions: Vec::new(),
             control: RunControl::new(),
             observer: None,
             flush_offset: 0,
@@ -517,6 +527,7 @@ impl AgentRuntime {
                 .pending_approval
                 .as_ref()
                 .map(|pending| pending.call.clone()),
+            pending_tool_execution: self.pending_tool_execution.clone(),
             pending_input: self.pending_input.clone(),
             last_failed_call: self.last_failed_call.clone(),
             next_message_id: self.next_message_id,
@@ -530,6 +541,7 @@ impl AgentRuntime {
             step_id: self.step_id,
             step_index: self.step_index,
             activities: self.activities.clone(),
+            interactions: self.interactions.clone(),
         }
     }
 
@@ -561,6 +573,25 @@ impl AgentRuntime {
         {
             state.pending_input = None;
         }
+        let resolved_at = Timestamp::now();
+        for interaction in &mut state.interactions {
+            if interaction.status != loom_protocol::AgentInteractionStatus::Pending {
+                continue;
+            }
+            let active = interaction.attempt_id == state.run.attempt_id
+                && interaction.control_revision == state.run.control_revision
+                && match interaction.kind {
+                    loom_protocol::AgentInteractionKind::ToolApproval => state
+                        .pending_approval
+                        .as_ref()
+                        .is_some_and(|call| interaction.tool_call_id == Some(call.id)),
+                    loom_protocol::AgentInteractionKind::UserInput => state.pending_input.is_some(),
+                };
+            if !active {
+                interaction.status = loom_protocol::AgentInteractionStatus::Abandoned;
+                interaction.resolved_at = Some(resolved_at);
+            }
+        }
         if provider.descriptor().id != state.task.model {
             return Err(LoomError::new(
                 ErrorCode::ProviderUnavailable,
@@ -581,6 +612,7 @@ impl AgentRuntime {
             tools,
             messages: state.messages,
             pending_approval: state.pending_approval.map(|call| PendingApproval { call }),
+            pending_tool_execution: state.pending_tool_execution,
             pending_input: state.pending_input,
             last_failed_call: state.last_failed_call,
             next_message_id: state.next_message_id,
@@ -594,6 +626,7 @@ impl AgentRuntime {
             step_id: state.step_id,
             step_index: state.step_index,
             activities: state.activities,
+            interactions: state.interactions,
             control: RunControl::new(),
             observer: None,
             flush_offset: 0,
@@ -649,7 +682,7 @@ impl AgentRuntime {
         self.publish(result)
     }
 
-    /// Applies an approval and runs the approved tool without driving the run.
+    /// Applies an approval and queues the tool for the run driver.
     pub fn approve_entry(
         &mut self,
         tool_call_id: loom_core::ToolCallId,
@@ -689,20 +722,31 @@ impl AgentRuntime {
                 false,
             ));
         }
+        let interaction_id = self.pending_interaction_id(
+            loom_protocol::AgentInteractionKind::ToolApproval,
+            attempt_id,
+            expected_control_revision,
+            Some(tool_call_id),
+        )?;
         let control_revision = self.next_control_revision()?;
         let pending = self.take_pending(tool_call_id)?;
         self.run.control_revision = control_revision;
+        self.resolve_interaction(
+            interaction_id,
+            loom_protocol::AgentInteractionStatus::Approved,
+            Some(ApprovalDecision::Approved),
+        )?;
+        self.pending_tool_execution = Some(pending.call.clone());
         let mut events = vec![AgentEvent::ToolApprovalDecided {
             run_id: self.run.id,
             attempt_id: self.run.attempt_id,
             control_revision,
+            interaction_id,
             tool_call_id,
             decision: ApprovalDecision::Approved,
         }];
         events.extend(self.set_state(AgentRunState::Executing));
-        let (tool_events, _result) = self.execute_tool(&pending.call);
-        events.extend(tool_events);
-        self.last_failed_call = None;
+        events.push(self.update_activity_status(tool_call_id, AgentActivityStatus::Started));
         Ok(RunProgress::running(events))
     }
 
@@ -745,13 +789,25 @@ impl AgentRuntime {
                 false,
             ));
         }
+        let interaction_id = self.pending_interaction_id(
+            loom_protocol::AgentInteractionKind::ToolApproval,
+            attempt_id,
+            expected_control_revision,
+            Some(tool_call_id),
+        )?;
         let control_revision = self.next_control_revision()?;
         let pending = self.take_pending(tool_call_id)?;
         self.run.control_revision = control_revision;
+        self.resolve_interaction(
+            interaction_id,
+            loom_protocol::AgentInteractionStatus::Rejected,
+            Some(ApprovalDecision::Rejected),
+        )?;
         let mut events = vec![AgentEvent::ToolApprovalDecided {
             run_id: self.run.id,
             attempt_id: self.run.attempt_id,
             control_revision,
+            interaction_id,
             tool_call_id,
             decision: ApprovalDecision::Rejected,
         }];
@@ -915,7 +971,24 @@ impl AgentRuntime {
                 "agent run is currently processing a message",
             ));
         }
+        let interaction_id = if self.pending_input.is_some() {
+            Some(self.pending_interaction_id(
+                loom_protocol::AgentInteractionKind::UserInput,
+                attempt_id,
+                expected_control_revision,
+                None,
+            )?)
+        } else {
+            None
+        };
         let control_revision = self.next_control_revision()?;
+        if let Some(interaction_id) = interaction_id {
+            self.resolve_interaction(
+                interaction_id,
+                loom_protocol::AgentInteractionStatus::Answered,
+                None,
+            )?;
+        }
         self.messages
             .push(ModelMessage::new(MessageRole::User, message.clone()));
         self.pending_input = None;
@@ -928,6 +1001,7 @@ impl AgentRuntime {
             run_id: self.run.id,
             attempt_id: self.run.attempt_id,
             control_revision,
+            interaction_id,
             text: message,
         }];
         events.extend(self.set_state(AgentRunState::Executing));
@@ -939,6 +1013,11 @@ impl AgentRuntime {
         if prompt.trim().is_empty() {
             return Err(LoomError::invalid_request(
                 "agent input prompt must not be empty",
+            ));
+        }
+        if prompt.len() > MAX_INTERACTION_PROMPT_BYTES {
+            return Err(LoomError::invalid_request(
+                "agent input prompt exceeds the supported size limit",
             ));
         }
         if self.pending_approval.is_some() {
@@ -954,7 +1033,30 @@ impl AgentRuntime {
                 "finished agent runs cannot request input",
             ));
         }
+        let previous_interaction = if self.pending_input.is_some() {
+            Some(self.pending_interaction_id(
+                loom_protocol::AgentInteractionKind::UserInput,
+                self.run.attempt_id,
+                self.run.control_revision,
+                None,
+            )?)
+        } else {
+            None
+        };
         let control_revision = self.next_control_revision()?;
+        if let Some(interaction_id) = previous_interaction {
+            self.resolve_interaction(
+                interaction_id,
+                loom_protocol::AgentInteractionStatus::Abandoned,
+                None,
+            )?;
+        }
+        let interaction_id = self.open_interaction(
+            loom_protocol::AgentInteractionKind::UserInput,
+            prompt.clone(),
+            None,
+            control_revision,
+        );
         self.pending_input = Some(prompt.clone());
         self.run.control_revision = control_revision;
         let mut events = self.set_state(AgentRunState::NeedsInput);
@@ -962,20 +1064,33 @@ impl AgentRuntime {
             run_id: self.run.id,
             attempt_id: self.run.attempt_id,
             control_revision,
+            interaction_id,
             prompt,
         });
         self.publish(Ok(events))
     }
 
     pub fn recover_after_restart(&mut self) -> Result<Vec<AgentEvent>> {
-        let events = if matches!(
+        let mut events = Vec::new();
+        if let Some(call) = self.pending_tool_execution.take() {
+            self.last_failed_call = Some(call);
+            events.push(AgentEvent::RecoveryRequired {
+                run_id: self.run.id,
+                reason: "an approved tool execution was interrupted; its external outcome is unknown and it was not replayed".to_owned(),
+            });
+            events.extend(
+                self.finish_failed(
+                    "approved tool execution was interrupted with an unknown outcome",
+                ),
+            );
+            return self.publish(Ok(events));
+        }
+        if matches!(
             self.run.state,
             AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
         ) {
-            self.set_state(AgentRunState::Paused)
-        } else {
-            Vec::new()
-        };
+            events.extend(self.set_state(AgentRunState::Paused));
+        }
         self.publish(Ok(events))
     }
 
@@ -984,7 +1099,7 @@ impl AgentRuntime {
         self.publish(result)
     }
 
-    /// Re-runs the failed tool step without driving the run.
+    /// Queues the failed tool step for the run driver to retry.
     pub fn retry_entry(&mut self) -> Result<RunProgress> {
         let result = self.retry_entry_inner();
         self.publish_progress(result)
@@ -1018,9 +1133,7 @@ impl AgentRuntime {
         self.run.summary = None;
         let mut events = self.set_state(AgentRunState::Executing);
         events.push(self.start_tool_activity(&call, None));
-        let (tool_events, _result) = self.execute_tool(&call);
-        events.extend(tool_events);
-        self.last_failed_call = None;
+        self.pending_tool_execution = Some(call);
         Ok(RunProgress::running(events))
     }
 
@@ -1060,6 +1173,8 @@ impl AgentRuntime {
                 false,
             ));
         }
+        let previous_attempt_id = self.run.attempt_id;
+        self.abandon_pending_interactions(previous_attempt_id);
         self.run.attempt_id = loom_core::RunAttemptId::new();
         self.run.control_revision = 0;
         self.run.completed_at = None;
@@ -1068,6 +1183,7 @@ impl AgentRuntime {
         self.run.state = AgentRunState::Planning;
         self.messages = initial_messages(&self.task);
         self.pending_approval = None;
+        self.pending_tool_execution = None;
         self.pending_input = None;
         self.last_failed_call = None;
         self.next_message_id = 0;
@@ -1122,6 +1238,12 @@ impl AgentRuntime {
         if let Some(control_events) = self.apply_control_request() {
             events.extend(control_events);
             return Ok(StepOutcome::Blocked);
+        }
+        if let Some(call) = self.pending_tool_execution.take() {
+            let (tool_events, _result) = self.execute_tool(&call);
+            events.extend(tool_events);
+            self.last_failed_call = None;
+            return Ok(StepOutcome::Continue);
         }
         if self.pending_approval.is_some()
             || matches!(
@@ -1406,6 +1528,12 @@ impl AgentRuntime {
                     let control_revision = self.next_control_revision()?;
                     self.pending_approval = Some(PendingApproval { call: call.clone() });
                     self.run.control_revision = control_revision;
+                    let interaction_id = self.open_interaction(
+                        loom_protocol::AgentInteractionKind::ToolApproval,
+                        "Tool approval requested".to_owned(),
+                        Some(call.id),
+                        control_revision,
+                    );
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
                     ctx.events.push(AgentEvent::StepCompleted {
@@ -1422,6 +1550,7 @@ impl AgentRuntime {
                         run_id: self.run.id,
                         attempt_id: self.run.attempt_id,
                         control_revision,
+                        interaction_id,
                         call,
                     });
                     ctx.finished = true;
@@ -1513,9 +1642,14 @@ impl AgentRuntime {
                         .arguments
                         .get("prompt")
                         .and_then(serde_json::Value::as_str)
-                        .filter(|prompt| !prompt.trim().is_empty())
+                        .filter(|prompt| {
+                            !prompt.trim().is_empty()
+                                && prompt.len() <= MAX_INTERACTION_PROMPT_BYTES
+                        })
                     else {
-                        let output = "ask_user requires a non-empty prompt".to_owned();
+                        let output = format!(
+                            "ask_user requires a non-empty prompt of at most {MAX_INTERACTION_PROMPT_BYTES} bytes"
+                        );
                         let result = ToolResult {
                             tool_call_id: call.id,
                             name: call.name.clone(),
@@ -1546,6 +1680,12 @@ impl AgentRuntime {
                         return Ok(StreamFlow::Stop);
                     };
                     let control_revision = self.next_control_revision()?;
+                    let interaction_id = self.open_interaction(
+                        loom_protocol::AgentInteractionKind::UserInput,
+                        prompt.to_owned(),
+                        None,
+                        control_revision,
+                    );
                     self.pending_input = Some(prompt.to_owned());
                     self.run.control_revision = control_revision;
                     self.messages.push(ModelMessage {
@@ -1570,19 +1710,21 @@ impl AgentRuntime {
                         run_id: self.run.id,
                         attempt_id: self.run.attempt_id,
                         control_revision,
+                        interaction_id,
                         prompt: prompt.to_owned(),
                     });
                     ctx.finished = true;
                     return Ok(StreamFlow::Stop);
                 }
-                let (tool_events, result) = self.execute_tool(&call);
-                ctx.events.extend(tool_events);
-                if result.success {
-                    self.last_failed_call = None;
-                } else {
-                    self.last_failed_call = None;
-                    return Ok(StreamFlow::Stop);
-                }
+                self.pending_tool_execution = Some(call.clone());
+                self.step_id = None;
+                self.step_index = self.step_index.saturating_add(1);
+                ctx.events.push(AgentEvent::StepCompleted {
+                    run_id: self.run.id,
+                    step_id: ctx.step_id,
+                    index: ctx.step_index,
+                });
+                return Ok(StreamFlow::Stop);
             }
             ModelStreamEvent::Usage { usage } => {
                 self.usage.add_tokens(
@@ -1837,6 +1979,98 @@ impl AgentRuntime {
         Ok(pending)
     }
 
+    fn open_interaction(
+        &mut self,
+        kind: loom_protocol::AgentInteractionKind,
+        prompt: String,
+        tool_call_id: Option<loom_core::ToolCallId>,
+        control_revision: u64,
+    ) -> InteractionId {
+        let id = InteractionId::new();
+        self.interactions.push(AgentInteractionRecord {
+            id,
+            run_id: self.run.id,
+            session_id: self.session_id,
+            attempt_id: self.run.attempt_id,
+            control_revision,
+            kind,
+            status: loom_protocol::AgentInteractionStatus::Pending,
+            tool_call_id,
+            prompt,
+            decision: None,
+            created_at: Timestamp::now(),
+            resolved_at: None,
+        });
+        id
+    }
+
+    fn pending_interaction_id(
+        &self,
+        kind: loom_protocol::AgentInteractionKind,
+        attempt_id: loom_core::RunAttemptId,
+        control_revision: u64,
+        tool_call_id: Option<loom_core::ToolCallId>,
+    ) -> Result<InteractionId> {
+        self.interactions
+            .iter()
+            .rev()
+            .find(|interaction| {
+                interaction.kind == kind
+                    && interaction.status == loom_protocol::AgentInteractionStatus::Pending
+                    && interaction.attempt_id == attempt_id
+                    && interaction.control_revision == control_revision
+                    && interaction.tool_call_id == tool_call_id
+            })
+            .map(|interaction| interaction.id)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::InvalidState,
+                    "pending run interaction is missing from durable history",
+                    false,
+                )
+            })
+    }
+
+    fn resolve_interaction(
+        &mut self,
+        interaction_id: InteractionId,
+        status: loom_protocol::AgentInteractionStatus,
+        decision: Option<ApprovalDecision>,
+    ) -> Result<()> {
+        let interaction = self
+            .interactions
+            .iter_mut()
+            .find(|interaction| interaction.id == interaction_id)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::InvalidState,
+                    "run interaction is missing from runtime history",
+                    false,
+                )
+            })?;
+        if interaction.status != loom_protocol::AgentInteractionStatus::Pending {
+            return Err(LoomError::invalid_state(
+                "run interaction has already been resolved",
+            ));
+        }
+        interaction.status = status;
+        interaction.decision = decision;
+        interaction.resolved_at = Some(Timestamp::now());
+        Ok(())
+    }
+
+    fn abandon_pending_interactions(&mut self, attempt_id: loom_core::RunAttemptId) {
+        let resolved_at = Timestamp::now();
+        for interaction in &mut self.interactions {
+            if interaction.attempt_id == attempt_id
+                && interaction.status == loom_protocol::AgentInteractionStatus::Pending
+            {
+                interaction.status = loom_protocol::AgentInteractionStatus::Abandoned;
+                interaction.resolved_at = Some(resolved_at);
+            }
+        }
+    }
+
     fn validate_control_revision(
         &self,
         attempt_id: loom_core::RunAttemptId,
@@ -2054,7 +2288,9 @@ impl AgentRuntime {
             state,
             AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
         ) {
+            self.abandon_pending_interactions(self.run.attempt_id);
             self.pending_approval = None;
+            self.pending_tool_execution = None;
             self.pending_input = None;
         }
         if self.run.state == state {
@@ -2642,21 +2878,39 @@ mod tests {
         let approval = first_events
             .iter()
             .find_map(|event| match event {
-                AgentEvent::ToolApprovalRequired { call, .. } => Some(call.id),
+                AgentEvent::ToolApprovalRequired {
+                    call,
+                    attempt_id,
+                    control_revision,
+                    ..
+                } => Some((call.id, *attempt_id, *control_revision)),
                 _ => None,
             })
             .unwrap();
         assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
 
-        let second_events = runtime.approve(approval).unwrap();
+        let approved = runtime
+            .approve_entry(approval.0, approval.1, approval.2)
+            .unwrap();
+        assert!(approved.continues);
+        assert!(runtime.export_state().pending_tool_execution.is_some());
+        assert!(!root.join("loom-m1-demo.txt").exists());
+
+        let second_events = runtime.advance().unwrap();
+        assert!(root.join("loom-m1-demo.txt").exists());
         let second_approval = second_events
             .iter()
             .find_map(|event| match event {
-                AgentEvent::ToolApprovalRequired { call, .. } => Some(call.id),
+                AgentEvent::ToolApprovalRequired {
+                    call,
+                    attempt_id,
+                    control_revision,
+                    ..
+                } => Some((call.id, *attempt_id, *control_revision)),
                 _ => None,
             })
             .unwrap();
-        let final_events = runtime.approve(second_approval).unwrap();
+        let final_events = runtime.approve(second_approval.0).unwrap();
 
         assert!(final_events.iter().any(|event| {
             matches!(
@@ -2694,6 +2948,59 @@ mod tests {
                 .filter(|activity| activity.kind == AgentActivityKind::ToolCall)
                 .all(|activity| activity.parent_id.is_some())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupted_approved_tool_is_not_replayed_during_recovery() {
+        let root = workspace();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("create a demo file", ModelId::new("deterministic/demo")).unwrap(),
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        let events = runtime.start().unwrap();
+        let (call_id, attempt_id, control_revision) = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolApprovalRequired {
+                    call,
+                    attempt_id,
+                    control_revision,
+                    ..
+                } => Some((call.id, *attempt_id, *control_revision)),
+                _ => None,
+            })
+            .unwrap();
+        runtime
+            .approve_entry(call_id, attempt_id, control_revision)
+            .unwrap();
+        let interrupted_call = runtime.export_state().pending_tool_execution.unwrap();
+        assert_eq!(interrupted_call.id, call_id);
+        assert!(!root.join("loom-m1-demo.txt").exists());
+
+        let mut recovered = AgentRuntime::from_state(
+            runtime.export_state(),
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap();
+        let recovery_events = recovered.recover_after_restart().unwrap();
+
+        assert!(recovery_events.iter().any(|event| {
+            matches!(event, AgentEvent::RecoveryRequired { reason, .. } if reason.contains("not replayed"))
+        }));
+        let recovered_state = recovered.export_state();
+        assert_eq!(recovered_state.run.state, AgentRunState::Failed);
+        assert_eq!(recovered_state.pending_tool_execution, None);
+        assert_eq!(recovered_state.last_failed_call.unwrap().id, call_id);
+        assert!(recovered_state.interactions.iter().any(|interaction| {
+            interaction.attempt_id == attempt_id
+                && interaction.status == loom_protocol::AgentInteractionStatus::Approved
+                && interaction.decision == Some(ApprovalDecision::Approved)
+        }));
+        assert!(!root.join("loom-m1-demo.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2899,18 +3206,53 @@ mod tests {
         let requested = runtime
             .request_input("Which validation should I run?")
             .unwrap();
+        let interaction_id = requested
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::NeedsInput { interaction_id, .. } => Some(*interaction_id),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(runtime.snapshot().state, AgentRunState::NeedsInput);
         assert!(requested.iter().any(|event| {
             matches!(event, AgentEvent::NeedsInput { prompt, .. } if prompt.contains("validation"))
         }));
+        assert!(
+            runtime
+                .export_state()
+                .interactions
+                .iter()
+                .any(|interaction| {
+                    interaction.id == interaction_id
+                        && interaction.status == loom_protocol::AgentInteractionStatus::Pending
+                })
+        );
 
         let continued = runtime
             .send_message("Run the standard validation.")
             .unwrap();
         assert!(continued.iter().any(|event| {
-            matches!(event, AgentEvent::UserMessage { text, .. } if text.contains("standard"))
+            matches!(
+                event,
+                AgentEvent::UserMessage {
+                    interaction_id: Some(event_interaction_id),
+                    text,
+                    ..
+                } if *event_interaction_id == interaction_id && text.contains("standard")
+            )
         }));
         assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
+        assert!(
+            runtime
+                .export_state()
+                .interactions
+                .iter()
+                .any(|interaction| {
+                    interaction.id == interaction_id
+                        && interaction.status == loom_protocol::AgentInteractionStatus::Answered
+                        && interaction.resolved_at.is_some()
+                })
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

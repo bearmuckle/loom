@@ -454,6 +454,7 @@ async fn m4_demo_remote(
                         attempt_id,
                         control_revision,
                         call,
+                        ..
                     },
             } = &event.event
                 && *event_run == run_id
@@ -989,6 +990,7 @@ fn stream_run(
                         attempt_id,
                         control_revision,
                         call,
+                        ..
                     },
             } = &event.event
             {

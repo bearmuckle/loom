@@ -1936,6 +1936,7 @@ impl InProcessBackend {
                 })?;
             runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
             runtime_state.activities = persistence.load_run_activities(run_id)?;
+            runtime_state.interactions = persistence.load_run_interactions(run_id)?;
             if runtime_state.run.id != run_id {
                 return Err(LoomError::new(
                     ErrorCode::MalformedPayload,
@@ -2010,6 +2011,7 @@ impl InProcessBackend {
                     DurableRunSummary {
                         snapshot: summary.snapshot.clone(),
                         usage: summary.usage.clone(),
+                        interactions: None,
                     },
                 )
             })
@@ -2020,6 +2022,7 @@ impl InProcessBackend {
                 DurableRunSummary {
                     snapshot: state.run.clone(),
                     usage: state.usage.clone(),
+                    interactions: Some(state.interactions.clone()),
                 },
             );
         }
@@ -2032,6 +2035,7 @@ impl InProcessBackend {
                     .insert(run_id, durable_run_messages_from_runtime(&state.messages));
                 state.messages.clear();
                 durable_run_activities.insert(run_id, std::mem::take(&mut state.activities));
+                state.interactions.clear();
                 Ok((format!("run:{run_id}"), json_value(state)?))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2584,6 +2588,7 @@ impl InProcessConnection {
         state.messages =
             persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
         state.activities = persistence.load_run_activities(summary.snapshot.id)?;
+        state.interactions = persistence.load_run_interactions(summary.snapshot.id)?;
         Ok(state)
     }
 
@@ -4672,6 +4677,10 @@ impl InProcessConnection {
             handle.refresh(&runtime);
             progress?
         };
+        if let Err(error) = self.backend.persist_state() {
+            handle.record_failure(error.clone());
+            return Err(error);
+        }
         if progress.continues {
             self.backend.spawn_run_worker(Arc::clone(&handle));
         }
@@ -4895,8 +4904,8 @@ mod tests {
     use loom_core::{AgentSessionId, CapabilitySet, PolicyDecision, ToolCallId, WorkspaceId};
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
     use loom_protocol::{
-        AgentActivityStatus, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
-        WorkerNodeConfig, WorkspaceConfig,
+        AgentActivityStatus, AgentInteractionStatus, ApprovalDecision, ClientRequest,
+        RequestEnvelope, ServerEvent, ServerResponse, WorkerNodeConfig, WorkspaceConfig,
     };
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
@@ -6158,6 +6167,7 @@ mod tests {
                             attempt_id,
                             control_revision,
                             call,
+                            ..
                         },
                 } = &event.event
                 {
@@ -6775,6 +6785,18 @@ mod tests {
         assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
         assert_eq!(snapshot.attempt_id, approval.1);
         assert_eq!(snapshot.control_revision, approval.2);
+        let recovered_interactions = backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_interactions(run_id)
+            .unwrap();
+        assert!(recovered_interactions.iter().any(|interaction| {
+            interaction.attempt_id == approval.1
+                && interaction.control_revision == approval.2
+                && interaction.tool_call_id == Some(approval.0)
+                && interaction.status == AgentInteractionStatus::Pending
+        }));
         let recovered_snapshot =
             connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
                 run_id,
@@ -6956,6 +6978,17 @@ mod tests {
             }));
         assert!(response.result.is_ok());
         await_settled_run(&connection, run_id);
+        let resolved_interactions = backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_interactions(run_id)
+            .unwrap();
+        assert!(resolved_interactions.iter().any(|interaction| {
+            interaction.tool_call_id == Some(approval.0)
+                && interaction.status == AgentInteractionStatus::Approved
+                && interaction.decision == Some(ApprovalDecision::Approved)
+        }));
         let command_approval = (0..1_000)
             .find_map(|_| {
                 let events = match connection

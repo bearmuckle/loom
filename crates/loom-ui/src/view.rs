@@ -3094,6 +3094,7 @@ impl LoomView {
                 attempt_id,
                 control_revision,
                 text,
+                ..
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 if self
@@ -3168,6 +3169,7 @@ impl LoomView {
                 attempt_id,
                 control_revision,
                 call,
+                ..
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 for item in &mut self.timeline {
@@ -3232,6 +3234,7 @@ impl LoomView {
                 attempt_id,
                 control_revision,
                 prompt,
+                ..
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 self.pending_input = Some(prompt.clone());
@@ -11093,6 +11096,8 @@ mod loom_view_render_tests {
                 name: "write_file".to_owned(),
                 arguments: serde_json::json!({"path": "src/main.rs"}),
             };
+            let approval_interaction_id = loom_core::InteractionId::new();
+            let input_interaction_id = loom_core::InteractionId::new();
             let snapshot = loom_protocol::AgentRunSnapshot {
                 id: run_id,
                 attempt_id: loom_core::RunAttemptId::new(),
@@ -11149,6 +11154,7 @@ mod loom_view_render_tests {
                     run_id,
                     attempt_id: snapshot.attempt_id,
                     control_revision: 1,
+                    interaction_id: Some(input_interaction_id),
                     text: "new request".to_owned(),
                 },
                 loom_protocol::AgentEvent::AssistantMessageDelta {
@@ -11169,6 +11175,7 @@ mod loom_view_render_tests {
                     run_id,
                     attempt_id: snapshot.attempt_id,
                     control_revision: 2,
+                    interaction_id: approval_interaction_id,
                     call: call.clone(),
                 },
                 loom_protocol::AgentEvent::ToolPolicyEvaluated {
@@ -11197,6 +11204,7 @@ mod loom_view_render_tests {
                     run_id,
                     attempt_id: snapshot.attempt_id,
                     control_revision: 3,
+                    interaction_id: approval_interaction_id,
                     tool_call_id: call.id,
                     decision: loom_protocol::ApprovalDecision::Approved,
                 },
@@ -11204,6 +11212,7 @@ mod loom_view_render_tests {
                     run_id,
                     attempt_id: snapshot.attempt_id,
                     control_revision: 4,
+                    interaction_id: input_interaction_id,
                     prompt: "Which branch?".to_owned(),
                 },
                 loom_protocol::AgentEvent::RunUsage {
