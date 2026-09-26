@@ -3,13 +3,15 @@
 Status: target design, 2026-09-26. The implementation is in progress: session,
 workspace, and run summaries, bounded session/workspace settings, reconnect
 events, provider usage totals, and filesystem records use indexed rows. Runtime
-details and filesystem snapshots are loaded on demand; filesystem payloads are
-compressed and hash-checked. Large strings in the generic section store are
-deduplicated and compressed. Provider configuration and health use
-provider-keyed records. Idempotency uses a dedicated table, while detailed run
-payloads and filesystem checkpoint/edit collections still use aggregate payloads.
-Provider request-level detail is aggregated by provider/model because no
-request-level usage history is exposed by the current protocol. This
+details and filesystem snapshots are loaded on demand. Checkpoint headers and
+file entries use keyed rows; checkpoint file text shares the compressed,
+content-addressed blob store. Remaining filesystem edit/change and repository
+metadata use a compressed, hash-checked per-session payload. Large strings in
+the generic section store are deduplicated and compressed. Provider configuration
+and health use provider-keyed records. Idempotency uses a dedicated table, while
+detailed run payloads remain aggregate state. Provider request-level detail is
+aggregated by provider/model because no request-level usage history is exposed
+by the current protocol. This
 design replaces the version-2 `sections` container. The release does not import
 existing databases: it creates a fresh database and rejects an existing
 unsupported format without changing it.

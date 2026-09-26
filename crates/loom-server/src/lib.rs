@@ -1351,7 +1351,9 @@ impl InProcessBackend {
                     false,
                 )
             })?;
-        let persisted: PersistedSessionFilesystem = from_json(durable.payload)?;
+        let mut payload = durable.payload;
+        payload["filesystem"]["checkpoints"] = json_value(durable.checkpoints)?;
+        let persisted: PersistedSessionFilesystem = from_json(payload)?;
         if durable.session_id != session_id
             || persisted.filesystem.session_id != session_id
             || persisted.filesystem.root != durable.root
@@ -1430,7 +1432,9 @@ impl InProcessBackend {
         else {
             return Ok(None);
         };
-        let persisted: PersistedSessionFilesystem = from_json(record.payload)?;
+        let mut payload = record.payload;
+        payload["filesystem"]["checkpoints"] = json_value(record.checkpoints)?;
+        let persisted: PersistedSessionFilesystem = from_json(payload)?;
         if record.session_id != session_id
             || persisted.filesystem.session_id != session_id
             || persisted.filesystem.root != record.root
@@ -1849,8 +1853,10 @@ impl InProcessBackend {
         let loaded_repositories = self.session_repositories()?;
         let mut filesystem_records = Vec::new();
         for (session_id, filesystem) in self.session_filesystems()?.iter() {
+            let mut filesystem_state = filesystem.export_state()?;
+            let checkpoints = std::mem::take(&mut filesystem_state.checkpoints);
             let persisted = PersistedSessionFilesystem {
-                filesystem: filesystem.export_state()?,
+                filesystem: filesystem_state,
                 repositories: loaded_repositories
                     .get(session_id)
                     .cloned()
@@ -1868,6 +1874,7 @@ impl InProcessBackend {
                 session_id: *session_id,
                 root: persisted.filesystem.root.clone(),
                 control: persisted.filesystem.control,
+                checkpoints,
                 payload: json_value(persisted)?,
             });
         }
@@ -5329,7 +5336,7 @@ mod tests {
         let source = git_repository();
         let state_dir = workspace();
         let persistence = state_dir.join("backend.sqlite");
-        let (workspace_id, session_id) = {
+        let (workspace_id, session_id, checkpoint_id) = {
             let backend = InProcessBackend::new_persistent(&persistence).unwrap();
             let connection = backend.connect();
             let capabilities = CapabilitySet::new([
@@ -5338,6 +5345,7 @@ mod tests {
                 Capability::CreateAgentSession,
                 Capability::ReadSessionFilesystem,
                 Capability::WriteSessionFilesystem,
+                Capability::ManageCheckpoints,
                 Capability::ManageSessionRepositories,
                 Capability::ReadVcsStatus,
             ]);
@@ -5381,22 +5389,29 @@ mod tests {
                 "{:?}",
                 attached.result
             );
-            let edit = connection.request(RequestEnvelope::new(
-                ClientRequest::ApplySessionFilesystemEdit {
+            let checkpoint = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateSessionCheckpoint {
                     session_id: session.id,
-                    edit: WorkspaceEdit {
-                        path: "repo/README.md".to_owned(),
-                        old_text: "source".to_owned(),
-                        new_text: "persisted session edit".to_owned(),
-                        expected_revision: None,
-                    },
+                    label: "before persistent edit".to_owned(),
                 },
             ));
-            assert!(matches!(
-                edit.result,
-                Ok(ServerResponse::WorkspaceEditApplied(_))
-            ));
-            (workspace.id, session.id)
+            let Ok(ServerResponse::CheckpointCreated(checkpoint)) = checkpoint.result else {
+                panic!("expected persisted checkpoint, got {:?}", checkpoint.result);
+            };
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&session.id)
+                .unwrap()
+                .apply_edit(WorkspaceEdit {
+                    path: "repo/README.md".to_owned(),
+                    old_text: "source".to_owned(),
+                    new_text: "persisted session edit".to_owned(),
+                    expected_revision: None,
+                })
+                .unwrap();
+            backend.flush().unwrap();
+            (workspace.id, session.id, checkpoint.id)
         };
 
         {
@@ -5405,6 +5420,8 @@ mod tests {
             let capabilities = CapabilitySet::new([
                 Capability::ReadAgentSession,
                 Capability::ReadSessionFilesystem,
+                Capability::WriteSessionFilesystem,
+                Capability::ManageCheckpoints,
                 Capability::ReadVcsStatus,
             ]);
             let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
@@ -5433,6 +5450,13 @@ mod tests {
                 panic!("expected restored repository metadata");
             };
             let repository = repositories.first().expect("repository was restored");
+            let persisted_filesystem = backend
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_filesystem_record(session_id)
+                .unwrap()
+                .expect("filesystem record remains inspectable");
             let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
                 session_id,
                 path: "repo/README.md".to_owned(),
@@ -5441,6 +5465,30 @@ mod tests {
                 panic!("expected restored session file");
             };
             assert_eq!(file.content, "persisted session edit\n");
+            assert_eq!(
+                persisted_filesystem.checkpoints[0].files["repo/README.md"].expected_revision,
+                file.revision
+            );
+            let reverted = connection.request(RequestEnvelope::new(
+                ClientRequest::RevertSessionCheckpoint {
+                    session_id,
+                    checkpoint_id,
+                },
+            ));
+            assert!(
+                matches!(reverted.result, Ok(ServerResponse::CheckpointReverted(_))),
+                "checkpoint revert failed: {:?}",
+                reverted.result
+            );
+            let restored =
+                connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+                    session_id,
+                    path: "repo/README.md".to_owned(),
+                }));
+            let Ok(ServerResponse::SessionFilesystemFile(restored)) = restored.result else {
+                panic!("expected checkpoint file contents after revert");
+            };
+            assert_eq!(restored.content, "source\n");
             let status =
                 connection.request(RequestEnvelope::new(ClientRequest::GetSessionVcsStatus {
                     session_id,
@@ -5449,7 +5497,7 @@ mod tests {
             let Ok(ServerResponse::VcsStatus(status)) = status.result else {
                 panic!("expected restored repository status");
             };
-            assert!(!status.clean);
+            assert!(status.clean);
         }
 
         fs::remove_dir_all(source).unwrap();

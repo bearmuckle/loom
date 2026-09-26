@@ -8,13 +8,14 @@ use std::{
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ErrorCode,
-    EventSequence, LoomError, RequestId, Result, RunId, Timestamp, UsageSnapshot, WorkspaceId,
-    WorkspaceRecord,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, CheckpointId,
+    ErrorCode, EventSequence, LoomError, RequestId, Result, RunId, Timestamp, UsageSnapshot,
+    WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
-    AgentRunSnapshot, AgentRunState, ServerEventEnvelope, WorkspaceConfig, WorkspaceControl,
+    AgentRunSnapshot, AgentRunState, Checkpoint, CheckpointFile, ServerEventEnvelope,
+    WorkspaceConfig, WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -24,8 +25,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 14;
-const DATABASE_SCHEMA_VERSION: u32 = 14;
+pub const CURRENT_SCHEMA_VERSION: u32 = 15;
+const DATABASE_SCHEMA_VERSION: u32 = 15;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
@@ -80,6 +81,31 @@ CREATE TABLE IF NOT EXISTS session_filesystems (
     payload_codec INTEGER NOT NULL CHECK(payload_codec IN (0, 1)),
     payload BLOB NOT NULL CHECK(length(payload) <= 536870912)
 ) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS checkpoints (
+    session_id BLOB NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    checkpoint_id BLOB NOT NULL CHECK(length(checkpoint_id) = 16),
+    label TEXT NOT NULL CHECK(length(trim(label)) > 0 AND length(label) <= 16384),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(session_id, checkpoint_id)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS checkpoints_by_session_time
+    ON checkpoints(session_id, created_at DESC, checkpoint_id DESC);
+CREATE TABLE IF NOT EXISTS checkpoint_files (
+    session_id BLOB NOT NULL,
+    checkpoint_id BLOB NOT NULL,
+    path TEXT NOT NULL CHECK(length(trim(path)) > 0),
+    existed INTEGER NOT NULL CHECK(existed IN (0, 1)),
+    revision TEXT NOT NULL,
+    expected_revision TEXT NOT NULL,
+    content_hash BLOB NOT NULL REFERENCES content_blobs(hash) ON DELETE RESTRICT
+        CHECK(length(content_hash) = 32),
+    PRIMARY KEY(session_id, checkpoint_id, path),
+    FOREIGN KEY(session_id, checkpoint_id)
+        REFERENCES checkpoints(session_id, checkpoint_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS checkpoint_files_by_content
+    ON checkpoint_files(content_hash);
 CREATE TABLE IF NOT EXISTS workspaces (
     id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
     name TEXT NOT NULL CHECK(length(trim(name)) > 0),
@@ -429,6 +455,7 @@ pub struct DurableFilesystemRecord {
     pub session_id: AgentSessionId,
     pub root: String,
     pub control: WorkspaceControl,
+    pub checkpoints: Vec<Checkpoint>,
     pub payload: Value,
 }
 
@@ -1289,6 +1316,8 @@ impl FilePersistence {
         let payload_control = filesystem.get("control").and_then(Value::as_str);
         if payload_root != Some(root.as_str())
             || payload_control != Some(workspace_control_name(control))
+            || filesystem.get("session_id").and_then(Value::as_str)
+                != Some(session_id.to_string().as_str())
         {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
@@ -1296,10 +1325,98 @@ impl FilePersistence {
                 false,
             ));
         }
+        let checkpoint_rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT checkpoint_id, label, created_at FROM checkpoints
+                     WHERE session_id=?1 ORDER BY created_at, checkpoint_id",
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not prepare checkpoint list: {error}"), true)
+                })?;
+            let rows = statement
+                .query_map([session_id.as_uuid().as_bytes().as_slice()], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|error| {
+                    persistence_error(format!("could not read checkpoint list: {error}"), true)
+                })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    persistence_error(format!("could not read checkpoint list: {error}"), true)
+                })?
+        };
+        let mut checkpoints = Vec::with_capacity(checkpoint_rows.len());
+        for (checkpoint_id, label, created_at) in checkpoint_rows {
+            let checkpoint_id =
+                CheckpointId::from_uuid(decode_uuid(&checkpoint_id, "checkpoint id")?);
+            let file_rows = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT path, existed, revision, expected_revision, content_hash
+                         FROM checkpoint_files WHERE session_id=?1 AND checkpoint_id=?2
+                         ORDER BY path",
+                    )
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not prepare checkpoint files: {error}"),
+                            true,
+                        )
+                    })?;
+                let rows = statement
+                    .query_map(
+                        params![
+                            session_id.as_uuid().as_bytes().as_slice(),
+                            checkpoint_id.as_uuid().as_bytes().as_slice()
+                        ],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, Vec<u8>>(4)?,
+                            ))
+                        },
+                    )
+                    .map_err(|error| {
+                        persistence_error(format!("could not read checkpoint files: {error}"), true)
+                    })?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        persistence_error(format!("could not read checkpoint files: {error}"), true)
+                    })?
+            };
+            let mut files = BTreeMap::new();
+            for (path, existed, revision, expected_revision, content_hash) in file_rows {
+                let content = decode_content(&connection, &content_hash)?;
+                files.insert(
+                    path,
+                    CheckpointFile {
+                        existed: existed != 0,
+                        content,
+                        revision,
+                        expected_revision,
+                    },
+                );
+            }
+            checkpoints.push(Checkpoint {
+                id: checkpoint_id,
+                session_id,
+                label,
+                created_at: decode_timestamp(created_at)?,
+                files,
+            });
+        }
         Ok(Some(DurableFilesystemRecord {
             session_id,
             root,
             control,
+            checkpoints,
             payload,
         }))
     }
@@ -1794,19 +1911,7 @@ fn save_section_nodes(
         .map_err(|error| {
             persistence_error(format!("could not prune section '{name}': {error}"), true)
         })?;
-    transaction
-        .execute(
-            "DELETE FROM content_blobs WHERE NOT EXISTS (
-                 SELECT 1 FROM state_nodes WHERE state_nodes.content_hash=content_blobs.hash
-             )",
-            [],
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not collect unused state content: {error}"),
-                true,
-            )
-        })?;
+    collect_unused_content(transaction)?;
     Ok(())
 }
 
@@ -1851,6 +1956,18 @@ fn flatten_value(value: &Value, path: &str, nodes: &mut Vec<EncodedNode>) -> Res
 
 fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8>> {
     let hash = Sha256::digest(content).to_vec();
+    let already_stored = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM content_blobs WHERE hash=?1)",
+            [hash.as_slice()],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not check state content: {error}"), true)
+        })?;
+    if already_stored {
+        return Ok(hash);
+    }
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(content).map_err(|error| {
         persistence_error(format!("could not compress state content: {error}"), false)
@@ -1873,6 +1990,27 @@ fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8
             persistence_error(format!("could not store state content: {error}"), true)
         })?;
     Ok(hash)
+}
+
+fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute(
+            "DELETE FROM content_blobs
+             WHERE NOT EXISTS (
+                SELECT 1 FROM state_nodes WHERE state_nodes.content_hash=content_blobs.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM checkpoint_files
+                WHERE checkpoint_files.content_hash=content_blobs.hash
+             )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not collect unused state content: {error}"),
+                true,
+            )
+        })?;
+    Ok(())
 }
 
 fn save_session_rows(transaction: &Transaction<'_>, state: &SessionManagerState) -> Result<()> {
@@ -2525,6 +2663,29 @@ fn save_filesystem_records(
     records: &[DurableFilesystemRecord],
 ) -> Result<()> {
     for record in records {
+        let filesystem = record.payload.get("filesystem").ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "filesystem record has no workspace snapshot",
+                false,
+            )
+        })?;
+        if filesystem.get("root").and_then(Value::as_str) != Some(record.root.as_str())
+            || filesystem.get("control").and_then(Value::as_str)
+                != Some(workspace_control_name(record.control))
+            || filesystem.get("session_id").and_then(Value::as_str)
+                != Some(record.session_id.to_string().as_str())
+            || filesystem
+                .get("checkpoints")
+                .and_then(Value::as_array)
+                .is_none_or(|checkpoints| !checkpoints.is_empty())
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "filesystem record index fields or checkpoint payload are invalid",
+                false,
+            ));
+        }
         let raw = serde_json::to_vec(&record.payload).map_err(|error| {
             persistence_error(
                 format!("could not encode filesystem record: {error}"),
@@ -2553,62 +2714,221 @@ fn save_filesystem_records(
                 )
             })?
             .is_some_and(|existing| existing == hash.as_slice());
-        if unchanged {
-            continue;
+        if !unchanged {
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&raw).map_err(|error| {
+                persistence_error(
+                    format!("could not compress filesystem record: {error}"),
+                    false,
+                )
+            })?;
+            let compressed = encoder.finish().map_err(|error| {
+                persistence_error(
+                    format!("could not compress filesystem record: {error}"),
+                    false,
+                )
+            })?;
+            let (codec, payload) = if compressed.len() < raw.len() {
+                (1_i64, compressed)
+            } else {
+                (0_i64, raw.clone())
+            };
+            transaction
+                .execute(
+                    "INSERT INTO session_filesystems(
+                        session_id, root, control, payload_hash, raw_size, payload_codec, payload
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                        root=excluded.root,
+                        control=excluded.control,
+                        payload_hash=excluded.payload_hash,
+                        raw_size=excluded.raw_size,
+                        payload_codec=excluded.payload_codec,
+                        payload=excluded.payload
+                     WHERE session_filesystems.root IS NOT excluded.root
+                        OR session_filesystems.control IS NOT excluded.control
+                        OR session_filesystems.payload_hash IS NOT excluded.payload_hash",
+                    params![
+                        record.session_id.as_uuid().as_bytes().as_slice(),
+                        record.root,
+                        workspace_control_name(record.control),
+                        hash.as_slice(),
+                        raw.len() as i64,
+                        codec,
+                        payload,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!(
+                            "could not save filesystem record for {}: {error}",
+                            record.session_id
+                        ),
+                        true,
+                    )
+                })?;
         }
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-        encoder.write_all(&raw).map_err(|error| {
+        save_checkpoint_rows(transaction, record.session_id, &record.checkpoints)?;
+    }
+    collect_unused_content(transaction)?;
+    Ok(())
+}
+
+fn save_checkpoint_rows(
+    transaction: &Transaction<'_>,
+    session_id: AgentSessionId,
+    checkpoints: &[Checkpoint],
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_checkpoints (
+                session_id BLOB NOT NULL,
+                checkpoint_id BLOB NOT NULL,
+                PRIMARY KEY(session_id, checkpoint_id)
+             ) WITHOUT ROWID, STRICT;
+             CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_checkpoint_files (
+                session_id BLOB NOT NULL,
+                checkpoint_id BLOB NOT NULL,
+                path TEXT NOT NULL,
+                PRIMARY KEY(session_id, checkpoint_id, path)
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_checkpoints;
+             DELETE FROM _loom_wanted_checkpoint_files;",
+        )
+        .map_err(|error| {
             persistence_error(
-                format!("could not compress filesystem record: {error}"),
-                false,
+                format!("could not stage filesystem checkpoints: {error}"),
+                true,
             )
         })?;
-        let compressed = encoder.finish().map_err(|error| {
-            persistence_error(
-                format!("could not compress filesystem record: {error}"),
+    let session_id_bytes = session_id.as_uuid().as_bytes();
+    for checkpoint in checkpoints {
+        if checkpoint.session_id != session_id || checkpoint.label.trim().is_empty() {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "checkpoint identity or label is invalid",
                 false,
-            )
-        })?;
-        let (codec, payload) = if compressed.len() < raw.len() {
-            (1_i64, compressed)
-        } else {
-            (0_i64, raw.clone())
-        };
+            ));
+        }
+        let checkpoint_id_bytes = checkpoint.id.as_uuid().as_bytes();
         transaction
             .execute(
-                "INSERT INTO session_filesystems(
-                    session_id, root, control, payload_hash, raw_size, payload_codec, payload
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                    root=excluded.root,
-                    control=excluded.control,
-                    payload_hash=excluded.payload_hash,
-                    raw_size=excluded.raw_size,
-                    payload_codec=excluded.payload_codec,
-                    payload=excluded.payload
-                 WHERE session_filesystems.root IS NOT excluded.root
-                    OR session_filesystems.control IS NOT excluded.control
-                    OR session_filesystems.payload_hash IS NOT excluded.payload_hash",
+                "INSERT INTO _loom_wanted_checkpoints(session_id, checkpoint_id)
+                 VALUES (?1, ?2)",
+                params![session_id_bytes.as_slice(), checkpoint_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not stage checkpoint {}: {error}", checkpoint.id),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO checkpoints(session_id, checkpoint_id, label, created_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(session_id, checkpoint_id) DO UPDATE SET
+                    label=excluded.label, created_at=excluded.created_at
+                 WHERE checkpoints.label IS NOT excluded.label
+                    OR checkpoints.created_at IS NOT excluded.created_at",
                 params![
-                    record.session_id.as_uuid().as_bytes().as_slice(),
-                    record.root,
-                    workspace_control_name(record.control),
-                    hash.as_slice(),
-                    raw.len() as i64,
-                    codec,
-                    payload,
+                    session_id_bytes.as_slice(),
+                    checkpoint_id_bytes.as_slice(),
+                    checkpoint.label,
+                    encode_timestamp(checkpoint.created_at)?,
                 ],
             )
             .map_err(|error| {
                 persistence_error(
-                    format!(
-                        "could not save filesystem record for {}: {error}",
-                        record.session_id
-                    ),
+                    format!("could not save checkpoint {}: {error}", checkpoint.id),
                     true,
                 )
             })?;
+        for (path, file) in &checkpoint.files {
+            if path.trim().is_empty() || file.content.len() > MAX_CONTENT_BYTES {
+                return Err(LoomError::new(
+                    ErrorCode::Persistence,
+                    "checkpoint file path or content is invalid",
+                    false,
+                ));
+            }
+            let content_hash = store_content(transaction, file.content.as_bytes())?;
+            transaction
+                .execute(
+                    "INSERT INTO _loom_wanted_checkpoint_files(session_id, checkpoint_id, path)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        session_id_bytes.as_slice(),
+                        checkpoint_id_bytes.as_slice(),
+                        path
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not stage checkpoint file '{path}': {error}"),
+                        true,
+                    )
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO checkpoint_files(
+                        session_id, checkpoint_id, path, existed, revision,
+                        expected_revision, content_hash
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(session_id, checkpoint_id, path) DO UPDATE SET
+                        existed=excluded.existed,
+                        revision=excluded.revision,
+                        expected_revision=excluded.expected_revision,
+                        content_hash=excluded.content_hash
+                     WHERE checkpoint_files.existed IS NOT excluded.existed
+                        OR checkpoint_files.revision IS NOT excluded.revision
+                        OR checkpoint_files.expected_revision IS NOT excluded.expected_revision
+                        OR checkpoint_files.content_hash IS NOT excluded.content_hash",
+                    params![
+                        session_id_bytes.as_slice(),
+                        checkpoint_id_bytes.as_slice(),
+                        path,
+                        if file.existed { 1_i64 } else { 0_i64 },
+                        file.revision,
+                        file.expected_revision,
+                        content_hash,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save checkpoint file '{path}': {error}"),
+                        true,
+                    )
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM checkpoint_files
+                 WHERE session_id=?1 AND checkpoint_id=?2 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_checkpoint_files wanted
+                    WHERE wanted.session_id=checkpoint_files.session_id
+                      AND wanted.checkpoint_id=checkpoint_files.checkpoint_id
+                      AND wanted.path=checkpoint_files.path
+                 )",
+                params![session_id_bytes.as_slice(), checkpoint_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prune checkpoint files: {error}"), true)
+            })?;
     }
+    transaction
+        .execute(
+            "DELETE FROM checkpoints
+             WHERE session_id=?1 AND NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_checkpoints wanted
+                WHERE wanted.session_id=checkpoints.session_id
+                  AND wanted.checkpoint_id=checkpoints.checkpoint_id
+             )",
+            [session_id_bytes.as_slice()],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prune checkpoints: {error}"), true)
+        })?;
     Ok(())
 }
 
@@ -3488,15 +3808,33 @@ mod tests {
             },
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
+        let checkpoint_id = CheckpointId::new();
+        let checkpoint = Checkpoint {
+            id: checkpoint_id,
+            session_id: session.id,
+            label: "rollback point".to_owned(),
+            created_at: Timestamp::from_unix_millis(4321),
+            files: BTreeMap::from([(
+                "src/main.rs".to_owned(),
+                CheckpointFile {
+                    existed: true,
+                    content: "checkpoint text ".repeat(500),
+                    revision: "revision-a".to_owned(),
+                    expected_revision: "revision-b".to_owned(),
+                },
+            )]),
+        };
         let filesystem_records = [DurableFilesystemRecord {
             session_id: session.id,
             root: "/tmp/loom-session-fs".to_owned(),
             control: WorkspaceControl::Agent,
+            checkpoints: vec![checkpoint.clone()],
             payload: serde_json::json!({
                 "filesystem": {
                     "session_id": session.id,
                     "root": "/tmp/loom-session-fs",
-                    "control": "agent"
+                    "control": "agent",
+                    "checkpoints": []
                 },
                 "details": "checkpoint state ".repeat(500)
             }),
@@ -3556,14 +3894,12 @@ mod tests {
             persistence.list_filesystem_sessions().unwrap(),
             vec![session.id]
         );
-        assert_eq!(
-            persistence
-                .load_filesystem_record(session.id)
-                .unwrap()
-                .unwrap()
-                .payload,
-            filesystem_records[0].payload
-        );
+        let loaded_filesystem = persistence
+            .load_filesystem_record(session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded_filesystem.payload, filesystem_records[0].payload);
+        assert_eq!(loaded_filesystem.checkpoints, vec![checkpoint.clone()]);
 
         assert!(
             persistence
@@ -3577,7 +3913,10 @@ mod tests {
                     usage: Some(&UsageLedger::default()),
                     idempotency: Some(&BTreeMap::new()),
                     run_summaries: Some(&BTreeMap::new()),
-                    filesystem_records: None,
+                    filesystem_records: Some(&[DurableFilesystemRecord {
+                        checkpoints: Vec::new(),
+                        ..filesystem_records[0].clone()
+                    }]),
                     records: &[],
                     feed: None,
                     sections: &[("", serde_json::json!({"invalid": true}))],
@@ -3599,14 +3938,12 @@ mod tests {
         assert_eq!(persistence.load_provider_usage().unwrap(), usage);
         assert_eq!(persistence.load_idempotency_records().unwrap(), idempotency);
         assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
-        assert_eq!(
-            persistence
-                .load_filesystem_record(session.id)
-                .unwrap()
-                .unwrap()
-                .payload,
-            filesystem_records[0].payload
-        );
+        let retained_filesystem = persistence
+            .load_filesystem_record(session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained_filesystem.payload, filesystem_records[0].payload);
+        assert_eq!(retained_filesystem.checkpoints, vec![checkpoint.clone()]);
 
         let connection = Connection::open(&path).unwrap();
         let plan: String = connection
@@ -3646,6 +3983,30 @@ mod tests {
             )
             .unwrap();
         assert!(filesystem_plan.contains("PRIMARY KEY"), "{filesystem_plan}");
+        let checkpoint_file_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT content_hash FROM checkpoint_files
+                 WHERE session_id=?1 AND checkpoint_id=?2 ORDER BY path",
+                params![
+                    session.id.as_uuid().as_bytes().as_slice(),
+                    checkpoint_id.as_uuid().as_bytes().as_slice()
+                ],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            checkpoint_file_plan.contains("PRIMARY KEY"),
+            "{checkpoint_file_plan}"
+        );
+        let (content_codec, content_count): (i64, i64) = connection
+            .query_row(
+                "SELECT MIN(codec), COUNT(*) FROM content_blobs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(content_codec, 1);
+        assert_eq!(content_count, 1);
         let (filesystem_codec, raw_size, payload_size): (i64, i64, i64) = connection
             .query_row(
                 "SELECT payload_codec, raw_size, length(payload) FROM session_filesystems
@@ -3673,6 +4034,42 @@ mod tests {
             )
             .unwrap();
         assert!(usage_plan.contains("PRIMARY KEY"), "{usage_plan}");
+        drop(connection);
+
+        let empty_filesystem_records = [DurableFilesystemRecord {
+            checkpoints: Vec::new(),
+            ..filesystem_records[0].clone()
+        }];
+        persistence
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &sessions.export_state(),
+                workspaces: Some(&workspaces.export_state()),
+                settings: Some(&settings),
+                workspace_configs: Some(&configs),
+                providers: Some(&provider_state),
+                usage: Some(&usage),
+                idempotency: Some(&idempotency),
+                run_summaries: Some(&run_summaries),
+                filesystem_records: Some(&empty_filesystem_records),
+                records: &[],
+                feed: None,
+                sections: &[],
+            })
+            .unwrap();
+        assert!(
+            persistence
+                .load_filesystem_record(session.id)
+                .unwrap()
+                .unwrap()
+                .checkpoints
+                .is_empty()
+        );
+        let connection = Connection::open(&path).unwrap();
+        let content_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(content_count, 0);
         drop(connection);
         fs::remove_file(path).unwrap();
     }
