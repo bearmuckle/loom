@@ -13,3 +13,4 @@ loom-model.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 ureq.workspace = true
+log.workspace = true

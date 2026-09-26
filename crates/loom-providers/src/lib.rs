@@ -2337,17 +2337,51 @@ impl StreamDecoder {
                 {
                     self.usage = Some(responses_usage(usage));
                 }
-                self.finish_reason = Some(
-                    if response
-                        .and_then(|response| response.get("status"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("completed")
-                    {
-                        FinishReason::Stop
-                    } else {
-                        FinishReason::Error
-                    },
-                );
+                let status = response
+                    .and_then(|response| response.get("status"))
+                    .and_then(serde_json::Value::as_str);
+                self.finish_reason = Some(match status {
+                    Some("completed") => FinishReason::Stop,
+                    Some("incomplete") => {
+                        let reason = response
+                            .and_then(|response| response.get("incomplete_details"))
+                            .and_then(|details| details.get("reason"))
+                            .and_then(serde_json::Value::as_str);
+                        log::error!(
+                            "{} response incomplete: status={status:?}, reason={reason:?}",
+                            self.provider
+                        );
+                        FinishReason::ErrorWithMessage {
+                            message: reason.map_or_else(
+                                || format!("{} response was incomplete", self.provider),
+                                |reason| {
+                                    format!("{} response was incomplete: {reason}", self.provider)
+                                },
+                            ),
+                        }
+                    }
+                    _ => {
+                        let error = response.and_then(|response| response.get("error"));
+                        log::error!(
+                            "{} response failed: status={status:?}, error={}",
+                            self.provider,
+                            error.map_or_else(
+                                || "<missing>".to_owned(),
+                                serde_json::Value::to_string
+                            )
+                        );
+                        let message = error
+                            .and_then(|error| error.get("message"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| {
+                                format!("{} request failed without further details", self.provider)
+                            });
+                        FinishReason::ErrorWithMessage {
+                            message: format!("{} request failed: {message}", self.provider),
+                        }
+                    }
+                });
                 self.completed = true;
                 Ok(StreamFlow::Continue)
             }
@@ -3156,6 +3190,39 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.message.contains("upstream failed"));
+    }
+
+    #[test]
+    fn responses_stream_decoder_preserves_failure_and_incomplete_details() {
+        for (event, expected) in [
+            (
+                serde_json::json!({
+                    "type":"response.failed",
+                    "response":{"status":"failed", "error":{"message":"model overloaded"}}
+                }),
+                "copilot request failed: model overloaded",
+            ),
+            (
+                serde_json::json!({
+                    "type":"response.incomplete",
+                    "response":{"status":"incomplete", "incomplete_details":{"reason":"max_output_tokens"}}
+                }),
+                "copilot response was incomplete: max_output_tokens",
+            ),
+        ] {
+            let mut decoder = StreamDecoder::responses("copilot".to_owned());
+            let mut sink = CollectingSink::default();
+            decoder
+                .accept(&event, &mut BTreeMap::new(), &mut sink)
+                .unwrap();
+            decoder.finish(&mut sink).unwrap();
+            assert!(matches!(
+                sink.events.last(),
+                Some(ModelStreamEvent::Completed {
+                    reason: FinishReason::ErrorWithMessage { message }
+                }) if message == expected
+            ));
+        }
     }
 
     #[test]

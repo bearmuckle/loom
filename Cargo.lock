@@ -4231,6 +4231,7 @@ dependencies = [
 name = "loom-agent"
 version = "0.1.0"
 dependencies = [
+ "log",
  "loom-context",
  "loom-core",
  "loom-model",
@@ -4322,6 +4323,7 @@ dependencies = [
 name = "loom-providers"
 version = "0.1.0"
 dependencies = [
+ "log",
  "loom-core",
  "loom-model",
  "serde",
