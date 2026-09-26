@@ -3,7 +3,8 @@ name = "loom-cli"
 description = "Native command-line shell for the Loom foundation vertical slice."
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "AGPL-3.0-only"
+license-file = "../../LICENSE-AGPL"
 rust-version.workspace = true
 
 [[bin]]

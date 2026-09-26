@@ -4,6 +4,7 @@ description = "Shared identifiers, errors, protocol versions, capabilities, and 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+license-file = "../../LICENSE"
 rust-version.workspace = true
 
 [dependencies]
