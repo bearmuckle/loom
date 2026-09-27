@@ -9488,6 +9488,7 @@ mod tests {
                     _ => None,
                 })
                 .unwrap();
+            backend.shutdown().unwrap();
             (session_id, run_id, approval)
         };
         assert!(persistence.is_file());
