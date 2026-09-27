@@ -97,6 +97,7 @@ const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(760.);
 // GPUI's text utilities use rems; native display scaling and browser zoom
 // are applied when the window converts them to pixels.
 const BASE_FONT_SIZE: f32 = 17.;
+const CONVERSATION_FONT_SIZE: f32 = 16.;
 
 #[derive(Clone, Copy, Debug)]
 struct ResponsiveLayout {
@@ -786,7 +787,7 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
         TextView::markdown(id, text)
             .selectable(true)
             .w_full()
-            .text_size(px(BASE_FONT_SIZE))
+            .text_size(px(CONVERSATION_FONT_SIZE))
             .text_color(rgb(color))
             .into_any()
     } else {
@@ -799,7 +800,7 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
             )
             .selectable(true)
             .w_full()
-            .text_size(px(BASE_FONT_SIZE))
+            .text_size(px(CONVERSATION_FONT_SIZE))
             .text_color(rgb(color))
             .into_any()
     }
@@ -7087,7 +7088,7 @@ impl LoomView {
                 .selected(selected)
                 .px_2()
                 .py_2()
-                .text_sm()
+                .text_size(gpui_kit::rems(0.8125))
                 .child(
                     div()
                         .w_full()
