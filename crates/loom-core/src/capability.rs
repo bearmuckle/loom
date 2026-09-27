@@ -42,6 +42,7 @@ pub enum Capability {
     BrowseGitHubRepositories,
     ReadSessionFilesystem,
     WriteSessionFilesystem,
+    ReadProject,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

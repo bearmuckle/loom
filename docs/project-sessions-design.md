@@ -56,7 +56,9 @@ parent identity, allowed delegation depth, permissions, and reporting
 expectations.
 
 The manager may run independent tasks concurrently up to a configured
-workspace/backend limit. Dependencies are explicit; a dependent task is not
+workspace/backend limit. Start with a default cap of four active child agents
+per project; a later settings surface may configure a lower cap, but disabling
+the bound is not supported. Dependencies are explicit; a dependent task is not
 started until its prerequisites reach an acceptable terminal state. Completion,
 failure, cancellation, and blockers all return control to the manager, which
 can inspect output and decide whether to retry, redirect, continue, or ask the

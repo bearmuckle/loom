@@ -14,9 +14,9 @@ use loom_agent::{
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
-    Capability, CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId,
-    RequestId, Result, RunAttemptId, SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId,
-    WorkspaceRecord,
+    Capability, CapabilitySet, ErrorCode, EventSequence, LoomError, ProjectAgentRecord, ProjectId,
+    ProjectSnapshot, ProtocolVersion, RepositoryId, RequestId, Result, RunAttemptId,
+    SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
@@ -2184,6 +2184,7 @@ impl InProcessBackend {
                 Capability::ManageWorkspaces,
                 Capability::ManageSessionRepositories,
                 Capability::BrowseGitHubRepositories,
+                Capability::ReadProject,
                 Capability::ReadSessionFilesystem,
                 Capability::WriteSessionFilesystem,
             ]),
@@ -5371,6 +5372,9 @@ impl InProcessConnection {
             ClientRequest::GetAgentSessionInitialState { session_id } => Ok(
                 ServerResponse::AgentSessionInitialState(self.session_initial_state(session_id)?),
             ),
+            ClientRequest::GetProjectSnapshot { project_id } => Ok(
+                ServerResponse::ProjectSnapshot(self.load_project_snapshot(project_id)?),
+            ),
             ClientRequest::RenameAgentSession { session_id, name } => {
                 let (snapshot, record) = self.backend.sessions()?.rename(session_id, name)?;
                 self.backend.journal()?.append_session(record);
@@ -6331,6 +6335,72 @@ impl InProcessConnection {
         })
     }
 
+    fn load_project_snapshot(&self, project_id: ProjectId) -> Result<ProjectSnapshot> {
+        if let Some(snapshot) = self
+            .backend
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.load_project_snapshot(project_id))
+            .transpose()?
+            .flatten()
+        {
+            return Ok(snapshot);
+        }
+
+        // The root session ID is also the project ID. This fallback keeps
+        // ephemeral backends and newly-created standalone sessions addressable
+        // before any hierarchy rows exist in durable storage.
+        let root_session_id = AgentSessionId::from_uuid(*project_id.as_uuid());
+        let root = self
+            .backend
+            .sessions()?
+            .get(root_session_id)
+            .map_err(|_| LoomError::not_found("project", project_id))?;
+        Ok(ProjectSnapshot {
+            project_id,
+            root_session_id,
+            agents: vec![ProjectAgentRecord {
+                session_id: root.id,
+                project_id,
+                parent_session_id: None,
+                depth: 1,
+                state: root.state,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: root.updated_at,
+            }],
+        })
+    }
+
+    fn authorize_project_snapshot(
+        &self,
+        auth: &AuthSession,
+        snapshot: &ProjectSnapshot,
+    ) -> Result<()> {
+        // A project projection includes every descendant, so each member must
+        // independently fit the token's session and workspace scope.
+        let mut session_ids = snapshot
+            .agents
+            .iter()
+            .map(|agent| agent.session_id)
+            .collect::<BTreeSet<_>>();
+        session_ids.insert(snapshot.root_session_id);
+        for session_id in session_ids {
+            if !auth.scope().allows_session(session_id) {
+                return Err(unauthorized_session(session_id));
+            }
+            let session = self.backend.sessions()?.get(session_id)?;
+            if !auth.scope().allows_workspace(session.workspace_id) {
+                return Err(LoomError::new(
+                    ErrorCode::AuthorizationDenied,
+                    "token is not authorized for a project member's workspace",
+                    false,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn authorize_request(&self, request: &ClientRequest) -> Result<()> {
         let Some(auth) = &self.auth else {
             return Ok(());
@@ -6357,6 +6427,23 @@ impl InProcessConnection {
                         false,
                     ));
                 }
+            }
+            ClientRequest::GetProjectSnapshot { project_id } => {
+                let root_session_id = AgentSessionId::from_uuid(*project_id.as_uuid());
+                if !auth.scope().allows_session(root_session_id) {
+                    return Err(unauthorized_session(root_session_id));
+                }
+                if let Ok(root) = self.backend.sessions()?.get(root_session_id)
+                    && !auth.scope().allows_workspace(root.workspace_id)
+                {
+                    return Err(LoomError::new(
+                        ErrorCode::AuthorizationDenied,
+                        "token is not authorized for the project's workspace",
+                        false,
+                    ));
+                }
+                let snapshot = self.load_project_snapshot(*project_id)?;
+                self.authorize_project_snapshot(auth, &snapshot)?;
             }
             ClientRequest::RegisterWorkspace { workspace } => {
                 if auth.scope().sessions.is_some() {
@@ -9838,6 +9925,18 @@ mod tests {
             protocol_3_negotiation.result.unwrap_err().code,
             ErrorCode::UnsupportedProtocol
         );
+        let protocol_4_connection = backend.connect();
+        let protocol_4_negotiation = protocol_4_connection.request(RequestEnvelope::with_version(
+            ProtocolVersion::new(4, 1),
+            ClientRequest::Negotiate {
+                client_version: ProtocolVersion::new(4, 1),
+                capabilities: backend.supported_capabilities.clone(),
+            },
+        ));
+        assert_eq!(
+            protocol_4_negotiation.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
 
         let capability_limited_connection = backend.connect();
         let capability_limited = CapabilitySet::new(
@@ -10941,6 +11040,104 @@ mod tests {
                     workspace_id: None,
                     after_sequence: None,
                     stream_epoch: None,
+                }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
+    }
+
+    #[test]
+    fn project_snapshot_is_available_to_authorized_tokens_and_scoped_by_membership() {
+        let backend = InProcessBackend::new();
+        let unrestricted = backend.connect();
+        negotiate(&unrestricted);
+        let workspace = match unrestricted
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Project snapshots".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match unrestricted
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Project root".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(root) => root,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        let project_id = ProjectId::from_uuid(*root.id.as_uuid());
+        let snapshot = unrestricted
+            .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
+                project_id,
+            }))
+            .result
+            .unwrap();
+        let ServerResponse::ProjectSnapshot(snapshot) = snapshot else {
+            panic!("expected project snapshot, received {snapshot:?}");
+        };
+        assert_eq!(snapshot.project_id, project_id);
+        assert_eq!(snapshot.root_session_id, root.id);
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(snapshot.agents[0].depth, 1);
+        assert_eq!(snapshot.agents[0].session_id, root.id);
+
+        let unknown_project_id = ProjectId::new();
+        assert_eq!(
+            unrestricted
+                .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
+                    project_id: unknown_project_id,
+                }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+
+        let tokens = AuthTokenStore::new();
+        let issued = tokens
+            .issue(AuthorizationScope::for_sessions(
+                [],
+                backend.supported_capabilities.clone(),
+            ))
+            .unwrap();
+        let scoped = backend.connect_authenticated(tokens.authenticate(&issued.token).unwrap());
+        negotiate(&scoped);
+        assert_eq!(
+            scoped
+                .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
+                    project_id,
+                }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+        let wrong_workspace = tokens
+            .issue(AuthorizationScope::for_workspaces(
+                [WorkspaceId::new()],
+                backend.supported_capabilities.clone(),
+            ))
+            .unwrap();
+        let workspace_scoped =
+            backend.connect_authenticated(tokens.authenticate(&wrong_workspace.token).unwrap());
+        negotiate(&workspace_scoped);
+        assert_eq!(
+            workspace_scoped
+                .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
+                    project_id,
                 }))
                 .result
                 .unwrap_err()

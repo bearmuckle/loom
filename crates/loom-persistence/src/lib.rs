@@ -10,9 +10,9 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
-    CheckpointId, ErrorCode, EventSequence, InteractionId, LoomError, PolicyDecision, RepositoryId,
-    RequestId, Result, RunAttemptId, RunId, SessionLimits, StepId, Timestamp, UsageSnapshot,
-    WorkspaceId, WorkspaceRecord,
+    CheckpointId, ErrorCode, EventSequence, InteractionId, LoomError, PolicyDecision,
+    ProjectAgentRecord, ProjectId, ProjectSnapshot, RepositoryId, RequestId, Result, RunAttemptId,
+    RunId, SessionLimits, StepId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
@@ -33,7 +33,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const DATABASE_SCHEMA_VERSION: u32 = 41;
+const DATABASE_SCHEMA_VERSION: u32 = 42;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;
@@ -73,6 +73,49 @@ CREATE INDEX IF NOT EXISTS sessions_visible
     ON sessions(workspace_id, updated_at DESC, id DESC) WHERE state != 'archived';
 CREATE INDEX IF NOT EXISTS sessions_archived
     ON sessions(workspace_id, updated_at DESC, id DESC) WHERE state = 'archived';
+CREATE TABLE IF NOT EXISTS sessions_hierarchy (
+    project_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(project_id) = 16),
+    session_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    parent_session_id BLOB REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(parent_session_id IS NULL OR length(parent_session_id) = 16),
+    depth INTEGER NOT NULL CHECK(depth BETWEEN 1 AND 3),
+    CHECK(parent_session_id IS NULL OR parent_session_id != session_id),
+    CHECK((parent_session_id IS NULL AND depth = 1)
+       OR (parent_session_id IS NOT NULL AND depth > 1)),
+    CHECK(parent_session_id IS NOT NULL OR project_id = session_id),
+    UNIQUE(project_id, session_id),
+    FOREIGN KEY(project_id, parent_session_id)
+        REFERENCES sessions_hierarchy(project_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS sessions_hierarchy_by_project
+    ON sessions_hierarchy(project_id, depth, session_id);
+CREATE INDEX IF NOT EXISTS sessions_hierarchy_by_parent
+    ON sessions_hierarchy(parent_session_id, session_id)
+    WHERE parent_session_id IS NOT NULL;
+CREATE TRIGGER IF NOT EXISTS sessions_hierarchy_parent_depth_insert
+BEFORE INSERT ON sessions_hierarchy
+WHEN NEW.parent_session_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM sessions_hierarchy AS parent
+    WHERE parent.project_id=NEW.project_id
+      AND parent.session_id=NEW.parent_session_id
+      AND parent.depth + 1=NEW.depth
+)
+BEGIN
+    SELECT RAISE(ABORT, 'project parent must belong to same project at previous depth');
+END;
+CREATE TRIGGER IF NOT EXISTS sessions_hierarchy_parent_depth_update
+BEFORE UPDATE OF project_id, parent_session_id, depth ON sessions_hierarchy
+WHEN NEW.parent_session_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM sessions_hierarchy AS parent
+    WHERE parent.project_id=NEW.project_id
+      AND parent.session_id=NEW.parent_session_id
+      AND parent.depth + 1=NEW.depth
+)
+BEGIN
+    SELECT RAISE(ABORT, 'project parent must belong to same project at previous depth');
+END;
 CREATE TABLE IF NOT EXISTS run_summaries (
     run_id BLOB PRIMARY KEY NOT NULL CHECK(length(run_id) = 16),
     session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE CHECK(length(session_id) = 16),
@@ -1402,6 +1445,86 @@ impl FilePersistence {
                     false,
                 )
             })?),
+        }))
+    }
+
+    /// Loads the durable hierarchy and current session projections for a project.
+    pub fn load_project_snapshot(&self, project_id: ProjectId) -> Result<Option<ProjectSnapshot>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT hierarchy.session_id, hierarchy.parent_session_id, hierarchy.depth,
+                        session.state, session.updated_at
+                 FROM sessions_hierarchy AS hierarchy
+                 JOIN sessions AS session ON session.id=hierarchy.session_id
+                 WHERE hierarchy.project_id=?1
+                 ORDER BY hierarchy.depth, hierarchy.session_id",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare project snapshot: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([project_id.as_uuid().as_bytes().as_slice()], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read project snapshot: {error}"), true)
+            })?;
+        let mut agents = Vec::new();
+        for row in rows {
+            let (session_id, parent_session_id, depth, state, updated_at) =
+                row.map_err(|error| {
+                    persistence_error(format!("could not read project snapshot: {error}"), true)
+                })?;
+            let depth = u8::try_from(depth).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted project depth is outside the supported range",
+                    false,
+                )
+            })?;
+            agents.push(ProjectAgentRecord {
+                session_id: AgentSessionId::from_uuid(decode_uuid(&session_id, "session id")?),
+                project_id,
+                parent_session_id: parent_session_id
+                    .as_deref()
+                    .map(|id| decode_uuid(id, "parent session id").map(AgentSessionId::from_uuid))
+                    .transpose()?,
+                depth,
+                state: parse_session_state(&state)?,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: decode_timestamp(updated_at)?,
+            });
+        }
+        if agents.is_empty() {
+            return Ok(None);
+        }
+        let root_session_id = AgentSessionId::from_uuid(*project_id.as_uuid());
+        if !agents.iter().any(|agent| {
+            agent.session_id == root_session_id
+                && agent.parent_session_id.is_none()
+                && agent.depth == 1
+        }) {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted project has no root session",
+                false,
+            ));
+        }
+        Ok(Some(ProjectSnapshot {
+            project_id,
+            root_session_id,
+            agents,
         }))
     }
 
@@ -4934,6 +5057,9 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     if database_version == DATABASE_SCHEMA_VERSION {
         return Ok(());
     }
+    if database_version == 41 {
+        return migrate_v41_to_v42(connection);
+    }
     if database_version != 0 {
         return Err(LoomError::new(
             ErrorCode::MalformedPayload,
@@ -5002,6 +5128,93 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(|error| {
         persistence_error(
             format!("could not commit persistence schema: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
+fn migrate_v41_to_v42(connection: &Connection) -> Result<()> {
+    // Keep the schema change, backfill, and version bump in one transaction. A
+    // failed backfill leaves a v41 database that can safely retry on next open.
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not begin persistence migration: {error}"),
+            true,
+        )
+    })?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE sessions_hierarchy (
+                project_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+                    CHECK(length(project_id) = 16),
+                session_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+                    CHECK(length(session_id) = 16),
+                parent_session_id BLOB REFERENCES sessions(id) ON DELETE CASCADE
+                    CHECK(parent_session_id IS NULL OR length(parent_session_id) = 16),
+                depth INTEGER NOT NULL CHECK(depth BETWEEN 1 AND 3),
+                CHECK(parent_session_id IS NULL OR parent_session_id != session_id),
+                CHECK((parent_session_id IS NULL AND depth = 1)
+                   OR (parent_session_id IS NOT NULL AND depth > 1)),
+                CHECK(parent_session_id IS NOT NULL OR project_id = session_id),
+                UNIQUE(project_id, session_id),
+                FOREIGN KEY(project_id, parent_session_id)
+                    REFERENCES sessions_hierarchy(project_id, session_id) ON DELETE CASCADE
+             ) WITHOUT ROWID, STRICT;
+             CREATE INDEX sessions_hierarchy_by_project
+                ON sessions_hierarchy(project_id, depth, session_id);
+             CREATE INDEX sessions_hierarchy_by_parent
+                ON sessions_hierarchy(parent_session_id, session_id)
+                WHERE parent_session_id IS NOT NULL;
+             CREATE TRIGGER sessions_hierarchy_parent_depth_insert
+             BEFORE INSERT ON sessions_hierarchy
+             WHEN NEW.parent_session_id IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM sessions_hierarchy AS parent
+                 WHERE parent.project_id=NEW.project_id
+                   AND parent.session_id=NEW.parent_session_id
+                   AND parent.depth + 1=NEW.depth
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'project parent must belong to same project at previous depth');
+             END;
+             CREATE TRIGGER sessions_hierarchy_parent_depth_update
+             BEFORE UPDATE OF project_id, parent_session_id, depth ON sessions_hierarchy
+             WHEN NEW.parent_session_id IS NOT NULL AND NOT EXISTS (
+                 SELECT 1 FROM sessions_hierarchy AS parent
+                 WHERE parent.project_id=NEW.project_id
+                   AND parent.session_id=NEW.parent_session_id
+                   AND parent.depth + 1=NEW.depth
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'project parent must belong to same project at previous depth');
+             END;",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project hierarchy schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO sessions_hierarchy(project_id, session_id, parent_session_id, depth)
+             SELECT id, id, NULL, 1 FROM sessions",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not backfill project roots: {error}"), true)
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record persistence schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit persistence migration: {error}"),
             true,
         )
     })?;
@@ -6113,6 +6326,22 @@ fn save_session_rows(transaction: &Transaction<'_>, state: &SessionManagerState)
             .map_err(|error| {
                 persistence_error(
                     format!("could not save session {}: {error}", session.id),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO sessions_hierarchy
+                    (project_id, session_id, parent_session_id, depth)
+                 VALUES (?1, ?1, NULL, 1)",
+                [id.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!(
+                        "could not initialize project root for session {}: {error}",
+                        session.id
+                    ),
                     true,
                 )
             })?;
@@ -10940,6 +11169,125 @@ mod tests {
     }
 
     #[test]
+    fn v41_upgrade_preserves_sessions_as_project_roots() {
+        type PersistedHierarchyRow = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, i64);
+
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
+                    workspace_id BLOB NOT NULL CHECK(length(workspace_id) = 16),
+                    name TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 ) WITHOUT ROWID, STRICT;
+                 PRAGMA user_version=41;",
+            )
+            .unwrap();
+        let root_a = Uuid::new_v4();
+        let root_b = Uuid::new_v4();
+        let workspace = Uuid::new_v4();
+        for (id, name) in [(root_a, "first"), (root_b, "second")] {
+            connection
+                .execute(
+                    "INSERT INTO sessions VALUES (?1, ?2, ?3, 'idle', 1, 1)",
+                    params![id.as_bytes(), workspace.as_bytes(), name],
+                )
+                .unwrap();
+        }
+
+        initialize_schema(&connection).unwrap();
+
+        let roots: Vec<PersistedHierarchyRow> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT project_id, session_id, parent_session_id, depth
+                     FROM sessions_hierarchy ORDER BY session_id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().all(|(project, session, parent, depth)| {
+            project == session && parent.is_none() && *depth == 1
+        }));
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 42);
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v41_upgrade_rolls_back_and_can_be_retried() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
+                    workspace_id BLOB NOT NULL CHECK(length(workspace_id) = 16),
+                    name TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 ) WITHOUT ROWID, STRICT;
+                 CREATE TABLE sessions_hierarchy(unexpected TEXT);
+                 PRAGMA user_version=41;",
+            )
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        connection
+            .execute(
+                "INSERT INTO sessions VALUES (?1, ?2, 'retry', 'idle', 1, 1)",
+                params![session_id.as_bytes(), workspace_id.as_bytes()],
+            )
+            .unwrap();
+
+        assert!(initialize_schema(&connection).is_err());
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 41);
+        let project_index_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sessions_hierarchy_by_project')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!project_index_exists);
+
+        connection
+            .execute_batch("DROP TABLE sessions_hierarchy;")
+            .unwrap();
+        initialize_schema(&connection).unwrap();
+        let root_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sessions_hierarchy", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(root_count, 1);
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 42);
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn fresh_database_uses_typed_schema_without_generic_section_tables() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let store = FilePersistence::open(&path).unwrap();
@@ -11052,6 +11400,49 @@ mod tests {
     }
 
     #[test]
+    fn project_hierarchy_constraints_reject_invalid_depth_and_cross_project_parent() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut manager = SessionManager::default();
+        let (first, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "First project")
+            .unwrap();
+        let (second, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Second project")
+            .unwrap();
+        persistence
+            .save_state_with_sessions(&manager.export_state())
+            .unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let child = Uuid::new_v4();
+        let cross_project = connection.execute(
+            "INSERT INTO sessions_hierarchy(project_id, session_id, parent_session_id, depth)
+             VALUES (?1, ?2, ?3, 2)",
+            params![
+                first.id.as_uuid().as_bytes().as_slice(),
+                child.as_bytes().as_slice(),
+                second.id.as_uuid().as_bytes().as_slice()
+            ],
+        );
+        assert!(cross_project.is_err());
+
+        let too_deep = connection.execute(
+            "INSERT INTO sessions_hierarchy(project_id, session_id, parent_session_id, depth)
+             VALUES (?1, ?2, ?3, 4)",
+            params![
+                first.id.as_uuid().as_bytes().as_slice(),
+                child.as_bytes().as_slice(),
+                first.id.as_uuid().as_bytes().as_slice()
+            ],
+        );
+        assert!(too_deep.is_err());
+        drop(connection);
+        drop(persistence);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn typed_session_catalog_round_trips_and_uses_the_picker_index() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let persistence = FilePersistence::open(&path).unwrap();
@@ -11066,6 +11457,26 @@ mod tests {
         let state = manager.export_state();
 
         persistence.save_state_with_sessions(&state).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let root_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions_hierarchy
+                 WHERE project_id=session_id AND parent_session_id IS NULL AND depth=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(root_rows, state.sessions.len() as i64);
+        let first_project = persistence
+            .load_project_snapshot(ProjectId::from_uuid(*first.id.as_uuid()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_project.root_session_id, first.id);
+        assert_eq!(first_project.agents.len(), 1);
+        assert_eq!(first_project.agents[0].session_id, first.id);
+        assert_eq!(first_project.agents[0].project_id, first_project.project_id);
+        assert_eq!(first_project.agents[0].depth, 1);
+        assert_eq!(first_project.agents[0].parent_session_id, None);
         let restored = persistence.load_sessions().unwrap().unwrap();
         assert_eq!(restored, state);
         assert_eq!(
@@ -11076,7 +11487,6 @@ mod tests {
             second
         );
 
-        let connection = Connection::open(&path).unwrap();
         let plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN

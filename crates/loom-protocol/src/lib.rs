@@ -1,7 +1,7 @@
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, Capability, CapabilitySet, EventSequence, LoomError,
-    ProtocolVersion, RepositoryId, RequestId, RunId, SessionEvent, SessionEventRecord,
-    SessionLimits, ToolCallId, UsageSnapshot, WorkspaceId,
+    ProjectAgentRecord, ProjectId, ProjectSnapshot, ProtocolVersion, RepositoryId, RequestId,
+    RunId, SessionEvent, SessionEventRecord, SessionLimits, ToolCallId, UsageSnapshot, WorkspaceId,
 };
 use loom_model::{
     ModelDescriptor, ModelId, ModelMessage, ProviderHealth, ProviderId, ProviderSummary,
@@ -50,7 +50,7 @@ pub use workspace::{
     WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(4, 1);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(5, 0);
 pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
 pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
 pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
@@ -380,6 +380,9 @@ pub enum ClientRequest {
     GetAgentSessionInitialState {
         session_id: AgentSessionId,
     },
+    GetProjectSnapshot {
+        project_id: ProjectId,
+    },
     RenameAgentSession {
         session_id: AgentSessionId,
         name: String,
@@ -557,6 +560,7 @@ impl ClientRequest {
             | Self::GetAgentSessionSnapshot { .. }
             | Self::GetAgentSessionSnapshotMetadata { .. }
             | Self::GetAgentSessionInitialState { .. } => Some(Capability::ReadAgentSession),
+            Self::GetProjectSnapshot { .. } => Some(Capability::ReadProject),
             Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
                 Some(Capability::ControlAgentSession)
             }
@@ -703,6 +707,7 @@ pub enum ServerResponse {
     AgentSession(AgentSessionSnapshot),
     AgentSessionSnapshot(AgentSessionSnapshotProjection),
     AgentSessionInitialState(AgentSessionInitialState),
+    ProjectSnapshot(ProjectSnapshot),
     AgentSessionRenamed(AgentSessionSnapshot),
     AgentSessionArchived(AgentSessionSnapshot),
     AgentRunStarted(AgentRunSnapshot),
@@ -893,6 +898,12 @@ pub enum WorkspaceFeedEvent {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum ServerEvent {
+    ProjectAgentCreated {
+        agent: ProjectAgentRecord,
+    },
+    ProjectAgentUpdated {
+        agent: ProjectAgentRecord,
+    },
     AgentSessionCreated {
         snapshot: AgentSessionSnapshot,
     },
@@ -1043,6 +1054,46 @@ pub fn unsupported_version_error(requested: ProtocolVersion) -> LoomError {
 #[cfg(test)]
 mod run_message_protocol_tests {
     use super::*;
+
+    #[test]
+    fn project_snapshot_request_uses_project_capability_and_round_trips() {
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(5, 0));
+        let project_id = ProjectId::new();
+        let request = ClientRequest::GetProjectSnapshot { project_id };
+        assert_eq!(request.required_capability(), Some(Capability::ReadProject));
+        let encoded = encode_request(&RequestEnvelope::new(request)).unwrap();
+        assert_eq!(
+            decode_request(&encoded).unwrap().protocol_version,
+            CURRENT_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            decode_request(&encoded).unwrap().request,
+            ClientRequest::GetProjectSnapshot { project_id }
+        );
+
+        let root_session_id = AgentSessionId::new();
+        let snapshot = ProjectSnapshot {
+            project_id,
+            root_session_id,
+            agents: vec![ProjectAgentRecord {
+                session_id: root_session_id,
+                project_id,
+                parent_session_id: None,
+                depth: 1,
+                state: loom_core::AgentSessionState::Idle,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: loom_core::Timestamp::from_unix_millis(1),
+            }],
+        };
+        let response = ServerResponse::ProjectSnapshot(snapshot);
+        let encoded = encode_response(&ResponseEnvelope::success(
+            RequestId::new(),
+            response.clone(),
+        ))
+        .unwrap();
+        assert_eq!(decode_response(&encoded).unwrap().result.unwrap(), response);
+    }
 
     #[test]
     fn stream_epoch_fields_default_for_sequence_only_peers() {
