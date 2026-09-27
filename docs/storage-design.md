@@ -17,13 +17,17 @@ before durable run-state writes and at completion.
 Run-attempt history and the current continuation cursor, control revision,
 pending input/approval/tool intent, and retry metadata use typed rows.
 Checkpoint headers and file entries use keyed rows; checkpoint file text shares the compressed,
-content-addressed blob store. Remaining filesystem edit/change and repository
-metadata use a compressed, hash-checked per-session payload. Large strings in
+content-addressed blob store. Filesystem edits and ordered changes use typed
+session-keyed rows, with prior edit bytes sharing the content store. Repository
+attachments and mounted directories also use typed session-keyed rows; only
+small filesystem identity/control data remains in the compressed, hash-checked
+per-session payload. Filesystem change retention is not yet bounded, and restoring
+the workspace still materializes retained edit/change histories. Large strings in
 the generic section store are deduplicated and compressed. Provider configuration
 and health use provider-keyed records. Idempotency uses a dedicated table.
 Activities and protocol-level transcript paging are typed; detailed tool-call
-and tool-attempt records, step/evidence rows, and direct page-backed context
-loading remain unfinished. Provider request-level detail is
+and tool-attempt records, step/evidence rows, direct page-backed context loading,
+and bounded filesystem history reads remain unfinished. Provider request-level detail is
 aggregated by provider/model because no request-level usage history is exposed
 by the current protocol. This
 design replaces the version-2 `sections` container. The release does not import

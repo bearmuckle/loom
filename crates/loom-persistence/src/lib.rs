@@ -9,8 +9,8 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
-    CheckpointId, ErrorCode, EventSequence, InteractionId, LoomError, RequestId, Result,
-    RunAttemptId, RunId, StepId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    CheckpointId, ErrorCode, EventSequence, InteractionId, LoomError, RepositoryId, RequestId,
+    Result, RunAttemptId, RunId, StepId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
@@ -18,8 +18,9 @@ use loom_protocol::{
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
     AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
-    ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope, SessionFilesystemChange,
-    ToolResult, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
+    ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope, SessionDirectory,
+    SessionFilesystemChange, SessionRepository, ToolResult, WorkspaceChangeKind, WorkspaceConfig,
+    WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -29,8 +30,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 27;
-const DATABASE_SCHEMA_VERSION: u32 = 27;
+pub const CURRENT_SCHEMA_VERSION: u32 = 28;
+const DATABASE_SCHEMA_VERSION: u32 = 28;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -315,6 +316,27 @@ CREATE TABLE IF NOT EXISTS filesystem_changes (
     kind TEXT NOT NULL CHECK(kind IN ('created', 'modified', 'deleted')),
     revision TEXT CHECK(revision IS NULL OR length(revision) <= 256),
     PRIMARY KEY(session_id, sequence)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS session_repositories (
+    session_id BLOB NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    repository_id BLOB NOT NULL CHECK(length(repository_id) = 16),
+    source TEXT NOT NULL,
+    path TEXT NOT NULL CHECK(length(path) > 0 AND length(path) <= 4096),
+    revision TEXT,
+    attached_at INTEGER NOT NULL CHECK(attached_at >= 0),
+    PRIMARY KEY(session_id, repository_id)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS session_repositories_by_path
+    ON session_repositories(session_id, path, repository_id);
+CREATE TABLE IF NOT EXISTS session_directories (
+    session_id BLOB NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    source TEXT NOT NULL,
+    path TEXT NOT NULL CHECK(length(path) > 0 AND length(path) <= 4096),
+    PRIMARY KEY(session_id, ordinal),
+    UNIQUE(session_id, path)
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS filesystem_edits_by_content
     ON filesystem_edits(before_hash) WHERE before_hash IS NOT NULL;
@@ -868,6 +890,8 @@ pub struct DurableFilesystemRecord {
     pub checkpoints: Vec<Checkpoint>,
     pub edits: Vec<DurableFilesystemEdit>,
     pub changes: Vec<SessionFilesystemChange>,
+    pub repositories: BTreeMap<RepositoryId, SessionRepository>,
+    pub directories: Vec<SessionDirectory>,
     pub payload: Value,
 }
 
@@ -3222,6 +3246,68 @@ impl FilePersistence {
                 revision,
             });
         }
+        let repositories = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT repository_id, source, path, revision, attached_at
+                     FROM session_repositories WHERE session_id=?1 ORDER BY repository_id",
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not prepare repository rows: {error}"), true)
+                })?;
+            let rows = statement
+                .query_map([session_id.as_uuid().as_bytes().as_slice()], |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                })
+                .map_err(|error| {
+                    persistence_error(format!("could not read repository rows: {error}"), true)
+                })?;
+            let rows = rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    persistence_error(format!("could not read repository rows: {error}"), true)
+                })?;
+            let mut repositories = BTreeMap::new();
+            for (id, source, path, revision, attached_at) in rows {
+                let id = RepositoryId::from_uuid(decode_uuid(&id, "repository id")?);
+                repositories.insert(
+                    id,
+                    SessionRepository {
+                        id,
+                        source,
+                        path,
+                        revision,
+                        attached_at: decode_timestamp(attached_at)?,
+                    },
+                );
+            }
+            repositories
+        };
+        let directories = {
+            let mut statement = connection
+                .prepare("SELECT source, path FROM session_directories WHERE session_id=?1 ORDER BY ordinal")
+                .map_err(|error| persistence_error(format!("could not prepare mounted directories: {error}"), true))?;
+            let rows = statement
+                .query_map([session_id.as_uuid().as_bytes().as_slice()], |row| {
+                    Ok(SessionDirectory {
+                        source: row.get(0)?,
+                        path: row.get(1)?,
+                    })
+                })
+                .map_err(|error| {
+                    persistence_error(format!("could not read mounted directories: {error}"), true)
+                })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    persistence_error(format!("could not read mounted directories: {error}"), true)
+                })?
+        };
         Ok(Some(DurableFilesystemRecord {
             session_id,
             root,
@@ -3229,6 +3315,8 @@ impl FilePersistence {
             checkpoints,
             edits,
             changes,
+            repositories,
+            directories,
             payload,
         }))
     }
@@ -6518,6 +6606,8 @@ fn save_filesystem_records(
         save_checkpoint_rows(transaction, record.session_id, &record.checkpoints)?;
         save_filesystem_edit_rows(transaction, record.session_id, &record.edits)?;
         save_filesystem_change_rows(transaction, record.session_id, &record.changes)?;
+        save_session_repository_rows(transaction, record.session_id, &record.repositories)?;
+        save_session_directory_rows(transaction, record.session_id, &record.directories)?;
     }
     collect_unused_content(transaction)?;
     Ok(())
@@ -6687,6 +6777,145 @@ fn save_filesystem_change_rows(
         .map_err(|error| {
             persistence_error(format!("could not prune filesystem changes: {error}"), true)
         })?;
+    Ok(())
+}
+
+fn save_session_repository_rows(
+    transaction: &Transaction<'_>,
+    session_id: AgentSessionId,
+    repositories: &BTreeMap<RepositoryId, SessionRepository>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_session_repositories (
+            session_id BLOB NOT NULL, repository_id BLOB NOT NULL,
+            PRIMARY KEY(session_id, repository_id)
+        ) WITHOUT ROWID;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage repositories: {error}"), true)
+        })?;
+    let session_bytes = session_id.as_uuid().as_bytes();
+    transaction
+        .execute(
+            "DELETE FROM _loom_wanted_session_repositories WHERE session_id=?1",
+            [session_bytes.as_slice()],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not reset repository staging: {error}"), true)
+        })?;
+    for (id, repository) in repositories {
+        if *id != repository.id || repository.path.is_empty() || repository.path.len() > 4096 {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "session repository metadata is invalid",
+                false,
+            ));
+        }
+        let repository_bytes = id.as_uuid().as_bytes();
+        let attached_at = encode_timestamp(repository.attached_at)?;
+        transaction.execute(
+            "INSERT INTO _loom_wanted_session_repositories(session_id, repository_id) VALUES (?1, ?2)",
+            params![session_bytes.as_slice(), repository_bytes.as_slice()],
+        ).map_err(|error| persistence_error(format!("could not stage repository: {error}"), true))?;
+        transaction.execute(
+            "INSERT INTO session_repositories(session_id, repository_id, source, path, revision, attached_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(session_id, repository_id) DO UPDATE SET
+                source=excluded.source, path=excluded.path, revision=excluded.revision, attached_at=excluded.attached_at
+             WHERE session_repositories.source IS NOT excluded.source
+                OR session_repositories.path IS NOT excluded.path
+                OR session_repositories.revision IS NOT excluded.revision
+                OR session_repositories.attached_at IS NOT excluded.attached_at",
+            params![session_bytes.as_slice(), repository_bytes.as_slice(), repository.source, repository.path,
+                repository.revision, attached_at],
+        ).map_err(|error| persistence_error(format!("could not save session repository: {error}"), true))?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM session_repositories WHERE session_id=?1 AND NOT EXISTS (
+            SELECT 1 FROM _loom_wanted_session_repositories wanted
+            WHERE wanted.session_id=session_repositories.session_id
+              AND wanted.repository_id=session_repositories.repository_id
+        )",
+            [session_bytes.as_slice()],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prune session repositories: {error}"),
+                true,
+            )
+        })?;
+    Ok(())
+}
+
+fn save_session_directory_rows(
+    transaction: &Transaction<'_>,
+    session_id: AgentSessionId,
+    directories: &[SessionDirectory],
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_session_directories (
+            session_id BLOB NOT NULL, ordinal INTEGER NOT NULL,
+            PRIMARY KEY(session_id, ordinal)
+        ) WITHOUT ROWID;",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not stage mounted directories: {error}"),
+                true,
+            )
+        })?;
+    let session_bytes = session_id.as_uuid().as_bytes();
+    transaction
+        .execute(
+            "DELETE FROM _loom_wanted_session_directories WHERE session_id=?1",
+            [session_bytes.as_slice()],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not reset directory staging: {error}"), true)
+        })?;
+    let mut unique_paths = BTreeSet::new();
+    for (ordinal, directory) in directories.iter().enumerate() {
+        if directory.path.is_empty()
+            || directory.path.len() > 4096
+            || !unique_paths.insert(&directory.path)
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "mounted directory metadata is invalid",
+                false,
+            ));
+        }
+        let ordinal = i64::try_from(ordinal).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "mounted directory count exceeds SQLite's integer range",
+                false,
+            )
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_session_directories(session_id, ordinal) VALUES (?1, ?2)",
+                params![session_bytes.as_slice(), ordinal],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not stage mounted directory: {error}"), true)
+            })?;
+        transaction.execute(
+            "INSERT INTO session_directories(session_id, ordinal, source, path) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id, ordinal) DO UPDATE SET source=excluded.source, path=excluded.path
+             WHERE session_directories.source IS NOT excluded.source OR session_directories.path IS NOT excluded.path",
+            params![session_bytes.as_slice(), ordinal, directory.source, directory.path],
+        ).map_err(|error| persistence_error(format!("could not save mounted directory: {error}"), true))?;
+    }
+    transaction.execute(
+        "DELETE FROM session_directories WHERE session_id=?1 AND NOT EXISTS (
+            SELECT 1 FROM _loom_wanted_session_directories wanted
+            WHERE wanted.session_id=session_directories.session_id AND wanted.ordinal=session_directories.ordinal
+        )", [session_bytes.as_slice()],
+    ).map_err(|error| persistence_error(format!("could not prune mounted directories: {error}"), true))?;
     Ok(())
 }
 
@@ -7841,6 +8070,21 @@ mod tests {
                 },
             )]),
         };
+        let repository_id = RepositoryId::new();
+        let repositories = BTreeMap::from([(
+            repository_id,
+            SessionRepository {
+                id: repository_id,
+                source: "https://example.test/repo.git".to_owned(),
+                path: "repositories/example".to_owned(),
+                revision: Some("abc123".to_owned()),
+                attached_at: Timestamp::from_unix_millis(4322),
+            },
+        )]);
+        let directories = vec![SessionDirectory {
+            source: "/tmp/external-docs".to_owned(),
+            path: "docs".to_owned(),
+        }];
         let filesystem_records = [DurableFilesystemRecord {
             session_id: session.id,
             root: "/tmp/loom-session-fs".to_owned(),
@@ -7860,6 +8104,8 @@ mod tests {
                 kind: WorkspaceChangeKind::Modified,
                 revision: Some("revision-after".to_owned()),
             }],
+            repositories: repositories.clone(),
+            directories: directories.clone(),
             payload: serde_json::json!({
                 "filesystem": {
                     "session_id": session.id,
@@ -8103,7 +8349,11 @@ mod tests {
         assert_eq!(loaded_filesystem.payload, filesystem_records[0].payload);
         assert_eq!(loaded_filesystem.edits, filesystem_records[0].edits);
         assert_eq!(loaded_filesystem.changes, filesystem_records[0].changes);
+        assert_eq!(loaded_filesystem.repositories, repositories);
+        assert_eq!(loaded_filesystem.directories, directories);
         assert_eq!(loaded_filesystem.checkpoints, vec![checkpoint.clone()]);
+        assert!(loaded_filesystem.payload.get("repositories").is_none());
+        assert!(loaded_filesystem.payload.get("directories").is_none());
 
         assert!(
             persistence
@@ -8161,6 +8411,33 @@ mod tests {
         assert_eq!(retained_filesystem.checkpoints, vec![checkpoint.clone()]);
 
         let connection = Connection::open(&path).unwrap();
+        let repo_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT path FROM session_repositories
+                 WHERE session_id=?1 AND path=?2",
+                params![
+                    session.id.as_uuid().as_bytes().as_slice(),
+                    "repositories/example"
+                ],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            repo_plan.contains("session_repositories_by_path"),
+            "{repo_plan}"
+        );
+        let directory_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT source FROM session_directories
+                 WHERE session_id=?1 AND path=?2",
+                params![session.id.as_uuid().as_bytes().as_slice(), "docs"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            directory_plan.contains("sqlite_autoindex_session_directories_2"),
+            "{directory_plan}"
+        );
         let summary_json: String = connection
             .query_row(
                 "SELECT snapshot FROM run_summaries WHERE run_id=?1",

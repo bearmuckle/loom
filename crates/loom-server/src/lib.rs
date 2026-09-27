@@ -657,8 +657,9 @@ fn persisted_run_messages(messages: Vec<DurableRunMessage>) -> Vec<ModelMessage>
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedSessionFilesystem {
     filesystem: loom_workspace::WorkspaceStateSnapshot,
+    #[serde(skip)]
     repositories: BTreeMap<RepositoryId, SessionRepository>,
-    #[serde(default)]
+    #[serde(skip)]
     directories: Vec<SessionDirectory>,
 }
 
@@ -1812,6 +1813,8 @@ impl InProcessBackend {
                 )
             })?;
         let mut payload = durable.payload;
+        let repositories = durable.repositories;
+        let directories = durable.directories;
         payload["filesystem"]["checkpoints"] = json_value(durable.checkpoints)?;
         let edits = durable.edits;
         let changes = durable.changes;
@@ -1827,6 +1830,8 @@ impl InProcessBackend {
             })
             .collect();
         persisted.filesystem.changes = changes;
+        persisted.repositories = repositories;
+        persisted.directories = directories;
         if durable.session_id != session_id
             || persisted.filesystem.session_id != session_id
             || persisted.filesystem.root != durable.root
@@ -1906,6 +1911,8 @@ impl InProcessBackend {
             return Ok(None);
         };
         let mut payload = record.payload;
+        let repositories = record.repositories;
+        let directories = record.directories;
         payload["filesystem"]["checkpoints"] = json_value(record.checkpoints)?;
         let edits = record.edits;
         let changes = record.changes;
@@ -1921,6 +1928,8 @@ impl InProcessBackend {
             })
             .collect();
         persisted.filesystem.changes = changes;
+        persisted.repositories = repositories;
+        persisted.directories = directories;
         if record.session_id != session_id
             || persisted.filesystem.session_id != session_id
             || persisted.filesystem.root != record.root
@@ -2405,20 +2414,22 @@ impl InProcessBackend {
                 })
                 .collect();
             let changes = std::mem::take(&mut filesystem_state.changes);
+            let directories = filesystem
+                .mounted_directories()?
+                .into_iter()
+                .map(|(path, source)| SessionDirectory {
+                    path,
+                    source: source.display().to_string(),
+                })
+                .collect::<Vec<_>>();
+            let repositories = loaded_repositories
+                .get(session_id)
+                .cloned()
+                .unwrap_or_default();
             let persisted = PersistedSessionFilesystem {
                 filesystem: filesystem_state,
-                repositories: loaded_repositories
-                    .get(session_id)
-                    .cloned()
-                    .unwrap_or_default(),
-                directories: filesystem
-                    .mounted_directories()?
-                    .into_iter()
-                    .map(|(path, source)| SessionDirectory {
-                        path,
-                        source: source.display().to_string(),
-                    })
-                    .collect(),
+                repositories: repositories.clone(),
+                directories: directories.clone(),
             };
             filesystem_records.push(DurableFilesystemRecord {
                 session_id: *session_id,
@@ -2427,6 +2438,8 @@ impl InProcessBackend {
                 checkpoints,
                 edits,
                 changes,
+                repositories,
+                directories,
                 payload: json_value(persisted)?,
             });
         }
