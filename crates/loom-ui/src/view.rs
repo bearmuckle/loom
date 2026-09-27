@@ -3094,51 +3094,91 @@ impl LoomView {
     #[cfg(not(target_family = "wasm"))]
     fn collect_events_since(
         &mut self,
-        after_sequence: Option<EventSequence>,
-        fallback: Option<AgentRunSnapshotProjection>,
+        mut after_sequence: Option<EventSequence>,
+        mut fallback: Option<AgentRunSnapshotProjection>,
     ) -> Result<(), LoomError> {
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-                    session_id: Some(self.active_session.id),
-                    after_sequence,
-                }));
-        match response.result? {
-            ServerResponse::SessionEvents { events } => {
-                self.reset_projection();
-                self.after_sequence = after_sequence;
-                for event in events {
-                    self.after_sequence = Some(event.sequence);
-                    self.consume_event(&event.event);
+        let session_id = self.active_session.id;
+        for resync_attempt in 0..=1 {
+            let response =
+                self.connection
+                    .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                        session_id: Some(session_id),
+                        after_sequence,
+                    }));
+            match response.result? {
+                ServerResponse::SessionEvents { events } => {
+                    self.reset_projection();
+                    self.after_sequence = after_sequence;
+                    for event in events {
+                        self.after_sequence = Some(event.sequence);
+                        self.consume_event(&event.event);
+                    }
+                    if self.timeline.is_empty()
+                        && let Some(projection) = fallback
+                    {
+                        self.apply_run_projection(projection);
+                    }
+                    return Ok(());
                 }
-                if self.timeline.is_empty()
-                    && let Some(projection) = fallback
-                {
-                    self.apply_run_projection(projection);
+                ServerResponse::SessionEventsSnapshot {
+                    session,
+                    events,
+                    latest_sequence,
+                    ..
+                } if resync_attempt == 0 => {
+                    self.active_session = session;
+                    let refreshed = self.connection.request(RequestEnvelope::new(
+                        ClientRequest::GetAgentSessionInitialState { session_id },
+                    ));
+                    if let Ok(ServerResponse::AgentSessionInitialState(initial)) = refreshed.result
+                    {
+                        after_sequence = Some(initial.cursor);
+                        fallback = initial.projection.active_run;
+                        self.active_session = initial.projection.session;
+                        self.session_state = self.active_session.state;
+                        self.auto_approve_actions = initial.projection.auto_approve_actions;
+                        self.session_auto_approve_actions
+                            .insert(session_id, initial.projection.auto_approve_actions);
+                        let _ = events;
+                        continue;
+                    }
+                    self.apply_event_snapshot(events, latest_sequence, fallback);
+                    return Ok(());
                 }
+                ServerResponse::SessionEventsSnapshot {
+                    session,
+                    events,
+                    latest_sequence,
+                    ..
+                } => {
+                    self.active_session = session;
+                    self.apply_event_snapshot(events, latest_sequence, fallback);
+                    return Ok(());
+                }
+                response => return Err(unexpected_response("session event stream", response)),
             }
-            ServerResponse::SessionEventsSnapshot {
-                session,
-                events,
-                latest_sequence,
-                ..
-            } => {
-                self.active_session = session;
-                self.reset_projection();
-                self.after_sequence = Some(latest_sequence);
-                for event in events {
-                    self.after_sequence = Some(event.sequence);
-                    self.consume_event(&event.event);
-                }
-                if self.timeline.is_empty()
-                    && let Some(projection) = fallback
-                {
-                    self.apply_run_projection(projection);
-                }
-            }
-            response => return Err(unexpected_response("session event stream", response)),
         }
         Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn apply_event_snapshot(
+        &mut self,
+        events: Vec<loom_protocol::ServerEventEnvelope>,
+        latest_sequence: EventSequence,
+        fallback: Option<AgentRunSnapshotProjection>,
+    ) {
+        self.reset_projection();
+        self.after_sequence = Some(latest_sequence);
+        for event in events {
+            self.after_sequence = Some(event.sequence);
+            self.consume_event(&event.event);
+        }
+        if self.timeline.is_empty()
+            && let Some(projection) = fallback
+        {
+            self.apply_run_projection(projection);
+        }
     }
 
     /// Applies newly journaled session events through the connection worker.
@@ -4113,9 +4153,35 @@ impl LoomView {
                     session_id: Some(session_id),
                     after_sequence: cursor,
                 }));
-            let events = cx
+            let mut events = cx
                 .background_spawn(async move { events_request.wait().await })
                 .await;
+            if matches!(
+                &events.result,
+                Ok(ServerResponse::SessionEventsSnapshot { .. })
+            ) {
+                let refresh_request = backend.submit(RequestEnvelope::new(
+                    ClientRequest::GetAgentSessionInitialState { session_id },
+                ));
+                let mut refreshed = cx
+                    .background_spawn(async move { refresh_request.wait().await })
+                    .await;
+                if let Ok(ServerResponse::AgentSessionInitialState(initial)) =
+                    refreshed.result.clone()
+                {
+                    let refreshed_cursor = initial.cursor;
+                    refreshed.result = Ok(ServerResponse::AgentSessionSnapshot(initial.projection));
+                    let retry_request =
+                        backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                            session_id: Some(session_id),
+                            after_sequence: Some(refreshed_cursor),
+                        }));
+                    snapshot = refreshed;
+                    events = cx
+                        .background_spawn(async move { retry_request.wait().await })
+                        .await;
+                }
+            }
             view.update(cx, |view, cx| {
                 view.finish_async_session_load(session_id, snapshot, events, cx);
             })

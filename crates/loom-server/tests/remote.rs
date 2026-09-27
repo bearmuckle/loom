@@ -708,6 +708,7 @@ async fn stale_cursors_return_a_snapshot_fallback() {
             .result
             .unwrap();
     }
+    let _fourth = session(&mut connection, workspace_id).await;
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(first.id),

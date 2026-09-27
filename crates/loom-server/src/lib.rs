@@ -3421,6 +3421,26 @@ impl InProcessConnection {
         Ok(deduplicate_events(events))
     }
 
+    fn stable_session_events_since(
+        &self,
+        session_id: AgentSessionId,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<(Vec<ServerEventEnvelope>, EventSequence)> {
+        for _ in 0..4 {
+            let before = self.latest_session_event_sequence(session_id)?;
+            let events = self.session_events_since(Some(session_id), after_sequence)?;
+            let after = self.latest_session_event_sequence(session_id)?;
+            if before == after {
+                return Ok((events, after));
+            }
+        }
+        Err(LoomError::new(
+            ErrorCode::Conflict,
+            "session event stream changed while reading; retry",
+            true,
+        ))
+    }
+
     fn recent_session_events(
         &self,
         session_id: AgentSessionId,
@@ -4313,7 +4333,14 @@ impl InProcessConnection {
                 session_id,
                 after_sequence,
             } => {
-                let events = self.session_events_since(session_id, after_sequence)?;
+                let (events, session_latest_sequence) = match session_id {
+                    Some(session_id) => {
+                        let (events, latest) =
+                            self.stable_session_events_since(session_id, after_sequence)?;
+                        (events, Some(latest))
+                    }
+                    None => (self.session_events_since(None, after_sequence)?, None),
+                };
                 let journal = self.backend.journal()?;
                 let history_missing = session_id.is_some()
                     && after_sequence.is_none()
@@ -4344,12 +4371,17 @@ impl InProcessConnection {
                                     .filter(|cursor| cursor.pruned_through.value() > 0)
                                     .map(|cursor| cursor.pruned_through.next())
                             })
-                            .unwrap_or_else(|| journal.next_sequence.next());
+                            .unwrap_or_else(|| {
+                                session_latest_sequence
+                                    .unwrap_or(journal.next_sequence)
+                                    .next()
+                            });
                         return Ok(ServerResponse::SessionEventsSnapshot {
                             session: self.backend.sessions()?.get(session_id)?,
                             events,
                             oldest_sequence,
-                            latest_sequence: journal.next_sequence,
+                            latest_sequence: session_latest_sequence
+                                .unwrap_or(journal.next_sequence),
                         });
                     }
                 }

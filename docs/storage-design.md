@@ -10,9 +10,10 @@ marked paused and hydrated only when a later operation needs their runtime;
 uncertain in-flight tool effects still use the eager recovery path.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
-evaluates the retained boundary for the requested session and resumes at the
-global high-water mark. Startup loads only the feed header; event payloads and
-per-session retained-boundary metadata load on demand. Cursor epochs and fully
+evaluates the retained boundary for the requested session and resumes at that
+session's high-water mark; events in other sessions do not advance its cursor.
+Sequence values remain globally allocated. Startup loads only the feed header;
+event payloads and per-session retained-boundary metadata load on demand. Cursor epochs and fully
 stream-scoped cursors remain unfinished; aggregate retained feed size grows with
 the number of sessions.
 Message role, run/session ownership, order, tool-call metadata, and content
@@ -361,8 +362,10 @@ limit prunes the globally oldest retained events first; each affected session's
 pruned-through cursor is advanced transactionally, so reconnect requests detect
 the gap and request an authoritative snapshot. Pending durable notifications are
 pruned to the same per-session event count. It keeps global sequence numbers and
-full event payloads. It has no stream epoch, workspace stream, or transactional
-snapshot/resubscribe cursor. The target still requires compact revision
+full event payloads. Initial projection reads, event reads, and cursor capture use
+before/after sequence checks with bounded retries; clients request a fresh initial
+state when retention invalidates the first cursor. It has no stream epoch,
+workspace stream, or transactional snapshot/resubscribe cursor. The target still requires compact revision
 notifications and fully scoped cursors; global pressure may expire a quiet
 session's entire retained feed.
 
