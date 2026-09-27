@@ -25,12 +25,13 @@ content-addressed blob store. Filesystem edits and ordered changes use typed
 session-keyed rows, with prior edit bytes sharing the content store. Repository
 attachments and mounted directories also use typed session-keyed rows; only
 small filesystem identity/control data remains in the compressed, hash-checked
-per-session payload. Filesystem change pages query SQLite directly without
-restoring a filesystem service; a separate typed high-water mark preserves the
-next sequence when watcher changes are committed incrementally. The newest 2,048
-sequence entries are retained, and responses flag clients whose cursors predate
-the retained range. Restoring a workspace still materializes retained edit undo
-history. Large strings in
+per-session payload. Filesystem change pages query SQLite directly and do not
+hydrate history into the workspace; a requested refresh still restores the
+selected filesystem service to detect external changes. A separate typed
+high-water mark preserves the next sequence when watcher changes are committed
+incrementally. The newest 2,048 sequence entries are retained, and responses
+flag clients whose cursors predate the retained range. Restoring a workspace
+still materializes retained edit undo history. Large strings in
 the generic section store are deduplicated and compressed. Provider configuration
 and health use provider-keyed records. Idempotency uses a dedicated table.
 Activities, tool calls, tool attempts, plan/evidence, and protocol-level
@@ -508,14 +509,16 @@ Implement in this order:
    records separately; undo bytes use the shared content store. Schema v28
    normalizes repository and directory mounts. Schema v29 stores typed context
    checkpoints. Schema v30 separates the filesystem sequence high-water mark,
-   bounds change history, and pages changes directly from SQLite without
-   restoring an unloaded filesystem service. The typed sequence high-water mark
-   and appended change rows commit atomically. Restart tests cover edit rollback
-   and lazy page reads with an unavailable filesystem root. Bounded undo-history
-   policy and broader crash-injection coverage remain.
+   bounds change history and pages change rows directly from SQLite after a
+   requested filesystem refresh. The typed sequence high-water mark and appended
+   change rows commit atomically. Restart tests cover edit rollback and bounded
+   page reads. Bounded undo-history policy and broader crash-injection coverage
+   remain.
 4. Keep filesystem services lazy and reduce remaining whole-state export/write
    work for isolated changes; selected-session filesystem operations may restore
-   that session, while startup and history-page reads stay filesystem-free.
+   and refresh that session. The SQLite history page query is bounded and avoids
+   hydrating retained history, but its request refresh still polls the selected
+   filesystem service for external changes.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
    exports and their mirrored in-memory journals completely.
 

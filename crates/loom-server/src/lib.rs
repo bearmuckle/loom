@@ -4345,22 +4345,11 @@ impl InProcessConnection {
                 session_id,
                 after_sequence,
             } => {
+                let filesystem = self.session_filesystem(session_id)?;
                 if let Some(persistence) = &self.backend.persistence {
-                    self.backend.sessions()?.get(session_id)?;
-                    let filesystem = self
-                        .backend
-                        .session_filesystems()?
-                        .get(&session_id)
-                        .cloned();
-                    if let Some(filesystem) = filesystem {
-                        let new_changes = filesystem.poll_changes()?;
-                        let next_sequence = filesystem.state()?.next_sequence;
-                        persistence.save_filesystem_changes(
-                            session_id,
-                            next_sequence,
-                            &new_changes,
-                        )?;
-                    }
+                    let new_changes = filesystem.poll_changes()?;
+                    let next_sequence = filesystem.state()?.next_sequence;
+                    persistence.save_filesystem_changes(session_id, next_sequence, &new_changes)?;
                     let page = persistence.load_filesystem_changes_page(
                         session_id,
                         after_sequence,
@@ -4371,7 +4360,6 @@ impl InProcessConnection {
                         truncated: page.truncated,
                     });
                 }
-                let filesystem = self.session_filesystem(session_id)?;
                 let mut changes = filesystem.changes_since(after_sequence)?;
                 let history_pruned = filesystem_history_pruned(after_sequence, &changes);
                 let truncated = history_pruned || changes.len() > MAX_REVIEW_CHANGES;
@@ -6517,16 +6505,6 @@ mod tests {
             assert!(matches!(
                 renamed.result,
                 Ok(ServerResponse::AgentSessionRenamed(_))
-            ));
-            let changes = connection.request(RequestEnvelope::new(
-                ClientRequest::GetSessionFilesystemChanges {
-                    session_id,
-                    after_sequence: None,
-                },
-            ));
-            assert!(matches!(
-                changes.result,
-                Ok(ServerResponse::SessionFilesystemChanges { .. })
             ));
         }
         fs::rename(&parked_root, &filesystem_root).unwrap();
