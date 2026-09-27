@@ -42,6 +42,7 @@ const MAX_CONTENT_RANGE_BYTES: usize =
 const MAX_RUN_MESSAGE_PAGE_SIZE: usize = loom_protocol::MAX_AGENT_RUN_MESSAGE_PAGE_SIZE as usize;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DURABLE_FEED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FILESYSTEM_CHANGE_HISTORY: usize = 2048;
 const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_IDEMPOTENCY_PAYLOAD_BYTES: usize = 1024 * 1024;
 
@@ -6691,6 +6692,13 @@ fn save_filesystem_change_rows(
     session_id: AgentSessionId,
     changes: &[SessionFilesystemChange],
 ) -> Result<()> {
+    if changes.len() > MAX_FILESYSTEM_CHANGE_HISTORY {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "filesystem change history exceeds its retention limit",
+            false,
+        ));
+    }
     transaction
         .execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_filesystem_changes (
@@ -7589,6 +7597,24 @@ mod tests {
             FilePersistence::open("").unwrap_err().code,
             ErrorCode::InvalidRequest
         );
+    }
+
+    #[test]
+    fn filesystem_change_writes_enforce_the_retention_limit() {
+        let session_id = AgentSessionId::new();
+        let changes = (1..=(MAX_FILESYSTEM_CHANGE_HISTORY as u64 + 1))
+            .map(|sequence| SessionFilesystemChange {
+                sequence: EventSequence::new(sequence),
+                session_id,
+                path: format!("file-{sequence}"),
+                kind: WorkspaceChangeKind::Created,
+                revision: None,
+            })
+            .collect::<Vec<_>>();
+        let mut connection = Connection::open_in_memory().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let error = save_filesystem_change_rows(&transaction, session_id, &changes).unwrap_err();
+        assert_eq!(error.code, ErrorCode::MalformedPayload);
     }
 
     #[test]

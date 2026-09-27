@@ -21,8 +21,9 @@ content-addressed blob store. Filesystem edits and ordered changes use typed
 session-keyed rows, with prior edit bytes sharing the content store. Repository
 attachments and mounted directories also use typed session-keyed rows; only
 small filesystem identity/control data remains in the compressed, hash-checked
-per-session payload. Filesystem change retention is not yet bounded, and restoring
-the workspace still materializes retained edit/change histories. Large strings in
+per-session payload. Filesystem changes retain the newest 2,048 sequence entries;
+responses flag clients whose cursors predate the retained range. Restoring the
+workspace still materializes retained edit/change histories. Large strings in
 the generic section store are deduplicated and compressed. Provider configuration
 and health use provider-keyed records. Idempotency uses a dedicated table.
 Activities and protocol-level transcript paging are typed; detailed tool-call

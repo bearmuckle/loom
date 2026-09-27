@@ -26,6 +26,7 @@ pub use loom_protocol::{
 };
 
 const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
+const MAX_RETAINED_FILESYSTEM_CHANGES: usize = 2048;
 
 fn checked_mount_path(relative: &str) -> Result<PathBuf> {
     let path = Path::new(relative);
@@ -971,6 +972,7 @@ impl Workspace {
                 changes.push(change);
             }
         }
+        trim_filesystem_change_history(&mut state.changes);
         Ok(changes)
     }
 
@@ -1184,6 +1186,15 @@ impl Workspace {
     }
 }
 
+fn trim_filesystem_change_history(changes: &mut Vec<SessionFilesystemChange>) {
+    let excess = changes
+        .len()
+        .saturating_sub(MAX_RETAINED_FILESYSTEM_CHANGES);
+    if excess > 0 {
+        changes.drain(..excess);
+    }
+}
+
 impl WorkspaceWatcher {
     pub fn poll(&self) -> Result<Vec<SessionFilesystemChange>> {
         self.workspace.poll_changes()
@@ -1251,6 +1262,24 @@ mod tests {
         fs::write(root.join("README.md"), "hello\n").unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn answer() -> u8 { 1 }\n").unwrap();
         (Workspace::open(session_id, &root).unwrap(), root)
+    }
+
+    #[test]
+    fn filesystem_change_retention_keeps_the_newest_sequences() {
+        let session_id = AgentSessionId::new();
+        let mut changes = (1..=(MAX_RETAINED_FILESYSTEM_CHANGES as u64 + 1))
+            .map(|sequence| SessionFilesystemChange {
+                sequence: EventSequence::new(sequence),
+                session_id,
+                path: format!("file-{sequence}"),
+                kind: WorkspaceChangeKind::Created,
+                revision: None,
+            })
+            .collect::<Vec<_>>();
+        trim_filesystem_change_history(&mut changes);
+        assert_eq!(changes.len(), MAX_RETAINED_FILESYSTEM_CHANGES);
+        assert_eq!(changes.first().unwrap().sequence, EventSequence::new(2));
+        assert_eq!(changes.last().unwrap().sequence, EventSequence::new(2049));
     }
 
     #[test]

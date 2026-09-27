@@ -314,6 +314,17 @@ pub use remote::{
 const DEFAULT_EVENT_RETENTION: usize = 4096;
 const IDEMPOTENCY_RETENTION: usize = 1024;
 const MAX_REVIEW_CHANGES: usize = 512;
+
+fn filesystem_history_pruned(
+    after: Option<loom_core::EventSequence>,
+    changes: &[SessionFilesystemChange],
+) -> bool {
+    after.is_some_and(|after| {
+        changes
+            .first()
+            .is_some_and(|first| first.sequence.value() > after.value().saturating_add(1))
+    })
+}
 const MAX_REVIEW_DIFF_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_FILE_BYTES: usize = 128 * 1024;
 const MAX_RUN_MESSAGE_BYTES: usize = 32 * 1024;
@@ -4276,8 +4287,9 @@ impl InProcessConnection {
                 let mut changes = self
                     .session_filesystem(session_id)?
                     .changes_since(after_sequence)?;
-                let truncated = changes.len() > MAX_REVIEW_CHANGES;
-                if truncated {
+                let history_pruned = filesystem_history_pruned(after_sequence, &changes);
+                let truncated = history_pruned || changes.len() > MAX_REVIEW_CHANGES;
+                if changes.len() > MAX_REVIEW_CHANGES {
                     changes = changes.split_off(changes.len() - MAX_REVIEW_CHANGES);
                 }
                 Ok(ServerResponse::SessionFilesystemChanges {
@@ -5349,7 +5361,9 @@ mod tests {
     };
 
     use loom_context::ContextAssemblyOptions;
-    use loom_core::{AgentSessionId, CapabilitySet, PolicyDecision, ToolCallId, WorkspaceId};
+    use loom_core::{
+        AgentSessionId, CapabilitySet, EventSequence, PolicyDecision, ToolCallId, WorkspaceId,
+    };
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
     use loom_protocol::{
         AgentActivityStatus, AgentInteractionStatus, ApprovalDecision, ClientRequest,
@@ -5358,6 +5372,27 @@ mod tests {
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
     use super::*;
+
+    #[test]
+    fn filesystem_change_response_detects_pruned_client_cursors() {
+        let session_id = AgentSessionId::new();
+        let changes = vec![SessionFilesystemChange {
+            sequence: EventSequence::new(5),
+            session_id,
+            path: "src/main.rs".to_owned(),
+            kind: loom_protocol::WorkspaceChangeKind::Modified,
+            revision: Some("revision".to_owned()),
+        }];
+        assert!(filesystem_history_pruned(
+            Some(EventSequence::new(1)),
+            &changes
+        ));
+        assert!(!filesystem_history_pruned(
+            Some(EventSequence::new(4)),
+            &changes
+        ));
+        assert!(!filesystem_history_pruned(None, &changes));
+    }
 
     fn negotiate(connection: &InProcessConnection) {
         let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
