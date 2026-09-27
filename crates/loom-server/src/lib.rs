@@ -19,8 +19,8 @@ use loom_core::{
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
     CURRENT_SCHEMA_VERSION, DurableFeedState, DurableFilesystemEdit, DurableFilesystemRecord,
-    DurableIdempotencyRecord, DurableProviderState, DurableRunMessage, DurableRunSummary,
-    DurableSessionSettings, DurableStateWrite, FilePersistence,
+    DurableIdempotencyRecord, DurableProviderState, DurableRunContextCheckpoint, DurableRunMessage,
+    DurableRunSummary, DurableSessionSettings, DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -663,6 +663,32 @@ fn persisted_run_messages(messages: Vec<DurableRunMessage>) -> Vec<ModelMessage>
             tool_calls: message.tool_calls,
         })
         .collect()
+}
+
+fn hydrate_run_context_checkpoint(
+    persistence: &FilePersistence,
+    run_id: loom_core::RunId,
+    state: &mut AgentRuntimeState,
+) -> Result<()> {
+    let Some(checkpoint) = persistence.load_run_context_checkpoint(run_id)? else {
+        state.context_checkpoint = None;
+        if let Some(inspection) = &mut state.context_inspection {
+            inspection.summary = None;
+        }
+        return Ok(());
+    };
+    if checkpoint.session_id != state.session_id {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "run context checkpoint belongs to a different session",
+            false,
+        ));
+    }
+    state.context_checkpoint = Some(checkpoint.summary.clone());
+    if let Some(inspection) = &mut state.context_inspection {
+        inspection.summary = Some(checkpoint.summary);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2280,6 +2306,7 @@ impl InProcessBackend {
             runtime_state.plan = persistence.load_run_plan(run_id)?;
             runtime_state.run.evidence = evidence;
             runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
+            hydrate_run_context_checkpoint(&persistence, run_id, &mut runtime_state)?;
             runtime_state.activities = persistence.load_run_activities(run_id)?;
             runtime_state.attempts = persistence.load_run_attempts(run_id)?;
             if runtime_state.attempts.is_empty() {
@@ -2398,6 +2425,20 @@ impl InProcessBackend {
                 },
             );
         }
+        let durable_run_context_checkpoints =
+            runs.iter()
+                .map(|(run_id, state)| {
+                    (
+                        *run_id,
+                        state.context_checkpoint.clone().map(|summary| {
+                            DurableRunContextCheckpoint {
+                                session_id: state.session_id,
+                                summary,
+                            }
+                        }),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
         let mut durable_run_messages = BTreeMap::new();
         let mut durable_run_activities = BTreeMap::new();
         let entity_sections = runs
@@ -2405,6 +2446,10 @@ impl InProcessBackend {
             .map(|(run_id, mut state)| {
                 state.plan.steps.clear();
                 state.run.evidence.clear();
+                state.context_checkpoint = None;
+                if let Some(inspection) = &mut state.context_inspection {
+                    inspection.summary = None;
+                }
                 durable_run_messages
                     .insert(run_id, durable_run_messages_from_runtime(&state.messages));
                 state.messages.clear();
@@ -2516,6 +2561,7 @@ impl InProcessBackend {
             usage: Some(&provider_usage),
             idempotency: Some(&idempotency),
             run_summaries: Some(&durable_run_summaries),
+            run_context_checkpoints: Some(&durable_run_context_checkpoints),
             run_plans: Some(&durable_run_plans),
             run_messages: Some(&durable_run_messages),
             run_activities: Some(&durable_run_activities),
@@ -3039,6 +3085,7 @@ impl InProcessConnection {
         state.run.evidence = summary.snapshot.evidence.clone();
         state.messages =
             persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
+        hydrate_run_context_checkpoint(persistence, summary.snapshot.id, &mut state)?;
         state.activities = persistence.load_run_activities(summary.snapshot.id)?;
         state.attempts = persistence.load_run_attempts(summary.snapshot.id)?;
         if state.attempts.is_empty() {

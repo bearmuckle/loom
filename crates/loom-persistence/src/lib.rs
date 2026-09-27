@@ -18,9 +18,9 @@ use loom_protocol::{
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
     AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
-    ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope, SessionDirectory,
-    SessionFilesystemChange, SessionRepository, ToolResult, WorkspaceChangeKind, WorkspaceConfig,
-    WorkspaceControl,
+    ApprovalDecision, Checkpoint, CheckpointFile, ContextSummary, ServerEventEnvelope,
+    SessionDirectory, SessionFilesystemChange, SessionRepository, ToolResult, WorkspaceChangeKind,
+    WorkspaceConfig, WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -30,8 +30,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 28;
-const DATABASE_SCHEMA_VERSION: u32 = 28;
+pub const CURRENT_SCHEMA_VERSION: u32 = 29;
+const DATABASE_SCHEMA_VERSION: u32 = 29;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -208,6 +208,20 @@ CREATE TABLE IF NOT EXISTS run_messages (
     FOREIGN KEY(run_id, session_id)
         REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
 ) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS run_context_checkpoints (
+    run_id BLOB PRIMARY KEY NOT NULL CHECK(length(run_id) = 16),
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    summary_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE RESTRICT
+        CHECK(length(summary_hash) = 32),
+    source_message_count INTEGER NOT NULL CHECK(source_message_count >= 0),
+    projection_version INTEGER NOT NULL CHECK(projection_version >= 0),
+    source_digest TEXT NOT NULL CHECK(length(source_digest) <= 64),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_context_checkpoints_by_session
+    ON run_context_checkpoints(session_id, run_id);
 CREATE INDEX IF NOT EXISTS run_messages_by_session
     ON run_messages(session_id, run_id, ordinal);
 CREATE TABLE IF NOT EXISTS run_activities (
@@ -863,6 +877,12 @@ pub struct DurableRunSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRunContextCheckpoint {
+    pub session_id: AgentSessionId,
+    pub summary: ContextSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableRunMessage {
     pub role: loom_model::MessageRole,
     pub content: String,
@@ -915,6 +935,7 @@ pub struct DurableStateWrite<'a> {
     pub usage: Option<&'a UsageLedger>,
     pub idempotency: Option<&'a BTreeMap<RequestId, DurableIdempotencyRecord>>,
     pub run_summaries: Option<&'a BTreeMap<RunId, DurableRunSummary>>,
+    pub run_context_checkpoints: Option<&'a BTreeMap<RunId, Option<DurableRunContextCheckpoint>>>,
     pub run_plans: Option<&'a BTreeMap<RunId, AgentPlan>>,
     pub run_messages: Option<&'a BTreeMap<RunId, Vec<DurableRunMessage>>>,
     pub run_activities: Option<&'a DurableRunActivities>,
@@ -1609,6 +1630,82 @@ impl FilePersistence {
             )?
             .into_values()
             .next())
+    }
+
+    /// Loads one run's typed context checkpoint without reading its runtime payload.
+    pub fn load_run_context_checkpoint(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<DurableRunContextCheckpoint>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT session_id, summary_hash, source_message_count,
+                        projection_version, source_digest, created_at
+                 FROM run_context_checkpoints WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read run context checkpoint: {error}"),
+                    true,
+                )
+            })?;
+        let Some((session_id, summary_hash, source_count, version, source_digest, created_at)) =
+            row
+        else {
+            return Ok(None);
+        };
+        let source_count = usize::try_from(decode_counter(source_count, "context message count")?)
+            .map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted context message count is out of range",
+                    false,
+                )
+            })?;
+        let projection_version =
+            u32::try_from(decode_counter(version, "context projection version")?).map_err(
+                |_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted context projection version is out of range",
+                        false,
+                    )
+                },
+            )?;
+        let summary = String::from_utf8(decode_content(&connection, &summary_hash)?.into_bytes())
+            .map_err(|error| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted context summary is not UTF-8: {error}"),
+                false,
+            )
+        })?;
+        Ok(Some(DurableRunContextCheckpoint {
+            session_id: AgentSessionId::from_uuid(decode_uuid(&session_id, "context session id")?),
+            summary: ContextSummary {
+                text: summary,
+                source_message_count: source_count,
+                projection_version,
+                source_digest,
+                created_at: decode_timestamp(created_at)?,
+            },
+        }))
     }
 
     /// Loads the latest summary for a session through its activity index.
@@ -3510,6 +3607,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            run_context_checkpoints: None,
             run_plans: None,
             run_messages: None,
             run_activities: None,
@@ -3540,6 +3638,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            run_context_checkpoints: None,
             run_plans: None,
             run_messages: None,
             run_activities: None,
@@ -3583,6 +3682,9 @@ impl FilePersistence {
             save_run_summary_rows(&transaction, run_summaries)?;
             save_run_attempt_rows(&transaction, run_summaries)?;
             save_run_execution_state_rows(&transaction, run_summaries)?;
+        }
+        if let Some(context_checkpoints) = write.run_context_checkpoints {
+            save_run_context_checkpoint_rows(&transaction, context_checkpoints)?;
         }
         if let Some(run_plans) = write.run_plans {
             save_run_plan_rows(&transaction, run_plans, write.run_summaries)?;
@@ -3969,6 +4071,9 @@ fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
              ) AND NOT EXISTS (
                 SELECT 1 FROM run_messages
                 WHERE run_messages.content_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_context_checkpoints
+                WHERE run_context_checkpoints.summary_hash=content_objects.hash
              ) AND NOT EXISTS (
                 SELECT 1 FROM run_message_fragments
                 WHERE run_message_fragments.content_hash=content_objects.hash
@@ -5378,6 +5483,98 @@ fn load_run_evidence_rows(
         }
     }
     Ok(evidence)
+}
+
+fn save_run_context_checkpoint_rows(
+    transaction: &Transaction<'_>,
+    checkpoints: &BTreeMap<RunId, Option<DurableRunContextCheckpoint>>,
+) -> Result<()> {
+    for (run_id, checkpoint) in checkpoints {
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let Some(checkpoint) = checkpoint else {
+            transaction
+                .execute(
+                    "DELETE FROM run_context_checkpoints WHERE run_id=?1",
+                    [run_id_bytes.as_slice()],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not clear run context checkpoint: {error}"),
+                        true,
+                    )
+                })?;
+            continue;
+        };
+        if checkpoint.summary.text.len() > MAX_CONTENT_BYTES
+            || checkpoint.summary.source_digest.len() > 64
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run context checkpoint metadata is invalid",
+                false,
+            ));
+        }
+        let session_id: Vec<u8> = transaction
+            .query_row(
+                "SELECT session_id FROM run_summaries WHERE run_id=?1",
+                [run_id_bytes.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("run {run_id} has no summary for its context checkpoint: {error}"),
+                    true,
+                )
+            })?;
+        if session_id.as_slice() != checkpoint.session_id.as_uuid().as_bytes() {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run context checkpoint belongs to a different session",
+                false,
+            ));
+        }
+        let summary_hash = store_content(transaction, checkpoint.summary.text.as_bytes())?;
+        let source_count = encode_counter(
+            checkpoint.summary.source_message_count as u64,
+            "context message count",
+        )?;
+        let projection_version = i64::from(checkpoint.summary.projection_version);
+        let created_at = encode_timestamp(checkpoint.summary.created_at)?;
+        transaction
+            .execute(
+                "INSERT INTO run_context_checkpoints(
+                    run_id, session_id, summary_hash, source_message_count,
+                    projection_version, source_digest, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    summary_hash=excluded.summary_hash,
+                    source_message_count=excluded.source_message_count,
+                    projection_version=excluded.projection_version,
+                    source_digest=excluded.source_digest,
+                    created_at=excluded.created_at
+                 WHERE run_context_checkpoints.session_id IS NOT excluded.session_id
+                    OR run_context_checkpoints.summary_hash IS NOT excluded.summary_hash
+                    OR run_context_checkpoints.source_message_count IS NOT excluded.source_message_count
+                    OR run_context_checkpoints.projection_version IS NOT excluded.projection_version
+                    OR run_context_checkpoints.source_digest IS NOT excluded.source_digest
+                    OR run_context_checkpoints.created_at IS NOT excluded.created_at",
+                params![
+                    run_id_bytes.as_slice(),
+                    session_id,
+                    summary_hash,
+                    source_count,
+                    projection_version,
+                    checkpoint.summary.source_digest,
+                    created_at,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save run context checkpoint: {error}"), true)
+            })?;
+    }
+    collect_unused_content(transaction)?;
+    Ok(())
 }
 
 fn save_run_plan_rows(
@@ -8027,6 +8224,17 @@ mod tests {
             interactions: None,
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
+        let context_checkpoint = DurableRunContextCheckpoint {
+            session_id: session.id,
+            summary: ContextSummary {
+                text: "older conversation summary".to_owned(),
+                source_message_count: 12,
+                projection_version: 1,
+                source_digest: "ab".repeat(32),
+                created_at: Timestamp::from_unix_millis(2100),
+            },
+        };
+        let run_context_checkpoints = BTreeMap::from([(run_id, Some(context_checkpoint.clone()))]);
         let run_plans = BTreeMap::from([(
             run_id,
             AgentPlan {
@@ -8156,6 +8364,7 @@ mod tests {
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
+                run_context_checkpoints: Some(&run_context_checkpoints),
                 run_plans: Some(&run_plans),
                 run_messages: Some(&run_messages),
                 run_activities: Some(&run_activities),
@@ -8244,6 +8453,7 @@ mod tests {
                     usage: None,
                     idempotency: None,
                     run_summaries: None,
+                    run_context_checkpoints: None,
                     run_plans: None,
                     run_messages: None,
                     run_activities: Some(&completed_activities),
@@ -8273,6 +8483,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: None,
+                run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: None,
                 run_activities: Some(&completed_activities),
@@ -8343,6 +8554,10 @@ mod tests {
             run_summaries.get(&run_id).cloned()
         );
         assert_eq!(
+            persistence.load_run_context_checkpoint(run_id).unwrap(),
+            Some(context_checkpoint.clone())
+        );
+        assert_eq!(
             persistence
                 .load_latest_run_summary_for_session(session.id)
                 .unwrap()
@@ -8393,6 +8608,7 @@ mod tests {
                     usage: Some(&UsageLedger::default()),
                     idempotency: Some(&BTreeMap::new()),
                     run_summaries: Some(&run_summaries),
+                    run_context_checkpoints: None,
                     run_plans: Some(&BTreeMap::new()),
                     run_messages: None,
                     run_activities: None,
@@ -8593,7 +8809,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(content_codec, 1);
-        assert_eq!(content_count, 6);
+        assert_eq!(content_count, 7);
         let (filesystem_codec, raw_size, payload_size): (i64, i64, i64) = connection
             .query_row(
                 "SELECT payload_codec, raw_size, length(payload) FROM session_filesystems
@@ -8638,6 +8854,7 @@ mod tests {
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
+                run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: None,
                 run_activities: None,
@@ -8660,8 +8877,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            content_count, 5,
-            "retained transcript, tool-call, tool-attempt, and filesystem undo content remain reachable"
+            content_count, 6,
+            "retained transcript, context checkpoint, tool, and filesystem undo content remain reachable"
         );
         drop(connection);
         fs::remove_file(path).unwrap();
@@ -8742,6 +8959,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: Some(&run_messages),
                 run_activities: None,
@@ -8866,6 +9084,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: Some(&run_messages),
                 run_activities: None,
@@ -8893,6 +9112,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: Some(&mismatched_messages),
                 run_activities: None,
@@ -8930,6 +9150,7 @@ mod tests {
                     usage: None,
                     idempotency: None,
                     run_summaries: Some(&run_summaries),
+                    run_context_checkpoints: None,
                     run_plans: None,
                     run_messages: Some(&assembled_messages),
                     run_activities: None,
@@ -8963,6 +9184,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: Some(&assembled_messages),
                 run_activities: None,
@@ -9230,6 +9452,7 @@ mod tests {
                     usage: None,
                     idempotency: None,
                     run_summaries: Some(summary),
+                    run_context_checkpoints: None,
                     run_plans: None,
                     run_messages: None,
                     run_activities: None,
@@ -9517,6 +9740,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&summaries),
+                run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: None,
                 run_activities: Some(&activities),

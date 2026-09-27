@@ -16,6 +16,10 @@ The server batches streamed assistant fragments at 50 ms or 32 KiB and flushes
 before durable run-state writes and at completion.
 Run-attempt history and the current continuation cursor, control revision,
 pending input/approval/tool intent, and retry metadata use typed rows.
+Context-compaction summaries use a dedicated run-keyed row for their content
+reference, source-message boundary, projection version, digest, and timestamp;
+the runtime inspection payload retains its token-budget diagnostics without a
+duplicate summary body.
 Checkpoint headers and file entries use keyed rows; checkpoint file text shares the compressed,
 content-addressed blob store. Filesystem edits and ordered changes use typed
 session-keyed rows, with prior edit bytes sharing the content store. Repository
@@ -26,9 +30,10 @@ responses flag clients whose cursors predate the retained range. Restoring the
 workspace still materializes retained edit/change histories. Large strings in
 the generic section store are deduplicated and compressed. Provider configuration
 and health use provider-keyed records. Idempotency uses a dedicated table.
-Activities and protocol-level transcript paging are typed; detailed tool-call
-and tool-attempt records, step/evidence rows, direct page-backed context loading,
-and bounded filesystem history reads remain unfinished. Provider request-level detail is
+Activities, tool calls, tool attempts, plan/evidence, and protocol-level
+transcript paging are typed. Direct page-backed context loading, detailed
+step-execution status, and bounded filesystem history reads remain unfinished.
+Provider request-level detail is
 aggregated by provider/model because no request-level usage history is exposed
 by the current protocol. This
 design replaces the version-2 `sections` container. The release does not import
