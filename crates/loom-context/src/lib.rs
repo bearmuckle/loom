@@ -7,7 +7,7 @@ pub use loom_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_OUTPUT_RESERVE: u64 = 1_024;
+const DEFAULT_OUTPUT_RESERVE: u64 = 4_096;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextAssembly {
@@ -507,6 +507,23 @@ mod tests {
         )
         .unwrap();
         assert!(assembled.inspection.budget.effective_input_tokens.unwrap() > 0);
+        assert_eq!(assembled.inspection.budget.reserved_output_tokens, 16);
+    }
+
+    #[test]
+    fn default_output_reserve_allows_longer_completions() {
+        let assembled = ContextAssembler::assemble(
+            &ContextInput {
+                task: "large model".to_owned(),
+                ..Default::default()
+            },
+            &ContextAssemblyOptions {
+                context_window: Some(128_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(assembled.inspection.budget.reserved_output_tokens, 4_096);
     }
     fn options(limit: u64) -> ContextAssemblyOptions {
         ContextAssemblyOptions {
