@@ -163,52 +163,50 @@ Sources: [server](../crates/loom-server/src/lib.rs), `restore_persisted`;
 ## Indexed persistence scale harness
 
 `cargo bench -p loom-persistence --bench sqlite_scale --locked --offline`
-builds a clean database with 10,000 sessions and 10,000 typed run summaries,
-plus one durable session-created reconnect event per session. It reports
-transaction population time, startup-style fresh-handle catalog/active-run/feed
-header loading, one-session feed reads, a full-feed decoding diagnostic, indexed
-per-session run lookup latency, and database size. Set `LOOM_SCALE_SESSIONS` and
-`LOOM_SCALE_RUNS` to vary the fixture. On this worktree, optimized runs produced:
+builds typed run summaries and runtime configuration rows, plus one durable
+session-created reconnect event per session. Every run has the same policy,
+limits, context budget, and instruction text, exercising profile and content
+deduplication. It reports transaction population time, startup-style fresh-handle
+catalog/active-run/feed-header loading, one-session feed reads, a full-feed
+decoding diagnostic, indexed per-session run lookup latency, and database size.
+Set `LOOM_SCALE_SESSIONS` and `LOOM_SCALE_RUNS` to vary the fixture. Optimized
+runs produced:
 
 | Sessions / runs / feed events | Database size | Population | Catalog + active + feed header p50 | One-session feed read p50 | Full-feed decode p50 | Per-session run query p50 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 / 10,000 / 10,000 | 8,368,128 bytes | 2,181 ms | 5.930 ms | 0.040 ms | 60.136 ms | 0.016 ms |
-| 100,000 / 100,000 / 100,000 | 80,936,960 bytes | 25,704 ms | 52.442 ms | 0.024 ms | 535.376 ms | 0.016 ms |
+| 10,000 / 10,000 / 10,000 | 9,637,888 bytes | 2,579 ms | 5.918 ms | 0.044 ms | 61.755 ms | 0.015 ms |
+| 100,000 / 100,000 / 100,000 | 93,794,304 bytes | 29,731 ms | 55.369 ms | 0.025 ms | 532.425 ms | 0.015 ms |
 
 Before schema v33, the same 100k fixture occupied 113,315,840 bytes. Schema v33
 replaced each run's duplicated JSON snapshot with typed columns for task, model,
 attempt identity, control revision, state and timestamps; optional summary text
-and ordered evidence rows remain separate. The synthetic measurements below
-were collected before the schema v35 runtime-configuration normalization;
-because this fixture contains no runtime configuration, its byte count is not
-expected to change. Schema v34's measured database was
-80,936,960 bytes, 32,378,880 bytes (28.6%) lower and below the 100 MB target. `dbstat`
-reports that at 100k the largest remaining objects are `feed_events` (19.1 MB),
-`run_summaries` (15.2 MB), and `sessions_visible` (8.1 MB). The index-heavy
-catalog and feed shape remains visible in the other `dbstat` rows printed by
-the harness. Schema v33 also makes the model a directly queryable column, but
-intentionally does not add a model index without a query that needs it. Schema
-v34 removes the generic per-run runtime section, storing only unique run
-configuration in a run-keyed record and reconstructing the runtime from typed
-summary/execution/history rows. Schema v35 decomposes approval policy and
-runtime limits, context budgets, checkpoint identity, and token-cost rates into
-typed columns; only context-inspection diagnostics remain bounded JSON. Runtime
-configuration is absent from this synthetic fixture, so its storage reduction
-is not measured here. Schema v36 content-addresses and compresses the system and
-repository instruction strings, sharing identical content across runs; the
-fixture still excludes these fields and therefore cannot quantify that saving.
+and ordered evidence rows remain separate. The earlier schema v34 fixture,
+which omitted runtime configuration, measured 80,936,960 bytes. Schema v35 made
+approval decisions and runtime options typed columns; schema v36 content-addresses
+instruction text and shares identical runtime profiles. With 100k config
+associations pointing to one shared profile, the measured database is
+93,794,304 bytes, 7,073,792 bytes smaller than storing those same typed
+configuration values on every run. `dbstat` shows that `run_runtime_config` and
+its profile-reference index consume about 12.5 MB together; `feed_events` use
+19.1 MB, `run_summaries` 15.2 MB, and `sessions_visible` 8.3 MB. This measured
+state is below the 100,000,000-byte target, but includes only one shared runtime
+profile and no transcript, filesystem, or activity payloads. Schema v33 makes
+the model directly queryable, but does not add a model index without a query
+that needs it. Schema v34 removed the generic per-run runtime section; schema v35
+decomposed approval, limits, context budgets, checkpoint identity, and token
+rates into typed columns. Only context-inspection diagnostics remain bounded
+JSON. The scale fixture includes runtime config and instruction strings.
 
 These are optimized local synthetic measurements, not a platform-independent
-latency guarantee. The fixture includes small session/run snapshots and one
-session-created event per session; it omits runtime configuration, transcripts,
-filesystem snapshots, large activity/output payloads, and UI initialization.
-Thus the 81.3 MB result is not proof that realistic 100k state fits the target.
-The 10 GB target and before/after comparison against the previous storage model
-remain unmeasured. The persistence harness reports per-table/index allocation
-from SQLite `dbstat` to make future size work attributable rather than relying
-only on a total database file size.
+latency guarantee. The fixture includes small session/run snapshots, a single
+runtime profile shared across runs, short instruction strings, and one
+session-created event per session. It omits transcripts, filesystem snapshots,
+large activity/output payloads, multiple realistic profile combinations, and UI
+initialization, so it does not prove that realistic 100k state fits the target.
 
-## Saves scale with all retained history
+The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, and bounded retention. Full snapshot capture/write amplification, atomic snapshot/resubscribe, backend ownership, retention policy, and end-to-end scale proof remain in the PR checklist.
+
+## Baseline findings before the redesign
 
 `persist_state` clones all runs and filesystem state, exports the other managers,
 converts every section to `Value`, and submits all 13 sections for serialization
@@ -242,7 +240,7 @@ event/cursor is durable and what can be lost on a crash.
 Source: [server](../crates/loom-server/src/lib.rs), `persist_state`,
 `spawn_run_worker`, `InProcessConnection::request`, and `run_observer`.
 
-## Recommended direction and order
+## Proposed direction and acceptance criteria
 
 Keep SQLite. Use it for indexed records and transactional updates, with bounded
 JSON payloads where flexibility is useful. A separate database per session is

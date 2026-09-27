@@ -6,15 +6,17 @@ use std::{
 };
 
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, RunAttemptId, RunId,
-    Timestamp, UsageSnapshot, WorkspaceId,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, EventSequence,
+    RunAttemptId, RunId, SessionLimits, Timestamp, UsageSnapshot, WorkspaceId,
 };
 use loom_model::ModelId;
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableRunSummary, DurableStateWrite, FilePersistence,
+    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableRunRuntimeConfig, DurableRunSummary,
+    DurableStateWrite, FilePersistence,
 };
 use loom_protocol::{
-    AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ServerEvent, ServerEventEnvelope,
+    AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ContextAssemblyOptions, ServerEvent,
+    ServerEventEnvelope,
 };
 use loom_session::SessionManager;
 use rusqlite::Connection;
@@ -43,6 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let now = Timestamp::from_unix_millis(1_750_000_000_000);
     let mut run_summaries = std::collections::BTreeMap::new();
+    let mut run_runtime_configs = std::collections::BTreeMap::new();
+    let system_instructions =
+        "Follow repository guidance, make focused changes, and verify behavior. ".repeat(8);
+    let repository_instructions =
+        "Prefer the existing code patterns and keep generated files unchanged. ".repeat(6);
     for index in 0..run_count {
         let run_id = RunId::new();
         let session_id = session_ids[index % session_ids.len().max(1)];
@@ -74,6 +81,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 attempts: None,
                 execution_state: None,
                 interactions: None,
+            },
+        );
+        run_runtime_configs.insert(
+            run_id,
+            DurableRunRuntimeConfig {
+                system_instructions: Some(system_instructions.clone()),
+                repository_instructions: Some(repository_instructions.clone()),
+                approval_policy: ApprovalPolicy::default(),
+                limits: SessionLimits {
+                    max_tool_calls: Some(100),
+                    ..SessionLimits::default()
+                },
+                context_options: ContextAssemblyOptions {
+                    context_window: Some(32_768),
+                    max_input_tokens: Some(24_000),
+                    reserved_output_tokens: Some(4_096),
+                },
+                checkpoint_id: None,
+                input_cost_micros_per_1k: 1,
+                output_cost_micros_per_1k: 3,
+                context_inspection: None,
             },
         );
     }
@@ -119,7 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         usage: None,
         idempotency: None,
         run_summaries: Some(&run_summaries),
-        run_runtime_configs: None,
+        run_runtime_configs: Some(&run_runtime_configs),
         run_context_checkpoints: None,
         run_plans: None,
         run_messages: None,
@@ -177,9 +205,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = io::stdout().lock();
     writeln!(output, "storage scale benchmark")?;
     writeln!(output, "sessions: {session_count}; runs: {run_count}")?;
+    writeln!(
+        output,
+        "typed run runtime configs: {}",
+        run_runtime_configs.len()
+    )?;
     writeln!(output, "durable reconnect events: {}", feed.events.len())?;
     writeln!(output, "database bytes: {database_bytes}")?;
     let connection = Connection::open(&path)?;
+    let runtime_profile_count: i64 =
+        connection.query_row("SELECT COUNT(*) FROM runtime_configurations", [], |row| {
+            row.get(0)
+        })?;
+    writeln!(
+        output,
+        "deduplicated runtime profiles: {runtime_profile_count}"
+    )?;
     let mut statement = connection.prepare(
         "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC LIMIT 12",
     )?;

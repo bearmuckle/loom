@@ -100,8 +100,8 @@ CREATE INDEX IF NOT EXISTS runs_by_session_activity
     ON run_summaries(session_id, updated_at DESC, run_id DESC);
 CREATE INDEX IF NOT EXISTS runs_by_state_activity
     ON run_summaries(state, updated_at DESC, run_id DESC);
-CREATE TABLE IF NOT EXISTS run_runtime_config (
-    run_id BLOB PRIMARY KEY NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE,
+CREATE TABLE IF NOT EXISTS runtime_configurations (
+    configuration_hash BLOB PRIMARY KEY NOT NULL CHECK(length(configuration_hash) = 32),
     system_instructions_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
         CHECK(system_instructions_hash IS NULL OR length(system_instructions_hash) = 32),
     repository_instructions_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
@@ -121,9 +121,16 @@ CREATE TABLE IF NOT EXISTS run_runtime_config (
     context_reserved_output_tokens INTEGER CHECK(context_reserved_output_tokens IS NULL OR context_reserved_output_tokens >= 0),
     checkpoint_id BLOB CHECK(checkpoint_id IS NULL OR length(checkpoint_id) = 16),
     input_cost_micros_per_1k INTEGER NOT NULL CHECK(input_cost_micros_per_1k >= 0),
-    output_cost_micros_per_1k INTEGER NOT NULL CHECK(output_cost_micros_per_1k >= 0),
+    output_cost_micros_per_1k INTEGER NOT NULL CHECK(output_cost_micros_per_1k >= 0)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS run_runtime_config (
+    run_id BLOB PRIMARY KEY NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE,
+    configuration_hash BLOB NOT NULL REFERENCES runtime_configurations(configuration_hash) ON DELETE RESTRICT
+        CHECK(length(configuration_hash) = 32),
     context_inspection TEXT
 ) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_runtime_config_by_configuration
+    ON run_runtime_config(configuration_hash);
 CREATE TABLE IF NOT EXISTS run_plan_steps (
     run_id BLOB NOT NULL,
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -591,14 +598,32 @@ CREATE TRIGGER IF NOT EXISTS gc_tool_attempts_update AFTER UPDATE OF result_hash
 WHEN OLD.result_hash IS NOT NULL AND OLD.result_hash IS NOT NEW.result_hash BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.result_hash);
 END;
-CREATE TRIGGER IF NOT EXISTS gc_run_runtime_config_delete AFTER DELETE ON run_runtime_config BEGIN
+CREATE TRIGGER IF NOT EXISTS gc_runtime_configurations_delete AFTER DELETE ON runtime_configurations BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
         SELECT 'object', OLD.system_instructions_hash WHERE OLD.system_instructions_hash IS NOT NULL;
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
         SELECT 'object', OLD.repository_instructions_hash WHERE OLD.repository_instructions_hash IS NOT NULL;
 END;
+CREATE TRIGGER IF NOT EXISTS gc_run_runtime_config_delete AFTER DELETE ON run_runtime_config BEGIN
+    DELETE FROM runtime_configurations
+    WHERE configuration_hash=OLD.configuration_hash
+      AND NOT EXISTS (
+          SELECT 1 FROM run_runtime_config
+          WHERE run_runtime_config.configuration_hash=OLD.configuration_hash
+      );
+END;
 CREATE TRIGGER IF NOT EXISTS gc_run_runtime_config_update
-AFTER UPDATE OF system_instructions_hash, repository_instructions_hash ON run_runtime_config BEGIN
+AFTER UPDATE OF configuration_hash ON run_runtime_config
+WHEN OLD.configuration_hash IS NOT NEW.configuration_hash BEGIN
+    DELETE FROM runtime_configurations
+    WHERE configuration_hash=OLD.configuration_hash
+      AND NOT EXISTS (
+          SELECT 1 FROM run_runtime_config
+          WHERE run_runtime_config.configuration_hash=OLD.configuration_hash
+      );
+END;
+CREATE TRIGGER IF NOT EXISTS gc_runtime_configurations_update
+AFTER UPDATE OF system_instructions_hash, repository_instructions_hash ON runtime_configurations BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
         SELECT 'object', OLD.system_instructions_hash
         WHERE OLD.system_instructions_hash IS NOT NULL
@@ -2040,7 +2065,9 @@ impl FilePersistence {
                         context_reserved_output_tokens, checkpoint_id,
                         input_cost_micros_per_1k, output_cost_micros_per_1k,
                         context_inspection
-                 FROM run_runtime_config WHERE run_id=?1",
+                 FROM run_runtime_config
+                 JOIN runtime_configurations USING(configuration_hash)
+                 WHERE run_id=?1",
                 [run_id.as_uuid().as_bytes().as_slice()],
                 |row| {
                     Ok((
@@ -4855,9 +4882,9 @@ fn collect_unused_content(transaction: &Transaction<'_>, candidate_limit: usize)
                 SELECT 1 FROM run_tool_attempts
                 WHERE run_tool_attempts.result_hash=content_objects.hash
              ) AND NOT EXISTS (
-                SELECT 1 FROM run_runtime_config
-                WHERE run_runtime_config.system_instructions_hash=content_objects.hash
-                   OR run_runtime_config.repository_instructions_hash=content_objects.hash
+                SELECT 1 FROM runtime_configurations
+                WHERE runtime_configurations.system_instructions_hash=content_objects.hash
+                   OR runtime_configurations.repository_instructions_hash=content_objects.hash
              ) AND NOT EXISTS (
                 SELECT 1 FROM filesystem_edits
                 WHERE filesystem_edits.before_hash=content_objects.hash
@@ -6153,69 +6180,66 @@ fn save_run_runtime_config_rows(
             encode_counter(config.input_cost_micros_per_1k, "input cost rate")?;
         let output_cost_micros_per_1k =
             encode_counter(config.output_cost_micros_per_1k, "output cost rate")?;
+        let policy_decisions = [
+            encode_policy_decision(config.approval_policy.read),
+            encode_policy_decision(config.approval_policy.write),
+            encode_policy_decision(config.approval_policy.command),
+            encode_policy_decision(config.approval_policy.network),
+            encode_policy_decision(config.approval_policy.destructive),
+        ];
+        let config_identity = serde_json::to_vec(&(
+            system_instructions_hash.as_deref(),
+            repository_instructions_hash.as_deref(),
+            policy_decisions,
+            [
+                max_duration_ms,
+                max_input_tokens,
+                max_output_tokens,
+                max_tool_calls,
+                max_cost_micros,
+            ],
+            [
+                context_window,
+                context_max_input_tokens,
+                context_reserved_output_tokens,
+            ],
+            config
+                .checkpoint_id
+                .map(|id| id.as_uuid().as_bytes().to_vec()),
+            input_cost_micros_per_1k,
+            output_cost_micros_per_1k,
+        ))
+        .map_err(|error| {
+            persistence_error(
+                format!("could not encode run runtime configuration identity: {error}"),
+                false,
+            )
+        })?;
+        let configuration_hash = Sha256::digest(config_identity).to_vec();
         transaction
             .execute(
-                "INSERT INTO run_runtime_config(
-                    run_id, system_instructions_hash, repository_instructions_hash,
+                "INSERT INTO runtime_configurations(
+                    configuration_hash, system_instructions_hash, repository_instructions_hash,
                     policy_read, policy_write, policy_command, policy_network,
                     policy_destructive, max_duration_ms, max_input_tokens,
                     max_output_tokens, max_tool_calls, max_cost_micros,
                     context_window, context_max_input_tokens,
                     context_reserved_output_tokens, checkpoint_id,
-                    input_cost_micros_per_1k, output_cost_micros_per_1k,
-                    context_inspection
+                    input_cost_micros_per_1k, output_cost_micros_per_1k
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
                  )
-                 ON CONFLICT(run_id) DO UPDATE SET
-                    system_instructions_hash=excluded.system_instructions_hash,
-                    repository_instructions_hash=excluded.repository_instructions_hash,
-                    policy_read=excluded.policy_read,
-                    policy_write=excluded.policy_write,
-                    policy_command=excluded.policy_command,
-                    policy_network=excluded.policy_network,
-                    policy_destructive=excluded.policy_destructive,
-                    max_duration_ms=excluded.max_duration_ms,
-                    max_input_tokens=excluded.max_input_tokens,
-                    max_output_tokens=excluded.max_output_tokens,
-                    max_tool_calls=excluded.max_tool_calls,
-                    max_cost_micros=excluded.max_cost_micros,
-                    context_window=excluded.context_window,
-                    context_max_input_tokens=excluded.context_max_input_tokens,
-                    context_reserved_output_tokens=excluded.context_reserved_output_tokens,
-                    checkpoint_id=excluded.checkpoint_id,
-                    input_cost_micros_per_1k=excluded.input_cost_micros_per_1k,
-                    output_cost_micros_per_1k=excluded.output_cost_micros_per_1k,
-                    context_inspection=excluded.context_inspection
-                 WHERE run_runtime_config.system_instructions_hash IS NOT excluded.system_instructions_hash
-                    OR run_runtime_config.repository_instructions_hash IS NOT excluded.repository_instructions_hash
-                    OR run_runtime_config.policy_read IS NOT excluded.policy_read
-                    OR run_runtime_config.policy_write IS NOT excluded.policy_write
-                    OR run_runtime_config.policy_command IS NOT excluded.policy_command
-                    OR run_runtime_config.policy_network IS NOT excluded.policy_network
-                    OR run_runtime_config.policy_destructive IS NOT excluded.policy_destructive
-                    OR run_runtime_config.max_duration_ms IS NOT excluded.max_duration_ms
-                    OR run_runtime_config.max_input_tokens IS NOT excluded.max_input_tokens
-                    OR run_runtime_config.max_output_tokens IS NOT excluded.max_output_tokens
-                    OR run_runtime_config.max_tool_calls IS NOT excluded.max_tool_calls
-                    OR run_runtime_config.max_cost_micros IS NOT excluded.max_cost_micros
-                    OR run_runtime_config.context_window IS NOT excluded.context_window
-                    OR run_runtime_config.context_max_input_tokens IS NOT excluded.context_max_input_tokens
-                    OR run_runtime_config.context_reserved_output_tokens IS NOT excluded.context_reserved_output_tokens
-                    OR run_runtime_config.checkpoint_id IS NOT excluded.checkpoint_id
-                    OR run_runtime_config.input_cost_micros_per_1k IS NOT excluded.input_cost_micros_per_1k
-                    OR run_runtime_config.output_cost_micros_per_1k IS NOT excluded.output_cost_micros_per_1k
-                    OR run_runtime_config.context_inspection IS NOT excluded.context_inspection",
+                 ON CONFLICT(configuration_hash) DO NOTHING",
                 params![
-                    run_id.as_uuid().as_bytes().as_slice(),
+                    configuration_hash,
                     system_instructions_hash,
                     repository_instructions_hash,
-                    encode_policy_decision(config.approval_policy.read),
-                    encode_policy_decision(config.approval_policy.write),
-                    encode_policy_decision(config.approval_policy.command),
-                    encode_policy_decision(config.approval_policy.network),
-                    encode_policy_decision(config.approval_policy.destructive),
+                    policy_decisions[0],
+                    policy_decisions[1],
+                    policy_decisions[2],
+                    policy_decisions[3],
+                    policy_decisions[4],
                     max_duration_ms,
                     max_input_tokens,
                     max_output_tokens,
@@ -6229,12 +6253,32 @@ fn save_run_runtime_config_rows(
                         .map(|id| id.as_uuid().as_bytes().to_vec()),
                     input_cost_micros_per_1k,
                     output_cost_micros_per_1k,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save run runtime profile for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO run_runtime_config(run_id, configuration_hash, context_inspection)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    configuration_hash=excluded.configuration_hash,
+                    context_inspection=excluded.context_inspection
+                 WHERE run_runtime_config.configuration_hash IS NOT excluded.configuration_hash
+                    OR run_runtime_config.context_inspection IS NOT excluded.context_inspection",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    configuration_hash,
                     context_inspection,
                 ],
             )
             .map_err(|error| {
                 persistence_error(
-                    format!("could not save run runtime configuration {run_id}: {error}"),
+                    format!("could not attach runtime profile to run {run_id}: {error}"),
                     true,
                 )
             })?;
@@ -9685,7 +9729,13 @@ mod tests {
             execution_state: None,
             interactions: None,
         };
-        let run_summaries = BTreeMap::from([(run_id, run_summary)]);
+        let second_run_id = RunId::new();
+        let mut second_summary = run_summary.clone();
+        second_summary.snapshot.id = second_run_id;
+        second_summary.snapshot.attempt_id = loom_core::RunAttemptId::new();
+        second_summary.usage = UsageSnapshot::default();
+        let run_summaries =
+            BTreeMap::from([(run_id, run_summary), (second_run_id, second_summary)]);
         let run_runtime_config = DurableRunRuntimeConfig {
             system_instructions: Some("Use the project conventions".to_owned()),
             repository_instructions: Some("Do not modify generated files".to_owned()),
@@ -9710,7 +9760,10 @@ mod tests {
             output_cost_micros_per_1k: 29,
             context_inspection: None,
         };
-        let run_runtime_configs = BTreeMap::from([(run_id, run_runtime_config.clone())]);
+        let run_runtime_configs = BTreeMap::from([
+            (run_id, run_runtime_config.clone()),
+            (second_run_id, run_runtime_config.clone()),
+        ]);
         let context_checkpoint = DurableRunContextCheckpoint {
             session_id: session.id,
             summary: ContextSummary {
@@ -10047,12 +10100,17 @@ mod tests {
             persistence.load_run_runtime_config(run_id).unwrap(),
             Some(run_runtime_config)
         );
+        assert_eq!(
+            persistence.load_run_runtime_config(second_run_id).unwrap(),
+            Some(run_runtime_configs[&run_id].clone())
+        );
         let connection = persistence.connection().unwrap();
         let (stored_tool_limit, stored_policy, limit_storage_type): (i64, String, String) =
             connection
                 .query_row(
                     "SELECT max_tool_calls, policy_write, typeof(max_tool_calls)
-                     FROM run_runtime_config WHERE run_id=?1",
+                     FROM run_runtime_config JOIN runtime_configurations USING(configuration_hash)
+                     WHERE run_id=?1",
                     [run_id.as_uuid().as_bytes().as_slice()],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
@@ -10061,7 +10119,7 @@ mod tests {
         assert_eq!(stored_policy, "deny");
         assert_eq!(limit_storage_type, "integer");
         let runtime_config_columns = connection
-            .prepare("PRAGMA table_info(run_runtime_config)")
+            .prepare("PRAGMA table_info(runtime_configurations)")
             .unwrap()
             .query_map([], |row| row.get::<_, String>(1))
             .unwrap()
@@ -10069,6 +10127,15 @@ mod tests {
             .unwrap();
         assert!(!runtime_config_columns.contains("options"));
         assert!(!runtime_config_columns.contains("approval_policy"));
+        let profile_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_configurations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            profile_count, 1,
+            "identical runtime configurations share one profile"
+        );
         drop(connection);
         assert_eq!(
             persistence.load_run_context_checkpoint(run_id).unwrap(),
