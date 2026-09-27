@@ -163,49 +163,38 @@ Sources: [server](../crates/loom-server/src/lib.rs), `restore_persisted`;
 ## Indexed persistence scale harness
 
 `cargo bench -p loom-persistence --bench sqlite_scale --locked --offline`
-builds typed run summaries and runtime configuration rows, plus one durable
-session-created reconnect event per session. Every run has the same policy,
-limits, context budget, and instruction text, exercising profile and content
-deduplication. It reports transaction population time, startup-style fresh-handle
-catalog/active-run/feed-header loading, one-session feed reads, a full-feed
-decoding diagnostic, indexed per-session run lookup latency, and database size.
-Set `LOOM_SCALE_SESSIONS` and `LOOM_SCALE_RUNS` to vary the fixture. Optimized
-runs produced:
+builds typed run summaries/runtime profiles, four varied transcript messages per
+run (including tool output), and one durable session-created event per session.
+Every run shares one policy/profile and the same short instruction strings,
+exercising profile and content deduplication. It reports transaction population,
+the all-session/active-run/feed-header startup-style read, a one-session feed,
+full-feed decode, bounded transcript-page and content-range reads, indexed
+per-session run lookup, and database size. Set `LOOM_SCALE_SESSIONS` and
+`LOOM_SCALE_RUNS` to vary the fixture. Optimized runs produced:
 
-| Sessions / runs / feed events | Database size | Population | Catalog + active + feed header p50 | One-session feed read p50 | Full-feed decode p50 | Per-session run query p50 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 / 10,000 / 10,000 | 9,629,696 bytes | 2,596 ms | 5.515 ms | 0.057 ms | 60.947 ms | 0.016 ms |
-| 100,000 / 100,000 / 100,000 | 93,995,008 bytes | 29,850 ms | 51.738 ms | 0.025 ms | 532.547 ms | 0.016 ms |
-
-Before schema v33, the same 100k fixture occupied 113,315,840 bytes. Schema v33
-replaced each run's duplicated JSON snapshot with typed columns for task, model,
-attempt identity, control revision, state and timestamps; optional summary text
-and ordered evidence rows remain separate. The earlier schema v34 fixture,
-which omitted runtime configuration, measured 80,936,960 bytes. Schema v35 made
-approval decisions and runtime options typed columns; schema v36 content-addresses
-instruction text and shares identical runtime profiles. With 100k config
-associations pointing to one shared profile, the measured database is
-93,794,304 bytes, 7,073,792 bytes smaller than storing those same typed
-configuration values on every run. The latest measurement is 93,995,008 bytes;
-the 201 KB increase from the prior run is the normalized transcript-call table
-and its indexes, which exist even though this fixture has no transcripts.
-`dbstat` shows that `run_runtime_config` and
-its profile-reference index consume about 12.5 MB together; `feed_events` use
-19.1 MB, `run_summaries` 15.2 MB, and `sessions_visible` 8.3 MB. This measured
-state is below the 100,000,000-byte target, but includes only one shared runtime
-profile and no transcript, filesystem, or activity payloads. Schema v33 makes
-the model directly queryable, but does not add a model index without a query
-that needs it. Schema v34 removed the generic per-run runtime section; schema v35
-decomposed approval, limits, context budgets, checkpoint identity, and token
-rates into typed columns. Only context-inspection diagnostics remain bounded
-JSON. The scale fixture includes runtime config and instruction strings.
+| Sessions / runs / messages / feed events | Database size | Population | Session catalog + active-run + feed header p50 | One-session feed p50 | Full-feed decode p50 | Transcript page p50 | Content range p50 | Per-session run lookup p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 / 10,000 / 40,000 / 10,000 | 42,500,096 bytes | 7,041 ms | 5.533 ms | 0.049 ms | 65.463 ms | 0.191 ms | 0.056 ms | 0.015 ms |
+| 100,000 / 100,000 / 400,000 / 100,000 | 425,418,752 bytes | 83,704 ms | 54.134 ms | 0.024 ms | 573.918 ms | 0.246 ms | 0.079 ms | 0.015 ms |
 
 These are optimized local synthetic measurements, not a platform-independent
-latency guarantee. The fixture includes small session/run snapshots, a single
-runtime profile shared across runs, short instruction strings, and one
-session-created event per session. It omits transcripts, filesystem snapshots,
-large activity/output payloads, multiple realistic profile combinations, and UI
-initialization, so it does not prove that realistic 100k state fits the target.
+latency guarantee or a cold UI startup measurement. The startup-style query
+loads the session catalog and active summaries from a fresh persistence handle;
+it omits UI initialization, filesystem snapshots/checkpoints, activity history,
+and diverse runtime profiles. The 100k state including these transcripts is
+425 MB, so the previous under-100 MB result applied only to the transcript-free
+fixture and is not representative of realistic retained content. `dbstat` shows
+the content blobs and part/index tables dominate at this size. The benchmark
+now proves that transcript pages and byte ranges stay fast on a database much
+larger than the prior synthetic fixture, but the cold application start target,
+full storage budget, realistic checkpoint/filesystem cost, and runtime-profile
+variety remain unproven.
+
+Historical schema v33-v36 comparisons used the earlier transcript-free fixture
+and are not directly comparable to these measurements. Schema v33 replaced
+duplicated run JSON snapshots with typed rows; later schemas normalized run
+options and deduplicated runtime profiles/content. The current fixture includes
+those features plus retained transcript content.
 
 The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. The CLI and native UI now drain their locally owned backends on graceful teardown. Event cursors now carry a backend-instance epoch and resync on restart; transactional snapshot capture, workspace streams, retention policy, and end-to-end scale proof remain in the PR checklist.
 

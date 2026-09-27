@@ -11,8 +11,8 @@ use loom_core::{
 };
 use loom_model::ModelId;
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableRunRuntimeConfig, DurableRunSummary,
-    DurableStateWrite, FilePersistence,
+    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableRunMessage, DurableRunRuntimeConfig,
+    DurableRunSummary, DurableStateWrite, FilePersistence,
 };
 use loom_protocol::{
     AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ContextAssemblyOptions, ServerEvent,
@@ -30,7 +30,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_count = env::var("LOOM_SCALE_RUNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(session_count);
+        .unwrap_or(session_count)
+        .max(1);
     let path = env::temp_dir().join(format!("loom-sqlite-scale-{}.db", std::process::id()));
     let _ = fs::remove_file(&path);
 
@@ -46,6 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let now = Timestamp::from_unix_millis(1_750_000_000_000);
     let mut run_summaries = std::collections::BTreeMap::new();
     let mut run_runtime_configs = std::collections::BTreeMap::new();
+    let mut run_messages = std::collections::BTreeMap::new();
+    let mut run_ids = Vec::with_capacity(run_count);
     let system_instructions =
         "Follow repository guidance, make focused changes, and verify behavior. ".repeat(8);
     let repository_instructions =
@@ -73,6 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             summary: None,
             evidence: Vec::new(),
         };
+        run_ids.push(run_id);
         run_summaries.insert(
             run_id,
             DurableRunSummary {
@@ -103,6 +107,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_cost_micros_per_1k: 3,
                 context_inspection: None,
             },
+        );
+        let tool_output = (0..12)
+            .map(|line| {
+                format!(
+                    "run {index}: test_module_{line} passed; fixtures and assertions verified\n"
+                )
+            })
+            .collect::<String>();
+        run_messages.insert(
+            run_id,
+            vec![
+                DurableRunMessage {
+                    role: loom_model::MessageRole::User,
+                    content: format!(
+                        "Inspect workspace item {index}, make a focused change, and run its tests."
+                    ),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                DurableRunMessage {
+                    role: loom_model::MessageRole::Assistant,
+                    content: format!(
+                        "I updated the relevant files for item {index} and am checking the result."
+                    ),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                DurableRunMessage {
+                    role: loom_model::MessageRole::Tool,
+                    content: tool_output,
+                    name: Some("run_tests".to_owned()),
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                DurableRunMessage {
+                    role: loom_model::MessageRole::Assistant,
+                    content: format!(
+                        "Validation completed for item {index}. {}",
+                        "No failures were reported. ".repeat(8)
+                    ),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+            ],
         );
     }
 
@@ -150,7 +201,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_runtime_configs: Some(&run_runtime_configs),
         run_context_checkpoints: None,
         run_plans: None,
-        run_messages: None,
+        run_messages: Some(&run_messages),
         run_activities: None,
         filesystem_records: None,
         records: &[],
@@ -168,6 +219,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut startup_samples = Vec::with_capacity(5);
     let mut stream_samples = Vec::with_capacity(5);
     let mut full_feed_samples = Vec::with_capacity(5);
+    let mut transcript_page_samples = Vec::with_capacity(5);
+    let mut content_range_samples = Vec::with_capacity(5);
+    let target_run_id = run_ids.first().copied().ok_or("missing target run")?;
     for _ in 0..5 {
         let fresh_handle = FilePersistence::open(&path)?;
         let started = Instant::now();
@@ -181,17 +235,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let full_feed_started = Instant::now();
         let full_feed = fresh_handle.load_feed_state()?.ok_or("missing feed")?;
         full_feed_samples.push(full_feed_started.elapsed());
+        let transcript_page_started = Instant::now();
+        let transcript_page = fresh_handle.load_run_message_page(target_run_id, None, 20)?;
+        transcript_page_samples.push(transcript_page_started.elapsed());
+        let content_range_started = Instant::now();
+        let newest_message = transcript_page.first().ok_or("missing transcript page")?;
+        let message_content = fresh_handle.load_run_message_content_range(
+            target_run_id,
+            newest_message.ordinal,
+            0,
+            usize::try_from(newest_message.content_bytes)?.min(4096),
+        )?;
+        content_range_samples.push(content_range_started.elapsed());
         black_box((
             loaded_sessions,
             active_runs,
             feed_header,
             stream_events,
             full_feed,
+            transcript_page,
+            message_content,
         ));
     }
     startup_samples.sort_unstable();
     stream_samples.sort_unstable();
     full_feed_samples.sort_unstable();
+    transcript_page_samples.sort_unstable();
+    content_range_samples.sort_unstable();
 
     let lookup_handle = FilePersistence::open(&path)?;
     let mut lookup_samples = Vec::with_capacity(100);
@@ -209,6 +279,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output,
         "typed run runtime configs: {}",
         run_runtime_configs.len()
+    )?;
+    writeln!(
+        output,
+        "transcript messages: {}",
+        run_messages.values().map(Vec::len).sum::<usize>()
     )?;
     writeln!(output, "durable reconnect events: {}", feed.events.len())?;
     writeln!(output, "database bytes: {database_bytes}")?;
@@ -248,6 +323,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output,
         "full retained feed decode p50 (diagnostic): {}",
         fmt(full_feed_samples[2])
+    )?;
+    writeln!(
+        output,
+        "newest transcript page p50 (20-message page): {}",
+        fmt(transcript_page_samples[2])
+    )?;
+    writeln!(
+        output,
+        "bounded transcript content read p50: {}",
+        fmt(content_range_samples[2])
     )?;
     writeln!(
         output,
