@@ -493,7 +493,12 @@ Implement in this order:
    worker step can perform an effect. Recovery never replays a persisted
    in-flight tool automatically; it marks the run failed with an unknown
    external outcome and requires an explicit retry. Further execution-state
-   normalization and crash-injection coverage remain.
+   normalization and crash-injection coverage remain. Ownership of one local
+   database by a single backend is not yet enforced. A run worker can retain the
+   backend while a run waits on approval, so dropping the caller's backend
+   handle does not mean it is safe to reopen the database in-process. Add an
+   explicit worker shutdown/drain lifecycle and cross-process ownership lock
+   before claiming exclusive database ownership.
    Schema v22 stores ordered run-attempt identity, state, checkpoint, and timing
    records separately; checkpoint retry adds a new row while earlier attempts
    remain queryable. These rows are written transactionally with the run
