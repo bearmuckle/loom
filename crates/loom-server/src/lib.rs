@@ -32,14 +32,15 @@ use loom_protocol::{
     MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult,
     RequestEnvelope, ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionDirectory,
     SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, unsupported_version_error,
+    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceEvent, WorkspaceEventEnvelope,
+    WorkspaceFeedEvent, unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
     ModelProvider, ProviderConfig, ProviderHealth, ProviderRegistry, UnavailableProvider,
     UsageLedger, deterministic_descriptor,
 };
-use loom_session::SessionManager;
+use loom_session::{SessionManager, WorkspaceManager};
 use loom_tools::ToolExecutor;
 use loom_vcs::GitService;
 use loom_workspace::Workspace;
@@ -583,6 +584,10 @@ struct EventJournal {
     events: Vec<ServerEventEnvelope>,
     #[serde(skip)]
     pending_events: Vec<ServerEventEnvelope>,
+    #[serde(default)]
+    workspace_events: Vec<WorkspaceEventEnvelope>,
+    #[serde(skip)]
+    pending_workspace_events: Vec<WorkspaceEventEnvelope>,
     #[serde(default = "default_event_retention")]
     retention_limit: usize,
 }
@@ -614,6 +619,52 @@ impl EventJournal {
         self.pending_events.push(event);
         Self::prune_events(&mut self.events, self.retention_limit);
         Self::prune_events(&mut self.pending_events, self.retention_limit);
+    }
+
+    fn append_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        event: WorkspaceEvent,
+    ) -> EventSequence {
+        let envelope = WorkspaceEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence: self.next(),
+            workspace_id,
+            event,
+        };
+        let sequence = envelope.sequence;
+        self.workspace_events.push(envelope.clone());
+        self.pending_workspace_events.push(envelope);
+        Self::prune_workspace_events(&mut self.workspace_events, self.retention_limit);
+        Self::prune_workspace_events(&mut self.pending_workspace_events, self.retention_limit);
+        sequence
+    }
+
+    fn discard_pending_workspace(&mut self, sequence: EventSequence) {
+        self.pending_workspace_events
+            .retain(|event| event.sequence != sequence);
+        self.workspace_events
+            .retain(|event| event.sequence != sequence);
+    }
+
+    fn prune_workspace_events(events: &mut Vec<WorkspaceEventEnvelope>, limit: usize) {
+        let mut counts = BTreeMap::<WorkspaceId, usize>::new();
+        for event in events.iter() {
+            *counts.entry(event.workspace_id).or_default() += 1;
+        }
+        for (workspace_id, count) in counts {
+            let mut excess = count.saturating_sub(limit);
+            if excess > 0 {
+                events.retain(|event| {
+                    if excess > 0 && event.workspace_id == workspace_id {
+                        excess -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
     }
 
     fn prune_events(events: &mut Vec<ServerEventEnvelope>, limit: usize) {
@@ -683,6 +734,8 @@ impl EventJournal {
         self.retention_limit = limit;
         Self::prune_events(&mut self.events, limit);
         Self::prune_events(&mut self.pending_events, limit);
+        Self::prune_workspace_events(&mut self.workspace_events, limit);
+        Self::prune_workspace_events(&mut self.pending_workspace_events, limit);
     }
 
     fn events_since(
@@ -703,47 +756,86 @@ impl EventJournal {
     fn workspace_events_since(
         &self,
         session_ids: &BTreeSet<AgentSessionId>,
+        workspace_id: WorkspaceId,
         after_sequence: Option<EventSequence>,
-    ) -> Vec<ServerEventEnvelope> {
-        self.events
+    ) -> Vec<WorkspaceFeedEvent> {
+        let mut events = self
+            .events
             .iter()
             .filter(|event| {
                 session_ids.contains(&event.session_id)
                     && after_sequence.is_none_or(|sequence| event.sequence > sequence)
             })
             .cloned()
-            .collect()
+            .map(WorkspaceFeedEvent::Session)
+            .collect::<Vec<_>>();
+        events.extend(
+            self.workspace_events
+                .iter()
+                .filter(|event| {
+                    event.workspace_id == workspace_id
+                        && after_sequence.is_none_or(|sequence| event.sequence > sequence)
+                })
+                .cloned()
+                .map(WorkspaceFeedEvent::Workspace),
+        );
+        events.sort_by_key(|event| match event {
+            WorkspaceFeedEvent::Session(event) => event.sequence,
+            WorkspaceFeedEvent::Workspace(event) => event.sequence,
+        });
+        events
     }
 
     fn workspace_oldest_sequence(
         &self,
         session_ids: &BTreeSet<AgentSessionId>,
+        workspace_id: WorkspaceId,
     ) -> Option<EventSequence> {
         self.events
             .iter()
             .find(|event| session_ids.contains(&event.session_id))
             .map(|event| event.sequence)
+            .into_iter()
+            .chain(
+                self.workspace_events
+                    .iter()
+                    .find(|event| event.workspace_id == workspace_id)
+                    .map(|event| event.sequence),
+            )
+            .min()
     }
 
     fn workspace_latest_sequence(
         &self,
         session_ids: &BTreeSet<AgentSessionId>,
+        workspace_id: WorkspaceId,
     ) -> Option<EventSequence> {
         self.events
             .iter()
             .rev()
             .find(|event| session_ids.contains(&event.session_id))
             .map(|event| event.sequence)
+            .into_iter()
+            .chain(
+                self.workspace_events
+                    .iter()
+                    .rev()
+                    .find(|event| event.workspace_id == workspace_id)
+                    .map(|event| event.sequence),
+            )
+            .max()
     }
 
     fn workspace_cursor_is_stale(
         &self,
         session_ids: &BTreeSet<AgentSessionId>,
+        workspace_id: WorkspaceId,
         after_sequence: Option<EventSequence>,
     ) -> bool {
-        let (Some(after), Some(oldest)) =
-            (after_sequence, self.workspace_oldest_sequence(session_ids))
-        else {
+        let (Some(after), Some(oldest)) = (
+            after_sequence,
+            self.workspace_oldest_sequence(session_ids, workspace_id),
+        ) else {
             return false;
         };
         after.next() < oldest
@@ -1923,6 +2015,7 @@ impl InProcessBackend {
                 Capability::ReadAgentSession,
                 Capability::ControlAgentSession,
                 Capability::SubscribeSessionEvents,
+                Capability::SubscribeWorkspaceEvents,
                 Capability::StartAgentRun,
                 Capability::ReadAgentRun,
                 Capability::ReadAgentRunMessages,
@@ -2354,7 +2447,11 @@ impl InProcessBackend {
         if current_revision.is_some_and(|revision| revision > config.revision) {
             return Ok(());
         }
+        let revision = config.revision;
         let previous = self.workspace_configs()?.insert(workspace_id, config);
+        let sequence = self
+            .journal()?
+            .append_workspace(workspace_id, WorkspaceEvent::ConfigChanged { revision });
         if let Err(error) = self.persist_state() {
             let mut configs = self.workspace_configs()?;
             if let Some(previous) = previous {
@@ -2362,6 +2459,7 @@ impl InProcessBackend {
             } else {
                 configs.remove(&workspace_id);
             }
+            self.journal()?.discard_pending_workspace(sequence);
             return Err(error);
         }
         Ok(())
@@ -2409,6 +2507,8 @@ impl InProcessBackend {
                     next_sequence: feed.next_sequence,
                     events: Vec::new(),
                     pending_events: Vec::new(),
+                    workspace_events: Vec::new(),
+                    pending_workspace_events: Vec::new(),
                     retention_limit: feed.retention_limit,
                 })
                 .unwrap_or_default(),
@@ -2676,6 +2776,7 @@ impl InProcessBackend {
                 next_sequence: journal.next_sequence,
                 retention_limit: journal.retention_limit,
                 events: journal.pending_events.clone(),
+                workspace_events: journal.pending_workspace_events.clone(),
             };
             persistence.save_recovery_updates(&recovery_updates, &feed)?;
             journal.pending_events.clear();
@@ -2844,6 +2945,7 @@ impl InProcessBackend {
             next_sequence: journal.next_sequence,
             retention_limit: journal.retention_limit,
             events: journal.pending_events.clone(),
+            workspace_events: journal.pending_workspace_events.clone(),
         };
         let session_settings = DurableSessionSettings {
             approval_policies: self.session_policies()?.clone(),
@@ -2898,6 +3000,7 @@ impl InProcessBackend {
         });
         if result.is_ok() {
             journal.pending_events.clear();
+            journal.pending_workspace_events.clear();
         }
         result
     }
@@ -3734,7 +3837,7 @@ impl InProcessConnection {
         &self,
         workspace_id: WorkspaceId,
         after_sequence: Option<EventSequence>,
-    ) -> Result<Vec<ServerEventEnvelope>> {
+    ) -> Result<Vec<WorkspaceFeedEvent>> {
         let session_ids = self
             .backend
             .sessions()?
@@ -3748,12 +3851,20 @@ impl InProcessConnection {
             }
             None => Vec::new(),
         };
-        events.extend(
-            self.backend
-                .journal()?
-                .workspace_events_since(&session_ids, after_sequence),
-        );
-        Ok(deduplicate_events(events))
+        events.extend(self.backend.journal()?.workspace_events_since(
+            &session_ids,
+            workspace_id,
+            after_sequence,
+        ));
+        events.sort_by_key(|event| match event {
+            WorkspaceFeedEvent::Session(event) => event.sequence,
+            WorkspaceFeedEvent::Workspace(event) => event.sequence,
+        });
+        events.dedup_by_key(|event| match event {
+            WorkspaceFeedEvent::Session(event) => event.sequence,
+            WorkspaceFeedEvent::Workspace(event) => event.sequence,
+        });
+        Ok(events)
     }
 
     fn session_events_with_safe_cursor(
@@ -3828,7 +3939,7 @@ impl InProcessConnection {
         let live = self
             .backend
             .journal()?
-            .workspace_latest_sequence(&session_ids)
+            .workspace_latest_sequence(&session_ids, workspace_id)
             .unwrap_or_default();
         Ok(durable.max(live))
     }
@@ -3876,7 +3987,22 @@ impl InProcessConnection {
     }
 
     fn rename_workspace(&self, workspace_id: WorkspaceId, name: String) -> Result<WorkspaceRecord> {
-        self.backend.workspace_records()?.rename(workspace_id, name)
+        let mut records = self.backend.workspace_records()?;
+        let previous = records.export_state();
+        let renamed = records.rename(workspace_id, name)?;
+        drop(records);
+        let sequence = self.backend.journal()?.append_workspace(
+            workspace_id,
+            WorkspaceEvent::Renamed {
+                name: renamed.name.clone(),
+            },
+        );
+        if let Err(error) = self.backend.persist_state() {
+            *self.backend.workspace_records()? = WorkspaceManager::from_state(previous)?;
+            self.backend.journal()?.discard_pending_workspace(sequence);
+            return Err(error);
+        }
+        Ok(renamed)
     }
 
     fn create_session_in_workspace(
@@ -4737,6 +4863,20 @@ impl InProcessConnection {
                 if let Some(workspace_id) = workspace_id {
                     self.backend.workspace_records()?.get(workspace_id)?;
                     let events = self.workspace_events_since(workspace_id, after_sequence)?;
+                    let workspace_events_supported = self
+                        .negotiated_capabilities()?
+                        .as_ref()
+                        .is_some_and(|capabilities| {
+                            capabilities.contains(Capability::SubscribeWorkspaceEvents)
+                        });
+                    let events = if workspace_events_supported {
+                        events
+                    } else {
+                        events
+                            .into_iter()
+                            .filter(|event| matches!(event, WorkspaceFeedEvent::Session(_)))
+                            .collect()
+                    };
                     let durable_cursor = self.feed_workspace_cursor(workspace_id)?;
                     let latest_sequence = self.latest_workspace_event_sequence(workspace_id)?;
                     let journal = self.backend.journal()?;
@@ -4752,12 +4892,15 @@ impl InProcessConnection {
                     let history_missing = after_sequence.is_none()
                         && session_ids.iter().any(|session_id| {
                             !events.iter().any(|event| {
-                                event.session_id == *session_id
-                                    && matches!(
-                                        &event.event,
-                                        loom_protocol::ServerEvent::AgentSessionCreated { .. }
-                                            | loom_protocol::ServerEvent::AgentSessionForked { .. }
-                                    )
+                                matches!(event,
+                                    WorkspaceFeedEvent::Session(event)
+                                        if event.session_id == *session_id
+                                            && matches!(
+                                                &event.event,
+                                                loom_protocol::ServerEvent::AgentSessionCreated { .. }
+                                                    | loom_protocol::ServerEvent::AgentSessionForked { .. }
+                                            )
+                                )
                             })
                         });
                     let cursor_stale = stream_epoch_changed
@@ -4769,21 +4912,27 @@ impl InProcessConnection {
                                     || (after > cursor.latest_sequence
                                         && journal.workspace_cursor_is_stale(
                                             &session_ids,
+                                            workspace_id,
                                             after_sequence,
                                         ))
                             }
                             (Some(cursor), None) => cursor.pruned_through.value() > 0,
                             (None, Some(after)) => {
                                 after > global_head_sequence
-                                    || journal
-                                        .workspace_cursor_is_stale(&session_ids, after_sequence)
+                                    || journal.workspace_cursor_is_stale(
+                                        &session_ids,
+                                        workspace_id,
+                                        after_sequence,
+                                    )
                             }
                             (None, None) => false,
                         };
                     if cursor_stale {
                         let oldest_sequence = durable_cursor
                             .and_then(|cursor| cursor.oldest_retained_sequence)
-                            .or_else(|| journal.workspace_oldest_sequence(&session_ids))
+                            .or_else(|| {
+                                journal.workspace_oldest_sequence(&session_ids, workspace_id)
+                            })
                             .or_else(|| {
                                 durable_cursor
                                     .filter(|cursor| cursor.pruned_through.value() > 0)
@@ -4802,8 +4951,21 @@ impl InProcessConnection {
                             stream_epoch: current_stream_epoch,
                         });
                     }
+                    if workspace_events_supported {
+                        return Ok(ServerResponse::WorkspaceEvents {
+                            workspace_id,
+                            events,
+                            stream_epoch: current_stream_epoch,
+                        });
+                    }
                     return Ok(ServerResponse::SessionEvents {
-                        events,
+                        events: events
+                            .into_iter()
+                            .filter_map(|event| match event {
+                                WorkspaceFeedEvent::Session(event) => Some(event),
+                                WorkspaceFeedEvent::Workspace(_) => None,
+                            })
+                            .collect(),
                         stream_epoch: current_stream_epoch,
                     });
                 }
@@ -6348,7 +6510,8 @@ mod tests {
 
     use loom_context::ContextAssemblyOptions;
     use loom_core::{
-        AgentSessionId, CapabilitySet, EventSequence, PolicyDecision, ToolCallId, WorkspaceId,
+        AgentSessionId, Capability, CapabilitySet, EventSequence, PolicyDecision, ProtocolVersion,
+        ToolCallId, WorkspaceId,
     };
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
     use loom_protocol::{
@@ -10708,7 +10871,8 @@ mod tests {
                 assert!(
                     events
                         .iter()
-                        .all(|event| event.session_id == sessions[0].id)
+                        .all(|event| matches!(event,
+                            WorkspaceFeedEvent::Session(event) if event.session_id == sessions[0].id))
                 );
             }
 
@@ -10762,8 +10926,10 @@ mod tests {
         assert_eq!(workspace_id, workspace_a);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session_a);
-        assert!(events.iter().all(|event| event.session_id == session_a));
-        assert!(!events.iter().any(|event| event.session_id == session_b));
+        assert!(events.iter().all(|event| matches!(event,
+            WorkspaceFeedEvent::Session(event) if event.session_id == session_a)));
+        assert!(!events.iter().any(|event| matches!(event,
+            WorkspaceFeedEvent::Session(event) if event.session_id == session_b)));
         assert!(oldest_sequence <= latest_sequence);
         assert_ne!(current_epoch, previous_epoch);
 
@@ -10785,7 +10951,8 @@ mod tests {
         };
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session_b);
-        assert!(events.iter().all(|event| event.session_id == session_b));
+        assert!(events.iter().all(|event| matches!(event,
+            WorkspaceFeedEvent::Session(event) if event.session_id == session_b)));
 
         let advanced_cursor =
             connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
@@ -10796,9 +10963,153 @@ mod tests {
             }));
         assert!(matches!(
             advanced_cursor.result.unwrap(),
-            ServerResponse::SessionEvents { events, .. } if events.is_empty()
+            ServerResponse::WorkspaceEvents { events, .. } if events.is_empty()
         ));
 
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_rename_and_config_changes_are_durable_workspace_events() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-server-workspace-mutations-{}.db",
+            WorkspaceId::new()
+        ));
+        let workspace_id = {
+            let backend = InProcessBackend::new_persistent(&path).unwrap();
+            let connection = backend.connect();
+            negotiate(&connection);
+            let created =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Before rename".to_owned(),
+                }));
+            let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            connection
+                .request(RequestEnvelope::new(ClientRequest::RenameWorkspace {
+                    workspace_id: workspace.id,
+                    name: "After rename".to_owned(),
+                }))
+                .result
+                .unwrap();
+            let config = WorkspaceConfig {
+                revision: 7,
+                ..WorkspaceConfig::default()
+            };
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                        config,
+                    },
+                ))
+                .result
+                .unwrap();
+            backend.flush().unwrap();
+            workspace.id
+        };
+
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let response = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace_id),
+            after_sequence: Some(EventSequence::default()),
+            stream_epoch: None,
+        }));
+        let ServerResponse::WorkspaceEvents {
+            workspace_id: returned,
+            events,
+            ..
+        } = response.result.unwrap()
+        else {
+            panic!("expected workspace event batch");
+        };
+        assert_eq!(returned, workspace_id);
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(events[0], WorkspaceFeedEvent::Workspace(WorkspaceEventEnvelope {
+            event: WorkspaceEvent::Renamed { ref name }, ..
+        }) if name == "After rename")
+        );
+        assert!(matches!(
+            events[1],
+            WorkspaceFeedEvent::Workspace(WorkspaceEventEnvelope {
+                event: WorkspaceEvent::ConfigChanged { revision: 7 },
+                ..
+            })
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_feed_capability_keeps_protocol_40_response_compatible() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-server-workspace-feed-capability-{}.db",
+            WorkspaceId::new()
+        ));
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let writer = backend.connect();
+        negotiate(&writer);
+        let created = writer.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Before".to_owned(),
+        }));
+        let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        writer
+            .request(RequestEnvelope::new(ClientRequest::RenameWorkspace {
+                workspace_id: workspace.id,
+                name: "After".to_owned(),
+            }))
+            .result
+            .unwrap();
+
+        let legacy = backend.connect();
+        let v40 = ProtocolVersion::new(4, 0);
+        let legacy_capabilities = CapabilitySet::new([Capability::SubscribeSessionEvents]);
+        let negotiated = legacy.request(RequestEnvelope::with_version(
+            v40,
+            ClientRequest::Negotiate {
+                client_version: v40,
+                capabilities: legacy_capabilities,
+            },
+        ));
+        assert!(matches!(
+            negotiated.result,
+            Ok(ServerResponse::Negotiated(_))
+        ));
+        let legacy_events = legacy.request(RequestEnvelope::with_version(
+            v40,
+            ClientRequest::GetSessionEvents {
+                session_id: None,
+                workspace_id: Some(workspace.id),
+                after_sequence: Some(EventSequence::default()),
+                stream_epoch: None,
+            },
+        ));
+        let ServerResponse::SessionEvents { events, .. } = legacy_events.result.unwrap() else {
+            panic!("protocol 4.0 clients must receive the legacy SessionEvents response");
+        };
+        assert!(
+            events.is_empty(),
+            "workspace-only rows must not leak to v4.0 clients"
+        );
+
+        let current = backend.connect();
+        negotiate(&current);
+        let current_events =
+            current.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: None,
+                workspace_id: Some(workspace.id),
+                after_sequence: Some(EventSequence::default()),
+                stream_epoch: None,
+            }));
+        assert!(matches!(current_events.result.unwrap(),
+            ServerResponse::WorkspaceEvents { events, .. }
+                if matches!(events.as_slice(), [WorkspaceFeedEvent::Workspace(_)])));
         fs::remove_file(path).unwrap();
     }
 

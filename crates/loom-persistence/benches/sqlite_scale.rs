@@ -271,6 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )
             .collect::<Result<Vec<_>, _>>()?,
+        workspace_events: Vec::new(),
     };
     let persistence = FilePersistence::open(&path)?;
     let write_started = Instant::now();

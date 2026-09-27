@@ -50,7 +50,7 @@ pub use workspace::{
     WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(4, 0);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(4, 1);
 pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
 pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
 pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
@@ -725,6 +725,12 @@ pub enum ServerResponse {
         #[serde(default)]
         stream_epoch: Option<String>,
     },
+    WorkspaceEvents {
+        workspace_id: WorkspaceId,
+        events: Vec<WorkspaceFeedEvent>,
+        #[serde(default)]
+        stream_epoch: Option<String>,
+    },
     SessionEventsSnapshot {
         session: AgentSessionSnapshot,
         events: Vec<ServerEventEnvelope>,
@@ -739,7 +745,7 @@ pub enum ServerResponse {
     WorkspaceEventsSnapshot {
         workspace_id: WorkspaceId,
         sessions: Vec<AgentSessionSnapshot>,
-        events: Vec<ServerEventEnvelope>,
+        events: Vec<WorkspaceFeedEvent>,
         oldest_sequence: EventSequence,
         latest_sequence: EventSequence,
         #[serde(default)]
@@ -850,6 +856,34 @@ pub struct ServerEventEnvelope {
     pub sequence: EventSequence,
     pub session_id: AgentSessionId,
     pub event: ServerEvent,
+}
+
+/// A change to workspace catalog or configuration state. Workspace events have
+/// their own scope and never borrow a session ID.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceEventEnvelope {
+    pub protocol_version: ProtocolVersion,
+    pub sequence: EventSequence,
+    pub workspace_id: WorkspaceId,
+    pub event: WorkspaceEvent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum WorkspaceEvent {
+    Renamed { name: String },
+    ConfigChanged { revision: u64 },
+}
+
+/// Unified entries in a workspace reconnect stream. Untagged serde preserves
+/// compatibility with older workspace stream payloads containing only session
+/// envelopes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+pub enum WorkspaceFeedEvent {
+    Session(ServerEventEnvelope),
+    Workspace(WorkspaceEventEnvelope),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1051,10 +1085,27 @@ mod run_message_protocol_tests {
 
     #[test]
     fn workspace_event_snapshot_round_trips() {
+        let session_id = AgentSessionId::new();
+        let workspace_id = WorkspaceId::new();
         let response = ServerResponse::WorkspaceEventsSnapshot {
-            workspace_id: WorkspaceId::new(),
+            workspace_id,
             sessions: Vec::new(),
-            events: Vec::new(),
+            events: vec![
+                WorkspaceFeedEvent::Session(ServerEventEnvelope {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(4),
+                    session_id,
+                    event: ServerEvent::AgentSessionArchived { session_id },
+                }),
+                WorkspaceFeedEvent::Workspace(WorkspaceEventEnvelope {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(5),
+                    workspace_id,
+                    event: WorkspaceEvent::Renamed {
+                        name: "new name".to_owned(),
+                    },
+                }),
+            ],
             oldest_sequence: EventSequence::new(4),
             latest_sequence: EventSequence::new(9),
             stream_epoch: Some("epoch".to_owned()),
@@ -1064,6 +1115,30 @@ mod run_message_protocol_tests {
             serde_json::from_slice::<ServerResponse>(&encoded).unwrap(),
             response
         );
+
+        // Older peers serialized plain session envelopes directly in workspace
+        // snapshots; the untagged feed entry keeps that payload readable.
+        let legacy_session = ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(9),
+            session_id,
+            event: ServerEvent::AgentSessionArchived { session_id },
+        };
+        let legacy = serde_json::json!({
+            "type": "workspace_events_snapshot",
+            "data": {
+                "workspace_id": workspace_id,
+                "sessions": [],
+                "events": [legacy_session],
+                "oldest_sequence": 9,
+                "latest_sequence": 9,
+                "stream_epoch": null
+            }
+        });
+        let decoded: ServerResponse = serde_json::from_value(legacy).unwrap();
+        assert!(matches!(decoded,
+            ServerResponse::WorkspaceEventsSnapshot { events, .. }
+                if matches!(events.as_slice(), [WorkspaceFeedEvent::Session(_)])));
     }
 
     #[test]

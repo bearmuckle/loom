@@ -35,9 +35,12 @@ Schema v38 stores content objects up to 4 KiB inline, compressing them when that
 saves at least ten percent. Larger objects retain the chunked, shared-blob
 representation and bounded range reads.
 Schema v39 stores each reconnect event's workspace ID beside its session ID,
-with an index over workspace and global sequence. Per-workspace retained
-boundaries make a workspace stream's stale-cursor check independent of events
-from other workspaces; older schemas remain rejected without migration.
+with an index over workspace and global sequence. Schema v40 adds a separate
+workspace-only feed table for rename and configuration revision notifications.
+Workspace event envelopes carry a workspace ID directly; session envelopes
+remain session-scoped. Both kinds share the global event sequence and update
+workspace cursors in the same SQLite transaction as the catalog/config write.
+Older schemas remain rejected without migration.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at that
@@ -417,9 +420,11 @@ Session cursors now include a backend-instance epoch and a mismatch returns an
 authoritative snapshot. Workspace-scoped reads use that epoch and a materialized
 workspace index over the same global sequence, with workspace-specific pruning
 boundaries. They aggregate session-addressed events and stale snapshots include
-the current session catalog. Workspace-only changes such as renames or config
-updates do not yet emit feed rows. Global pressure may expire a quiet session's
-entire retained feed. Compact revision notifications remain target work.
+the current session catalog. Workspace rename and configuration-revision
+events have separate workspace-scoped envelopes and durable rows; session event
+envelopes never use synthetic workspace IDs. Global pressure may expire a quiet
+session's entire retained feed. Compact revision notifications remain target
+work.
 
 An expired cursor returns `ResyncRequired`, followed by an authoritative snapshot
 with a fresh cursor read in the same SQLite read transaction. Subscribe after that
@@ -476,7 +481,7 @@ mutable links into the source session's in-progress message/output fragments.
 | Resumable state and pending interactions | Retain while the run is resumable |
 | Executing/paused/pending run checkpoint | Pinned; never automatically evict a referenced rollback dependency |
 | User-created checkpoint | Retain until explicit deletion |
-| Automatic checkpoint for a terminal run | Initially retain 30 days, with user pinning; atomically mark rollback expired and release references before GC |
+| Automatic checkpoint for a terminal run | Retain indefinitely; there is no automatic expiry or storage-budget deletion policy |
 | Detailed context inspections and diagnostic traces | Opt-in or time/byte bounded; final summary and required context remain durable |
 | Reconnect events/filesystem change notifications | Bounded disposable feeds with resync |
 | Idempotency | Seven-day retry horizon for UUIDv7 requests; reject stale retries before dispatch and retain responses through expiry. UUIDv4 peers keep a bounded compatibility cache. |
@@ -490,21 +495,20 @@ Retain terminal operation identifiers longer when necessary for side-effect
 reconciliation; a bounded response cache alone cannot promise eternal exactly-once
 execution.
 
-Checkpoint expiry is visible in the run's capabilities. Retrying from an expired
-checkpoint is rejected explicitly; ordinary conversation continuation and history
-remain available. An explicit storage budget may shorten terminal automatic
-checkpoint retention under the same advertised policy, but cannot evict active
-or user-pinned checkpoints. This is a deliberate product behavior change from
-indefinite retention, not silent damage to a supposedly available rollback.
+Checkpoint expiry is not currently implemented. Checkpoints and transcript history
+are retained indefinitely, and there is no explicit storage budget or deletion UI.
+Any future retention policy must preserve active rollback dependencies and report
+expired rollback capability explicitly before releasing referenced content.
 
 Terminal sessions and OS process handles remain live backend resources. Store
 command identity/outcomes and optionally bounded scrollback, but never promise
 that restoring a database reattaches a process that died with the host.
 
 There is deliberately no fixed cap on user-created history. It grows with retained
-useful data. Bounded transient state and lazy access prevent that growth from
-turning into unbounded startup, memory, and rewrite costs. Expose storage totals
-by session and category, together with deletion/checkpoint cleanup controls.
+useful data. Lazy reads prevent that growth from making catalog startup load every
+record, but whole-state write/export paths can still scale with retained history.
+Expose storage totals by session and category, together with deletion/checkpoint
+cleanup controls, as future work.
 
 Startup opens the store, reads schema and a page of workspace/session summaries,
 and opens the UI. A background query identifies interrupted local execution rows
@@ -621,18 +625,17 @@ Implement in this order:
    and refresh that session. The SQLite history page query is bounded and avoids
    hydrating retained history, but its request refresh still polls the selected
    filesystem service for external changes.
-5. Finish scoped feeds, retention policy, and storage maintenance. Session and
-   workspace streams now use indexed durable cursors, and persisted session
-   projections are captured with their cursor in one read transaction. Add
-   workspace-only change notifications. Define the cadence for queued content-GC
-   candidates and remove section exports and mirrored in-memory journals
-   completely.
+5. Complete write-path and storage maintenance work. Session and workspace
+   streams now use indexed durable cursors, workspace rename/configuration
+   events, and persisted session projections captured with their cursor in one
+   read transaction. Whole-state exports remain on some writes; bounded edit undo,
+   paged canonical context loading, content-GC cadence, and cleanup of unused
+   generic section storage remain follow-up work.
 
 This release has a clean start only. It does not copy, import, rename, or remove
 an existing state database. When the configured path contains an unsupported
 database, startup reports that state is unsupported and leaves the file intact.
-Any future import process is a separate product decision and is outside this
-design's implementation scope.
+Legacy import or migration support is out of scope and is not planned.
 
 ## Acceptance criteria
 

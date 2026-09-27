@@ -152,9 +152,9 @@ startup fix.
 Session selection no longer has to decode every persisted transcript message to
 build its initial timeline. It loads run metadata and an indexed page of up to 32
 messages, with each message capped at 32 KiB; earlier messages load through an
-explicit timeline control. The separate 10k-session scale harness does not
-exercise this server/UI path, so end-to-end session-switch and cold-start timing
-remains to be measured.
+explicit timeline control. The new 10k/100k full-backend restore harness covers
+server recovery and terminal-history laziness. End-to-end session-switch timing,
+cold process/disk startup, and UI initialization remain to be measured.
 
 Sources: [server](../crates/loom-server/src/lib.rs), `restore_persisted`;
 [workspace](../crates/loom-workspace/src/lib.rs), `open`, `restore_state`,
@@ -189,8 +189,28 @@ runtime profiles, and workspace feed indexing yields a 262 MB database and an
 89.5 second population. The measured first-use persistence load is 53.6 ms, with
 one checkpoint/filesystem record load at 0.191 ms. `dbstat` still identifies
 content objects, transcript rows, and feed/index structures as the largest
-consumers. Cold application startup, server recovery, and realistic checkpoint
-density remain unproven.
+consumers.
+
+## Full server restore scale harness
+
+`cargo bench -p loom-server --bench server_restore --locked --offline` seeds
+typed sessions, terminal run summaries, and one filesystem/checkpoint group per
+100 sessions, then times `InProcessBackend::open_persistent()` and validates
+the restored session catalog through the protocol. It reports warm same-process
+reopen samples, not true cold process/disk-cache or UI construction. The
+terminal runs intentionally exercise the lazy-history path; this fixture does
+not include transcript or activity bodies, so compare it only with the full
+typed fixture above for its startup measurement.
+
+| Sessions | Terminal run summaries | Filesystems / checkpoints | Database bytes | Warm full-backend restore p50 |
+| ---: | ---: | ---: | ---: | ---: |
+| 10,000 | 10,000 | 100 / 100 | 5,861,376 | 5.667 ms |
+| 100,000 | 100,000 | 1,000 / 1,000 | 55,816,192 | 57.995 ms |
+
+These local measurements show restore scaling with the visible session catalog
+and active-run index rather than deserializing terminal run payloads. Cold disk
+cache, actual resumed runs, dense filesystem/checkpoint histories, and UI startup
+still need measurement.
 
 Historical schema v33-v36 comparisons used the earlier transcript-free fixture
 and are not directly comparable to these measurements. Schema v33 replaced
@@ -198,7 +218,7 @@ duplicated run JSON snapshots with typed rows; later schemas normalized run
 options and deduplicated runtime profiles/content. The current fixture includes
 those features plus retained transcript content.
 
-The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. The CLI and native UI now drain their locally owned backends on graceful teardown. Session and workspace event cursors now carry a backend-instance epoch and resync on restart; persisted session projections and their feed cursors are captured in one read transaction. Run/checkpoint retention, broader failure injection, and end-to-end application startup proof remain in the PR checklist.
+The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. The CLI and native UI now drain their locally owned backends on graceful teardown. Session and workspace event cursors now carry a backend-instance epoch and resync on restart; persisted session projections and their feed cursors are captured in one read transaction. Run/checkpoint retention, broader failure injection, and cold end-to-end application startup proof remain in the PR checklist.
 
 ## Baseline findings before the redesign
 

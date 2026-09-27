@@ -23,6 +23,7 @@ use loom_protocol::{
     ApprovalDecision, Checkpoint, CheckpointFile, ContextAssemblyOptions, ContextInspection,
     ContextSummary, ServerEventEnvelope, SessionDirectory, SessionFilesystemChange,
     SessionRepository, ToolResult, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
+    WorkspaceEventEnvelope, WorkspaceFeedEvent,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -32,8 +33,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 39;
-const DATABASE_SCHEMA_VERSION: u32 = 39;
+/// Incremented when the durable workspace-only reconnect event table was added.
+pub const CURRENT_SCHEMA_VERSION: u32 = 40;
+const DATABASE_SCHEMA_VERSION: u32 = 40;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;
@@ -510,6 +512,14 @@ CREATE INDEX IF NOT EXISTS feed_events_by_session_sequence
     ON feed_events(session_id, sequence);
 CREATE INDEX IF NOT EXISTS feed_events_by_workspace_sequence
     ON feed_events(workspace_id, sequence);
+CREATE TABLE IF NOT EXISTS workspace_feed_events (
+    sequence INTEGER PRIMARY KEY CHECK(sequence > 0),
+    workspace_id BLOB NOT NULL CHECK(length(workspace_id) = 16),
+    payload_codec INTEGER NOT NULL CHECK(payload_codec IN (0, 1)),
+    payload BLOB NOT NULL
+) STRICT;
+CREATE INDEX IF NOT EXISTS workspace_feed_events_by_workspace_sequence
+    ON workspace_feed_events(workspace_id, sequence);
 CREATE TABLE IF NOT EXISTS feed_session_meta (
     session_id BLOB PRIMARY KEY NOT NULL CHECK(length(session_id) = 16),
     first_sequence INTEGER NOT NULL CHECK(first_sequence > 0),
@@ -1116,6 +1126,7 @@ pub struct DurableFeedState {
     pub next_sequence: EventSequence,
     pub retention_limit: usize,
     pub events: Vec<ServerEventEnvelope>,
+    pub workspace_events: Vec<WorkspaceEventEnvelope>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4347,6 +4358,9 @@ impl FilePersistence {
                 "SELECT COALESCE(MAX(stream_bytes), 0) FROM (
                     SELECT SUM(length(payload)) AS stream_bytes
                     FROM feed_events GROUP BY session_id
+                    UNION ALL
+                    SELECT SUM(length(payload)) AS stream_bytes
+                    FROM workspace_feed_events GROUP BY workspace_id
                  )",
                 [],
                 |row| row.get(0),
@@ -4470,9 +4484,28 @@ impl FilePersistence {
         for event in &events {
             *events_per_session.entry(event.session_id).or_default() += 1;
         }
+        let workspace_events = load_all_workspace_events(&connection)?;
+        let mut events_per_workspace = BTreeMap::<WorkspaceId, usize>::new();
+        let mut seen_sequences = events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<BTreeSet<_>>();
+        for event in &workspace_events {
+            *events_per_workspace.entry(event.workspace_id).or_default() += 1;
+            if !seen_sequences.insert(event.sequence) || event.sequence.value() > next_sequence {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted session and workspace event sequences overlap or exceed the cursor",
+                    false,
+                ));
+            }
+        }
         if events_per_session
             .values()
             .any(|count| *count > retention_limit)
+            || events_per_workspace
+                .values()
+                .any(|count| *count > retention_limit)
             || events
                 .last()
                 .is_some_and(|event| event.sequence.value() > next_sequence)
@@ -4487,6 +4520,7 @@ impl FilePersistence {
             next_sequence: EventSequence::new(next_sequence),
             retention_limit,
             events,
+            workspace_events,
         }))
     }
 
@@ -4592,7 +4626,11 @@ impl FilePersistence {
         let cursor = connection
             .query_row(
                 "SELECT first_sequence, latest_sequence, pruned_through,
-                        (SELECT MIN(sequence) FROM feed_events WHERE workspace_id=?1)
+                        (SELECT MIN(sequence) FROM (
+                            SELECT sequence FROM feed_events WHERE workspace_id=?1
+                            UNION ALL
+                            SELECT sequence FROM workspace_feed_events WHERE workspace_id=?1
+                        ))
                  FROM feed_workspace_meta WHERE workspace_id=?1",
                 [workspace_id.as_uuid().as_bytes().as_slice()],
                 |row| {
@@ -4640,8 +4678,89 @@ impl FilePersistence {
         &self,
         workspace_id: WorkspaceId,
         after_sequence: Option<EventSequence>,
-    ) -> Result<Vec<ServerEventEnvelope>> {
-        self.load_feed_events_by_workspace(workspace_id, after_sequence)
+    ) -> Result<Vec<WorkspaceFeedEvent>> {
+        let mut events = self
+            .load_feed_events_by_workspace(workspace_id, after_sequence)?
+            .into_iter()
+            .map(WorkspaceFeedEvent::Session)
+            .collect::<Vec<_>>();
+        events.extend(self.load_workspace_only_events_since(workspace_id, after_sequence)?);
+        events.sort_by_key(|event| match event {
+            WorkspaceFeedEvent::Session(event) => event.sequence,
+            WorkspaceFeedEvent::Workspace(event) => event.sequence,
+        });
+        Ok(events)
+    }
+
+    fn load_workspace_only_events_since(
+        &self,
+        workspace_id: WorkspaceId,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<Vec<WorkspaceFeedEvent>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let after = after_sequence
+            .map(|sequence| sequence.value() as i64)
+            .unwrap_or(0);
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, payload_codec, payload FROM workspace_feed_events
+             WHERE workspace_id=?1 AND sequence>?2 ORDER BY sequence ASC",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare workspace-only feed page: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map(
+                params![workspace_id.as_uuid().as_bytes().as_slice(), after],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read workspace-only feed page: {error}"),
+                    true,
+                )
+            })?;
+        rows.map(|row| {
+            let (sequence, codec, payload) = row.map_err(|error| {
+                persistence_error(
+                    format!("could not read workspace-only feed row: {error}"),
+                    true,
+                )
+            })?;
+            let payload = decode_feed_payload(codec, payload)?;
+            let event: WorkspaceEventEnvelope =
+                serde_json::from_slice(&payload).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted workspace event is malformed: {error}"),
+                        false,
+                    )
+                })?;
+            if sequence <= 0
+                || event.sequence.value() != sequence as u64
+                || event.workspace_id != workspace_id
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted workspace event index does not match its payload",
+                    false,
+                ));
+            }
+            Ok(WorkspaceFeedEvent::Workspace(event))
+        })
+        .collect()
     }
 
     fn load_feed_events_by_workspace(
@@ -9229,6 +9348,94 @@ fn save_feed_rows_with_limits(
                 persistence_error(format!("could not save session feed cursor: {error}"), true)
             })?;
     }
+    let mut previous_workspace = 0;
+    for event in &feed.workspace_events {
+        let sequence = i64::try_from(event.sequence.value()).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "workspace event sequence exceeds SQLite's integer range",
+                false,
+            )
+        })?;
+        if sequence <= previous_workspace || sequence > next_sequence {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "workspace event feed sequences are invalid",
+                false,
+            ));
+        }
+        previous_workspace = sequence;
+        let duplicate: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM feed_events WHERE sequence=?1)",
+                [sequence],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not validate workspace event sequence: {error}"),
+                    true,
+                )
+            })?;
+        if duplicate {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "workspace and session event sequences overlap",
+                false,
+            ));
+        }
+        let raw_payload = serde_json::to_vec(event).map_err(|error| {
+            persistence_error(
+                format!("could not encode workspace feed entry: {error}"),
+                false,
+            )
+        })?;
+        if raw_payload.len() > MAX_FEED_EVENT_BYTES {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "workspace event exceeds the maximum supported size",
+                false,
+            ));
+        }
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&raw_payload).map_err(|error| {
+            persistence_error(
+                format!("could not compress workspace event: {error}"),
+                false,
+            )
+        })?;
+        let compressed = encoder.finish().map_err(|error| {
+            persistence_error(
+                format!("could not compress workspace event: {error}"),
+                false,
+            )
+        })?;
+        let (codec, payload) = if compressed.len() < raw_payload.len() {
+            (1_i64, compressed)
+        } else {
+            (0_i64, raw_payload)
+        };
+        transaction
+            .execute(
+                "INSERT INTO workspace_feed_events(sequence, workspace_id, payload_codec, payload)
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT(sequence) DO NOTHING",
+                params![
+                    sequence,
+                    event.workspace_id.as_uuid().as_bytes().as_slice(),
+                    codec,
+                    payload
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save workspace event: {error}"), true)
+            })?;
+        transaction.execute(
+            "INSERT INTO feed_workspace_meta(workspace_id, first_sequence, latest_sequence, pruned_through)
+             VALUES (?1, ?2, ?2, 0)
+             ON CONFLICT(workspace_id) DO UPDATE SET latest_sequence=MAX(feed_workspace_meta.latest_sequence, excluded.latest_sequence)",
+            params![event.workspace_id.as_uuid().as_bytes().as_slice(), sequence],
+        ).map_err(|error| persistence_error(format!("could not save workspace feed cursor: {error}"), true))?;
+    }
     transaction
         .execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS _loom_pruned_feed (
@@ -9256,7 +9463,8 @@ fn save_feed_rows_with_limits(
                        ) AS session_position,
                        SUM(length(payload)) OVER (
                            ORDER BY sequence DESC
-                       ) AS total_bytes
+                       ) + (SELECT COALESCE(SUM(length(payload)), 0)
+                            FROM workspace_feed_events) AS total_bytes
                 FROM feed_events
              )
              INSERT INTO _loom_pruned_feed(sequence, session_id, workspace_id)
@@ -9338,6 +9546,63 @@ fn save_feed_rows_with_limits(
             [],
         )
         .map_err(|error| persistence_error(format!("could not prune event feed: {error}"), true))?;
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_pruned_workspace_feed (
+            sequence INTEGER PRIMARY KEY,
+            workspace_id BLOB NOT NULL
+         ) WITHOUT ROWID, STRICT;
+         DELETE FROM _loom_pruned_workspace_feed;",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prepare workspace feed pruning: {error}"),
+                true,
+            )
+        })?;
+    transaction.execute(
+        "WITH ranked AS (
+            SELECT sequence, workspace_id,
+                   SUM(length(payload)) OVER (PARTITION BY workspace_id ORDER BY sequence DESC) AS stream_bytes,
+                   ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY sequence DESC) AS stream_position,
+                   SUM(length(payload)) OVER (ORDER BY sequence DESC)
+                       + (SELECT COALESCE(SUM(length(payload)), 0) FROM feed_events) AS total_bytes
+            FROM workspace_feed_events
+         )
+         INSERT INTO _loom_pruned_workspace_feed(sequence, workspace_id)
+         SELECT sequence, workspace_id FROM ranked
+         WHERE stream_bytes > ?1 OR stream_position > ?2 OR total_bytes > ?3",
+        params![session_byte_limit as i64, retention_limit, total_byte_limit as i64],
+    ).map_err(|error| persistence_error(format!("could not select workspace feed retention: {error}"), true))?;
+    transaction
+        .execute(
+            "WITH pruned AS (
+            SELECT workspace_id, MAX(sequence) AS pruned_through
+            FROM _loom_pruned_workspace_feed GROUP BY workspace_id
+         )
+         UPDATE feed_workspace_meta
+         SET pruned_through=MAX(pruned_through,
+             (SELECT pruned.pruned_through FROM pruned
+              WHERE pruned.workspace_id=feed_workspace_meta.workspace_id))
+         WHERE workspace_id IN (SELECT workspace_id FROM pruned)",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not update pruned workspace-only cursors: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM workspace_feed_events WHERE sequence IN (
+            SELECT sequence FROM _loom_pruned_workspace_feed
+         )",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prune workspace feed: {error}"), true)
+        })?;
     Ok(())
 }
 
@@ -9395,6 +9660,103 @@ fn decode_feed_event(
         ));
     }
     Ok(event)
+}
+
+fn decode_feed_payload(payload_codec: i64, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let decoded = match payload_codec {
+        0 => payload,
+        1 => {
+            let mut decoded = Vec::new();
+            ZlibDecoder::new(payload.as_slice())
+                .take(MAX_FEED_EVENT_BYTES as u64 + 1)
+                .read_to_end(&mut decoded)
+                .map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted event feed entry is malformed: {error}"),
+                        false,
+                    )
+                })?;
+            decoded
+        }
+        _ => {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted event feed entry uses an unsupported codec",
+                false,
+            ));
+        }
+    };
+    if decoded.len() > MAX_FEED_EVENT_BYTES {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted event feed entry exceeds the maximum supported size",
+            false,
+        ));
+    }
+    Ok(decoded)
+}
+
+#[cfg(test)]
+fn workspace_feed_event_sequence(event: &WorkspaceFeedEvent) -> u64 {
+    match event {
+        WorkspaceFeedEvent::Session(event) => event.sequence.value(),
+        WorkspaceFeedEvent::Workspace(event) => event.sequence.value(),
+    }
+}
+
+fn load_all_workspace_events(connection: &Connection) -> Result<Vec<WorkspaceEventEnvelope>> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, workspace_id, payload_codec, payload
+         FROM workspace_feed_events ORDER BY sequence",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prepare workspace event feed: {error}"),
+                true,
+            )
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read workspace event feed: {error}"),
+                true,
+            )
+        })?;
+    rows.map(|row| {
+        let (sequence, workspace_id, codec, payload) = row.map_err(|error| {
+            persistence_error(format!("could not read workspace event: {error}"), true)
+        })?;
+        let payload = decode_feed_payload(codec, payload)?;
+        let event: WorkspaceEventEnvelope = serde_json::from_slice(&payload).map_err(|error| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted workspace event is malformed: {error}"),
+                false,
+            )
+        })?;
+        if sequence <= 0
+            || event.sequence.value() != sequence as u64
+            || event.workspace_id.as_uuid().as_bytes().as_slice() != workspace_id.as_slice()
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted workspace event index does not match its payload",
+                false,
+            ));
+        }
+        Ok(event)
+    })
+    .collect()
 }
 
 fn session_state_name(state: AgentSessionState) -> &'static str {
@@ -12318,31 +12680,35 @@ mod tests {
             next_sequence: EventSequence::new(1),
             retention_limit: 16,
             events: vec![input_event.clone()],
+            workspace_events: Vec::new(),
         };
-        let save =
-            |summary: &BTreeMap<RunId, DurableRunSummary>, feed: &DurableFeedState| -> Result<()> {
-                persistence.save_state(DurableStateWrite {
-                    schema_version: CURRENT_SCHEMA_VERSION,
-                    sessions: &manager.export_state(),
-                    workspaces: None,
-                    settings: None,
-                    workspace_configs: None,
-                    providers: None,
-                    usage: None,
-                    idempotency: None,
-                    run_summaries: Some(summary),
-                    run_runtime_configs: None,
-                    run_context_checkpoints: None,
-                    run_plans: None,
-                    run_messages: None,
-                    run_activities: None,
-                    filesystem_records: None,
-                    records: &[],
-                    feed: Some(feed),
-                    sections: &[],
-                })
-            };
-        save(&run_summaries, &feed).unwrap();
+        let initial_sessions = manager.export_state();
+        let save = |sessions: &SessionManagerState,
+                    summary: &BTreeMap<RunId, DurableRunSummary>,
+                    feed: &DurableFeedState|
+         -> Result<()> {
+            persistence.save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions,
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(summary),
+                run_runtime_configs: None,
+                run_context_checkpoints: None,
+                run_plans: None,
+                run_messages: None,
+                run_activities: None,
+                filesystem_records: None,
+                records: &[],
+                feed: Some(feed),
+                sections: &[],
+            })
+        };
+        save(&initial_sessions, &run_summaries, &feed).unwrap();
         assert_eq!(
             persistence.load_run_attempts(run_id).unwrap(),
             vec![attempt.clone()]
@@ -12393,8 +12759,16 @@ mod tests {
         feed.events.push(resolved_event);
         feed.next_sequence = EventSequence::new(0);
         let resolved_summaries = BTreeMap::from([(run_id, summary.clone())]);
+        let mut resolving_sessions = initial_sessions.clone();
+        resolving_sessions
+            .sessions
+            .get_mut(&session.id)
+            .unwrap()
+            .state = loom_core::AgentSessionState::Executing;
         assert_eq!(
-            save(&resolved_summaries, &feed).unwrap_err().code,
+            save(&resolving_sessions, &resolved_summaries, &feed)
+                .unwrap_err()
+                .code,
             ErrorCode::MalformedPayload
         );
         assert_eq!(
@@ -12420,43 +12794,131 @@ mod tests {
                 ..execution.clone()
             })
         );
-        let persisted_feed = persistence.load_feed_state().unwrap().unwrap();
-        assert_eq!(persisted_feed.next_sequence, EventSequence::new(1));
-        assert_eq!(persisted_feed.events, vec![input_event]);
-
-        feed.next_sequence = EventSequence::new(2);
-        save(&resolved_summaries, &feed).unwrap();
         assert_eq!(
-            persistence.load_run_attempts(run_id).unwrap(),
-            vec![AgentRunAttemptRecord {
-                state: AgentRunState::Executing,
-                ..attempt.clone()
-            }]
+            persistence
+                .load_run_summary(run_id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .state,
+            AgentRunState::NeedsInput
         );
         assert_eq!(
-            persistence.load_run_execution_state(run_id).unwrap(),
+            persistence.load_sessions().unwrap().unwrap(),
+            initial_sessions
+        );
+        let persisted_feed = persistence.load_feed_state().unwrap().unwrap();
+        assert_eq!(persisted_feed.next_sequence, EventSequence::new(1));
+        assert_eq!(persisted_feed.events, vec![input_event.clone()]);
+
+        drop(persistence);
+        let reopened = FilePersistence::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .load_run_summary(run_id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .state,
+            AgentRunState::NeedsInput
+        );
+        assert_eq!(
+            reopened.load_run_execution_state(run_id).unwrap(),
+            Some(AgentExecutionStateRecord {
+                control_revision: 1,
+                state: AgentRunState::NeedsInput,
+                next_message_id: 2,
+                pending_input: Some(prompt),
+                pending_tool_execution: None,
+                ..execution.clone()
+            })
+        );
+        assert_eq!(
+            reopened.load_run_interactions(run_id).unwrap()[0].status,
+            AgentInteractionStatus::Pending
+        );
+        assert_eq!(reopened.load_sessions().unwrap().unwrap(), initial_sessions);
+        let reopened_feed = reopened.load_feed_state().unwrap().unwrap();
+        assert_eq!(reopened_feed.next_sequence, EventSequence::new(1));
+        assert_eq!(reopened_feed.events, vec![input_event]);
+
+        feed.next_sequence = EventSequence::new(2);
+        reopened
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &resolving_sessions,
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&resolved_summaries),
+                run_runtime_configs: None,
+                run_context_checkpoints: None,
+                run_plans: None,
+                run_messages: None,
+                run_activities: None,
+                filesystem_records: None,
+                records: &[],
+                feed: Some(&feed),
+                sections: &[],
+            })
+            .unwrap();
+        assert_eq!(
+            reopened
+                .load_run_summary(run_id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .state,
+            AgentRunState::Executing
+        );
+        assert_eq!(
+            reopened.load_run_execution_state(run_id).unwrap(),
             Some(execution.clone())
         );
         assert_eq!(
-            persistence.load_run_interactions(run_id).unwrap(),
-            vec![interaction.clone()]
+            reopened.load_run_interactions(run_id).unwrap()[0].status,
+            AgentInteractionStatus::Answered
         );
-        let persisted_feed = persistence.load_feed_state().unwrap().unwrap();
-        assert_eq!(persisted_feed.next_sequence, EventSequence::new(2));
-        assert_eq!(persisted_feed.events.len(), 2);
-
+        assert_eq!(
+            reopened.load_feed_state().unwrap().unwrap().next_sequence,
+            EventSequence::new(2)
+        );
         summary.snapshot.state = AgentRunState::Evaluating;
         summary.snapshot.updated_at = Timestamp::from_unix_millis(3_000);
         summary.attempts = Some(vec![AgentRunAttemptRecord {
             state: AgentRunState::Evaluating,
-            ..attempt.clone()
+            ..attempt
         }]);
         execution.state = AgentRunState::Evaluating;
         summary.execution_state = Some(execution.clone());
         let evaluating_summaries = BTreeMap::from([(run_id, summary)]);
-        save(&evaluating_summaries, &feed).unwrap();
+        reopened
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &resolving_sessions,
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&evaluating_summaries),
+                run_runtime_configs: None,
+                run_context_checkpoints: None,
+                run_plans: None,
+                run_messages: None,
+                run_activities: None,
+                filesystem_records: None,
+                records: &[],
+                feed: Some(&feed),
+                sections: &[],
+            })
+            .unwrap();
         assert_eq!(
-            persistence.load_run_execution_state(run_id).unwrap(),
+            reopened.load_run_execution_state(run_id).unwrap(),
             Some(execution)
         );
         fs::remove_file(path).unwrap();
@@ -12720,6 +13182,7 @@ mod tests {
                 },
             )
             .collect(),
+            workspace_events: Vec::new(),
         };
         store
             .save_state_with_sessions_entities_and_feed(
@@ -12800,6 +13263,7 @@ mod tests {
                     },
                 },
             ],
+            workspace_events: Vec::new(),
         };
         let mut connection = Connection::open(&path).unwrap();
         let transaction = connection.transaction().unwrap();
@@ -12887,6 +13351,7 @@ mod tests {
                 event(3, session_a, workspace_a),
                 event(4, session_b, workspace_b),
             ],
+            workspace_events: Vec::new(),
         };
         store
             .save_state_with_sessions_entities_and_feed(
@@ -12907,14 +13372,14 @@ mod tests {
         assert_eq!(
             events_a
                 .iter()
-                .map(|e| e.sequence.value())
+                .map(workspace_feed_event_sequence)
                 .collect::<Vec<_>>(),
             vec![3]
         );
         assert_eq!(
             events_b
                 .iter()
-                .map(|e| e.sequence.value())
+                .map(workspace_feed_event_sequence)
                 .collect::<Vec<_>>(),
             vec![4]
         );
@@ -12951,6 +13416,127 @@ mod tests {
             )
             .unwrap();
         assert!(plan.contains("feed_events_by_workspace_sequence"), "{plan}");
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_only_events_share_the_cursor_and_persist_with_bounded_retention() {
+        let path = std::env::temp_dir().join(format!("loom-workspace-feed-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        let workspace_id = WorkspaceId::new();
+        let workspace_event = |sequence, name: &str| WorkspaceEventEnvelope {
+            protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(sequence),
+            workspace_id,
+            event: loom_protocol::WorkspaceEvent::Renamed {
+                name: name.to_owned(),
+            },
+        };
+        let feed = DurableFeedState {
+            next_sequence: EventSequence::new(2),
+            retention_limit: 1,
+            events: Vec::new(),
+            workspace_events: vec![workspace_event(1, "First"), workspace_event(2, "Second")],
+        };
+        store
+            .save_state_with_sessions_entities_and_feed(
+                CURRENT_SCHEMA_VERSION,
+                &SessionManager::default().export_state(),
+                &[],
+                Some(&feed),
+                &[],
+            )
+            .unwrap();
+        let events = store
+            .load_feed_workspace_events_since(workspace_id, None)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], WorkspaceFeedEvent::Workspace(event)
+            if event.sequence == EventSequence::new(2)
+                && matches!(&event.event, loom_protocol::WorkspaceEvent::Renamed { name } if name == "Second")));
+        let cursor = store
+            .load_feed_workspace_cursor(workspace_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.latest_sequence, EventSequence::new(2));
+        assert_eq!(cursor.pruned_through, EventSequence::new(1));
+        assert_eq!(cursor.oldest_retained_sequence, Some(EventSequence::new(2)));
+        let loaded = store.load_feed_state().unwrap().unwrap();
+        assert_eq!(loaded.workspace_events.len(), 1);
+        assert_eq!(loaded.workspace_events[0].sequence, EventSequence::new(2));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn session_and_workspace_feed_share_the_global_payload_budget() {
+        let path = std::env::temp_dir().join(format!("loom-mixed-feed-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        let workspace_id = WorkspaceId::new();
+        let session_id = AgentSessionId::new();
+        let mut manager = SessionManager::default();
+        let (snapshot, _) = manager
+            .create_in_workspace_with_id(workspace_id, session_id, "Feed budget")
+            .unwrap();
+        let empty_feed = DurableFeedState {
+            next_sequence: EventSequence::default(),
+            retention_limit: 100,
+            events: Vec::new(),
+            workspace_events: Vec::new(),
+        };
+        store
+            .save_state_with_sessions_entities_and_feed(
+                CURRENT_SCHEMA_VERSION,
+                &manager.export_state(),
+                &[],
+                Some(&empty_feed),
+                &[],
+            )
+            .unwrap();
+        let feed = DurableFeedState {
+            next_sequence: EventSequence::new(3),
+            retention_limit: 100,
+            events: vec![ServerEventEnvelope {
+                protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(1),
+                session_id,
+                event: loom_protocol::ServerEvent::AgentSessionCreated { snapshot },
+            }],
+            workspace_events: vec![
+                WorkspaceEventEnvelope {
+                    protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(2),
+                    workspace_id,
+                    event: loom_protocol::WorkspaceEvent::Renamed {
+                        name: "workspace mutation one".to_owned(),
+                    },
+                },
+                WorkspaceEventEnvelope {
+                    protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(3),
+                    workspace_id,
+                    event: loom_protocol::WorkspaceEvent::Renamed {
+                        name: "workspace mutation two".to_owned(),
+                    },
+                },
+            ],
+        };
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        save_feed_rows_with_limits(&transaction, &feed, 10_000, 250).unwrap();
+        transaction.commit().unwrap();
+        let retained_bytes: i64 = connection
+            .query_row(
+                "SELECT COALESCE((SELECT SUM(length(payload)) FROM feed_events), 0)
+                      + COALESCE((SELECT SUM(length(payload)) FROM workspace_feed_events), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            retained_bytes <= 250,
+            "retained payload bytes: {retained_bytes}"
+        );
         drop(connection);
         fs::remove_file(path).unwrap();
     }
