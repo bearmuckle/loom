@@ -155,14 +155,16 @@ async fn events(
     match connection
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence,
+            stream_epoch: None,
         }))
         .await
         .unwrap()
         .result
         .unwrap()
     {
-        ServerResponse::SessionEvents { events }
+        ServerResponse::SessionEvents { events, .. }
         | ServerResponse::SessionEventsSnapshot { events, .. } => events,
         response => panic!("unexpected event response: {response:?}"),
     }
@@ -625,7 +627,8 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
     let mut after = None;
     let mut approvals = 0;
     let mut completed = false;
-    for _ in 0..100 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !completed && tokio::time::Instant::now() < deadline {
         let batch = events(&mut second, session.id, after).await;
         if batch.is_empty() {
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -637,7 +640,10 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
                 event:
                     AgentEvent::ToolApprovalRequired {
                         run_id: event_run,
+                        attempt_id,
+                        control_revision,
                         call,
+                        ..
                     },
             } = &event.event
                 && *event_run == run_id
@@ -646,6 +652,8 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
                 second
                     .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                         run_id,
+                        attempt_id: *attempt_id,
+                        expected_control_revision: *control_revision,
                         tool_call_id: call.id,
                     }))
                     .await
@@ -691,27 +699,90 @@ async fn stale_cursors_return_a_snapshot_fallback() {
     let first = session(&mut connection, workspace_id).await;
     let _second = session(&mut connection, workspace_id).await;
     let _third = session(&mut connection, workspace_id).await;
+    for name in ["first-a", "first-b", "first-c"] {
+        connection
+            .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                session_id: first.id,
+                name: name.to_owned(),
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+    }
+    let _fourth = session(&mut connection, workspace_id).await;
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(first.id),
-            after_sequence: Some(EventSequence::default()),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::new(1)),
+            stream_epoch: None,
         }))
         .await
         .unwrap();
-    match response.result.unwrap() {
+    let stream_epoch = match response.result.unwrap() {
         ServerResponse::SessionEventsSnapshot {
             session,
             events,
             oldest_sequence,
             latest_sequence,
+            stream_epoch: Some(stream_epoch),
         } => {
             assert_eq!(session.id, first.id);
-            assert!(events.is_empty());
-            assert!(oldest_sequence.value() > 1);
-            assert_eq!(latest_sequence.value(), 3);
+            assert_eq!(events.len(), 2);
+            assert_eq!(oldest_sequence.value(), 5);
+            assert_eq!(latest_sequence.value(), 6);
+            stream_epoch
         }
         response => panic!("expected snapshot fallback, got {response:?}"),
-    }
+    };
+    let resumed = connection
+        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(first.id),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::new(6)),
+            stream_epoch: Some(stream_epoch.clone()),
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        resumed.result.unwrap(),
+        ServerResponse::SessionEvents {
+            stream_epoch: Some(epoch),
+            ..
+        } if epoch == stream_epoch
+    ));
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_cursor_before_creation_ignores_other_sessions_events() {
+    let (_backend, _auth, token, server) = server().await;
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token);
+    let mut connection = transport.connect().await.unwrap();
+    negotiate(&mut connection).await;
+    let workspace_id = create_workspace(&mut connection).await;
+    let _earlier_session = session(&mut connection, workspace_id).await;
+    let target_session = session(&mut connection, workspace_id).await;
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(target_session.id),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::default()),
+            stream_epoch: None,
+        }))
+        .await
+        .unwrap();
+    let ServerResponse::SessionEvents { events, .. } = response.result.unwrap() else {
+        panic!("an unrelated session's prior events must not stale this cursor");
+    };
+    assert!(events.iter().any(|event| {
+        event.session_id == target_session.id
+            && matches!(
+                event.event,
+                loom_protocol::ServerEvent::AgentSessionCreated { .. }
+            )
+    }));
     server.stop().await.unwrap();
 }
 

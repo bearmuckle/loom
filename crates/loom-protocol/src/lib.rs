@@ -23,7 +23,10 @@ pub use activity::{
     FileActivityOperation,
 };
 pub use agent::{
-    AgentEvent, AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState, ApprovalDecision,
+    AgentEvent, AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
+    AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
+    AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
+    ApprovalDecision,
 };
 pub use context::{
     ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
@@ -47,7 +50,11 @@ pub use workspace::{
     WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(4, 1);
+pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
+pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
+pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
+pub const MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES: u32 = 32 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerNodeResources {
@@ -101,6 +108,23 @@ pub struct AgentRunSnapshotProjection {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentRunMessageHeader {
+    pub ordinal: u64,
+    pub role: loom_model::MessageRole,
+    pub content_bytes: u64,
+    pub name: Option<String>,
+    pub tool_call_id: Option<loom_core::ToolCallId>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentRunTranscriptMessage {
+    pub ordinal: u64,
+    pub message: ModelMessage,
+    pub content_truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentSessionSnapshotProjection {
     pub session: AgentSessionSnapshot,
     pub active_run: Option<AgentRunSnapshotProjection>,
@@ -109,6 +133,12 @@ pub struct AgentSessionSnapshotProjection {
     pub approval_policy: loom_core::ApprovalPolicy,
     #[serde(default = "default_auto_approve_actions")]
     pub auto_approve_actions: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentSessionInitialState {
+    pub projection: AgentSessionSnapshotProjection,
+    pub cursor: EventSequence,
 }
 
 fn default_auto_approve_actions() -> bool {
@@ -342,6 +372,14 @@ pub enum ClientRequest {
     GetAgentSessionSnapshot {
         session_id: AgentSessionId,
     },
+    /// Returns session/run metadata without materializing the run transcript.
+    /// Clients can load conversation history through the bounded message-page API.
+    GetAgentSessionSnapshotMetadata {
+        session_id: AgentSessionId,
+    },
+    GetAgentSessionInitialState {
+        session_id: AgentSessionId,
+    },
     RenameAgentSession {
         session_id: AgentSessionId,
         name: String,
@@ -351,7 +389,15 @@ pub enum ClientRequest {
     },
     GetSessionEvents {
         session_id: Option<AgentSessionId>,
+        /// Workspace-wide event stream scope. Mutually exclusive with `session_id`.
+        #[serde(default)]
+        workspace_id: Option<WorkspaceId>,
+        /// Last global event sequence processed for the selected scope. Workspace event
+        /// sequences can have gaps because unrelated workspaces share the global counter.
         after_sequence: Option<EventSequence>,
+        /// Backend-instance identity paired with `after_sequence`.
+        #[serde(default)]
+        stream_epoch: Option<String>,
     },
     GetRecentSessionEvents {
         session_id: AgentSessionId,
@@ -359,6 +405,22 @@ pub enum ClientRequest {
     },
     GetAgentRun {
         run_id: RunId,
+    },
+    GetAgentRunMessagePage {
+        run_id: RunId,
+        before_ordinal: Option<u64>,
+        limit: u32,
+    },
+    GetAgentRunTranscriptPage {
+        run_id: RunId,
+        before_ordinal: Option<u64>,
+        limit: u32,
+    },
+    GetAgentRunMessageContentRange {
+        run_id: RunId,
+        message_ordinal: u64,
+        byte_offset: u64,
+        length: u32,
     },
     GetAgentRunSnapshot {
         run_id: RunId,
@@ -368,15 +430,21 @@ pub enum ClientRequest {
     },
     ApproveAgentAction {
         run_id: RunId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
         tool_call_id: ToolCallId,
     },
     RejectAgentAction {
         run_id: RunId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
         tool_call_id: ToolCallId,
         reason: Option<String>,
     },
     SendAgentMessage {
         run_id: RunId,
+        attempt_id: loom_core::RunAttemptId,
+        expected_control_revision: u64,
         message: String,
     },
     InterruptAgentRun {
@@ -481,9 +549,10 @@ impl ClientRequest {
             Self::CancelSessionTask { .. } => Some(Capability::ControlSessionTask),
             Self::GetSessionTaskEvidence { .. } => Some(Capability::ReadSessionTaskEvidence),
             Self::SetSessionApprovalPolicy { .. } => Some(Capability::ConfigureApprovalPolicy),
-            Self::GetAgentSession { .. } | Self::GetAgentSessionSnapshot { .. } => {
-                Some(Capability::ReadAgentSession)
-            }
+            Self::GetAgentSession { .. }
+            | Self::GetAgentSessionSnapshot { .. }
+            | Self::GetAgentSessionSnapshotMetadata { .. }
+            | Self::GetAgentSessionInitialState { .. } => Some(Capability::ReadAgentSession),
             Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
                 Some(Capability::ControlAgentSession)
             }
@@ -493,6 +562,9 @@ impl ClientRequest {
             Self::GetAgentRun { .. } | Self::GetAgentRunSnapshot { .. } => {
                 Some(Capability::ReadAgentRun)
             }
+            Self::GetAgentRunMessagePage { .. }
+            | Self::GetAgentRunTranscriptPage { .. }
+            | Self::GetAgentRunMessageContentRange { .. } => Some(Capability::ReadAgentRunMessages),
             Self::GetRunCheckpoint { .. } => Some(Capability::ReadAgentRun),
             Self::ApproveAgentAction { .. } | Self::RejectAgentAction { .. } => {
                 Some(Capability::ApproveAgentAction)
@@ -625,20 +697,59 @@ pub enum ServerResponse {
     AgentSessionForked(AgentSessionSnapshot),
     AgentSession(AgentSessionSnapshot),
     AgentSessionSnapshot(AgentSessionSnapshotProjection),
+    AgentSessionInitialState(AgentSessionInitialState),
     AgentSessionRenamed(AgentSessionSnapshot),
     AgentSessionArchived(AgentSessionSnapshot),
     AgentRunStarted(AgentRunSnapshot),
     AgentRun(AgentRunSnapshot),
     AgentRunSnapshot(AgentRunSnapshotProjection),
+    AgentRunMessagePage {
+        run_id: RunId,
+        messages: Vec<AgentRunMessageHeader>,
+    },
+    AgentRunTranscriptPage {
+        run_id: RunId,
+        messages: Vec<AgentRunTranscriptMessage>,
+        next_before: Option<u64>,
+        has_older: bool,
+    },
+    AgentRunMessageContentRange {
+        run_id: RunId,
+        message_ordinal: u64,
+        byte_offset: u64,
+        content: Vec<u8>,
+    },
     RunCheckpoint(Checkpoint),
     SessionEvents {
         events: Vec<ServerEventEnvelope>,
+        #[serde(default)]
+        stream_epoch: Option<String>,
+    },
+    WorkspaceEvents {
+        workspace_id: WorkspaceId,
+        events: Vec<WorkspaceFeedEvent>,
+        #[serde(default)]
+        stream_epoch: Option<String>,
     },
     SessionEventsSnapshot {
         session: AgentSessionSnapshot,
         events: Vec<ServerEventEnvelope>,
         oldest_sequence: EventSequence,
         latest_sequence: EventSequence,
+        #[serde(default)]
+        stream_epoch: Option<String>,
+    },
+    /// Returned when a workspace cursor is stale or the backend epoch changed. `sessions`
+    /// is the current workspace catalog snapshot; `events` contains the retained workspace
+    /// feed. `latest_sequence` is the latest event for this workspace, not the global head.
+    WorkspaceEventsSnapshot {
+        workspace_id: WorkspaceId,
+        sessions: Vec<AgentSessionSnapshot>,
+        events: Vec<WorkspaceFeedEvent>,
+        oldest_sequence: EventSequence,
+        latest_sequence: EventSequence,
+        #[serde(default)]
+        stream_epoch: Option<String>,
     },
     Models {
         models: Vec<ModelDescriptor>,
@@ -745,6 +856,32 @@ pub struct ServerEventEnvelope {
     pub sequence: EventSequence,
     pub session_id: AgentSessionId,
     pub event: ServerEvent,
+}
+
+/// A change to workspace catalog or configuration state. Workspace events have
+/// their own scope and never borrow a session ID.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceEventEnvelope {
+    pub protocol_version: ProtocolVersion,
+    pub sequence: EventSequence,
+    pub workspace_id: WorkspaceId,
+    pub event: WorkspaceEvent,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum WorkspaceEvent {
+    Renamed { name: String },
+    ConfigChanged { revision: u64 },
+}
+
+/// Unified entries in a workspace reconnect stream.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+pub enum WorkspaceFeedEvent {
+    Session(ServerEventEnvelope),
+    Workspace(WorkspaceEventEnvelope),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -896,4 +1033,199 @@ pub fn unsupported_version_error(requested: ProtocolVersion) -> LoomError {
         CURRENT_PROTOCOL_VERSION.major,
         CURRENT_PROTOCOL_VERSION.minor
     ))
+}
+
+#[cfg(test)]
+mod run_message_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn stream_epoch_fields_default_for_sequence_only_peers() {
+        let request = RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(AgentSessionId::new()),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::new(12)),
+            stream_epoch: None,
+        });
+        let mut encoded = serde_json::to_value(&request).unwrap();
+        encoded["request"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stream_epoch");
+        encoded["request"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_id");
+        let decoded: RequestEnvelope = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.request, request.request);
+
+        let response = ResponseEnvelope::success(
+            RequestId::new(),
+            ServerResponse::SessionEvents {
+                events: Vec::new(),
+                stream_epoch: None,
+            },
+        );
+        let mut encoded = serde_json::to_value(&response).unwrap();
+        encoded["result"]["Ok"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stream_epoch");
+        let decoded: ResponseEnvelope = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            decoded.result.unwrap(),
+            ServerResponse::SessionEvents {
+                events: Vec::new(),
+                stream_epoch: None,
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_event_snapshot_round_trips() {
+        let session_id = AgentSessionId::new();
+        let workspace_id = WorkspaceId::new();
+        let response = ServerResponse::WorkspaceEventsSnapshot {
+            workspace_id,
+            sessions: Vec::new(),
+            events: vec![
+                WorkspaceFeedEvent::Session(ServerEventEnvelope {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(4),
+                    session_id,
+                    event: ServerEvent::AgentSessionArchived { session_id },
+                }),
+                WorkspaceFeedEvent::Workspace(WorkspaceEventEnvelope {
+                    protocol_version: CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(5),
+                    workspace_id,
+                    event: WorkspaceEvent::Renamed {
+                        name: "new name".to_owned(),
+                    },
+                }),
+            ],
+            oldest_sequence: EventSequence::new(4),
+            latest_sequence: EventSequence::new(9),
+            stream_epoch: Some("epoch".to_owned()),
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ServerResponse>(&encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn transcript_page_and_range_frames_round_trip_with_their_capability() {
+        let session_id = AgentSessionId::new();
+        let metadata_request = ClientRequest::GetAgentSessionSnapshotMetadata { session_id };
+        assert_eq!(
+            metadata_request.required_capability(),
+            Some(Capability::ReadAgentSession)
+        );
+        let encoded = encode_request(&RequestEnvelope::new(metadata_request)).unwrap();
+        assert_eq!(
+            decode_request(&encoded).unwrap().request,
+            ClientRequest::GetAgentSessionSnapshotMetadata { session_id }
+        );
+
+        let run_id = RunId::new();
+        let page_request = ClientRequest::GetAgentRunMessagePage {
+            run_id,
+            before_ordinal: Some(12),
+            limit: 32,
+        };
+        assert_eq!(
+            page_request.required_capability(),
+            Some(Capability::ReadAgentRunMessages)
+        );
+        assert_eq!(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: 12,
+                byte_offset: 0,
+                length: 1,
+            }
+            .required_capability(),
+            Some(Capability::ReadAgentRunMessages)
+        );
+        let encoded = encode_request(&RequestEnvelope::new(page_request)).unwrap();
+        let decoded = decode_request(&encoded).unwrap();
+        assert_eq!(
+            decoded.request,
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: Some(12),
+                limit: 32
+            }
+        );
+        let transcript_request = ClientRequest::GetAgentRunTranscriptPage {
+            run_id,
+            before_ordinal: Some(12),
+            limit: 16,
+        };
+        assert_eq!(
+            transcript_request.required_capability(),
+            Some(Capability::ReadAgentRunMessages)
+        );
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(transcript_request)).unwrap())
+                .unwrap()
+                .request,
+            ClientRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal: Some(12),
+                limit: 16,
+            }
+        );
+
+        let page_response = ResponseEnvelope::success(
+            RequestId::new(),
+            ServerResponse::AgentRunMessagePage {
+                run_id,
+                messages: vec![AgentRunMessageHeader {
+                    ordinal: 11,
+                    role: loom_model::MessageRole::Assistant,
+                    content_bytes: 18,
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                }],
+            },
+        );
+        assert_eq!(
+            decode_response(&encode_response(&page_response).unwrap()).unwrap(),
+            page_response
+        );
+
+        let transcript_response = ResponseEnvelope::success(
+            RequestId::new(),
+            ServerResponse::AgentRunTranscriptPage {
+                run_id,
+                messages: vec![AgentRunTranscriptMessage {
+                    ordinal: 11,
+                    message: ModelMessage::new(loom_model::MessageRole::Assistant, "answer"),
+                    content_truncated: false,
+                }],
+                next_before: Some(11),
+                has_older: true,
+            },
+        );
+        assert_eq!(
+            decode_response(&encode_response(&transcript_response).unwrap()).unwrap(),
+            transcript_response
+        );
+
+        let response = ResponseEnvelope::success(
+            RequestId::new(),
+            ServerResponse::AgentRunMessageContentRange {
+                run_id,
+                message_ordinal: 12,
+                byte_offset: 256,
+                content: b"bounded transcript".to_vec(),
+            },
+        );
+        let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
+        assert_eq!(decoded, response);
+    }
 }

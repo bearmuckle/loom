@@ -26,6 +26,7 @@ pub use loom_protocol::{
 };
 
 const MAX_SNAPSHOT_ENTRIES: usize = 100_000;
+const MAX_RETAINED_FILESYSTEM_CHANGES: usize = 2048;
 
 fn checked_mount_path(relative: &str) -> Result<PathBuf> {
     let path = Path::new(relative);
@@ -65,6 +66,8 @@ pub struct WorkspaceByteWriteResult {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceEditHistory {
+    #[serde(default)]
+    pub id: u64,
     pub path: String,
     pub before: Option<String>,
     #[serde(default)]
@@ -80,8 +83,27 @@ pub struct WorkspaceStateSnapshot {
     pub control: WorkspaceControl,
     pub checkpoints: Vec<Checkpoint>,
     pub edits: Vec<WorkspaceEditHistory>,
+    #[serde(default)]
+    pub next_edit_id: u64,
     pub next_sequence: EventSequence,
     pub changes: Vec<SessionFilesystemChange>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VersionedWorkspaceStateSnapshot {
+    pub generation: u64,
+    pub state: WorkspaceStateSnapshot,
+    pub delta: WorkspaceStateDelta,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkspaceStateDelta {
+    pub checkpoints: Vec<Checkpoint>,
+    pub deleted_checkpoints: Vec<CheckpointId>,
+    pub edits: Vec<WorkspaceEditHistory>,
+    pub deleted_edits: Vec<u64>,
+    pub changes: Vec<SessionFilesystemChange>,
+    pub deleted_changes: Vec<EventSequence>,
 }
 
 #[derive(Debug)]
@@ -92,15 +114,67 @@ struct WorkspaceState {
     watcher_snapshot: Option<SessionFilesystemSnapshot>,
     next_sequence: EventSequence,
     changes: Vec<SessionFilesystemChange>,
+    generation: u64,
+    persisted_generation: u64,
+    next_edit_id: u64,
+    delta: WorkspaceStateDelta,
+    delta_batches: BTreeMap<u64, WorkspaceStateDelta>,
 }
 
 #[derive(Clone, Debug)]
 struct EditRecord {
+    id: u64,
     path: String,
     before: Option<String>,
     before_bytes: Option<Vec<u8>>,
     after_revision: String,
     source: WorkspaceControl,
+}
+
+fn merge_delta(target: &mut WorkspaceStateDelta, delta: WorkspaceStateDelta) {
+    for checkpoint in delta.checkpoints {
+        target.deleted_checkpoints.retain(|id| *id != checkpoint.id);
+        target.checkpoints.retain(|row| row.id != checkpoint.id);
+        target.checkpoints.push(checkpoint);
+    }
+    for id in delta.deleted_checkpoints {
+        target.checkpoints.retain(|row| row.id != id);
+        if !target.deleted_checkpoints.contains(&id) {
+            target.deleted_checkpoints.push(id);
+        }
+    }
+    for edit in delta.edits {
+        target.deleted_edits.retain(|id| *id != edit.id);
+        target.edits.retain(|row| row.id != edit.id);
+        target.edits.push(edit);
+    }
+    for id in delta.deleted_edits {
+        target.edits.retain(|row| row.id != id);
+        if !target.deleted_edits.contains(&id) {
+            target.deleted_edits.push(id);
+        }
+    }
+    for change in delta.changes {
+        target
+            .deleted_changes
+            .retain(|sequence| *sequence != change.sequence);
+        target.changes.retain(|row| row.sequence != change.sequence);
+        target.changes.push(change);
+    }
+    for sequence in delta.deleted_changes {
+        target.changes.retain(|row| row.sequence != sequence);
+        if !target.deleted_changes.contains(&sequence) {
+            target.deleted_changes.push(sequence);
+        }
+    }
+}
+
+fn merged_delta(batches: &BTreeMap<u64, WorkspaceStateDelta>, through: u64) -> WorkspaceStateDelta {
+    let mut result = WorkspaceStateDelta::default();
+    for (_, delta) in batches.range(..=through) {
+        merge_delta(&mut result, delta.clone());
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -123,7 +197,23 @@ pub struct WorkspaceWatcher {
 
 impl Workspace {
     pub fn open(session_id: AgentSessionId, root: impl Into<PathBuf>) -> Result<Self> {
-        let requested = root.into();
+        Self::open_inner(session_id, root.into(), true)
+    }
+
+    /// Opens a persisted filesystem without walking its tree before state restore.
+    ///
+    /// `restore_state` captures the watcher baseline once, after mounts and saved
+    /// metadata are installed. This avoids the previous eager scan followed by a
+    /// second scan during restore.
+    pub fn open_for_restore(session_id: AgentSessionId, root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_inner(session_id, root.into(), false)
+    }
+
+    fn open_inner(
+        session_id: AgentSessionId,
+        requested: PathBuf,
+        scan_initial: bool,
+    ) -> Result<Self> {
         let root = Self::canonical_root(&requested)?;
         let workspace = Self {
             inner: Arc::new(WorkspaceInner {
@@ -136,12 +226,19 @@ impl Workspace {
                     watcher_snapshot: None,
                     next_sequence: EventSequence::default(),
                     changes: Vec::new(),
+                    generation: 1,
+                    persisted_generation: 0,
+                    next_edit_id: 1,
+                    delta: WorkspaceStateDelta::default(),
+                    delta_batches: BTreeMap::new(),
                 }),
                 mounts: Mutex::new(BTreeMap::new()),
             }),
         };
-        let snapshot = workspace.snapshot()?;
-        workspace.lock_state()?.watcher_snapshot = Some(snapshot);
+        if scan_initial {
+            let snapshot = workspace.snapshot()?;
+            workspace.lock_state()?.watcher_snapshot = Some(snapshot);
+        }
         Ok(workspace)
     }
 
@@ -271,6 +368,8 @@ impl Workspace {
             .lock()
             .map_err(|_| LoomError::invalid_state("workspace mounts are unavailable"))?
             .insert(relative.to_owned(), source.clone());
+        let mut state = self.lock_state()?;
+        Self::advance_generation(&mut state);
         Ok(source)
     }
 
@@ -296,6 +395,9 @@ impl Workspace {
             )
         })?;
         mounts.remove(relative);
+        drop(mounts);
+        let mut state = self.lock_state()?;
+        Self::advance_generation(&mut state);
         Ok(())
     }
 
@@ -326,21 +428,99 @@ impl Workspace {
     pub fn take_control(&self, control: WorkspaceControl) -> Result<WorkspaceControl> {
         let mut state = self.lock_state()?;
         let previous = state.control;
-        state.control = control;
+        if previous != control {
+            state.control = control;
+            Self::advance_generation(&mut state);
+        }
         Ok(previous)
     }
 
     pub fn export_state(&self) -> Result<WorkspaceStateSnapshot> {
         let state = self.lock_state()?;
-        Ok(WorkspaceStateSnapshot {
+        Ok(Self::snapshot_from_state(
+            self.inner.session_id,
+            &self.inner.root,
+            &state,
+        ))
+    }
+
+    /// Avoid cloning checkpoint and undo history when no durable state changed.
+    pub fn export_state_if_dirty(&self) -> Result<Option<VersionedWorkspaceStateSnapshot>> {
+        let state = self.lock_state()?;
+        if state.generation == state.persisted_generation {
+            return Ok(None);
+        }
+        Ok(Some(VersionedWorkspaceStateSnapshot {
+            generation: state.generation,
+            state: Self::snapshot_from_state(self.inner.session_id, &self.inner.root, &state),
+            delta: merged_delta(&state.delta_batches, state.generation),
+        }))
+    }
+
+    /// Capture only filesystem rows changed since the last acknowledged commit.
+    /// Root/control and sequence metadata remain present so the caller can update
+    /// the small session index without cloning retained history.
+    pub fn export_delta_if_dirty(&self) -> Result<Option<VersionedWorkspaceStateSnapshot>> {
+        let state = self.lock_state()?;
+        if state.generation == state.persisted_generation {
+            return Ok(None);
+        }
+        let snapshot = WorkspaceStateSnapshot {
             session_id: self.inner.session_id,
             root: self.inner.root.display().to_string(),
+            control: state.control,
+            checkpoints: Vec::new(),
+            edits: Vec::new(),
+            next_edit_id: state.next_edit_id,
+            next_sequence: state.next_sequence,
+            changes: Vec::new(),
+        };
+        Ok(Some(VersionedWorkspaceStateSnapshot {
+            generation: state.generation,
+            state: snapshot,
+            delta: merged_delta(&state.delta_batches, state.generation),
+        }))
+    }
+
+    /// Acknowledge a captured generation only after its database transaction commits.
+    pub fn acknowledge_persisted_generation(&self, generation: u64) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if generation > state.generation {
+            return Err(LoomError::invalid_request(
+                "cannot acknowledge a future workspace generation",
+            ));
+        }
+        state.persisted_generation = state.persisted_generation.max(generation);
+        let persisted_generation = state.persisted_generation;
+        state
+            .delta_batches
+            .retain(|generation, _| *generation > persisted_generation);
+        Ok(())
+    }
+
+    /// Mark non-workspace metadata stored alongside this filesystem record dirty
+    /// (for example, repository or directory catalog changes).
+    pub fn mark_state_dirty(&self) -> Result<()> {
+        let mut state = self.lock_state()?;
+        Self::advance_generation(&mut state);
+        Ok(())
+    }
+
+    fn snapshot_from_state(
+        session_id: AgentSessionId,
+        root: &Path,
+        state: &WorkspaceState,
+    ) -> WorkspaceStateSnapshot {
+        WorkspaceStateSnapshot {
+            session_id,
+            root: root.display().to_string(),
             control: state.control,
             checkpoints: state.checkpoints.values().cloned().collect(),
             edits: state
                 .edits
                 .iter()
                 .map(|edit| WorkspaceEditHistory {
+                    id: edit.id,
                     path: edit.path.clone(),
                     before: edit.before.clone(),
                     before_bytes: edit.before_bytes.clone(),
@@ -348,9 +528,19 @@ impl Workspace {
                     source: edit.source,
                 })
                 .collect(),
+            next_edit_id: state.next_edit_id,
             next_sequence: state.next_sequence,
             changes: state.changes.clone(),
-        })
+        }
+    }
+
+    fn advance_generation(state: &mut WorkspaceState) {
+        state.generation = state.generation.saturating_add(1);
+        let delta = std::mem::take(&mut state.delta);
+        merge_delta(
+            state.delta_batches.entry(state.generation).or_default(),
+            delta,
+        );
     }
 
     pub fn state(&self) -> Result<WorkspaceStateSnapshot> {
@@ -445,6 +635,7 @@ impl Workspace {
             .edits
             .into_iter()
             .map(|edit| EditRecord {
+                id: edit.id,
                 path: edit.path,
                 before: edit.before,
                 before_bytes: edit.before_bytes,
@@ -452,8 +643,25 @@ impl Workspace {
                 source: edit.source,
             })
             .collect();
+        state.next_edit_id = persisted
+            .next_edit_id
+            .max(
+                state
+                    .edits
+                    .iter()
+                    .map(|edit| edit.id)
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1),
+            )
+            .max(1);
+        state.delta = WorkspaceStateDelta::default();
+        state.delta_batches.clear();
         state.next_sequence = persisted.next_sequence;
         state.changes = persisted.changes;
+        // Restored state is the durable baseline in this process.
+        state.generation = 0;
+        state.persisted_generation = 0;
         state.watcher_snapshot = Some(self.snapshot()?);
         Ok(())
     }
@@ -586,13 +794,25 @@ impl Workspace {
             )
         })?;
         let after_revision = revision_bytes(&bytes);
+        let edit_id = state.next_edit_id;
         state.edits.push(EditRecord {
+            id: edit_id,
+            path: relative.to_owned(),
+            before: String::from_utf8(before_bytes.clone()).ok(),
+            before_bytes: Some(before_bytes.clone()),
+            after_revision: after_revision.clone(),
+            source,
+        });
+        state.delta.edits.push(WorkspaceEditHistory {
+            id: edit_id,
             path: relative.to_owned(),
             before: String::from_utf8(before_bytes.clone()).ok(),
             before_bytes: Some(before_bytes),
             after_revision: after_revision.clone(),
             source,
         });
+        state.next_edit_id = edit_id.saturating_add(1);
+        Self::advance_generation(&mut state);
         Ok(WorkspaceByteWriteResult {
             path: relative.to_owned(),
             before_revision,
@@ -678,14 +898,26 @@ impl Workspace {
             )
         })?;
         let after_revision = revision(&next);
+        let edit_id = state.next_edit_id;
         state.edits.push(EditRecord {
+            id: edit_id,
+            path: edit.path.clone(),
+            before: before.clone(),
+            before_bytes: None,
+            after_revision: after_revision.clone(),
+            source,
+        });
+        state.delta.edits.push(WorkspaceEditHistory {
+            id: edit_id,
             path: edit.path.clone(),
             before,
             before_bytes: None,
             after_revision: after_revision.clone(),
             source,
         });
+        state.next_edit_id = edit_id.saturating_add(1);
         if source == WorkspaceControl::Agent {
+            let mut changed_checkpoints = Vec::new();
             for checkpoint in state.checkpoints.values_mut() {
                 if let Some(file) = checkpoint.files.get_mut(&edit.path) {
                     file.expected_revision = after_revision.clone();
@@ -700,8 +932,11 @@ impl Workspace {
                         },
                     );
                 }
+                changed_checkpoints.push(checkpoint.clone());
             }
+            state.delta.checkpoints.extend(changed_checkpoints);
         }
+        Self::advance_generation(&mut state);
         let diff = unified_diff(&edit.path, &before_content, &next);
         Ok(WorkspaceEditResult {
             path: edit.path,
@@ -752,9 +987,10 @@ impl Workspace {
             created_at: Timestamp::now(),
             files,
         };
-        self.lock_state()?
-            .checkpoints
-            .insert(checkpoint.id, checkpoint.clone());
+        let mut state = self.lock_state()?;
+        state.checkpoints.insert(checkpoint.id, checkpoint.clone());
+        state.delta.checkpoints.push(checkpoint.clone());
+        Self::advance_generation(&mut state);
         Ok(checkpoint)
     }
 
@@ -824,13 +1060,25 @@ impl Workspace {
                 )
             })?;
             let next_revision = revision(&content);
+            let edit_id = state.next_edit_id;
             state.edits.push(EditRecord {
-                path: relative,
-                before: Some(current),
+                id: edit_id,
+                path: relative.clone(),
+                before: Some(current.clone()),
                 before_bytes: None,
-                after_revision: next_revision,
+                after_revision: next_revision.clone(),
                 source: WorkspaceControl::User,
             });
+            state.delta.edits.push(WorkspaceEditHistory {
+                id: edit_id,
+                path: relative.clone(),
+                before: Some(current),
+                before_bytes: None,
+                after_revision: next_revision.clone(),
+                source: WorkspaceControl::User,
+            });
+            state.next_edit_id = edit_id.saturating_add(1);
+            Self::advance_generation(&mut state);
         }
         Ok(RevertResult {
             checkpoint_id,
@@ -891,6 +1139,7 @@ impl Workspace {
             )
         })?;
         state.edits.remove(index);
+        state.delta.deleted_edits.push(edit.id);
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
@@ -902,9 +1151,19 @@ impl Workspace {
                 ));
             }
         };
+        let restored_revision = revision(&content);
+        let mut changed_checkpoints = Vec::new();
+        for checkpoint in state.checkpoints.values_mut() {
+            if let Some(file) = checkpoint.files.get_mut(&edit.path) {
+                file.expected_revision = restored_revision.clone();
+                changed_checkpoints.push(checkpoint.clone());
+            }
+        }
+        state.delta.checkpoints.extend(changed_checkpoints);
+        Self::advance_generation(&mut state);
         Ok(UndoResult {
             path: edit.path,
-            revision: revision(&content),
+            revision: restored_revision,
         })
     }
 
@@ -952,6 +1211,25 @@ impl Workspace {
                 state.changes.push(change.clone());
                 changes.push(change);
             }
+        }
+        let retained_before = state
+            .changes
+            .iter()
+            .map(|change| change.sequence)
+            .collect::<BTreeSet<_>>();
+        trim_filesystem_change_history(&mut state.changes);
+        let retained_after = state
+            .changes
+            .iter()
+            .map(|change| change.sequence)
+            .collect::<BTreeSet<_>>();
+        state
+            .delta
+            .deleted_changes
+            .extend(retained_before.difference(&retained_after).copied());
+        state.delta.changes.extend(changes.iter().cloned());
+        if !changes.is_empty() {
+            Self::advance_generation(&mut state);
         }
         Ok(changes)
     }
@@ -1166,6 +1444,15 @@ impl Workspace {
     }
 }
 
+fn trim_filesystem_change_history(changes: &mut Vec<SessionFilesystemChange>) {
+    let excess = changes
+        .len()
+        .saturating_sub(MAX_RETAINED_FILESYSTEM_CHANGES);
+    if excess > 0 {
+        changes.drain(..excess);
+    }
+}
+
 impl WorkspaceWatcher {
     pub fn poll(&self) -> Result<Vec<SessionFilesystemChange>> {
         self.workspace.poll_changes()
@@ -1233,6 +1520,150 @@ mod tests {
         fs::write(root.join("README.md"), "hello\n").unwrap();
         fs::write(root.join("src/lib.rs"), "pub fn answer() -> u8 { 1 }\n").unwrap();
         (Workspace::open(session_id, &root).unwrap(), root)
+    }
+
+    #[test]
+    fn filesystem_change_retention_keeps_the_newest_sequences() {
+        let session_id = AgentSessionId::new();
+        let mut changes = (1..=(MAX_RETAINED_FILESYSTEM_CHANGES as u64 + 1))
+            .map(|sequence| SessionFilesystemChange {
+                sequence: EventSequence::new(sequence),
+                session_id,
+                path: format!("file-{sequence}"),
+                kind: WorkspaceChangeKind::Created,
+                revision: None,
+            })
+            .collect::<Vec<_>>();
+        trim_filesystem_change_history(&mut changes);
+        assert_eq!(changes.len(), MAX_RETAINED_FILESYSTEM_CHANGES);
+        assert_eq!(changes.first().unwrap().sequence, EventSequence::new(2));
+        assert_eq!(changes.last().unwrap().sequence, EventSequence::new(2049));
+    }
+
+    #[test]
+    fn dirty_workspace_snapshots_skip_clean_state_and_keep_newer_mutations() {
+        let (workspace, root) = workspace();
+        let initial = workspace.export_state_if_dirty().unwrap().unwrap();
+        workspace
+            .acknowledge_persisted_generation(initial.generation)
+            .unwrap();
+        assert!(workspace.export_state_if_dirty().unwrap().is_none());
+
+        let before = workspace.read_file("README.md").unwrap();
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: before.content.trim_end().to_owned(),
+                new_text: "first".to_owned(),
+                expected_revision: Some(before.revision),
+            })
+            .unwrap();
+        let captured = workspace.export_state_if_dirty().unwrap().unwrap();
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: "first".to_owned(),
+                new_text: "second".to_owned(),
+                expected_revision: None,
+            })
+            .unwrap();
+        workspace
+            .acknowledge_persisted_generation(captured.generation)
+            .unwrap();
+        let newer = workspace.export_state_if_dirty().unwrap().unwrap();
+        assert!(newer.generation > captured.generation);
+        assert_eq!(
+            newer.state.edits.last().unwrap().after_revision,
+            revision("second\n")
+        );
+        workspace
+            .acknowledge_persisted_generation(newer.generation)
+            .unwrap();
+        assert!(workspace.export_state_if_dirty().unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn filesystem_delta_tracks_stable_edit_deletes_and_checkpoint_updates_per_generation() {
+        let (workspace, root) = workspace();
+        let initial = workspace.export_delta_if_dirty().unwrap().unwrap();
+        workspace
+            .acknowledge_persisted_generation(initial.generation)
+            .unwrap();
+        let checkpoint = workspace.create_checkpoint("baseline").unwrap();
+        let checkpoint_capture = workspace.export_delta_if_dirty().unwrap().unwrap();
+        assert_eq!(
+            checkpoint_capture
+                .delta
+                .checkpoints
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![checkpoint.id]
+        );
+        workspace
+            .acknowledge_persisted_generation(checkpoint_capture.generation)
+            .unwrap();
+
+        let before = workspace.read_file("README.md").unwrap();
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: "hello".to_owned(),
+                new_text: "first".to_owned(),
+                expected_revision: Some(before.revision),
+            })
+            .unwrap();
+        let first = workspace.export_delta_if_dirty().unwrap().unwrap();
+        assert_eq!(first.delta.edits.len(), 1);
+        assert_eq!(first.delta.checkpoints.len(), 1);
+        let first_id = first.delta.edits[0].id;
+
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: "first".to_owned(),
+                new_text: "second".to_owned(),
+                expected_revision: None,
+            })
+            .unwrap();
+        workspace
+            .acknowledge_persisted_generation(first.generation)
+            .unwrap();
+        let second = workspace.export_delta_if_dirty().unwrap().unwrap();
+        assert_eq!(second.delta.edits.len(), 1);
+        assert!(second.delta.edits[0].id > first_id);
+        assert_eq!(second.delta.checkpoints.len(), 1);
+
+        let second_id = second.delta.edits[0].id;
+        workspace.undo_last_agent_edit().unwrap();
+        let undone = workspace.export_delta_if_dirty().unwrap().unwrap();
+        assert!(undone.delta.deleted_edits.contains(&second_id));
+        assert!(!undone.delta.edits.iter().any(|edit| edit.id == second_id));
+        assert!(
+            undone
+                .delta
+                .checkpoints
+                .iter()
+                .any(|row| row.id == checkpoint.id)
+        );
+        workspace
+            .acknowledge_persisted_generation(undone.generation)
+            .unwrap();
+        assert!(workspace.export_delta_if_dirty().unwrap().is_none());
+        let restored = Workspace::open(workspace.session_id(), &root).unwrap();
+        restored.restore_state(workspace.state().unwrap()).unwrap();
+        let current = restored.read_file("README.md").unwrap();
+        restored
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: "first".to_owned(),
+                new_text: "after restart".to_owned(),
+                expected_revision: Some(current.revision),
+            })
+            .unwrap();
+        assert!(restored.state().unwrap().edits.last().unwrap().id > second_id);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

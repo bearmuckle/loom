@@ -13,14 +13,12 @@ pub use workspace::{WorkspaceManager, WorkspaceManagerState};
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionManagerState {
     pub sessions: BTreeMap<AgentSessionId, AgentSessionSnapshot>,
-    pub events: Vec<SessionEventRecord>,
     pub next_sequence: EventSequence,
 }
 
 #[derive(Debug, Default)]
 pub struct SessionManager {
     sessions: BTreeMap<AgentSessionId, AgentSessionSnapshot>,
-    events: Vec<SessionEventRecord>,
     next_sequence: EventSequence,
 }
 
@@ -38,135 +36,8 @@ impl SessionManager {
             ));
         }
 
-        let mut previous = EventSequence::default();
-        for record in &state.events {
-            if record.sequence <= previous || record.sequence > state.next_sequence {
-                return Err(LoomError::new(
-                    loom_core::ErrorCode::MalformedPayload,
-                    "session journal sequences are not strictly increasing",
-                    false,
-                ));
-            }
-            if !state.sessions.contains_key(&record.session_id) {
-                return Err(LoomError::new(
-                    loom_core::ErrorCode::MalformedPayload,
-                    "session journal references an unknown session",
-                    false,
-                ));
-            }
-            match &record.event {
-                SessionEvent::AgentSessionCreated { snapshot } => {
-                    if snapshot.id != record.session_id {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session creation event id does not match its record",
-                            false,
-                        ));
-                    }
-                    let Some(current) = state.sessions.get(&snapshot.id) else {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session creation event references a missing session",
-                            false,
-                        ));
-                    };
-                    if current.workspace_id != snapshot.workspace_id
-                        || current.created_at != snapshot.created_at
-                    {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session creation event snapshot does not match the session map",
-                            false,
-                        ));
-                    }
-                }
-                SessionEvent::AgentSessionStateChanged { session_id, .. } => {
-                    if *session_id != record.session_id {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session state event id does not match its record",
-                            false,
-                        ));
-                    }
-                }
-                SessionEvent::AgentSessionForked {
-                    source_session_id,
-                    snapshot,
-                } => {
-                    if snapshot.id != record.session_id {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session fork event id does not match its record",
-                            false,
-                        ));
-                    }
-                    if !state.sessions.contains_key(source_session_id) {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session fork event references an unknown source session",
-                            false,
-                        ));
-                    }
-                }
-                SessionEvent::AgentSessionRenamed { session_id, name } => {
-                    if *session_id != record.session_id {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session rename event id does not match its record",
-                            false,
-                        ));
-                    }
-                    if !state.sessions.contains_key(session_id) {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session rename event references a missing session",
-                            false,
-                        ));
-                    }
-                    if name.trim().is_empty() {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session rename event contains an empty name",
-                            false,
-                        ));
-                    }
-                }
-                SessionEvent::AgentSessionArchived { session_id } => {
-                    if *session_id != record.session_id {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session archive event id does not match its record",
-                            false,
-                        ));
-                    }
-                    let Some(current) = state.sessions.get(session_id) else {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session archive event references a missing session",
-                            false,
-                        ));
-                    };
-                    if current.state != AgentSessionState::Archived {
-                        return Err(LoomError::new(
-                            loom_core::ErrorCode::MalformedPayload,
-                            "session archive event does not match the session map",
-                            false,
-                        ));
-                    }
-                }
-            }
-            previous = record.sequence;
-        }
-        if previous != state.next_sequence && !state.events.is_empty() {
-            return Err(LoomError::new(
-                loom_core::ErrorCode::MalformedPayload,
-                "session journal sequence does not match its stored cursor",
-                false,
-            ));
-        }
         Ok(Self {
             sessions: state.sessions,
-            events: state.events,
             next_sequence: state.next_sequence,
         })
     }
@@ -178,7 +49,6 @@ impl SessionManager {
     pub fn export_state(&self) -> SessionManagerState {
         SessionManagerState {
             sessions: self.sessions.clone(),
-            events: self.events.clone(),
             next_sequence: self.next_sequence,
         }
     }
@@ -238,6 +108,12 @@ impl SessionManager {
             .get(&session_id)
             .cloned()
             .ok_or_else(|| LoomError::not_found("agent session", session_id))
+    }
+
+    /// Returns the workspace-wide lifecycle sequence high-water mark without
+    /// cloning the session catalog.
+    pub fn next_sequence(&self) -> EventSequence {
+        self.next_sequence
     }
 
     pub fn list_in_workspace(
@@ -410,17 +286,6 @@ impl SessionManager {
         Ok((snapshot, record))
     }
 
-    pub fn events_since(
-        &self,
-        session_id: Option<AgentSessionId>,
-        after_sequence: Option<EventSequence>,
-    ) -> impl Iterator<Item = &SessionEventRecord> {
-        self.events.iter().filter(move |record| {
-            session_id.is_none_or(|id| record.session_id == id)
-                && after_sequence.is_none_or(|sequence| record.sequence > sequence)
-        })
-    }
-
     pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
@@ -432,14 +297,12 @@ impl SessionManager {
         event: SessionEvent,
     ) -> SessionEventRecord {
         self.next_sequence = self.next_sequence.next();
-        let record = SessionEventRecord {
+        SessionEventRecord {
             sequence: self.next_sequence,
             session_id,
             occurred_at,
             event,
-        };
-        self.events.push(record.clone());
-        record
+        }
     }
 }
 
@@ -475,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn transitions_are_journaled() {
+    fn transitions_return_records_for_the_server_journal() {
         let mut manager = SessionManager::default();
         let (snapshot, _) = manager
             .create_in_workspace(WorkspaceId::new(), "Transition demo")
@@ -487,7 +350,7 @@ mod tests {
 
         assert_eq!(updated.state, AgentSessionState::Planning);
         assert_eq!(event.sequence, EventSequence::new(2));
-        assert_eq!(manager.events_since(Some(snapshot.id), None).count(), 2);
+        assert_eq!(manager.export_state().next_sequence, event.sequence);
     }
 
     #[test]

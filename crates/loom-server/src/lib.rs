@@ -2,9 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, Weak},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use loom_agent::{
@@ -12,26 +13,38 @@ use loom_agent::{
     AgentRuntimeOptions, AgentRuntimeState, AgentTask, RunControl, RunProgress,
 };
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Capability,
-    CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId, Result,
-    SessionEventRecord, Timestamp, WorkspaceId, WorkspaceRecord,
+    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
+    Capability, CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId,
+    RequestId, Result, RunAttemptId, SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId,
+    WorkspaceRecord,
 };
-use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ProviderId};
-use loom_persistence::{CURRENT_SCHEMA_VERSION, FilePersistence};
+use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
+use loom_persistence::{
+    DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor, DurableFilesystemDelta,
+    DurableFilesystemEdit, DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
+    DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
+    DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
+    DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
+};
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
-    AgentRunSnapshotProjection, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
-    ClientRequest, GitHubCopilotLoginStatus, GitHubRepository, NegotiationResult, RequestEnvelope,
-    ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionDirectory,
-    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, unsupported_version_error,
+    AgentActivityRecord, AgentExecutionStateRecord, AgentRunMessageHeader,
+    AgentRunSnapshotProjection, AgentRunTranscriptMessage, AgentSessionInitialState,
+    AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest,
+    GitHubCopilotLoginStatus, GitHubRepository, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES,
+    MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES,
+    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult, RequestEnvelope, ResponseEnvelope,
+    ServerEventEnvelope, ServerResponse, SessionDirectory, SessionFilesystemChange,
+    SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository, WorkerNodeResources,
+    WorkerNodeStatus, WorkspaceConfig, WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceFeedEvent,
+    unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
     ModelProvider, ProviderConfig, ProviderHealth, ProviderRegistry, UnavailableProvider,
     UsageLedger, deterministic_descriptor,
 };
-use loom_session::SessionManager;
+use loom_session::{SessionManager, WorkspaceManager};
 use loom_tools::ToolExecutor;
 use loom_vcs::GitService;
 use loom_workspace::Workspace;
@@ -50,6 +63,73 @@ fn json_value<T: Serialize>(value: T) -> Result<Value> {
             false,
         )
     })
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+const FEED_PRUNE_AFTER_NEW_SEQUENCES: u64 = 64;
+const FEED_PRUNE_AFTER_NEW_BYTES: usize = 4 * 1024 * 1024;
+
+fn should_prune_worker_feed(
+    next_sequence: u64,
+    last_pruned_sequence: u64,
+    accumulated_bytes: usize,
+    pending_bytes: usize,
+) -> bool {
+    next_sequence.saturating_sub(last_pruned_sequence) >= FEED_PRUNE_AFTER_NEW_SEQUENCES
+        || accumulated_bytes.saturating_add(pending_bytes) >= FEED_PRUNE_AFTER_NEW_BYTES
+}
+
+fn validate_retry_horizon(request_id: RequestId, now_ms: u64) -> Result<()> {
+    let Some(issued_at_ms) = request_id.issued_at_unix_millis() else {
+        // UUIDv4 IDs were used by earlier protocol clients. Keep their bounded
+        // count-based cache behavior while new clients use timestamped UUIDv7.
+        return Ok(());
+    };
+    let future_skew_ms = REQUEST_ID_FUTURE_SKEW.as_millis() as u64;
+    if issued_at_ms > now_ms.saturating_add(future_skew_ms) {
+        return Err(LoomError::invalid_request(
+            "request id issue time is too far in the future",
+        ));
+    }
+    if now_ms.saturating_sub(issued_at_ms) > IDEMPOTENCY_RETENTION.as_millis() as u64 {
+        return Err(LoomError::new(
+            ErrorCode::DeadlineExceeded,
+            "retry horizon expired; submit the operation as a new request",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn trim_idempotency_cache(cache: &mut BTreeMap<RequestId, IdempotencyRecord>) {
+    let now = current_unix_millis();
+    cache.retain(|request_id, record| {
+        record
+            .expires_at
+            .is_none_or(|expires_at| expires_at.as_unix_millis() > now)
+            || request_id.issued_at_unix_millis().is_none()
+    });
+
+    let mut legacy = cache
+        .iter()
+        .filter(|(request_id, _)| request_id.issued_at_unix_millis().is_none())
+        .map(|(request_id, record)| (*request_id, record.created_at))
+        .collect::<Vec<_>>();
+    if legacy.len() > LEGACY_IDEMPOTENCY_RETENTION {
+        let expired_count = legacy.len() - LEGACY_IDEMPOTENCY_RETENTION;
+        legacy.sort_by_key(|(_, created_at)| *created_at);
+        for (request_id, _) in legacy.into_iter().take(expired_count) {
+            cache.remove(&request_id);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -306,8 +386,21 @@ pub use remote::{
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
-const IDEMPOTENCY_RETENTION: usize = 1024;
+const IDEMPOTENCY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const LEGACY_IDEMPOTENCY_RETENTION: usize = 1024;
+const REQUEST_ID_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 const MAX_REVIEW_CHANGES: usize = 512;
+
+fn filesystem_history_pruned(
+    after: Option<loom_core::EventSequence>,
+    changes: &[SessionFilesystemChange],
+) -> bool {
+    after.is_some_and(|after| {
+        changes
+            .first()
+            .is_some_and(|first| first.sequence.value() > after.value().saturating_add(1))
+    })
+}
 const MAX_REVIEW_DIFF_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_FILE_BYTES: usize = 128 * 1024;
 const MAX_RUN_MESSAGE_BYTES: usize = 32 * 1024;
@@ -506,25 +599,59 @@ fn github_copilot_credentials() -> Result<Arc<FileCredentialStore>> {
 struct EventJournal {
     next_sequence: EventSequence,
     events: Vec<ServerEventEnvelope>,
+    #[serde(skip)]
+    pending_events: Vec<ServerEventEnvelope>,
+    #[serde(default)]
+    workspace_events: Vec<WorkspaceEventEnvelope>,
+    #[serde(skip)]
+    pending_workspace_events: Vec<WorkspaceEventEnvelope>,
     #[serde(default = "default_event_retention")]
     retention_limit: usize,
 }
 
 impl EventJournal {
+    /// Capture only the pending session rows owned by one run checkpoint. The
+    /// workspace feed is committed by full-state saves, never worker saves.
+    fn capture_session_feed(
+        &self,
+        session_id: AgentSessionId,
+    ) -> (DurableFeedState, BTreeSet<EventSequence>) {
+        let events = self
+            .pending_events
+            .iter()
+            .filter(|event| event.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let sequences = events.iter().map(|event| event.sequence).collect();
+        (
+            DurableFeedState {
+                next_sequence: self.next_sequence,
+                retention_limit: self.retention_limit,
+                events,
+                workspace_events: Vec::new(),
+            },
+            sequences,
+        )
+    }
+
+    /// Acknowledge precisely the rows included in a successfully committed
+    /// checkpoint; unrelated sessions and workspace events remain pending.
+    fn acknowledge_session_feed(&mut self, sequences: &BTreeSet<EventSequence>) {
+        self.pending_events
+            .retain(|event| !sequences.contains(&event.sequence));
+    }
+
     fn append_session(&mut self, record: SessionEventRecord) {
         let sequence = self.next();
-        self.events.push(ServerEventEnvelope::from_session_event(
-            sequence,
-            record.session_id,
-            record.event,
-        ));
+        let event =
+            ServerEventEnvelope::from_session_event(sequence, record.session_id, record.event);
+        self.append_event(event);
     }
 
     fn append_agent(&mut self, session_id: AgentSessionId, event: AgentEvent) {
         let sequence = self.next();
-        self.events.push(ServerEventEnvelope::from_agent_event(
-            sequence, session_id, event,
-        ));
+        let event = ServerEventEnvelope::from_agent_event(sequence, session_id, event);
+        self.append_event(event);
     }
 
     fn next(&mut self) -> EventSequence {
@@ -532,32 +659,131 @@ impl EventJournal {
         if self.retention_limit == 0 {
             self.retention_limit = DEFAULT_EVENT_RETENTION;
         }
-        let excess = self
-            .events
-            .len()
-            .saturating_add(1)
-            .saturating_sub(self.retention_limit);
-        if excess > 0 {
-            self.events.drain(..excess);
-        }
         self.next_sequence
     }
 
-    fn is_cursor_stale(&self, after_sequence: Option<EventSequence>) -> bool {
+    fn append_event(&mut self, event: ServerEventEnvelope) {
+        self.events.push(event.clone());
+        self.pending_events.push(event);
+        Self::prune_events(&mut self.events, self.retention_limit);
+        Self::prune_events(&mut self.pending_events, self.retention_limit);
+    }
+
+    fn append_workspace(
+        &mut self,
+        workspace_id: WorkspaceId,
+        event: WorkspaceEvent,
+    ) -> EventSequence {
+        let envelope = WorkspaceEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence: self.next(),
+            workspace_id,
+            event,
+        };
+        let sequence = envelope.sequence;
+        self.workspace_events.push(envelope.clone());
+        self.pending_workspace_events.push(envelope);
+        Self::prune_workspace_events(&mut self.workspace_events, self.retention_limit);
+        Self::prune_workspace_events(&mut self.pending_workspace_events, self.retention_limit);
+        sequence
+    }
+
+    fn discard_pending_workspace(&mut self, sequence: EventSequence) {
+        self.pending_workspace_events
+            .retain(|event| event.sequence != sequence);
+        self.workspace_events
+            .retain(|event| event.sequence != sequence);
+    }
+
+    fn prune_workspace_events(events: &mut Vec<WorkspaceEventEnvelope>, limit: usize) {
+        let mut counts = BTreeMap::<WorkspaceId, usize>::new();
+        for event in events.iter() {
+            *counts.entry(event.workspace_id).or_default() += 1;
+        }
+        for (workspace_id, count) in counts {
+            let mut excess = count.saturating_sub(limit);
+            if excess > 0 {
+                events.retain(|event| {
+                    if excess > 0 && event.workspace_id == workspace_id {
+                        excess -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+    }
+
+    fn prune_events(events: &mut Vec<ServerEventEnvelope>, limit: usize) {
+        let mut counts = BTreeMap::<AgentSessionId, usize>::new();
+        for event in events.iter() {
+            *counts.entry(event.session_id).or_default() += 1;
+        }
+        for (session_id, count) in counts {
+            let mut excess = count.saturating_sub(limit);
+            if excess > 0 {
+                events.retain(|event| {
+                    if excess > 0 && event.session_id == session_id {
+                        excess -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
+    }
+
+    fn oldest_sequence(&self, session_id: Option<AgentSessionId>) -> Option<EventSequence> {
+        self.oldest_event(session_id).map(|event| event.sequence)
+    }
+
+    fn oldest_event(&self, session_id: Option<AgentSessionId>) -> Option<&ServerEventEnvelope> {
+        self.events
+            .iter()
+            .find(|event| session_id.is_none_or(|id| event.session_id == id))
+    }
+
+    fn latest_sequence(&self, session_id: Option<AgentSessionId>) -> Option<EventSequence> {
+        self.events
+            .iter()
+            .rev()
+            .find(|event| session_id.is_none_or(|id| event.session_id == id))
+            .map(|event| event.sequence)
+    }
+
+    fn is_cursor_stale(
+        &self,
+        session_id: Option<AgentSessionId>,
+        after_sequence: Option<EventSequence>,
+    ) -> bool {
         let Some(after_sequence) = after_sequence else {
             return false;
         };
-        self.events
-            .first()
-            .is_some_and(|first| after_sequence.next() < first.sequence)
+        let Some(oldest) = self.oldest_event(session_id) else {
+            return false;
+        };
+        if after_sequence.next() >= oldest.sequence {
+            return false;
+        }
+        let Some(session_id) = session_id else {
+            return true;
+        };
+        !matches!(
+            &oldest.event,
+            loom_protocol::ServerEvent::AgentSessionCreated { snapshot }
+                | loom_protocol::ServerEvent::AgentSessionForked { snapshot, .. }
+                if snapshot.id == session_id
+        )
     }
 
     fn set_retention(&mut self, limit: usize) {
         self.retention_limit = limit;
-        let excess = self.events.len().saturating_sub(limit);
-        if excess > 0 {
-            self.events.drain(..excess);
-        }
+        Self::prune_events(&mut self.events, limit);
+        Self::prune_events(&mut self.pending_events, limit);
+        Self::prune_workspace_events(&mut self.workspace_events, limit);
+        Self::prune_workspace_events(&mut self.pending_workspace_events, limit);
     }
 
     fn events_since(
@@ -573,6 +799,94 @@ impl EventJournal {
             })
             .cloned()
             .collect()
+    }
+
+    fn workspace_events_since(
+        &self,
+        session_ids: &BTreeSet<AgentSessionId>,
+        workspace_id: WorkspaceId,
+        after_sequence: Option<EventSequence>,
+    ) -> Vec<WorkspaceFeedEvent> {
+        let mut events = self
+            .events
+            .iter()
+            .filter(|event| {
+                session_ids.contains(&event.session_id)
+                    && after_sequence.is_none_or(|sequence| event.sequence > sequence)
+            })
+            .cloned()
+            .map(WorkspaceFeedEvent::Session)
+            .collect::<Vec<_>>();
+        events.extend(
+            self.workspace_events
+                .iter()
+                .filter(|event| {
+                    event.workspace_id == workspace_id
+                        && after_sequence.is_none_or(|sequence| event.sequence > sequence)
+                })
+                .cloned()
+                .map(WorkspaceFeedEvent::Workspace),
+        );
+        events.sort_by_key(|event| match event {
+            WorkspaceFeedEvent::Session(event) => event.sequence,
+            WorkspaceFeedEvent::Workspace(event) => event.sequence,
+        });
+        events
+    }
+
+    fn workspace_oldest_sequence(
+        &self,
+        session_ids: &BTreeSet<AgentSessionId>,
+        workspace_id: WorkspaceId,
+    ) -> Option<EventSequence> {
+        self.events
+            .iter()
+            .find(|event| session_ids.contains(&event.session_id))
+            .map(|event| event.sequence)
+            .into_iter()
+            .chain(
+                self.workspace_events
+                    .iter()
+                    .find(|event| event.workspace_id == workspace_id)
+                    .map(|event| event.sequence),
+            )
+            .min()
+    }
+
+    fn workspace_latest_sequence(
+        &self,
+        session_ids: &BTreeSet<AgentSessionId>,
+        workspace_id: WorkspaceId,
+    ) -> Option<EventSequence> {
+        self.events
+            .iter()
+            .rev()
+            .find(|event| session_ids.contains(&event.session_id))
+            .map(|event| event.sequence)
+            .into_iter()
+            .chain(
+                self.workspace_events
+                    .iter()
+                    .rev()
+                    .find(|event| event.workspace_id == workspace_id)
+                    .map(|event| event.sequence),
+            )
+            .max()
+    }
+
+    fn workspace_cursor_is_stale(
+        &self,
+        session_ids: &BTreeSet<AgentSessionId>,
+        workspace_id: WorkspaceId,
+        after_sequence: Option<EventSequence>,
+    ) -> bool {
+        let (Some(after), Some(oldest)) = (
+            after_sequence,
+            self.workspace_oldest_sequence(session_ids, workspace_id),
+        ) else {
+            return false;
+        };
+        after.next() < oldest
     }
 
     fn recent_events(&self, session_id: AgentSessionId, limit: usize) -> Vec<ServerEventEnvelope> {
@@ -593,10 +907,39 @@ fn default_event_retention() -> usize {
     DEFAULT_EVENT_RETENTION
 }
 
+fn deduplicate_events(events: Vec<ServerEventEnvelope>) -> Vec<ServerEventEnvelope> {
+    let mut by_sequence = BTreeMap::new();
+    for event in events {
+        by_sequence.insert(event.sequence.value(), event);
+    }
+    by_sequence.into_values().collect()
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct IdempotencyRecord {
+    created_at: Timestamp,
+    expires_at: Option<Timestamp>,
     request: ClientRequest,
     response: ResponseEnvelope,
+}
+
+impl IdempotencyRecord {
+    fn new(
+        request_id: loom_core::RequestId,
+        request: ClientRequest,
+        response: ResponseEnvelope,
+    ) -> Self {
+        Self {
+            created_at: Timestamp::now(),
+            expires_at: request_id.issued_at_unix_millis().map(|issued_at| {
+                Timestamp::from_unix_millis(
+                    issued_at.saturating_add(IDEMPOTENCY_RETENTION.as_millis() as u64),
+                )
+            }),
+            request,
+            response,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -604,8 +947,6 @@ struct PersistedBackendState {
     sessions: loom_session::SessionManagerState,
     workspace_records: loom_session::WorkspaceManagerState,
     journal: EventJournal,
-    runs: BTreeMap<loom_core::RunId, AgentRuntimeState>,
-    session_filesystems: BTreeMap<AgentSessionId, PersistedSessionFilesystem>,
     session_policies: BTreeMap<AgentSessionId, ApprovalPolicy>,
     auto_approve_actions: BTreeMap<AgentSessionId, bool>,
     provider_configs: Vec<ProviderConfig>,
@@ -615,12 +956,206 @@ struct PersistedBackendState {
     idempotency: BTreeMap<loom_core::RequestId, IdempotencyRecord>,
 }
 
+#[derive(Clone)]
+struct PersistedRunSummary {
+    snapshot: AgentRunSnapshot,
+    usage: UsageSnapshot,
+}
+
+fn durable_run_messages_from_runtime(messages: &[ModelMessage]) -> Vec<DurableRunMessage> {
+    messages
+        .iter()
+        .map(|message| DurableRunMessage {
+            role: message.role,
+            content: message.content.clone(),
+            name: message.name.clone(),
+            tool_call_id: message.tool_call_id,
+            tool_calls: message.tool_calls.clone(),
+        })
+        .collect()
+}
+
+fn persisted_run_messages(messages: Vec<DurableRunMessage>) -> Vec<ModelMessage> {
+    messages
+        .into_iter()
+        .map(|message| ModelMessage {
+            role: message.role,
+            content: message.content,
+            name: message.name,
+            tool_call_id: message.tool_call_id,
+            tool_calls: message.tool_calls,
+        })
+        .collect()
+}
+
+fn hydrate_run_context_checkpoint(
+    persistence: &FilePersistence,
+    run_id: loom_core::RunId,
+    state: &mut AgentRuntimeState,
+) -> Result<()> {
+    let Some(checkpoint) = persistence.load_run_context_checkpoint(run_id)? else {
+        state.context_checkpoint = None;
+        if let Some(inspection) = &mut state.context_inspection {
+            inspection.summary = None;
+        }
+        return Ok(());
+    };
+    if checkpoint.session_id != state.session_id {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "run context checkpoint belongs to a different session",
+            false,
+        ));
+    }
+    state.context_checkpoint = Some(checkpoint.summary.clone());
+    if let Some(inspection) = &mut state.context_inspection {
+        inspection.summary = Some(checkpoint.summary);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedSessionFilesystem {
     filesystem: loom_workspace::WorkspaceStateSnapshot,
+    #[serde(skip)]
     repositories: BTreeMap<RepositoryId, SessionRepository>,
-    #[serde(default)]
+    #[serde(skip)]
     directories: Vec<SessionDirectory>,
+}
+
+fn sync_cached_run_attempt(state: &mut AgentRuntimeState) {
+    let Some(attempt) = state
+        .attempts
+        .iter_mut()
+        .rfind(|attempt| attempt.id == state.run.attempt_id)
+    else {
+        return;
+    };
+    attempt.state = state.run.state;
+    attempt.completed_at = if matches!(
+        state.run.state,
+        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+    ) {
+        Some(state.run.completed_at.unwrap_or(state.run.updated_at))
+    } else {
+        None
+    };
+}
+
+fn execution_state_from_runtime(state: &AgentRuntimeState) -> Result<AgentExecutionStateRecord> {
+    Ok(AgentExecutionStateRecord {
+        run_id: state.run.id,
+        session_id: state.session_id,
+        attempt_id: state.run.attempt_id,
+        control_revision: state.run.control_revision,
+        state: state.run.state,
+        step_id: state.step_id,
+        step_index: state.step_index,
+        provider_cursor: u64::try_from(state.provider_cursor).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "provider cursor is out of range",
+                false,
+            )
+        })?,
+        next_message_id: state.next_message_id,
+        active_message_id: state.active_message_id,
+        pending_tool_execution: state.pending_tool_execution.clone(),
+        pending_approval: state.pending_approval.clone(),
+        pending_input: state.pending_input.clone(),
+        last_failed_call: state.last_failed_call.clone(),
+    })
+}
+
+fn runtime_state_from_durable_config(
+    summary: &PersistedRunSummary,
+    config: DurableRunRuntimeConfig,
+) -> Result<AgentRuntimeState> {
+    let options = AgentRuntimeOptions {
+        limits: config.limits,
+        context: config.context_options,
+        checkpoint_id: config.checkpoint_id,
+        input_cost_micros_per_1k: config.input_cost_micros_per_1k,
+        output_cost_micros_per_1k: config.output_cost_micros_per_1k,
+    };
+    Ok(AgentRuntimeState {
+        session_id: summary.snapshot.session_id,
+        task: AgentTask {
+            task: summary.snapshot.task.clone(),
+            model: summary.snapshot.model.clone(),
+            system_instructions: config.system_instructions,
+            repository_instructions: config.repository_instructions,
+        },
+        run: summary.snapshot.clone(),
+        plan: loom_agent::AgentPlan { steps: Vec::new() },
+        messages: Vec::new(),
+        attempts: Vec::new(),
+        pending_approval: None,
+        pending_tool_execution: None,
+        pending_input: None,
+        last_failed_call: None,
+        next_message_id: 0,
+        active_message_id: None,
+        approval_policy: config.approval_policy,
+        options,
+        usage: summary.usage.clone(),
+        context_inspection: config.context_inspection,
+        context_checkpoint: None,
+        provider_cursor: 0,
+        step_id: None,
+        step_index: 0,
+        activities: Vec::new(),
+        interactions: Vec::new(),
+    })
+}
+
+fn hydrate_runtime_execution_state(
+    state: &mut AgentRuntimeState,
+    execution: AgentExecutionStateRecord,
+) -> Result<()> {
+    if execution.run_id != state.run.id
+        || execution.session_id != state.session_id
+        || execution.attempt_id != state.run.attempt_id
+        || execution.control_revision != state.run.control_revision
+        || execution.state != state.run.state
+    {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted execution state does not match its run snapshot",
+            false,
+        ));
+    }
+    state.step_id = execution.step_id;
+    state.step_index = execution.step_index;
+    state.provider_cursor = usize::try_from(execution.provider_cursor).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted provider cursor is out of range",
+            false,
+        )
+    })?;
+    state.next_message_id = execution.next_message_id;
+    state.active_message_id = execution.active_message_id;
+    state.pending_tool_execution = execution.pending_tool_execution;
+    state.pending_approval = execution.pending_approval;
+    state.pending_input = execution.pending_input;
+    state.last_failed_call = execution.last_failed_call;
+    Ok(())
+}
+
+fn run_can_be_deferred_during_restore(
+    state: AgentRunState,
+    has_pending_tool_execution: Option<bool>,
+) -> bool {
+    matches!(
+        state,
+        AgentRunState::Planning
+            | AgentRunState::Executing
+            | AgentRunState::AwaitingApproval
+            | AgentRunState::Paused
+            | AgentRunState::NeedsInput
+            | AgentRunState::Evaluating
+    ) && has_pending_tool_execution == Some(false)
 }
 
 /// One agent run owned by the backend.
@@ -634,9 +1169,64 @@ struct RunHandle {
     runtime: Mutex<AgentRuntime>,
     control: RunControl,
     state: Mutex<AgentRuntimeState>,
+    message_fragments: Mutex<MessageFragmentState>,
+    activity_deltas: Mutex<PendingActivityDeltas>,
+    message_checkpoint: Mutex<MessageCheckpointCursor>,
+    event_gate: Mutex<()>,
+    fragment_wake: Condvar,
     running: Mutex<bool>,
     idle: Condvar,
     failure: Mutex<Option<LoomError>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+struct MessageCheckpointCursor {
+    attempt_id: RunAttemptId,
+    message_count: usize,
+}
+
+#[derive(Default)]
+struct MessageFragmentState {
+    active_message_ordinal: Option<u64>,
+    positions: BTreeMap<u64, MessageFragmentPosition>,
+    pending: BTreeMap<u64, PendingMessageFragments>,
+    pending_bytes: usize,
+    pending_since: Option<Instant>,
+}
+
+#[derive(Default)]
+struct PendingActivityDeltas {
+    by_id: BTreeMap<ActivityId, AgentActivityRecord>,
+    appended_order: Vec<ActivityId>,
+}
+
+impl PendingActivityDeltas {
+    fn ordered_values(&self) -> Vec<AgentActivityRecord> {
+        let appended = self.appended_order.iter().copied().collect::<BTreeSet<_>>();
+        self.by_id
+            .iter()
+            .filter(|(id, _)| !appended.contains(id))
+            .map(|(_, activity)| activity.clone())
+            .chain(
+                self.appended_order
+                    .iter()
+                    .filter_map(|id| self.by_id.get(id).cloned()),
+            )
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct PendingMessageFragments {
+    content: String,
+    committed_bytes: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MessageFragmentPosition {
+    ordinal: u64,
+    fragment_ordinal: u64,
+    byte_offset: u64,
 }
 
 /// Whether a control request pauses a run or ends it.
@@ -652,18 +1242,36 @@ const CONTROL_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// that is already finishing. A run that is genuinely busy is reported as a
 /// retryable conflict instead.
 const ENTRY_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Batch streamed transcript writes until this amount is buffered or the
+/// oldest pending bytes have waited this long.
+const MESSAGE_FRAGMENT_BATCH_BYTES: usize = 32 * 1024;
+const MESSAGE_FRAGMENT_BATCH_INTERVAL: Duration = Duration::from_millis(50);
 
 impl RunHandle {
     fn new(runtime: AgentRuntime) -> Self {
+        let initial_state = runtime.export_state();
+        let message_checkpoint = MessageCheckpointCursor {
+            attempt_id: initial_state.run.attempt_id,
+            // The handle cannot distinguish a newly-created run from a restored
+            // one without touching SQLite. Start at zero so its first checkpoint
+            // writes the complete current transcript; later checkpoints are tails.
+            message_count: 0,
+        };
         Self {
             run_id: runtime.run_id(),
             session_id: runtime.session_id(),
             control: runtime.control(),
-            state: Mutex::new(runtime.export_state()),
+            state: Mutex::new(initial_state),
+            message_fragments: Mutex::new(MessageFragmentState::default()),
+            activity_deltas: Mutex::new(PendingActivityDeltas::default()),
+            message_checkpoint: Mutex::new(message_checkpoint),
+            event_gate: Mutex::new(()),
+            fragment_wake: Condvar::new(),
             runtime: Mutex::new(runtime),
             running: Mutex::new(false),
             idle: Condvar::new(),
             failure: Mutex::new(None),
+            worker: Mutex::new(None),
         }
     }
 
@@ -675,12 +1283,275 @@ impl RunHandle {
         self.locked_state().run.clone()
     }
 
+    fn snapshot_projection(&self, include_messages: bool) -> AgentRunSnapshotProjection {
+        run_snapshot_projection_with_messages(&self.locked_state(), include_messages)
+    }
+
     fn locked_state(&self) -> MutexGuard<'_, AgentRuntimeState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn refresh(&self, runtime: &AgentRuntime) {
-        *self.locked_state() = runtime.export_state();
+        let state = runtime.export_state();
+        let mut fragments = self
+            .message_fragments
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *self.locked_state() = state;
+        fragments.active_message_ordinal = None;
+        self.fragment_wake.notify_all();
+    }
+
+    fn append_message_delta(&self, persistence: &FilePersistence, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        let mut fragments = self.message_fragments.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "run message fragment lock was poisoned",
+                true,
+            )
+        })?;
+        let ordinal = match fragments.active_message_ordinal {
+            Some(ordinal) => ordinal,
+            None => {
+                let state = self.locked_state();
+                let message_count = u64::try_from(state.messages.len()).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "run transcript has too many messages",
+                        false,
+                    )
+                })?;
+                let ordinal = if state
+                    .messages
+                    .last()
+                    .is_some_and(|message| message.role == loom_model::MessageRole::Assistant)
+                {
+                    message_count.saturating_sub(1)
+                } else {
+                    message_count
+                };
+                fragments.active_message_ordinal = Some(ordinal);
+                ordinal
+            }
+        };
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            fragments.positions.entry(ordinal)
+        {
+            let (fragment_ordinal, byte_offset) =
+                persistence.next_run_message_fragment_position(self.run_id, ordinal)?;
+            entry.insert(MessageFragmentPosition {
+                ordinal,
+                fragment_ordinal,
+                byte_offset,
+            });
+        }
+        let pending_bytes = fragments
+            .pending_bytes
+            .checked_add(text.len())
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "pending run message content is too large",
+                    false,
+                )
+            })?;
+        let now = Instant::now();
+        if fragments.pending_bytes == 0 {
+            fragments.pending_since = Some(now);
+        }
+        fragments
+            .pending
+            .entry(ordinal)
+            .or_default()
+            .content
+            .push_str(text);
+        fragments.pending_bytes = pending_bytes;
+        let interval_elapsed = fragments.pending_since.is_some_and(|pending_since| {
+            now.saturating_duration_since(pending_since) >= MESSAGE_FRAGMENT_BATCH_INTERVAL
+        });
+        if fragments.pending_bytes >= MESSAGE_FRAGMENT_BATCH_BYTES || interval_elapsed {
+            self.flush_message_fragments_locked(persistence, &mut fragments)?;
+        }
+        self.fragment_wake.notify_one();
+        Ok(())
+    }
+
+    fn flush_message_fragments(&self, persistence: &FilePersistence) -> Result<()> {
+        let mut fragments = self.message_fragments.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "run message fragment lock was poisoned",
+                true,
+            )
+        })?;
+        self.flush_message_fragments_locked(persistence, &mut fragments)
+    }
+
+    fn flush_message_fragments_locked(
+        &self,
+        persistence: &FilePersistence,
+        fragments: &mut MessageFragmentState,
+    ) -> Result<()> {
+        let ordinals = fragments.pending.keys().copied().collect::<Vec<_>>();
+        for ordinal in ordinals {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                fragments.positions.entry(ordinal)
+            {
+                let (fragment_ordinal, byte_offset) =
+                    persistence.next_run_message_fragment_position(self.run_id, ordinal)?;
+                entry.insert(MessageFragmentPosition {
+                    ordinal,
+                    fragment_ordinal,
+                    byte_offset,
+                });
+            }
+            loop {
+                let (start, end, content) = {
+                    let pending = fragments.pending.get(&ordinal).ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "pending run message fragment buffer is missing",
+                            false,
+                        )
+                    })?;
+                    let start = pending.committed_bytes;
+                    if start >= pending.content.len() {
+                        break;
+                    }
+                    let mut end = (start + MESSAGE_FRAGMENT_BATCH_BYTES).min(pending.content.len());
+                    while !pending.content.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    (start, end, pending.content.as_bytes()[start..end].to_vec())
+                };
+                let position = fragments.positions.get(&ordinal).copied().ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Internal,
+                        "streamed message fragment cursor is missing",
+                        false,
+                    )
+                })?;
+                let next_fragment_ordinal =
+                    position.fragment_ordinal.checked_add(1).ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::Persistence,
+                            "run message has too many persisted fragments",
+                            false,
+                        )
+                    })?;
+                let next_byte_offset = position
+                    .byte_offset
+                    .checked_add(u64::try_from(content.len()).map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::Persistence,
+                            "run message fragment length is out of range",
+                            false,
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::Persistence,
+                            "run message content is too large",
+                            false,
+                        )
+                    })?;
+                persistence.append_run_message_fragment(
+                    self.run_id,
+                    self.session_id,
+                    position.ordinal,
+                    position.fragment_ordinal,
+                    position.byte_offset,
+                    &content,
+                )?;
+                let position = fragments.positions.get_mut(&ordinal).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Internal,
+                        "streamed message fragment cursor is missing",
+                        false,
+                    )
+                })?;
+                position.fragment_ordinal = next_fragment_ordinal;
+                position.byte_offset = next_byte_offset;
+                let pending = fragments.pending.get_mut(&ordinal).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Internal,
+                        "pending run message fragment buffer is missing",
+                        false,
+                    )
+                })?;
+                pending.committed_bytes = end;
+                fragments.pending_bytes = fragments
+                    .pending_bytes
+                    .checked_sub(end - start)
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "pending run message byte count is inconsistent",
+                            false,
+                        )
+                    })?;
+            }
+            if fragments
+                .pending
+                .get(&ordinal)
+                .is_some_and(|pending| pending.committed_bytes == pending.content.len())
+            {
+                fragments.pending.remove(&ordinal);
+            }
+        }
+        if fragments.pending_bytes == 0 {
+            fragments.pending_since = None;
+        }
+        Ok(())
+    }
+
+    fn flush_message_fragments_until_stopped(handle: Weak<Self>, persistence: FilePersistence) {
+        loop {
+            let Some(handle) = handle.upgrade() else {
+                return;
+            };
+            let mut fragments = handle
+                .message_fragments
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if fragments.pending_bytes == 0 {
+                if !handle.is_running() {
+                    return;
+                }
+                let (guard, _) = handle
+                    .fragment_wake
+                    .wait_timeout(fragments, Duration::from_secs(1))
+                    .unwrap_or_else(PoisonError::into_inner);
+                fragments = guard;
+                if fragments.pending_bytes == 0 && !handle.is_running() {
+                    return;
+                }
+                continue;
+            }
+            let deadline = fragments
+                .pending_since
+                .map(|pending_since| pending_since + MESSAGE_FRAGMENT_BATCH_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            let Some(wait) = deadline.checked_duration_since(Instant::now()) else {
+                if let Err(error) =
+                    handle.flush_message_fragments_locked(&persistence, &mut fragments)
+                {
+                    drop(fragments);
+                    handle.record_failure(error);
+                    handle.control.request_interrupt();
+                    return;
+                }
+                continue;
+            };
+            let (guard, _) = handle
+                .fragment_wake
+                .wait_timeout(fragments, wait)
+                .unwrap_or_else(PoisonError::into_inner);
+            drop(guard);
+        }
     }
 
     /// Keeps the cached run state current while a step is still executing.
@@ -692,32 +1563,98 @@ impl RunHandle {
         match event {
             AgentEvent::RunStarted { snapshot } | AgentEvent::RunCompleted { snapshot } => {
                 state.run = snapshot.clone();
+                sync_cached_run_attempt(&mut state);
             }
             AgentEvent::RunStateChanged {
                 state: run_state, ..
             } => {
                 state.run.state = *run_state;
                 state.run.updated_at = Timestamp::now();
+                if !matches!(
+                    run_state,
+                    AgentRunState::AwaitingApproval | AgentRunState::Paused
+                ) {
+                    state.pending_approval = None;
+                }
+                if !matches!(run_state, AgentRunState::NeedsInput | AgentRunState::Paused) {
+                    state.pending_input = None;
+                }
+                let checkpoint_retry_transition = *run_state == AgentRunState::Planning
+                    && state.attempts.iter().any(|attempt| {
+                        attempt.id == state.run.attempt_id && attempt.completed_at.is_some()
+                    });
+                if !checkpoint_retry_transition {
+                    sync_cached_run_attempt(&mut state);
+                }
             }
             AgentEvent::RunUsageUpdated { usage, .. } => state.usage = usage.clone(),
-            AgentEvent::ToolApprovalRequired { call, .. } => {
+            AgentEvent::ToolApprovalRequired {
+                attempt_id,
+                control_revision,
+                call,
+                ..
+            } => {
                 state.pending_approval = Some(call.clone());
+                state.run.attempt_id = *attempt_id;
+                state.run.control_revision = *control_revision;
             }
-            AgentEvent::ToolApprovalDecided { .. } => state.pending_approval = None,
-            AgentEvent::NeedsInput { prompt, .. } => {
+            AgentEvent::ToolApprovalDecided {
+                attempt_id,
+                control_revision,
+                ..
+            } => {
+                state.pending_approval = None;
+                state.run.attempt_id = *attempt_id;
+                state.run.control_revision = *control_revision;
+            }
+            AgentEvent::NeedsInput {
+                attempt_id,
+                control_revision,
+                prompt,
+                ..
+            } => {
                 state.pending_input = Some(prompt.clone());
+                state.run.attempt_id = *attempt_id;
+                state.run.control_revision = *control_revision;
             }
-            AgentEvent::UserMessage { .. } => state.pending_input = None,
+            AgentEvent::UserMessage {
+                attempt_id,
+                control_revision,
+                ..
+            } => {
+                state.pending_input = None;
+                state.run.attempt_id = *attempt_id;
+                state.run.control_revision = *control_revision;
+            }
+            AgentEvent::ToolCallStarted { call, .. } => {
+                if state
+                    .pending_tool_execution
+                    .as_ref()
+                    .is_some_and(|pending| pending.id == call.id)
+                {
+                    state.pending_tool_execution = None;
+                }
+            }
             AgentEvent::ActivityRecorded { activity, .. } => {
-                if let Some(existing) = state
+                let updated = if let Some(existing) = state
                     .activities
                     .iter_mut()
                     .find(|existing| existing.id == activity.id)
                 {
                     *existing = activity.clone();
+                    true
                 } else {
                     state.activities.push(activity.clone());
+                    false
+                };
+                let mut deltas = self
+                    .activity_deltas
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !updated && !deltas.by_id.contains_key(&activity.id) {
+                    deltas.appended_order.push(activity.id);
                 }
+                deltas.by_id.insert(activity.id, activity.clone());
             }
             _ => {}
         }
@@ -730,6 +1667,30 @@ impl RunHandle {
     fn set_running(&self, running: bool) {
         *self.running.lock().unwrap_or_else(PoisonError::into_inner) = running;
         self.idle.notify_all();
+        self.fragment_wake.notify_all();
+    }
+
+    fn join_worker(&self) -> Result<()> {
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if worker.is_some_and(|worker| worker.join().is_err()) {
+            return Err(LoomError::new(
+                ErrorCode::Internal,
+                format!("agent run {} worker panicked", self.run_id),
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    fn failure(&self) -> Option<LoomError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Locks the runtime for an operation that requires exclusive access.
@@ -836,8 +1797,13 @@ pub struct InProcessBackend {
     sessions: Mutex<SessionManager>,
     workspace_records: Mutex<loom_session::WorkspaceManager>,
     runs: Mutex<BTreeMap<loom_core::RunId, Arc<RunHandle>>>,
+    persisted_runs: Mutex<BTreeMap<loom_core::RunId, PersistedRunSummary>>,
     journal: Mutex<EventJournal>,
+    last_feed_pruned_sequence: AtomicU64,
+    feed_bytes_since_prune: AtomicUsize,
     session_filesystems: Mutex<BTreeMap<AgentSessionId, Workspace>>,
+    persisted_session_filesystems: Mutex<BTreeSet<AgentSessionId>>,
+    session_filesystem_restore: Mutex<()>,
     session_repositories:
         Mutex<BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>,
     session_vcs: Mutex<BTreeMap<(AgentSessionId, RepositoryId), GitService>>,
@@ -849,7 +1815,6 @@ pub struct InProcessBackend {
     terminals: TerminalManager,
     resource_monitor: Mutex<ResourceMonitor>,
     supported_capabilities: CapabilitySet,
-    models: Vec<ModelDescriptor>,
     providers: ProviderRegistry,
     github_copilot_logins: Mutex<BTreeMap<String, GitHubCopilotLoginRecord>>,
     persistence: Option<FilePersistence>,
@@ -858,6 +1823,11 @@ pub struct InProcessBackend {
     in_flight_requests: Mutex<BTreeMap<loom_core::RequestId, Arc<Mutex<()>>>>,
     session_admissions: Mutex<BTreeMap<AgentSessionId, Arc<Mutex<()>>>>,
     self_reference: Mutex<Weak<InProcessBackend>>,
+    request_lifecycle: RwLock<u8>,
+    persistence_failed: AtomicBool,
+    durable_request_gate: Mutex<()>,
+    #[cfg(test)]
+    fail_next_state_save: AtomicBool,
 }
 
 #[derive(Default)]
@@ -1004,7 +1974,7 @@ impl InProcessBackend {
             };
             result.unwrap_or_else(|error| panic!("could not register provider model: {error}"));
         }
-        Self::with_provider_registry_and_models(providers, models, None)
+        Self::with_provider_registry_and_persistence(providers, None)
             .unwrap_or_else(|error| panic!("could not configure providers: {error}"))
     }
 
@@ -1081,19 +2051,15 @@ impl InProcessBackend {
     }
 
     pub fn with_provider_registry(providers: ProviderRegistry) -> Arc<Self> {
-        let models = providers
-            .list_models()
-            .unwrap_or_else(|error| panic!("could not inspect provider models: {error}"));
-        Self::with_provider_registry_and_models(providers, models, None)
+        Self::with_provider_registry_and_persistence(providers, None)
             .unwrap_or_else(|error| panic!("could not configure providers: {error}"))
     }
 
     pub fn new_persistent(path: impl Into<PathBuf>) -> Result<Arc<Self>> {
         let providers = ProviderRegistry::demo();
-        Self::with_provider_registry_and_models(
+        Self::with_provider_registry_and_persistence(
             providers,
-            Vec::new(),
-            Some(FilePersistence::open(path.into())?),
+            Some(FilePersistence::open_exclusive_writer(path.into())?),
         )
     }
 
@@ -1117,10 +2083,9 @@ impl InProcessBackend {
         providers: ProviderRegistry,
         path: impl Into<PathBuf>,
     ) -> Result<Arc<Self>> {
-        Self::with_provider_registry_and_models(
+        Self::with_provider_registry_and_persistence(
             providers,
-            Vec::new(),
-            Some(FilePersistence::open(path.into())?),
+            Some(FilePersistence::open_exclusive_writer(path.into())?),
         )
     }
 
@@ -1128,23 +2093,17 @@ impl InProcessBackend {
         providers: ProviderRegistry,
         path: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
-        Self::with_provider_registry_and_models(
+        Self::with_provider_registry_and_persistence(
             providers,
-            Vec::new(),
-            path.map(FilePersistence::open).transpose()?,
+            path.map(FilePersistence::open_exclusive_writer)
+                .transpose()?,
         )
     }
 
-    fn with_provider_registry_and_models(
+    fn with_provider_registry_and_persistence(
         providers: ProviderRegistry,
-        models: Vec<ModelDescriptor>,
         persistence: Option<FilePersistence>,
     ) -> Result<Arc<Self>> {
-        let models = if models.is_empty() {
-            providers.list_models()?
-        } else {
-            models
-        };
         let (node_id, node_name) = worker_node_identity();
         let session_root_base = persistence.as_ref().map_or_else(
             || {
@@ -1161,8 +2120,13 @@ impl InProcessBackend {
             sessions: Mutex::new(SessionManager::default()),
             workspace_records: Mutex::new(loom_session::WorkspaceManager::default()),
             runs: Mutex::new(BTreeMap::new()),
+            persisted_runs: Mutex::new(BTreeMap::new()),
             journal: Mutex::new(EventJournal::default()),
+            last_feed_pruned_sequence: AtomicU64::new(0),
+            feed_bytes_since_prune: AtomicUsize::new(0),
             session_filesystems: Mutex::new(BTreeMap::new()),
+            persisted_session_filesystems: Mutex::new(BTreeSet::new()),
+            session_filesystem_restore: Mutex::new(()),
             session_repositories: Mutex::new(BTreeMap::new()),
             session_vcs: Mutex::new(BTreeMap::new()),
             session_task_supervisors: Mutex::new(BTreeMap::new()),
@@ -1177,8 +2141,10 @@ impl InProcessBackend {
                 Capability::ReadAgentSession,
                 Capability::ControlAgentSession,
                 Capability::SubscribeSessionEvents,
+                Capability::SubscribeWorkspaceEvents,
                 Capability::StartAgentRun,
                 Capability::ReadAgentRun,
+                Capability::ReadAgentRunMessages,
                 Capability::ControlAgentRun,
                 Capability::PauseAgentRun,
                 Capability::ResumeAgentRun,
@@ -1209,7 +2175,6 @@ impl InProcessBackend {
                 Capability::ReadSessionFilesystem,
                 Capability::WriteSessionFilesystem,
             ]),
-            models,
             providers,
             github_copilot_logins: Mutex::new(BTreeMap::new()),
             persistence,
@@ -1218,6 +2183,11 @@ impl InProcessBackend {
             in_flight_requests: Mutex::new(BTreeMap::new()),
             session_admissions: Mutex::new(BTreeMap::new()),
             self_reference: Mutex::new(Weak::new()),
+            request_lifecycle: RwLock::new(0),
+            persistence_failed: AtomicBool::new(false),
+            durable_request_gate: Mutex::new(()),
+            #[cfg(test)]
+            fail_next_state_save: AtomicBool::new(false),
         });
         *backend
             .self_reference
@@ -1285,6 +2255,189 @@ impl InProcessBackend {
         })
     }
 
+    fn persisted_session_filesystems(&self) -> Result<MutexGuard<'_, BTreeSet<AgentSessionId>>> {
+        self.persisted_session_filesystems.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "persisted session filesystem manager lock was poisoned",
+                true,
+            )
+        })
+    }
+
+    fn restore_session_filesystem(&self, session_id: AgentSessionId) -> Result<Workspace> {
+        if let Some(filesystem) = self.session_filesystems()?.get(&session_id).cloned() {
+            return Ok(filesystem);
+        }
+        let _restore_guard = self.session_filesystem_restore.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "session filesystem restore lock was poisoned",
+                true,
+            )
+        })?;
+        if let Some(filesystem) = self.session_filesystems()?.get(&session_id).cloned() {
+            return Ok(filesystem);
+        }
+        if !self.persisted_session_filesystems()?.contains(&session_id) {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("filesystem for session {session_id} is unavailable"),
+                true,
+            ));
+        }
+        let durable = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("filesystem for session {session_id} has no persistence store"),
+                    true,
+                )
+            })?
+            .load_filesystem_record(session_id)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted filesystem record for session {session_id} is missing"),
+                    false,
+                )
+            })?;
+        let mut payload = durable.payload;
+        let repositories = durable.repositories;
+        let directories = durable.directories;
+        payload["filesystem"]["checkpoints"] = json_value(durable.checkpoints)?;
+        let edits = durable.edits;
+        let changes = durable.changes;
+        let mut persisted: PersistedSessionFilesystem = from_json(payload)?;
+        persisted.filesystem.edits = edits
+            .into_iter()
+            .map(|edit| loom_workspace::WorkspaceEditHistory {
+                id: edit.id,
+                path: edit.path,
+                before: edit.before,
+                before_bytes: edit.before_bytes,
+                after_revision: edit.after_revision,
+                source: edit.source,
+            })
+            .collect();
+        persisted.filesystem.changes = changes;
+        persisted.repositories = repositories;
+        persisted.directories = directories;
+        if durable.session_id != session_id
+            || persisted.filesystem.session_id != session_id
+            || persisted.filesystem.root != durable.root
+            || persisted.filesystem.control != durable.control
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted filesystem identity for session {session_id} is invalid"),
+                false,
+            ));
+        }
+        let session = self.sessions()?.get(session_id)?;
+        let expected_root = self
+            .session_root_base
+            .join(session.workspace_id.to_string())
+            .join(session_id.to_string())
+            .join("fs");
+        let canonical_expected_root = fs::canonicalize(&expected_root).map_err(|error| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("session filesystem root for {session_id} is unavailable: {error}"),
+                true,
+            )
+        })?;
+        if Path::new(&persisted.filesystem.root) != canonical_expected_root {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted filesystem root for session {session_id} is invalid"),
+                false,
+            ));
+        }
+        let filesystem = Workspace::open_for_restore(session_id, &canonical_expected_root)?;
+        for directory in &persisted.directories {
+            filesystem.mount_directory(&directory.path, &directory.source)?;
+        }
+        filesystem.restore_state(persisted.filesystem)?;
+        for (repository_id, repository) in &persisted.repositories {
+            if *repository_id != repository.id {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("repository key does not match repository {}", repository.id),
+                    false,
+                ));
+            }
+            let path = filesystem.directory_path(&repository.path)?;
+            let service = GitService::open(path)?;
+            self.session_vcs()?
+                .insert((session_id, *repository_id), service);
+        }
+        self.session_repositories()?
+            .insert(session_id, persisted.repositories);
+        self.session_filesystems()?
+            .insert(session_id, filesystem.clone());
+        self.persisted_session_filesystems()?.remove(&session_id);
+        Ok(filesystem)
+    }
+
+    fn persisted_filesystem_record(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Option<PersistedSessionFilesystem>> {
+        if !self.persisted_session_filesystems()?.contains(&session_id) {
+            return Ok(None);
+        }
+        let Some(record) = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("filesystem for session {session_id} has no persistence store"),
+                    true,
+                )
+            })?
+            .load_filesystem_record(session_id)?
+        else {
+            return Ok(None);
+        };
+        let mut payload = record.payload;
+        let repositories = record.repositories;
+        let directories = record.directories;
+        payload["filesystem"]["checkpoints"] = json_value(record.checkpoints)?;
+        let edits = record.edits;
+        let changes = record.changes;
+        let mut persisted: PersistedSessionFilesystem = from_json(payload)?;
+        persisted.filesystem.edits = edits
+            .into_iter()
+            .map(|edit| loom_workspace::WorkspaceEditHistory {
+                id: edit.id,
+                path: edit.path,
+                before: edit.before,
+                before_bytes: edit.before_bytes,
+                after_revision: edit.after_revision,
+                source: edit.source,
+            })
+            .collect();
+        persisted.filesystem.changes = changes;
+        persisted.repositories = repositories;
+        persisted.directories = directories;
+        if record.session_id != session_id
+            || persisted.filesystem.session_id != session_id
+            || persisted.filesystem.root != record.root
+            || persisted.filesystem.control != record.control
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted filesystem identity for session {session_id} is invalid"),
+                false,
+            ));
+        }
+        Ok(Some(persisted))
+    }
+
     fn session_repositories(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>>
@@ -1338,6 +2491,18 @@ impl InProcessBackend {
         self.runs
             .lock()
             .map_err(|_| LoomError::new(ErrorCode::Internal, "agent run lock was poisoned", true))
+    }
+
+    fn persisted_runs(
+        &self,
+    ) -> Result<MutexGuard<'_, BTreeMap<loom_core::RunId, PersistedRunSummary>>> {
+        self.persisted_runs.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "persisted run summary lock was poisoned",
+                true,
+            )
+        })
     }
 
     fn journal(&self) -> Result<MutexGuard<'_, EventJournal>> {
@@ -1414,7 +2579,11 @@ impl InProcessBackend {
         if current_revision.is_some_and(|revision| revision > config.revision) {
             return Ok(());
         }
+        let revision = config.revision;
         let previous = self.workspace_configs()?.insert(workspace_id, config);
+        let sequence = self
+            .journal()?
+            .append_workspace(workspace_id, WorkspaceEvent::ConfigChanged { revision });
         if let Err(error) = self.persist_state() {
             let mut configs = self.workspace_configs()?;
             if let Some(previous) = previous {
@@ -1422,6 +2591,7 @@ impl InProcessBackend {
             } else {
                 configs.remove(&workspace_id);
             }
+            self.journal()?.discard_pending_workspace(sequence);
             return Err(error);
         }
         Ok(())
@@ -1451,60 +2621,59 @@ impl InProcessBackend {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
         };
+        persistence.prune_expired_idempotency_records(Timestamp::from_unix_millis(
+            current_unix_millis(),
+        ))?;
+        let startup_started = Instant::now();
         let mut needs_persist = false;
-        let Some(sessions) = persistence.load_section::<loom_session::SessionManagerState>(
-            "sessions",
-            CURRENT_SCHEMA_VERSION,
-        )?
-        else {
+        let Some(sessions) = persistence.load_sessions()? else {
             return Ok(());
         };
-        let required = |name: &str| -> Result<Value> {
-            persistence
-                .load_section(name, CURRENT_SCHEMA_VERSION)?
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("persistence section '{name}' is missing"),
-                        false,
-                    )
-                })
-        };
-        let session_policies = persistence
-            .load_section("session_approval_policies", CURRENT_SCHEMA_VERSION)?
-            .map(from_json)
-            .transpose()?;
+        let session_settings = persistence.load_session_settings()?;
         let state = PersistedBackendState {
             sessions,
-            workspace_records: persistence
-                .load_section("workspace_records", CURRENT_SCHEMA_VERSION)?
-                .map(from_json)
-                .transpose()?
+            workspace_records: persistence.load_workspaces()?.unwrap_or_default(),
+            journal: persistence
+                .load_feed_header()?
+                .map(|feed| EventJournal {
+                    next_sequence: feed.next_sequence,
+                    events: Vec::new(),
+                    pending_events: Vec::new(),
+                    workspace_events: Vec::new(),
+                    pending_workspace_events: Vec::new(),
+                    retention_limit: feed.retention_limit,
+                })
                 .unwrap_or_default(),
-            journal: from_json(required("journal")?)?,
-            runs: from_json(required("runs")?)?,
-            session_filesystems: persistence
-                .load_section("session_filesystems", CURRENT_SCHEMA_VERSION)?
-                .map(from_json)
-                .transpose()?
-                .unwrap_or_default(),
-            session_policies: session_policies.unwrap_or_default(),
-            auto_approve_actions: persistence
-                .load_section("auto_approve_actions", CURRENT_SCHEMA_VERSION)?
-                .map(from_json)
-                .transpose()?
-                .unwrap_or_default(),
-            provider_configs: from_json(required("provider_configs")?)?,
-            provider_health: from_json(required("provider_health")?)?,
-            workspace_configs: persistence
-                .load_section("workspace_configs", CURRENT_SCHEMA_VERSION)?
-                .map(from_json)
-                .transpose()?
-                .unwrap_or_default(),
-            provider_usage: from_json(required("provider_usage")?)?,
-            idempotency: from_json(required("idempotency")?)?,
+            session_policies: session_settings.approval_policies,
+            auto_approve_actions: session_settings.auto_approve_actions,
+            provider_configs: persistence.load_provider_configs()?,
+            provider_health: persistence.load_provider_health()?,
+            workspace_configs: persistence.load_workspace_configs()?,
+            provider_usage: persistence.load_provider_usage()?,
+            idempotency: {
+                let mut cache = persistence
+                    .load_idempotency_records()?
+                    .into_iter()
+                    .map(|(id, record)| {
+                        Ok((
+                            id,
+                            IdempotencyRecord {
+                                created_at: record.created_at,
+                                expires_at: record.expires_at,
+                                request: from_json(record.request)?,
+                                response: from_json(record.response)?,
+                            },
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                trim_idempotency_cache(&mut cache);
+                cache
+            },
         };
-        let _: Vec<ModelDescriptor> = from_json(required("models")?)?;
+        log::info!(
+            "loaded persisted catalogs and feed cursors in {} ms",
+            startup_started.elapsed().as_millis()
+        );
         let sessions = SessionManager::from_state(state.sessions)?;
         {
             let mut target = self.sessions()?;
@@ -1551,74 +2720,138 @@ impl InProcessBackend {
         *self.workspace_records()? =
             loom_session::WorkspaceManager::from_state(state.workspace_records)?;
 
-        let mut session_filesystems = self.session_filesystems()?;
-        let mut session_repositories = self.session_repositories()?;
-        for (session_id, persisted) in state.session_filesystems {
-            let session = self.sessions()?.get(session_id)?;
-            let expected_root = self
-                .session_root_base
-                .join(session.workspace_id.to_string())
-                .join(session_id.to_string())
-                .join("fs");
-            let canonical_expected_root = fs::canonicalize(&expected_root).map_err(|error| {
+        for session_id in persistence.list_filesystem_sessions()? {
+            self.sessions()?.get(session_id)?;
+            self.persisted_session_filesystems()?.insert(session_id);
+        }
+
+        let active_run_summaries = persistence.load_active_run_summaries()?;
+        let active_run_count = active_run_summaries.len();
+        let mut lazy_run_count = 0;
+        let mut recovery_updates = BTreeMap::new();
+        let mut run_summaries = BTreeMap::new();
+        let mut restored_runs = BTreeMap::new();
+        for (run_id, mut summary) in active_run_summaries {
+            let mut snapshot = summary.snapshot.clone();
+            let run_state = snapshot.state;
+            let usage = summary.usage.clone();
+            self.sessions()?.get(snapshot.session_id)?;
+            run_summaries.insert(
+                run_id,
+                PersistedRunSummary {
+                    snapshot: snapshot.clone(),
+                    usage: usage.clone(),
+                },
+            );
+            let mut execution_state = persistence.load_run_execution_state(run_id)?;
+            let safely_deferred = run_can_be_deferred_during_restore(
+                run_state,
+                execution_state
+                    .as_ref()
+                    .map(|state| state.pending_tool_execution.is_some()),
+            );
+            if safely_deferred {
+                if matches!(
+                    run_state,
+                    AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+                ) {
+                    let updated_at = Timestamp::now();
+                    snapshot.state = AgentRunState::Paused;
+                    snapshot.updated_at = updated_at;
+                    snapshot.completed_at = None;
+                    let execution = execution_state.as_mut().ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::RecoveryRequired,
+                            format!("persisted run {run_id} has no typed execution state"),
+                            true,
+                        )
+                    })?;
+                    execution.state = AgentRunState::Paused;
+                    let mut attempts = persistence.load_run_attempts(run_id)?;
+                    let attempt = attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == snapshot.attempt_id)
+                        .ok_or_else(|| {
+                            LoomError::new(
+                                ErrorCode::RecoveryRequired,
+                                format!("persisted run {run_id} has no current attempt"),
+                                true,
+                            )
+                        })?;
+                    attempt.state = AgentRunState::Paused;
+                    attempt.completed_at = None;
+                    summary.snapshot = snapshot.clone();
+                    summary.attempts = Some(attempts);
+                    summary.execution_state = execution_state;
+                    summary.interactions = None;
+                    recovery_updates.insert(run_id, summary);
+                    run_summaries.insert(
+                        run_id,
+                        PersistedRunSummary {
+                            snapshot: snapshot.clone(),
+                            usage: usage.clone(),
+                        },
+                    );
+                    self.append_recovery_events(
+                        snapshot.session_id,
+                        vec![AgentEvent::RunStateChanged {
+                            run_id,
+                            state: AgentRunState::Paused,
+                        }],
+                    )?;
+                }
+                lazy_run_count += 1;
+                continue;
+            }
+            let runtime_config = persistence
+                .load_run_runtime_config(run_id)?
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::RecoveryRequired,
+                        format!("persisted run {run_id} has no runtime configuration"),
+                        true,
+                    )
+                })?;
+            let mut runtime_state = runtime_state_from_durable_config(
+                run_summaries.get(&run_id).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::RecoveryRequired,
+                        format!("persisted run {run_id} summary is unavailable"),
+                        true,
+                    )
+                })?,
+                runtime_config,
+            )?;
+            let execution_state = execution_state.take().ok_or_else(|| {
                 LoomError::new(
                     ErrorCode::RecoveryRequired,
-                    format!("session filesystem root for {session_id} is unavailable: {error}"),
+                    format!("persisted run {run_id} has no typed execution state"),
                     true,
                 )
             })?;
-            if Path::new(&persisted.filesystem.root) != canonical_expected_root {
+            hydrate_runtime_execution_state(&mut runtime_state, execution_state)?;
+            runtime_state.plan = persistence.load_run_plan(run_id)?;
+            runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
+            hydrate_run_context_checkpoint(&persistence, run_id, &mut runtime_state)?;
+            runtime_state.activities = persistence.load_run_activities(run_id)?;
+            runtime_state.attempts = persistence.load_run_attempts(run_id)?;
+            if runtime_state.attempts.is_empty() {
                 return Err(LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    format!("persisted filesystem root for session {session_id} is invalid"),
-                    false,
+                    ErrorCode::RecoveryRequired,
+                    format!("persisted run {run_id} has no typed attempt history"),
+                    true,
                 ));
             }
-            let filesystem = Workspace::open(session_id, &canonical_expected_root)?;
-            for directory in &persisted.directories {
-                filesystem.mount_directory(&directory.path, &directory.source)?;
-            }
-            filesystem.restore_state(persisted.filesystem)?;
-            for (repository_id, repository) in &persisted.repositories {
-                if *repository_id != repository.id {
-                    return Err(LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("repository key does not match repository {}", repository.id),
-                        false,
-                    ));
-                }
-                let path = filesystem.directory_path(&repository.path)?;
-                let service = GitService::open(path)?;
-                self.session_vcs()?
-                    .insert((session_id, *repository_id), service);
-            }
-            session_filesystems.insert(session_id, filesystem);
-            session_repositories.insert(session_id, persisted.repositories);
-        }
-        drop(session_repositories);
-        drop(session_filesystems);
-
-        let mut restored_runs = BTreeMap::new();
-        for (run_id, runtime_state) in state.runs {
-            if run_id != runtime_state.run.id {
+            runtime_state.interactions = persistence.load_run_interactions(run_id)?;
+            if runtime_state.run.id != run_id {
                 return Err(LoomError::new(
                     ErrorCode::MalformedPayload,
-                    format!("persisted run key does not match run snapshot {run_id}"),
+                    format!("persisted run key does not match runtime state {run_id}"),
                     false,
                 ));
             }
             let session = self.sessions()?.get(runtime_state.session_id)?;
-            let workspace = self
-                .session_filesystems()?
-                .get(&session.id)
-                .cloned()
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::RecoveryRequired,
-                        format!("filesystem for persisted run {run_id} is unavailable"),
-                        true,
-                    )
-                })?;
+            let workspace = self.restore_session_filesystem(session.id)?;
             let mut recovery_reason = None;
             let provider =
                 match self.provider_at(&runtime_state.task.model, runtime_state.provider_cursor) {
@@ -1652,93 +2885,654 @@ impl InProcessBackend {
             if let Some(reason) = recovery_reason {
                 recovery_events.push(AgentEvent::RecoveryRequired { run_id, reason });
             }
-            restored_runs.insert(run_id, self.register_runtime(runtime));
+            let handle = self.register_runtime(runtime);
+            if !recovery_events.is_empty()
+                && let Some(summary) = run_summaries.get_mut(&run_id)
+            {
+                summary.snapshot = handle.state().run;
+            }
+            restored_runs.insert(run_id, handle);
             if !recovery_events.is_empty() {
                 self.append_recovery_events(session.id, recovery_events)?;
                 needs_persist = true;
             }
         }
+        let restored_run_count = restored_runs.len();
+        *self.persisted_runs()? = run_summaries;
         *self.runs()? = restored_runs;
         if needs_persist {
-            self.persist_state()?;
+            self.persist_state_with_recovery_updates(&recovery_updates)?;
+        } else if !recovery_updates.is_empty() {
+            let mut journal = self.journal()?;
+            let feed = DurableFeedState {
+                next_sequence: journal.next_sequence,
+                retention_limit: journal.retention_limit,
+                events: journal.pending_events.clone(),
+                workspace_events: journal.pending_workspace_events.clone(),
+            };
+            persistence.save_recovery_updates(&recovery_updates, &feed)?;
+            journal.pending_events.clear();
         }
+        let lazy_filesystem_count = self.persisted_session_filesystems()?.len();
+        log::info!(
+            "indexed {} resumable runs, restored {} runtimes, deferred {} runtimes, and left {} filesystem services lazy in {} ms total",
+            active_run_count,
+            restored_run_count,
+            lazy_run_count,
+            lazy_filesystem_count,
+            startup_started.elapsed().as_millis()
+        );
         Ok(())
     }
 
     fn persist_state(&self) -> Result<()> {
+        self.persist_state_with_recovery_updates(&BTreeMap::new())
+    }
+
+    fn persist_state_with_idempotency_candidate(
+        &self,
+        candidate: (loom_core::RequestId, IdempotencyRecord),
+    ) -> Result<()> {
+        self.latch_on_persistence_error(self.persist_state_inner(&BTreeMap::new(), Some(candidate)))
+    }
+
+    /// Persists the current worker checkpoint without enumerating unrelated runs,
+    /// catalogs, or session filesystems. The journal lock is retained through the
+    /// transaction so only the captured event prefix can be acknowledged.
+    fn persist_run_checkpoint(&self, handle: &RunHandle) -> Result<()> {
+        self.ensure_persistence_healthy()?;
+        let result = self.persist_run_checkpoint_inner(handle);
+        self.latch_on_persistence_error(result)
+    }
+
+    fn persist_worker_state(&self) -> Result<()> {
+        self.ensure_persistence_healthy()?;
+        self.persist_state()
+    }
+
+    fn ensure_persistence_healthy(&self) -> Result<()> {
+        if self.persistence_failed.load(Ordering::SeqCst) {
+            Err(LoomError::new(
+                ErrorCode::Persistence,
+                "backend is unavailable after a durable state save failure; reopen it to recover",
+                true,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn persist_run_checkpoint_inner(&self, handle: &RunHandle) -> Result<()> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
-        let runs: BTreeMap<loom_core::RunId, AgentRuntimeState> = self
+        let _event_guard = handle
+            .event_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        handle.flush_message_fragments(persistence)?;
+        // Project only the checkpoint fields while holding the state lock.
+        // This intentionally excludes the potentially large activities vector;
+        // changed rows come from the ID-keyed queue below.
+        let (
+            session_id,
+            summary,
+            runtime_config,
+            context_checkpoint,
+            plan,
+            message_delta,
+            activities,
+        ) = {
+            let state = handle.locked_state();
+            let summary = DurableRunSummary {
+                snapshot: state.run.clone(),
+                usage: state.usage.clone(),
+                attempts: Some(state.attempts.clone()),
+                execution_state: Some(execution_state_from_runtime(&state)?),
+                interactions: Some(state.interactions.clone()),
+            };
+            let mut context_inspection = state.context_inspection.clone();
+            if let Some(inspection) = &mut context_inspection {
+                inspection.summary = None;
+            }
+            let runtime_config = DurableRunRuntimeConfig {
+                system_instructions: state.task.system_instructions.clone(),
+                repository_instructions: state.task.repository_instructions.clone(),
+                approval_policy: state.approval_policy.clone(),
+                limits: state.options.limits.clone(),
+                context_options: state.options.context.clone(),
+                checkpoint_id: state.options.checkpoint_id,
+                input_cost_micros_per_1k: state.options.input_cost_micros_per_1k,
+                output_cost_micros_per_1k: state.options.output_cost_micros_per_1k,
+                context_inspection,
+            };
+            let context_checkpoint =
+                state
+                    .context_checkpoint
+                    .clone()
+                    .map(|summary| DurableRunContextCheckpoint {
+                        session_id: state.session_id,
+                        summary,
+                    });
+            let activities = handle
+                .activity_deltas
+                .lock()
+                .map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::Internal,
+                        "activity delta lock was poisoned",
+                        true,
+                    )
+                })?
+                .ordered_values();
+            let cursor = handle.message_checkpoint.lock().map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    "message checkpoint cursor lock was poisoned",
+                    true,
+                )
+            })?;
+            let reset_messages = cursor.attempt_id != state.run.attempt_id
+                || state.messages.len() < cursor.message_count;
+            let start_ordinal = if reset_messages {
+                0
+            } else {
+                cursor.message_count.saturating_sub(1)
+            };
+            let start_index = start_ordinal.min(state.messages.len());
+            let message_delta = DurableRunMessageDelta {
+                start_ordinal: start_ordinal as u64,
+                reset: reset_messages,
+                messages: durable_run_messages_from_runtime(&state.messages[start_index..]),
+            };
+            (
+                state.session_id,
+                summary,
+                runtime_config,
+                context_checkpoint,
+                state.plan.clone(),
+                message_delta,
+                activities,
+            )
+        };
+
+        let (filesystem_record, filesystem_ack) = {
+            let filesystem = self.session_filesystems()?.get(&session_id).cloned();
+            if let Some(filesystem) = filesystem {
+                if let Some(versioned) = filesystem.export_delta_if_dirty()? {
+                    let workspace_delta = versioned.delta;
+                    let filesystem_state = versioned.state;
+                    let checkpoints = workspace_delta.checkpoints;
+                    let edits = workspace_delta
+                        .edits
+                        .into_iter()
+                        .map(|edit| DurableFilesystemEdit {
+                            id: edit.id,
+                            path: edit.path,
+                            before: edit.before,
+                            before_bytes: edit.before_bytes,
+                            after_revision: edit.after_revision,
+                            source: edit.source,
+                        })
+                        .collect();
+                    let changes = workspace_delta.changes;
+                    let deleted_checkpoints = workspace_delta.deleted_checkpoints;
+                    let deleted_edits = workspace_delta.deleted_edits;
+                    let deleted_changes = workspace_delta.deleted_changes;
+                    let directories = filesystem
+                        .mounted_directories()?
+                        .into_iter()
+                        .map(|(path, source)| SessionDirectory {
+                            path,
+                            source: source.display().to_string(),
+                        })
+                        .collect::<Vec<_>>();
+                    let repositories = self
+                        .session_repositories()?
+                        .get(&session_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let persisted = PersistedSessionFilesystem {
+                        filesystem: filesystem_state,
+                        repositories: repositories.clone(),
+                        directories: directories.clone(),
+                    };
+                    (
+                        Some(DurableFilesystemRecord {
+                            session_id,
+                            root: persisted.filesystem.root.clone(),
+                            control: persisted.filesystem.control,
+                            checkpoints,
+                            edits,
+                            changes,
+                            repositories,
+                            directories,
+                            payload: json_value(persisted)?,
+                            delta: Some(DurableFilesystemDelta {
+                                deleted_checkpoints,
+                                deleted_edits,
+                                deleted_changes,
+                            }),
+                        }),
+                        Some((filesystem, versioned.generation)),
+                    )
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        };
+
+        let mut journal = self.journal()?;
+        let (feed, captured_event_sequences) = journal.capture_session_feed(session_id);
+        // Full retention ranking scans the retained feed, so amortize it until
+        // at least 64 new global event sequences or 4 MiB of pending payloads
+        // have arrived. The byte threshold prevents large event bodies from
+        // overshooting the total feed retention budget between pruning passes.
+        let sequence = feed.next_sequence.value();
+        let last_pruned = self.last_feed_pruned_sequence.load(Ordering::Relaxed);
+        let pending_feed_bytes = serde_json::to_vec(&(&feed.events, &feed.workspace_events))
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    format!("could not size pending event feed: {error}"),
+                    false,
+                )
+            })?
+            .len();
+        let prior_feed_bytes = self.feed_bytes_since_prune.load(Ordering::Relaxed);
+        let accumulated_feed_bytes = prior_feed_bytes.saturating_add(pending_feed_bytes);
+        let prune_feed =
+            should_prune_worker_feed(sequence, last_pruned, prior_feed_bytes, pending_feed_bytes);
+        let session = self.sessions()?.get(session_id)?;
+        let session_next_sequence = self.sessions()?.next_sequence();
+        let checkpoint_result = persistence.save_run_checkpoint(DurableRunCheckpointWrite {
+            session: &session,
+            session_next_sequence,
+            prune_feed,
+            summary: &summary,
+            runtime_config: &runtime_config,
+            context_checkpoint: context_checkpoint.as_ref(),
+            plan: &plan,
+            messages: &[],
+            message_delta: Some(&message_delta),
+            activities: &[],
+            activity_deltas: Some(&activities),
+            filesystem: filesystem_record.as_ref(),
+            feed: &feed,
+        });
+        if let Err(error) = checkpoint_result {
+            self.persistence_failed.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
+        if let Some((filesystem, generation)) = filesystem_ack {
+            filesystem.acknowledge_persisted_generation(generation)?;
+        }
+        if prune_feed {
+            self.last_feed_pruned_sequence
+                .store(sequence, Ordering::Relaxed);
+            self.feed_bytes_since_prune.store(0, Ordering::Relaxed);
+        } else {
+            self.feed_bytes_since_prune
+                .store(accumulated_feed_bytes, Ordering::Relaxed);
+        }
+        {
+            let mut cursor = handle
+                .message_checkpoint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            cursor.attempt_id = summary.snapshot.attempt_id;
+            cursor.message_count = usize::try_from(message_delta.start_ordinal)
+                .unwrap_or(usize::MAX)
+                .saturating_add(message_delta.messages.len());
+        }
+        if !activities.is_empty() {
+            let mut pending = handle
+                .activity_deltas
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for activity in &activities {
+                if pending.by_id.get(&activity.id) == Some(activity) {
+                    pending.by_id.remove(&activity.id);
+                }
+            }
+            let still_pending = pending.by_id.keys().copied().collect::<BTreeSet<_>>();
+            pending
+                .appended_order
+                .retain(|activity_id| still_pending.contains(activity_id));
+        }
+        journal.acknowledge_session_feed(&captured_event_sequences);
+        Ok(())
+    }
+
+    fn persist_state_with_recovery_updates(
+        &self,
+        recovery_updates: &BTreeMap<loom_core::RunId, DurableRunSummary>,
+    ) -> Result<()> {
+        self.latch_on_persistence_error(self.persist_state_inner(recovery_updates, None))
+    }
+
+    fn latch_on_persistence_error<T>(&self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.persistence_failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn persist_state_inner(
+        &self,
+        recovery_updates: &BTreeMap<loom_core::RunId, DurableRunSummary>,
+        idempotency_candidate: Option<(loom_core::RequestId, IdempotencyRecord)>,
+    ) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        let handles = self.runs()?.values().cloned().collect::<Vec<_>>();
+        for handle in handles {
+            handle.flush_message_fragments(persistence)?;
+        }
+        let mut runs: BTreeMap<loom_core::RunId, AgentRuntimeState> = self
             .runs()?
             .iter()
             .map(|(run_id, handle)| (*run_id, handle.state()))
             .collect();
-        let session_filesystems = self
-            .session_filesystems()?
+        let durable_run_plans = runs
             .iter()
-            .map(|(session_id, filesystem)| {
+            .map(|(run_id, state)| (*run_id, state.plan.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let mut durable_run_summaries: BTreeMap<loom_core::RunId, DurableRunSummary> = self
+            .persisted_runs()?
+            .iter()
+            .map(|(run_id, summary)| {
+                (
+                    *run_id,
+                    DurableRunSummary {
+                        snapshot: summary.snapshot.clone(),
+                        usage: summary.usage.clone(),
+                        attempts: None,
+                        execution_state: None,
+                        interactions: None,
+                    },
+                )
+            })
+            .collect();
+        for (run_id, state) in &runs {
+            durable_run_summaries.insert(
+                *run_id,
+                DurableRunSummary {
+                    snapshot: state.run.clone(),
+                    usage: state.usage.clone(),
+                    attempts: Some(state.attempts.clone()),
+                    execution_state: Some(execution_state_from_runtime(state)?),
+                    interactions: Some(state.interactions.clone()),
+                },
+            );
+        }
+        durable_run_summaries.extend(
+            recovery_updates
+                .iter()
+                .map(|(run_id, summary)| (*run_id, summary.clone())),
+        );
+        let durable_run_context_checkpoints =
+            runs.iter()
+                .map(|(run_id, state)| {
+                    (
+                        *run_id,
+                        state.context_checkpoint.clone().map(|summary| {
+                            DurableRunContextCheckpoint {
+                                session_id: state.session_id,
+                                summary,
+                            }
+                        }),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+        let durable_run_runtime_configs = runs
+            .iter()
+            .map(|(run_id, state)| {
+                let mut context_inspection = state.context_inspection.clone();
+                if let Some(inspection) = &mut context_inspection {
+                    inspection.summary = None;
+                }
                 Ok((
-                    *session_id,
-                    PersistedSessionFilesystem {
-                        filesystem: filesystem.export_state()?,
-                        repositories: self
-                            .session_repositories()?
-                            .get(session_id)
-                            .cloned()
-                            .unwrap_or_default(),
-                        directories: filesystem
-                            .mounted_directories()?
-                            .into_iter()
-                            .map(|(path, source)| SessionDirectory {
-                                path,
-                                source: source.display().to_string(),
-                            })
-                            .collect(),
+                    *run_id,
+                    DurableRunRuntimeConfig {
+                        system_instructions: state.task.system_instructions.clone(),
+                        repository_instructions: state.task.repository_instructions.clone(),
+                        approval_policy: state.approval_policy.clone(),
+                        limits: state.options.limits.clone(),
+                        context_options: state.options.context.clone(),
+                        checkpoint_id: state.options.checkpoint_id,
+                        input_cost_micros_per_1k: state.options.input_cost_micros_per_1k,
+                        output_cost_micros_per_1k: state.options.output_cost_micros_per_1k,
+                        context_inspection,
                     },
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        persistence.save_sections(
-            CURRENT_SCHEMA_VERSION,
-            &[
-                ("sessions", json_value(self.sessions()?.export_state())?),
-                (
-                    "workspace_records",
-                    json_value(self.workspace_records()?.export_state())?,
-                ),
-                ("journal", json_value(self.journal()?.clone())?),
-                ("runs", json_value(runs)?),
-                ("session_filesystems", json_value(session_filesystems)?),
-                (
-                    "session_approval_policies",
-                    json_value(self.session_policies()?.clone())?,
-                ),
-                (
-                    "auto_approve_actions",
-                    json_value(self.auto_approve_actions()?.clone())?,
-                ),
-                (
-                    "workspace_configs",
-                    json_value(self.workspace_configs()?.clone())?,
-                ),
-                (
-                    "provider_configs",
-                    json_value(self.providers.export_configs()?)?,
-                ),
-                (
-                    "provider_health",
-                    json_value(self.providers.export_health()?)?,
-                ),
-                ("provider_usage", json_value(self.providers.usage()?)?),
-                ("models", json_value(self.models.clone())?),
-                ("idempotency", json_value(self.idempotency()?.clone())?),
-            ],
-        )
+        let mut durable_run_messages = BTreeMap::new();
+        let mut durable_run_activities = BTreeMap::new();
+        for (run_id, state) in &mut runs {
+            durable_run_messages
+                .insert(*run_id, durable_run_messages_from_runtime(&state.messages));
+            durable_run_activities.insert(*run_id, std::mem::take(&mut state.activities));
+        }
+        let loaded_repositories = self.session_repositories()?.clone();
+        let mut filesystem_records = Vec::new();
+        let mut filesystem_generations = Vec::new();
+        for (session_id, filesystem) in self.session_filesystems()?.iter() {
+            let Some(versioned) = filesystem.export_delta_if_dirty()? else {
+                continue;
+            };
+            let workspace_delta = versioned.delta;
+            let filesystem_state = versioned.state;
+            let checkpoints = workspace_delta.checkpoints;
+            let edits = workspace_delta
+                .edits
+                .into_iter()
+                .map(|edit| DurableFilesystemEdit {
+                    id: edit.id,
+                    path: edit.path,
+                    before: edit.before,
+                    before_bytes: edit.before_bytes,
+                    after_revision: edit.after_revision,
+                    source: edit.source,
+                })
+                .collect();
+            let changes = workspace_delta.changes;
+            let deleted_checkpoints = workspace_delta.deleted_checkpoints;
+            let deleted_edits = workspace_delta.deleted_edits;
+            let deleted_changes = workspace_delta.deleted_changes;
+            let directories = filesystem
+                .mounted_directories()?
+                .into_iter()
+                .map(|(path, source)| SessionDirectory {
+                    path,
+                    source: source.display().to_string(),
+                })
+                .collect::<Vec<_>>();
+            let repositories = loaded_repositories
+                .get(session_id)
+                .cloned()
+                .unwrap_or_default();
+            let persisted = PersistedSessionFilesystem {
+                filesystem: filesystem_state,
+                repositories: repositories.clone(),
+                directories: directories.clone(),
+            };
+            filesystem_records.push(DurableFilesystemRecord {
+                session_id: *session_id,
+                root: persisted.filesystem.root.clone(),
+                control: persisted.filesystem.control,
+                checkpoints,
+                edits,
+                changes,
+                repositories,
+                directories,
+                payload: json_value(persisted)?,
+                delta: Some(DurableFilesystemDelta {
+                    deleted_checkpoints,
+                    deleted_edits,
+                    deleted_changes,
+                }),
+            });
+            filesystem_generations.push((filesystem.clone(), versioned.generation));
+        }
+        let sessions = self.sessions()?.export_state();
+        let mut journal = self.journal()?;
+        let feed = DurableFeedState {
+            next_sequence: journal.next_sequence,
+            retention_limit: journal.retention_limit,
+            events: journal.pending_events.clone(),
+            workspace_events: journal.pending_workspace_events.clone(),
+        };
+        let session_settings = DurableSessionSettings {
+            approval_policies: self.session_policies()?.clone(),
+            auto_approve_actions: self.auto_approve_actions()?.clone(),
+        };
+        let workspace_configs = self.workspace_configs()?.clone();
+        let provider_state = DurableProviderState {
+            configs: self
+                .providers
+                .export_configs()?
+                .into_iter()
+                .map(|config| (config.id.clone(), config))
+                .collect(),
+            health: self.providers.export_health()?,
+        };
+        let workspace_records = self.workspace_records()?.export_state();
+        let provider_usage = self.providers.usage()?;
+        let mut idempotency = self
+            .idempotency()?
+            .iter()
+            .map(|(id, record)| {
+                Ok((
+                    *id,
+                    DurableIdempotencyRecord {
+                        created_at: record.created_at,
+                        expires_at: record.expires_at,
+                        request: json_value(&record.request)?,
+                        response: json_value(&record.response)?,
+                    },
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        if let Some((request_id, record)) = &idempotency_candidate {
+            idempotency.insert(
+                *request_id,
+                DurableIdempotencyRecord {
+                    created_at: record.created_at,
+                    expires_at: record.expires_at,
+                    request: json_value(&record.request)?,
+                    response: json_value(&record.response)?,
+                },
+            );
+        }
+        #[cfg(test)]
+        if self.fail_next_state_save.swap(false, Ordering::SeqCst) {
+            self.persistence_failed.store(true, Ordering::SeqCst);
+            return Err(LoomError::new(
+                ErrorCode::Internal,
+                "injected durable state save failure",
+                true,
+            ));
+        }
+        let result = persistence.save_state(DurableStateWrite {
+            sessions: &sessions,
+            workspaces: Some(&workspace_records),
+            settings: Some(&session_settings),
+            workspace_configs: Some(&workspace_configs),
+            providers: Some(&provider_state),
+            usage: Some(&provider_usage),
+            idempotency: Some(&idempotency),
+            run_summaries: Some(&durable_run_summaries),
+            run_runtime_configs: Some(&durable_run_runtime_configs),
+            run_context_checkpoints: Some(&durable_run_context_checkpoints),
+            run_plans: Some(&durable_run_plans),
+            run_messages: Some(&durable_run_messages),
+            run_activities: Some(&durable_run_activities),
+            filesystem_records: Some(&filesystem_records),
+            feed: Some(&feed),
+        });
+        if result.is_err() {
+            self.persistence_failed.store(true, Ordering::SeqCst);
+        }
+        if result.is_ok() {
+            for (filesystem, generation) in filesystem_generations {
+                filesystem.acknowledge_persisted_generation(generation)?;
+            }
+            journal.pending_events.clear();
+            journal.pending_workspace_events.clear();
+            self.last_feed_pruned_sequence
+                .store(feed.next_sequence.value(), Ordering::Relaxed);
+            self.feed_bytes_since_prune.store(0, Ordering::Relaxed);
+        }
+        result
     }
 
     pub fn flush(&self) -> Result<()> {
+        if *self.request_lifecycle.read().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "backend request lifecycle lock was poisoned",
+                true,
+            )
+        })? != 0
+        {
+            return Err(LoomError::conflict("backend is shutting down"));
+        }
         self.persist_state()
+    }
+
+    /// Stops active run workers, persists their paused continuation state,
+    /// joins all worker threads, and releases exclusive database ownership.
+    /// Requests through existing connections are rejected after shutdown.
+    pub fn shutdown(&self) -> Result<()> {
+        let mut shutting_down = self.request_lifecycle.write().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "backend request lifecycle lock was poisoned",
+                true,
+            )
+        })?;
+        if *shutting_down == 2 {
+            return Ok(());
+        }
+        *shutting_down = 1;
+        let handles = self
+            .runs()?
+            .values()
+            .cloned()
+            .collect::<Vec<Arc<RunHandle>>>();
+        for handle in handles {
+            if handle.is_running() {
+                handle.control.request_pause();
+                handle.wait_until_idle()?;
+                if let Some(error) = handle.take_failure() {
+                    return Err(error);
+                }
+                if handle.control.is_stopping() {
+                    let state = handle.state().run.state;
+                    if !matches!(
+                        state,
+                        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                    ) {
+                        let mut runtime = handle.try_runtime()?;
+                        runtime.pause()?;
+                        handle.refresh(&runtime);
+                    }
+                    handle.control.clear_request();
+                }
+            }
+            handle.join_worker()?;
+        }
+        self.persist_state()?;
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.release_exclusive_writer()?;
+        }
+        *shutting_down = 2;
+        Ok(())
     }
 
     fn append_recovery_events(
@@ -1835,8 +3629,29 @@ impl InProcessBackend {
             let Some(backend) = backend.upgrade() else {
                 return;
             };
-            let recorded = backend.record_agent_event(session_id, event.clone());
-            if let Some(handle) = handle.upgrade() {
+            let handle = handle.upgrade();
+            // Keep journal append and cached-state/dirty-activity application
+            // indivisible relative to a durable worker checkpoint.
+            let _event_guard = handle.as_ref().map(|handle| {
+                handle
+                    .event_gate
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+            });
+            let fragment_result = match (event, backend.persistence.as_ref(), handle.as_ref()) {
+                (
+                    AgentEvent::AssistantMessageDelta { text, .. },
+                    Some(persistence),
+                    Some(handle),
+                ) => handle.append_message_delta(persistence, text),
+                (AgentEvent::RunCompleted { .. }, Some(persistence), Some(handle)) => {
+                    handle.flush_message_fragments(persistence)
+                }
+                _ => Ok(()),
+            };
+            let recorded = fragment_result
+                .and_then(|()| backend.record_agent_event(session_id, event.clone()));
+            if let Some(handle) = handle.as_ref() {
                 handle.apply_event(event);
                 if let Err(error) = recorded {
                     handle.record_failure(error);
@@ -1856,38 +3671,81 @@ impl InProcessBackend {
 
     /// Drives a registered run on its own worker so the request handler returns
     /// as soon as the run is registered.
-    fn spawn_run_worker(self: &Arc<Self>, handle: Arc<RunHandle>) {
+    fn spawn_run_worker(self: &Arc<Self>, handle: Arc<RunHandle>) -> Result<()> {
+        handle.join_worker()?;
         handle.set_running(true);
         let backend = Arc::clone(self);
-        std::thread::spawn(move || {
-            loop {
-                let progress = {
-                    let mut runtime = handle
-                        .runtime
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    let progress = runtime.run_step();
-                    handle.refresh(&runtime);
-                    progress
-                };
-                match progress {
-                    Ok(progress) => {
-                        if let Err(error) = backend.persist_state() {
-                            handle.record_failure(error);
-                            break;
-                        }
-                        if !progress.continues {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        handle.record_failure(error);
+        let worker_handle = Arc::clone(&handle);
+        let run_id = handle.run_id;
+        let worker = thread::Builder::new()
+            .name(format!("loom-run-{run_id}"))
+            .spawn(move || {
+                let fragment_flusher = backend.persistence.clone().map(|persistence| {
+                    let handle = Arc::downgrade(&handle);
+                    thread::spawn(move || {
+                        RunHandle::flush_message_fragments_until_stopped(handle, persistence)
+                    })
+                });
+                loop {
+                    let progress = {
+                        let mut runtime = handle
+                            .runtime
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        let progress = runtime.run_step();
+                        handle.refresh(&runtime);
+                        progress
+                    };
+                    if handle.failure().is_some() {
                         break;
                     }
+                    match progress {
+                        Ok(progress) => {
+                            if let Some(persistence) = backend.persistence.as_ref()
+                                && let Err(error) = handle.flush_message_fragments(persistence)
+                            {
+                                handle.record_failure(error);
+                                break;
+                            }
+                            if let Err(error) = backend.persist_run_checkpoint(&handle) {
+                                handle.record_failure(error);
+                                break;
+                            }
+                            if !progress.continues {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let flush_error =
+                                backend.persistence.as_ref().and_then(|persistence| {
+                                    handle.flush_message_fragments(persistence).err()
+                                });
+                            handle.record_failure(flush_error.unwrap_or(error));
+                            break;
+                        }
+                    }
                 }
-            }
-            handle.set_running(false);
-        });
+                if let Err(error) = backend.persist_worker_state() {
+                    handle.record_failure(error);
+                }
+                handle.set_running(false);
+                if fragment_flusher.is_some_and(|flusher| flusher.join().is_err()) {
+                    log::error!("run message fragment flusher thread panicked");
+                }
+            })
+            .map_err(|error| {
+                worker_handle.set_running(false);
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!("could not start worker for run {run_id}: {error}"),
+                    true,
+                )
+            })?;
+        *worker_handle
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(worker);
+        Ok(())
     }
 
     fn cached_response(
@@ -1907,20 +3765,14 @@ impl InProcessBackend {
         Ok(Some(record.response.clone()))
     }
 
-    fn remember_response(
+    fn publish_idempotency_record(
         &self,
         request_id: loom_core::RequestId,
-        request: ClientRequest,
-        response: ResponseEnvelope,
+        record: IdempotencyRecord,
     ) -> Result<()> {
         let mut cache = self.idempotency()?;
-        cache.insert(request_id, IdempotencyRecord { request, response });
-        while cache.len() > IDEMPOTENCY_RETENTION {
-            let Some(first) = cache.keys().next().copied() else {
-                break;
-            };
-            cache.remove(&first);
-        }
+        cache.insert(request_id, record);
+        trim_idempotency_cache(&mut cache);
         Ok(())
     }
 
@@ -1951,7 +3803,12 @@ impl InProcessConnection {
         &self,
         run_id: loom_core::RunId,
     ) -> Result<AgentRunSnapshotProjection> {
-        Ok(run_snapshot_projection(&self.run_handle(run_id)?.state()))
+        if let Some(handle) = self.backend.runs()?.get(&run_id).cloned() {
+            return Ok(run_snapshot_projection(&handle.state()));
+        }
+        let summary = self.run_summary(run_id)?;
+        let state = self.load_persisted_run_state(&summary, true)?;
+        Ok(run_snapshot_projection(&state))
     }
 
     fn disk_resources(root: &Path) -> (Option<u64>, Option<u64>) {
@@ -1986,41 +3843,432 @@ impl InProcessConnection {
 
     /// Looks a run up without touching its runtime lock.
     fn run_handle(&self, run_id: loom_core::RunId) -> Result<Arc<RunHandle>> {
-        let handle = self
+        if let Some(handle) = self.backend.runs()?.get(&run_id).cloned() {
+            if let Some(error) = handle.take_failure() {
+                return Err(error);
+            }
+            return Ok(handle);
+        }
+        let summary = self.run_summary(run_id)?;
+        let state = self.load_persisted_run_state(&summary, true)?;
+        if state.run.id != run_id || state.session_id != summary.snapshot.session_id {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted run {run_id} does not match its summary"),
+                false,
+            ));
+        }
+        let workspace = self.backend.restore_session_filesystem(state.session_id)?;
+        let provider = match self
             .backend
-            .runs()?
-            .get(&run_id)
-            .cloned()
-            .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
+            .provider_at(&state.task.model, state.provider_cursor)
+        {
+            Ok(provider) => provider,
+            Err(error) => {
+                let descriptor = self
+                    .backend
+                    .providers
+                    .describe_model(&state.task.model)
+                    .unwrap_or_else(|_| ModelDescriptor {
+                        id: state.task.model.clone(),
+                        provider: ProviderId::new("recovered"),
+                        display_name: "Unavailable persisted model".to_owned(),
+                        context_window: None,
+                        capabilities: ModelCapabilities::default(),
+                    });
+                Box::new(UnavailableProvider::new(descriptor, error))
+            }
+        };
+        let tools = ToolExecutor::new_with_workspace(workspace)
+            .with_github_token(self.backend.providers.github_account_token().ok());
+        let runtime = AgentRuntime::from_state(state, provider, tools)?;
+        let handle = self.backend.register_runtime(runtime);
+        self.backend.runs()?.insert(run_id, Arc::clone(&handle));
         if let Some(error) = handle.take_failure() {
             return Err(error);
         }
         Ok(handle)
     }
 
+    fn run_summary(&self, run_id: loom_core::RunId) -> Result<PersistedRunSummary> {
+        if let Some(handle) = self.backend.runs()?.get(&run_id) {
+            let state = handle.state();
+            return Ok(PersistedRunSummary {
+                snapshot: state.run,
+                usage: state.usage,
+            });
+        }
+        if let Some(summary) = self.backend.persisted_runs()?.get(&run_id).cloned() {
+            return Ok(summary);
+        }
+        let persistence = self
+            .backend
+            .persistence
+            .as_ref()
+            .ok_or_else(|| LoomError::not_found("agent run", run_id))?;
+        persistence
+            .load_run_summary(run_id)?
+            .map(|summary| PersistedRunSummary {
+                snapshot: summary.snapshot,
+                usage: summary.usage,
+            })
+            .ok_or_else(|| LoomError::not_found("agent run", run_id))
+    }
+
+    fn run_message_page(
+        &self,
+        run_id: loom_core::RunId,
+        before_ordinal: Option<u64>,
+        limit: u32,
+    ) -> Result<Vec<AgentRunMessageHeader>> {
+        if !(1..=MAX_AGENT_RUN_MESSAGE_PAGE_SIZE).contains(&limit) {
+            return Err(LoomError::invalid_request(format!(
+                "run message page size must be between 1 and {MAX_AGENT_RUN_MESSAGE_PAGE_SIZE}"
+            )));
+        }
+        if let Some(persistence) = &self.backend.persistence {
+            return persistence
+                .load_run_message_page(run_id, before_ordinal, limit as usize)
+                .map(|messages| {
+                    messages
+                        .into_iter()
+                        .map(|message| AgentRunMessageHeader {
+                            ordinal: message.ordinal,
+                            role: message.role,
+                            content_bytes: message.content_bytes,
+                            name: message.name,
+                            tool_call_id: message.tool_call_id,
+                            tool_calls: message.tool_calls,
+                        })
+                        .collect()
+                });
+        }
+
+        let state = self.run_handle(run_id)?.state();
+        let end = before_ordinal
+            .and_then(|ordinal| usize::try_from(ordinal).ok())
+            .unwrap_or(state.messages.len())
+            .min(state.messages.len());
+        let start = end.saturating_sub(limit as usize);
+        state.messages[start..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(relative_ordinal, message)| {
+                let ordinal = start + relative_ordinal;
+                Ok(AgentRunMessageHeader {
+                    ordinal: u64::try_from(ordinal).map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            "run message ordinal is out of range",
+                            false,
+                        )
+                    })?,
+                    role: message.role,
+                    content_bytes: u64::try_from(message.content.len()).map_err(|_| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            "run message content size is out of range",
+                            false,
+                        )
+                    })?,
+                    name: message.name.clone(),
+                    tool_call_id: message.tool_call_id,
+                    tool_calls: message.tool_calls.clone(),
+                })
+            })
+            .collect()
+    }
+
+    fn run_transcript_page(
+        &self,
+        run_id: loom_core::RunId,
+        before_ordinal: Option<u64>,
+        limit: u32,
+    ) -> Result<(Vec<AgentRunTranscriptMessage>, Option<u64>, bool)> {
+        if !(1..=MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE).contains(&limit) {
+            return Err(LoomError::invalid_request(format!(
+                "transcript page size must be between 1 and {MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE}"
+            )));
+        }
+        let headers = self.run_message_page(run_id, before_ordinal, limit)?;
+        let next_before = headers.iter().map(|message| message.ordinal).min();
+        let has_older = headers.len() == limit as usize;
+        let messages = headers
+            .into_iter()
+            .rev()
+            .map(|header| {
+                let byte_count = header
+                    .content_bytes
+                    .min(u64::from(MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES));
+                let length = u32::try_from(byte_count).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "transcript message length is out of range",
+                        false,
+                    )
+                })?;
+                let content = if length == 0 {
+                    Vec::new()
+                } else {
+                    self.run_message_content_range(run_id, header.ordinal, 0, length)?
+                };
+                let (content, content_truncated) =
+                    bounded_transcript_content(&content, header.content_bytes);
+                Ok(AgentRunTranscriptMessage {
+                    ordinal: header.ordinal,
+                    message: ModelMessage {
+                        role: header.role,
+                        content,
+                        name: header.name,
+                        tool_call_id: header.tool_call_id,
+                        tool_calls: header.tool_calls,
+                    },
+                    content_truncated,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((messages, next_before, has_older))
+    }
+
+    fn run_message_content_range(
+        &self,
+        run_id: loom_core::RunId,
+        message_ordinal: u64,
+        byte_offset: u64,
+        length: u32,
+    ) -> Result<Vec<u8>> {
+        if length > MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES {
+            return Err(LoomError::invalid_request(format!(
+                "message content range exceeds {MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES} bytes"
+            )));
+        }
+        if let Some(persistence) = &self.backend.persistence {
+            return persistence.load_run_message_content_range(
+                run_id,
+                message_ordinal,
+                byte_offset,
+                length as usize,
+            );
+        }
+
+        let state = self.run_handle(run_id)?.state();
+        let ordinal = usize::try_from(message_ordinal)
+            .map_err(|_| LoomError::invalid_request("message ordinal is out of range"))?;
+        let message = state
+            .messages
+            .get(ordinal)
+            .ok_or_else(|| LoomError::not_found("run message", message_ordinal))?;
+        let start = usize::try_from(byte_offset)
+            .map_err(|_| LoomError::invalid_request("message byte offset is out of range"))?;
+        if start >= message.content.len() {
+            return Ok(Vec::new());
+        }
+        let end = start
+            .saturating_add(length as usize)
+            .min(message.content.len());
+        Ok(message.content.as_bytes()[start..end].to_vec())
+    }
+
+    fn load_persisted_run_state(
+        &self,
+        summary: &PersistedRunSummary,
+        include_messages: bool,
+    ) -> Result<AgentRuntimeState> {
+        let persistence = self
+            .backend
+            .persistence
+            .as_ref()
+            .ok_or_else(|| LoomError::not_found("agent run", summary.snapshot.id))?;
+        let runtime_config = persistence
+            .load_run_runtime_config(summary.snapshot.id)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!(
+                        "persisted run {} has no runtime configuration",
+                        summary.snapshot.id
+                    ),
+                    true,
+                )
+            })?;
+        let mut state = runtime_state_from_durable_config(summary, runtime_config)?;
+        let execution_state = persistence
+            .load_run_execution_state(summary.snapshot.id)?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!(
+                        "persisted run {} has no typed execution state",
+                        summary.snapshot.id
+                    ),
+                    true,
+                )
+            })?;
+        hydrate_runtime_execution_state(&mut state, execution_state)?;
+        state.plan = persistence.load_run_plan(summary.snapshot.id)?;
+        if include_messages {
+            state.messages =
+                persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
+        } else {
+            state.messages.clear();
+        }
+        hydrate_run_context_checkpoint(persistence, summary.snapshot.id, &mut state)?;
+        state.activities = persistence.load_run_activities(summary.snapshot.id)?;
+        state.attempts = persistence.load_run_attempts(summary.snapshot.id)?;
+        if state.attempts.is_empty() {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!(
+                    "persisted run {} has no typed attempt history",
+                    summary.snapshot.id
+                ),
+                true,
+            ));
+        }
+        state.interactions = persistence.load_run_interactions(summary.snapshot.id)?;
+        Ok(state)
+    }
+
+    fn load_persisted_run_state_from_projection(
+        &self,
+        summary: &PersistedRunSummary,
+        persisted: &DurableSessionProjectionRead,
+    ) -> Result<AgentRuntimeState> {
+        let run_id = summary.snapshot.id;
+        let durable_summary = persisted.latest_run.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "persisted run disappeared",
+                true,
+            )
+        })?;
+        if durable_summary.snapshot.id != run_id {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "persisted projection does not contain the selected run",
+                true,
+            ));
+        }
+        let runtime_config = persisted.runtime_config.clone().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("persisted run {run_id} has no runtime configuration"),
+                true,
+            )
+        })?;
+        let mut state = runtime_state_from_durable_config(summary, runtime_config)?;
+        let execution_state = persisted.execution_state.clone().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("persisted run {run_id} has no typed execution state"),
+                true,
+            )
+        })?;
+        hydrate_runtime_execution_state(&mut state, execution_state)?;
+        state.plan = persisted.plan.clone();
+        state.messages.clear();
+        if let Some(checkpoint) = &persisted.context_checkpoint {
+            if checkpoint.session_id != state.session_id {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "run context checkpoint belongs to a different session",
+                    false,
+                ));
+            }
+            state.context_checkpoint = Some(checkpoint.summary.clone());
+            if let Some(inspection) = &mut state.context_inspection {
+                inspection.summary = Some(checkpoint.summary.clone());
+            }
+        } else {
+            state.context_checkpoint = None;
+            if let Some(inspection) = &mut state.context_inspection {
+                inspection.summary = None;
+            }
+        }
+        state.activities = persisted.activities.clone();
+        state.attempts = persisted.attempts.clone();
+        if state.attempts.is_empty() {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("persisted run {run_id} has no typed attempt history"),
+                true,
+            ));
+        }
+        state.interactions = persisted.interactions.clone();
+        Ok(state)
+    }
+
     fn session_snapshot_projection(
         &self,
         session_id: AgentSessionId,
+        include_messages: bool,
     ) -> Result<AgentSessionSnapshotProjection> {
         let session = self.backend.sessions()?.get(session_id)?;
-        let active_run = self
-            .backend
-            .runs()?
-            .values()
-            .filter(|handle| handle.session_id == session_id)
-            .map(|handle| handle.state())
-            .max_by_key(|state| state.run.updated_at)
+        let (loaded_ids, latest_loaded) = {
+            let runs = self.backend.runs()?;
+            let loaded_ids = runs.keys().copied().collect::<BTreeSet<_>>();
+            let latest = runs
+                .values()
+                .filter(|handle| handle.session_id == session_id)
+                .max_by_key(|handle| handle.snapshot().updated_at)
+                .cloned();
+            (loaded_ids, latest)
+        };
+        let persisted_projection = match &self.backend.persistence {
+            Some(persistence) if !include_messages => {
+                Some(persistence.load_session_projection_read(session_id)?)
+            }
+            _ => None,
+        };
+        let latest_persisted = if let Some(projection) = &persisted_projection {
+            projection
+                .latest_run
+                .as_ref()
+                .map(|summary| PersistedRunSummary {
+                    snapshot: summary.snapshot.clone(),
+                    usage: summary.usage.clone(),
+                })
+                .filter(|summary| !loaded_ids.contains(&summary.snapshot.id))
+        } else {
+            match &self.backend.persistence {
+                Some(persistence) => persistence
+                    .load_latest_run_summary_for_session(session_id)?
+                    .map(|summary| PersistedRunSummary {
+                        snapshot: summary.snapshot,
+                        usage: summary.usage,
+                    })
+                    .filter(|summary| !loaded_ids.contains(&summary.snapshot.id)),
+                None => None,
+            }
+        };
+        let load_selected_persisted = |summary: &PersistedRunSummary| {
+            if let Some(projection) = &persisted_projection {
+                self.load_persisted_run_state_from_projection(summary, projection)
+            } else {
+                self.load_persisted_run_state(summary, include_messages)
+            }
+        };
+        let active_run = match (latest_loaded, latest_persisted) {
+            (Some(handle), Some(summary)) => {
+                let projection = handle.snapshot_projection(include_messages);
+                if projection.run.updated_at >= summary.snapshot.updated_at {
+                    Some(projection)
+                } else {
+                    Some(run_snapshot_projection(&load_selected_persisted(&summary)?))
+                }
+            }
+            (Some(handle), None) => Some(handle.snapshot_projection(include_messages)),
+            (None, Some(summary)) => {
+                Some(run_snapshot_projection(&load_selected_persisted(&summary)?))
+            }
+            (None, None) => None,
+        };
+        let latest_sequence = persisted_projection
             .as_ref()
-            .map(run_snapshot_projection);
-        let latest_sequence = self
-            .backend
-            .journal()?
-            .events
-            .iter()
-            .filter(|event| event.session_id == session_id)
-            .map(|event| event.sequence)
-            .max()
-            .unwrap_or_default();
+            .and_then(|projection| projection.latest_sequence)
+            .map(Ok)
+            .unwrap_or_else(|| self.latest_session_event_sequence(session_id))?;
         let approval_policy = self.policy(session_id)?;
         let auto_approve_actions = self.auto_approve_actions(session_id)?;
         Ok(AgentSessionSnapshotProjection {
@@ -2032,6 +4280,168 @@ impl InProcessConnection {
         })
     }
 
+    fn session_events_since(
+        &self,
+        session_id: Option<AgentSessionId>,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        let mut events = match &self.backend.persistence {
+            Some(persistence) => persistence.load_feed_events_since(session_id, after_sequence)?,
+            None => Vec::new(),
+        };
+        events.extend(
+            self.backend
+                .journal()?
+                .events_since(session_id, after_sequence),
+        );
+        Ok(deduplicate_events(events))
+    }
+
+    fn workspace_events_since(
+        &self,
+        workspace_id: WorkspaceId,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<Vec<WorkspaceFeedEvent>> {
+        let session_ids = self
+            .backend
+            .sessions()?
+            .list_in_workspace(Some(workspace_id), true)
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<BTreeSet<_>>();
+        let mut events = match &self.backend.persistence {
+            Some(persistence) => {
+                persistence.load_feed_workspace_events_since(workspace_id, after_sequence)?
+            }
+            None => Vec::new(),
+        };
+        events.extend(self.backend.journal()?.workspace_events_since(
+            &session_ids,
+            workspace_id,
+            after_sequence,
+        ));
+        events.sort_by_key(|event| match event {
+            WorkspaceFeedEvent::Session(event) => event.sequence,
+            WorkspaceFeedEvent::Workspace(event) => event.sequence,
+        });
+        events.dedup_by_key(|event| match event {
+            WorkspaceFeedEvent::Session(event) => event.sequence,
+            WorkspaceFeedEvent::Workspace(event) => event.sequence,
+        });
+        Ok(events)
+    }
+
+    fn session_events_with_safe_cursor(
+        &self,
+        session_id: AgentSessionId,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<(Vec<ServerEventEnvelope>, EventSequence)> {
+        let cursor_before = self.latest_session_event_sequence(session_id)?;
+        let events = self.session_events_since(Some(session_id), after_sequence)?;
+        let latest_in_batch = events
+            .iter()
+            .map(|event| event.sequence)
+            .max()
+            .unwrap_or_default();
+        Ok((events, cursor_before.max(latest_in_batch)))
+    }
+
+    fn recent_session_events(
+        &self,
+        session_id: AgentSessionId,
+        limit: usize,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        let mut events = match &self.backend.persistence {
+            Some(persistence) => persistence.load_recent_feed_events(session_id, limit)?,
+            None => Vec::new(),
+        };
+        events.extend(self.backend.journal()?.recent_events(session_id, limit));
+        let mut events = deduplicate_events(events);
+        let excess = events.len().saturating_sub(limit);
+        if excess > 0 {
+            events.drain(..excess);
+        }
+        Ok(events)
+    }
+
+    fn feed_session_cursor(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Option<DurableFeedSessionCursor>> {
+        self.backend
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.load_feed_session_cursor(session_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn feed_workspace_cursor(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<DurableFeedWorkspaceCursor>> {
+        self.backend
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.load_feed_workspace_cursor(workspace_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn latest_workspace_event_sequence(&self, workspace_id: WorkspaceId) -> Result<EventSequence> {
+        let session_ids = self
+            .backend
+            .sessions()?
+            .list_in_workspace(Some(workspace_id), true)
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<BTreeSet<_>>();
+        let durable = self
+            .feed_workspace_cursor(workspace_id)?
+            .map(|cursor| cursor.latest_sequence)
+            .unwrap_or_default();
+        let live = self
+            .backend
+            .journal()?
+            .workspace_latest_sequence(&session_ids, workspace_id)
+            .unwrap_or_default();
+        Ok(durable.max(live))
+    }
+
+    fn latest_session_event_sequence(&self, session_id: AgentSessionId) -> Result<EventSequence> {
+        if let Some(cursor) = self.feed_session_cursor(session_id)? {
+            return Ok(cursor.latest_sequence);
+        }
+        Ok(self
+            .backend
+            .journal()?
+            .latest_sequence(Some(session_id))
+            .unwrap_or_default())
+    }
+
+    fn session_initial_state(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<AgentSessionInitialState> {
+        for _ in 0..4 {
+            let before = self.latest_session_event_sequence(session_id)?;
+            let mut projection = self.session_snapshot_projection(session_id, false)?;
+            let after = self.latest_session_event_sequence(session_id)?;
+            if before == after {
+                projection.latest_sequence = after;
+                return Ok(AgentSessionInitialState {
+                    projection,
+                    cursor: after,
+                });
+            }
+        }
+        Err(LoomError::new(
+            ErrorCode::Conflict,
+            "session changed while reading initial state; retry",
+            true,
+        ))
+    }
+
     fn create_workspace(&self, name: String) -> Result<WorkspaceRecord> {
         self.backend.workspace_records()?.create(name)
     }
@@ -2041,7 +4451,22 @@ impl InProcessConnection {
     }
 
     fn rename_workspace(&self, workspace_id: WorkspaceId, name: String) -> Result<WorkspaceRecord> {
-        self.backend.workspace_records()?.rename(workspace_id, name)
+        let mut records = self.backend.workspace_records()?;
+        let previous = records.export_state();
+        let renamed = records.rename(workspace_id, name)?;
+        drop(records);
+        let sequence = self.backend.journal()?.append_workspace(
+            workspace_id,
+            WorkspaceEvent::Renamed {
+                name: renamed.name.clone(),
+            },
+        );
+        if let Err(error) = self.backend.persist_state() {
+            *self.backend.workspace_records()? = WorkspaceManager::from_state(previous)?;
+            self.backend.journal()?.discard_pending_workspace(sequence);
+            return Err(error);
+        }
+        Ok(renamed)
     }
 
     fn create_session_in_workspace(
@@ -2074,17 +4499,7 @@ impl InProcessConnection {
     }
 
     fn session_filesystem(&self, session_id: AgentSessionId) -> Result<Workspace> {
-        self.backend
-            .session_filesystems()?
-            .get(&session_id)
-            .cloned()
-            .ok_or_else(|| {
-                LoomError::new(
-                    ErrorCode::RecoveryRequired,
-                    format!("filesystem for session {session_id} is unavailable"),
-                    true,
-                )
-            })
+        self.backend.restore_session_filesystem(session_id)
     }
 
     fn import_session_directory(
@@ -2444,11 +4859,14 @@ impl InProcessConnection {
         self.backend
             .session_vcs()?
             .insert((session_id, repository_id), service);
-        self.backend
-            .session_repositories()?
-            .entry(session_id)
-            .or_default()
-            .insert(repository_id, repository.clone());
+        {
+            self.backend
+                .session_repositories()?
+                .entry(session_id)
+                .or_default()
+                .insert(repository_id, repository.clone());
+        }
+        filesystem.mark_state_dirty()?;
         log::info!("repository {source_name} attached to session {session_id}");
         Ok(repository)
     }
@@ -2473,6 +4891,7 @@ impl InProcessConnection {
                 "repositories cannot be detached while a session is active",
             ));
         }
+        let filesystem = self.session_filesystem(session_id)?;
         let repository = self
             .backend
             .session_repositories()?
@@ -2480,7 +4899,6 @@ impl InProcessConnection {
             .and_then(|repositories| repositories.get(&repository_id))
             .cloned()
             .ok_or_else(|| LoomError::not_found("session repository", repository_id))?;
-        let filesystem = self.session_filesystem(session_id)?;
         if filesystem.mounted_source_for(&repository.path)?.is_none() {
             let path = filesystem.directory_path(&repository.path)?;
             fs::remove_dir_all(&path).map_err(|error| {
@@ -2491,14 +4909,17 @@ impl InProcessConnection {
                 )
             })?;
         }
-        self.backend
-            .session_repositories()?
-            .entry(session_id)
-            .or_default()
-            .remove(&repository_id);
+        {
+            self.backend
+                .session_repositories()?
+                .entry(session_id)
+                .or_default()
+                .remove(&repository_id);
+        }
         self.backend
             .session_vcs()?
             .remove(&(session_id, repository_id));
+        filesystem.mark_state_dirty()?;
         Ok(())
     }
 
@@ -2515,6 +4936,7 @@ impl InProcessConnection {
         {
             return Ok(service);
         }
+        let _filesystem = self.session_filesystem(session_id)?;
         let repository = self
             .backend
             .session_repositories()?
@@ -2590,6 +5012,25 @@ impl InProcessConnection {
 
     pub fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
         let request_id = request.request_id;
+        let _lifecycle = match self.backend.request_lifecycle.read() {
+            Ok(lifecycle) if *lifecycle == 0 => lifecycle,
+            Ok(_) => {
+                return ResponseEnvelope::failure(
+                    request_id,
+                    LoomError::conflict("backend is shutting down"),
+                );
+            }
+            Err(_) => {
+                return ResponseEnvelope::failure(
+                    request_id,
+                    LoomError::new(
+                        ErrorCode::Internal,
+                        "backend request lifecycle lock was poisoned",
+                        true,
+                    ),
+                );
+            }
+        };
         if let Some(auth) = &self.auth
             && let Err(error) = auth.verify()
         {
@@ -2604,9 +5045,39 @@ impl InProcessConnection {
                 unsupported_version_error(request.protocol_version),
             );
         }
-
         let durable_mutation = request.request.is_retryable_mutation();
+        let _durable_request_guard = if durable_mutation {
+            match self.backend.durable_request_gate.lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    return ResponseEnvelope::failure(
+                        request_id,
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "durable request serialization lock was poisoned",
+                            true,
+                        ),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        if self.backend.persistence_failed.load(Ordering::SeqCst) {
+            return ResponseEnvelope::failure(
+                request_id,
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "backend is unavailable after a durable state save failure; reopen it to recover",
+                    true,
+                ),
+            );
+        }
+
         let retryable = durable_mutation;
+        if retryable && let Err(error) = validate_retry_horizon(request_id, current_unix_millis()) {
+            return ResponseEnvelope::failure(request_id, error);
+        }
         let slot = if retryable {
             match self.backend.request_slot(request_id) {
                 Ok(slot) => Some(slot),
@@ -2639,18 +5110,27 @@ impl InProcessConnection {
             Ok(response) => {
                 if retryable {
                     let response_envelope = ResponseEnvelope::success(request_id, response.clone());
-                    if let Err(error) = self.backend.remember_response(
-                        request_id,
-                        request_for_cache,
-                        response_envelope,
-                    ) {
-                        return ResponseEnvelope::failure(request_id, error);
+                    let record =
+                        IdempotencyRecord::new(request_id, request_for_cache, response_envelope);
+                    if durable_mutation {
+                        self.backend
+                            .persist_state_with_idempotency_candidate((request_id, record.clone()))
+                            .and_then(|()| {
+                                self.backend
+                                    .publish_idempotency_record(request_id, record)?;
+                                Ok(response)
+                            })
+                    } else {
+                        self.backend
+                            .publish_idempotency_record(request_id, record)
+                            .map(|()| response)
                     }
-                }
-                if durable_mutation {
-                    self.backend.persist_state().map(|()| response)
                 } else {
-                    Ok(response)
+                    if durable_mutation {
+                        self.backend.persist_state().map(|()| response)
+                    } else {
+                        Ok(response)
+                    }
                 }
             }
             Err(error) => Err(error),
@@ -2820,14 +5300,20 @@ impl InProcessConnection {
             ClientRequest::ListGitHubRepositories => self.list_github_repositories(),
             ClientRequest::ListSessionRepositories { session_id } => {
                 self.backend.sessions()?.get(session_id)?;
-                Ok(ServerResponse::SessionRepositories {
-                    repositories: self
+                let repositories = self
+                    .backend
+                    .session_repositories()?
+                    .get(&session_id)
+                    .map(|repositories| repositories.values().cloned().collect());
+                let repositories = match repositories {
+                    Some(repositories) => repositories,
+                    None => self
                         .backend
-                        .session_repositories()?
-                        .get(&session_id)
-                        .map(|repositories| repositories.values().cloned().collect())
+                        .persisted_filesystem_record(session_id)?
+                        .map(|persisted| persisted.repositories.into_values().collect())
                         .unwrap_or_default(),
-                })
+                };
+                Ok(ServerResponse::SessionRepositories { repositories })
             }
             ClientRequest::DetachSessionRepository {
                 session_id,
@@ -2840,8 +5326,18 @@ impl InProcessConnection {
                 let snapshot = self.backend.sessions()?.get(session_id)?;
                 Ok(ServerResponse::AgentSession(snapshot))
             }
-            ClientRequest::GetAgentSessionSnapshot { session_id } => Ok(
-                ServerResponse::AgentSessionSnapshot(self.session_snapshot_projection(session_id)?),
+            ClientRequest::GetAgentSessionSnapshot { session_id } => {
+                Ok(ServerResponse::AgentSessionSnapshot(
+                    self.session_snapshot_projection(session_id, true)?,
+                ))
+            }
+            ClientRequest::GetAgentSessionSnapshotMetadata { session_id } => {
+                Ok(ServerResponse::AgentSessionSnapshot(
+                    self.session_snapshot_projection(session_id, false)?,
+                ))
+            }
+            ClientRequest::GetAgentSessionInitialState { session_id } => Ok(
+                ServerResponse::AgentSessionInitialState(self.session_initial_state(session_id)?),
             ),
             ClientRequest::RenameAgentSession { session_id, name } => {
                 let (snapshot, record) = self.backend.sessions()?.rename(session_id, name)?;
@@ -2851,37 +5347,184 @@ impl InProcessConnection {
             ClientRequest::ArchiveAgentSession { session_id } => self.archive_session(session_id),
             ClientRequest::GetSessionEvents {
                 session_id,
+                workspace_id,
                 after_sequence,
+                stream_epoch,
             } => {
+                if session_id.is_some() && workspace_id.is_some() {
+                    return Err(LoomError::invalid_request(
+                        "session_id and workspace_id cannot both scope an event stream",
+                    ));
+                }
+                let current_stream_epoch = Some(self.backend.node_id.clone());
+                let stream_epoch_changed = (session_id.is_some() || workspace_id.is_some())
+                    && stream_epoch
+                        .as_deref()
+                        .is_some_and(|epoch| Some(epoch) != current_stream_epoch.as_deref());
+                let after_sequence = if stream_epoch_changed {
+                    None
+                } else {
+                    after_sequence
+                };
+                if let Some(workspace_id) = workspace_id {
+                    if !self
+                        .negotiated_capabilities()?
+                        .as_ref()
+                        .is_some_and(|capabilities| {
+                            capabilities.contains(Capability::SubscribeWorkspaceEvents)
+                        })
+                    {
+                        return Err(LoomError::new(
+                            ErrorCode::CapabilityDenied,
+                            "connection did not negotiate capability SubscribeWorkspaceEvents",
+                            false,
+                        ));
+                    }
+                    self.backend.workspace_records()?.get(workspace_id)?;
+                    let events = self.workspace_events_since(workspace_id, after_sequence)?;
+                    let durable_cursor = self.feed_workspace_cursor(workspace_id)?;
+                    let latest_sequence = self.latest_workspace_event_sequence(workspace_id)?;
+                    let journal = self.backend.journal()?;
+                    let session_ids = self
+                        .backend
+                        .sessions()?
+                        .list_in_workspace(Some(workspace_id), true)
+                        .into_iter()
+                        .map(|session| session.id)
+                        .collect::<BTreeSet<_>>();
+                    // EventJournal.next_sequence stores the last assigned global sequence.
+                    let global_head_sequence = journal.next_sequence;
+                    let history_missing = after_sequence.is_none()
+                        && session_ids.iter().any(|session_id| {
+                            !events.iter().any(|event| {
+                                matches!(event,
+                                    WorkspaceFeedEvent::Session(event)
+                                        if event.session_id == *session_id
+                                            && matches!(
+                                                &event.event,
+                                                loom_protocol::ServerEvent::AgentSessionCreated { .. }
+                                                    | loom_protocol::ServerEvent::AgentSessionForked { .. }
+                                            )
+                                )
+                            })
+                        });
+                    let cursor_stale = stream_epoch_changed
+                        || history_missing
+                        || match (durable_cursor, after_sequence) {
+                            (Some(cursor), Some(after)) => {
+                                after < cursor.pruned_through
+                                    || after > global_head_sequence
+                                    || (after > cursor.latest_sequence
+                                        && journal.workspace_cursor_is_stale(
+                                            &session_ids,
+                                            workspace_id,
+                                            after_sequence,
+                                        ))
+                            }
+                            (Some(cursor), None) => cursor.pruned_through.value() > 0,
+                            (None, Some(after)) => {
+                                after > global_head_sequence
+                                    || journal.workspace_cursor_is_stale(
+                                        &session_ids,
+                                        workspace_id,
+                                        after_sequence,
+                                    )
+                            }
+                            (None, None) => false,
+                        };
+                    if cursor_stale {
+                        let oldest_sequence = durable_cursor
+                            .and_then(|cursor| cursor.oldest_retained_sequence)
+                            .or_else(|| {
+                                journal.workspace_oldest_sequence(&session_ids, workspace_id)
+                            })
+                            .or_else(|| {
+                                durable_cursor
+                                    .filter(|cursor| cursor.pruned_through.value() > 0)
+                                    .map(|cursor| cursor.pruned_through.next())
+                            })
+                            .unwrap_or_else(|| latest_sequence.next());
+                        return Ok(ServerResponse::WorkspaceEventsSnapshot {
+                            workspace_id,
+                            sessions: self
+                                .backend
+                                .sessions()?
+                                .list_in_workspace(Some(workspace_id), true),
+                            events,
+                            oldest_sequence,
+                            latest_sequence,
+                            stream_epoch: current_stream_epoch,
+                        });
+                    }
+                    return Ok(ServerResponse::WorkspaceEvents {
+                        workspace_id,
+                        events,
+                        stream_epoch: current_stream_epoch,
+                    });
+                }
+                let (events, session_latest_sequence) = match session_id {
+                    Some(session_id) => {
+                        let (events, latest) =
+                            self.session_events_with_safe_cursor(session_id, after_sequence)?;
+                        (events, Some(latest))
+                    }
+                    None => (self.session_events_since(None, after_sequence)?, None),
+                };
                 let journal = self.backend.journal()?;
-                let events = journal.events_since(session_id, after_sequence);
                 let history_missing = session_id.is_some()
                     && after_sequence.is_none()
                     && !events.iter().any(|event| {
                         matches!(
                             &event.event,
                             loom_protocol::ServerEvent::AgentSessionCreated { .. }
+                                | loom_protocol::ServerEvent::AgentSessionForked { .. }
                         )
                     });
-                if let Some(session_id) = session_id
-                    && (journal.is_cursor_stale(after_sequence) || history_missing)
-                {
-                    return Ok(ServerResponse::SessionEventsSnapshot {
-                        session: self.backend.sessions()?.get(session_id)?,
-                        events,
-                        oldest_sequence: journal
-                            .events
-                            .first()
-                            .map_or(EventSequence::default(), |event| event.sequence),
-                        latest_sequence: journal.next_sequence,
-                    });
+                if let Some(session_id) = session_id {
+                    let durable_cursor = self.feed_session_cursor(session_id)?;
+                    let cursor_stale = stream_epoch_changed
+                        || match (durable_cursor, after_sequence) {
+                            (Some(cursor), Some(after)) => {
+                                after < cursor.pruned_through
+                                    || after > cursor.latest_sequence
+                                        && journal.is_cursor_stale(Some(session_id), after_sequence)
+                            }
+                            (None, _) => journal.is_cursor_stale(Some(session_id), after_sequence),
+                            (_, None) => false,
+                        };
+                    if cursor_stale || history_missing {
+                        let oldest_sequence = durable_cursor
+                            .and_then(|cursor| cursor.oldest_retained_sequence)
+                            .or_else(|| journal.oldest_sequence(Some(session_id)))
+                            .or_else(|| {
+                                durable_cursor
+                                    .filter(|cursor| cursor.pruned_through.value() > 0)
+                                    .map(|cursor| cursor.pruned_through.next())
+                            })
+                            .unwrap_or_else(|| {
+                                session_latest_sequence
+                                    .unwrap_or(journal.next_sequence)
+                                    .next()
+                            });
+                        return Ok(ServerResponse::SessionEventsSnapshot {
+                            session: self.backend.sessions()?.get(session_id)?,
+                            events,
+                            oldest_sequence,
+                            latest_sequence: session_latest_sequence
+                                .unwrap_or(journal.next_sequence),
+                            stream_epoch: current_stream_epoch,
+                        });
+                    }
                 }
-                Ok(ServerResponse::SessionEvents { events })
+                Ok(ServerResponse::SessionEvents {
+                    events,
+                    stream_epoch: session_id.map(|_| self.backend.node_id.clone()),
+                })
             }
             ClientRequest::GetRecentSessionEvents { session_id, limit } => {
-                let journal = self.backend.journal()?;
                 Ok(ServerResponse::SessionEvents {
-                    events: journal.recent_events(session_id, limit as usize),
+                    events: self.recent_session_events(session_id, limit as usize)?,
+                    stream_epoch: Some(self.backend.node_id.clone()),
                 })
             }
             ClientRequest::StartSessionAgentRun {
@@ -2919,9 +5562,47 @@ impl InProcessConnection {
                     ..Default::default()
                 },
             }),
-            ClientRequest::GetAgentRun { run_id } => Ok(ServerResponse::AgentRun(
-                self.run_handle(run_id)?.snapshot(),
-            )),
+            ClientRequest::GetAgentRun { run_id } => {
+                Ok(ServerResponse::AgentRun(self.run_summary(run_id)?.snapshot))
+            }
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal,
+                limit,
+            } => Ok(ServerResponse::AgentRunMessagePage {
+                run_id,
+                messages: self.run_message_page(run_id, before_ordinal, limit)?,
+            }),
+            ClientRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal,
+                limit,
+            } => {
+                let (messages, next_before, has_older) =
+                    self.run_transcript_page(run_id, before_ordinal, limit)?;
+                Ok(ServerResponse::AgentRunTranscriptPage {
+                    run_id,
+                    messages,
+                    next_before,
+                    has_older,
+                })
+            }
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal,
+                byte_offset,
+                length,
+            } => Ok(ServerResponse::AgentRunMessageContentRange {
+                run_id,
+                message_ordinal,
+                byte_offset,
+                content: self.run_message_content_range(
+                    run_id,
+                    message_ordinal,
+                    byte_offset,
+                    length,
+                )?,
+            }),
             ClientRequest::GetAgentRunSnapshot { run_id } => Ok(ServerResponse::AgentRunSnapshot(
                 self.run_snapshot_projection(run_id)?,
             )),
@@ -2947,21 +5628,29 @@ impl InProcessConnection {
             }
             ClientRequest::ApproveAgentAction {
                 run_id,
+                attempt_id,
+                expected_control_revision,
                 tool_call_id,
-            } => self.continue_run(run_id, |run| run.approve_entry(tool_call_id)),
+            } => self.continue_run(run_id, |run| {
+                run.approve_entry(tool_call_id, attempt_id, expected_control_revision)
+            }),
             ClientRequest::RejectAgentAction {
                 run_id,
+                attempt_id,
+                expected_control_revision,
                 tool_call_id,
                 reason,
             } => self.continue_run(run_id, |run| {
-                run.reject(tool_call_id, reason).map(|events| RunProgress {
-                    events,
-                    continues: false,
-                })
+                run.reject_entry(tool_call_id, reason, attempt_id, expected_control_revision)
             }),
-            ClientRequest::SendAgentMessage { run_id, message } => {
-                self.continue_run(run_id, |run| run.message_entry(message))
-            }
+            ClientRequest::SendAgentMessage {
+                run_id,
+                attempt_id,
+                expected_control_revision,
+                message,
+            } => self.continue_run(run_id, |run| {
+                run.message_entry_at_revision(message, attempt_id, expected_control_revision)
+            }),
             ClientRequest::InterruptAgentRun { run_id } => {
                 self.stop_run(run_id, RunStop::Interrupt)
             }
@@ -3081,7 +5770,7 @@ impl InProcessConnection {
                 let mut journal = self.backend.journal()?;
                 for event in history {
                     let sequence = journal.next();
-                    journal.events.push(ServerEventEnvelope {
+                    journal.append_event(ServerEventEnvelope {
                         protocol_version: event.protocol_version,
                         sequence,
                         session_id: target_id,
@@ -3113,36 +5802,42 @@ impl InProcessConnection {
                 self.backend.providers.check_health(&provider_id)?,
             )),
             ClientRequest::GetRunUsage { run_id } => {
-                let state = self.run_handle(run_id)?.state();
+                let summary = self.run_summary(run_id)?;
                 let provider = self
                     .backend
                     .providers
                     .usage()?
-                    .summary(None, Some(&state.run.model));
+                    .summary(None, Some(&summary.snapshot.model));
                 Ok(ServerResponse::RunUsage {
-                    usage: state.usage,
+                    usage: summary.usage,
                     provider,
                 })
             }
             ClientRequest::GetSessionUsage { session_id } => {
                 self.backend.sessions()?.get(session_id)?;
-                let usage = self
+                let loaded_ids = {
+                    let runs = self.backend.runs()?;
+                    runs.iter()
+                        .filter(|(_, handle)| handle.session_id == session_id)
+                        .map(|(run_id, _)| *run_id)
+                        .collect::<BTreeSet<_>>()
+                };
+                let mut usage = self
                     .backend
-                    .runs()?
-                    .values()
-                    .filter(|handle| handle.session_id == session_id)
-                    .fold(loom_core::UsageSnapshot::default(), |mut total, handle| {
-                        let current = handle.state().usage;
-                        total.add_tokens(
-                            current.input_tokens,
-                            current.output_tokens,
-                            current.cached_input_tokens,
-                        );
-                        total.tool_calls = total.tool_calls.saturating_add(current.tool_calls);
-                        total.cost_micros = total.cost_micros.saturating_add(current.cost_micros);
-                        total.elapsed_ms = total.elapsed_ms.max(current.elapsed_ms);
-                        total
-                    });
+                    .persistence
+                    .as_ref()
+                    .map(|persistence| persistence.load_session_usage(session_id, &loaded_ids))
+                    .transpose()?
+                    .unwrap_or_default();
+                {
+                    let runs = self.backend.runs()?;
+                    for handle in runs
+                        .values()
+                        .filter(|handle| handle.session_id == session_id)
+                    {
+                        add_usage(&mut usage, &handle.state().usage);
+                    }
+                }
                 Ok(ServerResponse::SessionUsage {
                     usage,
                     provider: self.backend.providers.usage()?.summary(None, None),
@@ -3178,11 +5873,25 @@ impl InProcessConnection {
                 session_id,
                 after_sequence,
             } => {
-                let mut changes = self
-                    .session_filesystem(session_id)?
-                    .changes_since(after_sequence)?;
-                let truncated = changes.len() > MAX_REVIEW_CHANGES;
-                if truncated {
+                let filesystem = self.session_filesystem(session_id)?;
+                if let Some(persistence) = &self.backend.persistence {
+                    let new_changes = filesystem.poll_changes()?;
+                    let next_sequence = filesystem.state()?.next_sequence;
+                    persistence.save_filesystem_changes(session_id, next_sequence, &new_changes)?;
+                    let page = persistence.load_filesystem_changes_page(
+                        session_id,
+                        after_sequence,
+                        MAX_REVIEW_CHANGES,
+                    )?;
+                    return Ok(ServerResponse::SessionFilesystemChanges {
+                        changes: page.changes,
+                        truncated: page.truncated,
+                    });
+                }
+                let mut changes = filesystem.changes_since(after_sequence)?;
+                let history_pruned = filesystem_history_pruned(after_sequence, &changes);
+                let truncated = history_pruned || changes.len() > MAX_REVIEW_CHANGES;
+                if changes.len() > MAX_REVIEW_CHANGES {
                     changes = changes.split_off(changes.len() - MAX_REVIEW_CHANGES);
                 }
                 Ok(ServerResponse::SessionFilesystemChanges {
@@ -3657,6 +6366,12 @@ impl InProcessConnection {
             | ClientRequest::GetAgentSessionSnapshot {
                 session_id: requested_session,
             }
+            | ClientRequest::GetAgentSessionSnapshotMetadata {
+                session_id: requested_session,
+            }
+            | ClientRequest::GetAgentSessionInitialState {
+                session_id: requested_session,
+            }
             | ClientRequest::RenameAgentSession {
                 session_id: requested_session,
                 ..
@@ -3673,8 +6388,13 @@ impl InProcessConnection {
             } => session_id = Some(*requested_session),
             ClientRequest::GetSessionEvents {
                 session_id: requested_session,
+                workspace_id: None,
                 ..
             } => session_id = *requested_session,
+            ClientRequest::GetSessionEvents {
+                workspace_id: Some(requested_workspace),
+                ..
+            } => workspace_id = Some(*requested_workspace),
             ClientRequest::GetRecentSessionEvents {
                 session_id: requested_session,
                 ..
@@ -3812,6 +6532,18 @@ impl InProcessConnection {
             ClientRequest::GetAgentRun {
                 run_id: requested_run,
             }
+            | ClientRequest::GetAgentRunMessagePage {
+                run_id: requested_run,
+                ..
+            }
+            | ClientRequest::GetAgentRunTranscriptPage {
+                run_id: requested_run,
+                ..
+            }
+            | ClientRequest::GetAgentRunMessageContentRange {
+                run_id: requested_run,
+                ..
+            }
             | ClientRequest::GetAgentRunSnapshot {
                 run_id: requested_run,
             }
@@ -3909,6 +6641,7 @@ impl InProcessConnection {
                 request,
                 ClientRequest::GetSessionEvents {
                     session_id: None,
+                    workspace_id: None,
                     ..
                 }
             )
@@ -3922,12 +6655,7 @@ impl InProcessConnection {
         }
 
         if let Some(run_id) = run_id {
-            let session_id = self
-                .backend
-                .runs()?
-                .get(&run_id)
-                .ok_or_else(|| LoomError::not_found("agent run", run_id))?
-                .session_id;
+            let session_id = self.run_summary(run_id)?.snapshot.session_id;
             if !auth.scope().allows_session(session_id) {
                 return Err(unauthorized_session(session_id));
             }
@@ -4006,8 +6734,9 @@ impl InProcessConnection {
             handle.refresh(&runtime);
             progress?
         };
+        self.backend.persist_state()?;
         if progress.continues {
-            self.backend.spawn_run_worker(Arc::clone(&handle));
+            self.backend.spawn_run_worker(Arc::clone(&handle))?;
         }
         Ok(ServerResponse::AgentRunStarted(handle.snapshot()))
     }
@@ -4026,8 +6755,12 @@ impl InProcessConnection {
             handle.refresh(&runtime);
             progress?
         };
+        if let Err(error) = self.backend.persist_state() {
+            handle.record_failure(error.clone());
+            return Err(error);
+        }
         if progress.continues {
-            self.backend.spawn_run_worker(Arc::clone(&handle));
+            self.backend.spawn_run_worker(Arc::clone(&handle))?;
         }
         Ok(ServerResponse::AgentRun(handle.snapshot()))
     }
@@ -4178,7 +6911,30 @@ fn bounded_review_text(value: &str, limit: usize) -> String {
 }
 
 fn run_snapshot_projection(state: &AgentRuntimeState) -> AgentRunSnapshotProjection {
-    let mut messages = state.messages.clone();
+    run_snapshot_projection_with_messages(state, true)
+}
+
+fn bounded_transcript_content(bytes: &[u8], content_bytes: u64) -> (String, bool) {
+    let content_truncated = content_bytes > u64::from(MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES);
+    let mut content = String::from_utf8_lossy(bytes).into_owned();
+    if content_truncated {
+        if content.ends_with('\u{fffd}') {
+            content.pop();
+        }
+        content.push_str("\n...[message truncated]");
+    }
+    (content, content_truncated)
+}
+
+fn run_snapshot_projection_with_messages(
+    state: &AgentRuntimeState,
+    include_messages: bool,
+) -> AgentRunSnapshotProjection {
+    let mut messages = if include_messages {
+        state.messages.clone()
+    } else {
+        Vec::new()
+    };
     for message in &mut messages {
         message.content = bounded_review_text(&message.content, MAX_RUN_MESSAGE_BYTES);
     }
@@ -4195,6 +6951,17 @@ fn run_snapshot_projection(state: &AgentRuntimeState) -> AgentRunSnapshotProject
         usage: state.usage.clone(),
         activities: state.activities.clone(),
     }
+}
+
+fn add_usage(total: &mut UsageSnapshot, current: &UsageSnapshot) {
+    total.add_tokens(
+        current.input_tokens,
+        current.output_tokens,
+        current.cached_input_tokens,
+    );
+    total.tool_calls = total.tool_calls.saturating_add(current.tool_calls);
+    total.cost_micros = total.cost_micros.saturating_add(current.cost_micros);
+    total.elapsed_ms = total.elapsed_ms.max(current.elapsed_ms);
 }
 
 fn unauthorized_session(session_id: AgentSessionId) -> LoomError {
@@ -4235,15 +7002,268 @@ mod tests {
     };
 
     use loom_context::ContextAssemblyOptions;
-    use loom_core::{AgentSessionId, CapabilitySet, PolicyDecision, ToolCallId, WorkspaceId};
+    use loom_core::{
+        AgentSessionId, Capability, CapabilitySet, EventSequence, PolicyDecision, ProtocolVersion,
+        ToolCallId, WorkspaceId,
+    };
     use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
     use loom_protocol::{
-        AgentActivityStatus, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
-        WorkerNodeConfig, WorkspaceConfig,
+        AgentActivityStatus, AgentInteractionStatus, ApprovalDecision, ClientRequest,
+        RequestEnvelope, ServerEvent, ServerResponse, WorkerNodeConfig, WorkspaceConfig,
     };
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
     use super::*;
+
+    #[test]
+    fn worker_feed_pruning_threshold_catches_large_payloads_before_count_limit() {
+        assert!(!should_prune_worker_feed(
+            10,
+            0,
+            0,
+            FEED_PRUNE_AFTER_NEW_BYTES - 1
+        ));
+        assert!(should_prune_worker_feed(
+            10,
+            0,
+            0,
+            FEED_PRUNE_AFTER_NEW_BYTES
+        ));
+        assert!(should_prune_worker_feed(
+            64,
+            0,
+            0,
+            FEED_PRUNE_AFTER_NEW_BYTES - 1
+        ));
+        assert!(should_prune_worker_feed(
+            10,
+            0,
+            FEED_PRUNE_AFTER_NEW_BYTES / 2,
+            FEED_PRUNE_AFTER_NEW_BYTES / 2
+        ));
+    }
+
+    fn request_id_with_issued_at(issued_at_ms: u64) -> loom_core::RequestId {
+        let mut bytes = *loom_core::RequestId::new().as_uuid().as_bytes();
+        bytes[..6].copy_from_slice(&issued_at_ms.to_be_bytes()[2..]);
+        loom_core::RequestId::from_uuid(uuid::Uuid::from_bytes(bytes))
+    }
+
+    #[test]
+    fn idempotency_cache_keeps_uuidv7_horizon_and_bounds_uuidv4_compatibility() {
+        let now = Timestamp::now();
+        let mut current = BTreeMap::new();
+        for _ in 0..LEGACY_IDEMPOTENCY_RETENTION + 1 {
+            let request_id = RequestId::new();
+            current.insert(
+                request_id,
+                IdempotencyRecord {
+                    created_at: now,
+                    expires_at: request_id.issued_at_unix_millis().map(|issued_at| {
+                        Timestamp::from_unix_millis(
+                            issued_at + IDEMPOTENCY_RETENTION.as_millis() as u64,
+                        )
+                    }),
+                    request: ClientRequest::ListWorkspaces,
+                    response: ResponseEnvelope::success(
+                        request_id,
+                        ServerResponse::WorkspaceConfigUpdated,
+                    ),
+                },
+            );
+        }
+        let expired_id = request_id_with_issued_at(
+            now.as_unix_millis()
+                .saturating_sub(IDEMPOTENCY_RETENTION.as_millis() as u64)
+                .saturating_sub(1),
+        );
+        current.insert(
+            expired_id,
+            IdempotencyRecord {
+                created_at: now,
+                expires_at: Some(now),
+                request: ClientRequest::ListWorkspaces,
+                response: ResponseEnvelope::success(
+                    expired_id,
+                    ServerResponse::WorkspaceConfigUpdated,
+                ),
+            },
+        );
+        trim_idempotency_cache(&mut current);
+        assert_eq!(current.len(), LEGACY_IDEMPOTENCY_RETENTION + 1);
+        assert!(!current.contains_key(&expired_id));
+
+        let mut legacy = BTreeMap::new();
+        for _ in 0..LEGACY_IDEMPOTENCY_RETENTION + 1 {
+            let request_id = RequestId::from_uuid(uuid::Uuid::new_v4());
+            legacy.insert(
+                request_id,
+                IdempotencyRecord {
+                    created_at: now,
+                    expires_at: None,
+                    request: ClientRequest::ListWorkspaces,
+                    response: ResponseEnvelope::success(
+                        request_id,
+                        ServerResponse::WorkspaceConfigUpdated,
+                    ),
+                },
+            );
+        }
+        trim_idempotency_cache(&mut legacy);
+        assert_eq!(legacy.len(), LEGACY_IDEMPOTENCY_RETENTION);
+    }
+
+    #[test]
+    fn resumable_runs_without_pending_tool_intent_are_deferred_on_restore() {
+        for state in [
+            AgentRunState::Planning,
+            AgentRunState::Executing,
+            AgentRunState::Evaluating,
+            AgentRunState::AwaitingApproval,
+            AgentRunState::NeedsInput,
+            AgentRunState::Paused,
+        ] {
+            assert!(run_can_be_deferred_during_restore(state, Some(false)));
+            assert!(!run_can_be_deferred_during_restore(state, Some(true)));
+            assert!(!run_can_be_deferred_during_restore(state, None));
+        }
+        for state in [
+            AgentRunState::Completed,
+            AgentRunState::Failed,
+            AgentRunState::Cancelled,
+        ] {
+            assert!(!run_can_be_deferred_during_restore(state, Some(false)));
+        }
+    }
+
+    #[test]
+    fn filesystem_change_response_detects_pruned_client_cursors() {
+        let session_id = AgentSessionId::new();
+        let changes = vec![SessionFilesystemChange {
+            sequence: EventSequence::new(5),
+            session_id,
+            path: "src/main.rs".to_owned(),
+            kind: loom_protocol::WorkspaceChangeKind::Modified,
+            revision: Some("revision".to_owned()),
+        }];
+        assert!(filesystem_history_pruned(
+            Some(EventSequence::new(1)),
+            &changes
+        ));
+        assert!(!filesystem_history_pruned(
+            Some(EventSequence::new(4)),
+            &changes
+        ));
+        assert!(!filesystem_history_pruned(None, &changes));
+    }
+
+    #[test]
+    fn event_journal_retention_is_independent_per_session() {
+        let first_session = AgentSessionId::new();
+        let second_session = AgentSessionId::new();
+        let mut journal = EventJournal::default();
+        journal.set_retention(2);
+        for (session_id, name) in [
+            (first_session, "first-1"),
+            (second_session, "second-1"),
+            (first_session, "first-2"),
+            (first_session, "first-3"),
+        ] {
+            journal.append_session(SessionEventRecord {
+                sequence: EventSequence::default(),
+                session_id,
+                occurred_at: Timestamp::from_unix_millis(1),
+                event: loom_core::SessionEvent::AgentSessionRenamed {
+                    session_id,
+                    name: name.to_owned(),
+                },
+            });
+        }
+
+        assert_eq!(journal.latest_sequence(None), Some(EventSequence::new(4)));
+        assert_eq!(
+            journal
+                .events_since(Some(first_session), None)
+                .iter()
+                .map(|event| event.sequence.value())
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(
+            journal
+                .events_since(Some(second_session), None)
+                .iter()
+                .map(|event| event.sequence.value())
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(journal.pending_events.len(), 3);
+        assert_eq!(
+            journal
+                .pending_events
+                .iter()
+                .filter(|event| event.session_id == first_session)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn worker_feed_capture_and_acknowledgement_are_session_scoped() {
+        let run_session = AgentSessionId::new();
+        let other_session = AgentSessionId::new();
+        let workspace_id = WorkspaceId::new();
+        let mut journal = EventJournal::default();
+        for (session_id, name) in [(run_session, "run"), (other_session, "other")] {
+            journal.append_session(SessionEventRecord {
+                sequence: EventSequence::default(),
+                session_id,
+                occurred_at: Timestamp::from_unix_millis(1),
+                event: loom_core::SessionEvent::AgentSessionRenamed {
+                    session_id,
+                    name: name.to_owned(),
+                },
+            });
+        }
+        journal.append_workspace(
+            workspace_id,
+            WorkspaceEvent::Renamed {
+                name: "workspace".to_owned(),
+            },
+        );
+
+        let (captured_feed, captured_sequences) = journal.capture_session_feed(run_session);
+        assert_eq!(captured_feed.events.len(), 1);
+        assert_eq!(captured_feed.events[0].session_id, run_session);
+        assert!(captured_feed.workspace_events.is_empty());
+
+        // Capture is non-mutating; a failed persistence call can retry the
+        // same capture because acknowledgement is a separate post-commit step.
+        assert_eq!(journal.pending_events.len(), 2);
+        assert!(
+            journal
+                .pending_events
+                .iter()
+                .any(|event| event.session_id == run_session)
+        );
+        assert!(
+            journal
+                .pending_events
+                .iter()
+                .any(|event| event.session_id == other_session)
+        );
+        assert_eq!(journal.pending_workspace_events.len(), 1);
+
+        // After commit, only the captured session sequences are acknowledged.
+        journal.acknowledge_session_feed(&captured_sequences);
+        assert_eq!(journal.pending_events.len(), 1);
+        assert_eq!(journal.pending_events[0].session_id, other_session);
+        assert_eq!(journal.pending_workspace_events.len(), 1);
+        assert_eq!(
+            journal.pending_workspace_events[0].workspace_id,
+            workspace_id
+        );
+    }
 
     fn negotiate(connection: &InProcessConnection) {
         let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
@@ -4657,6 +7677,7 @@ mod tests {
                 response.result,
                 Ok(ServerResponse::WorkspaceConfigUpdated)
             ));
+            backend.shutdown().unwrap();
         }
 
         {
@@ -4711,6 +7732,7 @@ mod tests {
                 ));
                 assert!(response.result.is_err());
             }
+            backend.shutdown().unwrap();
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -4721,12 +7743,14 @@ mod tests {
         connection: &InProcessConnection,
         run_id: loom_core::RunId,
     ) -> loom_agent::AgentRunSnapshot {
+        let mut last_snapshot = None;
         for _ in 0..1_000 {
             let response =
                 connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
             let Ok(ServerResponse::AgentRun(snapshot)) = response.result else {
                 panic!("unexpected run response");
             };
+            last_snapshot = Some(snapshot.clone());
             if !matches!(
                 snapshot.state,
                 AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
@@ -4735,7 +7759,13 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        panic!("agent run did not settle");
+        let failure = connection
+            .backend
+            .runs()
+            .ok()
+            .and_then(|runs| runs.get(&run_id).cloned())
+            .and_then(|handle| handle.failure());
+        panic!("agent run did not settle: {last_snapshot:?}; failure: {failure:?}");
     }
 
     fn workspace() -> PathBuf {
@@ -5027,7 +8057,7 @@ mod tests {
         let source = git_repository();
         let state_dir = workspace();
         let persistence = state_dir.join("backend.sqlite");
-        let (workspace_id, session_id) = {
+        let (workspace_id, session_id, checkpoint_id) = {
             let backend = InProcessBackend::new_persistent(&persistence).unwrap();
             let connection = backend.connect();
             let capabilities = CapabilitySet::new([
@@ -5036,6 +8066,7 @@ mod tests {
                 Capability::CreateAgentSession,
                 Capability::ReadSessionFilesystem,
                 Capability::WriteSessionFilesystem,
+                Capability::ManageCheckpoints,
                 Capability::ManageSessionRepositories,
                 Capability::ReadVcsStatus,
             ]);
@@ -5079,22 +8110,56 @@ mod tests {
                 "{:?}",
                 attached.result
             );
-            let edit = connection.request(RequestEnvelope::new(
-                ClientRequest::ApplySessionFilesystemEdit {
+            let checkpoint = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateSessionCheckpoint {
                     session_id: session.id,
-                    edit: WorkspaceEdit {
-                        path: "repo/README.md".to_owned(),
-                        old_text: "source".to_owned(),
-                        new_text: "persisted session edit".to_owned(),
-                        expected_revision: None,
-                    },
+                    label: "before persistent edit".to_owned(),
                 },
             ));
-            assert!(matches!(
-                edit.result,
-                Ok(ServerResponse::WorkspaceEditApplied(_))
-            ));
-            (workspace.id, session.id)
+            let Ok(ServerResponse::CheckpointCreated(checkpoint)) = checkpoint.result else {
+                panic!("expected persisted checkpoint, got {:?}", checkpoint.result);
+            };
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&session.id)
+                .unwrap()
+                .apply_edit(WorkspaceEdit {
+                    path: "repo/README.md".to_owned(),
+                    old_text: "source".to_owned(),
+                    new_text: "persisted session edit".to_owned(),
+                    expected_revision: None,
+                })
+                .unwrap();
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&session.id)
+                .unwrap()
+                .apply_edit(WorkspaceEdit {
+                    path: "repo/README.md".to_owned(),
+                    old_text: "persisted session edit".to_owned(),
+                    new_text: "temporary edit to undo".to_owned(),
+                    expected_revision: None,
+                })
+                .unwrap();
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&session.id)
+                .unwrap()
+                .undo_last_agent_edit()
+                .unwrap();
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&session.id)
+                .unwrap()
+                .poll_changes()
+                .unwrap();
+            backend.flush().unwrap();
+            backend.shutdown().unwrap();
+            (workspace.id, session.id, checkpoint.id)
         };
 
         {
@@ -5103,6 +8168,8 @@ mod tests {
             let capabilities = CapabilitySet::new([
                 Capability::ReadAgentSession,
                 Capability::ReadSessionFilesystem,
+                Capability::WriteSessionFilesystem,
+                Capability::ManageCheckpoints,
                 Capability::ReadVcsStatus,
             ]);
             let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
@@ -5131,6 +8198,36 @@ mod tests {
                 panic!("expected restored repository metadata");
             };
             let repository = repositories.first().expect("repository was restored");
+            let persisted_filesystem = backend
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_filesystem_record(session_id)
+                .unwrap()
+                .expect("filesystem record remains inspectable");
+            assert!(persisted_filesystem.edits.iter().any(|edit| {
+                edit.path == "repo/README.md" && edit.before.as_deref() == Some("source\n")
+            }));
+            assert_eq!(
+                persisted_filesystem.edits.len(),
+                1,
+                "undone edit ID is deleted from durable history"
+            );
+            assert!(
+                backend
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_filesystem_changes_page(session_id, None, 512)
+                    .unwrap()
+                    .changes
+                    .iter()
+                    .any(|change| {
+                        change.path == "repo/README.md"
+                            && change.session_id == session_id
+                            && change.sequence.value() > 0
+                    })
+            );
             let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
                 session_id,
                 path: "repo/README.md".to_owned(),
@@ -5139,6 +8236,30 @@ mod tests {
                 panic!("expected restored session file");
             };
             assert_eq!(file.content, "persisted session edit\n");
+            assert_eq!(
+                persisted_filesystem.checkpoints[0].files["repo/README.md"].expected_revision,
+                file.revision
+            );
+            let reverted = connection.request(RequestEnvelope::new(
+                ClientRequest::RevertSessionCheckpoint {
+                    session_id,
+                    checkpoint_id,
+                },
+            ));
+            assert!(
+                matches!(reverted.result, Ok(ServerResponse::CheckpointReverted(_))),
+                "checkpoint revert failed: {:?}",
+                reverted.result
+            );
+            let restored =
+                connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+                    session_id,
+                    path: "repo/README.md".to_owned(),
+                }));
+            let Ok(ServerResponse::SessionFilesystemFile(restored)) = restored.result else {
+                panic!("expected checkpoint file contents after revert");
+            };
+            assert_eq!(restored.content, "source\n");
             let status =
                 connection.request(RequestEnvelope::new(ClientRequest::GetSessionVcsStatus {
                     session_id,
@@ -5147,12 +8268,306 @@ mod tests {
             let Ok(ServerResponse::VcsStatus(status)) = status.result else {
                 panic!("expected restored repository status");
             };
-            assert!(!status.clean);
+            assert!(status.clean);
+            backend.shutdown().unwrap();
         }
 
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(persistence.with_extension("session-roots")).unwrap();
         fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() {
+        let source = git_repository();
+        let state_dir = workspace();
+        let persistence = state_dir.join("backend.sqlite");
+        let (workspace_id, source_session_id, fork_session_id, checkpoint_id) = {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let connection = backend.connect();
+            negotiate_m5(&connection);
+            let created =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Persistent fork workspace".to_owned(),
+                }));
+            let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+                panic!("expected workspace creation");
+            };
+            let created = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Persistent source".to_owned(),
+                },
+            ));
+            let Ok(ServerResponse::AgentSessionCreated(session)) = created.result else {
+                panic!("expected source session creation");
+            };
+            let policy = ApprovalPolicy::auto_approve();
+            let configured = connection.request(RequestEnvelope::new(
+                ClientRequest::SetSessionApprovalPolicy {
+                    session_id: session.id,
+                    policy: policy.clone(),
+                    auto_approve_actions: Some(true),
+                },
+            ));
+            assert!(matches!(
+                configured.result,
+                Ok(ServerResponse::ApprovalPolicy(configured)) if configured == policy
+            ));
+            let attached = connection.request(RequestEnvelope::new(
+                ClientRequest::AttachSessionRepository {
+                    session_id: session.id,
+                    source: source.display().to_string(),
+                    path: "repo".to_owned(),
+                    revision: None,
+                },
+            ));
+            assert!(matches!(
+                attached.result,
+                Ok(ServerResponse::SessionRepositoryAttached(_))
+            ));
+            let edited = connection.request(RequestEnvelope::new(
+                ClientRequest::ApplySessionFilesystemEdit {
+                    session_id: session.id,
+                    edit: WorkspaceEdit {
+                        path: "repo/README.md".to_owned(),
+                        old_text: "source".to_owned(),
+                        new_text: "source branch".to_owned(),
+                        expected_revision: None,
+                    },
+                },
+            ));
+            assert!(matches!(
+                edited.result,
+                Ok(ServerResponse::WorkspaceEditApplied(_))
+            ));
+            let forked =
+                connection.request(RequestEnvelope::new(ClientRequest::ForkAgentSession {
+                    session_id: session.id,
+                    name: "Persistent fork".to_owned(),
+                }));
+            let Ok(ServerResponse::AgentSessionForked(forked)) = forked.result else {
+                panic!("expected fork creation: {:?}", forked.result);
+            };
+            let checkpoint = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateSessionCheckpoint {
+                    session_id: forked.id,
+                    label: "fork baseline".to_owned(),
+                },
+            ));
+            let Ok(ServerResponse::CheckpointCreated(checkpoint)) = checkpoint.result else {
+                panic!("expected fork checkpoint: {:?}", checkpoint.result);
+            };
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&forked.id)
+                .unwrap()
+                .apply_edit(WorkspaceEdit {
+                    path: "repo/README.md".to_owned(),
+                    old_text: "source branch".to_owned(),
+                    new_text: "fork-only change".to_owned(),
+                    expected_revision: None,
+                })
+                .unwrap();
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&forked.id)
+                .unwrap()
+                .poll_changes()
+                .unwrap();
+            backend.flush().unwrap();
+            backend.shutdown().unwrap();
+            (workspace.id, session.id, forked.id, checkpoint.id)
+        };
+
+        {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let connection = backend.connect();
+            negotiate_m5(&connection);
+            let sessions =
+                connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+                    workspace_id,
+                    include_archived: false,
+                }));
+            let Ok(ServerResponse::AgentSessions { sessions }) = sessions.result else {
+                panic!("expected restored sessions");
+            };
+            assert!(
+                sessions
+                    .iter()
+                    .any(|session| session.id == source_session_id)
+            );
+            assert!(sessions.iter().any(|session| session.id == fork_session_id));
+
+            let snapshot = connection.request(RequestEnvelope::new(
+                ClientRequest::GetAgentSessionSnapshot {
+                    session_id: fork_session_id,
+                },
+            ));
+            let Ok(ServerResponse::AgentSessionSnapshot(snapshot)) = snapshot.result else {
+                panic!("expected restored fork snapshot");
+            };
+            assert!(snapshot.auto_approve_actions);
+            assert_eq!(snapshot.approval_policy, ApprovalPolicy::auto_approve());
+
+            let source_repositories = connection.request(RequestEnvelope::new(
+                ClientRequest::ListSessionRepositories {
+                    session_id: source_session_id,
+                },
+            ));
+            let Ok(ServerResponse::SessionRepositories {
+                repositories: source_repositories,
+            }) = source_repositories.result
+            else {
+                panic!("expected restored source repository metadata");
+            };
+            let fork_repositories = connection.request(RequestEnvelope::new(
+                ClientRequest::ListSessionRepositories {
+                    session_id: fork_session_id,
+                },
+            ));
+            let Ok(ServerResponse::SessionRepositories {
+                repositories: fork_repositories,
+            }) = fork_repositories.result
+            else {
+                panic!("expected restored fork repository metadata");
+            };
+            assert_ne!(
+                source_repositories.first().unwrap().id,
+                fork_repositories.first().unwrap().id
+            );
+
+            let read_file = |session_id| {
+                let response =
+                    connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+                        session_id,
+                        path: "repo/README.md".to_owned(),
+                    }));
+                let Ok(ServerResponse::SessionFilesystemFile(file)) = response.result else {
+                    panic!("expected restored session file: {:?}", response.result);
+                };
+                file.content
+            };
+            assert_eq!(read_file(source_session_id), "source branch\n");
+            assert_eq!(read_file(fork_session_id), "fork-only change\n");
+
+            let events =
+                connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: Some(fork_session_id),
+                    workspace_id: None,
+                    after_sequence: None,
+                    stream_epoch: None,
+                }));
+            let Ok(ServerResponse::SessionEvents { events, .. }) = events.result else {
+                panic!("expected restored fork event stream");
+            };
+            assert!(events.iter().any(|event| {
+                matches!(
+                    &event.event,
+                    loom_protocol::ServerEvent::AgentSessionForked {
+                        source_session_id: source_id,
+                        snapshot,
+                    } if *source_id == source_session_id && snapshot.id == fork_session_id
+                )
+            }));
+
+            let reverted = connection.request(RequestEnvelope::new(
+                ClientRequest::RevertSessionCheckpoint {
+                    session_id: fork_session_id,
+                    checkpoint_id,
+                },
+            ));
+            assert!(
+                matches!(reverted.result, Ok(ServerResponse::CheckpointReverted(_))),
+                "fork checkpoint revert failed: {:?}",
+                reverted.result
+            );
+            assert_eq!(read_file(fork_session_id), "source branch\n");
+            assert_eq!(read_file(source_session_id), "source branch\n");
+            backend.shutdown().unwrap();
+        }
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(persistence.with_extension("session-roots")).unwrap();
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn persisted_session_filesystems_restore_lazily_and_survive_unrelated_writes() {
+        let persistence =
+            std::env::temp_dir().join(format!("loom-server-state-{}.db", WorkspaceId::new()));
+        let session_root_base;
+        let (workspace_id, session_id) = {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            session_root_base = backend.session_root_base.clone();
+            let connection = backend.connect();
+            negotiate_m3(&connection);
+            let workspace =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Lazy restore workspace".to_owned(),
+                }));
+            let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            let session = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Archived history".to_owned(),
+                },
+            ));
+            let ServerResponse::AgentSessionCreated(session) = session.result.unwrap() else {
+                panic!("unexpected session response");
+            };
+            let root = session_root_base
+                .join(workspace.id.to_string())
+                .join(session.id.to_string())
+                .join("fs");
+            fs::write(root.join("retained.txt"), "retained content\n").unwrap();
+            backend.flush().unwrap();
+            backend.shutdown().unwrap();
+            (workspace.id, session.id)
+        };
+
+        let filesystem_root = session_root_base
+            .join(workspace_id.to_string())
+            .join(session_id.to_string())
+            .join("fs");
+        let parked_root = filesystem_root.with_extension("parked");
+        fs::rename(&filesystem_root, &parked_root).unwrap();
+        {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let connection = backend.connect();
+            negotiate_m3(&connection);
+            let renamed =
+                connection.request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                    session_id,
+                    name: "Still lazy".to_owned(),
+                }));
+            assert!(matches!(
+                renamed.result,
+                Ok(ServerResponse::AgentSessionRenamed(_))
+            ));
+            backend.shutdown().unwrap();
+        }
+        fs::rename(&parked_root, &filesystem_root).unwrap();
+        {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let connection = backend.connect();
+            negotiate_m3(&connection);
+            let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+                session_id,
+                path: "retained.txt".to_owned(),
+            }));
+            let ServerResponse::SessionFilesystemFile(file) = file.result.unwrap() else {
+                panic!("unexpected filesystem response");
+            };
+            assert_eq!(file.content, "retained content\n");
+            backend.shutdown().unwrap();
+            fs::remove_dir_all(&backend.session_root_base).unwrap();
+        }
+        let _ = fs::remove_file(&persistence);
     }
 
     #[test]
@@ -5234,6 +8649,24 @@ mod tests {
         );
         assert!(snapshot.active_run.unwrap().plan.is_empty());
 
+        let metadata = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshotMetadata {
+                session_id: session.id,
+            },
+        ));
+        let ServerResponse::AgentSessionSnapshot(metadata) = metadata.result.unwrap() else {
+            panic!("unexpected metadata snapshot response");
+        };
+        assert_eq!(
+            metadata.active_run.as_ref().map(|run| run.run.id),
+            Some(run_id)
+        );
+        assert!(
+            metadata
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.messages.is_empty())
+        );
         let run = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
             run_id,
         }));
@@ -5300,13 +8733,45 @@ mod tests {
 
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: None,
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
             panic!("unexpected response");
         };
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id, session_id);
+
+        let initial = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionInitialState { session_id },
+        ));
+        let ServerResponse::AgentSessionInitialState(initial) = initial.result.unwrap() else {
+            panic!("unexpected initial state response");
+        };
+        assert_eq!(initial.cursor, events[0].sequence);
+        let renamed = connection.request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+            session_id,
+            name: "Renamed after snapshot".to_owned(),
+        }));
+        assert!(matches!(
+            renamed.result,
+            Ok(ServerResponse::AgentSessionRenamed(_))
+        ));
+        let resumed = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: Some(initial.cursor),
+            stream_epoch: None,
+        }));
+        let ServerResponse::SessionEvents { events, .. } = resumed.result.unwrap() else {
+            panic!("unexpected incremental event response");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event,
+            ServerEvent::AgentSessionRenamed { .. }
+        ));
     }
 
     #[test]
@@ -5372,9 +8837,11 @@ mod tests {
             let response =
                 connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
+                    workspace_id: None,
                     after_sequence: after,
+                    stream_epoch: None,
                 }));
-            let ServerResponse::SessionEvents { events } = response.result.unwrap() else {
+            let ServerResponse::SessionEvents { events, .. } = response.result.unwrap() else {
                 panic!("unexpected response");
             };
             let mut completed = false;
@@ -5384,7 +8851,10 @@ mod tests {
                     event:
                         AgentEvent::ToolApprovalRequired {
                             run_id: event_run,
+                            attempt_id,
+                            control_revision,
                             call,
+                            ..
                         },
                 } = &event.event
                 {
@@ -5392,6 +8862,8 @@ mod tests {
                     let response = connection.request(RequestEnvelope::new(
                         ClientRequest::ApproveAgentAction {
                             run_id,
+                            attempt_id: *attempt_id,
+                            expected_control_revision: *control_revision,
                             tool_call_id: call.id,
                         },
                     ));
@@ -5416,11 +8888,96 @@ mod tests {
             panic!("unexpected response");
         };
         assert_eq!(snapshot.state, AgentRunState::Completed);
+        let page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: 2,
+            },
+        ));
+        let ServerResponse::AgentRunMessagePage { messages, .. } = page.result.unwrap() else {
+            panic!("unexpected run message page response");
+        };
+        let oldest_ordinal = messages.last().unwrap().ordinal;
+        let previous_page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: Some(oldest_ordinal),
+                limit: 1,
+            },
+        ));
+        let ServerResponse::AgentRunMessagePage {
+            messages: previous_messages,
+            ..
+        } = previous_page.result.unwrap()
+        else {
+            panic!("unexpected previous run message page response");
+        };
+        assert!(
+            previous_messages
+                .iter()
+                .all(|message| message.ordinal < oldest_ordinal)
+        );
+        let header = messages
+            .iter()
+            .find(|message| message.content_bytes > 0)
+            .unwrap();
+        let length = header.content_bytes.min(32) as u32;
+        let content = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: header.ordinal,
+                byte_offset: 0,
+                length,
+            },
+        ));
+        let ServerResponse::AgentRunMessageContentRange { content, .. } = content.result.unwrap()
+        else {
+            panic!("unexpected run message content response");
+        };
+        assert_eq!(content.len(), length as usize);
+        let beyond_content = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: header.ordinal,
+                byte_offset: u64::MAX,
+                length: 8,
+            },
+        ));
+        assert!(matches!(
+            beyond_content.result,
+            Ok(ServerResponse::AgentRunMessageContentRange { content, .. }) if content.is_empty()
+        ));
+        let missing_message = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: oldest_ordinal + 1000,
+                byte_offset: 0,
+                length: 8,
+            },
+        ));
+        assert_eq!(
+            missing_message.result.unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        let empty_page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: Some(0),
+                limit: 1,
+            },
+        ));
+        assert!(matches!(
+            empty_page.result,
+            Ok(ServerResponse::AgentRunMessagePage { messages, .. }) if messages.is_empty()
+        ));
         let history = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: None,
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = history.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = history.result.unwrap() else {
             panic!("unexpected history response");
         };
         assert!(events.iter().any(|event| {
@@ -5793,9 +9350,11 @@ mod tests {
         await_settled_run(&connection, run_id);
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: None,
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
             panic!("unexpected session event response");
         };
         assert!(events.iter().any(|event| {
@@ -5823,7 +9382,7 @@ mod tests {
         let persistence =
             std::env::temp_dir().join(format!("loom-server-state-{}.db", WorkspaceId::new()));
         let session_root_base;
-        let (session_id, run_id, approval_id) = {
+        let (session_id, run_id, approval) = {
             let backend = InProcessBackend::new_persistent(&persistence).unwrap();
             session_root_base = backend.session_root_base.clone();
             let connection = backend.connect();
@@ -5852,45 +9411,79 @@ mod tests {
                     auto_approve_actions: Some(false),
                 },
             ));
-            let started =
-                connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+            let started = connection.request(RequestEnvelope::new(
+                ClientRequest::StartSessionAgentRunWithOptions {
                     session_id,
                     task: "create a demo file".to_owned(),
                     model: ModelId::new("deterministic/demo"),
                     system_instructions: Some("Be concise.".to_owned()),
                     repository_instructions: Some("Keep changes focused.".to_owned()),
-                }));
+                    limits: loom_core::SessionLimits {
+                        max_tool_calls: Some(20),
+                        ..Default::default()
+                    },
+                    context: ContextAssemblyOptions {
+                        context_window: Some(8_192),
+                        max_input_tokens: Some(4_096),
+                        reserved_output_tokens: Some(1_024),
+                    },
+                },
+            ));
             let run_id = match started.result.unwrap() {
                 ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
                 response => panic!("unexpected response: {response:?}"),
             };
             await_settled_run(&connection, run_id);
             backend.flush().unwrap();
+            let persisted = FilePersistence::open(&persistence).unwrap();
+            let runtime_config = persisted.load_run_runtime_config(run_id).unwrap().unwrap();
+            assert_eq!(
+                runtime_config.system_instructions.as_deref(),
+                Some("Be concise.")
+            );
+            assert_eq!(
+                runtime_config.repository_instructions.as_deref(),
+                Some("Keep changes focused.")
+            );
+            assert_eq!(runtime_config.context_options.context_window, Some(8_192));
+            assert_eq!(runtime_config.limits.max_tool_calls, Some(20));
             let events = match connection
                 .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
+                    workspace_id: None,
                     after_sequence: None,
+                    stream_epoch: None,
                 }))
                 .result
                 .unwrap()
             {
-                ServerResponse::SessionEvents { events } => events,
+                ServerResponse::SessionEvents { events, .. } => events,
                 response => panic!("unexpected response: {response:?}"),
             };
-            let approval_id = events
+            let approval = events
                 .iter()
                 .find_map(|event| match &event.event {
                     ServerEvent::Agent {
-                        event: AgentEvent::ToolApprovalRequired { call, .. },
-                    } => Some(call.id),
+                        event:
+                            AgentEvent::ToolApprovalRequired {
+                                call,
+                                attempt_id,
+                                control_revision,
+                                ..
+                            },
+                    } => Some((call.id, *attempt_id, *control_revision)),
                     _ => None,
                 })
                 .unwrap();
-            (session_id, run_id, approval_id)
+            backend.shutdown().unwrap();
+            (session_id, run_id, approval)
         };
         assert!(persistence.is_file());
 
         let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+        assert!(backend.journal().unwrap().events.is_empty());
+        assert!(backend.runs().unwrap().is_empty());
+        assert!(backend.persisted_runs().unwrap().contains_key(&run_id));
         let connection = backend.connect();
         negotiate_m3(&connection);
         let recovered_session = connection.request(RequestEnvelope::new(
@@ -5903,12 +9496,57 @@ mod tests {
         };
         assert!(!recovered_session.auto_approve_actions);
         assert_eq!(recovered_session.approval_policy, ApprovalPolicy::default());
+        let detail = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+            run_id,
+        }));
+        let ServerResponse::AgentRunSnapshot(detail) = detail.result.unwrap() else {
+            panic!("unexpected run snapshot response");
+        };
+        assert_eq!(detail.run.id, run_id);
+        assert!(detail.messages.iter().any(|message| {
+            message.role == loom_model::MessageRole::User
+                && message.content.contains("create a demo file")
+        }));
+        assert!(detail.messages.iter().any(|message| {
+            message.role == loom_model::MessageRole::Assistant && !message.tool_calls.is_empty()
+        }));
+        assert!(
+            detail
+                .activities
+                .iter()
+                .any(|activity| { activity.status == AgentActivityStatus::AwaitingApproval })
+        );
+        assert!(backend.runs().unwrap().is_empty());
         let recovered =
             connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
         let ServerResponse::AgentRun(snapshot) = recovered.result.unwrap() else {
             panic!("unexpected run response");
         };
         assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
+        assert_eq!(snapshot.attempt_id, approval.1);
+        assert_eq!(snapshot.control_revision, approval.2);
+        let reconstructed_state = connection.run_handle(run_id).unwrap().state();
+        assert_eq!(
+            reconstructed_state.task.system_instructions.as_deref(),
+            Some("Be concise.")
+        );
+        assert_eq!(
+            reconstructed_state.options.context.context_window,
+            Some(8_192)
+        );
+        assert_eq!(reconstructed_state.options.limits.max_tool_calls, Some(20));
+        let recovered_interactions = backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_interactions(run_id)
+            .unwrap();
+        assert!(recovered_interactions.iter().any(|interaction| {
+            interaction.attempt_id == approval.1
+                && interaction.control_revision == approval.2
+                && interaction.tool_call_id == Some(approval.0)
+                && interaction.status == AgentInteractionStatus::Pending
+        }));
         let recovered_snapshot =
             connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
                 run_id,
@@ -5924,11 +9562,136 @@ mod tests {
                 .iter()
                 .any(|activity| activity.status == AgentActivityStatus::AwaitingApproval)
         );
+        let page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
+            },
+        ));
+        let ServerResponse::AgentRunMessagePage {
+            run_id: page_run_id,
+            messages,
+        } = page.result.unwrap()
+        else {
+            panic!("unexpected run message page response");
+        };
+        assert_eq!(page_run_id, run_id);
+        assert!(!messages.is_empty());
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| pair[0].ordinal > pair[1].ordinal),
+            "message page must be in descending keyset order"
+        );
+        let oversized_page = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE + 1,
+            },
+        ));
+        assert_eq!(
+            oversized_page.result.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let message_header = messages
+            .iter()
+            .find(|message| message.content_bytes > 0)
+            .unwrap();
+        let range = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: message_header.ordinal,
+                byte_offset: 0,
+                length: message_header.content_bytes.min(32) as u32,
+            },
+        ));
+        let ServerResponse::AgentRunMessageContentRange {
+            run_id: range_run_id,
+            message_ordinal,
+            byte_offset,
+            content,
+        } = range.result.unwrap()
+        else {
+            panic!("unexpected run message content response");
+        };
+        assert_eq!(range_run_id, run_id);
+        assert_eq!(message_ordinal, message_header.ordinal);
+        assert_eq!(byte_offset, 0);
+        assert!(!content.is_empty());
+        let expected_content = projection.messages[message_ordinal as usize]
+            .content
+            .as_bytes();
+        assert_eq!(content, expected_content[..content.len()]);
+        let oversized_range = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal,
+                byte_offset: 0,
+                length: MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES + 1,
+            },
+        ));
+        assert_eq!(
+            oversized_range.result.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let legacy_connection = backend.connect();
+        let legacy_negotiation =
+            legacy_connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+                client_version: ProtocolVersion::new(2, 0),
+                capabilities: backend.supported_capabilities.clone(),
+            }));
+        assert_eq!(
+            legacy_negotiation.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
+        let protocol_3_connection = backend.connect();
+        let protocol_3_negotiation =
+            protocol_3_connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+                client_version: ProtocolVersion::new(3, 0),
+                capabilities: backend.supported_capabilities.clone(),
+            }));
+        assert_eq!(
+            protocol_3_negotiation.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
+
+        let capability_limited_connection = backend.connect();
+        let capability_limited = CapabilitySet::new(
+            backend
+                .supported_capabilities
+                .iter()
+                .copied()
+                .filter(|capability| *capability != Capability::ReadAgentRunMessages),
+        );
+        let current_negotiation =
+            capability_limited_connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: capability_limited,
+            }));
+        assert!(matches!(
+            current_negotiation.result,
+            Ok(ServerResponse::Negotiated(_))
+        ));
+        let unsupported_page = capability_limited_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
+            },
+        ));
+        assert_eq!(
+            unsupported_page.result.unwrap_err().code,
+            ErrorCode::CapabilityDenied
+        );
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: None,
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
             panic!("unexpected events response");
         };
         assert!(events.len() >= 5);
@@ -5941,30 +9704,70 @@ mod tests {
         };
         assert_eq!(checkpoint.session_id, session_id);
 
+        let wrong_attempt =
+            connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+                run_id,
+                attempt_id: loom_core::RunAttemptId::new(),
+                expected_control_revision: approval.2,
+                tool_call_id: approval.0,
+            }));
+        assert_eq!(wrong_attempt.result.unwrap_err().code, ErrorCode::Conflict);
+        let stale_revision =
+            connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+                run_id,
+                attempt_id: approval.1,
+                expected_control_revision: approval.2.saturating_sub(1),
+                tool_call_id: approval.0,
+            }));
+        assert_eq!(stale_revision.result.unwrap_err().code, ErrorCode::Conflict);
+
         let response =
             connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                 run_id,
-                tool_call_id: approval_id,
+                attempt_id: approval.1,
+                expected_control_revision: approval.2,
+                tool_call_id: approval.0,
             }));
         assert!(response.result.is_ok());
         await_settled_run(&connection, run_id);
+        let resolved_interactions = backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_interactions(run_id)
+            .unwrap();
+        assert!(resolved_interactions.iter().any(|interaction| {
+            interaction.tool_call_id == Some(approval.0)
+                && interaction.status == AgentInteractionStatus::Approved
+                && interaction.decision == Some(ApprovalDecision::Approved)
+        }));
         let command_approval = (0..1_000)
             .find_map(|_| {
                 let events = match connection
                     .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                         session_id: Some(session_id),
+                        workspace_id: None,
                         after_sequence: None,
+                        stream_epoch: None,
                     }))
                     .result
                     .unwrap()
                 {
-                    ServerResponse::SessionEvents { events } => events,
+                    ServerResponse::SessionEvents { events, .. } => events,
                     response => panic!("unexpected events response: {response:?}"),
                 };
                 let approval = events.iter().find_map(|event| match &event.event {
                     ServerEvent::Agent {
-                        event: AgentEvent::ToolApprovalRequired { call, .. },
-                    } if call.name == "run_command" => Some(call.id),
+                        event:
+                            AgentEvent::ToolApprovalRequired {
+                                call,
+                                attempt_id,
+                                control_revision,
+                                ..
+                            },
+                    } if call.name == "run_command" => {
+                        Some((call.id, *attempt_id, *control_revision))
+                    }
                     _ => None,
                 });
                 approval.or_else(|| {
@@ -5976,7 +9779,9 @@ mod tests {
         let response =
             connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                 run_id,
-                tool_call_id: command_approval,
+                attempt_id: command_approval.1,
+                expected_control_revision: command_approval.2,
+                tool_call_id: command_approval.0,
             }));
         assert!(response.result.is_ok());
         let mut usage = match connection
@@ -6011,7 +9816,16 @@ mod tests {
             filesystem.result,
             Ok(ServerResponse::SessionFilesystemSnapshot(_))
         ));
-        backend.flush().unwrap();
+        backend.shutdown().unwrap();
+        backend.shutdown().unwrap();
+        assert_eq!(
+            connection
+                .request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
         drop(connection);
         drop(backend);
         let reopened = InProcessBackend::new_persistent(&persistence).unwrap();
@@ -6024,19 +9838,331 @@ mod tests {
         };
         assert_eq!(usage.input_tokens, 240);
         assert_eq!(usage.output_tokens, 52);
+        let before_retry = reopened_connection
+            .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+        let ServerResponse::AgentRun(before_retry) = before_retry.result.unwrap() else {
+            panic!("unexpected run response before checkpoint retry");
+        };
+        let prior_attempts = reopened
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_attempts(run_id)
+            .unwrap();
+        assert_eq!(prior_attempts.len(), 1);
+        assert_eq!(prior_attempts[0].id, before_retry.attempt_id);
         let retried = reopened_connection.request(RequestEnvelope::new(
             ClientRequest::RetryAgentFromCheckpoint {
                 run_id,
                 checkpoint_id: checkpoint.id,
             },
         ));
-        assert!(matches!(retried.result, Ok(ServerResponse::AgentRun(_))));
+        let ServerResponse::AgentRun(retried) = retried.result.unwrap() else {
+            panic!("unexpected checkpoint retry response");
+        };
+        assert_ne!(retried.attempt_id, before_retry.attempt_id);
         assert_eq!(
             await_settled_run(&reopened_connection, run_id).state,
             AgentRunState::AwaitingApproval
         );
+        let after_retry = reopened_connection
+            .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+        let ServerResponse::AgentRun(after_retry) = after_retry.result.unwrap() else {
+            panic!("unexpected run response after checkpoint retry");
+        };
+        assert_eq!(after_retry.attempt_id, retried.attempt_id);
+        let mut attempts = Vec::new();
+        for _ in 0..1_000 {
+            attempts = reopened
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_attempts(run_id)
+                .unwrap();
+            if attempts
+                .last()
+                .is_some_and(|attempt| attempt.state == AgentRunState::AwaitingApproval)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].id, before_retry.attempt_id);
+        assert_eq!(attempts[0].number, 1);
+        assert_eq!(attempts[1].id, retried.attempt_id);
+        assert_eq!(attempts[1].number, 2);
+        assert_eq!(attempts[1].state, AgentRunState::AwaitingApproval);
+        reopened.shutdown().unwrap();
+        drop(reopened_connection);
+        drop(reopened);
+
+        // Model a crash after execution started but before the runtime could
+        // persist its paused recovery state.
+        let persistence_store = FilePersistence::open(&persistence).unwrap();
+        let mut summary = persistence_store.load_run_summary(run_id).unwrap().unwrap();
+        summary.snapshot.state = AgentRunState::Executing;
+        summary.snapshot.completed_at = None;
+        let mut execution = persistence_store
+            .load_run_execution_state(run_id)
+            .unwrap()
+            .unwrap();
+        execution.state = AgentRunState::Executing;
+        execution.pending_approval = None;
+        execution.pending_input = None;
+        summary.execution_state = Some(execution);
+        let mut attempts = persistence_store.load_run_attempts(run_id).unwrap();
+        let current_attempt = attempts.last_mut().unwrap();
+        current_attempt.state = AgentRunState::Executing;
+        current_attempt.completed_at = None;
+        summary.attempts = Some(attempts);
+        let summaries = BTreeMap::from([(run_id, summary)]);
+        let sessions = persistence_store.load_sessions().unwrap().unwrap();
+        persistence_store
+            .save_state(DurableStateWrite {
+                sessions: &sessions,
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&summaries),
+                run_runtime_configs: None,
+                run_context_checkpoints: None,
+                run_plans: None,
+                run_messages: None,
+                run_activities: None,
+                filesystem_records: None,
+                feed: None,
+            })
+            .unwrap();
+        drop(persistence_store);
+
+        let restored = InProcessBackend::new_persistent(&persistence).unwrap();
+        assert!(restored.runs().unwrap().is_empty());
+        assert_eq!(
+            restored
+                .persisted_runs()
+                .unwrap()
+                .get(&run_id)
+                .unwrap()
+                .snapshot
+                .state,
+            AgentRunState::Paused
+        );
+        let recovery_session_id = restored
+            .persisted_runs()
+            .unwrap()
+            .get(&run_id)
+            .unwrap()
+            .snapshot
+            .session_id;
+        let restored_connection = restored.connect();
+        negotiate_m3(&restored_connection);
+        let metadata = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshotMetadata {
+                session_id: recovery_session_id,
+            },
+        ));
+        let ServerResponse::AgentSessionSnapshot(metadata) = metadata.result.unwrap() else {
+            panic!("unexpected metadata session snapshot response");
+        };
+        assert!(
+            metadata
+                .active_run
+                .as_ref()
+                .is_some_and(|projection| projection.messages.is_empty())
+        );
+        let initial = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionInitialState {
+                session_id: recovery_session_id,
+            },
+        ));
+        let ServerResponse::AgentSessionInitialState(initial) = initial.result.unwrap() else {
+            panic!("unexpected initial session state response");
+        };
+        assert_eq!(initial.cursor, initial.projection.latest_sequence);
+        assert!(
+            initial
+                .projection
+                .active_run
+                .as_ref()
+                .is_some_and(|projection| projection.messages.is_empty())
+        );
+        assert!(restored.runs().unwrap().is_empty());
+        let page = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: 10,
+            },
+        ));
+        let ServerResponse::AgentRunMessagePage { messages, .. } = page.result.unwrap() else {
+            panic!("unexpected transcript page response");
+        };
+        assert!(!messages.is_empty());
+        let first = messages.first().unwrap();
+        assert!(first.content_bytes > 0);
+        let content = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: first.ordinal,
+                byte_offset: 0,
+                length: u32::try_from(first.content_bytes.min(128)).unwrap(),
+            },
+        ));
+        let ServerResponse::AgentRunMessageContentRange { content, .. } = content.result.unwrap()
+        else {
+            panic!("unexpected transcript content response");
+        };
+        assert!(!content.is_empty());
+        let invalid_page = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal: None,
+                limit: 0,
+            },
+        ));
+        assert_eq!(
+            invalid_page.result.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let transcript_page = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
+            },
+        ));
+        let ServerResponse::AgentRunTranscriptPage {
+            messages,
+            next_before,
+            has_older,
+            ..
+        } = transcript_page.result.unwrap()
+        else {
+            panic!("unexpected bounded transcript page response");
+        };
+        assert!(!messages.is_empty());
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| pair[0].ordinal < pair[1].ordinal)
+        );
+        assert_eq!(next_before, messages.first().map(|message| message.ordinal));
+        assert!(!has_older);
+
+        let projection =
+            restored_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+                run_id,
+            }));
+        let ServerResponse::AgentRunSnapshot(projection) = projection.result.unwrap() else {
+            panic!("unexpected lazily restored run snapshot response");
+        };
+        assert_eq!(projection.run.state, AgentRunState::Paused);
+        assert!(!projection.messages.is_empty());
+        assert!(restored.runs().unwrap().is_empty());
+        let execution = restored
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_execution_state(run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.state, AgentRunState::Paused);
+        assert!(execution.pending_tool_execution.is_none());
+        let events =
+            restored_connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: Some(recovery_session_id),
+                workspace_id: None,
+                after_sequence: None,
+                stream_epoch: None,
+            }));
+        let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
+            panic!("unexpected recovery event response");
+        };
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            ServerEvent::Agent {
+                event: AgentEvent::RunStateChanged {
+                    run_id: event_run_id,
+                    state: AgentRunState::Paused,
+                }
+            } if *event_run_id == run_id
+        )));
+        drop(restored);
         fs::remove_file(persistence).unwrap();
         fs::remove_dir_all(session_root_base).unwrap();
+    }
+
+    #[test]
+    fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
+        let persistence =
+            std::env::temp_dir().join(format!("loom-server-state-{}.db", WorkspaceId::new()));
+        let (run_id, session_root_base) = {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let session_root_base = backend.session_root_base.clone();
+            let connection = backend.connect();
+            negotiate_m3(&connection);
+            let workspace =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Run summary workspace".to_owned(),
+                }));
+            let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            let session = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Completed history".to_owned(),
+                },
+            ));
+            let ServerResponse::AgentSessionCreated(session) = session.result.unwrap() else {
+                panic!("unexpected session response");
+            };
+            let started =
+                connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                    session_id: session.id,
+                    task: "answer briefly".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    system_instructions: None,
+                    repository_instructions: None,
+                }));
+            let run_id = match started.result.unwrap() {
+                ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+                response => panic!("unexpected response: {response:?}"),
+            };
+            let settled = await_settled_run(&connection, run_id);
+            assert_eq!(settled.state, AgentRunState::Completed);
+            backend.flush().unwrap();
+            backend.shutdown().unwrap();
+            (run_id, session_root_base)
+        };
+
+        let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+        assert!(backend.runs().unwrap().is_empty());
+        assert!(backend.persisted_runs().unwrap().is_empty());
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let response =
+            connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+        assert!(matches!(
+            response.result,
+            Ok(ServerResponse::AgentRun(snapshot)) if snapshot.state == AgentRunState::Completed
+        ));
+        let projection =
+            connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+                run_id,
+            }));
+        assert!(matches!(
+            projection.result,
+            Ok(ServerResponse::AgentRunSnapshot(snapshot))
+                if snapshot.run.state == AgentRunState::Completed && !snapshot.messages.is_empty()
+        ));
+        assert!(backend.runs().unwrap().is_empty());
+        fs::remove_dir_all(session_root_base).unwrap();
+        let _ = fs::remove_file(persistence);
     }
 
     #[test]
@@ -6183,12 +10309,14 @@ mod tests {
         let events = match connection
             .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session_id),
+                workspace_id: None,
                 after_sequence: None,
+                stream_epoch: None,
             }))
             .result
             .unwrap()
         {
-            ServerResponse::SessionEvents { events } => events,
+            ServerResponse::SessionEvents { events, .. } => events,
             response => panic!("unexpected response: {response:?}"),
         };
         assert!(events.iter().any(|event| {
@@ -6628,7 +10756,9 @@ mod tests {
             scoped
                 .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: None,
+                    workspace_id: None,
                     after_sequence: None,
+                    stream_epoch: None,
                 }))
                 .result
                 .unwrap_err()
@@ -6674,6 +10804,274 @@ mod tests {
             }
         });
         (format!("http://{address}/v1/chat/completions"), receiver)
+    }
+
+    fn gated_model_endpoint(
+        first_content: &str,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (first_sender, first_receiver) = std::sync::mpsc::channel();
+        let (second_sender, second_receiver) = std::sync::mpsc::channel();
+        let (second_gate_sender, second_gate_receiver) = std::sync::mpsc::channel();
+        let (finish_gate_sender, finish_gate_receiver) = std::sync::mpsc::channel();
+        let first_event = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+            serde_json::to_string(first_content).unwrap()
+        );
+        thread::spawn(move || {
+            use std::io::{Read, Write};
+
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = stream.read(&mut request);
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .is_err()
+                || stream.write_all(first_event.as_bytes()).is_err()
+                || stream.flush().is_err()
+            {
+                return;
+            }
+            let _ = first_sender.send(());
+            if second_gate_receiver.recv().is_err() {
+                return;
+            }
+            if stream
+                .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n")
+                .is_err()
+                || stream.flush().is_err()
+            {
+                return;
+            }
+            let _ = second_sender.send(());
+            if finish_gate_receiver.recv().is_err() {
+                return;
+            }
+            let _ = stream.write_all(b"data: [DONE]\n\n");
+            let _ = stream.flush();
+        });
+        (
+            format!("http://{address}/v1/chat/completions"),
+            first_receiver,
+            second_gate_sender,
+            second_receiver,
+            finish_gate_sender,
+        )
+    }
+
+    #[test]
+    fn streamed_message_fragments_batch_until_the_time_threshold() {
+        let (endpoint, first_delta, release_second, second_delta, finish) =
+            gated_model_endpoint("first");
+        let persistence =
+            std::env::temp_dir().join(format!("loom-server-batched-{}.db", WorkspaceId::new()));
+        let backend = InProcessBackend::with_openai_compatible_persistent(
+            endpoint,
+            "key",
+            ModelId::new("slow/model"),
+            &persistence,
+        )
+        .unwrap();
+        let session_root_base = backend.session_root_base.clone();
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Batched transcript workspace".to_owned(),
+        }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "batched transcript".to_owned(),
+            },
+        ));
+        let session_id = match session.result.unwrap() {
+            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id,
+                task: "stream a response".to_owned(),
+                model: ModelId::new("slow/model"),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
+        let run_id = match started.result.unwrap() {
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        first_delta
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first model delta");
+
+        let handle = backend.runs().unwrap().get(&run_id).cloned().unwrap();
+        for _ in 0..200 {
+            if handle.message_fragments.lock().unwrap().pending_bytes == "first".len() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            handle.message_fragments.lock().unwrap().pending_bytes,
+            "first".len()
+        );
+        assert!(
+            backend
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_messages(run_id)
+                .unwrap()
+                .iter()
+                .all(|message| message.content != "first")
+        );
+
+        thread::sleep(MESSAGE_FRAGMENT_BATCH_INTERVAL + Duration::from_millis(10));
+        let mut flushed_prefix = None;
+        for _ in 0..200 {
+            flushed_prefix = backend
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_messages(run_id)
+                .unwrap()
+                .into_iter()
+                .find(|message| message.role == loom_model::MessageRole::Assistant)
+                .map(|message| message.content);
+            if flushed_prefix.as_deref() == Some("first") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(flushed_prefix.as_deref(), Some("first"));
+
+        release_second.send(()).unwrap();
+        second_delta
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second model delta");
+        let transcript = backend.persistence.as_ref().unwrap();
+        let mut persisted_content = None;
+        for _ in 0..200 {
+            persisted_content = transcript
+                .load_run_messages(run_id)
+                .unwrap()
+                .into_iter()
+                .find(|message| message.role == loom_model::MessageRole::Assistant)
+                .map(|message| message.content);
+            if persisted_content.as_deref() == Some("firstsecond") {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(persisted_content.as_deref(), Some("firstsecond"));
+        assert_eq!(handle.message_fragments.lock().unwrap().pending_bytes, 0);
+
+        finish.send(()).unwrap();
+        await_settled_run(&connection, run_id);
+        drop(connection);
+        drop(backend);
+        fs::remove_dir_all(session_root_base).unwrap();
+        let _ = fs::remove_file(&persistence);
+        let _ = fs::remove_file(persistence.with_extension("db-shm"));
+        let _ = fs::remove_file(persistence.with_extension("db-wal"));
+    }
+
+    #[test]
+    fn streamed_message_fragments_flush_at_the_byte_threshold_without_splitting_utf8() {
+        let content = format!(
+            "{}é",
+            "a".repeat(MESSAGE_FRAGMENT_BATCH_BYTES.saturating_sub(1))
+        );
+        let (endpoint, first_delta, release_second, second_delta, finish) =
+            gated_model_endpoint(&content);
+        let persistence =
+            std::env::temp_dir().join(format!("loom-server-large-delta-{}.db", WorkspaceId::new()));
+        let backend = InProcessBackend::with_openai_compatible_persistent(
+            endpoint,
+            "key",
+            ModelId::new("slow/model"),
+            &persistence,
+        )
+        .unwrap();
+        let session_root_base = backend.session_root_base.clone();
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Large transcript workspace".to_owned(),
+        }));
+        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        let session = connection.request(RequestEnvelope::new(
+            ClientRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "large transcript".to_owned(),
+            },
+        ));
+        let session_id = match session.result.unwrap() {
+            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id,
+                task: "stream a large response".to_owned(),
+                model: ModelId::new("slow/model"),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
+        let run_id = match started.result.unwrap() {
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            response => panic!("unexpected response: {response:?}"),
+        };
+        first_delta
+            .recv_timeout(Duration::from_secs(10))
+            .expect("large model delta");
+
+        let transcript = backend.persistence.as_ref().unwrap();
+        let mut persisted_content = None;
+        for _ in 0..200 {
+            persisted_content = transcript
+                .load_run_messages(run_id)
+                .unwrap()
+                .into_iter()
+                .find(|message| message.role == loom_model::MessageRole::Assistant)
+                .map(|message| message.content);
+            if persisted_content.as_deref() == Some(content.as_str()) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(persisted_content.as_deref(), Some(content.as_str()));
+
+        release_second.send(()).unwrap();
+        second_delta
+            .recv_timeout(Duration::from_secs(10))
+            .expect("second model delta");
+        finish.send(()).unwrap();
+        await_settled_run(&connection, run_id);
+        drop(connection);
+        drop(backend);
+        fs::remove_dir_all(session_root_base).unwrap();
+        let _ = fs::remove_file(&persistence);
+        let _ = fs::remove_file(persistence.with_extension("db-shm"));
+        let _ = fs::remove_file(persistence.with_extension("db-wal"));
     }
 
     #[test]
@@ -6725,9 +11123,11 @@ mod tests {
         for _ in 0..1_000 {
             let events = observer.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session_id),
+                workspace_id: None,
                 after_sequence: None,
+                stream_epoch: None,
             }));
-            let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+            let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
                 panic!("unexpected events response");
             };
             if events.iter().any(|event| {
@@ -6866,7 +11266,501 @@ mod tests {
             first.result,
             Ok(ServerResponse::AgentSessionCreated(_))
         ));
+        let expired_request_id = request_id_with_issued_at(
+            current_unix_millis()
+                .saturating_sub(IDEMPOTENCY_RETENTION.as_millis() as u64)
+                .saturating_sub(1),
+        );
+        let expired = connection.request(RequestEnvelope::with_request_id(
+            expired_request_id,
+            ClientRequest::CreateWorkspace {
+                name: "must not be replayed".to_owned(),
+            },
+        ));
+        assert_eq!(
+            expired.result.unwrap_err().code,
+            ErrorCode::DeadlineExceeded
+        );
+        let workspaces = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+        assert!(matches!(
+            workspaces.result,
+            Ok(ServerResponse::Workspaces { workspaces }) if workspaces.len() == 1
+        ));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retryable_mutation_save_failure_does_not_cache_success() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-server-idempotency-failure-{}.db",
+            WorkspaceId::new()
+        ));
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let request_id = loom_core::RequestId::new();
+        let request = ClientRequest::CreateWorkspace {
+            name: "failure boundary".to_owned(),
+        };
+        backend.fail_next_state_save.store(true, Ordering::SeqCst);
+        let failed = connection.request(RequestEnvelope::with_request_id(
+            request_id,
+            request.clone(),
+        ));
+        assert_eq!(failed.result.unwrap_err().code, ErrorCode::Internal);
+        assert!(
+            backend
+                .cached_response(request_id, &request)
+                .unwrap()
+                .is_none()
+        );
+
+        // Handler state can already have changed when a save fails. Fail-stop
+        // prevents a retry from dispatching against that partially mutated
+        // in-memory state; reopening restores the last committed disk state.
+        let retried = connection.request(RequestEnvelope::with_request_id(request_id, request));
+        assert_eq!(retried.result.unwrap_err().code, ErrorCode::Persistence);
+        let listed = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+        assert_eq!(listed.result.unwrap_err().code, ErrorCode::Persistence);
+        drop(connection);
+        drop(backend);
+        let reopened = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = reopened.connect();
+        negotiate(&connection);
+        let listed = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+        assert!(
+            matches!(listed.result, Ok(ServerResponse::Workspaces { workspaces }) if workspaces.is_empty())
+        );
+        drop(connection);
+        drop(reopened);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
+        let path = std::env::temp_dir().join(format!("loom-server-feed-{}.db", WorkspaceId::new()));
+        let (session_id, session_root_base, previous_stream_epoch) = {
+            let backend = InProcessBackend::new_persistent(&path).unwrap();
+            backend.set_event_retention(1).unwrap();
+            let connection = backend.connect();
+            negotiate(&connection);
+            let workspace =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Lazy feed workspace".to_owned(),
+                }));
+            let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            let created = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Lazy feed session".to_owned(),
+                },
+            ));
+            let ServerResponse::AgentSessionCreated(session) = created.result.unwrap() else {
+                panic!("unexpected session response");
+            };
+            for name in ["renamed once", "renamed twice"] {
+                connection
+                    .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                        session_id: session.id,
+                        name: name.to_owned(),
+                    }))
+                    .result
+                    .unwrap();
+            }
+            backend.flush().unwrap();
+            (
+                session.id,
+                backend.session_root_base.clone(),
+                backend.node_id.clone(),
+            )
+        };
+
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        assert!(backend.journal().unwrap().events.is_empty());
+        let connection = backend.connect();
+        negotiate(&connection);
+        let stale = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::new(1)),
+            stream_epoch: None,
+        }));
+        let ServerResponse::SessionEventsSnapshot {
+            events,
+            oldest_sequence,
+            latest_sequence,
+            ..
+        } = stale.result.unwrap()
+        else {
+            panic!("expected a stale-cursor snapshot");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, EventSequence::new(3));
+        assert_eq!(oldest_sequence, EventSequence::new(3));
+        assert_eq!(latest_sequence, EventSequence::new(3));
+
+        let changed_epoch =
+            connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                workspace_id: None,
+                after_sequence: Some(EventSequence::new(3)),
+                stream_epoch: Some(previous_stream_epoch.clone()),
+            }));
+        let ServerResponse::SessionEventsSnapshot {
+            events,
+            latest_sequence,
+            stream_epoch: Some(current_epoch),
+            ..
+        } = changed_epoch.result.unwrap()
+        else {
+            panic!("expected a snapshot after the feed epoch changed");
+        };
+        assert_ne!(current_epoch, previous_stream_epoch);
+        assert_eq!(latest_sequence, EventSequence::new(3));
+        assert_eq!(events.len(), 1);
+
+        let current = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::new(2)),
+            stream_epoch: None,
+        }));
+        let ServerResponse::SessionEvents { events, .. } = current.result.unwrap() else {
+            panic!("expected retained session events");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, EventSequence::new(3));
+
+        fs::remove_dir_all(session_root_base).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-server-workspace-feed-{}.db",
+            WorkspaceId::new()
+        ));
+        let (workspace_a, workspace_b, session_a, session_b, previous_epoch) = {
+            let backend = InProcessBackend::new_persistent(&path).unwrap();
+            backend.set_event_retention(1).unwrap();
+            let connection = backend.connect();
+            negotiate(&connection);
+            let create_workspace = |name: &str| {
+                let response =
+                    connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                        name: name.to_owned(),
+                    }));
+                let ServerResponse::WorkspaceCreated(workspace) = response.result.unwrap() else {
+                    panic!("unexpected workspace response");
+                };
+                workspace.id
+            };
+            let workspace_a = create_workspace("Workspace feed A");
+            let workspace_b = create_workspace("Workspace feed B");
+            let create_session = |workspace_id, name: &str| {
+                let response = connection.request(RequestEnvelope::new(
+                    ClientRequest::CreateAgentSessionInWorkspace {
+                        workspace_id,
+                        name: name.to_owned(),
+                    },
+                ));
+                let ServerResponse::AgentSessionCreated(session) = response.result.unwrap() else {
+                    panic!("unexpected session response");
+                };
+                session.id
+            };
+            let session_a = create_session(workspace_a, "A");
+            let session_b = create_session(workspace_b, "B");
+            for (session_id, label) in [(session_a, "A"), (session_b, "B")] {
+                for revision in 1..=2 {
+                    connection
+                        .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                            session_id,
+                            name: format!("{label} {revision}"),
+                        }))
+                        .result
+                        .unwrap();
+                }
+            }
+
+            for workspace_id in [workspace_a, workspace_b] {
+                let response =
+                    connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                        session_id: None,
+                        workspace_id: Some(workspace_id),
+                        after_sequence: None,
+                        stream_epoch: None,
+                    }));
+                let ServerResponse::WorkspaceEventsSnapshot {
+                    workspace_id: returned_workspace,
+                    sessions,
+                    events,
+                    ..
+                } = response.result.unwrap()
+                else {
+                    panic!("expected a snapshot after in-memory feed pruning");
+                };
+                assert_eq!(returned_workspace, workspace_id);
+                assert_eq!(sessions.len(), 1);
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| matches!(event,
+                            WorkspaceFeedEvent::Session(event) if event.session_id == sessions[0].id))
+                );
+            }
+
+            let ambiguous =
+                connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: Some(session_a),
+                    workspace_id: Some(workspace_a),
+                    after_sequence: None,
+                    stream_epoch: None,
+                }));
+            assert!(ambiguous.result.is_err());
+            let unknown =
+                connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: None,
+                    workspace_id: Some(WorkspaceId::new()),
+                    after_sequence: None,
+                    stream_epoch: None,
+                }));
+            assert!(unknown.result.is_err());
+
+            backend.flush().unwrap();
+            (
+                workspace_a,
+                workspace_b,
+                session_a,
+                session_b,
+                backend.node_id.clone(),
+            )
+        };
+
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let stale = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace_a),
+            after_sequence: Some(EventSequence::new(1)),
+            stream_epoch: None,
+        }));
+        let ServerResponse::WorkspaceEventsSnapshot {
+            workspace_id,
+            sessions,
+            events,
+            oldest_sequence,
+            latest_sequence,
+            stream_epoch: Some(current_epoch),
+        } = stale.result.unwrap()
+        else {
+            panic!("expected a workspace snapshot after persisted pruning");
+        };
+        assert_eq!(workspace_id, workspace_a);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_a);
+        assert!(events.iter().all(|event| matches!(event,
+            WorkspaceFeedEvent::Session(event) if event.session_id == session_a)));
+        assert!(!events.iter().any(|event| matches!(event,
+            WorkspaceFeedEvent::Session(event) if event.session_id == session_b)));
+        assert!(oldest_sequence <= latest_sequence);
+        assert_ne!(current_epoch, previous_epoch);
+
+        let events_b = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace_b),
+            after_sequence: None,
+            stream_epoch: None,
+        }));
+        let ServerResponse::WorkspaceEventsSnapshot {
+            sessions,
+            events,
+            latest_sequence: global_cursor,
+            stream_epoch: Some(current_epoch),
+            ..
+        } = events_b.result.unwrap()
+        else {
+            panic!("expected a workspace snapshot after persisted pruning");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_b);
+        assert!(events.iter().all(|event| matches!(event,
+            WorkspaceFeedEvent::Session(event) if event.session_id == session_b)));
+
+        let advanced_cursor =
+            connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: None,
+                workspace_id: Some(workspace_a),
+                after_sequence: Some(global_cursor),
+                stream_epoch: Some(current_epoch),
+            }));
+        assert!(matches!(
+            advanced_cursor.result.unwrap(),
+            ServerResponse::WorkspaceEvents { events, .. } if events.is_empty()
+        ));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_rename_and_config_changes_are_durable_workspace_events() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-server-workspace-mutations-{}.db",
+            WorkspaceId::new()
+        ));
+        let workspace_id = {
+            let backend = InProcessBackend::new_persistent(&path).unwrap();
+            let connection = backend.connect();
+            negotiate(&connection);
+            let created =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Before rename".to_owned(),
+                }));
+            let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            connection
+                .request(RequestEnvelope::new(ClientRequest::RenameWorkspace {
+                    workspace_id: workspace.id,
+                    name: "After rename".to_owned(),
+                }))
+                .result
+                .unwrap();
+            let config = WorkspaceConfig {
+                revision: 7,
+                ..WorkspaceConfig::default()
+            };
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                        config,
+                    },
+                ))
+                .result
+                .unwrap();
+            backend.flush().unwrap();
+            workspace.id
+        };
+
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let response = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace_id),
+            after_sequence: Some(EventSequence::default()),
+            stream_epoch: None,
+        }));
+        let ServerResponse::WorkspaceEvents {
+            workspace_id: returned,
+            events,
+            ..
+        } = response.result.unwrap()
+        else {
+            panic!("expected workspace event batch");
+        };
+        assert_eq!(returned, workspace_id);
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(events[0], WorkspaceFeedEvent::Workspace(WorkspaceEventEnvelope {
+            event: WorkspaceEvent::Renamed { ref name }, ..
+        }) if name == "After rename")
+        );
+        assert!(matches!(
+            events[1],
+            WorkspaceFeedEvent::Workspace(WorkspaceEventEnvelope {
+                event: WorkspaceEvent::ConfigChanged { revision: 7 },
+                ..
+            })
+        ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_event_requests_require_workspace_event_capability() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-server-workspace-feed-capability-{}.db",
+            WorkspaceId::new()
+        ));
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let writer = backend.connect();
+        negotiate(&writer);
+        let created = writer.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            name: "Before".to_owned(),
+        }));
+        let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+            panic!("unexpected workspace response");
+        };
+        writer
+            .request(RequestEnvelope::new(ClientRequest::RenameWorkspace {
+                workspace_id: workspace.id,
+                name: "After".to_owned(),
+            }))
+            .result
+            .unwrap();
+
+        let limited = backend.connect();
+        let limited_capabilities = CapabilitySet::new([Capability::SubscribeSessionEvents]);
+        let negotiated = limited.request(RequestEnvelope::with_version(
+            CURRENT_PROTOCOL_VERSION,
+            ClientRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: limited_capabilities,
+            },
+        ));
+        assert!(matches!(
+            negotiated.result,
+            Ok(ServerResponse::Negotiated(_))
+        ));
+        let unsupported_events = limited.request(RequestEnvelope::with_version(
+            CURRENT_PROTOCOL_VERSION,
+            ClientRequest::GetSessionEvents {
+                session_id: None,
+                workspace_id: Some(workspace.id),
+                after_sequence: Some(EventSequence::default()),
+                stream_epoch: None,
+            },
+        ));
+        assert_eq!(
+            unsupported_events.result.unwrap_err().code,
+            ErrorCode::CapabilityDenied
+        );
+
+        let current = backend.connect();
+        negotiate(&current);
+        let current_events =
+            current.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: None,
+                workspace_id: Some(workspace.id),
+                after_sequence: Some(EventSequence::default()),
+                stream_epoch: None,
+            }));
+        assert!(matches!(current_events.result.unwrap(),
+            ServerResponse::WorkspaceEvents { events, .. }
+                if matches!(events.as_slice(), [WorkspaceFeedEvent::Workspace(_)])));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn transcript_page_content_is_bounded_and_marks_truncation() {
+        let large = vec![b'x'; MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES as usize + 1];
+        let (content, truncated) = bounded_transcript_content(
+            &large[..MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES as usize],
+            MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES as u64 + 1,
+        );
+        assert!(truncated);
+        assert!(content.starts_with(&"x".repeat(MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES as usize)));
+        assert!(content.ends_with("\n...[message truncated]"));
+
+        let (content, truncated) = bounded_transcript_content(b"short", 5);
+        assert!(!truncated);
+        assert_eq!(content, "short");
+        assert_eq!(bounded_transcript_content(&[], 0), (String::new(), false));
     }
 
     #[allow(dead_code)]

@@ -431,9 +431,44 @@ pub fn github_copilot_descriptor() -> ModelDescriptor {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ProviderUsageKey {
+    pub provider: ProviderId,
+    pub model: ModelId,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct UsageLedger {
-    pub records: Vec<ProviderUsageRecord>,
+    #[serde(with = "usage_aggregate_entries")]
+    pub aggregates: BTreeMap<ProviderUsageKey, ProviderUsageSummary>,
+}
+
+mod usage_aggregate_entries {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{ProviderUsageKey, ProviderUsageSummary};
+
+    pub fn serialize<S>(
+        aggregates: &BTreeMap<ProviderUsageKey, ProviderUsageSummary>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        aggregates.iter().collect::<Vec<_>>().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<ProviderUsageKey, ProviderUsageSummary>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries = Vec::<(ProviderUsageKey, ProviderUsageSummary)>::deserialize(deserializer)?;
+        Ok(entries.into_iter().collect())
+    }
 }
 
 impl UsageLedger {
@@ -444,13 +479,17 @@ impl UsageLedger {
         usage: TokenUsage,
         cost_micros: u64,
     ) {
-        self.records.push(ProviderUsageRecord {
-            provider,
-            model,
-            usage,
-            cost_micros,
-            recorded_at: Timestamp::now(),
-        });
+        let summary = self
+            .aggregates
+            .entry(ProviderUsageKey { provider, model })
+            .or_default();
+        summary.requests = summary.requests.saturating_add(1);
+        summary.input_tokens = summary.input_tokens.saturating_add(usage.input_tokens);
+        summary.output_tokens = summary.output_tokens.saturating_add(usage.output_tokens);
+        summary.cached_input_tokens = summary
+            .cached_input_tokens
+            .saturating_add(usage.cached_input_tokens);
+        summary.cost_micros = summary.cost_micros.saturating_add(cost_micros);
     }
 
     pub fn summary(
@@ -458,40 +497,37 @@ impl UsageLedger {
         provider: Option<&ProviderId>,
         model: Option<&ModelId>,
     ) -> ProviderUsageSummary {
-        self.records
+        self.aggregates
             .iter()
-            .filter(|record| {
-                provider.is_none_or(|provider| &record.provider == provider)
-                    && model.is_none_or(|model| &record.model == model)
+            .filter(|(key, _)| {
+                provider.is_none_or(|provider| &key.provider == provider)
+                    && model.is_none_or(|model| &key.model == model)
             })
-            .fold(ProviderUsageSummary::default(), |mut summary, record| {
-                summary.requests = summary.requests.saturating_add(1);
-                summary.input_tokens = summary
-                    .input_tokens
-                    .saturating_add(record.usage.input_tokens);
-                summary.output_tokens = summary
-                    .output_tokens
-                    .saturating_add(record.usage.output_tokens);
-                summary.cached_input_tokens = summary
-                    .cached_input_tokens
-                    .saturating_add(record.usage.cached_input_tokens);
-                summary.cost_micros = summary.cost_micros.saturating_add(record.cost_micros);
-                summary
-            })
+            .fold(
+                ProviderUsageSummary::default(),
+                |mut total, (_, summary)| {
+                    total.requests = total.requests.saturating_add(summary.requests);
+                    total.input_tokens = total.input_tokens.saturating_add(summary.input_tokens);
+                    total.output_tokens = total.output_tokens.saturating_add(summary.output_tokens);
+                    total.cached_input_tokens = total
+                        .cached_input_tokens
+                        .saturating_add(summary.cached_input_tokens);
+                    total.cost_micros = total.cost_micros.saturating_add(summary.cost_micros);
+                    total
+                },
+            )
     }
 
     pub fn session_usage(&self) -> UsageSnapshot {
-        self.records
-            .iter()
-            .fold(UsageSnapshot::default(), |mut usage, record| {
-                usage.add_tokens(
-                    record.usage.input_tokens,
-                    record.usage.output_tokens,
-                    record.usage.cached_input_tokens,
-                );
-                usage.add_cost_micros(record.cost_micros);
-                usage
-            })
+        let summary = self.summary(None, None);
+        let mut usage = UsageSnapshot::default();
+        usage.add_tokens(
+            summary.input_tokens,
+            summary.output_tokens,
+            summary.cached_input_tokens,
+        );
+        usage.add_cost_micros(summary.cost_micros);
+        usage
     }
 }
 
@@ -3052,6 +3088,19 @@ mod tests {
         assert_eq!(
             health_endpoint("https://example.test/v1/chat/completions"),
             "https://example.test/v1/models"
+        );
+        let provider = ProviderId::new("fixture");
+        let model = ModelId::new("fixture/model");
+        let mut ledger = UsageLedger::default();
+        ledger.record(provider.clone(), model.clone(), usage.clone(), 28);
+        ledger.record(provider.clone(), model.clone(), usage, 28);
+        assert_eq!(ledger.aggregates.len(), 1);
+        assert_eq!(ledger.summary(Some(&provider), Some(&model)).requests, 2);
+        assert_eq!(ledger.summary(None, None).input_tokens, 24);
+        assert_eq!(ledger.session_usage().cost_micros, 56);
+        assert_eq!(
+            serde_json::from_value::<UsageLedger>(serde_json::to_value(&ledger).unwrap()).unwrap(),
+            ledger
         );
         assert_eq!(
             health_endpoint("https://example.test/status"),

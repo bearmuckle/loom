@@ -1153,15 +1153,21 @@ mod tests {
                 artifact_paths: Vec::new(),
             })
             .unwrap();
+        let mut completed_without_output = None;
         for _ in 0..100 {
             let current = supervisor.get(task.id).unwrap();
             if current.status == TaskStatus::Completed {
-                assert!(current.output.contains(external.to_str().unwrap()));
-                fs::remove_dir_all(root).unwrap();
-                fs::remove_dir_all(external).unwrap();
-                return;
+                if current.output.contains(external.to_str().unwrap()) {
+                    fs::remove_dir_all(root).unwrap();
+                    fs::remove_dir_all(external).unwrap();
+                    return;
+                }
+                completed_without_output = Some(current);
             }
             thread::sleep(Duration::from_millis(10));
+        }
+        if let Some(current) = completed_without_output {
+            assert!(current.output.contains(external.to_str().unwrap()));
         }
         panic!("task did not finish");
     }

@@ -68,7 +68,7 @@ Implementation notes for the first vertical slice:
   configurations with normalized discovery, capability intersection,
   credential references, usage records, rate-limit/error normalization, and
   health state.
-- `loom-persistence` stores sectioned SQLite state atomically. The sections
+- `loom-persistence` stores typed, indexed SQLite state transactionally. The tables
   cover the session/event journal, serializable runtime state, checkpoints,
   policies, provider health, and usage. Recovery pauses unfinished runs for
   explicit resume.

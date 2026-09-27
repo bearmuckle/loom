@@ -342,44 +342,47 @@ impl ClientConnection {
 }
 
 #[cfg(not(target_family = "wasm"))]
+pub(crate) fn negotiation_capabilities() -> CapabilitySet {
+    CapabilitySet::new([
+        Capability::CreateAgentSession,
+        Capability::ReadAgentSession,
+        Capability::ControlAgentSession,
+        Capability::ManageWorkspaces,
+        Capability::ManageSessionRepositories,
+        Capability::ReadSessionFilesystem,
+        Capability::WriteSessionFilesystem,
+        Capability::SubscribeSessionEvents,
+        Capability::SubscribeWorkspaceEvents,
+        Capability::StartAgentRun,
+        Capability::ReadAgentRun,
+        Capability::ReadAgentRunMessages,
+        Capability::ControlAgentRun,
+        Capability::PauseAgentRun,
+        Capability::ResumeAgentRun,
+        Capability::ApproveAgentAction,
+        Capability::ListProviders,
+        Capability::ConfigureProviders,
+        Capability::ReadWorkspaceConfig,
+        Capability::BrowseGitHubRepositories,
+        Capability::ConfigureApprovalPolicy,
+        Capability::ManageCheckpoints,
+        Capability::ReadVcsStatus,
+        Capability::ReadVcsDiff,
+        Capability::ReadSessionTask,
+        Capability::StartSessionTask,
+        Capability::ControlSessionTask,
+        Capability::ReadSessionTaskEvidence,
+        Capability::ReadWorkerNodeStatus,
+        Capability::JsonProtocol,
+    ])
+}
+
+#[cfg(not(target_family = "wasm"))]
 pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> {
     let response = connection.request_with_timeout(
         RequestEnvelope::new(ClientRequest::Negotiate {
             client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: CapabilitySet::new([
-                Capability::CreateAgentSession,
-                Capability::ReadAgentSession,
-                Capability::ControlAgentSession,
-                Capability::ManageWorkspaces,
-                Capability::ManageSessionRepositories,
-                Capability::ReadSessionFilesystem,
-                Capability::WriteSessionFilesystem,
-                Capability::SubscribeSessionEvents,
-                Capability::StartAgentRun,
-                Capability::ReadAgentRun,
-                Capability::ControlAgentRun,
-                Capability::PauseAgentRun,
-                Capability::ResumeAgentRun,
-                Capability::ApproveAgentAction,
-                Capability::ListProviders,
-                Capability::ConfigureProviders,
-                Capability::ReadWorkspaceConfig,
-                Capability::BrowseGitHubRepositories,
-                Capability::ConfigureApprovalPolicy,
-                Capability::ManageCheckpoints,
-                Capability::ManageWorkspaces,
-                Capability::ManageSessionRepositories,
-                Capability::ReadSessionFilesystem,
-                Capability::WriteSessionFilesystem,
-                Capability::ReadVcsStatus,
-                Capability::ReadVcsDiff,
-                Capability::ReadSessionTask,
-                Capability::StartSessionTask,
-                Capability::ControlSessionTask,
-                Capability::ReadSessionTaskEvidence,
-                Capability::ReadWorkerNodeStatus,
-                Capability::JsonProtocol,
-            ]),
+            capabilities: negotiation_capabilities(),
         }),
         Duration::from_secs(15),
     );
@@ -396,8 +399,10 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::ReadAgentSession,
         Capability::ControlAgentSession,
         Capability::SubscribeSessionEvents,
+        Capability::SubscribeWorkspaceEvents,
         Capability::StartAgentRun,
         Capability::ReadAgentRun,
+        Capability::ReadAgentRunMessages,
         Capability::ControlAgentRun,
         Capability::PauseAgentRun,
         Capability::ResumeAgentRun,
@@ -1071,12 +1076,13 @@ mod tests {
     use super::{
         ClientConnection, LoomError, create_session_in_workspace, create_workspace,
         describe_startup_connection_error, include_discovered_models, list_models,
-        list_provider_ids, list_workspace_sessions, list_workspaces, negotiate, redact_secret,
-        register_workspace, remote_url_is_secure_for_secrets, set_workspace_config,
-        unexpected_response, worker_node_status, workspace_config,
+        list_provider_ids, list_workspace_sessions, list_workspaces, negotiate,
+        negotiation_capabilities, redact_secret, register_workspace,
+        remote_url_is_secure_for_secrets, set_workspace_config, unexpected_response,
+        worker_node_status, workspace_config,
     };
     use loom_core::{
-        ErrorCode, LoomError as CoreLoomError, Timestamp, WorkspaceId, WorkspaceRecord,
+        Capability, ErrorCode, LoomError as CoreLoomError, Timestamp, WorkspaceId, WorkspaceRecord,
     };
     use loom_model::ModelId;
     use loom_protocol::{ServerResponse, WorkspaceConfig};
@@ -1084,6 +1090,11 @@ mod tests {
         AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn current_client_contract_negotiates_transcript_paging() {
+        assert!(negotiation_capabilities().contains(Capability::ReadAgentRunMessages));
+    }
 
     #[test]
     fn provider_secrets_require_tls_or_loopback_transport() {

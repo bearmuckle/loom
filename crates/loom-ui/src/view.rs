@@ -1,5 +1,7 @@
 //! The GPUI view: session navigator, run canvas, composer, and review drawer.
 
+#[cfg(not(target_family = "wasm"))]
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -38,15 +40,15 @@ use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
     EventSequence, LoomError, RepositoryId, RunId, WorkspaceId, WorkspaceRecord,
 };
-use loom_model::{MessageRole, ModelId, ProviderKind, ProviderSummary, ToolCall};
+use loom_model::{MessageRole, ModelId, ModelMessage, ProviderKind, ProviderSummary, ToolCall};
 #[cfg(target_family = "wasm")]
 use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
-    GitDiffLineKind, GitFileStatusKind, GitHubRepository, RequestEnvelope, ResponseEnvelope,
-    ServerEvent, ServerResponse, SessionDirectory, SessionRepository, WorkerNodeConfig,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
+    GitDiffLineKind, GitFileStatusKind, GitHubRepository, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
+    RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse, SessionDirectory,
+    SessionRepository, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode};
@@ -387,6 +389,131 @@ fn order_session_nodes(
     nodes
 }
 
+async fn load_transcript_page(
+    backend: BackendWorker,
+    run_id: RunId,
+    before_ordinal: Option<u64>,
+) -> Result<(Vec<ModelMessage>, Option<u64>, bool), LoomError> {
+    let response = backend
+        .submit(RequestEnvelope::new(
+            ClientRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal,
+                limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
+            },
+        ))
+        .wait()
+        .await;
+    let (messages, next_before, has_older) = match response.result? {
+        ServerResponse::AgentRunTranscriptPage {
+            run_id: response_run_id,
+            messages,
+            next_before,
+            has_older,
+        } if response_run_id == run_id => (messages, next_before, has_older),
+        response => {
+            return Err(unexpected_response("run transcript page", response));
+        }
+    };
+    Ok((
+        messages
+            .into_iter()
+            .map(|message| message.message)
+            .collect(),
+        next_before,
+        has_older,
+    ))
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn load_transcript_page_sync(
+    connection: &ClientConnection,
+    run_id: RunId,
+    before_ordinal: Option<u64>,
+) -> Result<(Vec<ModelMessage>, Option<u64>, bool), LoomError> {
+    let response = connection.request(RequestEnvelope::new(
+        ClientRequest::GetAgentRunTranscriptPage {
+            run_id,
+            before_ordinal,
+            limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
+        },
+    ));
+    let (messages, next_before, has_older) = match response.result? {
+        ServerResponse::AgentRunTranscriptPage {
+            run_id: response_run_id,
+            messages,
+            next_before,
+            has_older,
+        } if response_run_id == run_id => (messages, next_before, has_older),
+        response => return Err(unexpected_response("run transcript page", response)),
+    };
+    Ok((
+        messages
+            .into_iter()
+            .map(|message| message.message)
+            .collect(),
+        next_before,
+        has_older,
+    ))
+}
+
+fn timeline_items_from_messages(
+    messages: Vec<ModelMessage>,
+    has_activity_records: bool,
+) -> Vec<TimelineItem> {
+    let mut timeline = Vec::new();
+    for message in messages {
+        match message.role {
+            MessageRole::User => timeline.push(TimelineItem::User(message.content)),
+            MessageRole::Assistant => {
+                if message.content.is_empty() {
+                    continue;
+                }
+                if let Some(TimelineItem::Assistant(previous)) = timeline.last_mut() {
+                    if !previous.is_empty() {
+                        previous.push_str("\n\n");
+                    }
+                    previous.push_str(&message.content);
+                } else {
+                    timeline.push(TimelineItem::Assistant(message.content));
+                }
+            }
+            MessageRole::Tool if !has_activity_records => {
+                timeline.push(TimelineItem::ToolOutput(bounded(&message.content)))
+            }
+            MessageRole::Tool | MessageRole::System => {}
+        }
+    }
+    timeline
+}
+
+fn prepend_timeline_page(
+    timeline: &mut Vec<TimelineItem>,
+    mut older_items: Vec<TimelineItem>,
+    insertion_index: usize,
+) {
+    let boundary_assistant = matches!(older_items.last(), Some(TimelineItem::Assistant(_)))
+        && matches!(
+            timeline.get(insertion_index),
+            Some(TimelineItem::Assistant(_))
+        );
+    if boundary_assistant {
+        let Some(TimelineItem::Assistant(older)) = older_items.pop() else {
+            unreachable!()
+        };
+        let Some(TimelineItem::Assistant(newer)) = timeline.get_mut(insertion_index) else {
+            unreachable!()
+        };
+        let separator = if older.is_empty() || newer.is_empty() {
+            ""
+        } else {
+            "\n\n"
+        };
+        *newer = format!("{older}{separator}{newer}");
+    }
+    timeline.splice(insertion_index..insertion_index, older_items);
+}
+
 fn merge_node_sessions(
     current: &[AgentSessionSnapshot],
     current_owners: &BTreeMap<AgentSessionId, String>,
@@ -430,6 +557,8 @@ fn session_id_for_request(
     match request {
         ClientRequest::GetAgentSession { session_id }
         | ClientRequest::GetAgentSessionSnapshot { session_id }
+        | ClientRequest::GetAgentSessionSnapshotMetadata { session_id }
+        | ClientRequest::GetAgentSessionInitialState { session_id }
         | ClientRequest::RenameAgentSession { session_id, .. }
         | ClientRequest::ArchiveAgentSession { session_id }
         | ClientRequest::GetRecentSessionEvents { session_id, .. }
@@ -1206,6 +1335,8 @@ pub(crate) struct LoomView {
     browser_demo_mode: bool,
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
+    #[cfg(not(target_family = "wasm"))]
+    owned_backend: Option<Arc<InProcessBackend>>,
     /// Used for every request made once the view is interactive.
     pub(crate) backend: BackendWorker,
     /// The startup backend remains the default for workspace requests and new sessions.
@@ -1258,7 +1389,12 @@ pub(crate) struct LoomView {
     pub(crate) theme_choice: ThemeChoice,
     appearance_subscription: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
+    event_stream_epoch: Option<String>,
     pub(crate) timeline: Vec<TimelineItem>,
+    transcript_before_ordinal: Option<u64>,
+    transcript_has_older: bool,
+    transcript_loading: bool,
+    transcript_generation: u64,
     timeline_view: Option<Entity<TimelineView>>,
     pub(crate) activity_records_seen: bool,
     pub(crate) expanded_activities: BTreeSet<ActivityId>,
@@ -1518,8 +1654,9 @@ impl Render for TimelineView {
         }
 
         let parent = self.parent.clone();
+        let parent_for_rows = parent.clone();
         let timeline = list(self.list_state.clone(), move |index, _window, cx| {
-            let view = parent.read(cx);
+            let view = parent_for_rows.read(cx);
             let item = &view.timeline[index];
             div()
                 .w_full()
@@ -1529,13 +1666,44 @@ impl Render for TimelineView {
                     div()
                         .w_full()
                         .max_w(TIMELINE_CONTENT_MAX_WIDTH)
-                        .child(view.render_timeline_item(item, index, &parent)),
+                        .child(view.render_timeline_item(item, index, &parent_for_rows)),
                 )
                 .into_any()
         })
         .size_full();
-
-        div().size_full().p_3().child(timeline)
+        if parent_state.transcript_has_older || parent_state.transcript_loading {
+            let loading = parent_state.transcript_loading;
+            let parent_for_page = parent.clone();
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(
+                    div().w_full().flex().justify_center().p_2().child(
+                        Button::new("load-older-transcript")
+                            .label(if loading {
+                                "Loading older messages…"
+                            } else {
+                                "Load older messages"
+                            })
+                            .small()
+                            .disabled(loading)
+                            .on_click(move |_, _, cx| {
+                                parent_for_page.update(cx, |view, cx| {
+                                    view.begin_transcript_page(view.transcript_before_ordinal, cx);
+                                });
+                            }),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .child(div().size_full().p_3().child(timeline)),
+                )
+        } else {
+            div().size_full().p_3().child(timeline)
+        }
     }
 }
 
@@ -1552,6 +1720,8 @@ impl LoomView {
         Self {
             backend,
             connection,
+            #[cfg(not(target_family = "wasm"))]
+            owned_backend: None,
             default_backend_node_id: node_id.clone(),
             node_backends,
             node_names: BTreeMap::new(),
@@ -1598,7 +1768,12 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
+            event_stream_epoch: None,
             timeline: Vec::new(),
+            transcript_before_ordinal: None,
+            transcript_has_older: false,
+            transcript_loading: false,
+            transcript_generation: 0,
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
@@ -1689,6 +1864,24 @@ impl Focusable for LoomView {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+impl Drop for LoomView {
+    fn drop(&mut self) {
+        self.shutdown_owned_backend();
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl LoomView {
+    fn shutdown_owned_backend(&self) {
+        if let Some(backend) = &self.owned_backend
+            && let Err(error) = backend.shutdown()
+        {
+            log::warn!("could not drain local backend during UI teardown: {error}");
+        }
+    }
+}
+
 impl LoomView {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn try_new(
@@ -1697,7 +1890,8 @@ impl LoomView {
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
         let mut remote_cleanup_guard = None;
-        let (connection, workspace_root, demo_workspace) = if let Some(remote_url) = &options.remote
+        let (connection, workspace_root, demo_workspace, owned_backend) = if let Some(remote_url) =
+            &options.remote
         {
             info!("connecting to remote backend");
             if worker_url_embeds_credential(remote_url) {
@@ -1725,7 +1919,7 @@ impl LoomView {
                     )
                 })?
                 .unwrap_or_default();
-            (connection, workspace_root, false)
+            (connection, workspace_root, false, None)
         } else {
             let (workspace_root, demo_workspace) = prepare_workspace(options)?;
             info!(
@@ -1760,13 +1954,14 @@ impl LoomView {
                 ClientConnection::InProcess(Box::new(backend.connect())),
                 workspace_root,
                 demo_workspace,
+                Some(backend),
             )
         };
         if options.remote.is_none() {
             info!("negotiating protocol");
             negotiate(&connection)?;
         }
-        Self::initialize_from_connection(
+        let mut view = Self::initialize_from_connection(
             options,
             connection,
             workspace_root,
@@ -1774,7 +1969,9 @@ impl LoomView {
             remote_cleanup_guard,
             focus_handle,
             true,
-        )
+        )?;
+        view.owned_backend = owned_backend;
+        Ok(view)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -1895,6 +2092,8 @@ impl LoomView {
         let mut view = Self {
             backend,
             connection: connection.clone(),
+            #[cfg(not(target_family = "wasm"))]
+            owned_backend: None,
             default_backend_node_id: default_backend_node_id.clone(),
             node_backends,
             node_names,
@@ -1945,7 +2144,12 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
+            event_stream_epoch: None,
             timeline: Vec::new(),
+            transcript_before_ordinal: None,
+            transcript_has_older: false,
+            transcript_loading: false,
+            transcript_generation: 0,
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
@@ -2103,6 +2307,7 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
+            event_stream_epoch: None,
             timeline: if demo_mode {
                 vec![
                     TimelineItem::User("What can Loom do?".to_owned()),
@@ -2111,6 +2316,10 @@ impl LoomView {
             } else {
                 Vec::new()
             },
+            transcript_before_ordinal: None,
+            transcript_has_older: false,
+            transcript_loading: false,
+            transcript_generation: 0,
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
@@ -2315,7 +2524,12 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
+            event_stream_epoch: None,
             timeline: Vec::new(),
+            transcript_before_ordinal: None,
+            transcript_has_older: false,
+            transcript_loading: false,
+            transcript_generation: 0,
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
@@ -2734,6 +2948,10 @@ impl LoomView {
 
     pub(crate) fn reset_projection(&mut self) {
         self.timeline.clear();
+        self.transcript_generation = self.transcript_generation.wrapping_add(1);
+        self.transcript_before_ordinal = None;
+        self.transcript_has_older = false;
+        self.transcript_loading = false;
         self.activity_records_seen = false;
         self.expanded_activities.clear();
         self.expanded_command_groups.clear();
@@ -2803,16 +3021,35 @@ impl LoomView {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn load_session(&mut self, session: AgentSessionSnapshot) {
         self.activate_session(session);
-        let fallback_projection = match self
-            .connection
-            .request(RequestEnvelope::new(
+        let metadata_response = self.connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionInitialState {
+                session_id: self.active_session.id,
+            },
+        ));
+        let snapshot_response = if metadata_response.result.is_err() {
+            self.connection.request(RequestEnvelope::new(
                 ClientRequest::GetAgentSessionSnapshot {
                     session_id: self.active_session.id,
                 },
             ))
-            .result
-        {
+        } else {
+            metadata_response
+        };
+        let mut event_cursor = None;
+        let snapshot_result = match snapshot_response.result {
+            Ok(ServerResponse::AgentSessionInitialState(initial)) => {
+                event_cursor = Some(initial.cursor);
+                Ok(ServerResponse::AgentSessionSnapshot(initial.projection))
+            }
+            result => result,
+        };
+        let mut needs_transcript_page = false;
+        let fallback_projection = match snapshot_result {
             Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
+                needs_transcript_page = projection
+                    .active_run
+                    .as_ref()
+                    .is_some_and(|run| run.messages.is_empty());
                 self.active_session = projection.session.clone();
                 self.session_state = self.active_session.state;
                 self.auto_approve_actions = projection.auto_approve_actions;
@@ -2838,10 +3075,18 @@ impl LoomView {
             }
         };
         if let Err(error) = self.collect_events_since(
-            None,
+            event_cursor,
             fallback_projection.and_then(|projection| projection.active_run),
         ) {
             self.record_backend_error("load session events", error);
+        }
+        if needs_transcript_page && let Some(run_id) = self.active_run_id {
+            match load_transcript_page_sync(&self.connection, run_id, None) {
+                Ok((messages, next_before, has_older)) => {
+                    self.apply_transcript_page(run_id, None, messages, next_before, has_older);
+                }
+                Err(error) => self.record_backend_error("load conversation history", error),
+            }
         }
         self.ensure_session_task_message(self.active_session.id);
         if let Some(run) = &self.active_run {
@@ -2884,50 +3129,101 @@ impl LoomView {
     #[cfg(not(target_family = "wasm"))]
     fn collect_events_since(
         &mut self,
-        after_sequence: Option<EventSequence>,
-        fallback: Option<AgentRunSnapshotProjection>,
+        mut after_sequence: Option<EventSequence>,
+        mut fallback: Option<AgentRunSnapshotProjection>,
     ) -> Result<(), LoomError> {
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-                    session_id: Some(self.active_session.id),
-                    after_sequence,
-                }));
-        match response.result? {
-            ServerResponse::SessionEvents { events } => {
-                self.reset_projection();
-                for event in events {
-                    self.after_sequence = Some(event.sequence);
-                    self.consume_event(&event.event);
+        let session_id = self.active_session.id;
+        for resync_attempt in 0..=1 {
+            let response =
+                self.connection
+                    .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                        session_id: Some(session_id),
+                        workspace_id: None,
+                        after_sequence,
+                        stream_epoch: self.event_stream_epoch.clone(),
+                    }));
+            match response.result? {
+                ServerResponse::SessionEvents {
+                    events,
+                    stream_epoch,
+                } => {
+                    self.reset_projection();
+                    self.after_sequence = after_sequence;
+                    self.event_stream_epoch = stream_epoch;
+                    for event in events {
+                        self.after_sequence = Some(event.sequence);
+                        self.consume_event(&event.event);
+                    }
+                    if self.timeline.is_empty()
+                        && let Some(projection) = fallback
+                    {
+                        self.apply_run_projection(projection);
+                    }
+                    return Ok(());
                 }
-                if self.timeline.is_empty()
-                    && let Some(projection) = fallback
-                {
-                    self.apply_run_projection(projection);
+                ServerResponse::SessionEventsSnapshot {
+                    session,
+                    events,
+                    latest_sequence,
+                    stream_epoch,
+                    ..
+                } if resync_attempt == 0 => {
+                    self.event_stream_epoch = stream_epoch;
+                    self.active_session = session;
+                    let refreshed = self.connection.request(RequestEnvelope::new(
+                        ClientRequest::GetAgentSessionInitialState { session_id },
+                    ));
+                    if let Ok(ServerResponse::AgentSessionInitialState(initial)) = refreshed.result
+                    {
+                        after_sequence = Some(initial.cursor);
+                        fallback = initial.projection.active_run;
+                        self.active_session = initial.projection.session;
+                        self.session_state = self.active_session.state;
+                        self.auto_approve_actions = initial.projection.auto_approve_actions;
+                        self.session_auto_approve_actions
+                            .insert(session_id, initial.projection.auto_approve_actions);
+                        let _ = events;
+                        continue;
+                    }
+                    self.apply_event_snapshot(events, latest_sequence, fallback);
+                    return Ok(());
                 }
+                ServerResponse::SessionEventsSnapshot {
+                    session,
+                    events,
+                    latest_sequence,
+                    stream_epoch,
+                    ..
+                } => {
+                    self.active_session = session;
+                    self.event_stream_epoch = stream_epoch;
+                    self.apply_event_snapshot(events, latest_sequence, fallback);
+                    return Ok(());
+                }
+                response => return Err(unexpected_response("session event stream", response)),
             }
-            ServerResponse::SessionEventsSnapshot {
-                session,
-                events,
-                latest_sequence,
-                ..
-            } => {
-                self.active_session = session;
-                self.reset_projection();
-                self.after_sequence = Some(latest_sequence);
-                for event in events {
-                    self.after_sequence = Some(event.sequence);
-                    self.consume_event(&event.event);
-                }
-                if self.timeline.is_empty()
-                    && let Some(projection) = fallback
-                {
-                    self.apply_run_projection(projection);
-                }
-            }
-            response => return Err(unexpected_response("session event stream", response)),
         }
         Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn apply_event_snapshot(
+        &mut self,
+        events: Vec<loom_protocol::ServerEventEnvelope>,
+        latest_sequence: EventSequence,
+        fallback: Option<AgentRunSnapshotProjection>,
+    ) {
+        self.reset_projection();
+        self.after_sequence = Some(latest_sequence);
+        for event in events {
+            self.after_sequence = Some(event.sequence);
+            self.consume_event(&event.event);
+        }
+        if self.timeline.is_empty()
+            && let Some(projection) = fallback
+        {
+            self.apply_run_projection(projection);
+        }
     }
 
     /// Applies newly journaled session events through the connection worker.
@@ -2936,11 +3232,17 @@ impl LoomView {
             cx,
             ClientRequest::GetSessionEvents {
                 session_id: Some(self.active_session.id),
+                workspace_id: None,
                 after_sequence: self.after_sequence,
+                stream_epoch: self.event_stream_epoch.clone(),
             },
             |view, response, cx| {
                 match response.result {
-                    Ok(ServerResponse::SessionEvents { events }) => {
+                    Ok(ServerResponse::SessionEvents {
+                        events,
+                        stream_epoch,
+                    }) => {
+                        view.event_stream_epoch = stream_epoch;
                         for event in events {
                             view.after_sequence = Some(event.sequence);
                             view.consume_event(&event.event);
@@ -2950,8 +3252,10 @@ impl LoomView {
                         session,
                         events,
                         latest_sequence,
+                        stream_epoch,
                         ..
                     }) => {
+                        view.event_stream_epoch = stream_epoch;
                         view.active_session = session;
                         view.reset_projection();
                         view.after_sequence = Some(latest_sequence);
@@ -3089,7 +3393,14 @@ impl LoomView {
                 completed: BTreeSet::new(),
                 active: None,
             }),
-            AgentEvent::UserMessage { text, .. } => {
+            AgentEvent::UserMessage {
+                run_id,
+                attempt_id,
+                control_revision,
+                text,
+                ..
+            } => {
+                self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 if self
                     .optimistic_messages
                     .first()
@@ -3157,7 +3468,14 @@ impl LoomView {
                     });
                 }
             }
-            AgentEvent::ToolApprovalRequired { call, .. } => {
+            AgentEvent::ToolApprovalRequired {
+                run_id,
+                attempt_id,
+                control_revision,
+                call,
+                ..
+            } => {
+                self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 for item in &mut self.timeline {
                     if let TimelineItem::Approval { active, .. } = item {
                         *active = false;
@@ -3172,7 +3490,13 @@ impl LoomView {
                 }
             }
             AgentEvent::ToolPolicyEvaluated { .. } => {}
-            AgentEvent::ToolApprovalDecided { .. } => {
+            AgentEvent::ToolApprovalDecided {
+                run_id,
+                attempt_id,
+                control_revision,
+                ..
+            } => {
+                self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 self.pending_approval = None;
                 self.approval_request_in_flight = false;
                 for item in &mut self.timeline {
@@ -3209,7 +3533,14 @@ impl LoomView {
                 self.enable_activity_projection();
                 upsert_activity(&mut self.timeline, activity.clone());
             }
-            AgentEvent::NeedsInput { prompt, .. } => {
+            AgentEvent::NeedsInput {
+                run_id,
+                attempt_id,
+                control_revision,
+                prompt,
+                ..
+            } => {
+                self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 self.pending_input = Some(prompt.clone());
                 self.timeline.push(TimelineItem::NeedsInput(prompt.clone()));
             }
@@ -3246,6 +3577,18 @@ impl LoomView {
                     });
                 }
             }
+        }
+    }
+
+    fn update_active_run_control(
+        &mut self,
+        run_id: RunId,
+        attempt_id: loom_core::RunAttemptId,
+        control_revision: u64,
+    ) {
+        if let Some(run) = self.active_run.as_mut().filter(|run| run.id == run_id) {
+            run.attempt_id = attempt_id;
+            run.control_revision = control_revision;
         }
     }
 
@@ -3587,9 +3930,19 @@ impl LoomView {
             None
         };
         let request = if let Some(run_id) = self.active_run_id {
+            let Some(run) = self.active_run.as_ref().filter(|run| run.id == run_id) else {
+                self.sending_message = false;
+                self.record_backend_error(
+                    "send message",
+                    LoomError::invalid_state("active run control state is unavailable"),
+                );
+                return;
+            };
             self.optimistic_messages.push(message.clone());
             ClientRequest::SendAgentMessage {
                 run_id,
+                attempt_id: run.attempt_id,
+                expected_control_revision: run.control_revision,
                 message: message.clone(),
             }
         } else {
@@ -3693,11 +4046,20 @@ impl LoomView {
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
             return;
         };
+        let Some(run) = self.active_run.as_ref().filter(|run| run.id == run_id) else {
+            self.record_backend_error(
+                "approve action",
+                LoomError::invalid_state("active run control state is unavailable"),
+            );
+            return;
+        };
         self.approval_request_in_flight = true;
         self.dispatch(
             cx,
             ClientRequest::ApproveAgentAction {
                 run_id,
+                attempt_id: run.attempt_id,
+                expected_control_revision: run.control_revision,
                 tool_call_id: call.id,
             },
             |view, response, cx| view.finish_approval_response(response, cx),
@@ -3711,11 +4073,20 @@ impl LoomView {
         let (Some(run_id), Some(call)) = (self.active_run_id, self.pending_approval.clone()) else {
             return;
         };
+        let Some(run) = self.active_run.as_ref().filter(|run| run.id == run_id) else {
+            self.record_backend_error(
+                "reject action",
+                LoomError::invalid_state("active run control state is unavailable"),
+            );
+            return;
+        };
         self.approval_request_in_flight = true;
         self.dispatch(
             cx,
             ClientRequest::RejectAgentAction {
                 run_id,
+                attempt_id: run.attempt_id,
+                expected_control_revision: run.control_revision,
                 tool_call_id: call.id,
                 reason: None,
             },
@@ -3808,21 +4179,74 @@ impl LoomView {
         }
         self.ensure_session_task_message(session.id);
         let session_id = session.id;
+        let mut event_stream_epoch = self.event_stream_epoch.clone();
         let snapshot_request = backend.submit(RequestEnvelope::new(
-            ClientRequest::GetAgentSessionSnapshot { session_id },
+            ClientRequest::GetAgentSessionInitialState { session_id },
         ));
         cx.spawn(async move |view, cx| {
-            let snapshot = cx
+            let mut snapshot = cx
                 .background_spawn(async move { snapshot_request.wait().await })
                 .await;
+            if snapshot.result.is_err() {
+                snapshot = backend
+                    .submit(RequestEnvelope::new(
+                        ClientRequest::GetAgentSessionSnapshot { session_id },
+                    ))
+                    .wait()
+                    .await;
+            }
+            let cursor = match &snapshot.result {
+                Ok(ServerResponse::AgentSessionInitialState(initial)) => Some(initial.cursor),
+                _ => None,
+            };
+            if let Ok(ServerResponse::AgentSessionInitialState(initial)) = snapshot.result.clone() {
+                snapshot.result = Ok(ServerResponse::AgentSessionSnapshot(initial.projection));
+            }
             let events_request =
                 backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
-                    after_sequence: None,
+                    workspace_id: None,
+                    after_sequence: cursor,
+                    stream_epoch: event_stream_epoch.clone(),
                 }));
-            let events = cx
+            let mut events = cx
                 .background_spawn(async move { events_request.wait().await })
                 .await;
+            if let Ok(ServerResponse::SessionEventsSnapshot {
+                stream_epoch: Some(epoch),
+                ..
+            }) = &events.result
+            {
+                event_stream_epoch = Some(epoch.clone());
+            }
+            if matches!(
+                &events.result,
+                Ok(ServerResponse::SessionEventsSnapshot { .. })
+            ) {
+                let refresh_request = backend.submit(RequestEnvelope::new(
+                    ClientRequest::GetAgentSessionInitialState { session_id },
+                ));
+                let mut refreshed = cx
+                    .background_spawn(async move { refresh_request.wait().await })
+                    .await;
+                if let Ok(ServerResponse::AgentSessionInitialState(initial)) =
+                    refreshed.result.clone()
+                {
+                    let refreshed_cursor = initial.cursor;
+                    refreshed.result = Ok(ServerResponse::AgentSessionSnapshot(initial.projection));
+                    let retry_request =
+                        backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                            session_id: Some(session_id),
+                            workspace_id: None,
+                            after_sequence: Some(refreshed_cursor),
+                            stream_epoch: event_stream_epoch.clone(),
+                        }));
+                    snapshot = refreshed;
+                    events = cx
+                        .background_spawn(async move { retry_request.wait().await })
+                        .await;
+                }
+            }
             view.update(cx, |view, cx| {
                 view.finish_async_session_load(session_id, snapshot, events, cx);
             })
@@ -3842,6 +4266,13 @@ impl LoomView {
         if self.active_session.id != session_id {
             return;
         }
+        let needs_transcript_page = match &snapshot_response.result {
+            Ok(ServerResponse::AgentSessionSnapshot(projection)) => projection
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.messages.is_empty()),
+            _ => false,
+        };
         let fallback_projection = match snapshot_response.result {
             Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
                 self.active_session = projection.session.clone();
@@ -3870,8 +4301,15 @@ impl LoomView {
             }
         };
         self.reset_projection();
+        self.after_sequence = fallback_projection
+            .as_ref()
+            .map(|projection| projection.latest_sequence);
         match events_response.result {
-            Ok(ServerResponse::SessionEvents { events }) => {
+            Ok(ServerResponse::SessionEvents {
+                events,
+                stream_epoch,
+            }) => {
+                self.event_stream_epoch = stream_epoch;
                 for event in events {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
@@ -3888,8 +4326,10 @@ impl LoomView {
                 session,
                 events,
                 latest_sequence,
+                stream_epoch,
                 ..
             }) => {
+                self.event_stream_epoch = stream_epoch;
                 self.active_session = session;
                 self.reset_projection();
                 self.after_sequence = Some(latest_sequence);
@@ -3920,8 +4360,103 @@ impl LoomView {
             ),
         }
         self.ensure_session_task_message(session_id);
+        if needs_transcript_page && self.active_run_id.is_some() {
+            self.begin_transcript_page(None, cx);
+        }
         self.refresh_review(cx);
         cx.notify();
+    }
+
+    fn begin_transcript_page(&mut self, before_ordinal: Option<u64>, cx: &mut Context<Self>) {
+        let Some(run_id) = self.active_run_id else {
+            return;
+        };
+        if self.transcript_loading || (before_ordinal.is_some() && !self.transcript_has_older) {
+            return;
+        }
+        let backend = match self.backend_for_session(self.active_session.id) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.record_backend_error("load conversation history", error);
+                cx.notify();
+                return;
+            }
+        };
+        let transcript_generation = self.transcript_generation;
+        self.transcript_loading = true;
+        cx.notify();
+        cx.spawn(async move |view, cx| {
+            let result = load_transcript_page(backend, run_id, before_ordinal).await;
+            view.update(cx, |view, cx| {
+                if view.active_run_id != Some(run_id)
+                    || view.transcript_generation != transcript_generation
+                {
+                    return;
+                }
+                view.transcript_loading = false;
+                match result {
+                    Ok((messages, next_before, has_older)) => {
+                        view.apply_transcript_page(
+                            run_id,
+                            before_ordinal,
+                            messages,
+                            next_before,
+                            has_older,
+                        );
+                    }
+                    Err(error) => view.record_backend_error("load conversation history", error),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_transcript_page(
+        &mut self,
+        run_id: RunId,
+        before_ordinal: Option<u64>,
+        messages: Vec<ModelMessage>,
+        next_before: Option<u64>,
+        has_older: bool,
+    ) {
+        if self.active_run_id != Some(run_id) {
+            return;
+        }
+        let page_items = timeline_items_from_messages(messages, self.activity_records_seen);
+        if before_ordinal.is_none() {
+            self.timeline.retain(|item| {
+                !matches!(
+                    item,
+                    TimelineItem::User(_)
+                        | TimelineItem::Assistant(_)
+                        | TimelineItem::ToolOutput(_)
+                )
+            });
+            let insertion_index = self.transcript_insertion_index();
+            self.timeline
+                .splice(insertion_index..insertion_index, page_items);
+        } else {
+            let insertion_index = self.transcript_insertion_index();
+            prepend_timeline_page(&mut self.timeline, page_items, insertion_index);
+        }
+        self.transcript_before_ordinal = next_before;
+        self.transcript_has_older = has_older;
+        self.ensure_session_task_message(self.active_session.id);
+    }
+
+    fn transcript_insertion_index(&self) -> usize {
+        let mut index = usize::from(matches!(
+            self.timeline.first(),
+            Some(TimelineItem::Plan { .. })
+        ));
+        let task = self.session_task_cache.get(&self.active_session.id);
+        if matches!(self.timeline.get(index), Some(TimelineItem::User(text)) if task == Some(text))
+        {
+            index += 1;
+        }
+        index
     }
 
     pub(crate) fn ensure_session_task_message(&mut self, session_id: AgentSessionId) {
@@ -3933,7 +4468,11 @@ impl LoomView {
             .iter()
             .any(|item| matches!(item, TimelineItem::User(text) if text == &task))
         {
-            self.timeline.insert(0, TimelineItem::User(task));
+            let index = usize::from(matches!(
+                self.timeline.first(),
+                Some(TimelineItem::Plan { .. })
+            ));
+            self.timeline.insert(index, TimelineItem::User(task));
         }
     }
 
@@ -10352,9 +10891,9 @@ mod loom_view_render_tests {
             let workspace_root =
                 std::env::temp_dir().join(format!("loom-ui-bootstrap-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&workspace_root).unwrap();
-            let connection = super::ClientConnection::InProcess(Box::new(
-                loom_server::InProcessBackend::new().connect(),
-            ));
+            let local_backend = loom_server::InProcessBackend::new();
+            let connection = super::ClientConnection::InProcess(Box::new(local_backend.connect()));
+            let connection_after_teardown = connection.clone();
             crate::connection::negotiate(&connection).unwrap();
             let mut view = LoomView::initialize_from_connection(
                 &options,
@@ -10366,6 +10905,7 @@ mod loom_view_render_tests {
                 false,
             )
             .unwrap();
+            view.owned_backend = Some(local_backend);
             assert_eq!(view.workspaces.len(), 1);
             assert_eq!(view.sessions.len(), 1);
             assert!(view.models.contains(&ModelId::new("deterministic/demo")));
@@ -10373,6 +10913,13 @@ mod loom_view_render_tests {
             // Avoid starting the live worker's delayed status poll in this synchronous UI test.
             view.worker_nodes.clear();
             let _ = std::fs::remove_dir_all(workspace_root);
+            view.shutdown_owned_backend();
+            assert!(
+                connection_after_teardown
+                    .request(RequestEnvelope::new(ClientRequest::ListWorkspaces))
+                    .result
+                    .is_err()
+            );
             view
         });
     }
@@ -10429,6 +10976,8 @@ mod loom_view_render_tests {
             view.apply_run_projection(loom_protocol::AgentRunSnapshotProjection {
                 run: loom_protocol::AgentRunSnapshot {
                     id: RunId::new(),
+                    attempt_id: loom_core::RunAttemptId::new(),
+                    control_revision: 0,
                     session_id: view.active_session.id,
                     task: "inspect the repository".to_owned(),
                     model: ModelId::new("deterministic/demo"),
@@ -10473,6 +11022,8 @@ mod loom_view_render_tests {
             view.apply_run_projection(loom_protocol::AgentRunSnapshotProjection {
                 run: loom_protocol::AgentRunSnapshot {
                     id: RunId::new(),
+                    attempt_id: loom_core::RunAttemptId::new(),
+                    control_revision: 0,
                     session_id: view.active_session.id,
                     task: "task".to_owned(),
                     model: ModelId::new("deterministic/demo"),
@@ -11025,8 +11576,12 @@ mod loom_view_render_tests {
                 name: "write_file".to_owned(),
                 arguments: serde_json::json!({"path": "src/main.rs"}),
             };
+            let approval_interaction_id = loom_core::InteractionId::new();
+            let input_interaction_id = loom_core::InteractionId::new();
             let snapshot = loom_protocol::AgentRunSnapshot {
                 id: run_id,
+                attempt_id: loom_core::RunAttemptId::new(),
+                control_revision: 0,
                 session_id: view.active_session.id,
                 task: "update the app".to_owned(),
                 model: ModelId::new("deterministic/demo"),
@@ -11077,6 +11632,9 @@ mod loom_view_render_tests {
                 loom_protocol::AgentEvent::ContextInspected { run_id, inspection },
                 loom_protocol::AgentEvent::UserMessage {
                     run_id,
+                    attempt_id: snapshot.attempt_id,
+                    control_revision: 1,
+                    interaction_id: Some(input_interaction_id),
                     text: "new request".to_owned(),
                 },
                 loom_protocol::AgentEvent::AssistantMessageDelta {
@@ -11095,6 +11653,9 @@ mod loom_view_render_tests {
                 },
                 loom_protocol::AgentEvent::ToolApprovalRequired {
                     run_id,
+                    attempt_id: snapshot.attempt_id,
+                    control_revision: 2,
+                    interaction_id: approval_interaction_id,
                     call: call.clone(),
                 },
                 loom_protocol::AgentEvent::ToolPolicyEvaluated {
@@ -11121,11 +11682,17 @@ mod loom_view_render_tests {
                 },
                 loom_protocol::AgentEvent::ToolApprovalDecided {
                     run_id,
+                    attempt_id: snapshot.attempt_id,
+                    control_revision: 3,
+                    interaction_id: approval_interaction_id,
                     tool_call_id: call.id,
                     decision: loom_protocol::ApprovalDecision::Approved,
                 },
                 loom_protocol::AgentEvent::NeedsInput {
                     run_id,
+                    attempt_id: snapshot.attempt_id,
+                    control_revision: 4,
+                    interaction_id: input_interaction_id,
                     prompt: "Which branch?".to_owned(),
                 },
                 loom_protocol::AgentEvent::RunUsage {
@@ -11225,6 +11792,19 @@ mod loom_view_render_tests {
                 "Loaded session",
             )
             .unwrap();
+            let started = view.connection.request(RequestEnvelope::new(
+                ClientRequest::StartSessionAgentRun {
+                    session_id: session.id,
+                    task: "startup transcript page".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    system_instructions: None,
+                    repository_instructions: None,
+                },
+            ));
+            let run_id = match started.result.unwrap() {
+                ServerResponse::AgentRunStarted(run) => run.id,
+                response => panic!("unexpected run start response: {response:?}"),
+            };
             view.workspace_id = workspace.id;
             view.workspaces.push(workspace);
             view.refresh_sessions().unwrap();
@@ -11233,6 +11813,12 @@ mod loom_view_render_tests {
             assert_eq!(view.active_session.id, session.id);
             assert_eq!(view.active_session.name, "Loaded session");
             assert!(view.after_sequence.is_some());
+            assert!(view.event_stream_epoch.is_some());
+            assert_eq!(view.active_run_id, Some(run_id));
+            assert_eq!(view.transcript_before_ordinal, Some(0));
+            assert!(view.timeline.iter().any(
+                |item| matches!(item, TimelineItem::User(task) if task == "startup transcript page")
+            ));
             view
         });
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
@@ -11249,6 +11835,8 @@ mod loom_view_render_tests {
             let session_id = view.active_session.id;
             let run = loom_protocol::AgentRunSnapshot {
                 id: RunId::new(),
+                attempt_id: loom_core::RunAttemptId::new(),
+                control_revision: 0,
                 session_id,
                 task: "recover the transcript".to_owned(),
                 model: ModelId::new("deterministic/demo"),
@@ -11286,7 +11874,10 @@ mod loom_view_render_tests {
                 ),
                 loom_protocol::ResponseEnvelope::success(
                     loom_core::RequestId::new(),
-                    loom_protocol::ServerResponse::SessionEvents { events: Vec::new() },
+                    loom_protocol::ServerResponse::SessionEvents {
+                        events: Vec::new(),
+                        stream_epoch: None,
+                    },
                 ),
                 cx,
             );
@@ -12958,6 +13549,8 @@ mod worker_node_tests {
             session_id_for_request(
                 &ClientRequest::SendAgentMessage {
                     run_id: RunId::new(),
+                    attempt_id: loom_core::RunAttemptId::new(),
+                    expected_control_revision: 0,
                     message: "hello".to_owned(),
                 },
                 active_session_id
@@ -13189,7 +13782,9 @@ mod worker_node_tests {
             session_id_for_request(
                 &ClientRequest::GetSessionEvents {
                     session_id: None,
-                    after_sequence: None
+                    workspace_id: None,
+                    after_sequence: None,
+                    stream_epoch: None,
                 },
                 active
             ),
@@ -13199,7 +13794,9 @@ mod worker_node_tests {
             session_id_for_request(
                 &ClientRequest::GetSessionEvents {
                     session_id: Some(session),
-                    after_sequence: None
+                    workspace_id: None,
+                    after_sequence: None,
+                    stream_epoch: None,
                 },
                 active
             ),
@@ -13396,5 +13993,118 @@ mod worker_node_tests {
             worker_node_display_name(&external_worker),
             "External worker · local"
         );
+    }
+}
+
+#[cfg(test)]
+mod transcript_paging_tests {
+    use super::{TimelineItem, prepend_timeline_page, timeline_items_from_messages};
+    use loom_model::{MessageRole, ModelMessage};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn transcript_pages_keep_message_order_and_project_tool_output_only_without_activities() {
+        let messages = vec![
+            ModelMessage::new(MessageRole::User, "task"),
+            ModelMessage::new(MessageRole::Assistant, "first"),
+            ModelMessage::new(MessageRole::Assistant, "second"),
+            ModelMessage::new(MessageRole::Tool, "tool output"),
+            ModelMessage::new(MessageRole::System, "hidden"),
+            ModelMessage::new(MessageRole::User, "follow-up"),
+        ];
+
+        assert!(matches!(
+            timeline_items_from_messages(messages.clone(), true).as_slice(),
+            [
+                TimelineItem::User(task),
+                TimelineItem::Assistant(answer),
+                TimelineItem::User(follow_up)
+            ] if task == "task" && answer == "first\n\nsecond" && follow_up == "follow-up"
+        ));
+        assert!(matches!(
+            timeline_items_from_messages(messages, false).as_slice(),
+            [
+                TimelineItem::User(task),
+                TimelineItem::Assistant(answer),
+                TimelineItem::ToolOutput(tool),
+                TimelineItem::User(follow_up)
+            ] if task == "task" && answer == "first\n\nsecond"
+                && tool.contains("tool output") && follow_up == "follow-up"
+        ));
+    }
+
+    #[test]
+    fn older_pages_prepend_and_join_assistant_messages_at_the_page_boundary() {
+        let mut timeline = vec![
+            TimelineItem::Plan {
+                steps: vec!["plan".to_owned()],
+                completed: BTreeSet::new(),
+                active: None,
+            },
+            TimelineItem::User("task".to_owned()),
+            TimelineItem::Assistant("newer answer".to_owned()),
+        ];
+        prepend_timeline_page(
+            &mut timeline,
+            vec![
+                TimelineItem::User("older question".to_owned()),
+                TimelineItem::Assistant("older answer".to_owned()),
+            ],
+            2,
+        );
+        assert!(matches!(
+            timeline.as_slice(),
+            [
+                TimelineItem::Plan { .. },
+                TimelineItem::User(task),
+                TimelineItem::User(question),
+                TimelineItem::Assistant(answer)
+            ] if task == "task" && question == "older question"
+                && answer == "older answer\n\nnewer answer"
+        ));
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn asynchronous_page_loader_uses_the_bounded_transcript_endpoint() {
+        use super::{BackendWorker, ClientConnection, load_transcript_page};
+        use loom_protocol::{ClientRequest, RequestEnvelope, ServerResponse};
+
+        let backend = loom_server::InProcessBackend::new();
+        let connection = ClientConnection::InProcess(Box::new(backend.connect()));
+        crate::connection::negotiate(&connection).unwrap();
+        let workspace =
+            crate::connection::create_workspace(&connection, "Transcript pages").unwrap();
+        let session = crate::connection::create_session_in_workspace(
+            &connection,
+            workspace.id,
+            "Paged session",
+        )
+        .unwrap();
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id: session.id,
+                task: "load only a transcript page".to_owned(),
+                model: loom_model::ModelId::new("deterministic/demo"),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
+        let run_id = match started.result.unwrap() {
+            ServerResponse::AgentRunStarted(run) => run.id,
+            response => panic!("unexpected run start response: {response:?}"),
+        };
+        let worker = BackendWorker::spawn(connection);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (messages, next_before, has_older) = runtime
+            .block_on(load_transcript_page(worker, run_id, None))
+            .unwrap();
+        assert_eq!(next_before, Some(0));
+        assert!(!has_older);
+        assert!(messages.iter().any(|message| {
+            message.role == MessageRole::User && message.content == "load only a transcript page"
+        }));
     }
 }

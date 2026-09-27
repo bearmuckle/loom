@@ -5,6 +5,9 @@ use uuid::Uuid;
 
 macro_rules! uuid_id {
     ($name:ident) => {
+        uuid_id!($name, Uuid::new_v4);
+    };
+    ($name:ident, $generator:path) => {
         #[derive(
             Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
         )]
@@ -13,7 +16,7 @@ macro_rules! uuid_id {
 
         impl $name {
             pub fn new() -> Self {
-                Self(Uuid::new_v4())
+                Self($generator())
             }
 
             pub const fn from_uuid(value: Uuid) -> Self {
@@ -56,14 +59,31 @@ macro_rules! uuid_id {
 uuid_id!(AgentSessionId);
 uuid_id!(ActivityId);
 uuid_id!(CheckpointId);
-uuid_id!(RequestId);
+uuid_id!(InteractionId);
+uuid_id!(RequestId, Uuid::now_v7);
 uuid_id!(RunId);
+uuid_id!(RunAttemptId);
 uuid_id!(StepId);
 uuid_id!(ToolCallId);
 uuid_id!(TerminalId);
 uuid_id!(TaskId);
 uuid_id!(WorkspaceId);
 uuid_id!(RepositoryId);
+
+impl RequestId {
+    /// Returns the immutable Unix-millisecond issue time for UUIDv7 request IDs.
+    /// Older UUIDv4 request IDs have no embedded issue time.
+    pub fn issued_at_unix_millis(&self) -> Option<u64> {
+        let uuid = self.as_uuid();
+        if uuid.get_version_num() != 7 {
+            return None;
+        }
+        let bytes = uuid.as_bytes();
+        Some(u64::from_be_bytes([
+            0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+        ]))
+    }
+}
 
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
@@ -93,7 +113,7 @@ impl fmt::Display for EventSequence {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentSessionId, EventSequence};
+    use super::{AgentSessionId, EventSequence, RequestId};
     use std::str::FromStr;
     use uuid::Uuid;
 
@@ -111,6 +131,11 @@ mod tests {
             id
         );
         assert_ne!(AgentSessionId::new(), AgentSessionId::new());
+        let request_id = RequestId::new();
+        assert_eq!(request_id.as_uuid().get_version_num(), 7);
+        assert!(request_id.issued_at_unix_millis().is_some());
+        let legacy_request_id = RequestId::from_uuid(Uuid::new_v4());
+        assert_eq!(legacy_request_id.issued_at_unix_millis(), None);
         assert_eq!(AgentSessionId::default().as_uuid().get_version_num(), 4);
     }
 

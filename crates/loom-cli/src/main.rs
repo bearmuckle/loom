@@ -95,6 +95,8 @@ fn main() -> Result<(), LoomError> {
             session.id,
             run_id,
         )?;
+    } else {
+        backend.shutdown()?;
     }
     Ok(())
 }
@@ -288,7 +290,9 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
             )
         })?;
     runtime.block_on(async move {
-        let server = RemoteServer::new(backend, auth, config).bind().await?;
+        let server = RemoteServer::new(backend.clone(), auth, config)
+            .bind()
+            .await?;
         println!(
             "Loom remote backend listening at {}",
             server.websocket_url()
@@ -301,7 +305,8 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
                 false,
             )
         })?;
-        server.stop().await
+        server.stop().await?;
+        backend.shutdown()
     })
 }
 
@@ -323,7 +328,9 @@ fn run_m4_demo(options: CliOptions) -> Result<(), LoomError> {
             )
         })?;
     runtime.block_on(async move {
-        let server = RemoteServer::new(backend, auth, config).bind().await?;
+        let server = RemoteServer::new(backend.clone(), auth, config)
+            .bind()
+            .await?;
         let result = m4_demo_remote(
             server.websocket_url().to_owned(),
             token.to_owned(),
@@ -332,7 +339,7 @@ fn run_m4_demo(options: CliOptions) -> Result<(), LoomError> {
         )
         .await;
         let stop_result = server.stop().await;
-        result.and(stop_result)
+        result.and(stop_result).and_then(|()| backend.shutdown())
     })
 }
 
@@ -420,17 +427,30 @@ async fn m4_demo_remote(
     let mut second = transport.connect().await?;
     negotiate_remote(&mut second).await?;
     let mut after = None;
+    let mut stream_epoch = None;
     let mut completed = false;
     for _ in 0..100 {
         let response = second
             .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session.id),
+                workspace_id: None,
                 after_sequence: after,
+                stream_epoch: stream_epoch.clone(),
             }))
             .await?;
         let events = match response.result? {
-            ServerResponse::SessionEvents { events }
-            | ServerResponse::SessionEventsSnapshot { events, .. } => events,
+            ServerResponse::SessionEvents {
+                events,
+                stream_epoch: current_epoch,
+            }
+            | ServerResponse::SessionEventsSnapshot {
+                events,
+                stream_epoch: current_epoch,
+                ..
+            } => {
+                stream_epoch = current_epoch;
+                events
+            }
             response => return Err(unexpected_response("remote event resume", response)),
         };
         if events.is_empty() {
@@ -451,7 +471,10 @@ async fn m4_demo_remote(
                 event:
                     AgentEvent::ToolApprovalRequired {
                         run_id: event_run,
+                        attempt_id,
+                        control_revision,
                         call,
+                        ..
                     },
             } = &event.event
                 && *event_run == run_id
@@ -460,6 +483,8 @@ async fn m4_demo_remote(
                 second
                     .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
                         run_id,
+                        attempt_id: *attempt_id,
+                        expected_control_revision: *control_revision,
                         tool_call_id: call.id,
                     }))
                     .await?
@@ -713,7 +738,7 @@ fn demonstrate_m3_recovery(
             );
         }
     }
-    backend.flush()?;
+    backend.shutdown()?;
     drop(connection);
     drop(backend);
 
@@ -734,10 +759,12 @@ fn demonstrate_m3_recovery(
     };
     let events = recovered.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
         session_id: Some(session_id),
+        workspace_id: None,
         after_sequence: None,
+        stream_epoch: None,
     }));
     let event_count = match events.result? {
-        ServerResponse::SessionEvents { events } => events.len(),
+        ServerResponse::SessionEvents { events, .. } => events.len(),
         response => return Err(unexpected_response("recovered events", response)),
     };
     let filesystem = recovered.request(RequestEnvelope::new(
@@ -948,16 +975,25 @@ fn stream_run(
     manual_approval: bool,
 ) -> Result<(), LoomError> {
     let mut after = None;
+    let mut stream_epoch = None;
     // The run executes on a backend worker, so an empty poll only means the
     // current step has not journaled anything yet.
     let mut idle_polls = 0_u32;
     loop {
         let response = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: after,
+            stream_epoch: stream_epoch.clone(),
         }));
         let events = match response.result? {
-            ServerResponse::SessionEvents { events } => events,
+            ServerResponse::SessionEvents {
+                events,
+                stream_epoch: current_epoch,
+            } => {
+                stream_epoch = current_epoch;
+                events
+            }
             response => return Err(unexpected_response("event stream", response)),
         };
         if events.is_empty() {
@@ -982,7 +1018,10 @@ fn stream_run(
                 event:
                     AgentEvent::ToolApprovalRequired {
                         run_id: event_run_id,
+                        attempt_id,
+                        control_revision,
                         call,
+                        ..
                     },
             } = &event.event
             {
@@ -998,11 +1037,15 @@ fn stream_run(
                 let request = if approved {
                     ClientRequest::ApproveAgentAction {
                         run_id,
+                        attempt_id: *attempt_id,
+                        expected_control_revision: *control_revision,
                         tool_call_id: call.id,
                     }
                 } else {
                     ClientRequest::RejectAgentAction {
                         run_id,
+                        attempt_id: *attempt_id,
+                        expected_control_revision: *control_revision,
                         tool_call_id: call.id,
                         reason: Some("denied at the native shell".to_owned()),
                     }

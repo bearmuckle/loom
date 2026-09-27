@@ -83,6 +83,19 @@ projection after reconnecting, while avoiding unbounded memory growth. A
 client that falls behind must be able to request a fresh snapshot and resume
 from a known sequence.
 
+Workspace-scoped `GetSessionEvents` requests require the
+`SubscribeWorkspaceEvents` capability. The server returns typed workspace
+event responses for these requests; it does not fall back to a session-only
+response shape.
+
+Workspace-scoped `GetSessionEvents` requests from capable clients return `WorkspaceEvents` when the
+cursor is current and `WorkspaceEventsSnapshot` when the client must resync.
+Their entries are a union of session event envelopes and workspace event
+envelopes. Workspace rename and configuration
+revision changes carry a workspace ID directly and never use a synthetic
+session ID. The workspace sequence is shared with session events so clients can
+resume one ordered workspace feed.
+
 The server retains a bounded global journal (4096 events by default). If a
 session-specific cursor is older than the retained range,
 `GetSessionEvents` returns `SessionEventsSnapshot` with the current session

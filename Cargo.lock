@@ -4240,6 +4240,7 @@ dependencies = [
  "loom-tools",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -4292,10 +4293,16 @@ dependencies = [
 name = "loom-persistence"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "loom-core",
+ "loom-model",
+ "loom-protocol",
+ "loom-providers",
+ "loom-session",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "uuid",
 ]
 
