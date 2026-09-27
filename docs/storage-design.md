@@ -12,7 +12,12 @@ The redundant generic `models` section is no longer written or read; model
 discovery is reconstructed from the provider registry. Schema v33 stores run
 summary fields as typed columns instead of repeating them in a JSON snapshot;
 evidence remains in ordered child rows. This reduced the 100k synthetic store
-fixture by 28.3%.
+fixture by 28.3%. Schema v34 removes generic per-run `AgentRuntimeState`
+sections. Recovery configuration (instructions, approval policy, runtime
+options, and token-budget diagnostics) now lives in a run-keyed table; the
+server reconstructs runtime state from this row plus indexed summaries,
+execution state, plans, transcripts, attempts, activities, interactions, and
+context checkpoints. No duplicate whole-run JSON snapshot is written.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at that
@@ -505,7 +510,7 @@ Implement in this order:
    Runtime context checkpoints now include a repaired-prefix digest and
    projection version, and are invalidated when recovered history differs.
    Schema v19 stores ordered run activities in typed rows with session/time and
-   tool-call indexes; activity data is content-addressed, and runtime section
+   tool-call indexes; activity data is content-addressed, and older runtime section
    snapshots no longer embed a second copy. Activity rows are written
    transactionally with run summaries and restored for both restart recovery
    and on-demand run detail loads.
@@ -520,7 +525,8 @@ Implement in this order:
    identity and expected control revision, and stale commands are rejected;
    the run snapshot persists those guards across recovery. Typed interaction rows,
    keyed by run and interaction with attempt/revision, status, prompt, decision,
-   and time columns, are now persisted separately from runtime sections.
+   and time columns, were persisted separately from the earlier runtime sections; schema
+   v34 removes those generic run sections altogether.
    Interaction rows, run summaries, and the reconnect feed share one SQLite
    transaction; history is loaded on demand and pending interactions are
    restored before guarded commands are accepted. A command's decision is
@@ -549,8 +555,8 @@ Implement in this order:
    derived from activity records. Schema v25 stores run usage as typed integer
    counters; session totals are computed with an indexed SQLite aggregate while
    live runs are overlaid from memory. Schema v26 stores ordered plan steps and
-   evidence links in child rows and removes those vectors from run/runtime JSON
-   snapshots. Schema v27 stores ordered filesystem edit history and change
+   evidence links in child rows, removing those vectors from run/runtime JSON
+   snapshots before schema v34 removed the generic run snapshot altogether. Schema v27 stores ordered filesystem edit history and change
    records separately; undo bytes use the shared content store. Schema v28
    normalizes repository and directory mounts. Schema v29 stores typed context
    checkpoints. Schema v30 separates the filesystem sequence high-water mark,

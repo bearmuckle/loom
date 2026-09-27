@@ -20,8 +20,8 @@ use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, Prov
 use loom_persistence::{
     CURRENT_SCHEMA_VERSION, DurableFeedSessionCursor, DurableFeedState, DurableFilesystemEdit,
     DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
-    DurableRunContextCheckpoint, DurableRunMessage, DurableRunSummary, DurableSessionSettings,
-    DurableStateWrite, FilePersistence,
+    DurableRunContextCheckpoint, DurableRunMessage, DurableRunRuntimeConfig, DurableRunSummary,
+    DurableSessionSettings, DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -695,7 +695,6 @@ struct PersistedBackendState {
 struct PersistedRunSummary {
     snapshot: AgentRunSnapshot,
     usage: UsageSnapshot,
-    section: String,
 }
 
 fn durable_run_messages_from_runtime(messages: &[ModelMessage]) -> Vec<DurableRunMessage> {
@@ -800,6 +799,48 @@ fn execution_state_from_runtime(state: &AgentRuntimeState) -> Result<AgentExecut
         pending_approval: state.pending_approval.clone(),
         pending_input: state.pending_input.clone(),
         last_failed_call: state.last_failed_call.clone(),
+    })
+}
+
+fn runtime_state_from_durable_config(
+    summary: &PersistedRunSummary,
+    config: DurableRunRuntimeConfig,
+) -> Result<AgentRuntimeState> {
+    let options = serde_json::from_value(config.options).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted run runtime options are malformed: {error}"),
+            false,
+        )
+    })?;
+    Ok(AgentRuntimeState {
+        session_id: summary.snapshot.session_id,
+        task: AgentTask {
+            task: summary.snapshot.task.clone(),
+            model: summary.snapshot.model.clone(),
+            system_instructions: config.system_instructions,
+            repository_instructions: config.repository_instructions,
+        },
+        run: summary.snapshot.clone(),
+        plan: loom_agent::AgentPlan { steps: Vec::new() },
+        messages: Vec::new(),
+        attempts: Vec::new(),
+        pending_approval: None,
+        pending_tool_execution: None,
+        pending_input: None,
+        last_failed_call: None,
+        next_message_id: 0,
+        active_message_id: None,
+        approval_policy: config.approval_policy,
+        options,
+        usage: summary.usage.clone(),
+        context_inspection: config.context_inspection,
+        context_checkpoint: None,
+        provider_cursor: 0,
+        step_id: None,
+        step_index: 0,
+        activities: Vec::new(),
+        interactions: Vec::new(),
     })
 }
 
@@ -2326,16 +2367,13 @@ impl InProcessBackend {
         for (run_id, mut summary) in active_run_summaries {
             let mut snapshot = summary.snapshot.clone();
             let run_state = snapshot.state;
-            let evidence = snapshot.evidence.clone();
             let usage = summary.usage.clone();
-            let section = format!("run:{run_id}");
             self.sessions()?.get(snapshot.session_id)?;
             run_summaries.insert(
                 run_id,
                 PersistedRunSummary {
                     snapshot: snapshot.clone(),
                     usage: usage.clone(),
-                    section: section.clone(),
                 },
             );
             let mut execution_state = persistence.load_run_execution_state(run_id)?;
@@ -2385,7 +2423,6 @@ impl InProcessBackend {
                         PersistedRunSummary {
                             snapshot: snapshot.clone(),
                             usage: usage.clone(),
-                            section: section.clone(),
                         },
                     );
                     self.append_recovery_events(
@@ -2399,15 +2436,25 @@ impl InProcessBackend {
                 lazy_run_count += 1;
                 continue;
             }
-            let mut runtime_state = persistence
-                .load_section::<AgentRuntimeState>(&section, CURRENT_SCHEMA_VERSION)?
+            let runtime_config = persistence
+                .load_run_runtime_config(run_id)?
                 .ok_or_else(|| {
                     LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("persisted run section '{section}' is empty"),
-                        false,
+                        ErrorCode::RecoveryRequired,
+                        format!("persisted run {run_id} has no runtime configuration"),
+                        true,
                     )
                 })?;
+            let mut runtime_state = runtime_state_from_durable_config(
+                run_summaries.get(&run_id).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::RecoveryRequired,
+                        format!("persisted run {run_id} summary is unavailable"),
+                        true,
+                    )
+                })?,
+                runtime_config,
+            )?;
             let execution_state = execution_state.take().ok_or_else(|| {
                 LoomError::new(
                     ErrorCode::RecoveryRequired,
@@ -2417,7 +2464,6 @@ impl InProcessBackend {
             })?;
             hydrate_runtime_execution_state(&mut runtime_state, execution_state)?;
             runtime_state.plan = persistence.load_run_plan(run_id)?;
-            runtime_state.run.evidence = evidence;
             runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
             hydrate_run_context_checkpoint(&persistence, run_id, &mut runtime_state)?;
             runtime_state.activities = persistence.load_run_activities(run_id)?;
@@ -2526,7 +2572,7 @@ impl InProcessBackend {
         for handle in handles {
             handle.flush_message_fragments(persistence)?;
         }
-        let runs: BTreeMap<loom_core::RunId, AgentRuntimeState> = self
+        let mut runs: BTreeMap<loom_core::RunId, AgentRuntimeState> = self
             .runs()?
             .iter()
             .map(|(run_id, handle)| (*run_id, handle.state()))
@@ -2582,35 +2628,32 @@ impl InProcessBackend {
                     )
                 })
                 .collect::<BTreeMap<_, _>>();
-        let mut durable_run_messages = BTreeMap::new();
-        let mut durable_run_activities = BTreeMap::new();
-        let entity_sections = runs
-            .into_iter()
-            .map(|(run_id, mut state)| {
-                state.plan.steps.clear();
-                state.run.evidence.clear();
-                state.context_checkpoint = None;
-                if let Some(inspection) = &mut state.context_inspection {
+        let durable_run_runtime_configs = runs
+            .iter()
+            .map(|(run_id, state)| {
+                let mut context_inspection = state.context_inspection.clone();
+                if let Some(inspection) = &mut context_inspection {
                     inspection.summary = None;
                 }
-                durable_run_messages
-                    .insert(run_id, durable_run_messages_from_runtime(&state.messages));
-                state.messages.clear();
-                state.pending_tool_execution = None;
-                state.pending_approval = None;
-                state.pending_input = None;
-                state.last_failed_call = None;
-                state.next_message_id = 0;
-                state.active_message_id = None;
-                state.provider_cursor = 0;
-                state.step_id = None;
-                state.step_index = 0;
-                durable_run_activities.insert(run_id, std::mem::take(&mut state.activities));
-                state.attempts.clear();
-                state.interactions.clear();
-                Ok((format!("run:{run_id}"), json_value(state)?))
+                Ok((
+                    *run_id,
+                    DurableRunRuntimeConfig {
+                        system_instructions: state.task.system_instructions.clone(),
+                        repository_instructions: state.task.repository_instructions.clone(),
+                        approval_policy: state.approval_policy.clone(),
+                        options: json_value(&state.options)?,
+                        context_inspection,
+                    },
+                ))
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut durable_run_messages = BTreeMap::new();
+        let mut durable_run_activities = BTreeMap::new();
+        for (run_id, state) in &mut runs {
+            durable_run_messages
+                .insert(*run_id, durable_run_messages_from_runtime(&state.messages));
+            durable_run_activities.insert(*run_id, std::mem::take(&mut state.activities));
+        }
         let loaded_repositories = self.session_repositories()?;
         let mut filesystem_records = Vec::new();
         for (session_id, filesystem) in self.session_filesystems()?.iter() {
@@ -2703,12 +2746,13 @@ impl InProcessBackend {
             usage: Some(&provider_usage),
             idempotency: Some(&idempotency),
             run_summaries: Some(&durable_run_summaries),
+            run_runtime_configs: Some(&durable_run_runtime_configs),
             run_context_checkpoints: Some(&durable_run_context_checkpoints),
             run_plans: Some(&durable_run_plans),
             run_messages: Some(&durable_run_messages),
             run_activities: Some(&durable_run_activities),
             filesystem_records: Some(&filesystem_records),
-            records: &entity_sections,
+            records: &[],
             feed: Some(&feed),
             sections: &[],
         });
@@ -3070,7 +3114,6 @@ impl InProcessConnection {
             return Ok(PersistedRunSummary {
                 snapshot: state.run,
                 usage: state.usage,
-                section: format!("run:{run_id}"),
             });
         }
         if let Some(summary) = self.backend.persisted_runs()?.get(&run_id).cloned() {
@@ -3086,7 +3129,6 @@ impl InProcessConnection {
             .map(|summary| PersistedRunSummary {
                 snapshot: summary.snapshot,
                 usage: summary.usage,
-                section: format!("run:{run_id}"),
             })
             .ok_or_else(|| LoomError::not_found("agent run", run_id))
     }
@@ -3256,15 +3298,19 @@ impl InProcessConnection {
             .persistence
             .as_ref()
             .ok_or_else(|| LoomError::not_found("agent run", summary.snapshot.id))?;
-        let mut state = persistence
-            .load_section::<AgentRuntimeState>(&summary.section, CURRENT_SCHEMA_VERSION)?
+        let runtime_config = persistence
+            .load_run_runtime_config(summary.snapshot.id)?
             .ok_or_else(|| {
                 LoomError::new(
                     ErrorCode::RecoveryRequired,
-                    format!("persisted run {} is missing", summary.snapshot.id),
+                    format!(
+                        "persisted run {} has no runtime configuration",
+                        summary.snapshot.id
+                    ),
                     true,
                 )
             })?;
+        let mut state = runtime_state_from_durable_config(summary, runtime_config)?;
         let execution_state = persistence
             .load_run_execution_state(summary.snapshot.id)?
             .ok_or_else(|| {
@@ -3277,24 +3323,8 @@ impl InProcessConnection {
                     true,
                 )
             })?;
-        if state.run.id == summary.snapshot.id
-            && state.run.state != execution_state.state
-            && summary.snapshot.state == AgentRunState::Paused
-            && execution_state.state == AgentRunState::Paused
-            && execution_state.pending_tool_execution.is_none()
-            && matches!(
-                state.run.state,
-                AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
-            )
-        {
-            state.run.state = AgentRunState::Paused;
-            state.run.updated_at = summary.snapshot.updated_at;
-            state.run.completed_at = None;
-            state.run.summary = summary.snapshot.summary.clone();
-        }
         hydrate_runtime_execution_state(&mut state, execution_state)?;
         state.plan = persistence.load_run_plan(summary.snapshot.id)?;
-        state.run.evidence = summary.snapshot.evidence.clone();
         if include_messages {
             state.messages =
                 persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
@@ -3337,13 +3367,9 @@ impl InProcessConnection {
         let latest_persisted = match &self.backend.persistence {
             Some(persistence) => persistence
                 .load_latest_run_summary_for_session(session_id)?
-                .map(|summary| {
-                    let run_id = summary.snapshot.id;
-                    PersistedRunSummary {
-                        snapshot: summary.snapshot,
-                        usage: summary.usage,
-                        section: format!("run:{run_id}"),
-                    }
+                .map(|summary| PersistedRunSummary {
+                    snapshot: summary.snapshot,
+                    usage: summary.usage,
                 })
                 .filter(|summary| !loaded_ids.contains(&summary.snapshot.id)),
             None => None,
@@ -7824,20 +7850,58 @@ mod tests {
                     auto_approve_actions: Some(false),
                 },
             ));
-            let started =
-                connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+            let started = connection.request(RequestEnvelope::new(
+                ClientRequest::StartSessionAgentRunWithOptions {
                     session_id,
                     task: "create a demo file".to_owned(),
                     model: ModelId::new("deterministic/demo"),
                     system_instructions: Some("Be concise.".to_owned()),
                     repository_instructions: Some("Keep changes focused.".to_owned()),
-                }));
+                    limits: loom_core::SessionLimits {
+                        max_tool_calls: Some(20),
+                        ..Default::default()
+                    },
+                    context: ContextAssemblyOptions {
+                        context_window: Some(8_192),
+                        max_input_tokens: Some(4_096),
+                        reserved_output_tokens: Some(1_024),
+                    },
+                },
+            ));
             let run_id = match started.result.unwrap() {
                 ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
                 response => panic!("unexpected response: {response:?}"),
             };
             await_settled_run(&connection, run_id);
             backend.flush().unwrap();
+            let persisted = FilePersistence::open(&persistence).unwrap();
+            assert!(
+                persisted
+                    .load_section::<serde_json::Value>(
+                        &format!("run:{run_id}"),
+                        CURRENT_SCHEMA_VERSION
+                    )
+                    .unwrap()
+                    .is_none(),
+                "run runtime snapshots must not be stored in generic JSON sections"
+            );
+            let runtime_config = persisted.load_run_runtime_config(run_id).unwrap().unwrap();
+            assert_eq!(
+                runtime_config.system_instructions.as_deref(),
+                Some("Be concise.")
+            );
+            assert_eq!(
+                runtime_config.repository_instructions.as_deref(),
+                Some("Keep changes focused.")
+            );
+            assert_eq!(
+                runtime_config.options["context"]["context_window"],
+                serde_json::json!(8_192)
+            );
+            assert_eq!(
+                runtime_config.options["limits"]["max_tool_calls"],
+                serde_json::json!(20)
+            );
             let events = match connection
                 .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
@@ -7913,6 +7977,16 @@ mod tests {
         assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
         assert_eq!(snapshot.attempt_id, approval.1);
         assert_eq!(snapshot.control_revision, approval.2);
+        let reconstructed_state = connection.run_handle(run_id).unwrap().state();
+        assert_eq!(
+            reconstructed_state.task.system_instructions.as_deref(),
+            Some("Be concise.")
+        );
+        assert_eq!(
+            reconstructed_state.options.context.context_window,
+            Some(8_192)
+        );
+        assert_eq!(reconstructed_state.options.limits.max_tool_calls, Some(20));
         let recovered_interactions = backend
             .persistence
             .as_ref()
@@ -8280,19 +8354,8 @@ mod tests {
         current_attempt.state = AgentRunState::Executing;
         current_attempt.completed_at = None;
         summary.attempts = Some(attempts);
-        let section = format!("run:{run_id}");
-        let mut runtime = persistence_store
-            .load_section::<AgentRuntimeState>(&section, CURRENT_SCHEMA_VERSION)
-            .unwrap()
-            .unwrap();
-        runtime.run.state = AgentRunState::Executing;
-        runtime.run.completed_at = None;
-        runtime.pending_approval = None;
-        runtime.pending_input = None;
         let summaries = BTreeMap::from([(run_id, summary)]);
         let sessions = persistence_store.load_sessions().unwrap().unwrap();
-        let section_value = json_value(runtime).unwrap();
-        let sections = [(section.as_str(), section_value)];
         persistence_store
             .save_state(DurableStateWrite {
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -8304,6 +8367,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&summaries),
+                run_runtime_configs: None,
                 run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: None,
@@ -8311,7 +8375,7 @@ mod tests {
                 filesystem_records: None,
                 records: &[],
                 feed: None,
-                sections: &sections,
+                sections: &[],
             })
             .unwrap();
         drop(persistence_store);

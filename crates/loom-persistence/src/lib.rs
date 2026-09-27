@@ -19,9 +19,9 @@ use loom_protocol::{
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
     AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
-    ApprovalDecision, Checkpoint, CheckpointFile, ContextSummary, ServerEventEnvelope,
-    SessionDirectory, SessionFilesystemChange, SessionRepository, ToolResult, WorkspaceChangeKind,
-    WorkspaceConfig, WorkspaceControl,
+    ApprovalDecision, Checkpoint, CheckpointFile, ContextInspection, ContextSummary,
+    ServerEventEnvelope, SessionDirectory, SessionFilesystemChange, SessionRepository, ToolResult,
+    WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -31,8 +31,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 33;
-const DATABASE_SCHEMA_VERSION: u32 = 33;
+pub const CURRENT_SCHEMA_VERSION: u32 = 34;
+const DATABASE_SCHEMA_VERSION: u32 = 34;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -50,6 +50,7 @@ const MAX_FILESYSTEM_CHANGE_HISTORY: usize = 2048;
 const MAX_FILESYSTEM_CHANGE_PAGE_SIZE: usize = 512;
 const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_IDEMPOTENCY_PAYLOAD_BYTES: usize = 1024 * 1024;
+const MAX_RUN_RUNTIME_CONFIG_BYTES: usize = 1024 * 1024;
 
 const DATABASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS session_store_meta (
@@ -98,6 +99,14 @@ CREATE INDEX IF NOT EXISTS runs_by_session_activity
     ON run_summaries(session_id, updated_at DESC, run_id DESC);
 CREATE INDEX IF NOT EXISTS runs_by_state_activity
     ON run_summaries(state, updated_at DESC, run_id DESC);
+CREATE TABLE IF NOT EXISTS run_runtime_config (
+    run_id BLOB PRIMARY KEY NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE,
+    system_instructions TEXT,
+    repository_instructions TEXT,
+    approval_policy TEXT NOT NULL,
+    options TEXT NOT NULL,
+    context_inspection TEXT
+) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS run_plan_steps (
     run_id BLOB NOT NULL,
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -1015,6 +1024,15 @@ pub struct DurableRunSummary {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRunRuntimeConfig {
+    pub system_instructions: Option<String>,
+    pub repository_instructions: Option<String>,
+    pub approval_policy: ApprovalPolicy,
+    pub options: Value,
+    pub context_inspection: Option<ContextInspection>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableRunContextCheckpoint {
     pub session_id: AgentSessionId,
     pub summary: ContextSummary,
@@ -1079,6 +1097,7 @@ pub struct DurableStateWrite<'a> {
     pub usage: Option<&'a UsageLedger>,
     pub idempotency: Option<&'a BTreeMap<RequestId, DurableIdempotencyRecord>>,
     pub run_summaries: Option<&'a BTreeMap<RunId, DurableRunSummary>>,
+    pub run_runtime_configs: Option<&'a BTreeMap<RunId, DurableRunRuntimeConfig>>,
     pub run_context_checkpoints: Option<&'a BTreeMap<RunId, Option<DurableRunContextCheckpoint>>>,
     pub run_plans: Option<&'a BTreeMap<RunId, AgentPlan>>,
     pub run_messages: Option<&'a BTreeMap<RunId, Vec<DurableRunMessage>>>,
@@ -1963,6 +1982,52 @@ impl FilePersistence {
             })?);
         }
         Ok(AgentPlan { steps })
+    }
+
+    pub fn load_run_runtime_config(
+        &self,
+        run_id: RunId,
+    ) -> Result<Option<DurableRunRuntimeConfig>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let row = connection
+            .query_row(
+                "SELECT system_instructions, repository_instructions,
+                        approval_policy, options, context_inspection
+                 FROM run_runtime_config WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not load run runtime configuration: {error}"),
+                    true,
+                )
+            })?;
+        row.map(|(system, repository, policy, options, inspection)| {
+            Ok(DurableRunRuntimeConfig {
+                system_instructions: system,
+                repository_instructions: repository,
+                approval_policy: decode_json(&policy, "run approval policy")?,
+                options: decode_json(&options, "run runtime options")?,
+                context_inspection: inspection
+                    .as_deref()
+                    .map(|payload| decode_json(payload, "run context inspection"))
+                    .transpose()?,
+            })
+        })
+        .transpose()
     }
 
     fn load_run_summaries_matching<P: rusqlite::Params>(
@@ -4100,6 +4165,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            run_runtime_configs: None,
             run_context_checkpoints: None,
             run_plans: None,
             run_messages: None,
@@ -4131,6 +4197,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            run_runtime_configs: None,
             run_context_checkpoints: None,
             run_plans: None,
             run_messages: None,
@@ -4175,6 +4242,9 @@ impl FilePersistence {
             save_run_summary_rows(&transaction, run_summaries)?;
             save_run_attempt_rows(&transaction, run_summaries)?;
             save_run_execution_state_rows(&transaction, run_summaries)?;
+        }
+        if let Some(runtime_configs) = write.run_runtime_configs {
+            save_run_runtime_config_rows(&transaction, runtime_configs)?;
         }
         if let Some(context_checkpoints) = write.run_context_checkpoints {
             save_run_context_checkpoint_rows(&transaction, context_checkpoints)?;
@@ -5883,6 +5953,90 @@ fn save_idempotency_rows(
                 true,
             )
         })?;
+    Ok(())
+}
+
+fn save_run_runtime_config_rows(
+    transaction: &Transaction<'_>,
+    configs: &BTreeMap<RunId, DurableRunRuntimeConfig>,
+) -> Result<()> {
+    for (run_id, config) in configs {
+        let approval_policy = serde_json::to_string(&config.approval_policy).map_err(|error| {
+            persistence_error(
+                format!("could not encode run approval policy: {error}"),
+                false,
+            )
+        })?;
+        let options = serde_json::to_string(&config.options).map_err(|error| {
+            persistence_error(
+                format!("could not encode run runtime options: {error}"),
+                false,
+            )
+        })?;
+        let context_inspection = config
+            .context_inspection
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not encode run context inspection: {error}"),
+                    false,
+                )
+            })?;
+        if config
+            .system_instructions
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_RUN_RUNTIME_CONFIG_BYTES)
+            || config
+                .repository_instructions
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_RUN_RUNTIME_CONFIG_BYTES)
+            || approval_policy.len() > MAX_RUN_RUNTIME_CONFIG_BYTES
+            || options.len() > MAX_RUN_RUNTIME_CONFIG_BYTES
+            || context_inspection
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_RUN_RUNTIME_CONFIG_BYTES)
+        {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "run runtime configuration exceeds its maximum supported size",
+                false,
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO run_runtime_config(
+                    run_id, system_instructions, repository_instructions,
+                    approval_policy, options, context_inspection
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    system_instructions=excluded.system_instructions,
+                    repository_instructions=excluded.repository_instructions,
+                    approval_policy=excluded.approval_policy,
+                    options=excluded.options,
+                    context_inspection=excluded.context_inspection
+                 WHERE run_runtime_config.system_instructions IS NOT excluded.system_instructions
+                    OR run_runtime_config.repository_instructions IS NOT excluded.repository_instructions
+                    OR run_runtime_config.approval_policy IS NOT excluded.approval_policy
+                    OR run_runtime_config.options IS NOT excluded.options
+                    OR run_runtime_config.context_inspection IS NOT excluded.context_inspection",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    config.system_instructions,
+                    config.repository_instructions,
+                    approval_policy,
+                    options,
+                    context_inspection,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save run runtime configuration {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
     Ok(())
 }
 
@@ -8388,6 +8542,16 @@ fn persistence_error(message: String, retryable: bool) -> LoomError {
     LoomError::new(ErrorCode::Persistence, message, retryable)
 }
 
+fn decode_json<T: DeserializeOwned>(payload: &str, field: &str) -> Result<T> {
+    serde_json::from_str(payload).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted {field} is malformed: {error}"),
+            false,
+        )
+    })
+}
+
 pub type DurableStore = FilePersistence;
 
 #[derive(Clone, Debug, Default)]
@@ -8779,7 +8943,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=32;")
+            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=33;")
             .unwrap();
         let original_journal_mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -8806,7 +8970,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
         assert_eq!(journal_mode, original_journal_mode);
         assert!(!has_feed_meta);
         fs::remove_file(path).unwrap();
@@ -9287,6 +9451,14 @@ mod tests {
             interactions: None,
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
+        let run_runtime_config = DurableRunRuntimeConfig {
+            system_instructions: Some("Use the project conventions".to_owned()),
+            repository_instructions: Some("Do not modify generated files".to_owned()),
+            approval_policy: ApprovalPolicy::default(),
+            options: serde_json::json!({"limits": {"max_steps": 12}}),
+            context_inspection: None,
+        };
+        let run_runtime_configs = BTreeMap::from([(run_id, run_runtime_config.clone())]);
         let context_checkpoint = DurableRunContextCheckpoint {
             session_id: session.id,
             summary: ContextSummary {
@@ -9427,6 +9599,7 @@ mod tests {
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
+                run_runtime_configs: Some(&run_runtime_configs),
                 run_context_checkpoints: Some(&run_context_checkpoints),
                 run_plans: Some(&run_plans),
                 run_messages: Some(&run_messages),
@@ -9516,6 +9689,7 @@ mod tests {
                     usage: None,
                     idempotency: None,
                     run_summaries: None,
+                    run_runtime_configs: None,
                     run_context_checkpoints: None,
                     run_plans: None,
                     run_messages: None,
@@ -9546,6 +9720,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: None,
+                run_runtime_configs: None,
                 run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: None,
@@ -9615,6 +9790,10 @@ mod tests {
         assert_eq!(
             persistence.load_run_summary(run_id).unwrap(),
             run_summaries.get(&run_id).cloned()
+        );
+        assert_eq!(
+            persistence.load_run_runtime_config(run_id).unwrap(),
+            Some(run_runtime_config)
         );
         assert_eq!(
             persistence.load_run_context_checkpoint(run_id).unwrap(),
@@ -9728,6 +9907,7 @@ mod tests {
                     usage: Some(&UsageLedger::default()),
                     idempotency: Some(&BTreeMap::new()),
                     run_summaries: Some(&run_summaries),
+                    run_runtime_configs: None,
                     run_context_checkpoints: None,
                     run_plans: Some(&BTreeMap::new()),
                     run_messages: None,
@@ -9970,6 +10150,7 @@ mod tests {
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
+                run_runtime_configs: None,
                 run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: None,
@@ -10083,6 +10264,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_runtime_configs: None,
                 run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: Some(&run_messages),
@@ -10291,6 +10473,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_runtime_configs: None,
                 run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: Some(&run_messages),
@@ -10319,6 +10502,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_runtime_configs: None,
                 run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: Some(&mismatched_messages),
@@ -10357,6 +10541,7 @@ mod tests {
                     usage: None,
                     idempotency: None,
                     run_summaries: Some(&run_summaries),
+                    run_runtime_configs: None,
                     run_context_checkpoints: None,
                     run_plans: None,
                     run_messages: Some(&assembled_messages),
@@ -10391,6 +10576,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_runtime_configs: None,
                 run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: Some(&assembled_messages),
@@ -10747,6 +10933,7 @@ mod tests {
                     usage: None,
                     idempotency: None,
                     run_summaries: Some(summary),
+                    run_runtime_configs: None,
                     run_context_checkpoints: None,
                     run_plans: None,
                     run_messages: None,
@@ -11035,6 +11222,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&summaries),
+                run_runtime_configs: None,
                 run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: None,

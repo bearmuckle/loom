@@ -172,19 +172,23 @@ per-session run lookup latency, and database size. Set `LOOM_SCALE_SESSIONS` and
 
 | Sessions / runs / feed events | Database size | Population | Catalog + active + feed header p50 | One-session feed read p50 | Full-feed decode p50 | Per-session run query p50 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 / 10,000 / 10,000 | 9,195,520 bytes | 2,071 ms | 5.115 ms | 0.048 ms | 61.455 ms | 0.016 ms |
-| 100,000 / 100,000 / 100,000 | 81,297,408 bytes | 25,771 ms | 50.535 ms | 0.025 ms | 519.335 ms | 0.016 ms |
+| 10,000 / 10,000 / 10,000 | 8,368,128 bytes | 2,181 ms | 5.930 ms | 0.040 ms | 60.136 ms | 0.016 ms |
+| 100,000 / 100,000 / 100,000 | 80,936,960 bytes | 25,704 ms | 52.442 ms | 0.024 ms | 535.376 ms | 0.016 ms |
 
 Before schema v33, the same 100k fixture occupied 113,315,840 bytes. Schema v33
-replaces each run's duplicated JSON snapshot with typed columns for task, model,
-attempt identity, control revision, state and timestamps, while the optional
-summary is stored as text and evidence remains in ordered rows. This reduced
-the fixture by 32,018,432 bytes (28.3%), below the 100 MB target. `dbstat`
-reports that at 100k the largest remaining objects are `feed_events` (19.3 MB),
-`run_summaries` (15.2 MB), and `sessions_visible` (8.2 MB). The index-heavy
+replaced each run's duplicated JSON snapshot with typed columns for task, model,
+attempt identity, control revision, state and timestamps; optional summary text
+and ordered evidence rows remain separate. Current schema v34 measures
+80,936,960 bytes, 32,378,880 bytes (28.6%) lower and below the 100 MB target. `dbstat`
+reports that at 100k the largest remaining objects are `feed_events` (19.1 MB),
+`run_summaries` (15.2 MB), and `sessions_visible` (8.1 MB). The index-heavy
 catalog and feed shape remains visible in the other `dbstat` rows printed by
 the harness. Schema v33 also makes the model a directly queryable column, but
-intentionally does not add a model index without a query that needs it.
+intentionally does not add a model index without a query that needs it. Schema
+v34 removes the generic per-run runtime section, storing only unique run
+configuration in a run-keyed record and reconstructing the runtime from typed
+summary/execution/history rows. Runtime configuration is absent from this
+synthetic fixture, so its additional size reduction is not measured here.
 
 These are optimized local synthetic measurements, not a platform-independent
 latency guarantee. The fixture includes small session/run snapshots and one

@@ -119,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         usage: None,
         idempotency: None,
         run_summaries: Some(&run_summaries),
+        run_runtime_configs: None,
         run_context_checkpoints: None,
         run_plans: None,
         run_messages: None,
