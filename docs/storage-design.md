@@ -488,9 +488,13 @@ Implement in this order:
    counters; session totals are computed with an indexed SQLite aggregate while
    live runs are overlaid from memory. Schema v26 stores ordered plan steps and
    evidence links in child rows and removes those vectors from run/runtime JSON
-   snapshots. Crash-injection coverage remains. Test crash boundaries before
-   switching live writes.
-4. Migrate checkpoint manifests and filesystem operations; make services lazy.
+   snapshots. Schema v27 stores ordered filesystem edit history and change
+   records separately; undo bytes use the shared content store, and change
+   lookups use the per-session sequence key. Restart tests cover edit rollback.
+   Repository/directory metadata normalization and crash-injection coverage
+   remain. Test crash boundaries before switching live writes.
+4. Normalize remaining repository/directory metadata, bound change-history
+   retention, and make filesystem services lazy.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
    exports and their mirrored in-memory journals completely.
 

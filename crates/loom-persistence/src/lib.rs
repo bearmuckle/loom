@@ -18,8 +18,8 @@ use loom_protocol::{
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
     AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
-    ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope, ToolResult, WorkspaceConfig,
-    WorkspaceControl,
+    ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope, SessionFilesystemChange,
+    ToolResult, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -29,8 +29,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 26;
-const DATABASE_SCHEMA_VERSION: u32 = 26;
+pub const CURRENT_SCHEMA_VERSION: u32 = 27;
+const DATABASE_SCHEMA_VERSION: u32 = 27;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -296,6 +296,28 @@ CREATE TABLE IF NOT EXISTS session_filesystems (
     payload_codec INTEGER NOT NULL CHECK(payload_codec IN (0, 1)),
     payload BLOB NOT NULL CHECK(length(payload) <= 536870912)
 ) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS filesystem_edits (
+    session_id BLOB NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    path TEXT NOT NULL CHECK(length(path) > 0 AND length(path) <= 4096),
+    before_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
+        CHECK(before_hash IS NULL OR length(before_hash) = 32),
+    after_revision TEXT NOT NULL CHECK(length(after_revision) <= 256),
+    source TEXT NOT NULL CHECK(source IN ('agent', 'user')),
+    PRIMARY KEY(session_id, ordinal)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS filesystem_changes (
+    session_id BLOB NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    path TEXT NOT NULL CHECK(length(path) > 0 AND length(path) <= 4096),
+    kind TEXT NOT NULL CHECK(kind IN ('created', 'modified', 'deleted')),
+    revision TEXT CHECK(revision IS NULL OR length(revision) <= 256),
+    PRIMARY KEY(session_id, sequence)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS filesystem_edits_by_content
+    ON filesystem_edits(before_hash) WHERE before_hash IS NOT NULL;
 CREATE TABLE IF NOT EXISTS checkpoints (
     session_id BLOB NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
         CHECK(length(session_id) = 16),
@@ -844,7 +866,18 @@ pub struct DurableFilesystemRecord {
     pub root: String,
     pub control: WorkspaceControl,
     pub checkpoints: Vec<Checkpoint>,
+    pub edits: Vec<DurableFilesystemEdit>,
+    pub changes: Vec<SessionFilesystemChange>,
     pub payload: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableFilesystemEdit {
+    pub path: String,
+    pub before: Option<String>,
+    pub before_bytes: Option<Vec<u8>>,
+    pub after_revision: String,
+    pub source: WorkspaceControl,
 }
 
 pub struct DurableStateWrite<'a> {
@@ -3107,11 +3140,95 @@ impl FilePersistence {
                 files,
             });
         }
+        let edit_rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT path, before_hash, after_revision, source FROM filesystem_edits
+                     WHERE session_id=?1 ORDER BY ordinal",
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not prepare filesystem edits: {error}"), true)
+                })?;
+            let rows = statement
+                .query_map([session_id.as_uuid().as_bytes().as_slice()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|error| {
+                    persistence_error(format!("could not read filesystem edits: {error}"), true)
+                })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    persistence_error(format!("could not read filesystem edits: {error}"), true)
+                })?
+        };
+        let mut edits = Vec::with_capacity(edit_rows.len());
+        for (path, before_hash, after_revision, source) in edit_rows {
+            let before_bytes = before_hash
+                .as_deref()
+                .map(|hash| load_content_range(&connection, hash, 0, MAX_CONTENT_BYTES))
+                .transpose()?;
+            let before = before_bytes
+                .as_ref()
+                .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
+            edits.push(DurableFilesystemEdit {
+                path,
+                before,
+                before_bytes,
+                after_revision,
+                source: parse_workspace_control(&source)?,
+            });
+        }
+        let change_rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT sequence, path, kind, revision FROM filesystem_changes
+                     WHERE session_id=?1 ORDER BY sequence",
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not prepare filesystem changes: {error}"),
+                        true,
+                    )
+                })?;
+            let rows = statement
+                .query_map([session_id.as_uuid().as_bytes().as_slice()], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .map_err(|error| {
+                    persistence_error(format!("could not read filesystem changes: {error}"), true)
+                })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    persistence_error(format!("could not read filesystem changes: {error}"), true)
+                })?
+        };
+        let mut changes = Vec::with_capacity(change_rows.len());
+        for (sequence, path, kind, revision) in change_rows {
+            changes.push(SessionFilesystemChange {
+                sequence: EventSequence::new(decode_counter(sequence, "filesystem sequence")?),
+                session_id,
+                path,
+                kind: parse_workspace_change_kind(&kind)?,
+                revision,
+            });
+        }
         Ok(Some(DurableFilesystemRecord {
             session_id,
             root,
             control,
             checkpoints,
+            edits,
+            changes,
             payload,
         }))
     }
@@ -3775,6 +3892,9 @@ fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
              ) AND NOT EXISTS (
                 SELECT 1 FROM run_tool_attempts
                 WHERE run_tool_attempts.result_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM filesystem_edits
+                WHERE filesystem_edits.before_hash=content_objects.hash
              )",
             [],
         )
@@ -6298,6 +6418,14 @@ fn save_filesystem_records(
                 .get("checkpoints")
                 .and_then(Value::as_array)
                 .is_none_or(|checkpoints| !checkpoints.is_empty())
+            || filesystem
+                .get("edits")
+                .and_then(Value::as_array)
+                .is_none_or(|edits| !edits.is_empty())
+            || filesystem
+                .get("changes")
+                .and_then(Value::as_array)
+                .is_none_or(|changes| !changes.is_empty())
         {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
@@ -6388,8 +6516,177 @@ fn save_filesystem_records(
                 })?;
         }
         save_checkpoint_rows(transaction, record.session_id, &record.checkpoints)?;
+        save_filesystem_edit_rows(transaction, record.session_id, &record.edits)?;
+        save_filesystem_change_rows(transaction, record.session_id, &record.changes)?;
     }
     collect_unused_content(transaction)?;
+    Ok(())
+}
+
+fn save_filesystem_edit_rows(
+    transaction: &Transaction<'_>,
+    session_id: AgentSessionId,
+    edits: &[DurableFilesystemEdit],
+) -> Result<()> {
+    for (ordinal, edit) in edits.iter().enumerate() {
+        if edit.path.is_empty()
+            || edit.path.len() > 4096
+            || edit.after_revision.len() > 256
+            || edit.before.as_ref().is_some_and(|text| {
+                edit.before_bytes
+                    .as_ref()
+                    .is_some_and(|bytes| bytes != text.as_bytes())
+            })
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "filesystem edit metadata is invalid",
+                false,
+            ));
+        }
+        let before = edit
+            .before_bytes
+            .as_deref()
+            .or_else(|| edit.before.as_ref().map(String::as_bytes));
+        let before_hash = before
+            .map(|bytes| store_content(transaction, bytes))
+            .transpose()?;
+        transaction
+            .execute(
+                "INSERT INTO filesystem_edits(
+                    session_id, ordinal, path, before_hash, after_revision, source
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(session_id, ordinal) DO UPDATE SET
+                    path=excluded.path,
+                    before_hash=excluded.before_hash,
+                    after_revision=excluded.after_revision,
+                    source=excluded.source
+                 WHERE filesystem_edits.path IS NOT excluded.path
+                    OR filesystem_edits.before_hash IS NOT excluded.before_hash
+                    OR filesystem_edits.after_revision IS NOT excluded.after_revision
+                    OR filesystem_edits.source IS NOT excluded.source",
+                params![
+                    session_id.as_uuid().as_bytes().as_slice(),
+                    i64::try_from(ordinal).map_err(|_| {
+                        LoomError::new(ErrorCode::Persistence, "too many filesystem edits", false)
+                    })?,
+                    edit.path,
+                    before_hash,
+                    edit.after_revision,
+                    workspace_control_name(edit.source),
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save filesystem edit: {error}"), true)
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM filesystem_edits WHERE session_id=?1 AND ordinal >= ?2",
+            params![
+                session_id.as_uuid().as_bytes().as_slice(),
+                i64::try_from(edits.len()).map_err(|_| {
+                    LoomError::new(ErrorCode::Persistence, "too many filesystem edits", false)
+                })?,
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prune filesystem edits: {error}"), true)
+        })?;
+    Ok(())
+}
+
+fn save_filesystem_change_rows(
+    transaction: &Transaction<'_>,
+    session_id: AgentSessionId,
+    changes: &[SessionFilesystemChange],
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_filesystem_changes (
+                session_id BLOB NOT NULL,
+                sequence INTEGER NOT NULL,
+                PRIMARY KEY(session_id, sequence)
+             ) WITHOUT ROWID, STRICT;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage filesystem changes: {error}"), true)
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM _loom_wanted_filesystem_changes WHERE session_id=?1",
+            [session_id.as_uuid().as_bytes().as_slice()],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not clear staged filesystem changes: {error}"),
+                true,
+            )
+        })?;
+    let mut previous = None;
+    for change in changes {
+        if change.session_id != session_id
+            || change.path.is_empty()
+            || change.path.len() > 4096
+            || change
+                .revision
+                .as_ref()
+                .is_some_and(|revision| revision.len() > 256)
+            || previous.is_some_and(|sequence| sequence >= change.sequence)
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "filesystem change identity or ordering is invalid",
+                false,
+            ));
+        }
+        previous = Some(change.sequence);
+        let sequence = encode_counter(change.sequence.value(), "filesystem sequence")?;
+        let session_id_bytes = session_id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "INSERT INTO _loom_wanted_filesystem_changes(session_id, sequence) VALUES (?1, ?2)",
+                params![session_id_bytes.as_slice(), sequence],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not stage filesystem change: {error}"), true)
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO filesystem_changes(session_id, sequence, path, kind, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_id, sequence) DO UPDATE SET
+                    path=excluded.path,
+                    kind=excluded.kind,
+                    revision=excluded.revision
+                 WHERE filesystem_changes.path IS NOT excluded.path
+                    OR filesystem_changes.kind IS NOT excluded.kind
+                    OR filesystem_changes.revision IS NOT excluded.revision",
+                params![
+                    session_id_bytes.as_slice(),
+                    sequence,
+                    change.path,
+                    workspace_change_kind_name(change.kind),
+                    change.revision,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save filesystem change: {error}"), true)
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM filesystem_changes
+             WHERE session_id=?1 AND NOT EXISTS (
+                SELECT 1 FROM _loom_wanted_filesystem_changes wanted
+                WHERE wanted.session_id=filesystem_changes.session_id
+                  AND wanted.sequence=filesystem_changes.sequence
+             )",
+            [session_id.as_uuid().as_bytes().as_slice()],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not prune filesystem changes: {error}"), true)
+        })?;
     Ok(())
 }
 
@@ -6789,6 +7086,27 @@ fn parse_workspace_control(control: &str) -> Result<WorkspaceControl> {
         _ => Err(LoomError::new(
             ErrorCode::MalformedPayload,
             "persisted filesystem has an unknown control state",
+            false,
+        )),
+    }
+}
+
+fn workspace_change_kind_name(kind: WorkspaceChangeKind) -> &'static str {
+    match kind {
+        WorkspaceChangeKind::Created => "created",
+        WorkspaceChangeKind::Modified => "modified",
+        WorkspaceChangeKind::Deleted => "deleted",
+    }
+}
+
+fn parse_workspace_change_kind(kind: &str) -> Result<WorkspaceChangeKind> {
+    match kind {
+        "created" => Ok(WorkspaceChangeKind::Created),
+        "modified" => Ok(WorkspaceChangeKind::Modified),
+        "deleted" => Ok(WorkspaceChangeKind::Deleted),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted filesystem change has an unknown kind",
             false,
         )),
     }
@@ -7528,12 +7846,29 @@ mod tests {
             root: "/tmp/loom-session-fs".to_owned(),
             control: WorkspaceControl::Agent,
             checkpoints: vec![checkpoint.clone()],
+            edits: vec![DurableFilesystemEdit {
+                path: "src/main.rs".to_owned(),
+                before: Some("before contents".to_owned()),
+                before_bytes: Some(b"before contents".to_vec()),
+                after_revision: "revision-after".to_owned(),
+                source: WorkspaceControl::Agent,
+            }],
+            changes: vec![SessionFilesystemChange {
+                sequence: EventSequence::new(1),
+                session_id: session.id,
+                path: "src/main.rs".to_owned(),
+                kind: WorkspaceChangeKind::Modified,
+                revision: Some("revision-after".to_owned()),
+            }],
             payload: serde_json::json!({
                 "filesystem": {
                     "session_id": session.id,
                     "root": "/tmp/loom-session-fs",
                     "control": "agent",
-                    "checkpoints": []
+                    "checkpoints": [],
+                    "edits": [],
+                    "next_sequence": 1,
+                    "changes": []
                 },
                 "details": "checkpoint state ".repeat(500)
             }),
@@ -7766,6 +8101,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(loaded_filesystem.payload, filesystem_records[0].payload);
+        assert_eq!(loaded_filesystem.edits, filesystem_records[0].edits);
+        assert_eq!(loaded_filesystem.changes, filesystem_records[0].changes);
         assert_eq!(loaded_filesystem.checkpoints, vec![checkpoint.clone()]);
 
         assert!(
@@ -7894,6 +8231,18 @@ mod tests {
             )
             .unwrap();
         assert!(filesystem_plan.contains("PRIMARY KEY"), "{filesystem_plan}");
+        let filesystem_change_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT sequence FROM filesystem_changes
+                 WHERE session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 32",
+                params![session.id.as_uuid().as_bytes().as_slice(), 0_i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            filesystem_change_plan.contains("PRIMARY KEY"),
+            "{filesystem_change_plan}"
+        );
         let checkpoint_file_plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT content_hash FROM checkpoint_files
@@ -7941,7 +8290,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(content_codec, 1);
-        assert_eq!(content_count, 5);
+        assert_eq!(content_count, 6);
         let (filesystem_codec, raw_size, payload_size): (i64, i64, i64) = connection
             .query_row(
                 "SELECT payload_codec, raw_size, length(payload) FROM session_filesystems
@@ -8008,8 +8357,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            content_count, 4,
-            "retained transcript, tool-call, and tool-attempt content remain reachable"
+            content_count, 5,
+            "retained transcript, tool-call, tool-attempt, and filesystem undo content remain reachable"
         );
         drop(connection);
         fs::remove_file(path).unwrap();

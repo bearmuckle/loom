@@ -18,9 +18,9 @@ use loom_core::{
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableFilesystemRecord, DurableIdempotencyRecord,
-    DurableProviderState, DurableRunMessage, DurableRunSummary, DurableSessionSettings,
-    DurableStateWrite, FilePersistence,
+    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableFilesystemEdit, DurableFilesystemRecord,
+    DurableIdempotencyRecord, DurableProviderState, DurableRunMessage, DurableRunSummary,
+    DurableSessionSettings, DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -1813,7 +1813,20 @@ impl InProcessBackend {
             })?;
         let mut payload = durable.payload;
         payload["filesystem"]["checkpoints"] = json_value(durable.checkpoints)?;
-        let persisted: PersistedSessionFilesystem = from_json(payload)?;
+        let edits = durable.edits;
+        let changes = durable.changes;
+        let mut persisted: PersistedSessionFilesystem = from_json(payload)?;
+        persisted.filesystem.edits = edits
+            .into_iter()
+            .map(|edit| loom_workspace::WorkspaceEditHistory {
+                path: edit.path,
+                before: edit.before,
+                before_bytes: edit.before_bytes,
+                after_revision: edit.after_revision,
+                source: edit.source,
+            })
+            .collect();
+        persisted.filesystem.changes = changes;
         if durable.session_id != session_id
             || persisted.filesystem.session_id != session_id
             || persisted.filesystem.root != durable.root
@@ -1894,7 +1907,20 @@ impl InProcessBackend {
         };
         let mut payload = record.payload;
         payload["filesystem"]["checkpoints"] = json_value(record.checkpoints)?;
-        let persisted: PersistedSessionFilesystem = from_json(payload)?;
+        let edits = record.edits;
+        let changes = record.changes;
+        let mut persisted: PersistedSessionFilesystem = from_json(payload)?;
+        persisted.filesystem.edits = edits
+            .into_iter()
+            .map(|edit| loom_workspace::WorkspaceEditHistory {
+                path: edit.path,
+                before: edit.before,
+                before_bytes: edit.before_bytes,
+                after_revision: edit.after_revision,
+                source: edit.source,
+            })
+            .collect();
+        persisted.filesystem.changes = changes;
         if record.session_id != session_id
             || persisted.filesystem.session_id != session_id
             || persisted.filesystem.root != record.root
@@ -2368,6 +2394,17 @@ impl InProcessBackend {
         for (session_id, filesystem) in self.session_filesystems()?.iter() {
             let mut filesystem_state = filesystem.export_state()?;
             let checkpoints = std::mem::take(&mut filesystem_state.checkpoints);
+            let edits = std::mem::take(&mut filesystem_state.edits)
+                .into_iter()
+                .map(|edit| DurableFilesystemEdit {
+                    path: edit.path,
+                    before: edit.before,
+                    before_bytes: edit.before_bytes,
+                    after_revision: edit.after_revision,
+                    source: edit.source,
+                })
+                .collect();
+            let changes = std::mem::take(&mut filesystem_state.changes);
             let persisted = PersistedSessionFilesystem {
                 filesystem: filesystem_state,
                 repositories: loaded_repositories
@@ -2388,6 +2425,8 @@ impl InProcessBackend {
                 root: persisted.filesystem.root.clone(),
                 control: persisted.filesystem.control,
                 checkpoints,
+                edits,
+                changes,
                 payload: json_value(persisted)?,
             });
         }
@@ -6171,6 +6210,13 @@ mod tests {
                     expected_revision: None,
                 })
                 .unwrap();
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&session.id)
+                .unwrap()
+                .poll_changes()
+                .unwrap();
             backend.flush().unwrap();
             (workspace.id, session.id, checkpoint.id)
         };
@@ -6218,6 +6264,14 @@ mod tests {
                 .load_filesystem_record(session_id)
                 .unwrap()
                 .expect("filesystem record remains inspectable");
+            assert!(persisted_filesystem.edits.iter().any(|edit| {
+                edit.path == "repo/README.md" && edit.before.as_deref() == Some("source\n")
+            }));
+            assert!(persisted_filesystem.changes.iter().any(|change| {
+                change.path == "repo/README.md"
+                    && change.session_id == session_id
+                    && change.sequence.value() > 0
+            }));
             let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
                 session_id,
                 path: "repo/README.md".to_owned(),
