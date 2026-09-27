@@ -7,7 +7,7 @@ pub use loom_protocol::{
 };
 use serde::{Deserialize, Serialize};
 
-const DEFAULT_OUTPUT_RESERVE: u64 = 4_096;
+const DEFAULT_OUTPUT_RESERVE: u64 = 1_024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContextAssembly {
@@ -345,6 +345,21 @@ pub fn output_reserve(options: &ContextAssemblyOptions) -> u64 {
     })
 }
 
+/// Select an output reserve that respects a provider's advertised completion cap.
+pub fn output_reserve_for_model(
+    options: &ContextAssemblyOptions,
+    model_max_output_tokens: Option<u64>,
+) -> u64 {
+    let reserve = options
+        .reserved_output_tokens
+        .or(model_max_output_tokens)
+        .unwrap_or_else(|| output_reserve(options));
+    let reserve = model_max_output_tokens.map_or(reserve, |limit| reserve.min(limit));
+    options
+        .context_window
+        .map_or(reserve, |window| reserve.min(window.saturating_sub(1)))
+}
+
 fn context_limit(message: &str) -> LoomError {
     LoomError::new(ErrorCode::ContextLimitExceeded, message, false)
 }
@@ -511,19 +526,20 @@ mod tests {
     }
 
     #[test]
-    fn default_output_reserve_allows_longer_completions() {
-        let assembled = ContextAssembler::assemble(
-            &ContextInput {
-                task: "large model".to_owned(),
-                ..Default::default()
-            },
-            &ContextAssemblyOptions {
-                context_window: Some(128_000),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(assembled.inspection.budget.reserved_output_tokens, 4_096);
+    fn model_output_cap_sets_the_reserve_without_exceeding_the_context() {
+        let options = ContextAssemblyOptions {
+            context_window: Some(32_000),
+            ..Default::default()
+        };
+        assert_eq!(output_reserve_for_model(&options, Some(8_192)), 8_192);
+        assert_eq!(output_reserve_for_model(&options, Some(64_000)), 31_999);
+        assert_eq!(output_reserve_for_model(&options, None), 1_024);
+
+        let requested = ContextAssemblyOptions {
+            reserved_output_tokens: Some(16_000),
+            ..options
+        };
+        assert_eq!(output_reserve_for_model(&requested, Some(8_192)), 8_192);
     }
     fn options(limit: u64) -> ContextAssemblyOptions {
         ContextAssemblyOptions {

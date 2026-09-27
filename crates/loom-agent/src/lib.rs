@@ -2194,14 +2194,34 @@ impl AgentRuntime {
                 (Some(requested), None) => Some(requested),
                 (None, model) => Some(model.map_or(8_192, u64::from)),
             };
-        options.max_input_tokens = match (
-            options.max_input_tokens,
+        for model_limit in [
+            provider.descriptor().max_input_tokens.map(u64::from),
             self.options.limits.max_input_tokens,
-        ) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        let reserve = loom_context::output_reserve(&options).min(u64::from(u32::MAX));
+        ]
+        .into_iter()
+        .flatten()
+        {
+            options.max_input_tokens = Some(
+                options
+                    .max_input_tokens
+                    .map_or(model_limit, |requested| requested.min(model_limit)),
+            );
+        }
+        let mut reserve = loom_context::output_reserve_for_model(
+            &options,
+            provider.descriptor().max_output_tokens.map(u64::from),
+        );
+        if let Some(session_output_limit) = self.options.limits.max_output_tokens {
+            reserve = reserve.min(session_output_limit.saturating_sub(self.usage.output_tokens));
+        }
+        if reserve == 0 {
+            return Err(LoomError::new(
+                ErrorCode::ContextLimitExceeded,
+                "no output tokens remain in the agent session budget",
+                false,
+            ));
+        }
+        reserve = reserve.min(u64::from(u32::MAX));
         options.reserved_output_tokens = Some(reserve);
         let budget = loom_protocol::ContextBudget::new(
             options.context_window,
@@ -2759,6 +2779,42 @@ mod tests {
         cursor: usize,
     }
 
+    struct IncompleteProvider {
+        descriptor: loom_model::ModelDescriptor,
+        calls: Arc<Mutex<u8>>,
+    }
+
+    impl ModelProvider for IncompleteProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            _cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            *self.calls.lock().unwrap() += 1;
+            sink.emit(ModelStreamEvent::TextDelta {
+                text: "partial answer".to_owned(),
+            })?;
+            sink.emit(ModelStreamEvent::Usage {
+                usage: loom_model::TokenUsage {
+                    output_tokens: 3,
+                    ..Default::default()
+                },
+            })?;
+            sink.emit(ModelStreamEvent::Completed {
+                reason: loom_model::FinishReason::ErrorWithMessage {
+                    message: "github-copilot responses response was incomplete: max_output_tokens"
+                        .to_owned(),
+                },
+            })?;
+            Ok(())
+        }
+    }
+
     impl ModelProvider for PlanThenCompleteProvider {
         fn descriptor(&self) -> &loom_model::ModelDescriptor {
             &self.descriptor
@@ -2869,6 +2925,8 @@ mod tests {
                     provider: loom_model::ProviderId::new("blocking"),
                     display_name: "Blocking test provider".to_owned(),
                     context_window: Some(8_192),
+                    max_input_tokens: None,
+                    max_output_tokens: None,
                     capabilities: loom_model::ModelCapabilities {
                         streaming: true,
                         tool_calling: false,
@@ -3561,6 +3619,79 @@ mod tests {
         assert_eq!(inspection.budget.effective_input_tokens, Some(count));
         assert_eq!(request.options.max_output_tokens, Some(512));
         assert!(inspection.within_budget());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_request_uses_provider_and_remaining_session_token_limits() {
+        let root = workspace();
+        let descriptor = loom_model::ModelDescriptor {
+            id: ModelId::new("limits/demo"),
+            provider: loom_model::ProviderId::new("limits"),
+            display_name: "Limits test model".to_owned(),
+            context_window: Some(8_192),
+            max_input_tokens: Some(2_000),
+            max_output_tokens: Some(2_048),
+            capabilities: loom_model::ModelCapabilities {
+                streaming: true,
+                tool_calling: false,
+                vision: false,
+                json_mode: false,
+            },
+        };
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("Respect provider limits", descriptor.id.clone()).unwrap(),
+            Box::new(PlanThenCompleteProvider {
+                descriptor,
+                cursor: 0,
+            }),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        runtime.options.limits.max_output_tokens = Some(512);
+        runtime.usage.output_tokens = 100;
+
+        let (request, inspection) = runtime.model_request().unwrap();
+        assert_eq!(inspection.budget.context_window, Some(8_192));
+        assert_eq!(inspection.budget.requested_input_tokens, Some(2_000));
+        assert_eq!(inspection.budget.reserved_output_tokens, 412);
+        assert_eq!(request.options.max_output_tokens, Some(412));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn incomplete_model_response_keeps_partial_text_and_fails_without_retrying() {
+        let root = workspace();
+        let calls = Arc::new(Mutex::new(0));
+        let descriptor = loom_model::ModelDescriptor {
+            id: ModelId::new("incomplete/demo"),
+            provider: loom_model::ProviderId::new("incomplete"),
+            display_name: "Incomplete test model".to_owned(),
+            context_window: Some(8_192),
+            max_input_tokens: None,
+            max_output_tokens: Some(4_096),
+            capabilities: loom_model::ModelCapabilities {
+                streaming: true,
+                tool_calling: false,
+                vision: false,
+                json_mode: false,
+            },
+        };
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("Keep partial output", descriptor.id.clone()).unwrap(),
+            Box::new(IncompleteProvider {
+                descriptor,
+                calls: Arc::clone(&calls),
+            }),
+            ToolExecutor::new(&root).unwrap(),
+        );
+
+        runtime.advance_step(&mut Vec::new()).unwrap();
+        assert_eq!(runtime.run.state, AgentRunState::Failed);
+        assert_eq!(runtime.messages.last().unwrap().content, "partial answer");
+        assert_eq!(runtime.usage.output_tokens, 3);
+        assert_eq!(*calls.lock().unwrap(), 1);
         fs::remove_dir_all(root).unwrap();
     }
 

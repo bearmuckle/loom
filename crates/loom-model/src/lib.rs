@@ -91,6 +91,12 @@ pub struct ModelDescriptor {
     pub provider: ProviderId,
     pub display_name: String,
     pub context_window: Option<u32>,
+    /// Maximum prompt size advertised by the provider for this model.
+    #[serde(default)]
+    pub max_input_tokens: Option<u32>,
+    /// Maximum completion size advertised by the provider for this model.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
     pub capabilities: ModelCapabilities,
 }
 
@@ -211,6 +217,25 @@ mod tests {
             .unwrap(),
             serde_json::json!({ "type": "completed", "data": { "reason": "tool_call" } })
         );
+    }
+
+    #[test]
+    fn model_descriptors_accept_persisted_records_without_advertised_limits() {
+        let descriptor: super::ModelDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "fixture/model",
+            "provider": "fixture",
+            "display_name": "Fixture model",
+            "context_window": 8192,
+            "capabilities": {
+                "streaming": false,
+                "tool_calling": false,
+                "vision": false,
+                "json_mode": false
+            }
+        }))
+        .unwrap();
+        assert_eq!(descriptor.max_input_tokens, None);
+        assert_eq!(descriptor.max_output_tokens, None);
     }
 
     #[test]

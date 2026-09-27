@@ -1905,6 +1905,8 @@ fn openai_compatible_descriptor(model: ModelId) -> ModelDescriptor {
         provider: loom_model::ProviderId::new("openai-compatible"),
         display_name: "OpenAI-compatible model".to_owned(),
         context_window: None,
+        max_input_tokens: None,
+        max_output_tokens: None,
         capabilities: loom_model::ModelCapabilities {
             streaming: false,
             tool_calling: true,
@@ -2897,6 +2899,8 @@ impl InProcessBackend {
                                 provider: ProviderId::new("recovered"),
                                 display_name: "Unavailable persisted model".to_owned(),
                                 context_window: None,
+                                max_input_tokens: None,
+                                max_output_tokens: None,
                                 capabilities: ModelCapabilities::default(),
                             });
                         recovery_reason = Some(error.message.clone());
@@ -3906,6 +3910,8 @@ impl InProcessConnection {
                         provider: ProviderId::new("recovered"),
                         display_name: "Unavailable persisted model".to_owned(),
                         context_window: None,
+                        max_input_tokens: None,
+                        max_output_tokens: None,
                         capabilities: ModelCapabilities::default(),
                     });
                 Box::new(UnavailableProvider::new(descriptor, error))
