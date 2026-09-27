@@ -7384,7 +7384,11 @@ impl LoomView {
                         .ml(px(26.))
                         .max_w(px(560.))
                         .text_color(rgb(0x94a3b8))
-                        .child(detail),
+                        .child(render_timeline_text(
+                            format!("activity-detail-{index}-{activity_index}"),
+                            detail,
+                            0x94a3b8,
+                        )),
                 );
             }
             if let Some(output) = output {
@@ -7396,13 +7400,15 @@ impl LoomView {
                         .border_color(rgb(0x30343f))
                         .pl_2()
                         .text_color(rgb(0x8f98a6))
-                        .child(
+                        .child(render_timeline_text(
+                            format!("activity-output-{index}-{activity_index}"),
                             if matches!(activity.data, AgentActivityData::Command { .. }) {
                                 command_output_summary(output)
                             } else {
                                 bounded_to(output, 420)
                             },
-                        ),
+                            0x8f98a6,
+                        )),
                 );
             }
         }
