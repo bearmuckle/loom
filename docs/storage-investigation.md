@@ -44,11 +44,20 @@ startup directory. The server journal has a global sequence and survives process
 restarts. Its events carry session IDs, and session-specific reads filter by that
 ID. A shared database and global reconnect cursor can be reasonable choices.
 
-The server journal is **bounded by event count**, with a default of 4,096, rather
-than growing indefinitely in event count. This database has not yet reached that
-limit. There is no aggregate byte limit. One busy session can evict another
-session's events because retention is global. In this sample, 3,846 of the 3,874
-events belong to archived sessions; they occupy about 3.708 MB.
+At the time of this sample, the server journal was **bounded by event count**,
+with a default of 4,096, rather than growing indefinitely in event count. This
+database had not reached that limit. There was no aggregate byte limit. One busy
+session could evict another session's events because retention was global. In
+this sample, 3,846 of the 3,874 events belonged to archived sessions; they
+occupied about 3.708 MB.
+
+The implementation has since changed the 4,096-event in-memory budget and
+16 MiB encoded-payload database budget to apply independently per session, so a
+busy session no longer evicts a quieter session's retained events. Sequence
+numbers remain global, and total feed size can now grow with the number of
+sessions. Fully scoped cursor epochs, on-demand per-session database reads, and
+an aggregate budget that does not reintroduce cross-session eviction remain
+open design work.
 
 There is also a separate lifecycle-event vector in `SessionManager`, persisted
 inside `sessions`, which has no retention bound. Filesystem changes, edit history,

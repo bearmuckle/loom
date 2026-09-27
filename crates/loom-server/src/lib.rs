@@ -534,15 +534,13 @@ impl EventJournal {
         let sequence = self.next();
         let event =
             ServerEventEnvelope::from_session_event(sequence, record.session_id, record.event);
-        self.events.push(event.clone());
-        self.pending_events.push(event);
+        self.append_event(event);
     }
 
     fn append_agent(&mut self, session_id: AgentSessionId, event: AgentEvent) {
         let sequence = self.next();
         let event = ServerEventEnvelope::from_agent_event(sequence, session_id, event);
-        self.events.push(event.clone());
-        self.pending_events.push(event);
+        self.append_event(event);
     }
 
     fn next(&mut self) -> EventSequence {
@@ -550,15 +548,34 @@ impl EventJournal {
         if self.retention_limit == 0 {
             self.retention_limit = DEFAULT_EVENT_RETENTION;
         }
-        let excess = self
-            .events
-            .len()
-            .saturating_add(1)
-            .saturating_sub(self.retention_limit);
-        if excess > 0 {
-            self.events.drain(..excess);
-        }
         self.next_sequence
+    }
+
+    fn append_event(&mut self, event: ServerEventEnvelope) {
+        self.events.push(event.clone());
+        self.pending_events.push(event);
+        Self::prune_events(&mut self.events, self.retention_limit);
+        Self::prune_events(&mut self.pending_events, self.retention_limit);
+    }
+
+    fn prune_events(events: &mut Vec<ServerEventEnvelope>, limit: usize) {
+        let mut counts = BTreeMap::<AgentSessionId, usize>::new();
+        for event in events.iter() {
+            *counts.entry(event.session_id).or_default() += 1;
+        }
+        for (session_id, count) in counts {
+            let mut excess = count.saturating_sub(limit);
+            if excess > 0 {
+                events.retain(|event| {
+                    if excess > 0 && event.session_id == session_id {
+                        excess -= 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
     }
 
     fn oldest_sequence(&self, session_id: Option<AgentSessionId>) -> Option<EventSequence> {
@@ -606,10 +623,8 @@ impl EventJournal {
 
     fn set_retention(&mut self, limit: usize) {
         self.retention_limit = limit;
-        let excess = self.events.len().saturating_sub(limit);
-        if excess > 0 {
-            self.events.drain(..excess);
-        }
+        Self::prune_events(&mut self.events, limit);
+        Self::prune_events(&mut self.pending_events, limit);
     }
 
     fn events_since(
@@ -4272,7 +4287,7 @@ impl InProcessConnection {
                 let mut journal = self.backend.journal()?;
                 for event in history {
                     let sequence = journal.next();
-                    journal.events.push(ServerEventEnvelope {
+                    journal.append_event(ServerEventEnvelope {
                         protocol_version: event.protocol_version,
                         sequence,
                         session_id: target_id,
@@ -5496,6 +5511,57 @@ mod tests {
             &changes
         ));
         assert!(!filesystem_history_pruned(None, &changes));
+    }
+
+    #[test]
+    fn event_journal_retention_is_independent_per_session() {
+        let first_session = AgentSessionId::new();
+        let second_session = AgentSessionId::new();
+        let mut journal = EventJournal::default();
+        journal.set_retention(2);
+        for (session_id, name) in [
+            (first_session, "first-1"),
+            (second_session, "second-1"),
+            (first_session, "first-2"),
+            (first_session, "first-3"),
+        ] {
+            journal.append_session(SessionEventRecord {
+                sequence: EventSequence::default(),
+                session_id,
+                occurred_at: Timestamp::from_unix_millis(1),
+                event: loom_core::SessionEvent::AgentSessionRenamed {
+                    session_id,
+                    name: name.to_owned(),
+                },
+            });
+        }
+
+        assert_eq!(journal.latest_sequence(None), Some(EventSequence::new(4)));
+        assert_eq!(
+            journal
+                .events_since(Some(first_session), None)
+                .iter()
+                .map(|event| event.sequence.value())
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(
+            journal
+                .events_since(Some(second_session), None)
+                .iter()
+                .map(|event| event.sequence.value())
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(journal.pending_events.len(), 3);
+        assert_eq!(
+            journal
+                .pending_events
+                .iter()
+                .filter(|event| event.session_id == first_session)
+                .count(),
+            2
+        );
     }
 
     fn negotiate(connection: &InProcessConnection) {

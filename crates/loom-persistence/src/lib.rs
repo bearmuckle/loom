@@ -42,7 +42,7 @@ const MAX_CONTENT_RANGE_BYTES: usize =
     loom_protocol::MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES as usize;
 const MAX_RUN_MESSAGE_PAGE_SIZE: usize = loom_protocol::MAX_AGENT_RUN_MESSAGE_PAGE_SIZE as usize;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
-const MAX_DURABLE_FEED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DURABLE_FEED_SESSION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILESYSTEM_CHANGE_HISTORY: usize = 2048;
 const MAX_FILESYSTEM_CHANGE_PAGE_SIZE: usize = 512;
 const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
@@ -3613,19 +3613,23 @@ impl FilePersistence {
         let Some((next_sequence, retention_limit)) = meta else {
             return Ok(None);
         };
-        let encoded_bytes: i64 = connection
+        let largest_stream_bytes: i64 = connection
             .query_row(
-                "SELECT COALESCE(SUM(length(payload)), 0) FROM feed_events",
+                "SELECT COALESCE(MAX(stream_bytes), 0) FROM (
+                    SELECT SUM(length(payload)) AS stream_bytes
+                    FROM feed_events GROUP BY session_id
+                 )",
                 [],
                 |row| row.get(0),
             )
             .map_err(|error| {
                 persistence_error(format!("could not validate event feed size: {error}"), true)
             })?;
-        if encoded_bytes < 0 || encoded_bytes > MAX_DURABLE_FEED_BYTES as i64 {
+        if largest_stream_bytes < 0 || largest_stream_bytes > MAX_DURABLE_FEED_SESSION_BYTES as i64
+        {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                "persisted event feed exceeds its byte limit",
+                "persisted session event stream exceeds its byte limit",
                 false,
             ));
         }
@@ -3718,7 +3722,13 @@ impl FilePersistence {
                 false,
             )
         })?;
-        if events.len() > retention_limit
+        let mut events_per_session = BTreeMap::<AgentSessionId, usize>::new();
+        for event in &events {
+            *events_per_session.entry(event.session_id).or_default() += 1;
+        }
+        if events_per_session
+            .values()
+            .any(|count| *count > retention_limit)
             || events
                 .last()
                 .is_some_and(|event| event.sequence.value() > next_sequence)
@@ -7641,15 +7651,21 @@ fn save_feed_rows(transaction: &Transaction<'_>, feed: &DurableFeedState) -> Res
         .execute(
             "WITH ranked AS (
                 SELECT sequence,
-                       SUM(length(payload)) OVER (ORDER BY sequence DESC) AS retained_bytes
+                       session_id,
+                       SUM(length(payload)) OVER (
+                           PARTITION BY session_id ORDER BY sequence DESC
+                       ) AS retained_bytes,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY session_id ORDER BY sequence DESC
+                       ) AS stream_position
                 FROM feed_events
              )
              DELETE FROM feed_events
-             WHERE sequence IN (SELECT sequence FROM ranked WHERE retained_bytes > ?1)
-                OR sequence NOT IN (
-                    SELECT sequence FROM feed_events ORDER BY sequence DESC LIMIT ?2
+             WHERE sequence IN (
+                    SELECT sequence FROM ranked
+                    WHERE retained_bytes > ?1 OR stream_position > ?2
                 )",
-            params![MAX_DURABLE_FEED_BYTES as i64, retention_limit],
+            params![MAX_DURABLE_FEED_SESSION_BYTES as i64, retention_limit],
         )
         .map_err(|error| persistence_error(format!("could not prune event feed: {error}"), true))?;
     Ok(())
@@ -10160,20 +10176,40 @@ mod tests {
         manager
             .create_in_workspace_with_id(workspace_id, session_id, "Feed test")
             .unwrap();
+        let second_session_id = AgentSessionId::new();
+        manager
+            .create_in_workspace_with_id(workspace_id, second_session_id, "Quiet feed")
+            .unwrap();
+        let second_snapshot = AgentSessionSnapshot {
+            id: second_session_id,
+            workspace_id,
+            name: "Quiet feed".to_owned(),
+            state: AgentSessionState::Idle,
+            created_at: Timestamp::from_unix_millis(11),
+            updated_at: Timestamp::from_unix_millis(11),
+        };
         let sessions = manager.export_state();
         let feed = DurableFeedState {
-            next_sequence: EventSequence::new(3),
+            next_sequence: EventSequence::new(4),
             retention_limit: 2,
-            events: (1..=3)
-                .map(|sequence| ServerEventEnvelope {
+            events: [
+                (1, session_id, snapshot.clone()),
+                (2, second_session_id, second_snapshot),
+                (3, session_id, snapshot.clone()),
+                (4, session_id, snapshot.clone()),
+            ]
+            .into_iter()
+            .map(
+                |(sequence, session_id, event_snapshot)| ServerEventEnvelope {
                     protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
                     sequence: EventSequence::new(sequence),
                     session_id,
                     event: loom_protocol::ServerEvent::AgentSessionCreated {
-                        snapshot: snapshot.clone(),
+                        snapshot: event_snapshot,
                     },
-                })
-                .collect(),
+                },
+            )
+            .collect(),
         };
         store
             .save_state_with_sessions_entities_and_feed(
@@ -10185,7 +10221,7 @@ mod tests {
             )
             .unwrap();
         let loaded = store.load_feed_state().unwrap().unwrap();
-        assert_eq!(loaded.next_sequence, EventSequence::new(3));
+        assert_eq!(loaded.next_sequence, EventSequence::new(4));
         assert_eq!(loaded.retention_limit, 2);
         assert_eq!(
             loaded
@@ -10193,7 +10229,15 @@ mod tests {
                 .iter()
                 .map(|event| event.sequence.value())
                 .collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![2, 3, 4]
+        );
+        assert_eq!(
+            loaded
+                .events
+                .iter()
+                .find(|event| event.session_id == session_id)
+                .map(|event| event.sequence),
+            Some(EventSequence::new(3))
         );
 
         let connection = Connection::open(&path).unwrap();

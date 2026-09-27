@@ -4,10 +4,11 @@ Status: target design, 2026-09-26. The implementation is in progress: session,
 workspace, and run summaries, ordered run messages, bounded session/workspace
 settings, reconnect events, provider usage totals, and filesystem records use
 indexed rows. Runtime details and filesystem snapshots are loaded on demand.
-The reconnect feed still uses a global sequence and retention budget. Session
-snapshot fallback now evaluates the retained boundary for the requested session
-and resumes at the global high-water mark; stream-scoped cursors and independent
-retention remain unfinished.
+The reconnect feed uses a global sequence, with independent per-session retention
+budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
+evaluates the retained boundary for the requested session and resumes at the
+global high-water mark. Cursor epochs and fully stream-scoped cursors remain
+unfinished; aggregate retained feed size grows with the number of sessions.
 Message role, run/session ownership, order, tool-call metadata, and content
 references are stored separately from runtime execution state; in-flight
 assistant text is persisted as append-only, content-addressed fragments. A
@@ -342,6 +343,16 @@ Initial configurable limits: 4,096 events, 1 MiB, or 24 hours per stream, plus
 Enforce a 4 KiB notification maximum and prune contiguous prefixes. Global pressure
 can expire a quiet stream entirely; no promise of a minimum reconnect duration is
 made. This bounds payload bytes, not total SQLite file size including free pages.
+
+The current implementation is a partial step: the in-memory journal retains up
+to 4,096 events per session, and the durable feed additionally retains up to
+16 MiB of encoded payload per session. Pending durable notifications are pruned
+to the same per-session event count. It keeps global sequence numbers and full
+event payloads. It has no aggregate feed byte limit, stream epoch, workspace
+stream, or transactional snapshot/resubscribe cursor. The target limits above
+still require compact revision notifications and fully scoped cursors before an
+aggregate budget can be added without letting one session evict another's
+history.
 
 An expired cursor returns `ResyncRequired`, followed by an authoritative snapshot
 with a fresh cursor read in the same SQLite read transaction. Subscribe after that

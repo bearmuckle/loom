@@ -697,6 +697,17 @@ async fn stale_cursors_return_a_snapshot_fallback() {
     let first = session(&mut connection, workspace_id).await;
     let _second = session(&mut connection, workspace_id).await;
     let _third = session(&mut connection, workspace_id).await;
+    for name in ["first-a", "first-b", "first-c"] {
+        connection
+            .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                session_id: first.id,
+                name: name.to_owned(),
+            }))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+    }
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(first.id),
@@ -712,9 +723,9 @@ async fn stale_cursors_return_a_snapshot_fallback() {
             latest_sequence,
         } => {
             assert_eq!(session.id, first.id);
-            assert!(events.is_empty());
-            assert_eq!(oldest_sequence.value(), 4);
-            assert_eq!(latest_sequence.value(), 3);
+            assert_eq!(events.len(), 2);
+            assert_eq!(oldest_sequence.value(), 5);
+            assert_eq!(latest_sequence.value(), 6);
         }
         response => panic!("expected snapshot fallback, got {response:?}"),
     }
