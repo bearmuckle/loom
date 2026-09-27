@@ -1438,7 +1438,6 @@ pub struct InProcessBackend {
     terminals: TerminalManager,
     resource_monitor: Mutex<ResourceMonitor>,
     supported_capabilities: CapabilitySet,
-    models: Vec<ModelDescriptor>,
     providers: ProviderRegistry,
     github_copilot_logins: Mutex<BTreeMap<String, GitHubCopilotLoginRecord>>,
     persistence: Option<FilePersistence>,
@@ -1593,7 +1592,7 @@ impl InProcessBackend {
             };
             result.unwrap_or_else(|error| panic!("could not register provider model: {error}"));
         }
-        Self::with_provider_registry_and_models(providers, models, None)
+        Self::with_provider_registry_and_persistence(providers, None)
             .unwrap_or_else(|error| panic!("could not configure providers: {error}"))
     }
 
@@ -1670,18 +1669,14 @@ impl InProcessBackend {
     }
 
     pub fn with_provider_registry(providers: ProviderRegistry) -> Arc<Self> {
-        let models = providers
-            .list_models()
-            .unwrap_or_else(|error| panic!("could not inspect provider models: {error}"));
-        Self::with_provider_registry_and_models(providers, models, None)
+        Self::with_provider_registry_and_persistence(providers, None)
             .unwrap_or_else(|error| panic!("could not configure providers: {error}"))
     }
 
     pub fn new_persistent(path: impl Into<PathBuf>) -> Result<Arc<Self>> {
         let providers = ProviderRegistry::demo();
-        Self::with_provider_registry_and_models(
+        Self::with_provider_registry_and_persistence(
             providers,
-            Vec::new(),
             Some(FilePersistence::open(path.into())?),
         )
     }
@@ -1706,9 +1701,8 @@ impl InProcessBackend {
         providers: ProviderRegistry,
         path: impl Into<PathBuf>,
     ) -> Result<Arc<Self>> {
-        Self::with_provider_registry_and_models(
+        Self::with_provider_registry_and_persistence(
             providers,
-            Vec::new(),
             Some(FilePersistence::open(path.into())?),
         )
     }
@@ -1717,23 +1711,16 @@ impl InProcessBackend {
         providers: ProviderRegistry,
         path: Option<PathBuf>,
     ) -> Result<Arc<Self>> {
-        Self::with_provider_registry_and_models(
+        Self::with_provider_registry_and_persistence(
             providers,
-            Vec::new(),
             path.map(FilePersistence::open).transpose()?,
         )
     }
 
-    fn with_provider_registry_and_models(
+    fn with_provider_registry_and_persistence(
         providers: ProviderRegistry,
-        models: Vec<ModelDescriptor>,
         persistence: Option<FilePersistence>,
     ) -> Result<Arc<Self>> {
-        let models = if models.is_empty() {
-            providers.list_models()?
-        } else {
-            models
-        };
         let (node_id, node_name) = worker_node_identity();
         let session_root_base = persistence.as_ref().map_or_else(
             || {
@@ -1802,7 +1789,6 @@ impl InProcessBackend {
                 Capability::ReadSessionFilesystem,
                 Capability::WriteSessionFilesystem,
             ]),
-            models,
             providers,
             github_copilot_logins: Mutex::new(BTreeMap::new()),
             persistence,
@@ -2242,17 +2228,6 @@ impl InProcessBackend {
         let Some(sessions) = persistence.load_sessions()? else {
             return Ok(());
         };
-        let required = |name: &str| -> Result<Value> {
-            persistence
-                .load_section(name, CURRENT_SCHEMA_VERSION)?
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("persistence section '{name}' is missing"),
-                        false,
-                    )
-                })
-        };
         let session_settings = persistence.load_session_settings()?;
         let state = PersistedBackendState {
             sessions,
@@ -2291,7 +2266,6 @@ impl InProcessBackend {
             "loaded persisted catalogs and feed cursors in {} ms",
             startup_started.elapsed().as_millis()
         );
-        let _: Vec<ModelDescriptor> = from_json(required("models")?)?;
         let sessions = SessionManager::from_state(state.sessions)?;
         {
             let mut target = self.sessions()?;
@@ -2719,7 +2693,6 @@ impl InProcessBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let sections = [("models", json_value(self.models.clone())?)];
         let result = persistence.save_state(DurableStateWrite {
             schema_version: CURRENT_SCHEMA_VERSION,
             sessions: &sessions,
@@ -2737,7 +2710,7 @@ impl InProcessBackend {
             filesystem_records: Some(&filesystem_records),
             records: &entity_sections,
             feed: Some(&feed),
-            sections: &sections,
+            sections: &[],
         });
         if result.is_ok() {
             journal.pending_events.clear();

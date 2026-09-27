@@ -8,14 +8,16 @@ Startup defers runtimes for resumable runs with no pending tool intent. Runs
 interrupted during planning, model execution, or evaluation are transactionally
 marked paused and hydrated only when a later operation needs their runtime;
 uncertain in-flight tool effects still use the eager recovery path.
+The redundant generic `models` section is no longer written or read; model
+discovery is reconstructed from the provider registry.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at that
 session's high-water mark; events in other sessions do not advance its cursor.
 Sequence values remain globally allocated. Startup loads only the feed header;
-event payloads and per-session retained-boundary metadata load on demand. Cursor epochs and fully
-stream-scoped cursors remain unfinished; aggregate retained feed size grows with
-the number of sessions.
+event payloads and per-session retained-boundary metadata load on demand. Cursor
+epochs and fully stream-scoped cursors remain unfinished; aggregate retained feed
+size grows with the number of sessions.
 Message role, run/session ownership, order, tool-call metadata, and content
 references are stored separately from runtime execution state; in-flight
 assistant text is persisted as append-only, content-addressed fragments. A
