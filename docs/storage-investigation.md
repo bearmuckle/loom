@@ -149,6 +149,13 @@ lazy. More granular recovery phases and actual UI initialization still need
 measurement in representative debug and optimized builds before claiming a full
 startup fix.
 
+Session selection no longer has to decode every persisted transcript message to
+build its initial timeline. It loads run metadata and an indexed page of up to 32
+messages, with each message capped at 32 KiB; earlier messages load through an
+explicit timeline control. The separate 10k-session scale harness does not
+exercise this server/UI path, so end-to-end session-switch and cold-start timing
+remains to be measured.
+
 Sources: [server](../crates/loom-server/src/lib.rs), `restore_persisted`;
 [workspace](../crates/loom-workspace/src/lib.rs), `open`, `restore_state`,
 `snapshot`, and `collect_entries`; [UI startup](../crates/loom-ui/src/main.rs).

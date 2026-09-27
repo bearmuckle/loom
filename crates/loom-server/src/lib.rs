@@ -26,12 +26,13 @@ use loom_persistence::{
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentExecutionStateRecord, AgentRunMessageHeader, AgentRunSnapshotProjection,
-    AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest,
-    GitHubCopilotLoginStatus, GitHubRepository, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES,
-    MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, NegotiationResult, RequestEnvelope, ResponseEnvelope,
-    ServerEventEnvelope, ServerResponse, SessionDirectory, SessionFilesystemChange,
-    SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository, WorkerNodeResources,
-    WorkerNodeStatus, WorkspaceConfig, unsupported_version_error,
+    AgentRunTranscriptMessage, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
+    ClientRequest, GitHubCopilotLoginStatus, GitHubRepository,
+    MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
+    MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult,
+    RequestEnvelope, ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionDirectory,
+    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
+    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
@@ -931,6 +932,10 @@ impl RunHandle {
 
     fn snapshot(&self) -> AgentRunSnapshot {
         self.locked_state().run.clone()
+    }
+
+    fn snapshot_projection(&self, include_messages: bool) -> AgentRunSnapshotProjection {
+        run_snapshot_projection_with_messages(&self.locked_state(), include_messages)
     }
 
     fn locked_state(&self) -> MutexGuard<'_, AgentRuntimeState> {
@@ -3003,7 +3008,7 @@ impl InProcessConnection {
             return Ok(run_snapshot_projection(&handle.state()));
         }
         let summary = self.run_summary(run_id)?;
-        let state = self.load_persisted_run_state(&summary)?;
+        let state = self.load_persisted_run_state(&summary, true)?;
         Ok(run_snapshot_projection(&state))
     }
 
@@ -3046,7 +3051,7 @@ impl InProcessConnection {
             return Ok(handle);
         }
         let summary = self.run_summary(run_id)?;
-        let state = self.load_persisted_run_state(&summary)?;
+        let state = self.load_persisted_run_state(&summary, true)?;
         if state.run.id != run_id || state.session_id != summary.snapshot.session_id {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
@@ -3178,6 +3183,57 @@ impl InProcessConnection {
             .collect()
     }
 
+    fn run_transcript_page(
+        &self,
+        run_id: loom_core::RunId,
+        before_ordinal: Option<u64>,
+        limit: u32,
+    ) -> Result<(Vec<AgentRunTranscriptMessage>, Option<u64>, bool)> {
+        if !(1..=MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE).contains(&limit) {
+            return Err(LoomError::invalid_request(format!(
+                "transcript page size must be between 1 and {MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE}"
+            )));
+        }
+        let headers = self.run_message_page(run_id, before_ordinal, limit)?;
+        let next_before = headers.iter().map(|message| message.ordinal).min();
+        let has_older = headers.len() == limit as usize;
+        let messages = headers
+            .into_iter()
+            .rev()
+            .map(|header| {
+                let byte_count = header
+                    .content_bytes
+                    .min(u64::from(MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES));
+                let length = u32::try_from(byte_count).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "transcript message length is out of range",
+                        false,
+                    )
+                })?;
+                let content = if length == 0 {
+                    Vec::new()
+                } else {
+                    self.run_message_content_range(run_id, header.ordinal, 0, length)?
+                };
+                let (content, content_truncated) =
+                    bounded_transcript_content(&content, header.content_bytes);
+                Ok(AgentRunTranscriptMessage {
+                    ordinal: header.ordinal,
+                    message: ModelMessage {
+                        role: header.role,
+                        content,
+                        name: header.name,
+                        tool_call_id: header.tool_call_id,
+                        tool_calls: header.tool_calls,
+                    },
+                    content_truncated,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((messages, next_before, has_older))
+    }
+
     fn run_message_content_range(
         &self,
         run_id: loom_core::RunId,
@@ -3217,7 +3273,11 @@ impl InProcessConnection {
         Ok(message.content.as_bytes()[start..end].to_vec())
     }
 
-    fn load_persisted_run_state(&self, summary: &PersistedRunSummary) -> Result<AgentRuntimeState> {
+    fn load_persisted_run_state(
+        &self,
+        summary: &PersistedRunSummary,
+        include_messages: bool,
+    ) -> Result<AgentRuntimeState> {
         let persistence = self
             .backend
             .persistence
@@ -3262,8 +3322,12 @@ impl InProcessConnection {
         hydrate_runtime_execution_state(&mut state, execution_state)?;
         state.plan = persistence.load_run_plan(summary.snapshot.id)?;
         state.run.evidence = summary.snapshot.evidence.clone();
-        state.messages =
-            persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
+        if include_messages {
+            state.messages =
+                persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
+        } else {
+            state.messages.clear();
+        }
         hydrate_run_context_checkpoint(persistence, summary.snapshot.id, &mut state)?;
         state.activities = persistence.load_run_activities(summary.snapshot.id)?;
         state.attempts = persistence.load_run_attempts(summary.snapshot.id)?;
@@ -3284,6 +3348,7 @@ impl InProcessConnection {
     fn session_snapshot_projection(
         &self,
         session_id: AgentSessionId,
+        include_messages: bool,
     ) -> Result<AgentSessionSnapshotProjection> {
         let session = self.backend.sessions()?.get(session_id)?;
         let (loaded_ids, latest_loaded) = {
@@ -3292,8 +3357,8 @@ impl InProcessConnection {
             let latest = runs
                 .values()
                 .filter(|handle| handle.session_id == session_id)
-                .map(|handle| handle.state())
-                .max_by_key(|state| state.run.updated_at);
+                .max_by_key(|handle| handle.snapshot().updated_at)
+                .cloned();
             (loaded_ids, latest)
         };
         let latest_persisted = match &self.backend.persistence {
@@ -3311,15 +3376,19 @@ impl InProcessConnection {
             None => None,
         };
         let active_run = match (latest_loaded, latest_persisted) {
-            (Some(state), Some(summary)) if state.run.updated_at >= summary.snapshot.updated_at => {
-                Some(run_snapshot_projection(&state))
+            (Some(handle), Some(summary)) => {
+                let projection = handle.snapshot_projection(include_messages);
+                if projection.run.updated_at >= summary.snapshot.updated_at {
+                    Some(projection)
+                } else {
+                    Some(run_snapshot_projection(
+                        &self.load_persisted_run_state(&summary, include_messages)?,
+                    ))
+                }
             }
-            (Some(_), Some(summary)) => Some(run_snapshot_projection(
-                &self.load_persisted_run_state(&summary)?,
-            )),
-            (Some(state), None) => Some(run_snapshot_projection(&state)),
+            (Some(handle), None) => Some(handle.snapshot_projection(include_messages)),
             (None, Some(summary)) => Some(run_snapshot_projection(
-                &self.load_persisted_run_state(&summary)?,
+                &self.load_persisted_run_state(&summary, include_messages)?,
             )),
             (None, None) => None,
         };
@@ -4198,9 +4267,16 @@ impl InProcessConnection {
                 let snapshot = self.backend.sessions()?.get(session_id)?;
                 Ok(ServerResponse::AgentSession(snapshot))
             }
-            ClientRequest::GetAgentSessionSnapshot { session_id } => Ok(
-                ServerResponse::AgentSessionSnapshot(self.session_snapshot_projection(session_id)?),
-            ),
+            ClientRequest::GetAgentSessionSnapshot { session_id } => {
+                Ok(ServerResponse::AgentSessionSnapshot(
+                    self.session_snapshot_projection(session_id, true)?,
+                ))
+            }
+            ClientRequest::GetAgentSessionSnapshotMetadata { session_id } => {
+                Ok(ServerResponse::AgentSessionSnapshot(
+                    self.session_snapshot_projection(session_id, false)?,
+                ))
+            }
             ClientRequest::RenameAgentSession { session_id, name } => {
                 let (snapshot, record) = self.backend.sessions()?.rename(session_id, name)?;
                 self.backend.journal()?.append_session(record);
@@ -4304,6 +4380,20 @@ impl InProcessConnection {
                 run_id,
                 messages: self.run_message_page(run_id, before_ordinal, limit)?,
             }),
+            ClientRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal,
+                limit,
+            } => {
+                let (messages, next_before, has_older) =
+                    self.run_transcript_page(run_id, before_ordinal, limit)?;
+                Ok(ServerResponse::AgentRunTranscriptPage {
+                    run_id,
+                    messages,
+                    next_before,
+                    has_older,
+                })
+            }
             ClientRequest::GetAgentRunMessageContentRange {
                 run_id,
                 message_ordinal,
@@ -5083,6 +5173,9 @@ impl InProcessConnection {
             | ClientRequest::GetAgentSessionSnapshot {
                 session_id: requested_session,
             }
+            | ClientRequest::GetAgentSessionSnapshotMetadata {
+                session_id: requested_session,
+            }
             | ClientRequest::RenameAgentSession {
                 session_id: requested_session,
                 ..
@@ -5239,6 +5332,10 @@ impl InProcessConnection {
                 run_id: requested_run,
             }
             | ClientRequest::GetAgentRunMessagePage {
+                run_id: requested_run,
+                ..
+            }
+            | ClientRequest::GetAgentRunTranscriptPage {
                 run_id: requested_run,
                 ..
             }
@@ -5612,7 +5709,30 @@ fn bounded_review_text(value: &str, limit: usize) -> String {
 }
 
 fn run_snapshot_projection(state: &AgentRuntimeState) -> AgentRunSnapshotProjection {
-    let mut messages = state.messages.clone();
+    run_snapshot_projection_with_messages(state, true)
+}
+
+fn bounded_transcript_content(bytes: &[u8], content_bytes: u64) -> (String, bool) {
+    let content_truncated = content_bytes > u64::from(MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES);
+    let mut content = String::from_utf8_lossy(bytes).into_owned();
+    if content_truncated {
+        if content.ends_with('\u{fffd}') {
+            content.pop();
+        }
+        content.push_str("\n...[message truncated]");
+    }
+    (content, content_truncated)
+}
+
+fn run_snapshot_projection_with_messages(
+    state: &AgentRuntimeState,
+    include_messages: bool,
+) -> AgentRunSnapshotProjection {
+    let mut messages = if include_messages {
+        state.messages.clone()
+    } else {
+        Vec::new()
+    };
     for message in &mut messages {
         message.content = bounded_review_text(&message.content, MAX_RUN_MESSAGE_BYTES);
     }
@@ -6923,6 +7043,25 @@ mod tests {
         );
         assert!(snapshot.active_run.unwrap().plan.is_empty());
 
+        let metadata = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshotMetadata {
+                session_id: session.id,
+            },
+        ));
+        let ServerResponse::AgentSessionSnapshot(metadata) = metadata.result.unwrap() else {
+            panic!("unexpected metadata snapshot response");
+        };
+        assert_eq!(
+            metadata.active_run.as_ref().map(|run| run.run.id),
+            Some(run_id)
+        );
+        assert!(
+            metadata
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.messages.is_empty())
+        );
+
         let run = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
             run_id,
         }));
@@ -8142,6 +8281,83 @@ mod tests {
             .session_id;
         let restored_connection = restored.connect();
         negotiate_m3(&restored_connection);
+        let metadata = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionSnapshotMetadata {
+                session_id: recovery_session_id,
+            },
+        ));
+        let ServerResponse::AgentSessionSnapshot(metadata) = metadata.result.unwrap() else {
+            panic!("unexpected metadata session snapshot response");
+        };
+        assert!(
+            metadata
+                .active_run
+                .as_ref()
+                .is_some_and(|projection| projection.messages.is_empty())
+        );
+        assert!(restored.runs().unwrap().is_empty());
+        let page = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessagePage {
+                run_id,
+                before_ordinal: None,
+                limit: 10,
+            },
+        ));
+        let ServerResponse::AgentRunMessagePage { messages, .. } = page.result.unwrap() else {
+            panic!("unexpected transcript page response");
+        };
+        assert!(!messages.is_empty());
+        let first = messages.first().unwrap();
+        assert!(first.content_bytes > 0);
+        let content = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunMessageContentRange {
+                run_id,
+                message_ordinal: first.ordinal,
+                byte_offset: 0,
+                length: u32::try_from(first.content_bytes.min(128)).unwrap(),
+            },
+        ));
+        let ServerResponse::AgentRunMessageContentRange { content, .. } = content.result.unwrap()
+        else {
+            panic!("unexpected transcript content response");
+        };
+        assert!(!content.is_empty());
+        let invalid_page = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal: None,
+                limit: 0,
+            },
+        ));
+        assert_eq!(
+            invalid_page.result.unwrap_err().code,
+            ErrorCode::InvalidRequest
+        );
+        let transcript_page = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal: None,
+                limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
+            },
+        ));
+        let ServerResponse::AgentRunTranscriptPage {
+            messages,
+            next_before,
+            has_older,
+            ..
+        } = transcript_page.result.unwrap()
+        else {
+            panic!("unexpected bounded transcript page response");
+        };
+        assert!(!messages.is_empty());
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| pair[0].ordinal < pair[1].ordinal)
+        );
+        assert_eq!(next_before, messages.first().map(|message| message.ordinal));
+        assert!(!has_older);
+
         let projection =
             restored_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
                 run_id,
@@ -9420,6 +9636,23 @@ mod tests {
 
         fs::remove_dir_all(session_root_base).unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn transcript_page_content_is_bounded_and_marks_truncation() {
+        let large = vec![b'x'; MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES as usize + 1];
+        let (content, truncated) = bounded_transcript_content(
+            &large[..MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES as usize],
+            MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES as u64 + 1,
+        );
+        assert!(truncated);
+        assert!(content.starts_with(&"x".repeat(MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES as usize)));
+        assert!(content.ends_with("\n...[message truncated]"));
+
+        let (content, truncated) = bounded_transcript_content(b"short", 5);
+        assert!(!truncated);
+        assert_eq!(content, "short");
+        assert_eq!(bounded_transcript_content(&[], 0), (String::new(), false));
     }
 
     #[allow(dead_code)]

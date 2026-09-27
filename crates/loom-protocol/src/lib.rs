@@ -53,6 +53,8 @@ pub use workspace::{
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(4, 0);
 pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
 pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
+pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
+pub const MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES: u32 = 32 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerNodeResources {
@@ -113,6 +115,13 @@ pub struct AgentRunMessageHeader {
     pub name: Option<String>,
     pub tool_call_id: Option<loom_core::ToolCallId>,
     pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentRunTranscriptMessage {
+    pub ordinal: u64,
+    pub message: ModelMessage,
+    pub content_truncated: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -357,6 +366,11 @@ pub enum ClientRequest {
     GetAgentSessionSnapshot {
         session_id: AgentSessionId,
     },
+    /// Returns session/run metadata without materializing the run transcript.
+    /// Clients can load conversation history through the bounded message-page API.
+    GetAgentSessionSnapshotMetadata {
+        session_id: AgentSessionId,
+    },
     RenameAgentSession {
         session_id: AgentSessionId,
         name: String,
@@ -376,6 +390,11 @@ pub enum ClientRequest {
         run_id: RunId,
     },
     GetAgentRunMessagePage {
+        run_id: RunId,
+        before_ordinal: Option<u64>,
+        limit: u32,
+    },
+    GetAgentRunTranscriptPage {
         run_id: RunId,
         before_ordinal: Option<u64>,
         limit: u32,
@@ -513,9 +532,9 @@ impl ClientRequest {
             Self::CancelSessionTask { .. } => Some(Capability::ControlSessionTask),
             Self::GetSessionTaskEvidence { .. } => Some(Capability::ReadSessionTaskEvidence),
             Self::SetSessionApprovalPolicy { .. } => Some(Capability::ConfigureApprovalPolicy),
-            Self::GetAgentSession { .. } | Self::GetAgentSessionSnapshot { .. } => {
-                Some(Capability::ReadAgentSession)
-            }
+            Self::GetAgentSession { .. }
+            | Self::GetAgentSessionSnapshot { .. }
+            | Self::GetAgentSessionSnapshotMetadata { .. } => Some(Capability::ReadAgentSession),
             Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
                 Some(Capability::ControlAgentSession)
             }
@@ -525,9 +544,9 @@ impl ClientRequest {
             Self::GetAgentRun { .. } | Self::GetAgentRunSnapshot { .. } => {
                 Some(Capability::ReadAgentRun)
             }
-            Self::GetAgentRunMessagePage { .. } | Self::GetAgentRunMessageContentRange { .. } => {
-                Some(Capability::ReadAgentRunMessages)
-            }
+            Self::GetAgentRunMessagePage { .. }
+            | Self::GetAgentRunTranscriptPage { .. }
+            | Self::GetAgentRunMessageContentRange { .. } => Some(Capability::ReadAgentRunMessages),
             Self::GetRunCheckpoint { .. } => Some(Capability::ReadAgentRun),
             Self::ApproveAgentAction { .. } | Self::RejectAgentAction { .. } => {
                 Some(Capability::ApproveAgentAction)
@@ -668,6 +687,12 @@ pub enum ServerResponse {
     AgentRunMessagePage {
         run_id: RunId,
         messages: Vec<AgentRunMessageHeader>,
+    },
+    AgentRunTranscriptPage {
+        run_id: RunId,
+        messages: Vec<AgentRunTranscriptMessage>,
+        next_before: Option<u64>,
+        has_older: bool,
     },
     AgentRunMessageContentRange {
         run_id: RunId,
@@ -949,6 +974,18 @@ mod run_message_protocol_tests {
 
     #[test]
     fn transcript_page_and_range_frames_round_trip_with_their_capability() {
+        let session_id = AgentSessionId::new();
+        let metadata_request = ClientRequest::GetAgentSessionSnapshotMetadata { session_id };
+        assert_eq!(
+            metadata_request.required_capability(),
+            Some(Capability::ReadAgentSession)
+        );
+        let encoded = encode_request(&RequestEnvelope::new(metadata_request)).unwrap();
+        assert_eq!(
+            decode_request(&encoded).unwrap().request,
+            ClientRequest::GetAgentSessionSnapshotMetadata { session_id }
+        );
+
         let run_id = RunId::new();
         let page_request = ClientRequest::GetAgentRunMessagePage {
             run_id,
@@ -979,6 +1016,25 @@ mod run_message_protocol_tests {
                 limit: 32
             }
         );
+        let transcript_request = ClientRequest::GetAgentRunTranscriptPage {
+            run_id,
+            before_ordinal: Some(12),
+            limit: 16,
+        };
+        assert_eq!(
+            transcript_request.required_capability(),
+            Some(Capability::ReadAgentRunMessages)
+        );
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(transcript_request)).unwrap())
+                .unwrap()
+                .request,
+            ClientRequest::GetAgentRunTranscriptPage {
+                run_id,
+                before_ordinal: Some(12),
+                limit: 16,
+            }
+        );
 
         let page_response = ResponseEnvelope::success(
             RequestId::new(),
@@ -997,6 +1053,24 @@ mod run_message_protocol_tests {
         assert_eq!(
             decode_response(&encode_response(&page_response).unwrap()).unwrap(),
             page_response
+        );
+
+        let transcript_response = ResponseEnvelope::success(
+            RequestId::new(),
+            ServerResponse::AgentRunTranscriptPage {
+                run_id,
+                messages: vec![AgentRunTranscriptMessage {
+                    ordinal: 11,
+                    message: ModelMessage::new(loom_model::MessageRole::Assistant, "answer"),
+                    content_truncated: false,
+                }],
+                next_before: Some(11),
+                has_older: true,
+            },
+        );
+        assert_eq!(
+            decode_response(&encode_response(&transcript_response).unwrap()).unwrap(),
+            transcript_response
         );
 
         let response = ResponseEnvelope::success(
