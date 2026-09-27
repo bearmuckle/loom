@@ -127,7 +127,8 @@ before sending any new project capabilities or schemas. Do not send new
 capability values, request/response variants, or event variants to a client
 that has not passed that gate. Once admitted, capability checks still govern
 which project operations that client may use. This avoids requiring old-client
-forward compatibility while preserving an explicit rollout gate. The
+forward compatibility: deployments may ensure or force the client upgrade,
+and the backend rejects any client that has not upgraded. The
 pre-feature version/error envelope must remain sufficient to deliver this
 rejection; do not add a new error enum value that an old client would need to
 decode.

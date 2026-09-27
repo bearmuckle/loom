@@ -9,10 +9,12 @@ use std::{
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
-    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
-    CheckpointId, ErrorCode, EventSequence, InteractionId, LoomError, PolicyDecision,
-    ProjectAgentRecord, ProjectId, ProjectSnapshot, RepositoryId, RequestId, Result, RunAttemptId,
-    RunId, SessionLimits, StepId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    ActivityId, AgentMessageDraft, AgentMessageId, AgentMessageKind, AgentMessageRecord,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, CheckpointId,
+    DelegatedTaskRecord, DelegatedTaskSpec, DelegatedTaskStatus, ErrorCode, EventSequence,
+    InteractionId, LoomError, PolicyDecision, ProjectAgentRecord, ProjectId, ProjectSnapshot,
+    RepositoryId, RequestId, Result, RunAttemptId, RunId, SessionLimits, StepId,
+    TaskContextReference, TaskId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
@@ -718,6 +720,79 @@ CREATE TRIGGER IF NOT EXISTS gc_content_parts_update AFTER UPDATE ON content_par
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
         SELECT 'blob', OLD.blob_hash WHERE OLD.blob_hash IS NOT NEW.blob_hash;
 END;
+";
+
+const PROJECT_TASK_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS delegated_tasks (
+    task_id BLOB PRIMARY KEY NOT NULL CHECK(length(task_id) = 16),
+    request_id BLOB NOT NULL UNIQUE CHECK(length(request_id) = 16),
+    request_fingerprint BLOB NOT NULL CHECK(length(request_fingerprint) = 32),
+    project_id BLOB NOT NULL CHECK(length(project_id) = 16),
+    requester_session_id BLOB NOT NULL CHECK(length(requester_session_id) = 16),
+    target_session_id BLOB NOT NULL UNIQUE CHECK(length(target_session_id) = 16),
+    child_name TEXT NOT NULL CHECK(length(trim(child_name)) > 0),
+    intent TEXT NOT NULL CHECK(length(trim(intent)) > 0),
+    code_change INTEGER NOT NULL CHECK(code_change IN (0, 1)),
+    status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'blocked', 'completed', 'failed', 'cancelled')),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+    FOREIGN KEY(project_id, requester_session_id)
+        REFERENCES sessions_hierarchy(project_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY(project_id, target_session_id)
+        REFERENCES sessions_hierarchy(project_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS delegated_tasks_by_requester
+    ON delegated_tasks(project_id, requester_session_id, created_at, task_id);
+CREATE INDEX IF NOT EXISTS delegated_tasks_by_status
+    ON delegated_tasks(project_id, status, updated_at, task_id);
+CREATE TABLE IF NOT EXISTS delegated_task_context_references (
+    task_id BLOB NOT NULL REFERENCES delegated_tasks(task_id) ON DELETE CASCADE
+        CHECK(length(task_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    label TEXT NOT NULL,
+    uri TEXT NOT NULL,
+    PRIMARY KEY(task_id, ordinal)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS delegated_task_dependencies (
+    task_id BLOB NOT NULL REFERENCES delegated_tasks(task_id) ON DELETE CASCADE
+        CHECK(length(task_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    dependency_task_id BLOB NOT NULL REFERENCES delegated_tasks(task_id) ON DELETE RESTRICT
+        CHECK(length(dependency_task_id) = 16),
+    CHECK(task_id != dependency_task_id),
+    PRIMARY KEY(task_id, ordinal),
+    UNIQUE(task_id, dependency_task_id)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS delegated_task_dependencies_by_dependency
+    ON delegated_task_dependencies(dependency_task_id, task_id);
+CREATE TABLE IF NOT EXISTS project_message_sequences (
+    project_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+        CHECK(length(project_id) = 16),
+    next_sequence INTEGER NOT NULL CHECK(next_sequence >= 1)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS project_agent_messages (
+    message_id BLOB PRIMARY KEY NOT NULL CHECK(length(message_id) = 16),
+    request_id BLOB NOT NULL UNIQUE CHECK(length(request_id) = 16),
+    project_id BLOB NOT NULL CHECK(length(project_id) = 16),
+    project_sequence INTEGER NOT NULL CHECK(project_sequence >= 1),
+    task_id BLOB CHECK(task_id IS NULL OR length(task_id) = 16),
+    sender_session_id BLOB NOT NULL CHECK(length(sender_session_id) = 16),
+    target_session_id BLOB NOT NULL CHECK(length(target_session_id) = 16),
+    kind TEXT NOT NULL CHECK(kind IN ('progress', 'result', 'question', 'blocker', 'direction', 'answer')),
+    accepted_at INTEGER NOT NULL CHECK(accepted_at >= 0),
+    body TEXT NOT NULL,
+    UNIQUE(project_id, project_sequence),
+    FOREIGN KEY(project_id, sender_session_id)
+        REFERENCES sessions_hierarchy(project_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY(project_id, target_session_id)
+        REFERENCES sessions_hierarchy(project_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY(task_id)
+        REFERENCES delegated_tasks(task_id) ON DELETE RESTRICT
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS project_agent_messages_by_target
+    ON project_agent_messages(project_id, target_session_id, project_sequence);
+CREATE INDEX IF NOT EXISTS project_agent_messages_by_sender
+    ON project_agent_messages(project_id, sender_session_id, project_sequence);
 ";
 
 fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> {
@@ -1448,6 +1523,580 @@ impl FilePersistence {
         }))
     }
 
+    /// Atomically creates a child session, its hierarchy edge, and its delegated task.
+    /// Reusing a request ID returns the durable task only when its semantic request
+    /// fields match, which makes the request key safe across a crash before generic
+    /// idempotency state is saved and after the child has changed state.
+    pub fn create_project_child(
+        &self,
+        request_id: RequestId,
+        child_snapshot: &AgentSessionSnapshot,
+        session_next_sequence: EventSequence,
+        task: &DelegatedTaskRecord,
+    ) -> Result<DelegatedTaskRecord> {
+        if task.target_session_id != child_snapshot.id {
+            return Err(LoomError::invalid_request(
+                "delegated task target must match the child session",
+            ));
+        }
+        if task.child_name != child_snapshot.name {
+            return Err(LoomError::invalid_request(
+                "delegated task child name must match the child session name",
+            ));
+        }
+        if task.intent.trim().is_empty() || task.child_name.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "delegated task intent and child name must not be empty",
+            ));
+        }
+        if task.dependencies.contains(&task.task_id) {
+            return Err(LoomError::invalid_request(
+                "delegated task cannot depend on itself",
+            ));
+        }
+        if task
+            .dependencies
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != task.dependencies.len()
+        {
+            return Err(LoomError::invalid_request(
+                "delegated task dependencies must not contain duplicates",
+            ));
+        }
+
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin delegated task transaction: {error}"),
+                true,
+            )
+        })?;
+        let request_bytes = request_id.as_uuid().as_bytes();
+        let request_fingerprint = delegated_task_request_fingerprint(task)?;
+        let existing = transaction
+            .query_row(
+                "SELECT task_id, request_fingerprint FROM delegated_tasks WHERE request_id=?1",
+                [request_bytes.as_slice()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect delegated task request: {error}"),
+                    true,
+                )
+            })?;
+        if let Some((existing_task_id, existing_fingerprint)) = existing {
+            let existing = load_delegated_task(
+                &transaction,
+                &decode_uuid(&existing_task_id, "delegated task id")?,
+            )?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "delegated task request index is inconsistent",
+                    false,
+                )
+            })?;
+            if existing_fingerprint != request_fingerprint {
+                return Err(LoomError::invalid_request(
+                    "request ID was already used for a different delegated task",
+                ));
+            }
+            transaction.commit().map_err(|error| {
+                persistence_error(
+                    format!("could not finish delegated task lookup: {error}"),
+                    true,
+                )
+            })?;
+            return Ok(existing);
+        }
+
+        for dependency_id in &task.dependencies {
+            let dependency_project: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT project_id FROM delegated_tasks WHERE task_id=?1",
+                    [dependency_id.as_uuid().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not inspect delegated task dependency: {error}"),
+                        true,
+                    )
+                })?;
+            if dependency_project.as_deref()
+                != Some(task.project_id.as_uuid().as_bytes().as_slice())
+            {
+                return Err(LoomError::invalid_request(
+                    "delegated task dependencies must refer to tasks in the same project",
+                ));
+            }
+        }
+
+        let parent_depth: Option<i64> = transaction
+            .query_row(
+                "SELECT hierarchy.depth FROM sessions_hierarchy AS hierarchy
+                 JOIN sessions AS parent ON parent.id=hierarchy.session_id
+                 WHERE hierarchy.project_id=?1 AND hierarchy.session_id=?2 AND parent.workspace_id=?3",
+                params![
+                    task.project_id.as_uuid().as_bytes().as_slice(),
+                    task.requester_session_id.as_uuid().as_bytes().as_slice(),
+                    child_snapshot.workspace_id.as_uuid().as_bytes().as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| persistence_error(format!("could not inspect delegated task parent: {error}"), true))?;
+        let parent_depth = parent_depth.ok_or_else(|| {
+            LoomError::invalid_request(
+                "delegated task requester must belong to the project and workspace",
+            )
+        })?;
+        let child_depth = parent_depth + 1;
+        if child_depth > 3 {
+            return Err(LoomError::invalid_request(
+                "project agent hierarchy exceeds maximum depth",
+            ));
+        }
+
+        let created_at = encode_timestamp(child_snapshot.created_at)?;
+        let updated_at = encode_timestamp(child_snapshot.updated_at)?;
+        let session_next_sequence = i64::try_from(session_next_sequence.value()).map_err(|_| {
+            LoomError::invalid_request("session sequence exceeds SQLite's integer range")
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    child_snapshot.id.as_uuid().as_bytes().as_slice(),
+                    child_snapshot.workspace_id.as_uuid().as_bytes().as_slice(),
+                    child_snapshot.name,
+                    session_state_name(child_snapshot.state),
+                    created_at,
+                    updated_at,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not create child session: {error}"), true)
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO sessions_hierarchy(project_id, session_id, parent_session_id, depth)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    task.project_id.as_uuid().as_bytes().as_slice(),
+                    child_snapshot.id.as_uuid().as_bytes().as_slice(),
+                    task.requester_session_id.as_uuid().as_bytes().as_slice(),
+                    child_depth,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not create child session hierarchy: {error}"),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO session_store_meta(singleton, next_sequence) VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET next_sequence=MAX(next_sequence, excluded.next_sequence)",
+                [session_next_sequence],
+            )
+            .map_err(|error| persistence_error(format!("could not update session sequence: {error}"), true))?;
+        insert_delegated_task(&transaction, request_id, &request_fingerprint, task)?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit delegated task transaction: {error}"),
+                true,
+            )
+        })?;
+        Ok(task.clone())
+    }
+
+    /// Reads a durable delegated task and its normalized context/dependency rows.
+    pub fn load_delegated_task(&self, task_id: TaskId) -> Result<Option<DelegatedTaskRecord>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        load_delegated_task(&connection, task_id.as_uuid())
+    }
+
+    /// Looks up a previously created child by its idempotency key and verifies
+    /// that the retry carries the same semantic request before returning it.
+    pub fn load_project_child_by_request(
+        &self,
+        request_id: RequestId,
+        expected_project_id: ProjectId,
+        expected_requester: AgentSessionId,
+        child_name: &str,
+        spec: &DelegatedTaskSpec,
+    ) -> Result<Option<DelegatedTaskRecord>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let request_bytes = request_id.as_uuid().as_bytes();
+        let existing = connection
+            .query_row(
+                "SELECT task_id, request_fingerprint FROM delegated_tasks WHERE request_id=?1",
+                [request_bytes.as_slice()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not look up project child request: {error}"),
+                    true,
+                )
+            })?;
+        let Some((task_id, fingerprint)) = existing else {
+            return Ok(None);
+        };
+        let expected = delegated_task_spec_fingerprint(
+            expected_project_id,
+            expected_requester,
+            child_name,
+            spec,
+        )?;
+        if fingerprint != expected {
+            return Err(LoomError::invalid_request(
+                "request ID was already used for a different delegated task",
+            ));
+        }
+        let uuid = decode_uuid(&task_id, "delegated task id")?;
+        load_delegated_task(&connection, &uuid)?
+            .map(Some)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "delegated task request index is inconsistent",
+                    false,
+                )
+            })
+    }
+
+    /// Loads tasks belonging to a project in deterministic creation order.
+    pub fn list_project_tasks(&self, project_id: ProjectId) -> Result<Vec<DelegatedTaskRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT task_id FROM delegated_tasks WHERE project_id=?1 ORDER BY created_at, task_id")
+            .map_err(|error| persistence_error(format!("could not prepare project task list: {error}"), true))?;
+        let ids = statement
+            .query_map([project_id.as_uuid().as_bytes().as_slice()], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read project task list: {error}"), true)
+            })?
+            .map(|row| {
+                row.map_err(|error| {
+                    persistence_error(format!("could not read project task id: {error}"), true)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|id| {
+                let uuid = decode_uuid(id, "delegated task id")?;
+                load_delegated_task(&connection, &uuid)?.ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "project task index is inconsistent",
+                        false,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Updates only the durable status and update timestamp for a delegated task.
+    pub fn update_delegated_task_status(
+        &self,
+        task_id: TaskId,
+        status: DelegatedTaskStatus,
+        updated_at: Timestamp,
+    ) -> Result<bool> {
+        let updated_at = encode_timestamp(updated_at)?;
+        let connection = self.connection_for_write()?;
+        let changed = connection
+            .execute(
+                "UPDATE delegated_tasks SET status=?2, updated_at=?3
+                 WHERE task_id=?1 AND updated_at <= ?3
+                   AND (status IS NOT ?2 OR updated_at IS NOT ?3)",
+                params![
+                    task_id.as_uuid().as_bytes().as_slice(),
+                    delegated_task_status_name(status),
+                    updated_at,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not update delegated task status: {error}"),
+                    true,
+                )
+            })?;
+        Ok(changed > 0)
+    }
+
+    /// Durably accepts a project message and assigns its project sequence in the
+    /// same transaction. The request ID remains authoritative across a crash gap.
+    pub fn accept_agent_message(
+        &self,
+        request_id: RequestId,
+        draft: &AgentMessageDraft,
+    ) -> Result<loom_core::AgentMessageRecord> {
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin agent message transaction: {error}"),
+                true,
+            )
+        })?;
+        let request_bytes = request_id.as_uuid().as_bytes();
+        let existing = load_agent_message_by_request(&transaction, request_bytes)?;
+        if let Some(existing) = existing {
+            if !agent_message_matches_draft(&existing, draft) {
+                return Err(LoomError::invalid_request(
+                    "request ID was already used for a different agent message",
+                ));
+            }
+            transaction.commit().map_err(|error| {
+                persistence_error(
+                    format!("could not finish agent message lookup: {error}"),
+                    true,
+                )
+            })?;
+            return Ok(existing);
+        }
+        if let Some(task_id) = draft.task_id {
+            let task_project: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT project_id FROM delegated_tasks WHERE task_id=?1",
+                    [task_id.as_uuid().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not inspect agent message task: {error}"),
+                        true,
+                    )
+                })?;
+            if task_project.as_deref() != Some(draft.project_id.as_uuid().as_bytes().as_slice()) {
+                return Err(LoomError::invalid_request(
+                    "agent message task must belong to the same project",
+                ));
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO project_message_sequences(project_id, next_sequence) VALUES (?1, 1)
+                 ON CONFLICT(project_id) DO NOTHING",
+                [draft.project_id.as_uuid().as_bytes().as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not initialize project message sequence: {error}"),
+                    true,
+                )
+            })?;
+        let project_sequence: i64 = transaction
+            .query_row(
+                "UPDATE project_message_sequences SET next_sequence=next_sequence+1
+                 WHERE project_id=?1 RETURNING next_sequence-1",
+                [draft.project_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not allocate project message sequence: {error}"),
+                    true,
+                )
+            })?;
+        let accepted_at = Timestamp::now();
+        let message_id = AgentMessageId::new();
+        transaction
+            .execute(
+                "INSERT INTO project_agent_messages(
+                    message_id, request_id, project_id, project_sequence, task_id,
+                    sender_session_id, target_session_id, kind, accepted_at, body
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    message_id.as_uuid().as_bytes().as_slice(),
+                    request_bytes.as_slice(),
+                    draft.project_id.as_uuid().as_bytes().as_slice(),
+                    project_sequence,
+                    draft.task_id.map(|id| id.as_uuid().as_bytes().to_vec()),
+                    draft.sender_session_id.as_uuid().as_bytes().as_slice(),
+                    draft.target_session_id.as_uuid().as_bytes().as_slice(),
+                    agent_message_kind_name(draft.kind),
+                    encode_timestamp(accepted_at)?,
+                    draft.body,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not accept agent message: {error}"), true)
+            })?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit agent message transaction: {error}"),
+                true,
+            )
+        })?;
+        Ok(loom_core::AgentMessageRecord {
+            message_id,
+            project_id: draft.project_id,
+            task_id: draft.task_id,
+            sender_session_id: draft.sender_session_id,
+            target_session_id: draft.target_session_id,
+            kind: draft.kind,
+            project_sequence: u64::try_from(project_sequence).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "allocated project sequence is invalid",
+                    false,
+                )
+            })?,
+            accepted_at,
+            body: draft.body.clone(),
+        })
+    }
+
+    /// Lists messages addressed to one project agent after its last seen sequence.
+    pub fn list_agent_messages(
+        &self,
+        project_id: ProjectId,
+        session_id: AgentSessionId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<loom_core::AgentMessageRecord>> {
+        if !(1..=512).contains(&limit) {
+            return Err(LoomError::invalid_request(
+                "agent message page size must be between 1 and 512",
+            ));
+        }
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let after = i64::try_from(after).map_err(|_| {
+            LoomError::invalid_request("message cursor exceeds SQLite's integer range")
+        })?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT message_id, project_id, task_id, sender_session_id, target_session_id,
+                    kind, project_sequence, accepted_at, body
+             FROM project_agent_messages
+             WHERE project_id=?1 AND target_session_id=?2 AND project_sequence>?3
+             ORDER BY project_sequence LIMIT ?4",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare agent message page: {error}"),
+                    true,
+                )
+            })?;
+        let mut rows = statement
+            .query(params![
+                project_id.as_uuid().as_bytes().as_slice(),
+                session_id.as_uuid().as_bytes().as_slice(),
+                after,
+                i64::try_from(limit).unwrap_or(512),
+            ])
+            .map_err(|error| {
+                persistence_error(format!("could not read agent message page: {error}"), true)
+            })?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next().map_err(|error| {
+            persistence_error(format!("could not read agent message row: {error}"), true)
+        })? {
+            messages.push(AgentMessageRecord {
+                message_id: AgentMessageId::from_uuid(decode_uuid(
+                    &row.get::<_, Vec<u8>>(0).map_err(|error| {
+                        persistence_error(format!("could not decode agent message: {error}"), true)
+                    })?,
+                    "message id",
+                )?),
+                project_id: ProjectId::from_uuid(decode_uuid(
+                    &row.get::<_, Vec<u8>>(1).map_err(|error| {
+                        persistence_error(format!("could not decode agent message: {error}"), true)
+                    })?,
+                    "project id",
+                )?),
+                task_id: row
+                    .get::<_, Option<Vec<u8>>>(2)
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not decode agent message task: {error}"),
+                            true,
+                        )
+                    })?
+                    .as_deref()
+                    .map(|id| decode_uuid(id, "task id").map(TaskId::from_uuid))
+                    .transpose()?,
+                sender_session_id: AgentSessionId::from_uuid(decode_uuid(
+                    &row.get::<_, Vec<u8>>(3).map_err(|error| {
+                        persistence_error(
+                            format!("could not decode agent message sender: {error}"),
+                            true,
+                        )
+                    })?,
+                    "sender session id",
+                )?),
+                target_session_id: AgentSessionId::from_uuid(decode_uuid(
+                    &row.get::<_, Vec<u8>>(4).map_err(|error| {
+                        persistence_error(
+                            format!("could not decode agent message target: {error}"),
+                            true,
+                        )
+                    })?,
+                    "target session id",
+                )?),
+                kind: parse_agent_message_kind(&row.get::<_, String>(5).map_err(|error| {
+                    persistence_error(
+                        format!("could not decode agent message kind: {error}"),
+                        true,
+                    )
+                })?)?,
+                project_sequence: u64::try_from(row.get::<_, i64>(6).map_err(|error| {
+                    persistence_error(
+                        format!("could not decode agent message sequence: {error}"),
+                        true,
+                    )
+                })?)
+                .map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted project message sequence is invalid",
+                        false,
+                    )
+                })?,
+                accepted_at: decode_timestamp(row.get::<_, i64>(7).map_err(|error| {
+                    persistence_error(
+                        format!("could not decode agent message timestamp: {error}"),
+                        true,
+                    )
+                })?)?,
+                body: row.get(8).map_err(|error| {
+                    persistence_error(
+                        format!("could not decode agent message body: {error}"),
+                        true,
+                    )
+                })?,
+            });
+        }
+        Ok(messages)
+    }
+
     /// Loads the durable hierarchy and current session projections for a project.
     pub fn load_project_snapshot(&self, project_id: ProjectId) -> Result<Option<ProjectSnapshot>> {
         if !self.path.exists() {
@@ -1457,9 +2106,12 @@ impl FilePersistence {
         let mut statement = connection
             .prepare(
                 "SELECT hierarchy.session_id, hierarchy.parent_session_id, hierarchy.depth,
-                        session.state, session.updated_at
+                        session.state, session.updated_at, task.intent
                  FROM sessions_hierarchy AS hierarchy
                  JOIN sessions AS session ON session.id=hierarchy.session_id
+                 LEFT JOIN delegated_tasks AS task
+                    ON task.project_id=hierarchy.project_id
+                    AND task.target_session_id=hierarchy.session_id
                  WHERE hierarchy.project_id=?1
                  ORDER BY hierarchy.depth, hierarchy.session_id",
             )
@@ -1474,6 +2126,7 @@ impl FilePersistence {
                     row.get::<_, i64>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(|error| {
@@ -1481,8 +2134,8 @@ impl FilePersistence {
             })?;
         let mut agents = Vec::new();
         for row in rows {
-            let (session_id, parent_session_id, depth, state, updated_at) =
-                row.map_err(|error| {
+            let (session_id, parent_session_id, depth, state, updated_at, task_summary) = row
+                .map_err(|error| {
                     persistence_error(format!("could not read project snapshot: {error}"), true)
                 })?;
             let depth = u8::try_from(depth).map_err(|_| {
@@ -1501,7 +2154,7 @@ impl FilePersistence {
                     .transpose()?,
                 depth,
                 state: parse_session_state(&state)?,
-                task_summary: None,
+                task_summary,
                 output_cursor: EventSequence::default(),
                 updated_at: decode_timestamp(updated_at)?,
             });
@@ -5118,6 +5771,14 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
+        .execute_batch(PROJECT_TASK_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project task schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
         .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .map_err(|error| {
             persistence_error(
@@ -5196,6 +5857,14 @@ fn migrate_v41_to_v42(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
+        .execute_batch(PROJECT_TASK_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project task schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
         .execute(
             "INSERT INTO sessions_hierarchy(project_id, session_id, parent_session_id, depth)
              SELECT id, id, NULL, 1 FROM sessions",
@@ -5219,6 +5888,369 @@ fn migrate_v41_to_v42(connection: &Connection) -> Result<()> {
         )
     })?;
     Ok(())
+}
+
+fn insert_delegated_task(
+    transaction: &Transaction<'_>,
+    request_id: RequestId,
+    request_fingerprint: &[u8],
+    task: &DelegatedTaskRecord,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO delegated_tasks(
+                task_id, request_id, request_fingerprint, project_id, requester_session_id, target_session_id,
+                child_name, intent, code_change, status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                task.task_id.as_uuid().as_bytes().as_slice(),
+                request_id.as_uuid().as_bytes().as_slice(),
+                request_fingerprint,
+                task.project_id.as_uuid().as_bytes().as_slice(),
+                task.requester_session_id.as_uuid().as_bytes().as_slice(),
+                task.target_session_id.as_uuid().as_bytes().as_slice(),
+                task.child_name,
+                task.intent,
+                i64::from(task.code_change),
+                delegated_task_status_name(task.status),
+                encode_timestamp(task.created_at)?,
+                encode_timestamp(task.updated_at)?,
+            ],
+        )
+        .map_err(|error| persistence_error(format!("could not insert delegated task: {error}"), true))?;
+    for (ordinal, reference) in task.context_references.iter().enumerate() {
+        let ordinal = i64::try_from(ordinal).map_err(|_| {
+            LoomError::invalid_request("too many delegated task context references")
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO delegated_task_context_references(task_id, ordinal, label, uri)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    task.task_id.as_uuid().as_bytes().as_slice(),
+                    ordinal,
+                    reference.label,
+                    reference.uri,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not insert delegated task context: {error}"),
+                    true,
+                )
+            })?;
+    }
+    let mut dependencies = BTreeSet::new();
+    for (ordinal, dependency) in task.dependencies.iter().enumerate() {
+        if !dependencies.insert(*dependency) {
+            return Err(LoomError::invalid_request(
+                "delegated task dependencies must not contain duplicates",
+            ));
+        }
+        let ordinal = i64::try_from(ordinal)
+            .map_err(|_| LoomError::invalid_request("too many delegated task dependencies"))?;
+        transaction
+            .execute(
+                "INSERT INTO delegated_task_dependencies(task_id, ordinal, dependency_task_id)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    task.task_id.as_uuid().as_bytes().as_slice(),
+                    ordinal,
+                    dependency.as_uuid().as_bytes().as_slice(),
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not insert delegated task dependency: {error}"),
+                    true,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn load_delegated_task(
+    connection: &Connection,
+    task_id: &Uuid,
+) -> Result<Option<DelegatedTaskRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT task_id, project_id, requester_session_id, target_session_id, child_name,
+                    intent, code_change, status, created_at, updated_at
+             FROM delegated_tasks WHERE task_id=?1",
+            [task_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(format!("could not load delegated task: {error}"), true)
+        })?;
+    let Some((
+        task_id,
+        project_id,
+        requester_id,
+        target_id,
+        child_name,
+        intent,
+        code_change,
+        status,
+        created_at,
+        updated_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let task_id = TaskId::from_uuid(decode_uuid(&task_id, "delegated task id")?);
+    let mut context_statement = connection
+        .prepare("SELECT label, uri FROM delegated_task_context_references WHERE task_id=?1 ORDER BY ordinal")
+        .map_err(|error| persistence_error(format!("could not prepare delegated task context: {error}"), true))?;
+    let context_references = context_statement
+        .query_map([task_id.as_uuid().as_bytes().as_slice()], |row| {
+            Ok(TaskContextReference {
+                label: row.get(0)?,
+                uri: row.get(1)?,
+            })
+        })
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read delegated task context: {error}"),
+                true,
+            )
+        })?
+        .map(|row| {
+            row.map_err(|error| {
+                persistence_error(
+                    format!("could not read delegated task context: {error}"),
+                    true,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut dependency_statement = connection
+        .prepare("SELECT dependency_task_id FROM delegated_task_dependencies WHERE task_id=?1 ORDER BY ordinal")
+        .map_err(|error| persistence_error(format!("could not prepare delegated task dependencies: {error}"), true))?;
+    let dependencies = dependency_statement
+        .query_map([task_id.as_uuid().as_bytes().as_slice()], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read delegated task dependencies: {error}"),
+                true,
+            )
+        })?
+        .map(|row| {
+            let bytes = row.map_err(|error| {
+                persistence_error(
+                    format!("could not read delegated task dependency: {error}"),
+                    true,
+                )
+            })?;
+            Ok(TaskId::from_uuid(decode_uuid(
+                &bytes,
+                "dependency task id",
+            )?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(DelegatedTaskRecord {
+        task_id,
+        project_id: ProjectId::from_uuid(decode_uuid(&project_id, "project id")?),
+        requester_session_id: AgentSessionId::from_uuid(decode_uuid(
+            &requester_id,
+            "requester session id",
+        )?),
+        target_session_id: AgentSessionId::from_uuid(decode_uuid(&target_id, "target session id")?),
+        child_name,
+        intent,
+        context_references,
+        dependencies,
+        code_change: code_change != 0,
+        status: parse_delegated_task_status(&status)?,
+        created_at: decode_timestamp(created_at)?,
+        updated_at: decode_timestamp(updated_at)?,
+    }))
+}
+
+fn delegated_task_request_fingerprint(task: &DelegatedTaskRecord) -> Result<Vec<u8>> {
+    delegated_task_spec_fingerprint(
+        task.project_id,
+        task.requester_session_id,
+        &task.child_name,
+        &DelegatedTaskSpec {
+            intent: task.intent.clone(),
+            context_references: task.context_references.clone(),
+            dependencies: task.dependencies.clone(),
+            code_change: task.code_change,
+        },
+    )
+}
+
+fn delegated_task_spec_fingerprint(
+    project_id: ProjectId,
+    requester_session_id: AgentSessionId,
+    child_name: &str,
+    spec: &DelegatedTaskSpec,
+) -> Result<Vec<u8>> {
+    let payload = serde_json::to_vec(&(
+        project_id,
+        requester_session_id,
+        child_name,
+        &spec.intent,
+        &spec.context_references,
+        &spec.dependencies,
+        spec.code_change,
+    ))
+    .map_err(|error| {
+        persistence_error(
+            format!("could not encode delegated task request: {error}"),
+            false,
+        )
+    })?;
+    Ok(Sha256::digest(payload).to_vec())
+}
+
+fn delegated_task_status_name(status: DelegatedTaskStatus) -> &'static str {
+    match status {
+        DelegatedTaskStatus::Queued => "queued",
+        DelegatedTaskStatus::Running => "running",
+        DelegatedTaskStatus::Blocked => "blocked",
+        DelegatedTaskStatus::Completed => "completed",
+        DelegatedTaskStatus::Failed => "failed",
+        DelegatedTaskStatus::Cancelled => "cancelled",
+    }
+}
+
+fn parse_delegated_task_status(status: &str) -> Result<DelegatedTaskStatus> {
+    match status {
+        "queued" => Ok(DelegatedTaskStatus::Queued),
+        "running" => Ok(DelegatedTaskStatus::Running),
+        "blocked" => Ok(DelegatedTaskStatus::Blocked),
+        "completed" => Ok(DelegatedTaskStatus::Completed),
+        "failed" => Ok(DelegatedTaskStatus::Failed),
+        "cancelled" => Ok(DelegatedTaskStatus::Cancelled),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted delegated task status is invalid",
+            false,
+        )),
+    }
+}
+
+fn agent_message_kind_name(kind: AgentMessageKind) -> &'static str {
+    match kind {
+        AgentMessageKind::Progress => "progress",
+        AgentMessageKind::Result => "result",
+        AgentMessageKind::Question => "question",
+        AgentMessageKind::Blocker => "blocker",
+        AgentMessageKind::Direction => "direction",
+        AgentMessageKind::Answer => "answer",
+    }
+}
+
+fn parse_agent_message_kind(kind: &str) -> Result<AgentMessageKind> {
+    match kind {
+        "progress" => Ok(AgentMessageKind::Progress),
+        "result" => Ok(AgentMessageKind::Result),
+        "question" => Ok(AgentMessageKind::Question),
+        "blocker" => Ok(AgentMessageKind::Blocker),
+        "direction" => Ok(AgentMessageKind::Direction),
+        "answer" => Ok(AgentMessageKind::Answer),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted agent message kind is invalid",
+            false,
+        )),
+    }
+}
+
+fn agent_message_matches_draft(message: &AgentMessageRecord, draft: &AgentMessageDraft) -> bool {
+    message.project_id == draft.project_id
+        && message.task_id == draft.task_id
+        && message.sender_session_id == draft.sender_session_id
+        && message.target_session_id == draft.target_session_id
+        && message.kind == draft.kind
+        && message.body == draft.body
+}
+
+fn load_agent_message_by_request(
+    connection: &Connection,
+    request_id: &[u8],
+) -> Result<Option<AgentMessageRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT message_id, project_id, task_id, sender_session_id, target_session_id,
+                    kind, project_sequence, accepted_at, body
+             FROM project_agent_messages WHERE request_id=?1",
+            [request_id],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(
+                format!("could not inspect agent message request: {error}"),
+                true,
+            )
+        })?;
+    let Some((
+        message_id,
+        project_id,
+        task_id,
+        sender_id,
+        target_id,
+        kind,
+        sequence,
+        accepted_at,
+        body,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let sequence = u64::try_from(sequence).map_err(|_| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted project message sequence is invalid",
+            false,
+        )
+    })?;
+    Ok(Some(AgentMessageRecord {
+        message_id: AgentMessageId::from_uuid(decode_uuid(&message_id, "message id")?),
+        project_id: ProjectId::from_uuid(decode_uuid(&project_id, "project id")?),
+        task_id: task_id
+            .as_deref()
+            .map(|id| decode_uuid(id, "task id").map(TaskId::from_uuid))
+            .transpose()?,
+        sender_session_id: AgentSessionId::from_uuid(decode_uuid(&sender_id, "sender session id")?),
+        target_session_id: AgentSessionId::from_uuid(decode_uuid(&target_id, "target session id")?),
+        kind: parse_agent_message_kind(&kind)?,
+        project_sequence: sequence,
+        accepted_at: decode_timestamp(accepted_at)?,
+        body,
+    }))
 }
 
 fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8>> {
@@ -11224,6 +12256,22 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 42);
+        for table in [
+            "delegated_tasks",
+            "delegated_task_context_references",
+            "delegated_task_dependencies",
+            "project_message_sequences",
+            "project_agent_messages",
+        ] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "v41 migration did not create {table}");
+        }
         drop(connection);
         fs::remove_file(path).unwrap();
     }
@@ -11438,6 +12486,199 @@ mod tests {
         );
         assert!(too_deep.is_err());
         drop(connection);
+        drop(persistence);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn project_child_and_agent_messages_are_atomic_ordered_and_request_idempotent() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut manager = SessionManager::default();
+        let (root, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Project manager")
+            .unwrap();
+        persistence
+            .save_state_with_sessions(&manager.export_state())
+            .unwrap();
+
+        let child_id = AgentSessionId::new();
+        let child_snapshot = AgentSessionSnapshot {
+            id: child_id,
+            workspace_id: root.workspace_id,
+            name: "Research agent".to_owned(),
+            state: AgentSessionState::Idle,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+        };
+        let task = DelegatedTaskRecord {
+            task_id: TaskId::new(),
+            project_id: ProjectId::from_uuid(*root.id.as_uuid()),
+            requester_session_id: root.id,
+            target_session_id: child_id,
+            child_name: child_snapshot.name.clone(),
+            intent: "Inspect the relevant module".to_owned(),
+            context_references: vec![TaskContextReference {
+                label: "architecture".to_owned(),
+                uri: "docs/architecture.md".to_owned(),
+            }],
+            dependencies: Vec::new(),
+            code_change: false,
+            status: DelegatedTaskStatus::Queued,
+            created_at: child_snapshot.created_at,
+            updated_at: child_snapshot.updated_at,
+        };
+        let request_id = RequestId::new();
+        let created = persistence
+            .create_project_child(
+                request_id,
+                &child_snapshot,
+                manager.export_state().next_sequence,
+                &task,
+            )
+            .unwrap();
+        assert_eq!(created, task);
+        let project_snapshot = persistence
+            .load_project_snapshot(task.project_id)
+            .unwrap()
+            .unwrap();
+        let child_projection = project_snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == child_id)
+            .unwrap();
+        assert_eq!(
+            child_projection.task_summary.as_deref(),
+            Some(task.intent.as_str())
+        );
+        assert_eq!(
+            persistence.load_delegated_task(task.task_id).unwrap(),
+            Some(task.clone())
+        );
+        assert_eq!(
+            persistence.list_project_tasks(task.project_id).unwrap(),
+            vec![task.clone()]
+        );
+        let task_spec = DelegatedTaskSpec {
+            intent: task.intent.clone(),
+            context_references: task.context_references.clone(),
+            dependencies: task.dependencies.clone(),
+            code_change: task.code_change,
+        };
+        assert_eq!(
+            persistence
+                .load_project_child_by_request(
+                    request_id,
+                    task.project_id,
+                    task.requester_session_id,
+                    &task.child_name,
+                    &task_spec,
+                )
+                .unwrap(),
+            Some(task.clone())
+        );
+        assert!(
+            persistence
+                .load_project_child_by_request(
+                    request_id,
+                    task.project_id,
+                    task.requester_session_id,
+                    "different child name",
+                    &task_spec,
+                )
+                .is_err()
+        );
+
+        // A retried create request may re-generate its internal IDs, but the
+        // semantic task request is the same and must return the original child.
+        let retry_child = AgentSessionSnapshot {
+            id: AgentSessionId::new(),
+            ..child_snapshot.clone()
+        };
+        let retry_task = DelegatedTaskRecord {
+            task_id: TaskId::new(),
+            target_session_id: retry_child.id,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+            ..task.clone()
+        };
+        assert_eq!(
+            persistence
+                .create_project_child(
+                    request_id,
+                    &retry_child,
+                    manager.export_state().next_sequence,
+                    &retry_task,
+                )
+                .unwrap(),
+            task
+        );
+        assert!(
+            persistence
+                .update_delegated_task_status(
+                    task.task_id,
+                    DelegatedTaskStatus::Running,
+                    Timestamp::now()
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            persistence
+                .load_delegated_task(task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            DelegatedTaskStatus::Running
+        );
+
+        let draft = AgentMessageDraft {
+            project_id: task.project_id,
+            task_id: Some(task.task_id),
+            sender_session_id: root.id,
+            target_session_id: child_id,
+            kind: AgentMessageKind::Direction,
+            body: "Start with the persistence layer".to_owned(),
+        };
+        let message_request = RequestId::new();
+        let accepted = persistence
+            .accept_agent_message(message_request, &draft)
+            .unwrap();
+        assert_eq!(accepted.project_sequence, 1);
+        assert_eq!(accepted.kind, AgentMessageKind::Direction);
+        assert_eq!(
+            persistence
+                .accept_agent_message(message_request, &draft)
+                .unwrap(),
+            accepted
+        );
+        let next = persistence
+            .accept_agent_message(
+                RequestId::new(),
+                &AgentMessageDraft {
+                    target_session_id: root.id,
+                    body: "Child completed a first pass".to_owned(),
+                    kind: AgentMessageKind::Progress,
+                    ..draft.clone()
+                },
+            )
+            .unwrap();
+        assert_eq!(next.project_sequence, 2);
+        assert_eq!(
+            persistence
+                .list_agent_messages(task.project_id, child_id, 0, 10)
+                .unwrap(),
+            vec![accepted]
+        );
+
+        let mismatch = AgentMessageDraft {
+            body: "changed payload".to_owned(),
+            ..draft
+        };
+        assert!(
+            persistence
+                .accept_agent_message(message_request, &mismatch)
+                .is_err()
+        );
         drop(persistence);
         fs::remove_file(path).unwrap();
     }

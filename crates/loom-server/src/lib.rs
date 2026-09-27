@@ -34,7 +34,7 @@ use loom_protocol::{
     GitHubCopilotLoginStatus, GitHubRepository, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES,
     MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES,
     MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult, RequestEnvelope, ResponseEnvelope,
-    ServerEventEnvelope, ServerResponse, SessionDirectory, SessionFilesystemChange,
+    ServerEvent, ServerEventEnvelope, ServerResponse, SessionDirectory, SessionFilesystemChange,
     SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository, WorkerNodeResources,
     WorkerNodeStatus, WorkspaceConfig, WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceFeedEvent,
     unsupported_version_error,
@@ -2126,6 +2126,53 @@ impl InProcessBackend {
             },
             |persistence| persistence.path().with_extension("session-roots"),
         );
+        let mut supported_capabilities = vec![
+            Capability::CreateAgentSession,
+            Capability::ReadAgentSession,
+            Capability::ControlAgentSession,
+            Capability::SubscribeSessionEvents,
+            Capability::SubscribeWorkspaceEvents,
+            Capability::StartAgentRun,
+            Capability::ReadAgentRun,
+            Capability::ReadAgentRunMessages,
+            Capability::ControlAgentRun,
+            Capability::PauseAgentRun,
+            Capability::ResumeAgentRun,
+            Capability::ForkAgentSession,
+            Capability::RetryFromCheckpoint,
+            Capability::ApproveAgentAction,
+            Capability::ListProviders,
+            Capability::ConfigureProviders,
+            Capability::ReadProviderHealth,
+            Capability::ReadUsage,
+            Capability::InspectContext,
+            Capability::ReadWorkspaceConfig,
+            Capability::OpenSessionTerminal,
+            Capability::ControlSessionTerminal,
+            Capability::ReadSessionTask,
+            Capability::StartSessionTask,
+            Capability::ControlSessionTask,
+            Capability::ConfigureApprovalPolicy,
+            Capability::ManageCheckpoints,
+            Capability::ReadVcsStatus,
+            Capability::ReadVcsDiff,
+            Capability::ReadSessionTaskEvidence,
+            Capability::ReadWorkerNodeStatus,
+            Capability::JsonProtocol,
+            Capability::ManageWorkspaces,
+            Capability::ManageSessionRepositories,
+            Capability::BrowseGitHubRepositories,
+            Capability::ReadProject,
+            Capability::ReadSessionFilesystem,
+            Capability::WriteSessionFilesystem,
+        ];
+        if persistence.is_some() {
+            supported_capabilities.extend([
+                Capability::CreateProjectChild,
+                Capability::SendProjectAgentMessage,
+                Capability::ReadProjectAgentMessages,
+            ]);
+        }
         let backend = Arc::new(Self {
             node_id,
             node_name,
@@ -2148,46 +2195,7 @@ impl InProcessBackend {
             session_terminals: Mutex::new(BTreeMap::new()),
             terminals: TerminalManager::new(),
             resource_monitor: Mutex::new(ResourceMonitor::default()),
-            supported_capabilities: CapabilitySet::new([
-                Capability::CreateAgentSession,
-                Capability::ReadAgentSession,
-                Capability::ControlAgentSession,
-                Capability::SubscribeSessionEvents,
-                Capability::SubscribeWorkspaceEvents,
-                Capability::StartAgentRun,
-                Capability::ReadAgentRun,
-                Capability::ReadAgentRunMessages,
-                Capability::ControlAgentRun,
-                Capability::PauseAgentRun,
-                Capability::ResumeAgentRun,
-                Capability::ForkAgentSession,
-                Capability::RetryFromCheckpoint,
-                Capability::ApproveAgentAction,
-                Capability::ListProviders,
-                Capability::ConfigureProviders,
-                Capability::ReadProviderHealth,
-                Capability::ReadUsage,
-                Capability::InspectContext,
-                Capability::ReadWorkspaceConfig,
-                Capability::OpenSessionTerminal,
-                Capability::ControlSessionTerminal,
-                Capability::ReadSessionTask,
-                Capability::StartSessionTask,
-                Capability::ControlSessionTask,
-                Capability::ConfigureApprovalPolicy,
-                Capability::ManageCheckpoints,
-                Capability::ReadVcsStatus,
-                Capability::ReadVcsDiff,
-                Capability::ReadSessionTaskEvidence,
-                Capability::ReadWorkerNodeStatus,
-                Capability::JsonProtocol,
-                Capability::ManageWorkspaces,
-                Capability::ManageSessionRepositories,
-                Capability::BrowseGitHubRepositories,
-                Capability::ReadProject,
-                Capability::ReadSessionFilesystem,
-                Capability::WriteSessionFilesystem,
-            ]),
+            supported_capabilities: CapabilitySet::new(supported_capabilities),
             providers,
             github_copilot_logins: Mutex::new(BTreeMap::new()),
             persistence,
@@ -5124,6 +5132,9 @@ impl InProcessConnection {
             .map(|slot| slot.lock().unwrap_or_else(PoisonError::into_inner));
         let request_for_cache = request.request.clone();
         if retryable {
+            if let Err(error) = self.authorize_request_access(&request_for_cache) {
+                return ResponseEnvelope::failure(request_id, error);
+            }
             match self.backend.cached_response(request_id, &request_for_cache) {
                 Ok(Some(response)) => return response,
                 Ok(None) => {}
@@ -5137,7 +5148,7 @@ impl InProcessConnection {
                 capabilities,
             } => self.negotiate(client_version, capabilities),
             ClientRequest::DiscoverCapabilities => self.discover_capabilities(),
-            request => self.handle_after_negotiation(request),
+            request => self.handle_after_negotiation(request, request_id),
         };
         let result = match result {
             Ok(response) => {
@@ -5211,8 +5222,8 @@ impl InProcessConnection {
         }))
     }
 
-    fn handle_after_negotiation(&self, request: ClientRequest) -> Result<ServerResponse> {
-        self.authorize_request(&request)?;
+    fn authorize_request_access(&self, request: &ClientRequest) -> Result<()> {
+        self.authorize_request(request)?;
         let capabilities = self
             .negotiated_capabilities()?
             .clone()
@@ -5226,7 +5237,29 @@ impl InProcessConnection {
                 false,
             ));
         }
+        Ok(())
+    }
 
+    fn handle_after_negotiation(
+        &self,
+        request: ClientRequest,
+        request_id: RequestId,
+    ) -> Result<ServerResponse> {
+        self.authorize_request_access(&request)?;
+        if self.backend.persistence.is_none()
+            && matches!(
+                &request,
+                ClientRequest::CreateProjectChild { .. }
+                    | ClientRequest::SendProjectAgentMessage { .. }
+                    | ClientRequest::ListProjectAgentMessages { .. }
+            )
+        {
+            return Err(LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "project agents and messages require durable storage",
+                false,
+            ));
+        }
         match request {
             ClientRequest::Negotiate { .. } | ClientRequest::DiscoverCapabilities => {
                 unreachable!("capability requests are handled above")
@@ -5374,6 +5407,25 @@ impl InProcessConnection {
             ),
             ClientRequest::GetProjectSnapshot { project_id } => Ok(
                 ServerResponse::ProjectSnapshot(self.load_project_snapshot(project_id)?),
+            ),
+            ClientRequest::CreateProjectChild {
+                parent_session_id,
+                child_name,
+                spec,
+            } => self.create_project_child(request_id, parent_session_id, child_name, spec),
+            ClientRequest::SendProjectAgentMessage { message } => {
+                self.send_project_agent_message(request_id, message)
+            }
+            ClientRequest::ListProjectAgentMessages {
+                project_id,
+                session_id,
+                after_project_sequence,
+                limit,
+            } => self.list_project_agent_messages(
+                project_id,
+                session_id,
+                after_project_sequence.unwrap_or(0),
+                limit,
             ),
             ClientRequest::RenameAgentSession { session_id, name } => {
                 let (snapshot, record) = self.backend.sessions()?.rename(session_id, name)?;
@@ -6335,6 +6387,424 @@ impl InProcessConnection {
         })
     }
 
+    fn create_project_child(
+        &self,
+        request_id: RequestId,
+        parent_session_id: AgentSessionId,
+        child_name: String,
+        spec: loom_core::DelegatedTaskSpec,
+    ) -> Result<ServerResponse> {
+        if spec.code_change {
+            return Err(LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "delegated code changes require project worktree support",
+                false,
+            ));
+        }
+        if child_name.trim().is_empty() || child_name.len() > 128 {
+            return Err(LoomError::invalid_request(
+                "child name must contain 1 to 128 bytes",
+            ));
+        }
+        if spec.intent.trim().is_empty() || spec.intent.len() > 16 * 1024 {
+            return Err(LoomError::invalid_request(
+                "delegated task intent must contain 1 to 16384 bytes",
+            ));
+        }
+        if spec.context_references.len() > 128 || spec.dependencies.len() > 128 {
+            return Err(LoomError::invalid_request(
+                "delegated task references and dependencies are limited to 128 each",
+            ));
+        }
+        let project_id = ProjectId::from_uuid(*parent_session_id.as_uuid());
+        let project = self.load_project_snapshot(project_id)?;
+        let parent = project
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == parent_session_id)
+            .ok_or_else(|| LoomError::invalid_request("requester is not a project member"))?;
+        if parent.depth != 1 || parent.parent_session_id.is_some() {
+            return Err(LoomError::invalid_request(
+                "only the project root can create direct child agents",
+            ));
+        }
+        if let Some(auth) = &self.auth {
+            if !auth.scope().allows_session(parent_session_id) {
+                return Err(unauthorized_session(parent_session_id));
+            }
+            if !auth.scope().allows_workspace(
+                self.backend
+                    .sessions()?
+                    .get(parent_session_id)?
+                    .workspace_id,
+            ) {
+                return Err(LoomError::new(
+                    ErrorCode::AuthorizationDenied,
+                    "token is not authorized for the project's workspace",
+                    false,
+                ));
+            }
+        }
+        let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "delegated child creation requires durable storage",
+                false,
+            )
+        })?;
+        if let Some(existing_task) = persistence.load_project_child_by_request(
+            request_id,
+            project_id,
+            parent_session_id,
+            &child_name,
+            &spec,
+        )? {
+            let mut existing_project = project;
+            if !existing_project
+                .agents
+                .iter()
+                .any(|agent| agent.session_id == existing_task.target_session_id)
+            {
+                let state = persistence.load_sessions()?.ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "persisted child session is missing from the session catalog",
+                        false,
+                    )
+                })?;
+                *self.backend.sessions()? = SessionManager::from_state(state)?;
+                existing_project = self.load_project_snapshot(project_id)?;
+            }
+            let child = existing_project
+                .agents
+                .iter()
+                .find(|agent| agent.session_id == existing_task.target_session_id)
+                .cloned()
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "delegated task child is missing from its project hierarchy",
+                        false,
+                    )
+                })?;
+            if !self
+                .backend
+                .session_filesystems()?
+                .contains_key(&existing_task.target_session_id)
+            {
+                let filesystem = if self
+                    .backend
+                    .persisted_session_filesystems()?
+                    .contains(&existing_task.target_session_id)
+                {
+                    self.session_filesystem(existing_task.target_session_id)?
+                } else {
+                    self.backend.create_session_filesystem(
+                        self.backend
+                            .sessions()?
+                            .get(existing_task.target_session_id)?
+                            .workspace_id,
+                        existing_task.target_session_id,
+                    )?
+                };
+                self.backend
+                    .session_filesystems()?
+                    .insert(existing_task.target_session_id, filesystem);
+            }
+            return Ok(ServerResponse::ProjectChildCreated {
+                task: existing_task,
+                child,
+            });
+        }
+        let current_tasks = persistence.list_project_tasks(project_id)?;
+        if spec
+            .dependencies
+            .iter()
+            .any(|dependency| !current_tasks.iter().any(|task| task.task_id == *dependency))
+        {
+            return Err(LoomError::invalid_request(
+                "delegated task dependencies must reference tasks in the same project",
+            ));
+        }
+        let nonterminal_direct_children = project
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent.depth == 2
+                    && agent.parent_session_id == Some(parent_session_id)
+                    && !matches!(
+                        agent.state,
+                        AgentSessionState::Completed
+                            | AgentSessionState::Failed
+                            | AgentSessionState::Cancelled
+                            | AgentSessionState::Archived
+                    )
+            })
+            .count();
+        if nonterminal_direct_children >= 4 {
+            return Err(LoomError::conflict(
+                "project already has four nonterminal direct child agents",
+            ));
+        }
+
+        let parent_snapshot = self.backend.sessions()?.get(parent_session_id)?;
+        let child_session_id = AgentSessionId::new();
+        let timestamp = loom_core::Timestamp::now();
+        let child_snapshot = AgentSessionSnapshot {
+            id: child_session_id,
+            workspace_id: parent_snapshot.workspace_id,
+            name: child_name.clone(),
+            state: loom_core::AgentSessionState::Idle,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let task = loom_core::DelegatedTaskRecord {
+            task_id: loom_core::TaskId::new(),
+            project_id,
+            requester_session_id: parent_session_id,
+            target_session_id: child_session_id,
+            child_name: child_name.clone(),
+            intent: spec.intent,
+            context_references: spec.context_references,
+            dependencies: spec.dependencies,
+            code_change: false,
+            status: loom_core::DelegatedTaskStatus::Queued,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let next_sequence = self.backend.sessions()?.next_sequence().next();
+        let persisted_task =
+            persistence.create_project_child(request_id, &child_snapshot, next_sequence, &task)?;
+        let actual_child_session_id = persisted_task.target_session_id;
+        let was_created = actual_child_session_id == child_session_id;
+        let actual_snapshot = match self.backend.sessions()?.get(actual_child_session_id) {
+            Ok(snapshot) => snapshot,
+            Err(_) if !was_created => {
+                let persisted_sessions = persistence.load_sessions()?.ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "persisted child session is missing from the session catalog",
+                        false,
+                    )
+                })?;
+                let snapshot = persisted_sessions
+                    .sessions
+                    .get(&actual_child_session_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        LoomError::not_found("agent session", actual_child_session_id)
+                    })?;
+                *self.backend.sessions()? = SessionManager::from_state(persisted_sessions)?;
+                snapshot
+            }
+            Err(_) => child_snapshot.clone(),
+        };
+        if was_created {
+            let (created, event) = self.backend.sessions()?.create_in_workspace_with_id(
+                actual_snapshot.workspace_id,
+                actual_child_session_id,
+                child_name,
+            )?;
+            self.backend.journal()?.append_session(event);
+            let filesystem = self
+                .backend
+                .create_session_filesystem(created.workspace_id, actual_child_session_id)?;
+            self.backend
+                .session_filesystems()?
+                .insert(actual_child_session_id, filesystem);
+            self.backend
+                .session_repositories()?
+                .insert(actual_child_session_id, BTreeMap::new());
+        } else if !self
+            .backend
+            .session_filesystems()?
+            .contains_key(&actual_child_session_id)
+        {
+            let filesystem = self
+                .backend
+                .create_session_filesystem(actual_snapshot.workspace_id, actual_child_session_id)?;
+            self.backend
+                .session_filesystems()?
+                .insert(actual_child_session_id, filesystem);
+        }
+        let child = ProjectAgentRecord {
+            session_id: actual_child_session_id,
+            project_id,
+            parent_session_id: Some(parent_session_id),
+            depth: 2,
+            state: actual_snapshot.state,
+            task_summary: Some(persisted_task.intent.clone()),
+            output_cursor: EventSequence::default(),
+            updated_at: actual_snapshot.updated_at,
+        };
+        if was_created {
+            let sequence = self.backend.journal()?.next();
+            self.backend.journal()?.append_event(ServerEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence,
+                session_id: parent_session_id,
+                event: ServerEvent::ProjectAgentCreated {
+                    agent: child.clone(),
+                },
+            });
+            let sequence = self.backend.journal()?.next();
+            self.backend.journal()?.append_event(ServerEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence,
+                session_id: parent_session_id,
+                event: ServerEvent::ProjectTaskUpdated {
+                    task: persisted_task.clone(),
+                },
+            });
+        }
+        Ok(ServerResponse::ProjectChildCreated {
+            task: persisted_task,
+            child,
+        })
+    }
+
+    fn send_project_agent_message(
+        &self,
+        request_id: RequestId,
+        draft: loom_core::AgentMessageDraft,
+    ) -> Result<ServerResponse> {
+        if draft.body.trim().is_empty() || draft.body.len() > 16 * 1024 {
+            return Err(LoomError::invalid_request(
+                "agent message body must contain 1 to 16384 bytes",
+            ));
+        }
+        let project = self.load_project_snapshot(draft.project_id)?;
+        let sender = project
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == draft.sender_session_id)
+            .ok_or_else(|| LoomError::invalid_request("message sender is not a project member"))?;
+        let target = project
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == draft.target_session_id)
+            .ok_or_else(|| LoomError::invalid_request("message target is not a project member"))?;
+        let adjacent = sender.parent_session_id == Some(target.session_id)
+            || target.parent_session_id == Some(sender.session_id);
+        if !adjacent {
+            return Err(LoomError::invalid_request(
+                "agent messages are limited to a parent and direct child",
+            ));
+        }
+        if let Some(auth) = &self.auth {
+            for session_id in [draft.sender_session_id, draft.target_session_id] {
+                if !auth.scope().allows_session(session_id) {
+                    return Err(unauthorized_session(session_id));
+                }
+                let session = self.backend.sessions()?.get(session_id)?;
+                if !auth.scope().allows_workspace(session.workspace_id) {
+                    return Err(LoomError::new(
+                        ErrorCode::AuthorizationDenied,
+                        "token is not authorized for a project member's workspace",
+                        false,
+                    ));
+                }
+            }
+        }
+        if let Some(task_id) = draft.task_id {
+            let task = self
+                .backend
+                .persistence
+                .as_ref()
+                .ok_or_else(|| LoomError::not_found("delegated task", task_id))?
+                .load_delegated_task(task_id)?
+                .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
+            if task.project_id != draft.project_id
+                || ![task.requester_session_id, task.target_session_id]
+                    .contains(&draft.sender_session_id)
+                || ![task.requester_session_id, task.target_session_id]
+                    .contains(&draft.target_session_id)
+            {
+                return Err(LoomError::invalid_request(
+                    "message task must belong to the sender and target",
+                ));
+            }
+        }
+        let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "agent messaging requires durable storage",
+                false,
+            )
+        })?;
+        let message = persistence.accept_agent_message(request_id, &draft)?;
+        let sequence = self.backend.journal()?.next();
+        self.backend.journal()?.append_event(ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence,
+            session_id: draft.target_session_id,
+            event: ServerEvent::ProjectAgentMessageAccepted {
+                message: message.clone(),
+            },
+        });
+        Ok(ServerResponse::ProjectAgentMessageAccepted(message))
+    }
+
+    fn list_project_agent_messages(
+        &self,
+        project_id: ProjectId,
+        session_id: AgentSessionId,
+        after_sequence: u64,
+        limit: u32,
+    ) -> Result<ServerResponse> {
+        if !(1..=512).contains(&limit) {
+            return Err(LoomError::invalid_request(
+                "agent message page size must be between 1 and 512",
+            ));
+        }
+        let project = self.load_project_snapshot(project_id)?;
+        if !project
+            .agents
+            .iter()
+            .any(|agent| agent.session_id == session_id)
+        {
+            return Err(LoomError::invalid_request(
+                "session is not a project member",
+            ));
+        }
+        if let Some(auth) = &self.auth
+            && !auth.scope().allows_session(session_id)
+        {
+            return Err(unauthorized_session(session_id));
+        }
+        if let Some(auth) = &self.auth
+            && !auth
+                .scope()
+                .allows_workspace(self.backend.sessions()?.get(session_id)?.workspace_id)
+        {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "token is not authorized for the project member's workspace",
+                false,
+            ));
+        }
+        let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "agent messaging requires durable storage",
+                false,
+            )
+        })?;
+        let messages = persistence.list_agent_messages(
+            project_id,
+            session_id,
+            after_sequence,
+            limit as usize,
+        )?;
+        let next_after_project_sequence = (messages.len() == limit as usize)
+            .then(|| messages.last().map(|message| message.project_sequence))
+            .flatten();
+        Ok(ServerResponse::ProjectAgentMessages {
+            messages,
+            next_after_project_sequence,
+        })
+    }
+
     fn load_project_snapshot(&self, project_id: ProjectId) -> Result<ProjectSnapshot> {
         if let Some(snapshot) = self
             .backend
@@ -6517,6 +6987,10 @@ impl InProcessConnection {
             | ClientRequest::ForkAgentSession {
                 session_id: requested_session,
                 ..
+            }
+            | ClientRequest::CreateProjectChild {
+                parent_session_id: requested_session,
+                ..
             } => session_id = Some(*requested_session),
             ClientRequest::GetSessionEvents {
                 session_id: requested_session,
@@ -6531,6 +7005,18 @@ impl InProcessConnection {
                 session_id: requested_session,
                 ..
             } => session_id = Some(*requested_session),
+            ClientRequest::ListProjectAgentMessages {
+                session_id: requested_session,
+                ..
+            } => session_id = Some(*requested_session),
+            ClientRequest::SendProjectAgentMessage { message } => {
+                if !auth.scope().allows_session(message.sender_session_id) {
+                    return Err(unauthorized_session(message.sender_session_id));
+                }
+                if !auth.scope().allows_session(message.target_session_id) {
+                    return Err(unauthorized_session(message.target_session_id));
+                }
+            }
             ClientRequest::StartSessionAgentRun {
                 session_id: requested_session,
                 ..
@@ -11144,6 +11630,323 @@ mod tests {
                 .code,
             ErrorCode::AuthorizationDenied
         );
+        fs::remove_dir_all(&backend.session_root_base).unwrap();
+    }
+
+    #[test]
+    fn delegated_children_and_direct_messages_are_durable_and_bounded() {
+        let temp =
+            std::env::temp_dir().join(format!("loom-project-agents-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp).unwrap();
+        let backend = InProcessBackend::new_persistent(temp.join("state.sqlite")).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Project agents".into(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Manager".into(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+
+        let create = ClientRequest::CreateProjectChild {
+            parent_session_id: root,
+            child_name: "worker-1".into(),
+            spec: loom_core::DelegatedTaskSpec {
+                intent: "Review a bounded task".into(),
+                context_references: vec![],
+                dependencies: vec![],
+                code_change: false,
+            },
+        };
+        let request_id = RequestId::new();
+        let response =
+            connection.request(RequestEnvelope::with_request_id(request_id, create.clone()));
+        let (task, child) = match response.result.unwrap() {
+            ServerResponse::ProjectChildCreated { task, child } => (task, child),
+            response => panic!("unexpected child response: {response:?}"),
+        };
+        assert_eq!(task.requester_session_id, root);
+        assert_eq!(task.target_session_id, child.session_id);
+        assert_eq!(child.depth, 2);
+        assert_eq!(
+            backend
+                .connect()
+                .request(RequestEnvelope::with_request_id(request_id, create.clone()))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        let scoped_tokens = AuthTokenStore::new();
+        let scoped_token = scoped_tokens
+            .issue(AuthorizationScope::for_sessions(
+                [root],
+                CapabilitySet::new([Capability::ReadAgentSession]),
+            ))
+            .unwrap();
+        let scoped_connection =
+            backend.connect_authenticated(scoped_tokens.authenticate(&scoped_token.token).unwrap());
+        negotiate(&scoped_connection);
+        assert_eq!(
+            scoped_connection
+                .request(RequestEnvelope::with_request_id(request_id, create.clone()))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::with_request_id(request_id, create.clone()))
+                .result,
+            Ok(ServerResponse::ProjectChildCreated { task: repeated, child: repeated_child })
+                if repeated.task_id == task.task_id && repeated_child.session_id == child.session_id
+        ));
+        let snapshot = connection
+            .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
+                project_id: ProjectId::from_uuid(*root.as_uuid()),
+            }))
+            .result
+            .unwrap();
+        assert!(
+            matches!(snapshot, ServerResponse::ProjectSnapshot(snapshot) if snapshot.agents.len() == 2)
+        );
+
+        let message = loom_core::AgentMessageDraft {
+            project_id: ProjectId::from_uuid(*root.as_uuid()),
+            task_id: Some(task.task_id),
+            sender_session_id: root,
+            target_session_id: child.session_id,
+            kind: loom_core::AgentMessageKind::Direction,
+            body: "Please report findings.".into(),
+        };
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::SendProjectAgentMessage {
+                        message: message.clone(),
+                    }
+                ))
+                .result,
+            Ok(ServerResponse::ProjectAgentMessageAccepted(_))
+        ));
+        let messages = connection.request(RequestEnvelope::new(
+            ClientRequest::ListProjectAgentMessages {
+                project_id: message.project_id,
+                session_id: child.session_id,
+                after_project_sequence: None,
+                limit: 10,
+            },
+        ));
+        assert!(
+            matches!(messages.result, Ok(ServerResponse::ProjectAgentMessages { messages, .. }) if messages.len() == 1 && messages[0].kind == loom_core::AgentMessageKind::Direction)
+        );
+        let tokens = AuthTokenStore::new();
+        let scoped_token = tokens
+            .issue(AuthorizationScope::for_sessions(
+                [root],
+                backend.supported_capabilities.clone(),
+            ))
+            .unwrap();
+        let scoped =
+            backend.connect_authenticated(tokens.authenticate(&scoped_token.token).unwrap());
+        negotiate(&scoped);
+        assert_eq!(
+            scoped
+                .request(RequestEnvelope::new(
+                    ClientRequest::SendProjectAgentMessage {
+                        message: message.clone(),
+                    }
+                ))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+        assert_eq!(
+            scoped
+                .request(RequestEnvelope::new(
+                    ClientRequest::ListProjectAgentMessages {
+                        project_id: message.project_id,
+                        session_id: child.session_id,
+                        after_project_sequence: None,
+                        limit: 10,
+                    }
+                ))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+        let wrong_direction = connection.request(RequestEnvelope::new(
+            ClientRequest::SendProjectAgentMessage {
+                message: loom_core::AgentMessageDraft {
+                    target_session_id: AgentSessionId::new(),
+                    ..message.clone()
+                },
+            },
+        ));
+        assert!(matches!(
+            wrong_direction.result,
+            Err(error) if error.code == ErrorCode::InvalidRequest
+        ));
+        let code_change =
+            connection.request(RequestEnvelope::new(ClientRequest::CreateProjectChild {
+                parent_session_id: root,
+                child_name: "coder".into(),
+                spec: loom_core::DelegatedTaskSpec {
+                    intent: "Change code".into(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: true,
+                },
+            }));
+        assert!(matches!(
+            code_change.result,
+            Err(error) if error.code == ErrorCode::UnsupportedCapability
+        ));
+
+        for index in 1..4 {
+            let result =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateProjectChild {
+                    parent_session_id: root,
+                    child_name: format!("worker-{index}"),
+                    spec: loom_core::DelegatedTaskSpec {
+                        intent: format!("Task {index}"),
+                        context_references: vec![],
+                        dependencies: vec![],
+                        code_change: false,
+                    },
+                }));
+            assert!(matches!(
+                result.result,
+                Ok(ServerResponse::ProjectChildCreated { .. })
+            ));
+        }
+        let over_capacity_request = RequestEnvelope::new(ClientRequest::CreateProjectChild {
+            parent_session_id: root,
+            child_name: "worker-5".into(),
+            spec: loom_core::DelegatedTaskSpec {
+                intent: "One too many".into(),
+                context_references: vec![],
+                dependencies: vec![],
+                code_change: false,
+            },
+        });
+        let over_capacity = connection.request(over_capacity_request.clone());
+        assert!(matches!(over_capacity.result, Err(error) if error.code == ErrorCode::Conflict));
+        let (_, terminal_event) = backend
+            .sessions()
+            .unwrap()
+            .transition(child.session_id, AgentSessionState::Completed)
+            .unwrap();
+        backend.journal().unwrap().append_session(terminal_event);
+        backend.persist_state().unwrap();
+        assert!(matches!(
+            connection.request(over_capacity_request).result,
+            Ok(ServerResponse::ProjectChildCreated { .. })
+        ));
+        backend.idempotency().unwrap().remove(&request_id);
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::with_request_id(request_id, create.clone()))
+                .result,
+            Ok(ServerResponse::ProjectChildCreated { task: replayed, child: replayed_child })
+                if replayed.task_id == task.task_id && replayed_child.session_id == child.session_id
+        ));
+        let changed_retry = ClientRequest::CreateProjectChild {
+            parent_session_id: root,
+            child_name: "different-child".into(),
+            spec: loom_core::DelegatedTaskSpec {
+                intent: "Changed request under reused ID".into(),
+                context_references: vec![],
+                dependencies: vec![],
+                code_change: false,
+            },
+        };
+        backend.idempotency().unwrap().remove(&request_id);
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::with_request_id(request_id, changed_retry))
+                .result,
+            Err(error) if error.code == ErrorCode::InvalidRequest
+        ));
+        drop(connection);
+        drop(backend);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn delegated_children_require_durable_storage_on_ephemeral_backends() {
+        let backend = InProcessBackend::new();
+        let connection = backend.connect();
+        let discovered = connection
+            .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+            .result
+            .unwrap();
+        assert!(matches!(
+            discovered,
+            ServerResponse::Capabilities(result)
+                if !result.capabilities.contains(Capability::CreateProjectChild)
+                    && !result.capabilities.contains(Capability::SendProjectAgentMessage)
+        ));
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Ephemeral project".into(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Manager".into(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        let response =
+            connection.request(RequestEnvelope::new(ClientRequest::CreateProjectChild {
+                parent_session_id: root,
+                child_name: "worker".into(),
+                spec: loom_core::DelegatedTaskSpec {
+                    intent: "Durably owned work".into(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                },
+            }));
+        assert!(matches!(
+            response.result,
+            Err(error) if error.code == ErrorCode::UnsupportedCapability
+                && error.message.contains("durable storage")
+        ));
         fs::remove_dir_all(&backend.session_root_base).unwrap();
     }
 

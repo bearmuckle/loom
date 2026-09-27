@@ -1,5 +1,6 @@
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, Capability, CapabilitySet, EventSequence, LoomError,
+    AgentMessageDraft, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, Capability,
+    CapabilitySet, DelegatedTaskRecord, DelegatedTaskSpec, EventSequence, LoomError,
     ProjectAgentRecord, ProjectId, ProjectSnapshot, ProtocolVersion, RepositoryId, RequestId,
     RunId, SessionEvent, SessionEventRecord, SessionLimits, ToolCallId, UsageSnapshot, WorkspaceId,
 };
@@ -383,6 +384,20 @@ pub enum ClientRequest {
     GetProjectSnapshot {
         project_id: ProjectId,
     },
+    CreateProjectChild {
+        parent_session_id: AgentSessionId,
+        child_name: String,
+        spec: DelegatedTaskSpec,
+    },
+    SendProjectAgentMessage {
+        message: AgentMessageDraft,
+    },
+    ListProjectAgentMessages {
+        project_id: ProjectId,
+        session_id: AgentSessionId,
+        after_project_sequence: Option<u64>,
+        limit: u32,
+    },
     RenameAgentSession {
         session_id: AgentSessionId,
         name: String,
@@ -561,6 +576,9 @@ impl ClientRequest {
             | Self::GetAgentSessionSnapshotMetadata { .. }
             | Self::GetAgentSessionInitialState { .. } => Some(Capability::ReadAgentSession),
             Self::GetProjectSnapshot { .. } => Some(Capability::ReadProject),
+            Self::CreateProjectChild { .. } => Some(Capability::CreateProjectChild),
+            Self::SendProjectAgentMessage { .. } => Some(Capability::SendProjectAgentMessage),
+            Self::ListProjectAgentMessages { .. } => Some(Capability::ReadProjectAgentMessages),
             Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
                 Some(Capability::ControlAgentSession)
             }
@@ -607,6 +625,7 @@ impl ClientRequest {
                 | Self::RegisterWorkspace { .. }
                 | Self::RenameWorkspace { .. }
                 | Self::CreateAgentSessionInWorkspace { .. }
+                | Self::CreateProjectChild { .. }
                 | Self::SetWorkspaceConfigForWorkspace { .. }
                 | Self::AttachSessionRepository { .. }
                 | Self::DetachSessionRepository { .. }
@@ -631,6 +650,7 @@ impl ClientRequest {
                 | Self::ApproveAgentAction { .. }
                 | Self::RejectAgentAction { .. }
                 | Self::SendAgentMessage { .. }
+                | Self::SendProjectAgentMessage { .. }
                 | Self::InterruptAgentRun { .. }
                 | Self::RetryAgentStep { .. }
                 | Self::PauseAgentRun { .. }
@@ -708,6 +728,15 @@ pub enum ServerResponse {
     AgentSessionSnapshot(AgentSessionSnapshotProjection),
     AgentSessionInitialState(AgentSessionInitialState),
     ProjectSnapshot(ProjectSnapshot),
+    ProjectChildCreated {
+        task: DelegatedTaskRecord,
+        child: ProjectAgentRecord,
+    },
+    ProjectAgentMessageAccepted(AgentMessageRecord),
+    ProjectAgentMessages {
+        messages: Vec<AgentMessageRecord>,
+        next_after_project_sequence: Option<u64>,
+    },
     AgentSessionRenamed(AgentSessionSnapshot),
     AgentSessionArchived(AgentSessionSnapshot),
     AgentRunStarted(AgentRunSnapshot),
@@ -898,6 +927,12 @@ pub enum WorkspaceFeedEvent {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum ServerEvent {
+    ProjectTaskUpdated {
+        task: DelegatedTaskRecord,
+    },
+    ProjectAgentMessageAccepted {
+        message: AgentMessageRecord,
+    },
     ProjectAgentCreated {
         agent: ProjectAgentRecord,
     },
@@ -1093,6 +1128,97 @@ mod run_message_protocol_tests {
         ))
         .unwrap();
         assert_eq!(decode_response(&encoded).unwrap().result.unwrap(), response);
+    }
+
+    #[test]
+    fn delegated_child_and_addressed_message_protocol_round_trip() {
+        let parent = AgentSessionId::new();
+        let project_id = ProjectId::new();
+        let child_request = ClientRequest::CreateProjectChild {
+            parent_session_id: parent,
+            child_name: "worker".into(),
+            spec: DelegatedTaskSpec {
+                intent: "Inspect protocol compatibility".into(),
+                context_references: vec![loom_core::TaskContextReference {
+                    label: "Plan".into(),
+                    uri: "docs/project-sessions-design.md".into(),
+                }],
+                dependencies: vec![],
+                code_change: true,
+            },
+        };
+        assert_eq!(
+            child_request.required_capability(),
+            Some(Capability::CreateProjectChild)
+        );
+        assert!(child_request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(child_request.clone())).unwrap())
+                .unwrap()
+                .request,
+            child_request
+        );
+
+        let draft = AgentMessageDraft {
+            project_id,
+            task_id: Some(loom_core::TaskId::new()),
+            sender_session_id: parent,
+            target_session_id: AgentSessionId::new(),
+            kind: loom_core::AgentMessageKind::Progress,
+            body: "Status update".into(),
+        };
+        let send_request = ClientRequest::SendProjectAgentMessage {
+            message: draft.clone(),
+        };
+        assert_eq!(
+            send_request.required_capability(),
+            Some(Capability::SendProjectAgentMessage)
+        );
+        assert!(send_request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(send_request.clone())).unwrap())
+                .unwrap()
+                .request,
+            send_request
+        );
+
+        let list_request = ClientRequest::ListProjectAgentMessages {
+            project_id,
+            session_id: parent,
+            after_project_sequence: Some(4),
+            limit: 20,
+        };
+        assert_eq!(
+            list_request.required_capability(),
+            Some(Capability::ReadProjectAgentMessages)
+        );
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(list_request.clone())).unwrap())
+                .unwrap()
+                .request,
+            list_request
+        );
+
+        let message = AgentMessageRecord {
+            message_id: loom_core::AgentMessageId::new(),
+            project_id,
+            task_id: draft.task_id,
+            sender_session_id: draft.sender_session_id,
+            target_session_id: draft.target_session_id,
+            kind: draft.kind,
+            project_sequence: 1,
+            accepted_at: loom_core::Timestamp::from_unix_millis(10),
+            body: draft.body,
+        };
+        let event = ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(1),
+            session_id: parent,
+            event: ServerEvent::ProjectAgentMessageAccepted {
+                message: message.clone(),
+            },
+        };
+        assert_eq!(decode_event(&encode_event(&event).unwrap()).unwrap(), event);
     }
 
     #[test]

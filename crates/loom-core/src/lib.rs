@@ -18,7 +18,11 @@ pub use id::{
 };
 pub use limits::{LimitKind, LimitStatus, SessionLimits, UsageSnapshot};
 pub use policy::{ActionKind, ApprovalPolicy, PolicyDecision, PolicyEvaluation};
-pub use project::{MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord, ProjectSnapshot};
+pub use project::{
+    AgentMessageDraft, AgentMessageKind, AgentMessageRecord, DelegatedTaskRecord,
+    DelegatedTaskSpec, DelegatedTaskStatus, MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord,
+    ProjectSnapshot, TaskContextReference,
+};
 pub use session::{AgentSessionSnapshot, AgentSessionState, SessionEvent, SessionEventRecord};
 pub use time::Timestamp;
 pub use version::ProtocolVersion;
