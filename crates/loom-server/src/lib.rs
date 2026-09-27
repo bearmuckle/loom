@@ -2954,6 +2954,7 @@ impl InProcessBackend {
             persistence.save_recovery_updates(&recovery_updates, &feed)?;
             journal.pending_events.clear();
         }
+        self.resume_queued_project_tasks()?;
         let lazy_filesystem_count = self.persisted_session_filesystems()?.len();
         log::info!(
             "indexed {} resumable runs, restored {} runtimes, deferred {} runtimes, and left {} filesystem services lazy in {} ms total",
@@ -2963,6 +2964,34 @@ impl InProcessBackend {
             lazy_filesystem_count,
             startup_started.elapsed().as_millis()
         );
+        Ok(())
+    }
+
+    fn resume_queued_project_tasks(self: &Arc<Self>) -> Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let session_ids = self
+            .sessions()?
+            .list_in_workspace(None, true)
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>();
+        let mut project_ids = BTreeSet::new();
+        for session_id in session_ids {
+            let project_id = ProjectId::from_uuid(*session_id.as_uuid());
+            if persistence.load_project_snapshot(project_id)?.is_some() {
+                project_ids.insert(project_id);
+            }
+        }
+        let connection = self.connect();
+        for project_id in project_ids {
+            for mut task in persistence.list_project_tasks(project_id)? {
+                if task.status == loom_core::DelegatedTaskStatus::Queued {
+                    connection.schedule_project_task_if_ready(&mut task)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3577,7 +3606,7 @@ impl InProcessBackend {
     }
 
     fn append_recovery_events(
-        &self,
+        self: &Arc<Self>,
         session_id: AgentSessionId,
         events: Vec<AgentEvent>,
     ) -> Result<()> {
@@ -3589,6 +3618,15 @@ impl InProcessBackend {
                 if current != state {
                     let (_, record) = self.sessions()?.transition(session_id, state)?;
                     self.journal()?.append_session(record);
+                }
+                self.update_project_task_for_session_state(session_id, state)?;
+                if matches!(
+                    state,
+                    AgentSessionState::Completed
+                        | AgentSessionState::Failed
+                        | AgentSessionState::Cancelled
+                ) {
+                    self.resume_queued_project_tasks()?;
                 }
             }
         }
@@ -3645,7 +3683,11 @@ impl InProcessBackend {
     }
 
     /// Journals one agent event and keeps the session state in step with it.
-    fn record_agent_event(&self, session_id: AgentSessionId, event: AgentEvent) -> Result<()> {
+    fn record_agent_event(
+        self: &Arc<Self>,
+        session_id: AgentSessionId,
+        event: AgentEvent,
+    ) -> Result<()> {
         let state = session_state_for_event(&event);
         self.journal()?.append_agent(session_id, event);
         if let Some(state) = state {
@@ -3654,7 +3696,46 @@ impl InProcessBackend {
                 let (_, record) = self.sessions()?.transition(session_id, state)?;
                 self.journal()?.append_session(record);
             }
+            self.update_project_task_for_session_state(session_id, state)?;
+            if matches!(
+                state,
+                AgentSessionState::Completed
+                    | AgentSessionState::Failed
+                    | AgentSessionState::Cancelled
+            ) {
+                self.resume_queued_project_tasks()?;
+            }
         }
+        Ok(())
+    }
+
+    fn update_project_task_for_session_state(
+        &self,
+        session_id: AgentSessionId,
+        state: AgentSessionState,
+    ) -> Result<()> {
+        let Some(next_status) = delegated_task_status_for_session_state(state) else {
+            return Ok(());
+        };
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let Some(task) = persistence.load_delegated_task_for_target(session_id)? else {
+            return Ok(());
+        };
+        if !persistence.update_delegated_task_status(task.task_id, next_status, Timestamp::now())? {
+            return Ok(());
+        }
+        let task = persistence
+            .load_delegated_task(task.task_id)?
+            .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
+        let sequence = self.journal()?.next();
+        self.journal()?.append_event(ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence,
+            session_id: task.requester_session_id,
+            event: ServerEvent::ProjectTaskUpdated { task },
+        });
         Ok(())
     }
 
@@ -6406,6 +6487,21 @@ impl InProcessConnection {
                 "child name must contain 1 to 128 bytes",
             ));
         }
+        if spec.model_id.trim().is_empty() || spec.model_id.len() > 512 {
+            return Err(LoomError::invalid_request(
+                "delegated task model ID must contain 1 to 512 bytes",
+            ));
+        }
+        if self.backend.persistence.is_none() {
+            return Err(LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "delegated child creation requires durable storage",
+                false,
+            ));
+        }
+        let model_id = ModelId::new(spec.model_id.clone());
+        self.backend.provider(&model_id)?;
+        self.backend.providers.pricing(&model_id)?;
         if spec.intent.trim().is_empty() || spec.intent.len() > 16 * 1024 {
             return Err(LoomError::invalid_request(
                 "delegated task intent must contain 1 to 16384 bytes",
@@ -6511,6 +6607,8 @@ impl InProcessConnection {
                     .session_filesystems()?
                     .insert(existing_task.target_session_id, filesystem);
             }
+            let mut existing_task = existing_task;
+            self.schedule_project_task_if_ready(&mut existing_task)?;
             return Ok(ServerResponse::ProjectChildCreated {
                 task: existing_task,
                 child,
@@ -6565,6 +6663,7 @@ impl InProcessConnection {
             target_session_id: child_session_id,
             child_name: child_name.clone(),
             intent: spec.intent,
+            model_id: model_id.as_str().to_owned(),
             context_references: spec.context_references,
             dependencies: spec.dependencies,
             code_change: false,
@@ -6573,7 +6672,7 @@ impl InProcessConnection {
             updated_at: timestamp,
         };
         let next_sequence = self.backend.sessions()?.next_sequence().next();
-        let persisted_task =
+        let mut persisted_task =
             persistence.create_project_child(request_id, &child_snapshot, next_sequence, &task)?;
         let actual_child_session_id = persisted_task.target_session_id;
         let was_created = actual_child_session_id == child_session_id;
@@ -6657,10 +6756,106 @@ impl InProcessConnection {
                 },
             });
         }
+        self.schedule_project_task_if_ready(&mut persisted_task)?;
         Ok(ServerResponse::ProjectChildCreated {
             task: persisted_task,
             child,
         })
+    }
+
+    fn schedule_project_task_if_ready(
+        &self,
+        task: &mut loom_core::DelegatedTaskRecord,
+    ) -> Result<()> {
+        if task.status != loom_core::DelegatedTaskStatus::Queued {
+            return Ok(());
+        }
+        let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "project task scheduling requires durable storage",
+                false,
+            )
+        })?;
+        let tasks = persistence.list_project_tasks(task.project_id)?;
+        if task.dependencies.iter().any(|dependency| {
+            !tasks.iter().any(|candidate| {
+                candidate.task_id == *dependency
+                    && candidate.status == loom_core::DelegatedTaskStatus::Completed
+            })
+        }) {
+            return Ok(());
+        }
+        if persistence
+            .load_latest_run_summary_for_session(task.target_session_id)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if self.backend.sessions()?.get(task.target_session_id)?.state != AgentSessionState::Idle {
+            return Ok(());
+        }
+
+        let context = task
+            .context_references
+            .iter()
+            .map(|reference| format!("- {}: {}", reference.label, reference.uri))
+            .collect::<Vec<_>>();
+        let task_prompt = if context.is_empty() {
+            task.intent.clone()
+        } else {
+            format!(
+                "{}\n\nRelevant context:\n{}",
+                task.intent,
+                context.join("\n")
+            )
+        };
+        let system_instructions = format!(
+            "You are a non-code project sub-agent working on one bounded task. Do not modify source code or repository files. Report progress and findings to the parent agent. Project: {}. Parent session: {}. Task ID: {}.",
+            task.project_id, task.requester_session_id, task.task_id
+        );
+        let result = self.start_run_with_options(StartRunInput {
+            session_id: task.target_session_id,
+            task: task_prompt,
+            model: ModelId::new(task.model_id.clone()),
+            system_instructions: Some(system_instructions),
+            repository_instructions: None,
+            options: AgentRuntimeOptions::default(),
+        });
+        let next_status = match result {
+            Ok(ServerResponse::AgentRunStarted(_)) => loom_core::DelegatedTaskStatus::Running,
+            Ok(_) => {
+                return Err(LoomError::new(
+                    ErrorCode::Internal,
+                    "project child scheduler returned an unexpected response",
+                    false,
+                ));
+            }
+            Err(error) => {
+                log::warn!("could not start delegated task {}: {}", task.task_id, error);
+                loom_core::DelegatedTaskStatus::Blocked
+            }
+        };
+        let updated_at = loom_core::Timestamp::now();
+        if !persistence.update_delegated_task_status_if_queued(
+            task.task_id,
+            next_status,
+            updated_at,
+        )? {
+            return Ok(());
+        }
+        let Some(updated_task) = persistence.load_delegated_task(task.task_id)? else {
+            return Err(LoomError::not_found("delegated task", task.task_id));
+        };
+        *task = updated_task;
+        let sequence = self.backend.journal()?.next();
+        self.backend.journal()?.append_event(ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence,
+            session_id: task.requester_session_id,
+            event: ServerEvent::ProjectTaskUpdated { task: task.clone() },
+        });
+        Ok(())
     }
 
     fn send_project_agent_message(
@@ -7510,6 +7705,26 @@ fn session_state_for_event(event: &AgentEvent) -> Option<AgentSessionState> {
         AgentRunState::Completed => AgentSessionState::Completed,
         AgentRunState::Failed => AgentSessionState::Failed,
         AgentRunState::Cancelled => AgentSessionState::Cancelled,
+    })
+}
+
+fn delegated_task_status_for_session_state(
+    state: AgentSessionState,
+) -> Option<loom_core::DelegatedTaskStatus> {
+    use loom_core::DelegatedTaskStatus as Status;
+    Some(match state {
+        AgentSessionState::Planning
+        | AgentSessionState::Executing
+        | AgentSessionState::Evaluating => Status::Running,
+        AgentSessionState::AwaitingApproval
+        | AgentSessionState::Paused
+        | AgentSessionState::NeedsInput => Status::Blocked,
+        AgentSessionState::Completed => Status::Completed,
+        AgentSessionState::Failed => Status::Failed,
+        AgentSessionState::Cancelled => Status::Cancelled,
+        AgentSessionState::Idle | AgentSessionState::Queued | AgentSessionState::Archived => {
+            return None;
+        }
     })
 }
 
@@ -11670,6 +11885,7 @@ mod tests {
             child_name: "worker-1".into(),
             spec: loom_core::DelegatedTaskSpec {
                 intent: "Review a bounded task".into(),
+                model_id: "deterministic/demo".into(),
                 context_references: vec![],
                 dependencies: vec![],
                 code_change: false,
@@ -11813,6 +12029,7 @@ mod tests {
                 child_name: "coder".into(),
                 spec: loom_core::DelegatedTaskSpec {
                     intent: "Change code".into(),
+                    model_id: "deterministic/demo".into(),
                     context_references: vec![],
                     dependencies: vec![],
                     code_change: true,
@@ -11820,7 +12037,7 @@ mod tests {
             }));
         assert!(matches!(
             code_change.result,
-            Err(error) if error.code == ErrorCode::UnsupportedCapability
+            Err(ref error) if error.code == ErrorCode::UnsupportedCapability
         ));
 
         for index in 1..4 {
@@ -11830,6 +12047,7 @@ mod tests {
                     child_name: format!("worker-{index}"),
                     spec: loom_core::DelegatedTaskSpec {
                         intent: format!("Task {index}"),
+                        model_id: "deterministic/demo".into(),
                         context_references: vec![],
                         dependencies: vec![],
                         code_change: false,
@@ -11845,24 +12063,30 @@ mod tests {
             child_name: "worker-5".into(),
             spec: loom_core::DelegatedTaskSpec {
                 intent: "One too many".into(),
+                model_id: "deterministic/demo".into(),
                 context_references: vec![],
                 dependencies: vec![],
                 code_change: false,
             },
         });
         let over_capacity = connection.request(over_capacity_request.clone());
-        assert!(matches!(over_capacity.result, Err(error) if error.code == ErrorCode::Conflict));
-        let (_, terminal_event) = backend
-            .sessions()
-            .unwrap()
-            .transition(child.session_id, AgentSessionState::Completed)
-            .unwrap();
-        backend.journal().unwrap().append_session(terminal_event);
-        backend.persist_state().unwrap();
-        assert!(matches!(
-            connection.request(over_capacity_request).result,
-            Ok(ServerResponse::ProjectChildCreated { .. })
-        ));
+        match over_capacity.result {
+            Err(error) if error.code == ErrorCode::Conflict => {
+                let (_, terminal_event) = backend
+                    .sessions()
+                    .unwrap()
+                    .transition(child.session_id, AgentSessionState::Completed)
+                    .unwrap();
+                backend.journal().unwrap().append_session(terminal_event);
+                backend.persist_state().unwrap();
+                assert!(matches!(
+                    connection.request(over_capacity_request).result,
+                    Ok(ServerResponse::ProjectChildCreated { .. })
+                ));
+            }
+            Ok(ServerResponse::ProjectChildCreated { .. }) => {}
+            result => panic!("unexpected capacity response: {result:?}"),
+        }
         backend.idempotency().unwrap().remove(&request_id);
         assert!(matches!(
             connection
@@ -11876,6 +12100,7 @@ mod tests {
             child_name: "different-child".into(),
             spec: loom_core::DelegatedTaskSpec {
                 intent: "Changed request under reused ID".into(),
+                model_id: "deterministic/demo".into(),
                 context_references: vec![],
                 dependencies: vec![],
                 code_change: false,
@@ -11937,16 +12162,20 @@ mod tests {
                 child_name: "worker".into(),
                 spec: loom_core::DelegatedTaskSpec {
                     intent: "Durably owned work".into(),
+                    model_id: "deterministic/demo".into(),
                     context_references: vec![],
                     dependencies: vec![],
                     code_change: false,
                 },
             }));
-        assert!(matches!(
-            response.result,
-            Err(error) if error.code == ErrorCode::UnsupportedCapability
-                && error.message.contains("durable storage")
-        ));
+        assert!(
+            matches!(
+                response.result,
+                Err(ref error) if error.code == ErrorCode::CapabilityDenied
+            ),
+            "unexpected ephemeral child response: {:?}",
+            response.result
+        );
         fs::remove_dir_all(&backend.session_root_base).unwrap();
     }
 

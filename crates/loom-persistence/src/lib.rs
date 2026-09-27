@@ -732,6 +732,7 @@ CREATE TABLE IF NOT EXISTS delegated_tasks (
     target_session_id BLOB NOT NULL UNIQUE CHECK(length(target_session_id) = 16),
     child_name TEXT NOT NULL CHECK(length(trim(child_name)) > 0),
     intent TEXT NOT NULL CHECK(length(trim(intent)) > 0),
+    model_id TEXT NOT NULL CHECK(length(trim(model_id)) > 0),
     code_change INTEGER NOT NULL CHECK(code_change IN (0, 1)),
     status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'blocked', 'completed', 'failed', 'cancelled')),
     created_at INTEGER NOT NULL CHECK(created_at >= 0),
@@ -1728,6 +1729,44 @@ impl FilePersistence {
         load_delegated_task(&connection, task_id.as_uuid())
     }
 
+    /// Finds the delegated task owned by a child session, if it was created as
+    /// part of a project.
+    pub fn load_delegated_task_for_target(
+        &self,
+        target_session_id: AgentSessionId,
+    ) -> Result<Option<DelegatedTaskRecord>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let task_id: Option<Vec<u8>> = connection
+            .query_row(
+                "SELECT task_id FROM delegated_tasks WHERE target_session_id=?1",
+                [target_session_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not find delegated task for child session: {error}"),
+                    true,
+                )
+            })?;
+        let Some(task_id) = task_id else {
+            return Ok(None);
+        };
+        let task_id = decode_uuid(&task_id, "delegated task id")?;
+        load_delegated_task(&connection, &task_id)?
+            .map(Some)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "delegated task target index is inconsistent",
+                    false,
+                )
+            })
+    }
+
     /// Looks up a previously created child by its idempotency key and verifies
     /// that the retry carries the same semantic request before returning it.
     pub fn load_project_child_by_request(
@@ -1830,8 +1869,7 @@ impl FilePersistence {
         let changed = connection
             .execute(
                 "UPDATE delegated_tasks SET status=?2, updated_at=?3
-                 WHERE task_id=?1 AND updated_at <= ?3
-                   AND (status IS NOT ?2 OR updated_at IS NOT ?3)",
+                 WHERE task_id=?1 AND updated_at <= ?3 AND status IS NOT ?2",
                 params![
                     task_id.as_uuid().as_bytes().as_slice(),
                     delegated_task_status_name(status),
@@ -1841,6 +1879,36 @@ impl FilePersistence {
             .map_err(|error| {
                 persistence_error(
                     format!("could not update delegated task status: {error}"),
+                    true,
+                )
+            })?;
+        Ok(changed > 0)
+    }
+
+    /// Claims a queued task after its child run has been started. A concurrent
+    /// completion event may already have advanced it, so this never regresses a
+    /// terminal or blocked status back to running.
+    pub fn update_delegated_task_status_if_queued(
+        &self,
+        task_id: TaskId,
+        status: DelegatedTaskStatus,
+        updated_at: Timestamp,
+    ) -> Result<bool> {
+        let updated_at = encode_timestamp(updated_at)?;
+        let connection = self.connection_for_write()?;
+        let changed = connection
+            .execute(
+                "UPDATE delegated_tasks SET status=?2, updated_at=?3
+                 WHERE task_id=?1 AND status='queued'",
+                params![
+                    task_id.as_uuid().as_bytes().as_slice(),
+                    delegated_task_status_name(status),
+                    updated_at
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not update queued delegated task: {error}"),
                     true,
                 )
             })?;
@@ -5900,8 +5968,8 @@ fn insert_delegated_task(
         .execute(
             "INSERT INTO delegated_tasks(
                 task_id, request_id, request_fingerprint, project_id, requester_session_id, target_session_id,
-                child_name, intent, code_change, status, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                child_name, intent, model_id, code_change, status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 task.task_id.as_uuid().as_bytes().as_slice(),
                 request_id.as_uuid().as_bytes().as_slice(),
@@ -5911,6 +5979,7 @@ fn insert_delegated_task(
                 task.target_session_id.as_uuid().as_bytes().as_slice(),
                 task.child_name,
                 task.intent,
+                task.model_id,
                 i64::from(task.code_change),
                 delegated_task_status_name(task.status),
                 encode_timestamp(task.created_at)?,
@@ -5976,7 +6045,7 @@ fn load_delegated_task(
     let row = connection
         .query_row(
             "SELECT task_id, project_id, requester_session_id, target_session_id, child_name,
-                    intent, code_change, status, created_at, updated_at
+                    intent, model_id, code_change, status, created_at, updated_at
              FROM delegated_tasks WHERE task_id=?1",
             [task_id.as_bytes().as_slice()],
             |row| {
@@ -5987,10 +6056,11 @@ fn load_delegated_task(
                     row.get::<_, Vec<u8>>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
                     row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
                 ))
             },
         )
@@ -6005,6 +6075,7 @@ fn load_delegated_task(
         target_id,
         child_name,
         intent,
+        model_id,
         code_change,
         status,
         created_at,
@@ -6075,6 +6146,7 @@ fn load_delegated_task(
         target_session_id: AgentSessionId::from_uuid(decode_uuid(&target_id, "target session id")?),
         child_name,
         intent,
+        model_id,
         context_references,
         dependencies,
         code_change: code_change != 0,
@@ -6091,6 +6163,7 @@ fn delegated_task_request_fingerprint(task: &DelegatedTaskRecord) -> Result<Vec<
         &task.child_name,
         &DelegatedTaskSpec {
             intent: task.intent.clone(),
+            model_id: task.model_id.clone(),
             context_references: task.context_references.clone(),
             dependencies: task.dependencies.clone(),
             code_change: task.code_change,
@@ -6109,6 +6182,7 @@ fn delegated_task_spec_fingerprint(
         requester_session_id,
         child_name,
         &spec.intent,
+        &spec.model_id,
         &spec.context_references,
         &spec.dependencies,
         spec.code_change,
@@ -12518,6 +12592,7 @@ mod tests {
             target_session_id: child_id,
             child_name: child_snapshot.name.clone(),
             intent: "Inspect the relevant module".to_owned(),
+            model_id: "deterministic/demo".to_owned(),
             context_references: vec![TaskContextReference {
                 label: "architecture".to_owned(),
                 uri: "docs/architecture.md".to_owned(),
@@ -12561,6 +12636,7 @@ mod tests {
         );
         let task_spec = DelegatedTaskSpec {
             intent: task.intent.clone(),
+            model_id: task.model_id.clone(),
             context_references: task.context_references.clone(),
             dependencies: task.dependencies.clone(),
             code_change: task.code_change,

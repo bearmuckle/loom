@@ -50,6 +50,9 @@ pub enum DelegatedTaskStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DelegatedTaskSpec {
     pub intent: String,
+    /// Provider model selected for this child; persisted so retries and restart
+    /// recovery use the same model.
+    pub model_id: String,
     pub context_references: Vec<TaskContextReference>,
     pub dependencies: Vec<TaskId>,
     pub code_change: bool,
@@ -63,6 +66,7 @@ pub struct DelegatedTaskRecord {
     pub target_session_id: AgentSessionId,
     pub child_name: String,
     pub intent: String,
+    pub model_id: String,
     pub context_references: Vec<TaskContextReference>,
     pub dependencies: Vec<TaskId>,
     pub code_change: bool,
@@ -166,6 +170,7 @@ mod tests {
         let task_id = TaskId::new();
         let spec = DelegatedTaskSpec {
             intent: "Review migration".into(),
+            model_id: "provider/review-model".into(),
             context_references: vec![TaskContextReference {
                 label: "Design".into(),
                 uri: "docs/design.md".into(),
@@ -180,6 +185,7 @@ mod tests {
             target_session_id: target,
             child_name: "reviewer".into(),
             intent: spec.intent.clone(),
+            model_id: spec.model_id.clone(),
             context_references: spec.context_references.clone(),
             dependencies: spec.dependencies.clone(),
             code_change: spec.code_change,

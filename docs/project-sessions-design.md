@@ -4,8 +4,13 @@
 
 This document turns [GitHub issue #17](https://github.com/bearmuckle/loom/issues/17),
 “Project sessions and coordinated sub-agents,” into an implementation design.
-It is a design and sequencing plan, not a claim that project orchestration is
-implemented. The issue is XL-sized, so delivery is split into reviewable slices.
+It is the design and sequencing plan for the feature. The issue is XL-sized, so
+delivery is split into reviewable slices. The current draft implementation has
+landed the project hierarchy, protocol 5.0 contract, forward v41-to-v42 SQLite
+migration, durable child/task creation, persisted child model selection,
+restart scheduling for queued children, dependency gating, and basic durable
+parent-child message storage. Active runtime mailbox delivery, worktree-backed
+code tasks, controls, UI, and integration remain future slices.
 
 The feature makes a root agent session a **project**: the durable owner of a
 user goal and the root of an agent hierarchy. A project manager may delegate
@@ -26,8 +31,9 @@ a descendant.
 - **Agent session** is one executing or completed agent context. It belongs to
   exactly one project and has either no parent (the root) or one parent agent.
 - **Delegated task** records bounded intent, context references, dependencies,
-  expected outcome, code-change intent, owner, and status. It is not merely a
-  prompt convention or a fixed planning gate.
+  expected outcome, selected model, code-change intent, owner, and status. The
+  selected model is stored so retries and restart recovery keep the same model.
+  A delegated task is not merely a prompt convention or a fixed planning gate.
 - **Agent message** is a durable, ordered, attributed message addressed to an
   agent in the same project: progress, result, question, blocker, direction, or
   answer. It is distinct from user conversation and tool activity.
@@ -146,8 +152,10 @@ have been created.
 Persist normalized queryable records for project membership/parentage,
 delegated task intent and dependencies, message envelope/body and ordering,
 and worktree/integration state. Use foreign keys and transactions so child
-creation with its initial task, and message acceptance with its event, are
-atomic. Enforce one root per project, same-project parentage, no cycles, and
+creation with its initial task is atomic. Message acceptance and project
+ordering commit together; event delivery is a post-commit notification, and
+clients recover missed notifications from the durable addressed-message log.
+Enforce one root per project, same-project parentage, no cycles, and
 maximum depth three in the backend domain service and persistence boundary.
 Do not place growing messages or child lists inside session JSON blobs.
 
@@ -183,23 +191,23 @@ and its decision.
 
 ### Slice 0: domain and protocol foundation
 
-1. Add project/agent hierarchy IDs, depth, delegated-task intent/status,
-   message envelope/type, and worktree integration state to shared domain
-   types. Define invariants and stable transition/error codes.
-2. Add the forward v41-to-v42 transactional migration for project roots,
-   parentage, task dependencies, addressed messages, and integration records.
-   Represent all existing sessions as roots in projects without children.
-3. Advance the protocol contract and enforce the minimum client version at
-   negotiation/connection setup before serving project-aware schemas. Add
-   project snapshots, commands, and events with contract tests for ordering,
-   idempotency, authorization, and depth limits.
-4. Add recovery reconciliation for committed-but-not-launched children and
-   interrupted child runs.
+1. **Implemented:** add project/agent hierarchy IDs, depth, delegated-task
+   intent/status, message envelope/type, and worktree integration state to
+   shared domain types; enforce the core hierarchy invariants.
+2. **Implemented:** add the forward v41-to-v42 migration and represent existing
+   sessions as project roots.
+3. **Implemented:** advance to protocol 5.0 and reject older clients during
+   negotiation before serving project-aware schemas.
+4. **Partial:** recover committed-but-not-launched queued children and schedule
+   tasks when dependencies complete. Interrupted child runs still need full
+   reconciliation into a resumable/unknown state.
 
 **Exit:** v41 data migrates to v42 with existing sessions represented as
 projects; unsupported clients are directed to upgrade before using the new
-contract; hierarchy invariants are backend-enforced; snapshots/events survive
-restart and reconnect. Backend downgrade is unsupported and documented.
+contract; hierarchy invariants are backend-enforced; snapshots and durable
+records survive restart and reconnect. Backend downgrade is unsupported and
+documented. Event replay is rebuilt from authoritative records where a crash
+occurs after record commit but before notification persistence.
 
 ### Slice 1: direct-child non-code coordination
 
@@ -208,7 +216,9 @@ restart and reconnect. Backend downgrade is unsupported and documented.
 2. Enforce configurable bounded parallelism and project membership; create
    the child durably before scheduling its independent agent runtime.
 3. Implement parent-child durable messaging with accepted/ordered semantics,
-   active-recipient wakeup, and queued delivery after resume.
+   active runtime wakeup, and queued delivery after resume. The current slice
+   stores messages and publishes a notification, but does not yet wake an
+   already-running recipient or replay missed notifications automatically.
 4. Return progress, completion, questions, and blockers to the manager and
    allow it to answer, redirect, continue, retry, or cancel.
 5. Add a deterministic end-to-end scenario for investigation/planning that

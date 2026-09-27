@@ -1139,6 +1139,7 @@ mod run_message_protocol_tests {
             child_name: "worker".into(),
             spec: DelegatedTaskSpec {
                 intent: "Inspect protocol compatibility".into(),
+                model_id: "deterministic/demo".into(),
                 context_references: vec![loom_core::TaskContextReference {
                     label: "Plan".into(),
                     uri: "docs/project-sessions-design.md".into(),
