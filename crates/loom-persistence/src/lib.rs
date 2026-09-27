@@ -43,6 +43,7 @@ const MAX_CONTENT_RANGE_BYTES: usize =
 const MAX_RUN_MESSAGE_PAGE_SIZE: usize = loom_protocol::MAX_AGENT_RUN_MESSAGE_PAGE_SIZE as usize;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DURABLE_FEED_SESSION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DURABLE_FEED_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILESYSTEM_CHANGE_HISTORY: usize = 2048;
 const MAX_FILESYSTEM_CHANGE_PAGE_SIZE: usize = 512;
 const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
@@ -3645,11 +3646,26 @@ impl FilePersistence {
             .map_err(|error| {
                 persistence_error(format!("could not validate event feed size: {error}"), true)
             })?;
-        if largest_stream_bytes < 0 || largest_stream_bytes > MAX_DURABLE_FEED_SESSION_BYTES as i64
+        let total_feed_bytes: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(length(payload)), 0) FROM feed_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not validate total event feed size: {error}"),
+                    true,
+                )
+            })?;
+        if largest_stream_bytes < 0
+            || largest_stream_bytes > MAX_DURABLE_FEED_SESSION_BYTES as i64
+            || total_feed_bytes < 0
+            || total_feed_bytes > MAX_DURABLE_FEED_TOTAL_BYTES as i64
         {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                "persisted session event stream exceeds its byte limit",
+                "persisted event feed exceeds its byte limit",
                 false,
             ));
         }
@@ -7752,6 +7768,20 @@ where
 }
 
 fn save_feed_rows(transaction: &Transaction<'_>, feed: &DurableFeedState) -> Result<()> {
+    save_feed_rows_with_limits(
+        transaction,
+        feed,
+        MAX_DURABLE_FEED_SESSION_BYTES,
+        MAX_DURABLE_FEED_TOTAL_BYTES,
+    )
+}
+
+fn save_feed_rows_with_limits(
+    transaction: &Transaction<'_>,
+    feed: &DurableFeedState,
+    session_byte_limit: usize,
+    total_byte_limit: usize,
+) -> Result<()> {
     let next_sequence = i64::try_from(feed.next_sequence.value()).map_err(|_| {
         LoomError::new(
             ErrorCode::Persistence,
@@ -7843,21 +7873,54 @@ fn save_feed_rows(transaction: &Transaction<'_>, feed: &DurableFeedState) -> Res
             })?;
     }
     transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_pruned_feed (
+                sequence INTEGER PRIMARY KEY,
+                session_id BLOB NOT NULL
+             ) WITHOUT ROWID;
+             DELETE FROM _loom_pruned_feed;",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prepare reconnect feed pruning: {error}"),
+                true,
+            )
+        })?;
+    transaction
         .execute(
             "WITH ranked AS (
                 SELECT sequence, session_id,
                        SUM(length(payload)) OVER (
                            PARTITION BY session_id ORDER BY sequence DESC
-                       ) AS retained_bytes,
+                       ) AS session_bytes,
                        ROW_NUMBER() OVER (
                            PARTITION BY session_id ORDER BY sequence DESC
-                       ) AS stream_position
+                       ) AS session_position,
+                       SUM(length(payload)) OVER (
+                           ORDER BY sequence DESC
+                       ) AS total_bytes
                 FROM feed_events
-             ), pruned AS (
+             )
+             INSERT INTO _loom_pruned_feed(sequence, session_id)
+             SELECT sequence, session_id FROM ranked
+             WHERE session_bytes > ?1 OR session_position > ?2 OR total_bytes > ?3",
+            params![
+                session_byte_limit as i64,
+                retention_limit,
+                total_byte_limit as i64
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not select reconnect feed retention: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "WITH pruned AS (
                 SELECT session_id, MAX(sequence) AS pruned_through
-                FROM ranked
-                WHERE retained_bytes > ?1 OR stream_position > ?2
-                GROUP BY session_id
+                FROM _loom_pruned_feed GROUP BY session_id
              )
              UPDATE feed_session_meta
              SET pruned_through=MAX(
@@ -7866,7 +7929,7 @@ fn save_feed_rows(transaction: &Transaction<'_>, feed: &DurableFeedState) -> Res
                      WHERE pruned.session_id=feed_session_meta.session_id)
                  )
              WHERE session_id IN (SELECT session_id FROM pruned)",
-            params![MAX_DURABLE_FEED_SESSION_BYTES as i64, retention_limit],
+            [],
         )
         .map_err(|error| {
             persistence_error(
@@ -7890,23 +7953,10 @@ fn save_feed_rows(transaction: &Transaction<'_>, feed: &DurableFeedState) -> Res
         })?;
     transaction
         .execute(
-            "WITH ranked AS (
-                SELECT sequence,
-                       session_id,
-                       SUM(length(payload)) OVER (
-                           PARTITION BY session_id ORDER BY sequence DESC
-                       ) AS retained_bytes,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY session_id ORDER BY sequence DESC
-                       ) AS stream_position
-                FROM feed_events
-             )
-             DELETE FROM feed_events
-             WHERE sequence IN (
-                    SELECT sequence FROM ranked
-                    WHERE retained_bytes > ?1 OR stream_position > ?2
-                )",
-            params![MAX_DURABLE_FEED_SESSION_BYTES as i64, retention_limit],
+            "DELETE FROM feed_events WHERE sequence IN (
+                SELECT sequence FROM _loom_pruned_feed
+             )",
+            [],
         )
         .map_err(|error| persistence_error(format!("could not prune event feed: {error}"), true))?;
     Ok(())
@@ -10594,6 +10644,69 @@ mod tests {
                 .map(|event| event.sequence),
             Some(EventSequence::new(3))
         );
+
+        // A small test-only aggregate budget exercises the same global policy
+        // used in production without allocating a multi-megabyte fixture.
+        let additional_events = DurableFeedState {
+            next_sequence: EventSequence::new(6),
+            retention_limit: 100,
+            events: vec![
+                ServerEventEnvelope {
+                    protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(5),
+                    session_id,
+                    event: loom_protocol::ServerEvent::AgentSessionCreated {
+                        snapshot: snapshot.clone(),
+                    },
+                },
+                ServerEventEnvelope {
+                    protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                    sequence: EventSequence::new(6),
+                    session_id: second_session_id,
+                    event: loom_protocol::ServerEvent::AgentSessionCreated {
+                        snapshot: AgentSessionSnapshot {
+                            id: second_session_id,
+                            workspace_id,
+                            name: "Quiet feed".to_owned(),
+                            state: AgentSessionState::Idle,
+                            created_at: Timestamp::from_unix_millis(11),
+                            updated_at: Timestamp::from_unix_millis(11),
+                        },
+                    },
+                },
+            ],
+        };
+        let mut connection = Connection::open(&path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        save_feed_rows_with_limits(&transaction, &additional_events, 1_000_000, 250).unwrap();
+        transaction.commit().unwrap();
+        let retained_sequences: Vec<i64> = {
+            let mut statement = connection
+                .prepare("SELECT sequence FROM feed_events ORDER BY sequence")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert!(retained_sequences.contains(&6));
+        assert!(retained_sequences.iter().all(|sequence| *sequence >= 5));
+        let retained_bytes: i64 = connection
+            .query_row(
+                "SELECT COALESCE(SUM(length(payload)), 0) FROM feed_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(retained_bytes <= 250);
+        let quiet_cursor = store
+            .load_feed_session_cursor(second_session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(quiet_cursor.latest_sequence, EventSequence::new(6));
+        assert_eq!(quiet_cursor.pruned_through, EventSequence::new(2));
+        drop(connection);
 
         let connection = Connection::open(&path).unwrap();
         let plan: String = connection

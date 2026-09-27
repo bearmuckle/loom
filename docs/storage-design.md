@@ -347,14 +347,16 @@ can expire a quiet stream entirely; no promise of a minimum reconnect duration i
 made. This bounds payload bytes, not total SQLite file size including free pages.
 
 The current implementation is a partial step: the in-memory journal retains up
-to 4,096 events per session, and the durable feed additionally retains up to
-16 MiB of encoded payload per session. Pending durable notifications are pruned
-to the same per-session event count. It keeps global sequence numbers and full
-event payloads. It has no aggregate feed byte limit, stream epoch, workspace
-stream, or transactional snapshot/resubscribe cursor. The target limits above
-still require compact revision notifications and fully scoped cursors before an
-aggregate budget can be added without letting one session evict another's
-history.
+to 4,096 events per session, and the durable feed retains up to 16 MiB of
+encoded payload per session and 16 MiB across the backend. The backend-wide
+limit prunes the globally oldest retained events first; each affected session's
+pruned-through cursor is advanced transactionally, so reconnect requests detect
+the gap and request an authoritative snapshot. Pending durable notifications are
+pruned to the same per-session event count. It keeps global sequence numbers and
+full event payloads. It has no stream epoch, workspace stream, or transactional
+snapshot/resubscribe cursor. The target still requires compact revision
+notifications and fully scoped cursors; global pressure may expire a quiet
+session's entire retained feed.
 
 An expired cursor returns `ResyncRequired`, followed by an authoritative snapshot
 with a fresh cursor read in the same SQLite read transaction. Subscribe after that
