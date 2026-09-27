@@ -786,6 +786,7 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
         TextView::markdown(id, text)
             .selectable(true)
             .w_full()
+            .text_size(px(BASE_FONT_SIZE))
             .text_color(rgb(color))
             .into_any()
     } else {
@@ -798,6 +799,7 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
             )
             .selectable(true)
             .w_full()
+            .text_size(px(BASE_FONT_SIZE))
             .text_color(rgb(color))
             .into_any()
     }
