@@ -8392,6 +8392,48 @@ mod tests {
     }
 
     #[test]
+    fn missing_database_reads_stay_lazy_and_return_empty_state() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        let session_id = AgentSessionId::new();
+        let run_id = RunId::new();
+        assert!(!store.exists());
+        assert!(
+            store
+                .load_section::<Value>("missing", CURRENT_SCHEMA_VERSION)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_section_path::<Value>("missing", "/run", CURRENT_SCHEMA_VERSION)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.list_sections_with_prefix("run:").unwrap().is_empty());
+        assert!(store.load_sessions().unwrap().is_none());
+        assert!(store.load_workspaces().unwrap().is_none());
+        assert!(store.load_run_messages(run_id).unwrap().is_empty());
+        assert!(
+            store
+                .load_run_message_page(run_id, None, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.load_filesystem_record(session_id).unwrap().is_none());
+        assert!(store.load_feed_state().unwrap().is_none());
+        assert!(store.load_feed_header().unwrap().is_none());
+        assert!(
+            store
+                .load_feed_session_cursor(session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.load_feed_events_since(None, None).unwrap().is_empty());
+        assert!(!store.exists());
+    }
+
+    #[test]
     fn filesystem_change_writes_retain_only_the_newest_entries() {
         let session_id = AgentSessionId::new();
         let changes = (1..=(MAX_FILESYSTEM_CHANGE_HISTORY as u64 + 1))
@@ -9704,6 +9746,14 @@ mod tests {
                 },
             ],
         )]);
+        let oversized_fragment = vec![b'x'; MAX_MESSAGE_FRAGMENT_BYTES + 1];
+        assert_eq!(
+            persistence
+                .append_run_message_fragment(run_id, session.id, 1, 0, 4, &oversized_fragment,)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
         persistence
             .save_state(DurableStateWrite {
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -9726,6 +9776,56 @@ mod tests {
             })
             .unwrap();
 
+        for (message_ordinal, fragment_ordinal, byte_offset) in [
+            (u64::MAX, 0, 0),
+            (1, u64::MAX, 4),
+            (1, 0, u64::MAX),
+            (1, 0, i64::MAX as u64),
+        ] {
+            assert_eq!(
+                persistence
+                    .append_run_message_fragment(
+                        run_id,
+                        session.id,
+                        message_ordinal,
+                        fragment_ordinal,
+                        byte_offset,
+                        b"x",
+                    )
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidRequest
+            );
+        }
+
+        assert_eq!(
+            persistence
+                .append_run_message_fragment(run_id, AgentSessionId::new(), 1, 0, 4, b"x")
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        assert_eq!(
+            persistence
+                .append_run_message_fragment(run_id, session.id, 1, 0, 4, b"")
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            persistence
+                .append_run_message_fragment(run_id, session.id, 1, 0, 4, &[0xff])
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            persistence
+                .append_run_message_fragment(run_id, session.id, 0, 0, 0, b"not assistant")
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
         persistence
             .append_run_message_fragment(run_id, session.id, 1, 0, 4, b"hello ")
             .unwrap();
@@ -9735,12 +9835,45 @@ mod tests {
         persistence
             .append_run_message_fragment(run_id, session.id, 1, 1, 10, b"world")
             .unwrap();
+        assert_eq!(
+            persistence
+                .append_run_message_fragment(run_id, session.id, 1, 0, 4, b"conflict")
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            persistence
+                .load_run_message_content_range(run_id, 999, 0, 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            persistence
+                .load_run_message_content_range(
+                    run_id,
+                    1,
+                    0,
+                    MAX_CONTENT_RANGE_BYTES.saturating_add(1),
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
         let newest_page = persistence
             .load_run_message_page(run_id, Some(2), 1)
             .unwrap();
         assert_eq!(newest_page.len(), 1);
         assert_eq!(newest_page[0].ordinal, 1);
         assert_eq!(newest_page[0].content_bytes, 15);
+        assert_eq!(
+            persistence
+                .load_run_message_content_range(run_id, 1, u64::MAX, 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
         assert_eq!(
             persistence
                 .load_run_message_content_range(run_id, 1, 7, 5)
@@ -10099,6 +10232,94 @@ mod tests {
                 .load_section_path::<Value>(&first, "/kmissing", CURRENT_SCHEMA_VERSION)
                 .unwrap()
                 .is_none()
+        );
+        assert_eq!(
+            store
+                .load_section_path::<Value>(&first, "krun", CURRENT_SCHEMA_VERSION)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            store
+                .load_section_path::<Value>(&first, "/krun", CURRENT_SCHEMA_VERSION + 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+        let full_section = store
+            .load_section_path::<Value>(&first, "", CURRENT_SCHEMA_VERSION)
+            .unwrap()
+            .unwrap();
+        assert_eq!(full_section["run"]["state"], "completed");
+        assert_eq!(
+            store
+                .load_section_path::<String>(&first, "/krun", CURRENT_SCHEMA_VERSION)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+        assert!(
+            store
+                .load_section_path::<Value>("run:missing", "/krun", CURRENT_SCHEMA_VERSION)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .load_section::<String>(&first, CURRENT_SCHEMA_VERSION)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+        assert!(
+            store
+                .load_section::<Value>("run:missing", CURRENT_SCHEMA_VERSION)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .load_section::<Value>(&first, CURRENT_SCHEMA_VERSION + 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn run_message_pages_reject_invalid_limits_and_cursors() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        store.save_sections(CURRENT_SCHEMA_VERSION, &[]).unwrap();
+        let run_id = RunId::new();
+        assert!(
+            store
+                .load_run_message_page(run_id, None, 1)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .load_run_message_page(run_id, None, 0)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            store
+                .load_run_message_page(run_id, None, MAX_RUN_MESSAGE_PAGE_SIZE + 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            store
+                .load_run_message_page(run_id, Some(u64::MAX), 1)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
         );
         fs::remove_file(path).unwrap();
     }
@@ -10720,5 +10941,68 @@ mod tests {
         assert!(plan.contains("feed_events_by_session_sequence"), "{plan}");
         drop(connection);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reconnect_event_decoder_accepts_compressed_rows_and_rejects_corruption() {
+        let session_id = AgentSessionId::new();
+        let event = ServerEventEnvelope {
+            protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(7),
+            session_id,
+            event: loom_protocol::ServerEvent::AgentSessionCreated {
+                snapshot: AgentSessionSnapshot {
+                    id: session_id,
+                    workspace_id: WorkspaceId::new(),
+                    name: "compressed event".to_owned(),
+                    state: AgentSessionState::Idle,
+                    created_at: Timestamp::from_unix_millis(1),
+                    updated_at: Timestamp::from_unix_millis(1),
+                },
+            },
+        };
+        let raw = serde_json::to_vec(&event).unwrap();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < raw.len());
+        assert_eq!(
+            decode_feed_event(
+                7,
+                session_id.as_uuid().as_bytes().to_vec(),
+                1,
+                compressed.clone(),
+            )
+            .unwrap(),
+            event
+        );
+        assert_eq!(
+            decode_feed_event(
+                7,
+                session_id.as_uuid().as_bytes().to_vec(),
+                99,
+                compressed.clone(),
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::MalformedPayload
+        );
+        assert_eq!(
+            decode_feed_event(
+                7,
+                session_id.as_uuid().as_bytes().to_vec(),
+                1,
+                b"not a zlib stream".to_vec(),
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::MalformedPayload
+        );
+        assert_eq!(
+            decode_feed_event(8, session_id.as_uuid().as_bytes().to_vec(), 1, compressed,)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
     }
 }
