@@ -10331,6 +10331,7 @@ impl Render for LoomView {
                     .border_b_1()
                     .border_color(rgb(0x30343f))
                     .rounded_client_top(client_decorated, tiling)
+                    .when(cfg!(target_os = "macos"), |element| element.pl(px(72.)))
                     .child(
                         div()
                             .id("window-titlebar-drag")
