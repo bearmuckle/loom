@@ -32,8 +32,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 35;
-const DATABASE_SCHEMA_VERSION: u32 = 35;
+pub const CURRENT_SCHEMA_VERSION: u32 = 36;
+const DATABASE_SCHEMA_VERSION: u32 = 36;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -102,8 +102,10 @@ CREATE INDEX IF NOT EXISTS runs_by_state_activity
     ON run_summaries(state, updated_at DESC, run_id DESC);
 CREATE TABLE IF NOT EXISTS run_runtime_config (
     run_id BLOB PRIMARY KEY NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE,
-    system_instructions TEXT,
-    repository_instructions TEXT,
+    system_instructions_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
+        CHECK(system_instructions_hash IS NULL OR length(system_instructions_hash) = 32),
+    repository_instructions_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
+        CHECK(repository_instructions_hash IS NULL OR length(repository_instructions_hash) = 32),
     policy_read TEXT NOT NULL CHECK(policy_read IN ('allow', 'require_approval', 'deny')),
     policy_write TEXT NOT NULL CHECK(policy_write IN ('allow', 'require_approval', 'deny')),
     policy_command TEXT NOT NULL CHECK(policy_command IN ('allow', 'require_approval', 'deny')),
@@ -588,6 +590,23 @@ END;
 CREATE TRIGGER IF NOT EXISTS gc_tool_attempts_update AFTER UPDATE OF result_hash ON run_tool_attempts
 WHEN OLD.result_hash IS NOT NULL AND OLD.result_hash IS NOT NEW.result_hash BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.result_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_run_runtime_config_delete AFTER DELETE ON run_runtime_config BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
+        SELECT 'object', OLD.system_instructions_hash WHERE OLD.system_instructions_hash IS NOT NULL;
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
+        SELECT 'object', OLD.repository_instructions_hash WHERE OLD.repository_instructions_hash IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS gc_run_runtime_config_update
+AFTER UPDATE OF system_instructions_hash, repository_instructions_hash ON run_runtime_config BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
+        SELECT 'object', OLD.system_instructions_hash
+        WHERE OLD.system_instructions_hash IS NOT NULL
+          AND OLD.system_instructions_hash IS NOT NEW.system_instructions_hash;
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
+        SELECT 'object', OLD.repository_instructions_hash
+        WHERE OLD.repository_instructions_hash IS NOT NULL
+          AND OLD.repository_instructions_hash IS NOT NEW.repository_instructions_hash;
 END;
 CREATE TRIGGER IF NOT EXISTS gc_filesystem_edits_delete AFTER DELETE ON filesystem_edits
 WHEN OLD.before_hash IS NOT NULL BEGIN
@@ -2013,7 +2032,7 @@ impl FilePersistence {
         let connection = self.connection()?;
         let row = connection
             .query_row(
-                "SELECT system_instructions, repository_instructions,
+                "SELECT system_instructions_hash, repository_instructions_hash,
                         policy_read, policy_write, policy_command, policy_network,
                         policy_destructive, max_duration_ms, max_input_tokens,
                         max_output_tokens, max_tool_calls, max_cost_micros,
@@ -2025,8 +2044,8 @@ impl FilePersistence {
                 [run_id.as_uuid().as_bytes().as_slice()],
                 |row| {
                     Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
@@ -2077,8 +2096,14 @@ impl FilePersistence {
                 inspection,
             )| {
                 Ok(DurableRunRuntimeConfig {
-                    system_instructions: system,
-                    repository_instructions: repository,
+                    system_instructions: system
+                        .as_deref()
+                        .map(|hash| decode_content(&connection, hash))
+                        .transpose()?,
+                    repository_instructions: repository
+                        .as_deref()
+                        .map(|hash| decode_content(&connection, hash))
+                        .transpose()?,
                     approval_policy: ApprovalPolicy {
                         read: decode_policy_decision(&policy_read, "read")?,
                         write: decode_policy_decision(&policy_write, "write")?,
@@ -4830,6 +4855,10 @@ fn collect_unused_content(transaction: &Transaction<'_>, candidate_limit: usize)
                 SELECT 1 FROM run_tool_attempts
                 WHERE run_tool_attempts.result_hash=content_objects.hash
              ) AND NOT EXISTS (
+                SELECT 1 FROM run_runtime_config
+                WHERE run_runtime_config.system_instructions_hash=content_objects.hash
+                   OR run_runtime_config.repository_instructions_hash=content_objects.hash
+             ) AND NOT EXISTS (
                 SELECT 1 FROM filesystem_edits
                 WHERE filesystem_edits.before_hash=content_objects.hash
              )",
@@ -6094,6 +6123,16 @@ fn save_run_runtime_config_rows(
                 false,
             ));
         }
+        let system_instructions_hash = config
+            .system_instructions
+            .as_deref()
+            .map(|value| store_content(transaction, value.as_bytes()))
+            .transpose()?;
+        let repository_instructions_hash = config
+            .repository_instructions
+            .as_deref()
+            .map(|value| store_content(transaction, value.as_bytes()))
+            .transpose()?;
         let limits = &config.limits;
         let context = &config.context_options;
         let max_duration_ms = encode_optional_counter(limits.max_duration_ms, "max duration")?;
@@ -6117,7 +6156,7 @@ fn save_run_runtime_config_rows(
         transaction
             .execute(
                 "INSERT INTO run_runtime_config(
-                    run_id, system_instructions, repository_instructions,
+                    run_id, system_instructions_hash, repository_instructions_hash,
                     policy_read, policy_write, policy_command, policy_network,
                     policy_destructive, max_duration_ms, max_input_tokens,
                     max_output_tokens, max_tool_calls, max_cost_micros,
@@ -6130,8 +6169,8 @@ fn save_run_runtime_config_rows(
                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
                  )
                  ON CONFLICT(run_id) DO UPDATE SET
-                    system_instructions=excluded.system_instructions,
-                    repository_instructions=excluded.repository_instructions,
+                    system_instructions_hash=excluded.system_instructions_hash,
+                    repository_instructions_hash=excluded.repository_instructions_hash,
                     policy_read=excluded.policy_read,
                     policy_write=excluded.policy_write,
                     policy_command=excluded.policy_command,
@@ -6149,8 +6188,8 @@ fn save_run_runtime_config_rows(
                     input_cost_micros_per_1k=excluded.input_cost_micros_per_1k,
                     output_cost_micros_per_1k=excluded.output_cost_micros_per_1k,
                     context_inspection=excluded.context_inspection
-                 WHERE run_runtime_config.system_instructions IS NOT excluded.system_instructions
-                    OR run_runtime_config.repository_instructions IS NOT excluded.repository_instructions
+                 WHERE run_runtime_config.system_instructions_hash IS NOT excluded.system_instructions_hash
+                    OR run_runtime_config.repository_instructions_hash IS NOT excluded.repository_instructions_hash
                     OR run_runtime_config.policy_read IS NOT excluded.policy_read
                     OR run_runtime_config.policy_write IS NOT excluded.policy_write
                     OR run_runtime_config.policy_command IS NOT excluded.policy_command
@@ -6170,8 +6209,8 @@ fn save_run_runtime_config_rows(
                     OR run_runtime_config.context_inspection IS NOT excluded.context_inspection",
                 params![
                     run_id.as_uuid().as_bytes().as_slice(),
-                    config.system_instructions,
-                    config.repository_instructions,
+                    system_instructions_hash,
+                    repository_instructions_hash,
                     encode_policy_decision(config.approval_policy.read),
                     encode_policy_decision(config.approval_policy.write),
                     encode_policy_decision(config.approval_policy.command),
@@ -6200,7 +6239,7 @@ fn save_run_runtime_config_rows(
                 )
             })?;
     }
-    Ok(())
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
 }
 
 fn save_run_summary_rows(
@@ -9139,7 +9178,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=34;")
+            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=35;")
             .unwrap();
         let original_journal_mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -9166,7 +9205,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 34);
+        assert_eq!(version, 35);
         assert_eq!(journal_mode, original_journal_mode);
         assert!(!has_feed_meta);
         fs::remove_file(path).unwrap();
@@ -10341,7 +10380,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(content_codec, 1);
-        assert_eq!(content_count, 7);
+        assert_eq!(content_count, 9);
         let (filesystem_codec, raw_size, payload_size): (i64, i64, i64) = connection
             .query_row(
                 "SELECT payload_codec, raw_size, length(payload) FROM session_filesystems
@@ -10410,8 +10449,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))
             .unwrap();
         assert_eq!(
-            content_count, 6,
-            "retained transcript, context checkpoint, tool, and filesystem undo content remain reachable"
+            content_count, 8,
+            "retained transcript, context checkpoint, tool, filesystem undo, and run-instruction content remain reachable"
         );
         drop(connection);
         fs::remove_file(path).unwrap();

@@ -194,7 +194,9 @@ summary/execution/history rows. Schema v35 decomposes approval policy and
 runtime limits, context budgets, checkpoint identity, and token-cost rates into
 typed columns; only context-inspection diagnostics remain bounded JSON. Runtime
 configuration is absent from this synthetic fixture, so its storage reduction
-is not measured here.
+is not measured here. Schema v36 content-addresses and compresses the system and
+repository instruction strings, sharing identical content across runs; the
+fixture still excludes these fields and therefore cannot quantify that saving.
 
 These are optimized local synthetic measurements, not a platform-independent
 latency guarantee. The fixture includes small session/run snapshots and one

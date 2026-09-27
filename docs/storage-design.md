@@ -22,6 +22,10 @@ Schema v35 stores approval decisions, session limits, context budgets,
 checkpoint identity, and token cost rates as constrained scalar columns rather
 than JSON text; only the bounded context-inspection diagnostic remains JSON.
 As requested, databases from schema v34 are rejected without import or mutation.
+Schema v36 stores system and repository instructions as shared, compressed,
+content-addressed objects; per-run configuration holds only their hashes, and
+the existing bounded garbage collector retains shared instruction text until
+its final run reference is removed.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at that
