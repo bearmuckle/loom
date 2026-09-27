@@ -700,7 +700,7 @@ async fn stale_cursors_return_a_snapshot_fallback() {
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(first.id),
-            after_sequence: Some(EventSequence::default()),
+            after_sequence: Some(EventSequence::new(1)),
         }))
         .await
         .unwrap();
@@ -713,11 +713,40 @@ async fn stale_cursors_return_a_snapshot_fallback() {
         } => {
             assert_eq!(session.id, first.id);
             assert!(events.is_empty());
-            assert!(oldest_sequence.value() > 1);
+            assert_eq!(oldest_sequence.value(), 4);
             assert_eq!(latest_sequence.value(), 3);
         }
         response => panic!("expected snapshot fallback, got {response:?}"),
     }
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_cursor_before_creation_ignores_other_sessions_events() {
+    let (_backend, _auth, token, server) = server().await;
+    let transport = WebSocketTransport::new(server.websocket_url(), token.token);
+    let mut connection = transport.connect().await.unwrap();
+    negotiate(&mut connection).await;
+    let workspace_id = create_workspace(&mut connection).await;
+    let _earlier_session = session(&mut connection, workspace_id).await;
+    let target_session = session(&mut connection, workspace_id).await;
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(target_session.id),
+            after_sequence: Some(EventSequence::default()),
+        }))
+        .await
+        .unwrap();
+    let ServerResponse::SessionEvents { events } = response.result.unwrap() else {
+        panic!("an unrelated session's prior events must not stale this cursor");
+    };
+    assert!(events.iter().any(|event| {
+        event.session_id == target_session.id
+            && matches!(
+                event.event,
+                loom_protocol::ServerEvent::AgentSessionCreated { .. }
+            )
+    }));
     server.stop().await.unwrap();
 }
 

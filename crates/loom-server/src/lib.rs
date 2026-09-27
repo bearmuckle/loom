@@ -561,13 +561,47 @@ impl EventJournal {
         self.next_sequence
     }
 
-    fn is_cursor_stale(&self, after_sequence: Option<EventSequence>) -> bool {
+    fn oldest_sequence(&self, session_id: Option<AgentSessionId>) -> Option<EventSequence> {
+        self.oldest_event(session_id).map(|event| event.sequence)
+    }
+
+    fn oldest_event(&self, session_id: Option<AgentSessionId>) -> Option<&ServerEventEnvelope> {
+        self.events
+            .iter()
+            .find(|event| session_id.is_none_or(|id| event.session_id == id))
+    }
+
+    fn latest_sequence(&self, session_id: Option<AgentSessionId>) -> Option<EventSequence> {
+        self.events
+            .iter()
+            .rev()
+            .find(|event| session_id.is_none_or(|id| event.session_id == id))
+            .map(|event| event.sequence)
+    }
+
+    fn is_cursor_stale(
+        &self,
+        session_id: Option<AgentSessionId>,
+        after_sequence: Option<EventSequence>,
+    ) -> bool {
         let Some(after_sequence) = after_sequence else {
             return false;
         };
-        self.events
-            .first()
-            .is_some_and(|first| after_sequence.next() < first.sequence)
+        let Some(oldest) = self.oldest_event(session_id) else {
+            return after_sequence < self.next_sequence;
+        };
+        if after_sequence.next() >= oldest.sequence {
+            return false;
+        }
+        let Some(session_id) = session_id else {
+            return true;
+        };
+        !matches!(
+            &oldest.event,
+            loom_protocol::ServerEvent::AgentSessionCreated { snapshot }
+                | loom_protocol::ServerEvent::AgentSessionForked { snapshot, .. }
+                if snapshot.id == session_id
+        )
     }
 
     fn set_retention(&mut self, limit: usize) {
@@ -3147,11 +3181,7 @@ impl InProcessConnection {
         let latest_sequence = self
             .backend
             .journal()?
-            .events
-            .iter()
-            .filter(|event| event.session_id == session_id)
-            .map(|event| event.sequence)
-            .max()
+            .latest_sequence(Some(session_id))
             .unwrap_or_default();
         let approval_policy = self.policy(session_id)?;
         let auto_approve_actions = self.auto_approve_actions(session_id)?;
@@ -3993,15 +4023,15 @@ impl InProcessConnection {
                         )
                     });
                 if let Some(session_id) = session_id
-                    && (journal.is_cursor_stale(after_sequence) || history_missing)
+                    && (journal.is_cursor_stale(Some(session_id), after_sequence)
+                        || history_missing)
                 {
                     return Ok(ServerResponse::SessionEventsSnapshot {
                         session: self.backend.sessions()?.get(session_id)?,
                         events,
                         oldest_sequence: journal
-                            .events
-                            .first()
-                            .map_or(EventSequence::default(), |event| event.sequence),
+                            .oldest_sequence(Some(session_id))
+                            .unwrap_or_else(|| journal.next_sequence.next()),
                         latest_sequence: journal.next_sequence,
                     });
                 }

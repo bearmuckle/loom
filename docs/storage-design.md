@@ -4,6 +4,10 @@ Status: target design, 2026-09-26. The implementation is in progress: session,
 workspace, and run summaries, ordered run messages, bounded session/workspace
 settings, reconnect events, provider usage totals, and filesystem records use
 indexed rows. Runtime details and filesystem snapshots are loaded on demand.
+The reconnect feed still uses a global sequence and retention budget. Session
+snapshot fallback now evaluates the retained boundary for the requested session
+and resumes at the global high-water mark; stream-scoped cursors and independent
+retention remain unfinished.
 Message role, run/session ownership, order, tool-call metadata, and content
 references are stored separately from runtime execution state; in-flight
 assistant text is persisted as append-only, content-addressed fragments. A
