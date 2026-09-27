@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -890,6 +890,25 @@ struct IdempotencyRecord {
     response: ResponseEnvelope,
 }
 
+impl IdempotencyRecord {
+    fn new(
+        request_id: loom_core::RequestId,
+        request: ClientRequest,
+        response: ResponseEnvelope,
+    ) -> Self {
+        Self {
+            created_at: Timestamp::now(),
+            expires_at: request_id.issued_at_unix_millis().map(|issued_at| {
+                Timestamp::from_unix_millis(
+                    issued_at.saturating_add(IDEMPOTENCY_RETENTION.as_millis() as u64),
+                )
+            }),
+            request,
+            response,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PersistedBackendState {
     sessions: loom_session::SessionManagerState,
@@ -1721,6 +1740,10 @@ pub struct InProcessBackend {
     session_admissions: Mutex<BTreeMap<AgentSessionId, Arc<Mutex<()>>>>,
     self_reference: Mutex<Weak<InProcessBackend>>,
     request_lifecycle: RwLock<u8>,
+    persistence_failed: AtomicBool,
+    durable_request_gate: Mutex<()>,
+    #[cfg(test)]
+    fail_next_state_save: AtomicBool,
 }
 
 #[derive(Default)]
@@ -2077,6 +2100,10 @@ impl InProcessBackend {
             session_admissions: Mutex::new(BTreeMap::new()),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),
+            persistence_failed: AtomicBool::new(false),
+            durable_request_gate: Mutex::new(()),
+            #[cfg(test)]
+            fail_next_state_save: AtomicBool::new(false),
         });
         *backend
             .self_reference
@@ -2816,10 +2843,40 @@ impl InProcessBackend {
         self.persist_state_with_recovery_updates(&BTreeMap::new())
     }
 
+    fn persist_state_with_idempotency_candidate(
+        &self,
+        candidate: (loom_core::RequestId, IdempotencyRecord),
+    ) -> Result<()> {
+        self.latch_on_persistence_error(self.persist_state_inner(&BTreeMap::new(), Some(candidate)))
+    }
+
     /// Persists the current worker checkpoint without enumerating unrelated runs,
     /// catalogs, or session filesystems. The journal lock is retained through the
     /// transaction so only the captured event prefix can be acknowledged.
     fn persist_run_checkpoint(&self, handle: &RunHandle) -> Result<()> {
+        self.ensure_persistence_healthy()?;
+        let result = self.persist_run_checkpoint_inner(handle);
+        self.latch_on_persistence_error(result)
+    }
+
+    fn persist_worker_state(&self) -> Result<()> {
+        self.ensure_persistence_healthy()?;
+        self.persist_state()
+    }
+
+    fn ensure_persistence_healthy(&self) -> Result<()> {
+        if self.persistence_failed.load(Ordering::SeqCst) {
+            Err(LoomError::new(
+                ErrorCode::Persistence,
+                "backend is unavailable after a durable state save failure; reopen it to recover",
+                true,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn persist_run_checkpoint_inner(&self, handle: &RunHandle) -> Result<()> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
@@ -2938,7 +2995,7 @@ impl InProcessBackend {
             should_prune_worker_feed(sequence, last_pruned, prior_feed_bytes, pending_feed_bytes);
         let session = self.sessions()?.get(state.session_id)?;
         let session_next_sequence = self.sessions()?.next_sequence();
-        persistence.save_run_checkpoint(DurableRunCheckpointWrite {
+        let checkpoint_result = persistence.save_run_checkpoint(DurableRunCheckpointWrite {
             session: &session,
             session_next_sequence,
             prune_feed,
@@ -2950,7 +3007,11 @@ impl InProcessBackend {
             activities: &activities,
             filesystem: filesystem.as_ref(),
             feed: &feed,
-        })?;
+        });
+        if let Err(error) = checkpoint_result {
+            self.persistence_failed.store(true, Ordering::SeqCst);
+            return Err(error);
+        }
         if prune_feed {
             self.last_feed_pruned_sequence
                 .store(sequence, Ordering::Relaxed);
@@ -2969,6 +3030,21 @@ impl InProcessBackend {
     fn persist_state_with_recovery_updates(
         &self,
         recovery_updates: &BTreeMap<loom_core::RunId, DurableRunSummary>,
+    ) -> Result<()> {
+        self.latch_on_persistence_error(self.persist_state_inner(recovery_updates, None))
+    }
+
+    fn latch_on_persistence_error<T>(&self, result: Result<T>) -> Result<T> {
+        if result.is_err() {
+            self.persistence_failed.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn persist_state_inner(
+        &self,
+        recovery_updates: &BTreeMap<loom_core::RunId, DurableRunSummary>,
+        idempotency_candidate: Option<(loom_core::RequestId, IdempotencyRecord)>,
     ) -> Result<()> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
@@ -3132,7 +3208,7 @@ impl InProcessBackend {
         };
         let workspace_records = self.workspace_records()?.export_state();
         let provider_usage = self.providers.usage()?;
-        let idempotency = self
+        let mut idempotency = self
             .idempotency()?
             .iter()
             .map(|(id, record)| {
@@ -3147,6 +3223,26 @@ impl InProcessBackend {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        if let Some((request_id, record)) = &idempotency_candidate {
+            idempotency.insert(
+                *request_id,
+                DurableIdempotencyRecord {
+                    created_at: record.created_at,
+                    expires_at: record.expires_at,
+                    request: json_value(&record.request)?,
+                    response: json_value(&record.response)?,
+                },
+            );
+        }
+        #[cfg(test)]
+        if self.fail_next_state_save.swap(false, Ordering::SeqCst) {
+            self.persistence_failed.store(true, Ordering::SeqCst);
+            return Err(LoomError::new(
+                ErrorCode::Internal,
+                "injected durable state save failure",
+                true,
+            ));
+        }
         let result = persistence.save_state(DurableStateWrite {
             schema_version: CURRENT_SCHEMA_VERSION,
             sessions: &sessions,
@@ -3167,6 +3263,9 @@ impl InProcessBackend {
             feed: Some(&feed),
             sections: &[],
         });
+        if result.is_err() {
+            self.persistence_failed.store(true, Ordering::SeqCst);
+        }
         if result.is_ok() {
             journal.pending_events.clear();
             journal.pending_workspace_events.clear();
@@ -3423,7 +3522,7 @@ impl InProcessBackend {
                         }
                     }
                 }
-                if let Err(error) = backend.persist_state() {
+                if let Err(error) = backend.persist_worker_state() {
                     handle.record_failure(error);
                 }
                 handle.set_running(false);
@@ -3463,26 +3562,13 @@ impl InProcessBackend {
         Ok(Some(record.response.clone()))
     }
 
-    fn remember_response(
+    fn publish_idempotency_record(
         &self,
         request_id: loom_core::RequestId,
-        request: ClientRequest,
-        response: ResponseEnvelope,
+        record: IdempotencyRecord,
     ) -> Result<()> {
         let mut cache = self.idempotency()?;
-        cache.insert(
-            request_id,
-            IdempotencyRecord {
-                created_at: Timestamp::now(),
-                expires_at: request_id.issued_at_unix_millis().map(|issued_at| {
-                    Timestamp::from_unix_millis(
-                        issued_at.saturating_add(IDEMPOTENCY_RETENTION.as_millis() as u64),
-                    )
-                }),
-                request,
-                response,
-            },
-        );
+        cache.insert(request_id, record);
         trim_idempotency_cache(&mut cache);
         Ok(())
     }
@@ -4750,8 +4836,35 @@ impl InProcessConnection {
                 unsupported_version_error(request.protocol_version),
             );
         }
-
         let durable_mutation = request.request.is_retryable_mutation();
+        let _durable_request_guard = if durable_mutation {
+            match self.backend.durable_request_gate.lock() {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    return ResponseEnvelope::failure(
+                        request_id,
+                        LoomError::new(
+                            ErrorCode::Internal,
+                            "durable request serialization lock was poisoned",
+                            true,
+                        ),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        if self.backend.persistence_failed.load(Ordering::SeqCst) {
+            return ResponseEnvelope::failure(
+                request_id,
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "backend is unavailable after a durable state save failure; reopen it to recover",
+                    true,
+                ),
+            );
+        }
+
         let retryable = durable_mutation;
         if retryable && let Err(error) = validate_retry_horizon(request_id, current_unix_millis()) {
             return ResponseEnvelope::failure(request_id, error);
@@ -4788,18 +4901,27 @@ impl InProcessConnection {
             Ok(response) => {
                 if retryable {
                     let response_envelope = ResponseEnvelope::success(request_id, response.clone());
-                    if let Err(error) = self.backend.remember_response(
-                        request_id,
-                        request_for_cache,
-                        response_envelope,
-                    ) {
-                        return ResponseEnvelope::failure(request_id, error);
+                    let record =
+                        IdempotencyRecord::new(request_id, request_for_cache, response_envelope);
+                    if durable_mutation {
+                        self.backend
+                            .persist_state_with_idempotency_candidate((request_id, record.clone()))
+                            .and_then(|()| {
+                                self.backend
+                                    .publish_idempotency_record(request_id, record)?;
+                                Ok(response)
+                            })
+                    } else {
+                        self.backend
+                            .publish_idempotency_record(request_id, record)
+                            .map(|()| response)
                     }
-                }
-                if durable_mutation {
-                    self.backend.persist_state().map(|()| response)
                 } else {
-                    Ok(response)
+                    if durable_mutation {
+                        self.backend.persist_state().map(|()| response)
+                    } else {
+                        Ok(response)
+                    }
                 }
             }
             Err(error) => Err(error),
@@ -10899,6 +11021,53 @@ mod tests {
             workspaces.result,
             Ok(ServerResponse::Workspaces { workspaces }) if workspaces.len() == 1
         ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn retryable_mutation_save_failure_does_not_cache_success() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-server-idempotency-failure-{}.db",
+            WorkspaceId::new()
+        ));
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let request_id = loom_core::RequestId::new();
+        let request = ClientRequest::CreateWorkspace {
+            name: "failure boundary".to_owned(),
+        };
+        backend.fail_next_state_save.store(true, Ordering::SeqCst);
+        let failed = connection.request(RequestEnvelope::with_request_id(
+            request_id,
+            request.clone(),
+        ));
+        assert_eq!(failed.result.unwrap_err().code, ErrorCode::Internal);
+        assert!(
+            backend
+                .cached_response(request_id, &request)
+                .unwrap()
+                .is_none()
+        );
+
+        // Handler state can already have changed when a save fails. Fail-stop
+        // prevents a retry from dispatching against that partially mutated
+        // in-memory state; reopening restores the last committed disk state.
+        let retried = connection.request(RequestEnvelope::with_request_id(request_id, request));
+        assert_eq!(retried.result.unwrap_err().code, ErrorCode::Persistence);
+        let listed = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+        assert_eq!(listed.result.unwrap_err().code, ErrorCode::Persistence);
+        drop(connection);
+        drop(backend);
+        let reopened = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = reopened.connect();
+        negotiate(&connection);
+        let listed = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+        assert!(
+            matches!(listed.result, Ok(ServerResponse::Workspaces { workspaces }) if workspaces.is_empty())
+        );
+        drop(connection);
+        drop(reopened);
         fs::remove_file(path).unwrap();
     }
 
