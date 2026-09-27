@@ -10639,7 +10639,13 @@ mod tests {
 
     #[test]
     fn exclusive_writer_ownership_is_shared_by_clones_and_released_on_drop() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let test_dir = std::env::temp_dir().join(format!(
+            "loom-persistence-owner-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&test_dir).unwrap();
+        let path = test_dir.join("state.db");
         let writer = FilePersistence::open_exclusive_writer(&path).unwrap();
         let clone = writer.clone();
         assert_eq!(
@@ -10666,6 +10672,7 @@ mod tests {
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".loom-owner.lock");
         fs::remove_file(PathBuf::from(lock_path)).unwrap();
+        fs::remove_dir(test_dir).unwrap();
     }
 
     fn run_exclusive_writer_probe(path: &Path, should_be_owned: bool) {
@@ -10706,7 +10713,13 @@ mod tests {
 
     #[test]
     fn exclusive_writer_lock_is_enforced_across_processes() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let test_dir = std::env::temp_dir().join(format!(
+            "loom-persistence-owner-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&test_dir).unwrap();
+        let path = test_dir.join("state.db");
         let writer = FilePersistence::open_exclusive_writer(&path).unwrap();
         run_exclusive_writer_probe(&path, true);
         drop(writer);
@@ -10714,6 +10727,7 @@ mod tests {
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".loom-owner.lock");
         fs::remove_file(PathBuf::from(lock_path)).unwrap();
+        fs::remove_dir(test_dir).unwrap();
     }
 
     #[test]
