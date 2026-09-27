@@ -10408,6 +10408,13 @@ mod tests {
             persistence.load_run_messages(run_id).unwrap(),
             run_messages[&run_id]
         );
+        let newest_page = persistence.load_run_message_page(run_id, None, 1).unwrap();
+        assert_eq!(newest_page.len(), 1);
+        assert_eq!(newest_page[0].ordinal, 1);
+        assert_eq!(
+            newest_page[0].tool_calls,
+            run_messages[&run_id][1].tool_calls
+        );
         assert_eq!(
             persistence.list_filesystem_sessions().unwrap(),
             vec![session.id]
