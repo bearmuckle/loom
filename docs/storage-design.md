@@ -37,7 +37,10 @@ event payloads and per-session retained-boundary metadata load on demand. Cursor
 epochs and fully stream-scoped cursors remain unfinished; aggregate retained feed
 size grows with the number of sessions.
 Message role, run/session ownership, order, tool-call metadata, and content
-references are stored separately from runtime execution state; in-flight
+references are stored separately from runtime execution state. Message-emitted
+tool calls are ordered child rows, and their argument JSON is shared through
+the compressed content-addressed store instead of being repeated in a transcript
+JSON array; in-flight
 assistant text is persisted as append-only, content-addressed fragments. A
 matching full-message snapshot atomically consolidates those fragments into the
 canonical message body; mismatched snapshots preserve the prior base and

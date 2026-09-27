@@ -174,8 +174,8 @@ runs produced:
 
 | Sessions / runs / feed events | Database size | Population | Catalog + active + feed header p50 | One-session feed read p50 | Full-feed decode p50 | Per-session run query p50 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 / 10,000 / 10,000 | 9,637,888 bytes | 2,579 ms | 5.918 ms | 0.044 ms | 61.755 ms | 0.015 ms |
-| 100,000 / 100,000 / 100,000 | 93,794,304 bytes | 29,731 ms | 55.369 ms | 0.025 ms | 532.425 ms | 0.015 ms |
+| 10,000 / 10,000 / 10,000 | 9,629,696 bytes | 2,596 ms | 5.515 ms | 0.057 ms | 60.947 ms | 0.016 ms |
+| 100,000 / 100,000 / 100,000 | 93,995,008 bytes | 29,850 ms | 51.738 ms | 0.025 ms | 532.547 ms | 0.016 ms |
 
 Before schema v33, the same 100k fixture occupied 113,315,840 bytes. Schema v33
 replaced each run's duplicated JSON snapshot with typed columns for task, model,
@@ -186,7 +186,10 @@ approval decisions and runtime options typed columns; schema v36 content-address
 instruction text and shares identical runtime profiles. With 100k config
 associations pointing to one shared profile, the measured database is
 93,794,304 bytes, 7,073,792 bytes smaller than storing those same typed
-configuration values on every run. `dbstat` shows that `run_runtime_config` and
+configuration values on every run. The latest measurement is 93,995,008 bytes;
+the 201 KB increase from the prior run is the normalized transcript-call table
+and its indexes, which exist even though this fixture has no transcripts.
+`dbstat` shows that `run_runtime_config` and
 its profile-reference index consume about 12.5 MB together; `feed_events` use
 19.1 MB, `run_summaries` 15.2 MB, and `sessions_visible` 8.3 MB. This measured
 state is below the 100,000,000-byte target, but includes only one shared runtime
