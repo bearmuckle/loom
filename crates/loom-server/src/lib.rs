@@ -15,15 +15,16 @@ use loom_agent::{
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
     Capability, CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId,
-    RequestId, Result, SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    RequestId, Result, RunAttemptId, SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId,
+    WorkspaceRecord,
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
     CURRENT_SCHEMA_VERSION, DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor,
     DurableFilesystemEdit, DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
     DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
-    DurableRunRuntimeConfig, DurableRunSummary, DurableSessionProjectionRead,
-    DurableSessionSettings, DurableStateWrite, FilePersistence,
+    DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
+    DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -1170,12 +1171,18 @@ struct RunHandle {
     state: Mutex<AgentRuntimeState>,
     message_fragments: Mutex<MessageFragmentState>,
     activity_deltas: Mutex<PendingActivityDeltas>,
+    message_checkpoint: Mutex<MessageCheckpointCursor>,
     event_gate: Mutex<()>,
     fragment_wake: Condvar,
     running: Mutex<bool>,
     idle: Condvar,
     failure: Mutex<Option<LoomError>>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+struct MessageCheckpointCursor {
+    attempt_id: RunAttemptId,
+    message_count: usize,
 }
 
 #[derive(Default)]
@@ -1242,13 +1249,22 @@ const MESSAGE_FRAGMENT_BATCH_INTERVAL: Duration = Duration::from_millis(50);
 
 impl RunHandle {
     fn new(runtime: AgentRuntime) -> Self {
+        let initial_state = runtime.export_state();
+        let message_checkpoint = MessageCheckpointCursor {
+            attempt_id: initial_state.run.attempt_id,
+            // The handle cannot distinguish a newly-created run from a restored
+            // one without touching SQLite. Start at zero so its first checkpoint
+            // writes the complete current transcript; later checkpoints are tails.
+            message_count: 0,
+        };
         Self {
             run_id: runtime.run_id(),
             session_id: runtime.session_id(),
             control: runtime.control(),
-            state: Mutex::new(runtime.export_state()),
+            state: Mutex::new(initial_state),
             message_fragments: Mutex::new(MessageFragmentState::default()),
             activity_deltas: Mutex::new(PendingActivityDeltas::default()),
+            message_checkpoint: Mutex::new(message_checkpoint),
             event_gate: Mutex::new(()),
             fragment_wake: Condvar::new(),
             runtime: Mutex::new(runtime),
@@ -2956,7 +2972,15 @@ impl InProcessBackend {
         // Project only the checkpoint fields while holding the state lock.
         // This intentionally excludes the potentially large activities vector;
         // changed rows come from the ID-keyed queue below.
-        let (session_id, summary, runtime_config, context_checkpoint, plan, messages, activities) = {
+        let (
+            session_id,
+            summary,
+            runtime_config,
+            context_checkpoint,
+            plan,
+            message_delta,
+            activities,
+        ) = {
             let state = handle.locked_state();
             let summary = DurableRunSummary {
                 snapshot: state.run.clone(),
@@ -2999,64 +3023,91 @@ impl InProcessBackend {
                     )
                 })?
                 .ordered_values();
+            let cursor = handle.message_checkpoint.lock().map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    "message checkpoint cursor lock was poisoned",
+                    true,
+                )
+            })?;
+            let reset_messages = cursor.attempt_id != state.run.attempt_id
+                || state.messages.len() < cursor.message_count;
+            let start_ordinal = if reset_messages {
+                0
+            } else {
+                cursor.message_count.saturating_sub(1)
+            };
+            let start_index = start_ordinal.min(state.messages.len());
+            let message_delta = DurableRunMessageDelta {
+                start_ordinal: start_ordinal as u64,
+                reset: reset_messages,
+                messages: durable_run_messages_from_runtime(&state.messages[start_index..]),
+            };
             (
                 state.session_id,
                 summary,
                 runtime_config,
                 context_checkpoint,
                 state.plan.clone(),
-                durable_run_messages_from_runtime(&state.messages),
+                message_delta,
                 activities,
             )
         };
 
-        let filesystem = {
+        let (filesystem_record, filesystem_ack) = {
             let filesystem = self.session_filesystems()?.get(&session_id).cloned();
             if let Some(filesystem) = filesystem {
-                let mut filesystem_state = filesystem.export_state()?;
-                let checkpoints = std::mem::take(&mut filesystem_state.checkpoints);
-                let edits = std::mem::take(&mut filesystem_state.edits)
-                    .into_iter()
-                    .map(|edit| DurableFilesystemEdit {
-                        path: edit.path,
-                        before: edit.before,
-                        before_bytes: edit.before_bytes,
-                        after_revision: edit.after_revision,
-                        source: edit.source,
-                    })
-                    .collect();
-                let changes = std::mem::take(&mut filesystem_state.changes);
-                let directories = filesystem
-                    .mounted_directories()?
-                    .into_iter()
-                    .map(|(path, source)| SessionDirectory {
-                        path,
-                        source: source.display().to_string(),
-                    })
-                    .collect::<Vec<_>>();
-                let repositories = self
-                    .session_repositories()?
-                    .get(&session_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let persisted = PersistedSessionFilesystem {
-                    filesystem: filesystem_state,
-                    repositories: repositories.clone(),
-                    directories: directories.clone(),
-                };
-                Some(DurableFilesystemRecord {
-                    session_id,
-                    root: persisted.filesystem.root.clone(),
-                    control: persisted.filesystem.control,
-                    checkpoints,
-                    edits,
-                    changes,
-                    repositories,
-                    directories,
-                    payload: json_value(persisted)?,
-                })
+                if let Some(versioned) = filesystem.export_state_if_dirty()? {
+                    let mut filesystem_state = versioned.state;
+                    let checkpoints = std::mem::take(&mut filesystem_state.checkpoints);
+                    let edits = std::mem::take(&mut filesystem_state.edits)
+                        .into_iter()
+                        .map(|edit| DurableFilesystemEdit {
+                            path: edit.path,
+                            before: edit.before,
+                            before_bytes: edit.before_bytes,
+                            after_revision: edit.after_revision,
+                            source: edit.source,
+                        })
+                        .collect();
+                    let changes = std::mem::take(&mut filesystem_state.changes);
+                    let directories = filesystem
+                        .mounted_directories()?
+                        .into_iter()
+                        .map(|(path, source)| SessionDirectory {
+                            path,
+                            source: source.display().to_string(),
+                        })
+                        .collect::<Vec<_>>();
+                    let repositories = self
+                        .session_repositories()?
+                        .get(&session_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let persisted = PersistedSessionFilesystem {
+                        filesystem: filesystem_state,
+                        repositories: repositories.clone(),
+                        directories: directories.clone(),
+                    };
+                    (
+                        Some(DurableFilesystemRecord {
+                            session_id,
+                            root: persisted.filesystem.root.clone(),
+                            control: persisted.filesystem.control,
+                            checkpoints,
+                            edits,
+                            changes,
+                            repositories,
+                            directories,
+                            payload: json_value(persisted)?,
+                        }),
+                        Some((filesystem, versioned.generation)),
+                    )
+                } else {
+                    (None, None)
+                }
             } else {
-                None
+                (None, None)
             }
         };
 
@@ -3091,15 +3142,19 @@ impl InProcessBackend {
             runtime_config: &runtime_config,
             context_checkpoint: context_checkpoint.as_ref(),
             plan: &plan,
-            messages: &messages,
+            messages: &[],
+            message_delta: Some(&message_delta),
             activities: &[],
             activity_deltas: Some(&activities),
-            filesystem: filesystem.as_ref(),
+            filesystem: filesystem_record.as_ref(),
             feed: &feed,
         });
         if let Err(error) = checkpoint_result {
             self.persistence_failed.store(true, Ordering::SeqCst);
             return Err(error);
+        }
+        if let Some((filesystem, generation)) = filesystem_ack {
+            filesystem.acknowledge_persisted_generation(generation)?;
         }
         if prune_feed {
             self.last_feed_pruned_sequence
@@ -3108,6 +3163,16 @@ impl InProcessBackend {
         } else {
             self.feed_bytes_since_prune
                 .store(accumulated_feed_bytes, Ordering::Relaxed);
+        }
+        {
+            let mut cursor = handle
+                .message_checkpoint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            cursor.attempt_id = summary.snapshot.attempt_id;
+            cursor.message_count = usize::try_from(message_delta.start_ordinal)
+                .unwrap_or(usize::MAX)
+                .saturating_add(message_delta.messages.len());
         }
         if !activities.is_empty() {
             let mut pending = handle
@@ -3240,10 +3305,14 @@ impl InProcessBackend {
                 .insert(*run_id, durable_run_messages_from_runtime(&state.messages));
             durable_run_activities.insert(*run_id, std::mem::take(&mut state.activities));
         }
-        let loaded_repositories = self.session_repositories()?;
+        let loaded_repositories = self.session_repositories()?.clone();
         let mut filesystem_records = Vec::new();
+        let mut filesystem_generations = Vec::new();
         for (session_id, filesystem) in self.session_filesystems()?.iter() {
-            let mut filesystem_state = filesystem.export_state()?;
+            let Some(versioned) = filesystem.export_state_if_dirty()? else {
+                continue;
+            };
+            let mut filesystem_state = versioned.state;
             let checkpoints = std::mem::take(&mut filesystem_state.checkpoints);
             let edits = std::mem::take(&mut filesystem_state.edits)
                 .into_iter()
@@ -3284,6 +3353,7 @@ impl InProcessBackend {
                 directories,
                 payload: json_value(persisted)?,
             });
+            filesystem_generations.push((filesystem.clone(), versioned.generation));
         }
         let sessions = self.sessions()?.export_state();
         let mut journal = self.journal()?;
@@ -3368,6 +3438,9 @@ impl InProcessBackend {
             self.persistence_failed.store(true, Ordering::SeqCst);
         }
         if result.is_ok() {
+            for (filesystem, generation) in filesystem_generations {
+                filesystem.acknowledge_persisted_generation(generation)?;
+            }
             journal.pending_events.clear();
             journal.pending_workspace_events.clear();
             self.last_feed_pruned_sequence
@@ -4765,11 +4838,14 @@ impl InProcessConnection {
         self.backend
             .session_vcs()?
             .insert((session_id, repository_id), service);
-        self.backend
-            .session_repositories()?
-            .entry(session_id)
-            .or_default()
-            .insert(repository_id, repository.clone());
+        {
+            self.backend
+                .session_repositories()?
+                .entry(session_id)
+                .or_default()
+                .insert(repository_id, repository.clone());
+        }
+        filesystem.mark_state_dirty()?;
         log::info!("repository {source_name} attached to session {session_id}");
         Ok(repository)
     }
@@ -4812,14 +4888,17 @@ impl InProcessConnection {
                 )
             })?;
         }
-        self.backend
-            .session_repositories()?
-            .entry(session_id)
-            .or_default()
-            .remove(&repository_id);
+        {
+            self.backend
+                .session_repositories()?
+                .entry(session_id)
+                .or_default()
+                .remove(&repository_id);
+        }
         self.backend
             .session_vcs()?
             .remove(&(session_id, repository_id));
+        filesystem.mark_state_dirty()?;
         Ok(())
     }
 

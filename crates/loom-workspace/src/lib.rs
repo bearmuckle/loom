@@ -85,6 +85,12 @@ pub struct WorkspaceStateSnapshot {
     pub changes: Vec<SessionFilesystemChange>,
 }
 
+#[derive(Clone, Debug)]
+pub struct VersionedWorkspaceStateSnapshot {
+    pub generation: u64,
+    pub state: WorkspaceStateSnapshot,
+}
+
 #[derive(Debug)]
 struct WorkspaceState {
     control: WorkspaceControl,
@@ -93,6 +99,8 @@ struct WorkspaceState {
     watcher_snapshot: Option<SessionFilesystemSnapshot>,
     next_sequence: EventSequence,
     changes: Vec<SessionFilesystemChange>,
+    generation: u64,
+    persisted_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +161,8 @@ impl Workspace {
                     watcher_snapshot: None,
                     next_sequence: EventSequence::default(),
                     changes: Vec::new(),
+                    generation: 1,
+                    persisted_generation: 0,
                 }),
                 mounts: Mutex::new(BTreeMap::new()),
             }),
@@ -290,6 +300,8 @@ impl Workspace {
             .lock()
             .map_err(|_| LoomError::invalid_state("workspace mounts are unavailable"))?
             .insert(relative.to_owned(), source.clone());
+        let mut state = self.lock_state()?;
+        Self::advance_generation(&mut state);
         Ok(source)
     }
 
@@ -315,6 +327,9 @@ impl Workspace {
             )
         })?;
         mounts.remove(relative);
+        drop(mounts);
+        let mut state = self.lock_state()?;
+        Self::advance_generation(&mut state);
         Ok(())
     }
 
@@ -345,15 +360,62 @@ impl Workspace {
     pub fn take_control(&self, control: WorkspaceControl) -> Result<WorkspaceControl> {
         let mut state = self.lock_state()?;
         let previous = state.control;
-        state.control = control;
+        if previous != control {
+            state.control = control;
+            Self::advance_generation(&mut state);
+        }
         Ok(previous)
     }
 
     pub fn export_state(&self) -> Result<WorkspaceStateSnapshot> {
         let state = self.lock_state()?;
-        Ok(WorkspaceStateSnapshot {
-            session_id: self.inner.session_id,
-            root: self.inner.root.display().to_string(),
+        Ok(Self::snapshot_from_state(
+            self.inner.session_id,
+            &self.inner.root,
+            &state,
+        ))
+    }
+
+    /// Avoid cloning checkpoint and undo history when no durable state changed.
+    pub fn export_state_if_dirty(&self) -> Result<Option<VersionedWorkspaceStateSnapshot>> {
+        let state = self.lock_state()?;
+        if state.generation == state.persisted_generation {
+            return Ok(None);
+        }
+        Ok(Some(VersionedWorkspaceStateSnapshot {
+            generation: state.generation,
+            state: Self::snapshot_from_state(self.inner.session_id, &self.inner.root, &state),
+        }))
+    }
+
+    /// Acknowledge a captured generation only after its database transaction commits.
+    pub fn acknowledge_persisted_generation(&self, generation: u64) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if generation > state.generation {
+            return Err(LoomError::invalid_request(
+                "cannot acknowledge a future workspace generation",
+            ));
+        }
+        state.persisted_generation = state.persisted_generation.max(generation);
+        Ok(())
+    }
+
+    /// Mark non-workspace metadata stored alongside this filesystem record dirty
+    /// (for example, repository or directory catalog changes).
+    pub fn mark_state_dirty(&self) -> Result<()> {
+        let mut state = self.lock_state()?;
+        Self::advance_generation(&mut state);
+        Ok(())
+    }
+
+    fn snapshot_from_state(
+        session_id: AgentSessionId,
+        root: &Path,
+        state: &WorkspaceState,
+    ) -> WorkspaceStateSnapshot {
+        WorkspaceStateSnapshot {
+            session_id,
+            root: root.display().to_string(),
             control: state.control,
             checkpoints: state.checkpoints.values().cloned().collect(),
             edits: state
@@ -369,7 +431,11 @@ impl Workspace {
                 .collect(),
             next_sequence: state.next_sequence,
             changes: state.changes.clone(),
-        })
+        }
+    }
+
+    fn advance_generation(state: &mut WorkspaceState) {
+        state.generation = state.generation.saturating_add(1);
     }
 
     pub fn state(&self) -> Result<WorkspaceStateSnapshot> {
@@ -473,6 +539,9 @@ impl Workspace {
             .collect();
         state.next_sequence = persisted.next_sequence;
         state.changes = persisted.changes;
+        // Restored state is the durable baseline in this process.
+        state.generation = 0;
+        state.persisted_generation = 0;
         state.watcher_snapshot = Some(self.snapshot()?);
         Ok(())
     }
@@ -612,6 +681,7 @@ impl Workspace {
             after_revision: after_revision.clone(),
             source,
         });
+        Self::advance_generation(&mut state);
         Ok(WorkspaceByteWriteResult {
             path: relative.to_owned(),
             before_revision,
@@ -704,6 +774,7 @@ impl Workspace {
             after_revision: after_revision.clone(),
             source,
         });
+        Self::advance_generation(&mut state);
         if source == WorkspaceControl::Agent {
             for checkpoint in state.checkpoints.values_mut() {
                 if let Some(file) = checkpoint.files.get_mut(&edit.path) {
@@ -771,9 +842,9 @@ impl Workspace {
             created_at: Timestamp::now(),
             files,
         };
-        self.lock_state()?
-            .checkpoints
-            .insert(checkpoint.id, checkpoint.clone());
+        let mut state = self.lock_state()?;
+        state.checkpoints.insert(checkpoint.id, checkpoint.clone());
+        Self::advance_generation(&mut state);
         Ok(checkpoint)
     }
 
@@ -850,6 +921,7 @@ impl Workspace {
                 after_revision: next_revision,
                 source: WorkspaceControl::User,
             });
+            Self::advance_generation(&mut state);
         }
         Ok(RevertResult {
             checkpoint_id,
@@ -910,6 +982,7 @@ impl Workspace {
             )
         })?;
         state.edits.remove(index);
+        Self::advance_generation(&mut state);
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(error) if error.kind() == ErrorKind::NotFound => String::new(),
@@ -973,6 +1046,9 @@ impl Workspace {
             }
         }
         trim_filesystem_change_history(&mut state.changes);
+        if !changes.is_empty() {
+            Self::advance_generation(&mut state);
+        }
         Ok(changes)
     }
 
@@ -1280,6 +1356,49 @@ mod tests {
         assert_eq!(changes.len(), MAX_RETAINED_FILESYSTEM_CHANGES);
         assert_eq!(changes.first().unwrap().sequence, EventSequence::new(2));
         assert_eq!(changes.last().unwrap().sequence, EventSequence::new(2049));
+    }
+
+    #[test]
+    fn dirty_workspace_snapshots_skip_clean_state_and_keep_newer_mutations() {
+        let (workspace, root) = workspace();
+        let initial = workspace.export_state_if_dirty().unwrap().unwrap();
+        workspace
+            .acknowledge_persisted_generation(initial.generation)
+            .unwrap();
+        assert!(workspace.export_state_if_dirty().unwrap().is_none());
+
+        let before = workspace.read_file("README.md").unwrap();
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: before.content.trim_end().to_owned(),
+                new_text: "first".to_owned(),
+                expected_revision: Some(before.revision),
+            })
+            .unwrap();
+        let captured = workspace.export_state_if_dirty().unwrap().unwrap();
+        workspace
+            .apply_edit(WorkspaceEdit {
+                path: "README.md".to_owned(),
+                old_text: "first".to_owned(),
+                new_text: "second".to_owned(),
+                expected_revision: None,
+            })
+            .unwrap();
+        workspace
+            .acknowledge_persisted_generation(captured.generation)
+            .unwrap();
+        let newer = workspace.export_state_if_dirty().unwrap().unwrap();
+        assert!(newer.generation > captured.generation);
+        assert_eq!(
+            newer.state.edits.last().unwrap().after_revision,
+            revision("second\n")
+        );
+        workspace
+            .acknowledge_persisted_generation(newer.generation)
+            .unwrap();
+        assert!(workspace.export_state_if_dirty().unwrap().is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

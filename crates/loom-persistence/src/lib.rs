@@ -1224,6 +1224,15 @@ pub struct DurableRunMessage {
     pub tool_calls: Vec<loom_model::ToolCall>,
 }
 
+/// A normal worker checkpoint writes only the mutable transcript tail. A retry
+/// starts a new transcript generation and replaces the prior generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRunMessageDelta {
+    pub start_ordinal: u64,
+    pub reset: bool,
+    pub messages: Vec<DurableRunMessage>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableRunMessageHeader {
     pub ordinal: u64,
@@ -1247,6 +1256,9 @@ pub struct DurableRunCheckpointWrite<'a> {
     pub context_checkpoint: Option<&'a DurableRunContextCheckpoint>,
     pub plan: &'a AgentPlan,
     pub messages: &'a [DurableRunMessage],
+    /// Incremental transcript tail for worker checkpoints. `None` keeps the
+    /// full replacement behavior used by explicit recovery/state flushes.
+    pub message_delta: Option<&'a DurableRunMessageDelta>,
     pub activities: &'a [AgentActivityRecord],
     /// Activity rows changed since the previous successful worker checkpoint.
     /// When present, these are upserted without enumerating or pruning history.
@@ -5071,7 +5083,7 @@ impl FilePersistence {
             save_run_tool_rows(&transaction, run_activities, write.run_summaries)?;
         }
         if let Some(run_messages) = write.run_messages {
-            save_run_message_rows(&transaction, run_messages)?;
+            save_run_message_rows(&transaction, run_messages, None, true)?;
         }
         if let Some(filesystems) = write.filesystem_records {
             save_filesystem_records(&transaction, filesystems)?;
@@ -5135,18 +5147,18 @@ impl FilePersistence {
             || write.filesystem.is_some_and(|filesystem| {
                 filesystem.session_id != write.summary.snapshot.session_id
             })
+            || write
+                .message_delta
+                .is_some_and(|delta| delta.reset && delta.start_ordinal != 0)
         {
             return Err(LoomError::invalid_request(
-                "run checkpoint records must belong to the same run and session",
+                "run checkpoint records must belong to the same run and session, and transcript resets must start at ordinal zero",
             ));
         }
         let summaries = BTreeMap::from([(run_id, write.summary.clone())]);
         let runtime_configs = BTreeMap::from([(run_id, write.runtime_config.clone())]);
         let context_checkpoints = BTreeMap::from([(run_id, write.context_checkpoint.cloned())]);
         let plans = BTreeMap::from([(run_id, write.plan.clone())]);
-        let messages = BTreeMap::from([(run_id, write.messages.to_vec())]);
-        let activities = BTreeMap::from([(run_id, write.activities.to_vec())]);
-
         let connection = self.connection_for_write()?;
         let transaction = connection.unchecked_transaction().map_err(|error| {
             persistence_error(
@@ -5154,6 +5166,38 @@ impl FilePersistence {
                 true,
             )
         })?;
+        let messages = if let Some(delta) = write.message_delta {
+            if delta.reset {
+                transaction
+                    .execute(
+                        "DELETE FROM run_messages WHERE run_id=?1",
+                        [run_id.as_uuid().as_bytes().as_slice()],
+                    )
+                    .map_err(|error| {
+                        persistence_error(format!("could not reset run transcript: {error}"), true)
+                    })?;
+                // Fragments for base rows cascade, while orphaned streamed rows
+                // need explicit removal during a transcript-generation reset.
+                transaction
+                    .execute(
+                        "DELETE FROM run_message_fragments WHERE run_id=?1",
+                        [run_id.as_uuid().as_bytes().as_slice()],
+                    )
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not reset run transcript fragments: {error}"),
+                            true,
+                        )
+                    })?;
+            }
+            BTreeMap::from([(run_id, delta.messages.clone())])
+        } else {
+            BTreeMap::from([(run_id, write.messages.to_vec())])
+        };
+        let message_offsets = write.message_delta.map(|delta| {
+            BTreeMap::from([(run_id, if delta.reset { 0 } else { delta.start_ordinal })])
+        });
+        let activities = BTreeMap::from([(run_id, write.activities.to_vec())]);
         save_session_checkpoint_row(&transaction, write.session, write.session_next_sequence)?;
         save_run_summary_rows(&transaction, &summaries)?;
         save_run_attempt_rows(&transaction, &summaries)?;
@@ -5167,7 +5211,12 @@ impl FilePersistence {
             save_run_activity_rows(&transaction, &activities)?;
             save_run_tool_rows(&transaction, &activities, Some(&summaries))?;
         }
-        save_run_message_rows(&transaction, &messages)?;
+        save_run_message_rows(
+            &transaction,
+            &messages,
+            message_offsets.as_ref(),
+            write.message_delta.is_none(),
+        )?;
         if let Some(filesystem) = write.filesystem {
             save_filesystem_records(&transaction, std::slice::from_ref(filesystem))?;
         }
@@ -6263,6 +6312,8 @@ fn load_run_message_tool_calls(
 fn save_run_message_rows(
     transaction: &Transaction<'_>,
     messages_by_run: &BTreeMap<RunId, Vec<DurableRunMessage>>,
+    ordinal_offsets: Option<&BTreeMap<RunId, u64>>,
+    prune_missing: bool,
 ) -> Result<()> {
     transaction
         .execute_batch(
@@ -6307,6 +6358,24 @@ fn save_run_message_rows(
             })?;
         for (ordinal, message) in messages.iter().enumerate() {
             let run_id_bytes = run_id.as_uuid().as_bytes();
+            let ordinal = ordinal_offsets
+                .and_then(|offsets| offsets.get(run_id))
+                .copied()
+                .unwrap_or_default()
+                .checked_add(u64::try_from(ordinal).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "run transcript has too many messages",
+                        false,
+                    )
+                })?)
+                .ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "run transcript ordinal overflow",
+                        false,
+                    )
+                })?;
             let ordinal = i64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
                     ErrorCode::Persistence,
@@ -6473,9 +6542,10 @@ fn save_run_message_rows(
                 delete_run_message_fragments(transaction, *run_id, ordinal)?;
             }
         }
-        transaction
-            .execute(
-                "DELETE FROM run_messages WHERE run_id=?1 AND NOT EXISTS (
+        if prune_missing {
+            transaction
+                .execute(
+                    "DELETE FROM run_messages WHERE run_id=?1 AND NOT EXISTS (
                 SELECT 1 FROM _loom_wanted_run_messages wanted
                 WHERE wanted.run_id=run_messages.run_id AND wanted.ordinal=run_messages.ordinal
                 ) AND NOT EXISTS (
@@ -6483,14 +6553,15 @@ fn save_run_message_rows(
                    WHERE fragment.run_id=run_messages.run_id
                      AND fragment.message_ordinal=run_messages.ordinal
                 )",
-                [run_id.as_uuid().as_bytes().as_slice()],
-            )
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not prune run messages for {run_id}: {error}"),
-                    true,
+                    [run_id.as_uuid().as_bytes().as_slice()],
                 )
-            })?;
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not prune run messages for {run_id}: {error}"),
+                        true,
+                    )
+                })?;
+        }
     }
     collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
 }
@@ -10622,6 +10693,25 @@ mod tests {
             },
         };
         let initial_activities = BTreeMap::from([(run_id, vec![initial_activity.clone()])]);
+        let initial_transcript = BTreeMap::from([(
+            run_id,
+            vec![
+                DurableRunMessage {
+                    role: loom_model::MessageRole::System,
+                    content: "old system".to_owned(),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                DurableRunMessage {
+                    role: loom_model::MessageRole::Assistant,
+                    content: "stale streamed answer".to_owned(),
+                    name: Some("old header".to_owned()),
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+            ],
+        )]);
         persistence
             .save_state(DurableStateWrite {
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -10636,7 +10726,7 @@ mod tests {
                 run_runtime_configs: None,
                 run_context_checkpoints: None,
                 run_plans: None,
-                run_messages: None,
+                run_messages: Some(&initial_transcript),
                 run_activities: Some(&initial_activities),
                 filesystem_records: None,
                 records: &[],
@@ -10724,6 +10814,26 @@ mod tests {
             second_activity.clone(),
             third_activity.clone(),
         ];
+        let retry_transcript = DurableRunMessageDelta {
+            start_ordinal: 0,
+            reset: true,
+            messages: vec![
+                DurableRunMessage {
+                    role: loom_model::MessageRole::User,
+                    content: "retry prompt".to_owned(),
+                    name: None,
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+                DurableRunMessage {
+                    role: loom_model::MessageRole::Assistant,
+                    content: "partial".to_owned(),
+                    name: Some("streaming".to_owned()),
+                    tool_call_id: None,
+                    tool_calls: Vec::new(),
+                },
+            ],
+        };
         let invalid_checkpoint = DurableRunCheckpointWrite {
             session: &changed_session,
             session_next_sequence: EventSequence::new(1),
@@ -10733,6 +10843,7 @@ mod tests {
             context_checkpoint: None,
             plan: &plan,
             messages: &[],
+            message_delta: Some(&retry_transcript),
             activities: &[],
             activity_deltas: Some(&activity_delta),
             filesystem: None,
@@ -10771,6 +10882,11 @@ mod tests {
             1,
             "feed failure must roll back tool attempt updates"
         );
+        assert_eq!(
+            persistence.load_run_messages(run_id).unwrap(),
+            initial_transcript[&run_id],
+            "a failed retry checkpoint must retain the previous transcript generation"
+        );
 
         let valid_feed = DurableFeedState {
             next_sequence: EventSequence::new(1),
@@ -10794,18 +10910,64 @@ mod tests {
             context_checkpoint: None,
             plan: &plan,
             messages: &[],
+            message_delta: Some(&retry_transcript),
             activities: &[],
             activity_deltas: Some(&activity_delta),
             filesystem: None,
             feed: &valid_feed,
         };
         persistence.save_run_checkpoint(valid_checkpoint).unwrap();
+        persistence
+            .append_run_message_fragment(run_id, session.id, 1, 0, 7, b" final")
+            .unwrap();
+        let tail_delta = DurableRunMessageDelta {
+            start_ordinal: 1,
+            reset: false,
+            messages: vec![DurableRunMessage {
+                role: loom_model::MessageRole::Assistant,
+                content: "partial final".to_owned(),
+                name: Some("new header".to_owned()),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            }],
+        };
+        let empty_feed = DurableFeedState {
+            next_sequence: EventSequence::new(1),
+            retention_limit: 250,
+            events: Vec::new(),
+            workspace_events: Vec::new(),
+        };
+        persistence
+            .save_run_checkpoint(DurableRunCheckpointWrite {
+                session: &changed_session,
+                session_next_sequence: EventSequence::new(1),
+                prune_feed: false,
+                summary: &updated_summary,
+                runtime_config: &runtime_config,
+                context_checkpoint: None,
+                plan: &plan,
+                messages: &[],
+                message_delta: Some(&tail_delta),
+                activities: &[],
+                activity_deltas: Some(&[]),
+                filesystem: None,
+                feed: &empty_feed,
+            })
+            .unwrap();
         drop(persistence);
         let reopened = FilePersistence::open(&path).unwrap();
         assert_eq!(
             reopened.load_run_activities(run_id).unwrap(),
             vec![updated_activity, second_activity, third_activity],
             "activity update and append order must survive restart"
+        );
+        assert_eq!(
+            reopened.load_run_messages(run_id).unwrap(),
+            vec![
+                retry_transcript.messages[0].clone(),
+                tail_delta.messages[0].clone()
+            ],
+            "retry reset and active assistant header update must survive restart"
         );
         assert_eq!(
             reopened
