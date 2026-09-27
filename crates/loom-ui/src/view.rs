@@ -8079,6 +8079,7 @@ impl LoomView {
                                         .icon(Icon::new(IconName::FileText))
                                         .ghost()
                                         .xsmall()
+                                        .tooltip("Show changes")
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.review.panel = ReviewPanel::Changes;
                                             cx.notify();
@@ -8090,6 +8091,7 @@ impl LoomView {
                                     .label("Close")
                                     .ghost()
                                     .small()
+                                    .tooltip("Close review panel")
                                     .on_click(cx.listener(Self::close_review)),
                             ),
                     ),
@@ -9564,6 +9566,7 @@ impl LoomView {
                                 .label("Close")
                                 .ghost()
                                 .small()
+                                .tooltip("Close session drawer")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.session_drawer_open = false;
                                     cx.notify();
