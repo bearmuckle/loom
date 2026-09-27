@@ -31,6 +31,9 @@ shared instruction text until its final profile reference is removed.
 Schema v37 persists an indexed expiry for idempotency responses, rejects stale
 UUIDv7 retries before dispatch, and prunes expired rows on startup. UUIDv4
 request IDs retain their bounded compatibility cache.
+Schema v38 stores content objects up to 4 KiB inline, compressing them when that
+saves at least ten percent. Larger objects retain the chunked, shared-blob
+representation and bounded range reads.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at that
@@ -147,7 +150,8 @@ enforcement explicitly on every connection. [STRICT tables](https://sqlite.org/s
 | Status, role, kind, short names, paths | `TEXT`; checked stable enum strings where applicable |
 | Frequently queried properties | Dedicated columns, indexed where needed |
 | Small extensible configuration | Versioned JSON `TEXT`, validated and size-limited |
-| Large text or binary content | Raw bytes, optionally compressed, referenced by content ID |
+| Small content objects (up to 4 KiB) | Inline bytes in the content-object row, compressed when materially smaller |
+| Larger text or binary content | Content-addressed object split into reusable compressed chunks |
 
 JSON remains appropriate for small policy/options objects and provider-specific
 arguments. It must not contain sessions, messages, checkpoints, or histories as

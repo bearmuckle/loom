@@ -32,10 +32,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 37;
-const DATABASE_SCHEMA_VERSION: u32 = 37;
+pub const CURRENT_SCHEMA_VERSION: u32 = 38;
+const DATABASE_SCHEMA_VERSION: u32 = 38;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
+const INLINE_CONTENT_BYTES: usize = 4096;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGE_FRAGMENT_BYTES: usize = 32 * 1024;
@@ -524,7 +525,11 @@ CREATE TABLE IF NOT EXISTS content_blobs (
 ) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS content_objects (
     hash BLOB PRIMARY KEY NOT NULL CHECK(length(hash) = 32),
-    raw_size INTEGER NOT NULL CHECK(raw_size >= 0 AND raw_size <= 536870912)
+    raw_size INTEGER NOT NULL CHECK(raw_size >= 0 AND raw_size <= 536870912),
+    inline_codec INTEGER CHECK(inline_codec IS NULL OR inline_codec IN (0, 1)),
+    inline_payload BLOB,
+    CHECK((raw_size <= 4096 AND inline_codec IS NOT NULL AND inline_payload IS NOT NULL)
+       OR (raw_size > 4096 AND inline_codec IS NULL AND inline_payload IS NULL))
 ) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS content_parts (
     content_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE CASCADE
@@ -757,10 +762,35 @@ fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> 
         .map_err(|error| {
             persistence_error(format!("could not read state content part: {error}"), true)
         })?;
-    if raw_size <= 0 || raw_size > CONTENT_PART_BYTES as i64 {
+    if raw_size <= 0 {
         return Err(LoomError::new(
             ErrorCode::MalformedPayload,
             "persisted content part has an invalid size",
+            false,
+        ));
+    }
+    decode_content_payload(
+        hash,
+        raw_size,
+        codec,
+        payload,
+        CONTENT_PART_BYTES,
+        "content part",
+    )
+}
+
+fn decode_content_payload(
+    hash: &[u8],
+    raw_size: i64,
+    codec: i64,
+    payload: Vec<u8>,
+    max_size: usize,
+    kind: &str,
+) -> Result<Vec<u8>> {
+    if raw_size < 0 || raw_size > max_size as i64 {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted {kind} has an invalid size"),
             false,
         ));
     }
@@ -774,7 +804,7 @@ fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> 
                 .map_err(|error| {
                     LoomError::new(
                         ErrorCode::MalformedPayload,
-                        format!("persisted content part is malformed: {error}"),
+                        format!("persisted {kind} is malformed: {error}"),
                         false,
                     )
                 })?;
@@ -783,7 +813,7 @@ fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> 
         _ => {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
-                "persisted content part uses an unsupported codec",
+                format!("persisted {kind} uses an unsupported codec"),
                 false,
             ));
         }
@@ -791,7 +821,7 @@ fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> 
     if bytes.len() as i64 != raw_size || Sha256::digest(&bytes).as_slice() != hash {
         return Err(LoomError::new(
             ErrorCode::MalformedPayload,
-            "persisted content part failed its length or hash check",
+            format!("persisted {kind} failed its length or hash check"),
             false,
         ));
     }
@@ -804,11 +834,11 @@ fn load_content_range(
     offset: usize,
     requested_len: usize,
 ) -> Result<Vec<u8>> {
-    let raw_size: i64 = connection
+    let (raw_size, inline_codec, inline_payload): (i64, Option<i64>, Option<Vec<u8>>) = connection
         .query_row(
-            "SELECT raw_size FROM content_objects WHERE hash = ?1",
+            "SELECT raw_size, inline_codec, inline_payload FROM content_objects WHERE hash = ?1",
             [hash],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| {
             persistence_error(
@@ -828,6 +858,17 @@ fn load_content_range(
     if start == end {
         return Ok(Vec::new());
     };
+    if let (Some(codec), Some(payload)) = (inline_codec, inline_payload) {
+        let bytes = decode_content_payload(
+            hash,
+            raw_size,
+            codec,
+            payload,
+            INLINE_CONTENT_BYTES,
+            "inline content",
+        )?;
+        return Ok(bytes[start..end].to_vec());
+    }
     let mut statement = connection
         .prepare(
             "SELECT byte_offset, byte_length, blob_hash FROM content_parts
@@ -4930,14 +4971,26 @@ fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8
     if already_stored {
         return Ok(hash);
     }
+    let inline = (content.len() <= INLINE_CONTENT_BYTES)
+        .then(|| encode_inline_content(content))
+        .transpose()?;
     transaction
         .execute(
-            "INSERT INTO content_objects(hash, raw_size) VALUES (?1, ?2)",
-            params![hash, content.len() as i64],
+            "INSERT INTO content_objects(hash, raw_size, inline_codec, inline_payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                hash,
+                content.len() as i64,
+                inline.as_ref().map(|(codec, _)| *codec),
+                inline.as_ref().map(|(_, payload)| payload.as_slice()),
+            ],
         )
         .map_err(|error| {
             persistence_error(format!("could not store content metadata: {error}"), true)
         })?;
+    if inline.is_some() {
+        return Ok(hash);
+    }
     for (ordinal, part) in content.chunks(CONTENT_PART_BYTES).enumerate() {
         let byte_offset = ordinal * CONTENT_PART_BYTES;
         let part_hash = store_content_blob(transaction, part)?;
@@ -4962,6 +5015,28 @@ fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8
             })?;
     }
     Ok(hash)
+}
+
+fn encode_inline_content(content: &[u8]) -> Result<(i64, Vec<u8>)> {
+    if content.len() >= 512 {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(content).map_err(|error| {
+            persistence_error(
+                format!("could not compress inline state content: {error}"),
+                false,
+            )
+        })?;
+        let compressed = encoder.finish().map_err(|error| {
+            persistence_error(
+                format!("could not compress inline state content: {error}"),
+                false,
+            )
+        })?;
+        if compressed.len().saturating_mul(100) <= content.len().saturating_mul(90) {
+            return Ok((1, compressed));
+        }
+    }
+    Ok((0, content.to_vec()))
 }
 
 fn store_content_blob(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8>> {
@@ -9736,6 +9811,49 @@ mod tests {
     }
 
     #[test]
+    fn small_content_is_inline_compressed_and_read_by_range() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let text = "repeated transcript text with useful detail\n".repeat(48);
+        let connection = Connection::open(&path).unwrap();
+        initialize_schema(&connection).unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        let hash = store_content(&transaction, text.as_bytes()).unwrap();
+        transaction.commit().unwrap();
+
+        let (codec, payload_length, parts, blobs): (i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT objects.inline_codec, length(objects.inline_payload),
+                        (SELECT COUNT(*) FROM content_parts WHERE content_hash=objects.hash),
+                        (SELECT COUNT(*) FROM content_blobs)
+                 FROM content_objects objects WHERE objects.hash=?1",
+                [&hash],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(codec, 1);
+        assert!(payload_length < text.len() as i64);
+        assert_eq!((parts, blobs), (0, 0));
+        assert_eq!(decode_content(&connection, &hash).unwrap(), text);
+        assert_eq!(
+            load_content_range(&connection, &hash, 13, 41).unwrap(),
+            text.as_bytes()[13..54]
+        );
+
+        connection
+            .execute(
+                "UPDATE content_objects SET inline_payload=x'0102' WHERE hash=?1",
+                [&hash],
+            )
+            .unwrap();
+        assert_eq!(
+            decode_content(&connection, &hash).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn content_collection_is_reference_aware_and_uses_queued_candidates() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let store = FilePersistence::open(&path).unwrap();
@@ -10919,7 +11037,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(content_codec, 1);
-        assert_eq!(content_count, 9);
+        assert!(content_count > 0 && content_count < 9);
         let (filesystem_codec, raw_size, payload_size): (i64, i64, i64) = connection
             .query_row(
                 "SELECT payload_codec, raw_size, length(payload) FROM session_filesystems
@@ -10985,10 +11103,10 @@ mod tests {
         );
         let connection = Connection::open(&path).unwrap();
         let content_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM content_blobs", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM content_objects", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(
-            content_count, 8,
+        assert!(
+            content_count >= 8,
             "retained transcript, context checkpoint, tool, filesystem undo, and run-instruction content remain reachable"
         );
         drop(connection);

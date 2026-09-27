@@ -174,21 +174,21 @@ per-session run lookup, and database size. Set `LOOM_SCALE_SESSIONS` and
 
 | Sessions / runs / messages / feed events | Database size | Population | Session catalog + active-run + feed header p50 | One-session feed p50 | Full-feed decode p50 | Transcript page p50 | Content range p50 | Per-session run lookup p50 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 / 10,000 / 40,000 / 10,000 | 42,500,096 bytes | 7,041 ms | 5.533 ms | 0.049 ms | 65.463 ms | 0.191 ms | 0.056 ms | 0.015 ms |
-| 100,000 / 100,000 / 400,000 / 100,000 | 425,418,752 bytes | 83,704 ms | 54.134 ms | 0.024 ms | 573.918 ms | 0.246 ms | 0.079 ms | 0.015 ms |
+| 10,000 / 10,000 / 40,000 / 10,000 | 23,142,400 bytes | 6,950 ms | 6.242 ms | 0.060 ms | 67.438 ms | 0.205 ms | 0.021 ms | 0.016 ms |
+| 100,000 / 100,000 / 400,000 / 100,000 | 229,244,928 bytes | 68,538 ms | 55.950 ms | 0.032 ms | 584.065 ms | 0.231 ms | 0.025 ms | 0.016 ms |
 
 These are optimized local synthetic measurements, not a platform-independent
 latency guarantee or a cold UI startup measurement. The startup-style query
 loads the session catalog and active summaries from a fresh persistence handle;
 it omits UI initialization, filesystem snapshots/checkpoints, activity history,
-and diverse runtime profiles. The 100k state including these transcripts is
-425 MB, so the previous under-100 MB result applied only to the transcript-free
-fixture and is not representative of realistic retained content. `dbstat` shows
-the content blobs and part/index tables dominate at this size. The benchmark
-now proves that transcript pages and byte ranges stay fast on a database much
-larger than the prior synthetic fixture, but the cold application start target,
-full storage budget, realistic checkpoint/filesystem cost, and runtime-profile
-variety remain unproven.
+and diverse runtime profiles. Schema v38's inline representation for objects up
+to 4 KiB reduced both fixture database sizes by about 46% and cut 100k population
+time from 83.7 to 68.5 seconds. The 100k state is still 229 MB, so the full
+storage budget remains unmet. `dbstat` shows content objects, transcript rows,
+and feed/index structures remain the largest consumers. Transcript pages and
+byte ranges stay below 0.24 ms in these local runs, but cold application startup,
+realistic checkpoint/filesystem cost, and runtime-profile variety remain
+unproven.
 
 Historical schema v33-v36 comparisons used the earlier transcript-free fixture
 and are not directly comparable to these measurements. Schema v33 replaced
