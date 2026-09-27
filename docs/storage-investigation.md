@@ -207,7 +207,7 @@ session-created event per session. It omits transcripts, filesystem snapshots,
 large activity/output payloads, multiple realistic profile combinations, and UI
 initialization, so it does not prove that realistic 100k state fits the target.
 
-The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, and bounded retention. Full snapshot capture/write amplification, atomic snapshot/resubscribe, backend ownership, retention policy, and end-to-end scale proof remain in the PR checklist.
+The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. Full snapshot capture/write amplification, atomic snapshot/resubscribe, host shutdown integration, retention policy, and end-to-end scale proof remain in the PR checklist.
 
 ## Baseline findings before the redesign
 
@@ -258,8 +258,9 @@ not necessary to fix these issues.
 2. **Introduce ordered incremental persistence.** Use a backend-owned writer and
    a long-lived connection. Update only affected records in a transaction, keeping
    state changes, durable events, and idempotency records consistent. Coalesce
-   suitable streaming updates without weakening required crash recovery. Enforce
-   single backend ownership of a local database, or design explicit concurrency.
+   suitable streaming updates without weakening required crash recovery. Persistent
+   server backends now reject a second owner through an OS sidecar lock; ordering
+   snapshot capture and commit through one writer remains.
 3. **Separate durable history from reconnect traffic.** Store messages, activities,
    and run summaries by session/run ID, with keyset pagination. Keep a reconnect
    feed bounded by bytes, count, and age, with an explicit expired-cursor response

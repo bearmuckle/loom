@@ -507,8 +507,11 @@ Implement in this order:
    phase timings and row/byte counters. `FilePersistence` lazily opens one SQLite
    connection and shares it across clones, avoiding per-operation open/PRAGMA/
    schema-check work while leaving missing databases untouched during reads.
-   Calls through one handle are serialized; coordination across separately opened
-   handles or processes still needs an explicit ownership policy.
+   Calls through one handle are serialized. Persistent server backends acquire an
+   advisory sidecar lock for the canonical database path, preventing a second
+   backend process from opening a stale in-memory writer. Low-level diagnostic
+   `FilePersistence::open` handles do not claim ownership and must not be used as
+   concurrent writers.
 2. Finish message-fragment and immutable-content streaming, then migrate tools
    and activities; add paging and canonical context loading. Make startup and
    history independent of filesystems. The persistence layer now appends streamed
@@ -551,13 +554,11 @@ Implement in this order:
    persist a pending execution intent and started activity before the next
    worker step can perform an effect. Recovery never replays a persisted
    in-flight tool automatically; it marks the run failed with an unknown
-   external outcome and requires an explicit retry. Further execution-state
-   normalization and crash-injection coverage remain. Ownership of one local
-   database by a single backend is not yet enforced. A run worker can retain the
-   backend while a run waits on approval, so dropping the caller's backend
-   handle does not mean it is safe to reopen the database in-process. Add an
-   explicit worker shutdown/drain lifecycle and cross-process ownership lock
-   before claiming exclusive database ownership.
+   external outcome and requires an explicit retry. `InProcessBackend::shutdown`
+   rejects new requests, pauses and joins active run workers, persists the final
+   state, then releases the owner lock. The host should call it for graceful
+   shutdown; process termination also releases the OS lock. Further execution-
+   state normalization and crash-injection coverage remain.
    Schema v22 stores ordered run-attempt identity, state, checkpoint, and timing
    records separately; checkpoint retry adds a new row while earlier attempts
    remain queryable. These rows are written transactionally with the run

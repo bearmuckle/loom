@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak},
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, Weak},
     thread,
     time::{Duration, Instant},
 };
@@ -909,6 +909,7 @@ struct RunHandle {
     running: Mutex<bool>,
     idle: Condvar,
     failure: Mutex<Option<LoomError>>,
+    worker: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 #[derive(Default)]
@@ -964,6 +965,7 @@ impl RunHandle {
             running: Mutex::new(false),
             idle: Condvar::new(),
             failure: Mutex::new(None),
+            worker: Mutex::new(None),
         }
     }
 
@@ -1352,6 +1354,22 @@ impl RunHandle {
         self.fragment_wake.notify_all();
     }
 
+    fn join_worker(&self) -> Result<()> {
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if worker.is_some_and(|worker| worker.join().is_err()) {
+            return Err(LoomError::new(
+                ErrorCode::Internal,
+                format!("agent run {} worker panicked", self.run_id),
+                false,
+            ));
+        }
+        Ok(())
+    }
+
     fn failure(&self) -> Option<LoomError> {
         self.failure
             .lock()
@@ -1487,6 +1505,7 @@ pub struct InProcessBackend {
     in_flight_requests: Mutex<BTreeMap<loom_core::RequestId, Arc<Mutex<()>>>>,
     session_admissions: Mutex<BTreeMap<AgentSessionId, Arc<Mutex<()>>>>,
     self_reference: Mutex<Weak<InProcessBackend>>,
+    request_lifecycle: RwLock<u8>,
 }
 
 #[derive(Default)]
@@ -1718,7 +1737,7 @@ impl InProcessBackend {
         let providers = ProviderRegistry::demo();
         Self::with_provider_registry_and_persistence(
             providers,
-            Some(FilePersistence::open(path.into())?),
+            Some(FilePersistence::open_exclusive_writer(path.into())?),
         )
     }
 
@@ -1744,7 +1763,7 @@ impl InProcessBackend {
     ) -> Result<Arc<Self>> {
         Self::with_provider_registry_and_persistence(
             providers,
-            Some(FilePersistence::open(path.into())?),
+            Some(FilePersistence::open_exclusive_writer(path.into())?),
         )
     }
 
@@ -1754,7 +1773,8 @@ impl InProcessBackend {
     ) -> Result<Arc<Self>> {
         Self::with_provider_registry_and_persistence(
             providers,
-            path.map(FilePersistence::open).transpose()?,
+            path.map(FilePersistence::open_exclusive_writer)
+                .transpose()?,
         )
     }
 
@@ -1838,6 +1858,7 @@ impl InProcessBackend {
             in_flight_requests: Mutex::new(BTreeMap::new()),
             session_admissions: Mutex::new(BTreeMap::new()),
             self_reference: Mutex::new(Weak::new()),
+            request_lifecycle: RwLock::new(0),
         });
         *backend
             .self_reference
@@ -2767,7 +2788,67 @@ impl InProcessBackend {
     }
 
     pub fn flush(&self) -> Result<()> {
+        if *self.request_lifecycle.read().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "backend request lifecycle lock was poisoned",
+                true,
+            )
+        })? != 0
+        {
+            return Err(LoomError::conflict("backend is shutting down"));
+        }
         self.persist_state()
+    }
+
+    /// Stops active run workers, persists their paused continuation state,
+    /// joins all worker threads, and releases exclusive database ownership.
+    /// Requests through existing connections are rejected after shutdown.
+    pub fn shutdown(&self) -> Result<()> {
+        let mut shutting_down = self.request_lifecycle.write().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "backend request lifecycle lock was poisoned",
+                true,
+            )
+        })?;
+        if *shutting_down == 2 {
+            return Ok(());
+        }
+        *shutting_down = 1;
+        let handles = self
+            .runs()?
+            .values()
+            .cloned()
+            .collect::<Vec<Arc<RunHandle>>>();
+        for handle in handles {
+            if handle.is_running() {
+                handle.control.request_pause();
+                handle.wait_until_idle()?;
+                if let Some(error) = handle.take_failure() {
+                    return Err(error);
+                }
+                if handle.control.is_stopping() {
+                    let state = handle.state().run.state;
+                    if !matches!(
+                        state,
+                        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                    ) {
+                        let mut runtime = handle.try_runtime()?;
+                        runtime.pause()?;
+                        handle.refresh(&runtime);
+                    }
+                    handle.control.clear_request();
+                }
+            }
+            handle.join_worker()?;
+        }
+        self.persist_state()?;
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.release_exclusive_writer()?;
+        }
+        *shutting_down = 2;
+        Ok(())
     }
 
     fn append_recovery_events(
@@ -2898,59 +2979,78 @@ impl InProcessBackend {
 
     /// Drives a registered run on its own worker so the request handler returns
     /// as soon as the run is registered.
-    fn spawn_run_worker(self: &Arc<Self>, handle: Arc<RunHandle>) {
+    fn spawn_run_worker(self: &Arc<Self>, handle: Arc<RunHandle>) -> Result<()> {
+        handle.join_worker()?;
         handle.set_running(true);
         let backend = Arc::clone(self);
-        std::thread::spawn(move || {
-            let fragment_flusher = backend.persistence.clone().map(|persistence| {
-                let handle = Arc::downgrade(&handle);
-                thread::spawn(move || {
-                    RunHandle::flush_message_fragments_until_stopped(handle, persistence)
-                })
-            });
-            loop {
-                let progress = {
-                    let mut runtime = handle
-                        .runtime
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    let progress = runtime.run_step();
-                    handle.refresh(&runtime);
-                    progress
-                };
-                if handle.failure().is_some() {
-                    break;
-                }
-                match progress {
-                    Ok(progress) => {
-                        if let Some(persistence) = backend.persistence.as_ref()
-                            && let Err(error) = handle.flush_message_fragments(persistence)
-                        {
-                            handle.record_failure(error);
-                            break;
-                        }
-                        if let Err(error) = backend.persist_state() {
-                            handle.record_failure(error);
-                            break;
-                        }
-                        if !progress.continues {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let flush_error = backend.persistence.as_ref().and_then(|persistence| {
-                            handle.flush_message_fragments(persistence).err()
-                        });
-                        handle.record_failure(flush_error.unwrap_or(error));
+        let worker_handle = Arc::clone(&handle);
+        let run_id = handle.run_id;
+        let worker = thread::Builder::new()
+            .name(format!("loom-run-{run_id}"))
+            .spawn(move || {
+                let fragment_flusher = backend.persistence.clone().map(|persistence| {
+                    let handle = Arc::downgrade(&handle);
+                    thread::spawn(move || {
+                        RunHandle::flush_message_fragments_until_stopped(handle, persistence)
+                    })
+                });
+                loop {
+                    let progress = {
+                        let mut runtime = handle
+                            .runtime
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        let progress = runtime.run_step();
+                        handle.refresh(&runtime);
+                        progress
+                    };
+                    if handle.failure().is_some() {
                         break;
                     }
+                    match progress {
+                        Ok(progress) => {
+                            if let Some(persistence) = backend.persistence.as_ref()
+                                && let Err(error) = handle.flush_message_fragments(persistence)
+                            {
+                                handle.record_failure(error);
+                                break;
+                            }
+                            if let Err(error) = backend.persist_state() {
+                                handle.record_failure(error);
+                                break;
+                            }
+                            if !progress.continues {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let flush_error =
+                                backend.persistence.as_ref().and_then(|persistence| {
+                                    handle.flush_message_fragments(persistence).err()
+                                });
+                            handle.record_failure(flush_error.unwrap_or(error));
+                            break;
+                        }
+                    }
                 }
-            }
-            handle.set_running(false);
-            if fragment_flusher.is_some_and(|flusher| flusher.join().is_err()) {
-                log::error!("run message fragment flusher thread panicked");
-            }
-        });
+                handle.set_running(false);
+                if fragment_flusher.is_some_and(|flusher| flusher.join().is_err()) {
+                    log::error!("run message fragment flusher thread panicked");
+                }
+            })
+            .map_err(|error| {
+                worker_handle.set_running(false);
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!("could not start worker for run {run_id}: {error}"),
+                    true,
+                )
+            })?;
+        *worker_handle
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(worker);
+        Ok(())
     }
 
     fn cached_response(
@@ -4052,6 +4152,25 @@ impl InProcessConnection {
 
     pub fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
         let request_id = request.request_id;
+        let _lifecycle = match self.backend.request_lifecycle.read() {
+            Ok(lifecycle) if *lifecycle == 0 => lifecycle,
+            Ok(_) => {
+                return ResponseEnvelope::failure(
+                    request_id,
+                    LoomError::conflict("backend is shutting down"),
+                );
+            }
+            Err(_) => {
+                return ResponseEnvelope::failure(
+                    request_id,
+                    LoomError::new(
+                        ErrorCode::Internal,
+                        "backend request lifecycle lock was poisoned",
+                        true,
+                    ),
+                );
+            }
+        };
         if let Some(auth) = &self.auth
             && let Err(error) = auth.verify()
         {
@@ -5593,7 +5712,7 @@ impl InProcessConnection {
         };
         self.backend.persist_state()?;
         if progress.continues {
-            self.backend.spawn_run_worker(Arc::clone(&handle));
+            self.backend.spawn_run_worker(Arc::clone(&handle))?;
         }
         Ok(ServerResponse::AgentRunStarted(handle.snapshot()))
     }
@@ -5617,7 +5736,7 @@ impl InProcessConnection {
             return Err(error);
         }
         if progress.continues {
-            self.backend.spawn_run_worker(Arc::clone(&handle));
+            self.backend.spawn_run_worker(Arc::clone(&handle))?;
         }
         Ok(ServerResponse::AgentRun(handle.snapshot()))
     }
@@ -6378,6 +6497,7 @@ mod tests {
                 response.result,
                 Ok(ServerResponse::WorkspaceConfigUpdated)
             ));
+            backend.shutdown().unwrap();
         }
 
         {
@@ -6432,6 +6552,7 @@ mod tests {
                 ));
                 assert!(response.result.is_err());
             }
+            backend.shutdown().unwrap();
         }
         std::fs::remove_file(path).unwrap();
     }
@@ -6838,6 +6959,7 @@ mod tests {
                 .poll_changes()
                 .unwrap();
             backend.flush().unwrap();
+            backend.shutdown().unwrap();
             (workspace.id, session.id, checkpoint.id)
         };
 
@@ -6943,6 +7065,7 @@ mod tests {
                 panic!("expected restored repository status");
             };
             assert!(status.clean);
+            backend.shutdown().unwrap();
         }
 
         fs::remove_dir_all(source).unwrap();
@@ -6982,6 +7105,7 @@ mod tests {
                 .join("fs");
             fs::write(root.join("retained.txt"), "retained content\n").unwrap();
             backend.flush().unwrap();
+            backend.shutdown().unwrap();
             (workspace.id, session.id)
         };
 
@@ -7004,6 +7128,7 @@ mod tests {
                 renamed.result,
                 Ok(ServerResponse::AgentSessionRenamed(_))
             ));
+            backend.shutdown().unwrap();
         }
         fs::rename(&parked_root, &filesystem_root).unwrap();
         {
@@ -7018,6 +7143,7 @@ mod tests {
                 panic!("unexpected filesystem response");
             };
             assert_eq!(file.content, "retained content\n");
+            backend.shutdown().unwrap();
             fs::remove_dir_all(&backend.session_root_base).unwrap();
         }
         let _ = fs::remove_file(&persistence);
@@ -8262,7 +8388,16 @@ mod tests {
             filesystem.result,
             Ok(ServerResponse::SessionFilesystemSnapshot(_))
         ));
-        backend.flush().unwrap();
+        backend.shutdown().unwrap();
+        backend.shutdown().unwrap();
+        assert_eq!(
+            connection
+                .request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
         drop(connection);
         drop(backend);
         let reopened = InProcessBackend::new_persistent(&persistence).unwrap();
@@ -8330,6 +8465,7 @@ mod tests {
         assert_eq!(attempts[1].id, retried.attempt_id);
         assert_eq!(attempts[1].number, 2);
         assert_eq!(attempts[1].state, AgentRunState::AwaitingApproval);
+        reopened.shutdown().unwrap();
         drop(reopened_connection);
         drop(reopened);
 

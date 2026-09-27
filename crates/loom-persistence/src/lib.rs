@@ -1037,6 +1037,7 @@ impl RestoreNode {
 pub struct FilePersistence {
     path: PathBuf,
     connection: Arc<Mutex<Option<Connection>>>,
+    owner_lock: Arc<Mutex<Option<fs::File>>>,
 }
 
 struct CachedConnection<'a>(MutexGuard<'a, Option<Connection>>);
@@ -1213,7 +1214,104 @@ impl FilePersistence {
         Ok(Self {
             path,
             connection: Arc::new(Mutex::new(None)),
+            owner_lock: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Opens the store as the exclusive writer for a backend process. The lock
+    /// is advisory and remains held by this handle and its clones until they
+    /// are all dropped. Read-only/diagnostic handles may still use `open`.
+    pub fn open_exclusive_writer(path: impl Into<PathBuf>) -> Result<Self> {
+        let path = path.into();
+        if path.as_os_str().is_empty() {
+            return Err(LoomError::invalid_request(
+                "persistence path must not be empty",
+            ));
+        }
+        let absolute_path = if path.exists() {
+            path.canonicalize().map_err(|error| {
+                persistence_error(format!("could not resolve persistence path: {error}"), true)
+            })?
+        } else {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                fs::create_dir_all(parent).map_err(|error| {
+                    persistence_error(
+                        format!(
+                            "could not create persistence directory '{}': {error}",
+                            parent.display()
+                        ),
+                        true,
+                    )
+                })?;
+            }
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent = parent.canonicalize().map_err(|error| {
+                persistence_error(
+                    format!("could not resolve persistence directory: {error}"),
+                    true,
+                )
+            })?;
+            parent.join(path.file_name().ok_or_else(|| {
+                LoomError::invalid_request("persistence path must name a database file")
+            })?)
+        };
+        let mut lock_path = absolute_path.as_os_str().to_os_string();
+        lock_path.push(".loom-owner.lock");
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(lock_path))
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not open persistence owner lock: {error}"),
+                    true,
+                )
+            })?;
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(LoomError::conflict(format!(
+                    "persistence database '{}' is already owned by another backend",
+                    absolute_path.display()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(persistence_error(
+                    format!("could not acquire persistence owner lock: {error}"),
+                    true,
+                ));
+            }
+        }
+        let persistence = Self::open(path)?;
+        *persistence.owner_lock.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "persistence owner lock state was poisoned",
+                true,
+            )
+        })? = Some(lock_file);
+        Ok(persistence)
+    }
+
+    /// Releases exclusive writer ownership after the backend has stopped and
+    /// joined every worker. Cloned store handles share this ownership slot.
+    pub fn release_exclusive_writer(&self) -> Result<()> {
+        self.owner_lock
+            .lock()
+            .map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "persistence owner lock state was poisoned",
+                    true,
+                )
+            })?
+            .take();
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -9160,6 +9258,37 @@ mod tests {
         );
         drop((first, clone, second_handle));
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn exclusive_writer_ownership_is_shared_by_clones_and_released_on_drop() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let writer = FilePersistence::open_exclusive_writer(&path).unwrap();
+        let clone = writer.clone();
+        assert_eq!(
+            FilePersistence::open_exclusive_writer(&path)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        // Diagnostic handles do not claim backend ownership.
+        assert!(FilePersistence::open(&path).is_ok());
+        drop(writer);
+        assert_eq!(
+            FilePersistence::open_exclusive_writer(&path)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        clone.release_exclusive_writer().unwrap();
+        let replacement = FilePersistence::open_exclusive_writer(&path).unwrap();
+        drop(replacement);
+        drop(clone);
+        let replacement = FilePersistence::open_exclusive_writer(&path).unwrap();
+        drop(replacement);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".loom-owner.lock");
+        fs::remove_file(PathBuf::from(lock_path)).unwrap();
     }
 
     #[test]
