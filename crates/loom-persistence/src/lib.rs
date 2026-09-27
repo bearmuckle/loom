@@ -30,8 +30,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 29;
-const DATABASE_SCHEMA_VERSION: u32 = 29;
+pub const CURRENT_SCHEMA_VERSION: u32 = 30;
+const DATABASE_SCHEMA_VERSION: u32 = 30;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -43,6 +43,7 @@ const MAX_RUN_MESSAGE_PAGE_SIZE: usize = loom_protocol::MAX_AGENT_RUN_MESSAGE_PA
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DURABLE_FEED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILESYSTEM_CHANGE_HISTORY: usize = 2048;
+const MAX_FILESYSTEM_CHANGE_PAGE_SIZE: usize = 512;
 const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_IDEMPOTENCY_PAYLOAD_BYTES: usize = 1024 * 1024;
 
@@ -311,6 +312,11 @@ CREATE TABLE IF NOT EXISTS session_filesystems (
     raw_size INTEGER NOT NULL CHECK(raw_size >= 0 AND raw_size <= 536870912),
     payload_codec INTEGER NOT NULL CHECK(payload_codec IN (0, 1)),
     payload BLOB NOT NULL CHECK(length(payload) <= 536870912)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS filesystem_change_state (
+    session_id BLOB PRIMARY KEY NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
+        CHECK(length(session_id) = 16),
+    next_sequence INTEGER NOT NULL CHECK(next_sequence >= 0)
 ) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS filesystem_edits (
     session_id BLOB NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
@@ -914,6 +920,12 @@ pub struct DurableFilesystemRecord {
     pub repositories: BTreeMap<RepositoryId, SessionRepository>,
     pub directories: Vec<SessionDirectory>,
     pub payload: Value,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableFilesystemChangesPage {
+    pub changes: Vec<SessionFilesystemChange>,
+    pub truncated: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3071,6 +3083,144 @@ impl FilePersistence {
         .collect()
     }
 
+    /// Appends newly observed filesystem changes and enforces bounded retention.
+    pub fn save_filesystem_changes(
+        &self,
+        session_id: AgentSessionId,
+        next_sequence: EventSequence,
+        changes: &[SessionFilesystemChange],
+    ) -> Result<()> {
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin filesystem change write: {error}"),
+                true,
+            )
+        })?;
+        let next_sequence = encode_counter(next_sequence.value(), "filesystem sequence")?;
+        transaction
+            .execute(
+                "INSERT INTO filesystem_change_state(session_id, next_sequence)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    next_sequence=MAX(filesystem_change_state.next_sequence, excluded.next_sequence)",
+                params![session_id.as_uuid().as_bytes().as_slice(), next_sequence],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not update filesystem sequence: {error}"), true)
+            })?;
+        save_filesystem_change_rows(&transaction, session_id, changes)?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit filesystem changes: {error}"),
+                true,
+            )
+        })
+    }
+
+    /// Loads a bounded filesystem change page without restoring the workspace.
+    pub fn load_filesystem_changes_page(
+        &self,
+        session_id: AgentSessionId,
+        after: Option<EventSequence>,
+        limit: usize,
+    ) -> Result<DurableFilesystemChangesPage> {
+        if !(1..=MAX_FILESYSTEM_CHANGE_PAGE_SIZE).contains(&limit) {
+            return Err(LoomError::invalid_request(format!(
+                "filesystem change page size must be between 1 and {MAX_FILESYSTEM_CHANGE_PAGE_SIZE}"
+            )));
+        }
+        if !self.path.exists() {
+            return Ok(DurableFilesystemChangesPage {
+                changes: Vec::new(),
+                truncated: false,
+            });
+        }
+        let after = after
+            .map(|sequence| encode_counter(sequence.value(), "filesystem sequence"))
+            .transpose()?;
+        let connection = self.connection()?;
+        let first_retained: Option<i64> = connection
+            .query_row(
+                "SELECT MIN(sequence) FROM filesystem_changes WHERE session_id=?1",
+                [session_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect filesystem change retention: {error}"),
+                    true,
+                )
+            })?;
+        let limit_plus_one = i64::try_from(limit + 1).map_err(|_| {
+            LoomError::invalid_request("filesystem change page size is out of range")
+        })?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, path, kind, revision FROM filesystem_changes
+                 WHERE session_id=?1 AND (?2 IS NULL OR sequence>?2)
+                 ORDER BY sequence DESC LIMIT ?3",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare filesystem change page: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map(
+                params![
+                    session_id.as_uuid().as_bytes().as_slice(),
+                    after,
+                    limit_plus_one
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not query filesystem change page: {error}"),
+                    true,
+                )
+            })?;
+        let mut rows = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read filesystem change page: {error}"),
+                    true,
+                )
+            })?;
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.truncate(limit);
+        }
+        rows.reverse();
+        let history_pruned = after
+            .zip(first_retained)
+            .is_some_and(|(cursor, first)| first > cursor.saturating_add(1));
+        let mut changes = Vec::with_capacity(rows.len());
+        for (sequence, path, kind, revision) in rows {
+            changes.push(SessionFilesystemChange {
+                sequence: EventSequence::new(decode_counter(sequence, "filesystem sequence")?),
+                session_id,
+                path,
+                kind: parse_workspace_change_kind(&kind)?,
+                revision,
+            });
+        }
+        Ok(DurableFilesystemChangesPage {
+            changes,
+            truncated: history_pruned || has_more,
+        })
+    }
+
     pub fn load_filesystem_record(
         &self,
         session_id: AgentSessionId,
@@ -3148,7 +3298,7 @@ impl FilePersistence {
                 false,
             ));
         }
-        let payload: Value = serde_json::from_slice(&raw).map_err(|error| {
+        let mut payload: Value = serde_json::from_slice(&raw).map_err(|error| {
             LoomError::new(
                 ErrorCode::MalformedPayload,
                 format!("persisted filesystem payload is malformed: {error}"),
@@ -3174,6 +3324,42 @@ impl FilePersistence {
                 "filesystem index columns do not match the payload",
                 false,
             ));
+        }
+        let sequence = connection
+            .query_row(
+                "SELECT next_sequence FROM filesystem_change_state WHERE session_id=?1",
+                [session_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read filesystem sequence state: {error}"),
+                    true,
+                )
+            })?
+            .map(|sequence| decode_counter(sequence, "filesystem sequence"))
+            .transpose()?
+            .unwrap_or(0);
+        let payload_sequence = filesystem
+            .get("next_sequence")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted filesystem sequence is missing",
+                    false,
+                )
+            })?;
+        if sequence < payload_sequence {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "filesystem sequence index is behind its payload",
+                false,
+            ));
+        }
+        if sequence > payload_sequence {
+            payload["filesystem"]["next_sequence"] = serde_json::json!(sequence);
         }
         let checkpoint_rows = {
             let mut statement = connection
@@ -3305,45 +3491,7 @@ impl FilePersistence {
                 source: parse_workspace_control(&source)?,
             });
         }
-        let change_rows = {
-            let mut statement = connection
-                .prepare(
-                    "SELECT sequence, path, kind, revision FROM filesystem_changes
-                     WHERE session_id=?1 ORDER BY sequence",
-                )
-                .map_err(|error| {
-                    persistence_error(
-                        format!("could not prepare filesystem changes: {error}"),
-                        true,
-                    )
-                })?;
-            let rows = statement
-                .query_map([session_id.as_uuid().as_bytes().as_slice()], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                })
-                .map_err(|error| {
-                    persistence_error(format!("could not read filesystem changes: {error}"), true)
-                })?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    persistence_error(format!("could not read filesystem changes: {error}"), true)
-                })?
-        };
-        let mut changes = Vec::with_capacity(change_rows.len());
-        for (sequence, path, kind, revision) in change_rows {
-            changes.push(SessionFilesystemChange {
-                sequence: EventSequence::new(decode_counter(sequence, "filesystem sequence")?),
-                session_id,
-                path,
-                kind: parse_workspace_change_kind(&kind)?,
-                revision,
-            });
-        }
+        let changes = Vec::new();
         let repositories = {
             let mut statement = connection
                 .prepare(
@@ -6695,6 +6843,16 @@ fn save_filesystem_records(
                 false,
             )
         })?;
+        let next_sequence = filesystem
+            .get("next_sequence")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "filesystem record has no change sequence high-water mark",
+                    false,
+                )
+            })?;
         if filesystem.get("root").and_then(Value::as_str) != Some(record.root.as_str())
             || filesystem.get("control").and_then(Value::as_str)
                 != Some(workspace_control_name(record.control))
@@ -6801,6 +6959,18 @@ fn save_filesystem_records(
                     )
                 })?;
         }
+        let next_sequence = encode_counter(next_sequence, "filesystem sequence")?;
+        transaction
+            .execute(
+                "INSERT INTO filesystem_change_state(session_id, next_sequence)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    next_sequence=MAX(filesystem_change_state.next_sequence, excluded.next_sequence)",
+                params![record.session_id.as_uuid().as_bytes().as_slice(), next_sequence],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save filesystem sequence: {error}"), true)
+            })?;
         save_checkpoint_rows(transaction, record.session_id, &record.checkpoints)?;
         save_filesystem_edit_rows(transaction, record.session_id, &record.edits)?;
         save_filesystem_change_rows(transaction, record.session_id, &record.changes)?;
@@ -6889,32 +7059,15 @@ fn save_filesystem_change_rows(
     session_id: AgentSessionId,
     changes: &[SessionFilesystemChange],
 ) -> Result<()> {
-    if changes.len() > MAX_FILESYSTEM_CHANGE_HISTORY {
-        return Err(LoomError::new(
-            ErrorCode::MalformedPayload,
-            "filesystem change history exceeds its retention limit",
-            false,
-        ));
-    }
-    transaction
-        .execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_filesystem_changes (
-                session_id BLOB NOT NULL,
-                sequence INTEGER NOT NULL,
-                PRIMARY KEY(session_id, sequence)
-             ) WITHOUT ROWID, STRICT;",
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not stage filesystem changes: {error}"), true)
-        })?;
-    transaction
-        .execute(
-            "DELETE FROM _loom_wanted_filesystem_changes WHERE session_id=?1",
+    let mut max_sequence = transaction
+        .query_row(
+            "SELECT MAX(sequence) FROM filesystem_changes WHERE session_id=?1",
             [session_id.as_uuid().as_bytes().as_slice()],
+            |row| row.get::<_, Option<i64>>(0),
         )
         .map_err(|error| {
             persistence_error(
-                format!("could not clear staged filesystem changes: {error}"),
+                format!("could not inspect filesystem change high-water mark: {error}"),
                 true,
             )
         })?;
@@ -6937,15 +7090,10 @@ fn save_filesystem_change_rows(
         }
         previous = Some(change.sequence);
         let sequence = encode_counter(change.sequence.value(), "filesystem sequence")?;
+        if max_sequence.is_some_and(|current| sequence <= current) {
+            continue;
+        }
         let session_id_bytes = session_id.as_uuid().as_bytes();
-        transaction
-            .execute(
-                "INSERT INTO _loom_wanted_filesystem_changes(session_id, sequence) VALUES (?1, ?2)",
-                params![session_id_bytes.as_slice(), sequence],
-            )
-            .map_err(|error| {
-                persistence_error(format!("could not stage filesystem change: {error}"), true)
-            })?;
         transaction
             .execute(
                 "INSERT INTO filesystem_changes(session_id, sequence, path, kind, revision)
@@ -6968,16 +7116,20 @@ fn save_filesystem_change_rows(
             .map_err(|error| {
                 persistence_error(format!("could not save filesystem change: {error}"), true)
             })?;
+        max_sequence = Some(sequence);
     }
     transaction
         .execute(
             "DELETE FROM filesystem_changes
-             WHERE session_id=?1 AND NOT EXISTS (
-                SELECT 1 FROM _loom_wanted_filesystem_changes wanted
-                WHERE wanted.session_id=filesystem_changes.session_id
-                  AND wanted.sequence=filesystem_changes.sequence
-             )",
-            [session_id.as_uuid().as_bytes().as_slice()],
+             WHERE session_id=?1 AND sequence < COALESCE((
+                SELECT sequence FROM filesystem_changes
+                WHERE session_id=?1 ORDER BY sequence DESC
+                LIMIT 1 OFFSET ?2
+             ), -1)",
+            params![
+                session_id.as_uuid().as_bytes().as_slice(),
+                (MAX_FILESYSTEM_CHANGE_HISTORY - 1) as i64
+            ],
         )
         .map_err(|error| {
             persistence_error(format!("could not prune filesystem changes: {error}"), true)
@@ -7797,7 +7949,7 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_change_writes_enforce_the_retention_limit() {
+    fn filesystem_change_writes_retain_only_the_newest_entries() {
         let session_id = AgentSessionId::new();
         let changes = (1..=(MAX_FILESYSTEM_CHANGE_HISTORY as u64 + 1))
             .map(|sequence| SessionFilesystemChange {
@@ -7809,9 +7961,27 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE filesystem_changes(
+                    session_id BLOB NOT NULL, sequence INTEGER NOT NULL,
+                    path TEXT NOT NULL, kind TEXT NOT NULL, revision TEXT,
+                    PRIMARY KEY(session_id, sequence)
+                ) WITHOUT ROWID;",
+            )
+            .unwrap();
         let transaction = connection.transaction().unwrap();
-        let error = save_filesystem_change_rows(&transaction, session_id, &changes).unwrap_err();
-        assert_eq!(error.code, ErrorCode::MalformedPayload);
+        save_filesystem_change_rows(&transaction, session_id, &changes).unwrap();
+        let (count, min_sequence, max_sequence): (i64, i64, i64) = transaction
+            .query_row(
+                "SELECT COUNT(*), MIN(sequence), MAX(sequence) FROM filesystem_changes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, MAX_FILESYSTEM_CHANGE_HISTORY as i64);
+        assert_eq!(min_sequence, 2);
+        assert_eq!(max_sequence, MAX_FILESYSTEM_CHANGE_HISTORY as i64 + 1);
     }
 
     #[test]
@@ -8589,7 +8759,43 @@ mod tests {
             .unwrap();
         assert_eq!(loaded_filesystem.payload, filesystem_records[0].payload);
         assert_eq!(loaded_filesystem.edits, filesystem_records[0].edits);
-        assert_eq!(loaded_filesystem.changes, filesystem_records[0].changes);
+        assert!(loaded_filesystem.changes.is_empty());
+        assert_eq!(
+            persistence
+                .load_filesystem_changes_page(session.id, None, 512)
+                .unwrap()
+                .changes,
+            filesystem_records[0].changes
+        );
+        let watcher_change = SessionFilesystemChange {
+            sequence: EventSequence::new(2),
+            session_id: session.id,
+            path: "src/generated.rs".to_owned(),
+            kind: WorkspaceChangeKind::Created,
+            revision: Some("revision-new".to_owned()),
+        };
+        persistence
+            .save_filesystem_changes(
+                session.id,
+                EventSequence::new(2),
+                std::slice::from_ref(&watcher_change),
+            )
+            .unwrap();
+        let reloaded_filesystem = persistence
+            .load_filesystem_record(session.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reloaded_filesystem.payload["filesystem"]["next_sequence"],
+            serde_json::json!(2)
+        );
+        assert_eq!(
+            persistence
+                .load_filesystem_changes_page(session.id, Some(EventSequence::new(1)), 512)
+                .unwrap()
+                .changes,
+            vec![watcher_change]
+        );
         assert_eq!(loaded_filesystem.repositories, repositories);
         assert_eq!(loaded_filesystem.directories, directories);
         assert_eq!(loaded_filesystem.checkpoints, vec![checkpoint.clone()]);
@@ -8649,7 +8855,9 @@ mod tests {
             .load_filesystem_record(session.id)
             .unwrap()
             .unwrap();
-        assert_eq!(retained_filesystem.payload, filesystem_records[0].payload);
+        let mut expected_filesystem_payload = filesystem_records[0].payload.clone();
+        expected_filesystem_payload["filesystem"]["next_sequence"] = serde_json::json!(2);
+        assert_eq!(retained_filesystem.payload, expected_filesystem_payload);
         assert_eq!(retained_filesystem.checkpoints, vec![checkpoint.clone()]);
 
         let connection = Connection::open(&path).unwrap();

@@ -25,9 +25,12 @@ content-addressed blob store. Filesystem edits and ordered changes use typed
 session-keyed rows, with prior edit bytes sharing the content store. Repository
 attachments and mounted directories also use typed session-keyed rows; only
 small filesystem identity/control data remains in the compressed, hash-checked
-per-session payload. Filesystem changes retain the newest 2,048 sequence entries;
-responses flag clients whose cursors predate the retained range. Restoring the
-workspace still materializes retained edit/change histories. Large strings in
+per-session payload. Filesystem change pages query SQLite directly without
+restoring a filesystem service; a separate typed high-water mark preserves the
+next sequence when watcher changes are committed incrementally. The newest 2,048
+sequence entries are retained, and responses flag clients whose cursors predate
+the retained range. Restoring a workspace still materializes retained edit undo
+history. Large strings in
 the generic section store are deduplicated and compressed. Provider configuration
 and health use provider-keyed records. Idempotency uses a dedicated table.
 Activities, tool calls, tool attempts, plan/evidence, and protocol-level

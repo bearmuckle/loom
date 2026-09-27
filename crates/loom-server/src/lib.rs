@@ -4345,9 +4345,34 @@ impl InProcessConnection {
                 session_id,
                 after_sequence,
             } => {
-                let mut changes = self
-                    .session_filesystem(session_id)?
-                    .changes_since(after_sequence)?;
+                if let Some(persistence) = &self.backend.persistence {
+                    self.backend.sessions()?.get(session_id)?;
+                    let filesystem = self
+                        .backend
+                        .session_filesystems()?
+                        .get(&session_id)
+                        .cloned();
+                    if let Some(filesystem) = filesystem {
+                        let new_changes = filesystem.poll_changes()?;
+                        let next_sequence = filesystem.state()?.next_sequence;
+                        persistence.save_filesystem_changes(
+                            session_id,
+                            next_sequence,
+                            &new_changes,
+                        )?;
+                    }
+                    let page = persistence.load_filesystem_changes_page(
+                        session_id,
+                        after_sequence,
+                        MAX_REVIEW_CHANGES,
+                    )?;
+                    return Ok(ServerResponse::SessionFilesystemChanges {
+                        changes: page.changes,
+                        truncated: page.truncated,
+                    });
+                }
+                let filesystem = self.session_filesystem(session_id)?;
+                let mut changes = filesystem.changes_since(after_sequence)?;
                 let history_pruned = filesystem_history_pruned(after_sequence, &changes);
                 let truncated = history_pruned || changes.len() > MAX_REVIEW_CHANGES;
                 if changes.len() > MAX_REVIEW_CHANGES {
@@ -6376,11 +6401,21 @@ mod tests {
             assert!(persisted_filesystem.edits.iter().any(|edit| {
                 edit.path == "repo/README.md" && edit.before.as_deref() == Some("source\n")
             }));
-            assert!(persisted_filesystem.changes.iter().any(|change| {
-                change.path == "repo/README.md"
-                    && change.session_id == session_id
-                    && change.sequence.value() > 0
-            }));
+            assert!(
+                backend
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .load_filesystem_changes_page(session_id, None, 512)
+                    .unwrap()
+                    .changes
+                    .iter()
+                    .any(|change| {
+                        change.path == "repo/README.md"
+                            && change.session_id == session_id
+                            && change.sequence.value() > 0
+                    })
+            );
             let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
                 session_id,
                 path: "repo/README.md".to_owned(),
@@ -6482,6 +6517,16 @@ mod tests {
             assert!(matches!(
                 renamed.result,
                 Ok(ServerResponse::AgentSessionRenamed(_))
+            ));
+            let changes = connection.request(RequestEnvelope::new(
+                ClientRequest::GetSessionFilesystemChanges {
+                    session_id,
+                    after_sequence: None,
+                },
+            ));
+            assert!(matches!(
+                changes.result,
+                Ok(ServerResponse::SessionFilesystemChanges { .. })
             ));
         }
         fs::rename(&parked_root, &filesystem_root).unwrap();
