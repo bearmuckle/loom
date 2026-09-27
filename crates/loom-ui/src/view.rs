@@ -9828,6 +9828,7 @@ impl LoomView {
 
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_window_title(&format!("Loom - {}", self.active_session.name));
         #[cfg(target_family = "wasm")]
         if !self.browser_window_initialized {
             self.browser_window_initialized = true;
