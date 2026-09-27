@@ -19,6 +19,10 @@ canonical message body; mismatched snapshots preserve the prior base and
 committed fragments rather than replacing either. Bounded
 keyset pages and byte-range reads are available from persistence. Completed
 nonempty message bodies share the compressed, content-addressed blob store.
+Reference changes enqueue content-object and blob candidates through SQLite
+triggers. Normal writes examine at most 256 candidates of each kind instead
+of scanning all stored content; `FilePersistence::collect_garbage` can drain a
+larger bounded batch when storage maintenance runs.
 The server batches streamed assistant fragments at 50 ms or 32 KiB and flushes
 before durable run-state writes and at completion.
 Run-attempt history and the current continuation cursor, control revision,
@@ -540,15 +544,18 @@ Implement in this order:
    bounds change history and pages change rows directly from SQLite after a
    requested filesystem refresh. The typed sequence high-water mark and appended
    change rows commit atomically. Restart tests cover edit rollback and bounded
-   page reads. Bounded undo-history policy and broader crash-injection coverage
-   remain.
+   page reads. Schema v32 tracks content garbage through indexed, trigger-fed
+   candidate queues and bounds collection work inside ordinary writes; shared
+   blobs are retained while any reference exists. Bounded undo-history policy
+   and broader crash-injection coverage remain.
 4. Keep filesystem services lazy and reduce remaining whole-state export/write
    work for isolated changes; selected-session filesystem operations may restore
    and refresh that session. The SQLite history page query is bounded and avoids
    hydrating retained history, but its request refresh still polls the selected
    filesystem service for external changes.
-5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
-   exports and their mirrored in-memory journals completely.
+5. Finish scoped feeds, retention policy, and storage maintenance; define the
+   maintenance cadence that drains queued content-GC candidates and remove
+   section exports and mirrored in-memory journals completely.
 
 This release has a clean start only. It does not copy, import, rename, or remove
 an existing state database. When the configured path contains an unsupported

@@ -31,8 +31,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 31;
-const DATABASE_SCHEMA_VERSION: u32 = 31;
+pub const CURRENT_SCHEMA_VERSION: u32 = 32;
+const DATABASE_SCHEMA_VERSION: u32 = 32;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -44,6 +44,8 @@ const MAX_RUN_MESSAGE_PAGE_SIZE: usize = loom_protocol::MAX_AGENT_RUN_MESSAGE_PA
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DURABLE_FEED_SESSION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DURABLE_FEED_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONTENT_GC_CANDIDATES_PER_WRITE: usize = 256;
+const MAX_MANUAL_CONTENT_GC_CANDIDATES: usize = 16_384;
 const MAX_FILESYSTEM_CHANGE_HISTORY: usize = 2048;
 const MAX_FILESYSTEM_CHANGE_PAGE_SIZE: usize = 512;
 const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
@@ -494,6 +496,89 @@ CREATE TABLE IF NOT EXISTS state_nodes (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS state_nodes_by_section_kind
     ON state_nodes(section, node_kind);
+CREATE TABLE IF NOT EXISTS content_gc_candidates (
+    kind TEXT NOT NULL CHECK(kind IN ('object', 'blob')),
+    hash BLOB NOT NULL CHECK(length(hash) = 32),
+    PRIMARY KEY(kind, hash)
+) WITHOUT ROWID, STRICT;
+
+CREATE TRIGGER IF NOT EXISTS gc_state_nodes_delete AFTER DELETE ON state_nodes
+WHEN OLD.content_hash IS NOT NULL BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_state_nodes_update AFTER UPDATE OF content_hash ON state_nodes
+WHEN OLD.content_hash IS NOT NULL AND OLD.content_hash IS NOT NEW.content_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_checkpoint_files_delete AFTER DELETE ON checkpoint_files BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_checkpoint_files_update AFTER UPDATE OF content_hash ON checkpoint_files
+WHEN OLD.content_hash IS NOT NEW.content_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_run_messages_delete AFTER DELETE ON run_messages
+WHEN OLD.content_hash IS NOT NULL BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_run_messages_update AFTER UPDATE OF content_hash ON run_messages
+WHEN OLD.content_hash IS NOT NULL AND OLD.content_hash IS NOT NEW.content_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_context_checkpoints_delete AFTER DELETE ON run_context_checkpoints BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.summary_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_context_checkpoints_update AFTER UPDATE OF summary_hash ON run_context_checkpoints
+WHEN OLD.summary_hash IS NOT NEW.summary_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.summary_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_message_fragments_delete AFTER DELETE ON run_message_fragments BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_message_fragments_update AFTER UPDATE OF content_hash ON run_message_fragments
+WHEN OLD.content_hash IS NOT NEW.content_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_activities_delete AFTER DELETE ON run_activities BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.data_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_activities_update AFTER UPDATE OF data_hash ON run_activities
+WHEN OLD.data_hash IS NOT NEW.data_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.data_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_tool_calls_delete AFTER DELETE ON run_tool_calls BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.arguments_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_tool_calls_update AFTER UPDATE OF arguments_hash ON run_tool_calls
+WHEN OLD.arguments_hash IS NOT NEW.arguments_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.arguments_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_tool_attempts_delete AFTER DELETE ON run_tool_attempts
+WHEN OLD.result_hash IS NOT NULL BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.result_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_tool_attempts_update AFTER UPDATE OF result_hash ON run_tool_attempts
+WHEN OLD.result_hash IS NOT NULL AND OLD.result_hash IS NOT NEW.result_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.result_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_filesystem_edits_delete AFTER DELETE ON filesystem_edits
+WHEN OLD.before_hash IS NOT NULL BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.before_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_filesystem_edits_update AFTER UPDATE OF before_hash ON filesystem_edits
+WHEN OLD.before_hash IS NOT NULL AND OLD.before_hash IS NOT NEW.before_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.before_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_content_parts_delete AFTER DELETE ON content_parts BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('blob', OLD.blob_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_content_parts_update AFTER UPDATE ON content_parts BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
+        SELECT 'object', OLD.content_hash WHERE OLD.content_hash IS NOT NEW.content_hash;
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
+        SELECT 'blob', OLD.blob_hash WHERE OLD.blob_hash IS NOT NEW.blob_hash;
+END;
 ";
 
 #[derive(Default)]
@@ -4116,6 +4201,31 @@ impl FilePersistence {
         })
     }
 
+    /// Collects a bounded batch of content objects and blobs queued by reference changes.
+    /// Ordinary writes process smaller batches; callers can repeat this method to drain a
+    /// backlog without scanning all stored content on every transaction.
+    pub fn collect_garbage(&self, max_candidates: usize) -> Result<()> {
+        if !(1..=MAX_MANUAL_CONTENT_GC_CANDIDATES).contains(&max_candidates) {
+            return Err(LoomError::invalid_request(format!(
+                "content garbage-collection batch must be between 1 and {MAX_MANUAL_CONTENT_GC_CANDIDATES}"
+            )));
+        }
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin content garbage-collection transaction: {error}"),
+                true,
+            )
+        })?;
+        collect_unused_content(&transaction, max_candidates)?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit content garbage collection: {error}"),
+                true,
+            )
+        })
+    }
+
     pub fn save_sections(&self, schema_version: u32, sections: &[(&str, Value)]) -> Result<()> {
         let connection = self.connection_for_write()?;
         let transaction = connection.unchecked_transaction().map_err(|error| {
@@ -4347,7 +4457,7 @@ fn save_section_nodes(
         .map_err(|error| {
             persistence_error(format!("could not prune section '{name}': {error}"), true)
         })?;
-    collect_unused_content(transaction)?;
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)?;
     Ok(())
 }
 
@@ -4474,11 +4584,17 @@ fn store_content_blob(transaction: &Transaction<'_>, content: &[u8]) -> Result<V
     Ok(hash)
 }
 
-fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
+fn collect_unused_content(transaction: &Transaction<'_>, candidate_limit: usize) -> Result<()> {
+    let candidate_limit = i64::try_from(candidate_limit).map_err(|_| {
+        LoomError::invalid_request("content garbage-collection limit is out of range")
+    })?;
     transaction
         .execute(
             "DELETE FROM content_objects
-             WHERE NOT EXISTS (
+             WHERE hash IN (
+                 SELECT hash FROM content_gc_candidates
+                 WHERE kind='object' ORDER BY hash LIMIT ?1
+             ) AND NOT EXISTS (
                 SELECT 1 FROM state_nodes WHERE state_nodes.content_hash=content_objects.hash
              ) AND NOT EXISTS (
                 SELECT 1 FROM checkpoint_files
@@ -4505,7 +4621,7 @@ fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
                 SELECT 1 FROM filesystem_edits
                 WHERE filesystem_edits.before_hash=content_objects.hash
              )",
-            [],
+            [candidate_limit],
         )
         .map_err(|error| {
             persistence_error(
@@ -4515,15 +4631,48 @@ fn collect_unused_content(transaction: &Transaction<'_>) -> Result<()> {
         })?;
     transaction
         .execute(
+            "DELETE FROM content_gc_candidates
+             WHERE kind='object' AND hash IN (
+                 SELECT hash FROM content_gc_candidates
+                 WHERE kind='object' ORDER BY hash LIMIT ?1
+             )",
+            [candidate_limit],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prune processed content candidates: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
             "DELETE FROM content_blobs
-             WHERE NOT EXISTS (
+             WHERE hash IN (
+                 SELECT hash FROM content_gc_candidates
+                 WHERE kind='blob' ORDER BY hash LIMIT ?1
+             ) AND NOT EXISTS (
                  SELECT 1 FROM content_parts WHERE content_parts.blob_hash=content_blobs.hash
              )",
-            [],
+            [candidate_limit],
         )
         .map_err(|error| {
             persistence_error(
                 format!("could not collect unused content parts: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM content_gc_candidates
+             WHERE kind='blob' AND hash IN (
+                 SELECT hash FROM content_gc_candidates
+                 WHERE kind='blob' ORDER BY hash LIMIT ?1
+             )",
+            [candidate_limit],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prune processed blob candidates: {error}"),
                 true,
             )
         })?;
@@ -5156,7 +5305,7 @@ fn save_run_message_rows(
                 )
             })?;
     }
-    collect_unused_content(transaction)
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
 }
 
 fn save_session_rows(transaction: &Transaction<'_>, state: &SessionManagerState) -> Result<()> {
@@ -5988,7 +6137,7 @@ fn save_run_context_checkpoint_rows(
                 persistence_error(format!("could not save run context checkpoint: {error}"), true)
             })?;
     }
-    collect_unused_content(transaction)?;
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)?;
     Ok(())
 }
 
@@ -6712,7 +6861,7 @@ fn save_run_activity_rows(
                 persistence_error(format!("could not prune run activities: {error}"), true)
             })?;
     }
-    collect_unused_content(transaction)
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
 }
 
 fn activity_tool_data(
@@ -7095,7 +7244,7 @@ fn save_run_tool_rows(
                 )
             })?;
     }
-    collect_unused_content(transaction)
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
 }
 
 fn save_filesystem_records(
@@ -7244,7 +7393,7 @@ fn save_filesystem_records(
         save_session_repository_rows(transaction, record.session_id, &record.repositories)?;
         save_session_directory_rows(transaction, record.session_id, &record.directories)?;
     }
-    collect_unused_content(transaction)?;
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)?;
     Ok(())
 }
 
@@ -8690,6 +8839,128 @@ mod tests {
             text
         );
         drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn content_collection_is_reference_aware_and_uses_queued_candidates() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        let shared = "shared retained transcript content ".repeat(500);
+        store
+            .save_sections(
+                CURRENT_SCHEMA_VERSION,
+                &[
+                    ("first", serde_json::json!({"content": shared})),
+                    ("second", serde_json::json!({"content": shared})),
+                ],
+            )
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let shared_hash: Vec<u8> = connection
+            .query_row("SELECT hash FROM content_objects LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let shared_blob_hash: Vec<u8> = connection
+            .query_row(
+                "SELECT blob_hash FROM content_parts WHERE content_hash=?1 LIMIT 1",
+                [&shared_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let replacement = "replacement object with distinct bytes ".repeat(500);
+        store
+            .save_sections(
+                CURRENT_SCHEMA_VERSION,
+                &[("first", serde_json::json!({"content": replacement}))],
+            )
+            .unwrap();
+        let shared_references: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM state_nodes WHERE content_hash=?1",
+                [&shared_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_references, 1);
+
+        store
+            .save_sections(
+                CURRENT_SCHEMA_VERSION,
+                &[("second", serde_json::json!({"content": "small"}))],
+            )
+            .unwrap();
+        let shared_object_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_objects WHERE hash=?1)",
+                [&shared_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!shared_object_exists);
+        let shared_blob_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_blobs WHERE hash=?1)",
+                [&shared_blob_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!shared_blob_exists);
+        let pending_candidates: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM content_gc_candidates WHERE hash=?1",
+                [&shared_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_candidates, 0);
+        drop(connection);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn bounded_content_collection_can_drain_a_candidate_backlog() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        let values = (0..300)
+            .map(|index| {
+                (
+                    format!("item-{index}"),
+                    Value::String(format!("unique content {index} ").repeat(500)),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        store
+            .save_sections(CURRENT_SCHEMA_VERSION, &[("bulk", Value::Object(values))])
+            .unwrap();
+        store
+            .save_sections(CURRENT_SCHEMA_VERSION, &[("bulk", serde_json::json!({}))])
+            .unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let before_collection: i64 = connection
+            .query_row("SELECT COUNT(*) FROM content_gc_candidates", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(before_collection > 0);
+
+        store.collect_garbage(512).unwrap();
+        let (objects, blobs, candidates): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM content_objects),
+                        (SELECT COUNT(*) FROM content_blobs),
+                        (SELECT COUNT(*) FROM content_gc_candidates)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((objects, blobs, candidates), (0, 0, 0));
+        assert!(store.collect_garbage(0).is_err());
+        drop(connection);
+        drop(store);
         fs::remove_file(path).unwrap();
     }
 
