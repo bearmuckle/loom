@@ -131,27 +131,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_bytes = fs::metadata(&path)?.len();
     drop(persistence);
 
+    let target_session = session_ids
+        .first()
+        .copied()
+        .unwrap_or_else(AgentSessionId::new);
     let mut startup_samples = Vec::with_capacity(5);
-    let mut feed_samples = Vec::with_capacity(5);
+    let mut stream_samples = Vec::with_capacity(5);
+    let mut full_feed_samples = Vec::with_capacity(5);
     for _ in 0..5 {
         let fresh_handle = FilePersistence::open(&path)?;
         let started = Instant::now();
         let loaded_sessions = fresh_handle.load_sessions()?.ok_or("missing sessions")?;
         let active_runs = fresh_handle.load_active_run_summaries()?;
+        let feed_header = fresh_handle.load_feed_header()?.ok_or("missing feed")?;
         startup_samples.push(started.elapsed());
-        let feed_started = Instant::now();
-        let loaded_feed = fresh_handle.load_feed_state()?.ok_or("missing feed")?;
-        feed_samples.push(feed_started.elapsed());
-        black_box((loaded_sessions, active_runs, loaded_feed));
+        let stream_started = Instant::now();
+        let stream_events = fresh_handle.load_feed_events_since(Some(target_session), None)?;
+        stream_samples.push(stream_started.elapsed());
+        let full_feed_started = Instant::now();
+        let full_feed = fresh_handle.load_feed_state()?.ok_or("missing feed")?;
+        full_feed_samples.push(full_feed_started.elapsed());
+        black_box((
+            loaded_sessions,
+            active_runs,
+            feed_header,
+            stream_events,
+            full_feed,
+        ));
     }
     startup_samples.sort_unstable();
-    feed_samples.sort_unstable();
+    stream_samples.sort_unstable();
+    full_feed_samples.sort_unstable();
 
     let lookup_handle = FilePersistence::open(&path)?;
-    let target_session = session_ids
-        .first()
-        .copied()
-        .unwrap_or_else(AgentSessionId::new);
     let mut lookup_samples = Vec::with_capacity(100);
     for _ in 0..100 {
         let started = Instant::now();
@@ -168,13 +180,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writeln!(output, "one-transaction population: {}", fmt(write_elapsed))?;
     writeln!(
         output,
-        "fresh-handle session+active-run load p50: {}",
+        "fresh-handle session+active-run+feed-header load p50: {}",
         fmt(startup_samples[2])
     )?;
     writeln!(
         output,
-        "fresh-handle reconnect feed load p50: {}",
-        fmt(feed_samples[2])
+        "fresh-handle one-session feed load p50: {}",
+        fmt(stream_samples[2])
+    )?;
+    writeln!(
+        output,
+        "full retained feed decode p50 (diagnostic): {}",
+        fmt(full_feed_samples[2])
     )?;
     writeln!(
         output,

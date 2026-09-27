@@ -25,14 +25,14 @@ use loom_protocol::{
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, types::Value as SqlValue};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 30;
-const DATABASE_SCHEMA_VERSION: u32 = 30;
+pub const CURRENT_SCHEMA_VERSION: u32 = 31;
+const DATABASE_SCHEMA_VERSION: u32 = 31;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -447,6 +447,12 @@ CREATE TABLE IF NOT EXISTS feed_events (
 ) STRICT;
 CREATE INDEX IF NOT EXISTS feed_events_by_session_sequence
     ON feed_events(session_id, sequence);
+CREATE TABLE IF NOT EXISTS feed_session_meta (
+    session_id BLOB PRIMARY KEY NOT NULL CHECK(length(session_id) = 16),
+    first_sequence INTEGER NOT NULL CHECK(first_sequence > 0),
+    latest_sequence INTEGER NOT NULL CHECK(latest_sequence >= first_sequence),
+    pruned_through INTEGER NOT NULL CHECK(pruned_through >= 0)
+) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS section_meta (
     name TEXT PRIMARY KEY NOT NULL,
     schema_version INTEGER NOT NULL
@@ -874,6 +880,20 @@ pub struct DurableFeedState {
     pub next_sequence: EventSequence,
     pub retention_limit: usize,
     pub events: Vec<ServerEventEnvelope>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DurableFeedHeader {
+    pub next_sequence: EventSequence,
+    pub retention_limit: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DurableFeedSessionCursor {
+    pub first_sequence: EventSequence,
+    pub latest_sequence: EventSequence,
+    pub pruned_through: EventSequence,
+    pub oldest_retained_sequence: Option<EventSequence>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3744,6 +3764,180 @@ impl FilePersistence {
             retention_limit,
             events,
         }))
+    }
+
+    /// Loads only the global feed cursor metadata for startup.
+    pub fn load_feed_header(&self) -> Result<Option<DurableFeedHeader>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let meta = connection
+            .query_row(
+                "SELECT next_sequence, retention_limit FROM feed_store_meta WHERE singleton=1",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not read event feed header: {error}"), true)
+            })?;
+        meta.map(|(next_sequence, retention_limit)| {
+            Ok(DurableFeedHeader {
+                next_sequence: EventSequence::new(decode_counter(next_sequence, "event cursor")?),
+                retention_limit: usize::try_from(retention_limit).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted event retention is invalid",
+                        false,
+                    )
+                })?,
+            })
+        })
+        .transpose()
+    }
+
+    /// Loads lightweight retained-boundary metadata for one session stream.
+    pub fn load_feed_session_cursor(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Option<DurableFeedSessionCursor>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let cursor = connection
+            .query_row(
+                "SELECT first_sequence, latest_sequence, pruned_through,
+                        (SELECT MIN(sequence) FROM feed_events WHERE session_id=?1)
+                 FROM feed_session_meta WHERE session_id=?1",
+                [session_id.as_uuid().as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not read session feed cursor: {error}"), true)
+            })?;
+        cursor
+            .map(|(first, latest, pruned, oldest)| {
+                Ok(DurableFeedSessionCursor {
+                    first_sequence: EventSequence::new(decode_counter(
+                        first,
+                        "first event sequence",
+                    )?),
+                    latest_sequence: EventSequence::new(decode_counter(
+                        latest,
+                        "latest event sequence",
+                    )?),
+                    pruned_through: EventSequence::new(decode_counter(
+                        pruned,
+                        "pruned event sequence",
+                    )?),
+                    oldest_retained_sequence: oldest
+                        .map(|sequence| decode_counter(sequence, "oldest event sequence"))
+                        .transpose()?
+                        .map(EventSequence::new),
+                })
+            })
+            .transpose()
+    }
+
+    /// Loads a session's retained events after a cursor without hydrating other streams.
+    pub fn load_feed_events_since(
+        &self,
+        session_id: Option<AgentSessionId>,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        self.load_feed_events_query(session_id, after_sequence, None, false)
+    }
+
+    /// Loads a bounded tail of one session's retained events.
+    pub fn load_recent_feed_events(
+        &self,
+        session_id: AgentSessionId,
+        limit: usize,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        self.load_feed_events_query(Some(session_id), None, Some(limit), true)
+    }
+
+    fn load_feed_events_query(
+        &self,
+        session_id: Option<AgentSessionId>,
+        after_sequence: Option<EventSequence>,
+        limit: Option<usize>,
+        descending: bool,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        if !self.path.exists() || limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let limit = limit
+            .map(|limit| {
+                i64::try_from(limit).map_err(|_| {
+                    LoomError::invalid_request("event feed limit exceeds SQLite's integer range")
+                })
+            })
+            .transpose()?
+            .unwrap_or(-1);
+        let connection = self.connection()?;
+        let mut bindings = Vec::with_capacity(3);
+        let mut predicates = Vec::with_capacity(2);
+        if let Some(session_id) = session_id {
+            bindings.push(SqlValue::Blob(session_id.as_uuid().as_bytes().to_vec()));
+            predicates.push(format!("session_id=?{}", bindings.len()));
+        }
+        if let Some(sequence) = after_sequence {
+            let sequence = i64::try_from(sequence.value()).map_err(|_| {
+                LoomError::invalid_request("event cursor exceeds SQLite's integer range")
+            })?;
+            bindings.push(SqlValue::Integer(sequence));
+            predicates.push(format!("sequence>?{}", bindings.len()));
+        }
+        let where_clause = if predicates.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", predicates.join(" AND "))
+        };
+        bindings.push(SqlValue::Integer(limit));
+        let ordering = if descending { "DESC" } else { "ASC" };
+        let sql = format!(
+            "SELECT sequence, session_id, payload_codec, payload FROM feed_events
+             {where_clause} ORDER BY sequence {ordering} LIMIT ?{}",
+            bindings.len()
+        );
+        let mut statement = connection.prepare(&sql).map_err(|error| {
+            persistence_error(format!("could not prepare event feed page: {error}"), true)
+        })?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(bindings.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read event feed page: {error}"), true)
+            })?;
+        let mut events = rows
+            .map(|row| {
+                let (sequence, session_id, codec, payload) = row.map_err(|error| {
+                    persistence_error(format!("could not read event feed row: {error}"), true)
+                })?;
+                decode_feed_event(sequence, session_id, codec, payload)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if descending {
+            events.reverse();
+        }
+        Ok(events)
     }
 
     /// Persists typed session rows and the remaining bounded state snapshot atomically.
@@ -7632,7 +7826,54 @@ fn save_feed_rows(transaction: &Transaction<'_>, feed: &DurableFeedState) -> Res
             .map_err(|error| {
                 persistence_error(format!("could not save event feed entry: {error}"), true)
             })?;
+        transaction
+            .execute(
+                "INSERT INTO feed_session_meta(
+                    session_id, first_sequence, latest_sequence, pruned_through
+                 ) VALUES (?1, ?2, ?2, 0)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    latest_sequence=MAX(feed_session_meta.latest_sequence, excluded.latest_sequence)",
+                params![
+                    event.session_id.as_uuid().as_bytes().as_slice(),
+                    sequence
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save session feed cursor: {error}"), true)
+            })?;
     }
+    transaction
+        .execute(
+            "WITH ranked AS (
+                SELECT sequence, session_id,
+                       SUM(length(payload)) OVER (
+                           PARTITION BY session_id ORDER BY sequence DESC
+                       ) AS retained_bytes,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY session_id ORDER BY sequence DESC
+                       ) AS stream_position
+                FROM feed_events
+             ), pruned AS (
+                SELECT session_id, MAX(sequence) AS pruned_through
+                FROM ranked
+                WHERE retained_bytes > ?1 OR stream_position > ?2
+                GROUP BY session_id
+             )
+             UPDATE feed_session_meta
+             SET pruned_through=MAX(
+                    pruned_through,
+                    (SELECT pruned.pruned_through FROM pruned
+                     WHERE pruned.session_id=feed_session_meta.session_id)
+                 )
+             WHERE session_id IN (SELECT session_id FROM pruned)",
+            params![MAX_DURABLE_FEED_SESSION_BYTES as i64, retention_limit],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not update pruned feed cursors: {error}"),
+                true,
+            )
+        })?;
     transaction
         .execute(
             "INSERT INTO feed_store_meta(singleton, next_sequence, retention_limit)
@@ -7669,6 +7910,62 @@ fn save_feed_rows(transaction: &Transaction<'_>, feed: &DurableFeedState) -> Res
         )
         .map_err(|error| persistence_error(format!("could not prune event feed: {error}"), true))?;
     Ok(())
+}
+
+fn decode_feed_event(
+    sequence: i64,
+    session_id: Vec<u8>,
+    payload_codec: i64,
+    payload: Vec<u8>,
+) -> Result<ServerEventEnvelope> {
+    let payload = match payload_codec {
+        0 => payload,
+        1 => {
+            let mut decoded = Vec::new();
+            ZlibDecoder::new(payload.as_slice())
+                .take(MAX_FEED_EVENT_BYTES as u64 + 1)
+                .read_to_end(&mut decoded)
+                .map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted event feed entry is malformed: {error}"),
+                        false,
+                    )
+                })?;
+            decoded
+        }
+        _ => {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted event feed entry uses an unsupported codec",
+                false,
+            ));
+        }
+    };
+    if sequence <= 0 || payload.len() > MAX_FEED_EVENT_BYTES {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted event feed entry exceeds its supported size or sequence range",
+            false,
+        ));
+    }
+    let event: ServerEventEnvelope = serde_json::from_slice(&payload).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted event feed entry is malformed: {error}"),
+            false,
+        )
+    })?;
+    if event.sequence.value() != sequence as u64
+        || event.session_id.as_uuid().as_bytes().as_slice() != session_id.as_slice()
+    {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted event feed index does not match its payload",
+            false,
+        ));
+    }
+    Ok(event)
 }
 
 fn session_state_name(state: AgentSessionState) -> &'static str {
@@ -8180,6 +8477,44 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 0);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn previous_database_version_is_rejected_without_schema_changes() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=30;")
+            .unwrap();
+        let original_journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        drop(connection);
+
+        let store = FilePersistence::open(&path).unwrap();
+        assert_eq!(
+            store.load_feed_header().unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let has_feed_meta: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='feed_session_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 30);
+        assert_eq!(journal_mode, original_journal_mode);
+        assert!(!has_feed_meta);
         fs::remove_file(path).unwrap();
     }
 
@@ -10220,6 +10555,26 @@ mod tests {
                 &[],
             )
             .unwrap();
+        let header = store.load_feed_header().unwrap().unwrap();
+        assert_eq!(header.next_sequence, EventSequence::new(4));
+        assert_eq!(header.retention_limit, 2);
+        let first_cursor = store.load_feed_session_cursor(session_id).unwrap().unwrap();
+        assert_eq!(first_cursor.first_sequence, EventSequence::new(1));
+        assert_eq!(first_cursor.latest_sequence, EventSequence::new(4));
+        assert_eq!(first_cursor.pruned_through, EventSequence::new(1));
+        assert_eq!(
+            first_cursor.oldest_retained_sequence,
+            Some(EventSequence::new(3))
+        );
+        assert_eq!(
+            store
+                .load_feed_events_since(Some(session_id), Some(EventSequence::new(2)))
+                .unwrap()
+                .iter()
+                .map(|event| event.sequence.value())
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
         let loaded = store.load_feed_state().unwrap().unwrap();
         assert_eq!(loaded.next_sequence, EventSequence::new(4));
         assert_eq!(loaded.retention_limit, 2);

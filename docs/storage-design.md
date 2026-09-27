@@ -7,8 +7,10 @@ indexed rows. Runtime details and filesystem snapshots are loaded on demand.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at the
-global high-water mark. Cursor epochs and fully stream-scoped cursors remain
-unfinished; aggregate retained feed size grows with the number of sessions.
+global high-water mark. Startup loads only the feed header; event payloads and
+per-session retained-boundary metadata load on demand. Cursor epochs and fully
+stream-scoped cursors remain unfinished; aggregate retained feed size grows with
+the number of sessions.
 Message role, run/session ownership, order, tool-call metadata, and content
 references are stored separately from runtime execution state; in-flight
 assistant text is persisted as append-only, content-addressed fragments. A

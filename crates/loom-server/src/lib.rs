@@ -18,9 +18,10 @@ use loom_core::{
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableFilesystemEdit, DurableFilesystemRecord,
-    DurableIdempotencyRecord, DurableProviderState, DurableRunContextCheckpoint, DurableRunMessage,
-    DurableRunSummary, DurableSessionSettings, DurableStateWrite, FilePersistence,
+    CURRENT_SCHEMA_VERSION, DurableFeedSessionCursor, DurableFeedState, DurableFilesystemEdit,
+    DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
+    DurableRunContextCheckpoint, DurableRunMessage, DurableRunSummary, DurableSessionSettings,
+    DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -605,7 +606,7 @@ impl EventJournal {
             return false;
         };
         let Some(oldest) = self.oldest_event(session_id) else {
-            return after_sequence < self.next_sequence;
+            return false;
         };
         if after_sequence.next() >= oldest.sequence {
             return false;
@@ -658,6 +659,14 @@ impl EventJournal {
 
 fn default_event_retention() -> usize {
     DEFAULT_EVENT_RETENTION
+}
+
+fn deduplicate_events(events: Vec<ServerEventEnvelope>) -> Vec<ServerEventEnvelope> {
+    let mut by_sequence = BTreeMap::new();
+    for event in events {
+        by_sequence.insert(event.sequence.value(), event);
+    }
+    by_sequence.into_values().collect()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2229,10 +2238,10 @@ impl InProcessBackend {
             sessions,
             workspace_records: persistence.load_workspaces()?.unwrap_or_default(),
             journal: persistence
-                .load_feed_state()?
+                .load_feed_header()?
                 .map(|feed| EventJournal {
                     next_sequence: feed.next_sequence,
-                    events: feed.events,
+                    events: Vec::new(),
                     pending_events: Vec::new(),
                     retention_limit: feed.retention_limit,
                 })
@@ -2259,7 +2268,7 @@ impl InProcessBackend {
                 .collect::<Result<BTreeMap<_, _>>>()?,
         };
         log::info!(
-            "loaded persisted catalogs and bounded feeds in {} ms",
+            "loaded persisted catalogs and feed cursors in {} ms",
             startup_started.elapsed().as_millis()
         );
         let _: Vec<ModelDescriptor> = from_json(required("models")?)?;
@@ -3193,11 +3202,7 @@ impl InProcessConnection {
             )),
             (None, None) => None,
         };
-        let latest_sequence = self
-            .backend
-            .journal()?
-            .latest_sequence(Some(session_id))
-            .unwrap_or_default();
+        let latest_sequence = self.latest_session_event_sequence(session_id)?;
         let approval_policy = self.policy(session_id)?;
         let auto_approve_actions = self.auto_approve_actions(session_id)?;
         Ok(AgentSessionSnapshotProjection {
@@ -3207,6 +3212,64 @@ impl InProcessConnection {
             approval_policy,
             auto_approve_actions,
         })
+    }
+
+    fn session_events_since(
+        &self,
+        session_id: Option<AgentSessionId>,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        let mut events = match &self.backend.persistence {
+            Some(persistence) => persistence.load_feed_events_since(session_id, after_sequence)?,
+            None => Vec::new(),
+        };
+        events.extend(
+            self.backend
+                .journal()?
+                .events_since(session_id, after_sequence),
+        );
+        Ok(deduplicate_events(events))
+    }
+
+    fn recent_session_events(
+        &self,
+        session_id: AgentSessionId,
+        limit: usize,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        let mut events = match &self.backend.persistence {
+            Some(persistence) => persistence.load_recent_feed_events(session_id, limit)?,
+            None => Vec::new(),
+        };
+        events.extend(self.backend.journal()?.recent_events(session_id, limit));
+        let mut events = deduplicate_events(events);
+        let excess = events.len().saturating_sub(limit);
+        if excess > 0 {
+            events.drain(..excess);
+        }
+        Ok(events)
+    }
+
+    fn feed_session_cursor(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<Option<DurableFeedSessionCursor>> {
+        self.backend
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.load_feed_session_cursor(session_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn latest_session_event_sequence(&self, session_id: AgentSessionId) -> Result<EventSequence> {
+        if let Some(cursor) = self.feed_session_cursor(session_id)? {
+            return Ok(cursor.latest_sequence);
+        }
+        Ok(self
+            .backend
+            .journal()?
+            .latest_sequence(Some(session_id))
+            .unwrap_or_default())
     }
 
     fn create_workspace(&self, name: String) -> Result<WorkspaceRecord> {
@@ -4027,35 +4090,51 @@ impl InProcessConnection {
                 session_id,
                 after_sequence,
             } => {
+                let events = self.session_events_since(session_id, after_sequence)?;
                 let journal = self.backend.journal()?;
-                let events = journal.events_since(session_id, after_sequence);
                 let history_missing = session_id.is_some()
                     && after_sequence.is_none()
                     && !events.iter().any(|event| {
                         matches!(
                             &event.event,
                             loom_protocol::ServerEvent::AgentSessionCreated { .. }
+                                | loom_protocol::ServerEvent::AgentSessionForked { .. }
                         )
                     });
-                if let Some(session_id) = session_id
-                    && (journal.is_cursor_stale(Some(session_id), after_sequence)
-                        || history_missing)
-                {
-                    return Ok(ServerResponse::SessionEventsSnapshot {
-                        session: self.backend.sessions()?.get(session_id)?,
-                        events,
-                        oldest_sequence: journal
-                            .oldest_sequence(Some(session_id))
-                            .unwrap_or_else(|| journal.next_sequence.next()),
-                        latest_sequence: journal.next_sequence,
-                    });
+                if let Some(session_id) = session_id {
+                    let durable_cursor = self.feed_session_cursor(session_id)?;
+                    let cursor_stale = match (durable_cursor, after_sequence) {
+                        (Some(cursor), Some(after)) => {
+                            after < cursor.pruned_through
+                                || after > cursor.latest_sequence
+                                    && journal.is_cursor_stale(Some(session_id), after_sequence)
+                        }
+                        (None, _) => journal.is_cursor_stale(Some(session_id), after_sequence),
+                        (_, None) => false,
+                    };
+                    if cursor_stale || history_missing {
+                        let oldest_sequence = durable_cursor
+                            .and_then(|cursor| cursor.oldest_retained_sequence)
+                            .or_else(|| journal.oldest_sequence(Some(session_id)))
+                            .or_else(|| {
+                                durable_cursor
+                                    .filter(|cursor| cursor.pruned_through.value() > 0)
+                                    .map(|cursor| cursor.pruned_through.next())
+                            })
+                            .unwrap_or_else(|| journal.next_sequence.next());
+                        return Ok(ServerResponse::SessionEventsSnapshot {
+                            session: self.backend.sessions()?.get(session_id)?,
+                            events,
+                            oldest_sequence,
+                            latest_sequence: journal.next_sequence,
+                        });
+                    }
                 }
                 Ok(ServerResponse::SessionEvents { events })
             }
             ClientRequest::GetRecentSessionEvents { session_id, limit } => {
-                let journal = self.backend.journal()?;
                 Ok(ServerResponse::SessionEvents {
-                    events: journal.recent_events(session_id, limit as usize),
+                    events: self.recent_session_events(session_id, limit as usize)?,
                 })
             }
             ClientRequest::StartSessionAgentRun {
@@ -7451,6 +7530,7 @@ mod tests {
         assert!(persistence.is_file());
 
         let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+        assert!(backend.journal().unwrap().events.is_empty());
         let connection = backend.connect();
         negotiate_m3(&connection);
         let recovered_session = connection.request(RequestEnvelope::new(
@@ -8983,6 +9063,79 @@ mod tests {
             first.result,
             Ok(ServerResponse::AgentSessionCreated(_))
         ));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
+        let path = std::env::temp_dir().join(format!("loom-server-feed-{}.db", WorkspaceId::new()));
+        let (session_id, session_root_base) = {
+            let backend = InProcessBackend::new_persistent(&path).unwrap();
+            backend.set_event_retention(1).unwrap();
+            let connection = backend.connect();
+            negotiate(&connection);
+            let workspace =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Lazy feed workspace".to_owned(),
+                }));
+            let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+                panic!("unexpected workspace response");
+            };
+            let created = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Lazy feed session".to_owned(),
+                },
+            ));
+            let ServerResponse::AgentSessionCreated(session) = created.result.unwrap() else {
+                panic!("unexpected session response");
+            };
+            for name in ["renamed once", "renamed twice"] {
+                connection
+                    .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                        session_id: session.id,
+                        name: name.to_owned(),
+                    }))
+                    .result
+                    .unwrap();
+            }
+            backend.flush().unwrap();
+            (session.id, backend.session_root_base.clone())
+        };
+
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        assert!(backend.journal().unwrap().events.is_empty());
+        let connection = backend.connect();
+        negotiate(&connection);
+        let stale = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            after_sequence: Some(EventSequence::new(1)),
+        }));
+        let ServerResponse::SessionEventsSnapshot {
+            events,
+            oldest_sequence,
+            latest_sequence,
+            ..
+        } = stale.result.unwrap()
+        else {
+            panic!("expected a stale-cursor snapshot");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, EventSequence::new(3));
+        assert_eq!(oldest_sequence, EventSequence::new(3));
+        assert_eq!(latest_sequence, EventSequence::new(3));
+
+        let current = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            after_sequence: Some(EventSequence::new(2)),
+        }));
+        let ServerResponse::SessionEvents { events } = current.result.unwrap() else {
+            panic!("expected retained session events");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].sequence, EventSequence::new(3));
+
+        fs::remove_dir_all(session_root_base).unwrap();
         fs::remove_file(path).unwrap();
     }
 

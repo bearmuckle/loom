@@ -158,23 +158,24 @@ Sources: [server](../crates/loom-server/src/lib.rs), `restore_persisted`;
 `cargo bench -p loom-persistence --bench sqlite_scale --locked --offline`
 builds a clean database with 10,000 sessions and 10,000 typed run summaries,
 plus one durable session-created reconnect event per session. It reports
-transaction population time, fresh-handle catalog/active-run loading, fresh
-reconnect-feed decoding, indexed per-session run lookup latency, and database
-size. Set `LOOM_SCALE_SESSIONS` and `LOOM_SCALE_RUNS` to vary the fixture. On
-this worktree, optimized runs produced:
+transaction population time, startup-style fresh-handle catalog/active-run/feed
+header loading, one-session feed reads, a full-feed decoding diagnostic, indexed
+per-session run lookup latency, and database size. Set `LOOM_SCALE_SESSIONS` and
+`LOOM_SCALE_RUNS` to vary the fixture. On this worktree, optimized runs produced:
 
-| Sessions / runs / feed events | Database size | Population | Catalog + active summaries p50 | Feed restore p50 | Per-session run query p50 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 10,000 / 10,000 / 10,000 | 11,268,096 bytes | 1,847 ms | 6.544 ms | 60.104 ms | 0.015 ms |
-| 20,000 / 20,000 / 20,000 | 22,138,880 bytes | 4,220 ms | 13.190 ms | 129.918 ms | 0.014 ms |
+| Sessions / runs / feed events | Database size | Population | Catalog + active + feed header p50 | One-session feed read p50 | Full-feed decode p50 | Per-session run query p50 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,000 / 10,000 / 10,000 | 11,575,296 bytes | 1,937 ms | 7.274 ms | 0.047 ms | 59.384 ms | 0.015 ms |
+| 20,000 / 20,000 / 20,000 | 22,753,280 bytes | 4,368 ms | 11.972 ms | 0.049 ms | 128.945 ms | 0.014 ms |
 
-The per-session run lookup stayed flat, while reconnect-feed restoration grew
-approximately with event count because startup currently decodes the complete
-retained feed. These small session-created events do not represent large activity
-or output events. The fixture omits runtime payloads, transcripts, filesystem
-snapshots, and UI initialization, so it is still a store component benchmark,
-not full startup. The 100 MB / 10 GB acceptance targets and before/after
-comparison against the previous storage model remain to be measured.
+The per-session run lookup and one-session feed read stayed flat. Startup now
+loads only the small feed header; a diagnostic full-feed decode still grows
+approximately with event count, but it is no longer on the restore path. The
+fixture uses small session-created events rather than large activity or output
+payloads and omits runtime payloads, transcripts, filesystem snapshots, and UI
+initialization. It remains a store component benchmark, not full startup. The
+100 MB / 10 GB acceptance targets and before/after comparison against the
+previous storage model remain to be measured.
 
 ## Saves scale with all retained history
 
