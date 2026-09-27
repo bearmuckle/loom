@@ -8735,6 +8735,7 @@ mod tests {
             let settled = await_settled_run(&connection, run_id);
             assert_eq!(settled.state, AgentRunState::Completed);
             backend.flush().unwrap();
+            backend.shutdown().unwrap();
             (run_id, session_root_base)
         };
 
