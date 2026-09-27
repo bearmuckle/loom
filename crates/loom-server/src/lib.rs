@@ -6079,6 +6079,70 @@ mod tests {
     }
 
     #[test]
+    fn idempotency_cache_keeps_uuidv7_horizon_and_bounds_uuidv4_compatibility() {
+        let now = Timestamp::now();
+        let mut current = BTreeMap::new();
+        for _ in 0..LEGACY_IDEMPOTENCY_RETENTION + 1 {
+            let request_id = RequestId::new();
+            current.insert(
+                request_id,
+                IdempotencyRecord {
+                    created_at: now,
+                    expires_at: request_id.issued_at_unix_millis().map(|issued_at| {
+                        Timestamp::from_unix_millis(
+                            issued_at + IDEMPOTENCY_RETENTION.as_millis() as u64,
+                        )
+                    }),
+                    request: ClientRequest::ListWorkspaces,
+                    response: ResponseEnvelope::success(
+                        request_id,
+                        ServerResponse::WorkspaceConfigUpdated,
+                    ),
+                },
+            );
+        }
+        let expired_id = request_id_with_issued_at(
+            now.as_unix_millis()
+                .saturating_sub(IDEMPOTENCY_RETENTION.as_millis() as u64)
+                .saturating_sub(1),
+        );
+        current.insert(
+            expired_id,
+            IdempotencyRecord {
+                created_at: now,
+                expires_at: Some(now),
+                request: ClientRequest::ListWorkspaces,
+                response: ResponseEnvelope::success(
+                    expired_id,
+                    ServerResponse::WorkspaceConfigUpdated,
+                ),
+            },
+        );
+        trim_idempotency_cache(&mut current);
+        assert_eq!(current.len(), LEGACY_IDEMPOTENCY_RETENTION + 1);
+        assert!(!current.contains_key(&expired_id));
+
+        let mut legacy = BTreeMap::new();
+        for _ in 0..LEGACY_IDEMPOTENCY_RETENTION + 1 {
+            let request_id = RequestId::from_uuid(uuid::Uuid::new_v4());
+            legacy.insert(
+                request_id,
+                IdempotencyRecord {
+                    created_at: now,
+                    expires_at: None,
+                    request: ClientRequest::ListWorkspaces,
+                    response: ResponseEnvelope::success(
+                        request_id,
+                        ServerResponse::WorkspaceConfigUpdated,
+                    ),
+                },
+            );
+        }
+        trim_idempotency_cache(&mut legacy);
+        assert_eq!(legacy.len(), LEGACY_IDEMPOTENCY_RETENTION);
+    }
+
+    #[test]
     fn resumable_runs_without_pending_tool_intent_are_deferred_on_restore() {
         for state in [
             AgentRunState::Planning,
