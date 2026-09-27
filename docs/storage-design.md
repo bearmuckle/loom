@@ -407,20 +407,19 @@ limit prunes the globally oldest retained events first; each affected session's
 pruned-through cursor is advanced transactionally, so reconnect requests detect
 the gap and request an authoritative snapshot. Pending durable notifications are
 pruned to the same per-session event count. It keeps global sequence numbers and
-full event payloads. Initial projection reads use before/after sequence checks;
-event reads report no cursor later than the read cursor or latest included event.
+full event payloads. Initial projection reads load the persisted run projection
+and feed cursor from one deferred SQLite read transaction, then retain the
+before/after sequence fence for process-local session/run state and journal
+events. Event reads report no cursor later than the read cursor or latest
+included event.
 Clients request a fresh initial state when retention invalidates the first cursor.
 Session cursors now include a backend-instance epoch and a mismatch returns an
 authoritative snapshot. Workspace-scoped reads use that epoch and a materialized
 workspace index over the same global sequence, with workspace-specific pruning
 boundaries. They aggregate session-addressed events and stale snapshots include
 the current session catalog. Workspace-only changes such as renames or config
-updates do not yet emit feed rows. Snapshot projection still checks its sequence
-before and after reading, then fetches events from that cursor; this closes the
-ordinary snapshot/subscription gap but is not a single database read transaction.
-Global pressure may expire a quiet session's entire retained feed. Compact
-revision notifications and transactionally captured snapshot cursors remain
-target work.
+updates do not yet emit feed rows. Global pressure may expire a quiet session's
+entire retained feed. Compact revision notifications remain target work.
 
 An expired cursor returns `ResyncRequired`, followed by an authoritative snapshot
 with a fresh cursor read in the same SQLite read transaction. Subscribe after that
@@ -623,10 +622,11 @@ Implement in this order:
    hydrating retained history, but its request refresh still polls the selected
    filesystem service for external changes.
 5. Finish scoped feeds, retention policy, and storage maintenance. Session and
-   workspace streams now use indexed durable cursors; capture the snapshot and
-   its cursor transactionally, and add workspace-only change notifications.
-   Define the cadence for queued content-GC candidates and remove section
-   exports and mirrored in-memory journals completely.
+   workspace streams now use indexed durable cursors, and persisted session
+   projections are captured with their cursor in one read transaction. Add
+   workspace-only change notifications. Define the cadence for queued content-GC
+   candidates and remove section exports and mirrored in-memory journals
+   completely.
 
 This release has a clean start only. It does not copy, import, rename, or remove
 an existing state database. When the configured path contains an unsupported

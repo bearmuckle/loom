@@ -1188,6 +1188,22 @@ pub struct DurableRunContextCheckpoint {
     pub summary: ContextSummary,
 }
 
+/// Persisted inputs used to hydrate the latest run during a session bootstrap.
+/// All fields are read from the same SQLite snapshot; process-local state and
+/// journal events are intentionally handled by the server separately.
+#[derive(Clone, Debug)]
+pub struct DurableSessionProjectionRead {
+    pub latest_run: Option<DurableRunSummary>,
+    pub runtime_config: Option<DurableRunRuntimeConfig>,
+    pub execution_state: Option<AgentExecutionStateRecord>,
+    pub plan: AgentPlan,
+    pub context_checkpoint: Option<DurableRunContextCheckpoint>,
+    pub activities: Vec<AgentActivityRecord>,
+    pub attempts: Vec<AgentRunAttemptRecord>,
+    pub interactions: Vec<AgentInteractionRecord>,
+    pub latest_sequence: Option<EventSequence>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableRunMessage {
     pub role: loom_model::MessageRole,
@@ -2083,6 +2099,13 @@ impl FilePersistence {
             return Ok(None);
         }
         let connection = self.connection()?;
+        Self::load_run_context_checkpoint_on(&connection, run_id)
+    }
+
+    fn load_run_context_checkpoint_on(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<Option<DurableRunContextCheckpoint>> {
         let row = connection
             .query_row(
                 "SELECT session_id, summary_hash, source_message_count,
@@ -2130,14 +2153,14 @@ impl FilePersistence {
                     )
                 },
             )?;
-        let summary = String::from_utf8(decode_content(&connection, &summary_hash)?.into_bytes())
+        let summary = String::from_utf8(decode_content(connection, &summary_hash)?.into_bytes())
             .map_err(|error| {
-            LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!("persisted context summary is not UTF-8: {error}"),
-                false,
-            )
-        })?;
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted context summary is not UTF-8: {error}"),
+                    false,
+                )
+            })?;
         Ok(Some(DurableRunContextCheckpoint {
             session_id: AgentSessionId::from_uuid(decode_uuid(&session_id, "context session id")?),
             summary: ContextSummary {
@@ -2163,6 +2186,109 @@ impl FilePersistence {
             )?
             .into_values()
             .next())
+    }
+
+    /// Reads the persisted latest-run bootstrap inputs and feed cursor from a
+    /// single deferred SQLite read transaction. Live handles and the in-memory
+    /// journal remain server-owned overlays and are not part of this snapshot.
+    pub fn load_session_projection_read(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<DurableSessionProjectionRead> {
+        self.load_session_projection_read_between(session_id, || Ok(()))
+    }
+
+    fn load_session_projection_read_between<F>(
+        &self,
+        session_id: AgentSessionId,
+        between_reads: F,
+    ) -> Result<DurableSessionProjectionRead>
+    where
+        F: FnOnce() -> Result<()>,
+    {
+        if !self.path.exists() {
+            return Ok(DurableSessionProjectionRead {
+                latest_run: None,
+                runtime_config: None,
+                execution_state: None,
+                plan: AgentPlan { steps: Vec::new() },
+                context_checkpoint: None,
+                activities: Vec::new(),
+                attempts: Vec::new(),
+                interactions: Vec::new(),
+                latest_sequence: None,
+            });
+        }
+        let connection = self.connection()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin session projection read: {error}"),
+                true,
+            )
+        })?;
+        // The first SELECT establishes the deferred transaction's read snapshot.
+        let latest_sequence = Self::load_feed_session_cursor_on(&transaction, session_id)?
+            .map(|cursor| cursor.latest_sequence);
+        between_reads()?;
+        let latest_run = Self::load_run_summaries_matching_on(
+            &transaction,
+            "WHERE session_id=?1",
+            [session_id.as_uuid().as_bytes().as_slice()],
+            "LIMIT 1",
+        )?
+        .into_values()
+        // The shared query applies ORDER BY updated_at DESC, run_id DESC before
+        // LIMIT 1, so this is the same deterministic latest-run selection as
+        // `load_latest_run_summary_for_session`.
+        .next();
+        let (
+            runtime_config,
+            execution_state,
+            plan,
+            context_checkpoint,
+            activities,
+            attempts,
+            interactions,
+        ) = if let Some(summary) = latest_run.as_ref() {
+            (
+                Self::load_run_runtime_config_on(&transaction, summary.snapshot.id)?,
+                Self::load_run_execution_state_on(&transaction, summary.snapshot.id)?,
+                Self::load_run_plan_on(&transaction, summary.snapshot.id)?,
+                Self::load_run_context_checkpoint_on(&transaction, summary.snapshot.id)?,
+                Self::load_run_activities_on(&transaction, summary.snapshot.id)?,
+                Self::load_run_attempts_on(&transaction, summary.snapshot.id)?,
+                Self::load_run_interactions_on(&transaction, summary.snapshot.id)?,
+            )
+        } else {
+            (
+                None,
+                None,
+                AgentPlan { steps: Vec::new() },
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        // These columns are part of the bootstrap projection and must be
+        // present in the same snapshot as the run and cursor.
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not finish session projection read: {error}"),
+                true,
+            )
+        })?;
+        Ok(DurableSessionProjectionRead {
+            latest_run,
+            runtime_config,
+            execution_state,
+            plan,
+            context_checkpoint,
+            activities,
+            attempts,
+            interactions,
+            latest_sequence,
+        })
     }
 
     /// Aggregates typed per-run usage in SQLite, optionally excluding runs whose
@@ -2234,6 +2360,10 @@ impl FilePersistence {
             return Ok(AgentPlan { steps: Vec::new() });
         }
         let connection = self.connection()?;
+        Self::load_run_plan_on(&connection, run_id)
+    }
+
+    fn load_run_plan_on(connection: &Connection, run_id: RunId) -> Result<AgentPlan> {
         let mut statement = connection
             .prepare(
                 "SELECT step_id, description FROM run_plan_steps WHERE run_id=?1 ORDER BY ordinal",
@@ -2268,6 +2398,13 @@ impl FilePersistence {
             return Ok(None);
         }
         let connection = self.connection()?;
+        Self::load_run_runtime_config_on(&connection, run_id)
+    }
+
+    fn load_run_runtime_config_on(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<Option<DurableRunRuntimeConfig>> {
         let row = connection
             .query_row(
                 "SELECT system_instructions_hash, repository_instructions_hash,
@@ -2338,11 +2475,11 @@ impl FilePersistence {
                 Ok(DurableRunRuntimeConfig {
                     system_instructions: system
                         .as_deref()
-                        .map(|hash| decode_content(&connection, hash))
+                        .map(|hash| decode_content(connection, hash))
                         .transpose()?,
                     repository_instructions: repository
                         .as_deref()
-                        .map(|hash| decode_content(&connection, hash))
+                        .map(|hash| decode_content(connection, hash))
                         .transpose()?,
                     approval_policy: ApprovalPolicy {
                         read: decode_policy_decision(&policy_read, "read")?,
@@ -2409,6 +2546,15 @@ impl FilePersistence {
             return Ok(BTreeMap::new());
         }
         let connection = self.connection()?;
+        Self::load_run_summaries_matching_on(&connection, predicate, params, limit)
+    }
+
+    fn load_run_summaries_matching_on<P: rusqlite::Params>(
+        connection: &Connection,
+        predicate: &str,
+        params: P,
+        limit: &str,
+    ) -> Result<BTreeMap<RunId, DurableRunSummary>> {
         let mut statement = connection
             .prepare(&format!(
                 "SELECT run_id, session_id, attempt_id, control_revision, state, started_at, updated_at, completed_at,
@@ -2512,7 +2658,7 @@ impl FilePersistence {
             );
         }
         drop(statement);
-        let evidence = load_run_evidence_rows(&connection, summaries.keys().copied())?;
+        let evidence = load_run_evidence_rows(connection, summaries.keys().copied())?;
         for (run_id, links) in evidence {
             if let Some(summary) = summaries.get_mut(&run_id) {
                 summary.snapshot.evidence = links;
@@ -2527,6 +2673,13 @@ impl FilePersistence {
             return Ok(Vec::new());
         }
         let connection = self.connection()?;
+        Self::load_run_attempts_on(&connection, run_id)
+    }
+
+    fn load_run_attempts_on(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<Vec<AgentRunAttemptRecord>> {
         let mut statement = connection
             .prepare(
                 "SELECT session_id, attempt_id, attempt_number, state, checkpoint_id,
@@ -2594,6 +2747,13 @@ impl FilePersistence {
             return Ok(None);
         }
         let connection = self.connection()?;
+        Self::load_run_execution_state_on(&connection, run_id)
+    }
+
+    fn load_run_execution_state_on(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<Option<AgentExecutionStateRecord>> {
         let row = connection
             .query_row(
                 "SELECT session_id, attempt_id, control_revision, state, step_id, step_index,
@@ -2721,6 +2881,13 @@ impl FilePersistence {
             return Ok(Vec::new());
         }
         let connection = self.connection()?;
+        Self::load_run_interactions_on(&connection, run_id)
+    }
+
+    fn load_run_interactions_on(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<Vec<AgentInteractionRecord>> {
         let mut statement = connection
             .prepare(
                 "SELECT session_id, interaction_id, attempt_id, control_revision, kind, status,
@@ -2893,6 +3060,13 @@ impl FilePersistence {
             return Ok(Vec::new());
         }
         let connection = self.connection()?;
+        Self::load_run_activities_on(&connection, run_id)
+    }
+
+    fn load_run_activities_on(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<Vec<AgentActivityRecord>> {
         let mut statement = connection
             .prepare(
                 "SELECT ordinal, activity_id, parent_activity_id, step_id, tool_call_id,
@@ -2926,19 +3100,15 @@ impl FilePersistence {
                 persistence_error(format!("could not read run activity row: {error}"), true)
             })?;
         drop(statement);
-        drop(connection);
 
-        let calls = self
-            .load_run_tool_calls(run_id)?
+        let calls = Self::load_run_tool_calls_on(connection, run_id)?
             .into_iter()
             .map(|record| (record.call.id, record.call))
             .collect::<BTreeMap<_, _>>();
-        let attempts = self
-            .load_run_tool_attempts(run_id)?
+        let attempts = Self::load_run_tool_attempts_on(connection, run_id)?
             .into_iter()
             .map(|record| (record.id, record.result))
             .collect::<BTreeMap<_, _>>();
-        let connection = self.connection()?;
         let mut activities = Vec::with_capacity(rows.len());
         for (
             expected_ordinal,
@@ -2972,7 +3142,7 @@ impl FilePersistence {
                     false,
                 ));
             }
-            let data = decode_content(&connection, &data_hash)?;
+            let data = decode_content(connection, &data_hash)?;
             let data: AgentActivityData = serde_json::from_str(&data).map_err(|error| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
@@ -3030,6 +3200,13 @@ impl FilePersistence {
             return Ok(Vec::new());
         }
         let connection = self.connection()?;
+        Self::load_run_tool_calls_on(&connection, run_id)
+    }
+
+    fn load_run_tool_calls_on(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<Vec<AgentToolCallRecord>> {
         let mut statement = connection
             .prepare(
                 "SELECT session_id, tool_call_id, name, arguments_hash, created_at
@@ -3059,7 +3236,7 @@ impl FilePersistence {
         rows.into_iter()
             .map(
                 |(session_id, tool_call_id, name, arguments_hash, created_at)| {
-                    let arguments = decode_content(&connection, &arguments_hash)?;
+                    let arguments = decode_content(connection, &arguments_hash)?;
                     let arguments = serde_json::from_str(&arguments).map_err(|error| {
                         LoomError::new(
                             ErrorCode::MalformedPayload,
@@ -3094,6 +3271,13 @@ impl FilePersistence {
             return Ok(Vec::new());
         }
         let connection = self.connection()?;
+        Self::load_run_tool_attempts_on(&connection, run_id)
+    }
+
+    fn load_run_tool_attempts_on(
+        connection: &Connection,
+        run_id: RunId,
+    ) -> Result<Vec<AgentToolAttemptRecord>> {
         let mut statement = connection
             .prepare(
                 "SELECT session_id, activity_id, tool_call_id, attempt_number, state,
@@ -3145,7 +3329,7 @@ impl FilePersistence {
                 )| {
                     let result = result_hash
                         .as_deref()
-                        .map(|hash| decode_content(&connection, hash))
+                        .map(|hash| decode_content(connection, hash))
                         .transpose()?
                         .map(|json| {
                             serde_json::from_str::<ToolResult>(&json).map_err(|error| {
@@ -4346,6 +4530,13 @@ impl FilePersistence {
             return Ok(None);
         }
         let connection = self.connection()?;
+        Self::load_feed_session_cursor_on(&connection, session_id)
+    }
+
+    fn load_feed_session_cursor_on(
+        connection: &Connection,
+        session_id: AgentSessionId,
+    ) -> Result<Option<DurableFeedSessionCursor>> {
         let cursor = connection
             .query_row(
                 "SELECT first_sequence, latest_sequence, pruned_through,
@@ -9491,6 +9682,80 @@ mod tests {
     #[derive(Debug, Deserialize, PartialEq, Serialize)]
     struct Fixture {
         value: String,
+    }
+
+    #[test]
+    fn session_projection_reader_keeps_run_and_cursor_on_one_sqlite_snapshot() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        store.save_sections(CURRENT_SCHEMA_VERSION, &[]).unwrap();
+
+        let session_id = AgentSessionId::new();
+        let workspace_id = WorkspaceId::new();
+        let run_id = RunId::new();
+        let attempt_id = RunAttemptId::new();
+        {
+            let setup = Connection::open(&path).unwrap();
+            setup
+                .execute(
+                    "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'snapshot', 'idle', 1, 1)",
+                    params![
+                        session_id.as_uuid().as_bytes().as_slice(),
+                        workspace_id.as_uuid().as_bytes().as_slice()
+                    ],
+                )
+                .unwrap();
+            setup
+                .execute(
+                    "INSERT INTO run_summaries(
+                    run_id, session_id, attempt_id, control_revision, state, started_at,
+                    updated_at, completed_at, task, model, summary, input_tokens,
+                    output_tokens, cached_input_tokens, tool_calls, cost_micros, elapsed_ms
+                 ) VALUES (?1, ?2, ?3, 1, 'executing', 1, 1, NULL, 'before', 'model', NULL,
+                           0, 0, 0, 0, 0, 0)",
+                    params![
+                        run_id.as_uuid().as_bytes().as_slice(),
+                        session_id.as_uuid().as_bytes().as_slice(),
+                        attempt_id.as_uuid().as_bytes().as_slice()
+                    ],
+                )
+                .unwrap();
+            setup.execute(
+                "INSERT INTO feed_session_meta(session_id, first_sequence, latest_sequence, pruned_through)
+                 VALUES (?1, 1, 1, 0)",
+                [session_id.as_uuid().as_bytes().as_slice()],
+            ).unwrap();
+        }
+
+        let read = store
+            .load_session_projection_read_between(session_id, || {
+                let writer = Connection::open(&path).unwrap();
+                let transaction = writer.unchecked_transaction().unwrap();
+                transaction
+                    .execute(
+                        "UPDATE run_summaries SET task='after', updated_at=2 WHERE run_id=?1",
+                        [run_id.as_uuid().as_bytes().as_slice()],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "UPDATE feed_session_meta SET latest_sequence=2 WHERE session_id=?1",
+                        [session_id.as_uuid().as_bytes().as_slice()],
+                    )
+                    .unwrap();
+                transaction.commit().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(read.latest_run.as_ref().unwrap().snapshot.task, "before");
+        assert_eq!(read.latest_sequence, Some(EventSequence::new(1)));
+
+        let fresh = store.load_session_projection_read(session_id).unwrap();
+        assert_eq!(fresh.latest_run.as_ref().unwrap().snapshot.task, "after");
+        assert_eq!(fresh.latest_sequence, Some(EventSequence::new(2)));
+        drop(store);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

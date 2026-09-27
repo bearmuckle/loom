@@ -21,7 +21,7 @@ use loom_persistence::{
     CURRENT_SCHEMA_VERSION, DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor,
     DurableFilesystemEdit, DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
     DurableRunContextCheckpoint, DurableRunMessage, DurableRunRuntimeConfig, DurableRunSummary,
-    DurableSessionSettings, DurableStateWrite, FilePersistence,
+    DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -3563,6 +3563,75 @@ impl InProcessConnection {
         Ok(state)
     }
 
+    fn load_persisted_run_state_from_projection(
+        &self,
+        summary: &PersistedRunSummary,
+        persisted: &DurableSessionProjectionRead,
+    ) -> Result<AgentRuntimeState> {
+        let run_id = summary.snapshot.id;
+        let durable_summary = persisted.latest_run.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "persisted run disappeared",
+                true,
+            )
+        })?;
+        if durable_summary.snapshot.id != run_id {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "persisted projection does not contain the selected run",
+                true,
+            ));
+        }
+        let runtime_config = persisted.runtime_config.clone().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("persisted run {run_id} has no runtime configuration"),
+                true,
+            )
+        })?;
+        let mut state = runtime_state_from_durable_config(summary, runtime_config)?;
+        let execution_state = persisted.execution_state.clone().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("persisted run {run_id} has no typed execution state"),
+                true,
+            )
+        })?;
+        hydrate_runtime_execution_state(&mut state, execution_state)?;
+        state.plan = persisted.plan.clone();
+        state.messages.clear();
+        if let Some(checkpoint) = &persisted.context_checkpoint {
+            if checkpoint.session_id != state.session_id {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "run context checkpoint belongs to a different session",
+                    false,
+                ));
+            }
+            state.context_checkpoint = Some(checkpoint.summary.clone());
+            if let Some(inspection) = &mut state.context_inspection {
+                inspection.summary = Some(checkpoint.summary.clone());
+            }
+        } else {
+            state.context_checkpoint = None;
+            if let Some(inspection) = &mut state.context_inspection {
+                inspection.summary = None;
+            }
+        }
+        state.activities = persisted.activities.clone();
+        state.attempts = persisted.attempts.clone();
+        if state.attempts.is_empty() {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("persisted run {run_id} has no typed attempt history"),
+                true,
+            ));
+        }
+        state.interactions = persisted.interactions.clone();
+        Ok(state)
+    }
+
     fn session_snapshot_projection(
         &self,
         session_id: AgentSessionId,
@@ -3579,15 +3648,39 @@ impl InProcessConnection {
                 .cloned();
             (loaded_ids, latest)
         };
-        let latest_persisted = match &self.backend.persistence {
-            Some(persistence) => persistence
-                .load_latest_run_summary_for_session(session_id)?
+        let persisted_projection = match &self.backend.persistence {
+            Some(persistence) if !include_messages => {
+                Some(persistence.load_session_projection_read(session_id)?)
+            }
+            _ => None,
+        };
+        let latest_persisted = if let Some(projection) = &persisted_projection {
+            projection
+                .latest_run
+                .as_ref()
                 .map(|summary| PersistedRunSummary {
-                    snapshot: summary.snapshot,
-                    usage: summary.usage,
+                    snapshot: summary.snapshot.clone(),
+                    usage: summary.usage.clone(),
                 })
-                .filter(|summary| !loaded_ids.contains(&summary.snapshot.id)),
-            None => None,
+                .filter(|summary| !loaded_ids.contains(&summary.snapshot.id))
+        } else {
+            match &self.backend.persistence {
+                Some(persistence) => persistence
+                    .load_latest_run_summary_for_session(session_id)?
+                    .map(|summary| PersistedRunSummary {
+                        snapshot: summary.snapshot,
+                        usage: summary.usage,
+                    })
+                    .filter(|summary| !loaded_ids.contains(&summary.snapshot.id)),
+                None => None,
+            }
+        };
+        let load_selected_persisted = |summary: &PersistedRunSummary| {
+            if let Some(projection) = &persisted_projection {
+                self.load_persisted_run_state_from_projection(summary, projection)
+            } else {
+                self.load_persisted_run_state(summary, include_messages)
+            }
         };
         let active_run = match (latest_loaded, latest_persisted) {
             (Some(handle), Some(summary)) => {
@@ -3595,18 +3688,20 @@ impl InProcessConnection {
                 if projection.run.updated_at >= summary.snapshot.updated_at {
                     Some(projection)
                 } else {
-                    Some(run_snapshot_projection(
-                        &self.load_persisted_run_state(&summary, include_messages)?,
-                    ))
+                    Some(run_snapshot_projection(&load_selected_persisted(&summary)?))
                 }
             }
             (Some(handle), None) => Some(handle.snapshot_projection(include_messages)),
-            (None, Some(summary)) => Some(run_snapshot_projection(
-                &self.load_persisted_run_state(&summary, include_messages)?,
-            )),
+            (None, Some(summary)) => {
+                Some(run_snapshot_projection(&load_selected_persisted(&summary)?))
+            }
             (None, None) => None,
         };
-        let latest_sequence = self.latest_session_event_sequence(session_id)?;
+        let latest_sequence = persisted_projection
+            .as_ref()
+            .and_then(|projection| projection.latest_sequence)
+            .map(Ok)
+            .unwrap_or_else(|| self.latest_session_event_sequence(session_id))?;
         let approval_policy = self.policy(session_id)?;
         let auto_approve_actions = self.auto_approve_actions(session_id)?;
         Ok(AgentSessionSnapshotProjection {
