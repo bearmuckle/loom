@@ -362,12 +362,13 @@ limit prunes the globally oldest retained events first; each affected session's
 pruned-through cursor is advanced transactionally, so reconnect requests detect
 the gap and request an authoritative snapshot. Pending durable notifications are
 pruned to the same per-session event count. It keeps global sequence numbers and
-full event payloads. Initial projection reads, event reads, and cursor capture use
-before/after sequence checks with bounded retries; clients request a fresh initial
-state when retention invalidates the first cursor. It has no stream epoch,
-workspace stream, or transactional snapshot/resubscribe cursor. The target still requires compact revision
-notifications and fully scoped cursors; global pressure may expire a quiet
-session's entire retained feed.
+full event payloads. Initial projection reads use before/after sequence checks;
+event reads report no cursor later than the read cursor or latest included event.
+Clients request a fresh initial state when retention invalidates the first cursor.
+It has no stream epoch,
+workspace stream, or transactional snapshot/resubscribe cursor. The target still
+requires compact revision notifications and fully scoped cursors; global pressure
+may expire a quiet session's entire retained feed.
 
 An expired cursor returns `ResyncRequired`, followed by an authoritative snapshot
 with a fresh cursor read in the same SQLite read transaction. Subscribe after that

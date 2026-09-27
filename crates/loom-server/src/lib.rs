@@ -3421,24 +3421,19 @@ impl InProcessConnection {
         Ok(deduplicate_events(events))
     }
 
-    fn stable_session_events_since(
+    fn session_events_with_safe_cursor(
         &self,
         session_id: AgentSessionId,
         after_sequence: Option<EventSequence>,
     ) -> Result<(Vec<ServerEventEnvelope>, EventSequence)> {
-        for _ in 0..4 {
-            let before = self.latest_session_event_sequence(session_id)?;
-            let events = self.session_events_since(Some(session_id), after_sequence)?;
-            let after = self.latest_session_event_sequence(session_id)?;
-            if before == after {
-                return Ok((events, after));
-            }
-        }
-        Err(LoomError::new(
-            ErrorCode::Conflict,
-            "session event stream changed while reading; retry",
-            true,
-        ))
+        let cursor_before = self.latest_session_event_sequence(session_id)?;
+        let events = self.session_events_since(Some(session_id), after_sequence)?;
+        let latest_in_batch = events
+            .iter()
+            .map(|event| event.sequence)
+            .max()
+            .unwrap_or_default();
+        Ok((events, cursor_before.max(latest_in_batch)))
     }
 
     fn recent_session_events(
@@ -4336,7 +4331,7 @@ impl InProcessConnection {
                 let (events, session_latest_sequence) = match session_id {
                     Some(session_id) => {
                         let (events, latest) =
-                            self.stable_session_events_since(session_id, after_sequence)?;
+                            self.session_events_with_safe_cursor(session_id, after_sequence)?;
                         (events, Some(latest))
                     }
                     None => (self.session_events_since(None, after_sequence)?, None),
