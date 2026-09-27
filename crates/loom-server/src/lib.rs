@@ -842,7 +842,12 @@ fn run_can_be_deferred_during_restore(
 ) -> bool {
     matches!(
         state,
-        AgentRunState::AwaitingApproval | AgentRunState::NeedsInput | AgentRunState::Paused
+        AgentRunState::Planning
+            | AgentRunState::Executing
+            | AgentRunState::AwaitingApproval
+            | AgentRunState::Paused
+            | AgentRunState::NeedsInput
+            | AgentRunState::Evaluating
     ) && has_pending_tool_execution == Some(false)
 }
 
@@ -2336,31 +2341,82 @@ impl InProcessBackend {
         let active_run_summaries = persistence.load_active_run_summaries()?;
         let active_run_count = active_run_summaries.len();
         let mut lazy_run_count = 0;
+        let mut recovery_updates = BTreeMap::new();
         let mut run_summaries = BTreeMap::new();
         let mut restored_runs = BTreeMap::new();
-        for (run_id, summary) in active_run_summaries {
-            let snapshot = summary.snapshot;
+        for (run_id, mut summary) in active_run_summaries {
+            let mut snapshot = summary.snapshot.clone();
             let run_state = snapshot.state;
             let evidence = snapshot.evidence.clone();
-            let usage = summary.usage;
+            let usage = summary.usage.clone();
             let section = format!("run:{run_id}");
             self.sessions()?.get(snapshot.session_id)?;
             run_summaries.insert(
                 run_id,
                 PersistedRunSummary {
-                    snapshot,
-                    usage,
+                    snapshot: snapshot.clone(),
+                    usage: usage.clone(),
                     section: section.clone(),
                 },
             );
-            let execution_state = persistence.load_run_execution_state(run_id)?;
-            let safely_dormant = run_can_be_deferred_during_restore(
+            let mut execution_state = persistence.load_run_execution_state(run_id)?;
+            let safely_deferred = run_can_be_deferred_during_restore(
                 run_state,
                 execution_state
                     .as_ref()
                     .map(|state| state.pending_tool_execution.is_some()),
             );
-            if safely_dormant {
+            if safely_deferred {
+                if matches!(
+                    run_state,
+                    AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+                ) {
+                    let updated_at = Timestamp::now();
+                    snapshot.state = AgentRunState::Paused;
+                    snapshot.updated_at = updated_at;
+                    snapshot.completed_at = None;
+                    let execution = execution_state.as_mut().ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::RecoveryRequired,
+                            format!("persisted run {run_id} has no typed execution state"),
+                            true,
+                        )
+                    })?;
+                    execution.state = AgentRunState::Paused;
+                    let mut attempts = persistence.load_run_attempts(run_id)?;
+                    let attempt = attempts
+                        .iter_mut()
+                        .find(|attempt| attempt.id == snapshot.attempt_id)
+                        .ok_or_else(|| {
+                            LoomError::new(
+                                ErrorCode::RecoveryRequired,
+                                format!("persisted run {run_id} has no current attempt"),
+                                true,
+                            )
+                        })?;
+                    attempt.state = AgentRunState::Paused;
+                    attempt.completed_at = None;
+                    summary.snapshot = snapshot.clone();
+                    summary.attempts = Some(attempts);
+                    summary.execution_state = execution_state;
+                    summary.interactions = None;
+                    recovery_updates.insert(run_id, summary);
+                    run_summaries.insert(
+                        run_id,
+                        PersistedRunSummary {
+                            snapshot: snapshot.clone(),
+                            usage: usage.clone(),
+                            section: section.clone(),
+                        },
+                    );
+                    self.append_recovery_events(
+                        snapshot.session_id,
+                        vec![AgentEvent::RunStateChanged {
+                            run_id,
+                            state: AgentRunState::Paused,
+                        }],
+                    )?;
+                }
                 lazy_run_count += 1;
                 continue;
             }
@@ -2373,7 +2429,7 @@ impl InProcessBackend {
                         false,
                     )
                 })?;
-            let execution_state = execution_state.ok_or_else(|| {
+            let execution_state = execution_state.take().ok_or_else(|| {
                 LoomError::new(
                     ErrorCode::RecoveryRequired,
                     format!("persisted run {run_id} has no typed execution state"),
@@ -2453,11 +2509,20 @@ impl InProcessBackend {
         *self.persisted_runs()? = run_summaries;
         *self.runs()? = restored_runs;
         if needs_persist {
-            self.persist_state()?;
+            self.persist_state_with_recovery_updates(&recovery_updates)?;
+        } else if !recovery_updates.is_empty() {
+            let mut journal = self.journal()?;
+            let feed = DurableFeedState {
+                next_sequence: journal.next_sequence,
+                retention_limit: journal.retention_limit,
+                events: journal.pending_events.clone(),
+            };
+            persistence.save_recovery_updates(&recovery_updates, &feed)?;
+            journal.pending_events.clear();
         }
         let lazy_filesystem_count = self.persisted_session_filesystems()?.len();
         log::info!(
-            "indexed {} resumable runs, restored {} runtimes, deferred {} dormant runtimes, and left {} filesystem services lazy in {} ms total",
+            "indexed {} resumable runs, restored {} runtimes, deferred {} runtimes, and left {} filesystem services lazy in {} ms total",
             active_run_count,
             restored_run_count,
             lazy_run_count,
@@ -2468,6 +2533,13 @@ impl InProcessBackend {
     }
 
     fn persist_state(&self) -> Result<()> {
+        self.persist_state_with_recovery_updates(&BTreeMap::new())
+    }
+
+    fn persist_state_with_recovery_updates(
+        &self,
+        recovery_updates: &BTreeMap<loom_core::RunId, DurableRunSummary>,
+    ) -> Result<()> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
@@ -2512,6 +2584,11 @@ impl InProcessBackend {
                 },
             );
         }
+        durable_run_summaries.extend(
+            recovery_updates
+                .iter()
+                .map(|(run_id, summary)| (*run_id, summary.clone())),
+        );
         let durable_run_context_checkpoints =
             runs.iter()
                 .map(|(run_id, state)| {
@@ -3167,6 +3244,21 @@ impl InProcessConnection {
                     true,
                 )
             })?;
+        if state.run.id == summary.snapshot.id
+            && state.run.state != execution_state.state
+            && summary.snapshot.state == AgentRunState::Paused
+            && execution_state.state == AgentRunState::Paused
+            && execution_state.pending_tool_execution.is_none()
+            && matches!(
+                state.run.state,
+                AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+            )
+        {
+            state.run.state = AgentRunState::Paused;
+            state.run.updated_at = summary.snapshot.updated_at;
+            state.run.completed_at = None;
+            state.run.summary = summary.snapshot.summary.clone();
+        }
         hydrate_runtime_execution_state(&mut state, execution_state)?;
         state.plan = persistence.load_run_plan(summary.snapshot.id)?;
         state.run.evidence = summary.snapshot.evidence.clone();
@@ -5601,8 +5693,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_quiescent_runs_without_tool_intent_are_deferred_on_restore() {
+    fn resumable_runs_without_pending_tool_intent_are_deferred_on_restore() {
         for state in [
+            AgentRunState::Planning,
+            AgentRunState::Executing,
+            AgentRunState::Evaluating,
             AgentRunState::AwaitingApproval,
             AgentRunState::NeedsInput,
             AgentRunState::Paused,
@@ -5612,11 +5707,9 @@ mod tests {
             assert!(!run_can_be_deferred_during_restore(state, None));
         }
         for state in [
-            AgentRunState::Planning,
-            AgentRunState::Executing,
-            AgentRunState::Evaluating,
             AgentRunState::Completed,
             AgentRunState::Failed,
+            AgentRunState::Cancelled,
         ] {
             assert!(!run_can_be_deferred_during_restore(state, Some(false)));
         }
@@ -8029,8 +8122,7 @@ mod tests {
         drop(persistence_store);
 
         let restored = InProcessBackend::new_persistent(&persistence).unwrap();
-        let restored_handle = restored.runs().unwrap().get(&run_id).cloned().unwrap();
-        assert_eq!(restored_handle.state().run.state, AgentRunState::Paused);
+        assert!(restored.runs().unwrap().is_empty());
         assert_eq!(
             restored
                 .persisted_runs()
@@ -8041,6 +8133,51 @@ mod tests {
                 .state,
             AgentRunState::Paused
         );
+        let recovery_session_id = restored
+            .persisted_runs()
+            .unwrap()
+            .get(&run_id)
+            .unwrap()
+            .snapshot
+            .session_id;
+        let restored_connection = restored.connect();
+        negotiate_m3(&restored_connection);
+        let projection =
+            restored_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+                run_id,
+            }));
+        let ServerResponse::AgentRunSnapshot(projection) = projection.result.unwrap() else {
+            panic!("unexpected lazily restored run snapshot response");
+        };
+        assert_eq!(projection.run.state, AgentRunState::Paused);
+        assert!(!projection.messages.is_empty());
+        assert!(restored.runs().unwrap().is_empty());
+        let execution = restored
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_execution_state(run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.state, AgentRunState::Paused);
+        assert!(execution.pending_tool_execution.is_none());
+        let events =
+            restored_connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: Some(recovery_session_id),
+                after_sequence: None,
+            }));
+        let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+            panic!("unexpected recovery event response");
+        };
+        assert!(events.iter().any(|event| matches!(
+            &event.event,
+            ServerEvent::Agent {
+                event: AgentEvent::RunStateChanged {
+                    run_id: event_run_id,
+                    state: AgentRunState::Paused,
+                }
+            } if *event_run_id == run_id
+        )));
         drop(restored);
         fs::remove_file(persistence).unwrap();
         fs::remove_dir_all(session_root_base).unwrap();

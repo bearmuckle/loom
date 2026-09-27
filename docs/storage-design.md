@@ -4,6 +4,10 @@ Status: target design, 2026-09-26. The implementation is in progress: session,
 workspace, and run summaries, ordered run messages, bounded session/workspace
 settings, reconnect events, provider usage totals, and filesystem records use
 indexed rows. Runtime details and filesystem snapshots are loaded on demand.
+Startup defers runtimes for resumable runs with no pending tool intent. Runs
+interrupted during planning, model execution, or evaluation are transactionally
+marked paused and hydrated only when a later operation needs their runtime;
+uncertain in-flight tool effects still use the eager recovery path.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at the

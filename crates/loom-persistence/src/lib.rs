@@ -4201,6 +4201,31 @@ impl FilePersistence {
         })
     }
 
+    /// Atomically persists startup recovery updates without rewriting unrelated catalogs.
+    pub fn save_recovery_updates(
+        &self,
+        summaries: &BTreeMap<RunId, DurableRunSummary>,
+        feed: &DurableFeedState,
+    ) -> Result<()> {
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin recovery update transaction: {error}"),
+                true,
+            )
+        })?;
+        save_run_summary_rows(&transaction, summaries)?;
+        save_run_attempt_rows(&transaction, summaries)?;
+        save_run_execution_state_rows(&transaction, summaries)?;
+        save_feed_rows(&transaction, feed)?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit recovery update transaction: {error}"),
+                true,
+            )
+        })
+    }
+
     /// Collects a bounded batch of content objects and blobs queued by reference changes.
     /// Ordinary writes process smaller batches; callers can repeat this method to drain a
     /// backlog without scanning all stored content on every transaction.
