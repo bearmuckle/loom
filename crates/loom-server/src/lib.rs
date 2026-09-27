@@ -2192,6 +2192,7 @@ impl InProcessBackend {
         let mut restored_runs = BTreeMap::new();
         for (run_id, summary) in persistence.load_active_run_summaries()? {
             let snapshot = summary.snapshot;
+            let evidence = snapshot.evidence.clone();
             let usage = summary.usage;
             let section = format!("run:{run_id}");
             self.sessions()?.get(snapshot.session_id)?;
@@ -2223,6 +2224,8 @@ impl InProcessBackend {
                         )
                     })?;
             hydrate_runtime_execution_state(&mut runtime_state, execution_state)?;
+            runtime_state.plan = persistence.load_run_plan(run_id)?;
+            runtime_state.run.evidence = evidence;
             runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
             runtime_state.activities = persistence.load_run_activities(run_id)?;
             runtime_state.attempts = persistence.load_run_attempts(run_id)?;
@@ -2303,6 +2306,10 @@ impl InProcessBackend {
             .iter()
             .map(|(run_id, handle)| (*run_id, handle.state()))
             .collect();
+        let durable_run_plans = runs
+            .iter()
+            .map(|(run_id, state)| (*run_id, state.plan.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut durable_run_summaries: BTreeMap<loom_core::RunId, DurableRunSummary> = self
             .persisted_runs()?
             .iter()
@@ -2336,6 +2343,8 @@ impl InProcessBackend {
         let entity_sections = runs
             .into_iter()
             .map(|(run_id, mut state)| {
+                state.plan.steps.clear();
+                state.run.evidence.clear();
                 durable_run_messages
                     .insert(run_id, durable_run_messages_from_runtime(&state.messages));
                 state.messages.clear();
@@ -2430,6 +2439,7 @@ impl InProcessBackend {
             usage: Some(&provider_usage),
             idempotency: Some(&idempotency),
             run_summaries: Some(&durable_run_summaries),
+            run_plans: Some(&durable_run_plans),
             run_messages: Some(&durable_run_messages),
             run_activities: Some(&durable_run_activities),
             filesystem_records: Some(&filesystem_records),
@@ -2948,6 +2958,8 @@ impl InProcessConnection {
                 )
             })?;
         hydrate_runtime_execution_state(&mut state, execution_state)?;
+        state.plan = persistence.load_run_plan(summary.snapshot.id)?;
+        state.run.evidence = summary.snapshot.evidence.clone();
         state.messages =
             persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
         state.activities = persistence.load_run_activities(summary.snapshot.id)?;

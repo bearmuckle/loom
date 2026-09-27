@@ -486,9 +486,10 @@ Implement in this order:
    run summary. Tool-call/tool-attempt records now have typed indexed rows
    derived from activity records. Schema v25 stores run usage as typed integer
    counters; session totals are computed with an indexed SQLite aggregate while
-   live runs are overlaid from memory. Normalized steps/evidence and
-   crash-injection coverage remain. Test crash boundaries before switching live
-   writes.
+   live runs are overlaid from memory. Schema v26 stores ordered plan steps and
+   evidence links in child rows and removes those vectors from run/runtime JSON
+   snapshots. Crash-injection coverage remains. Test crash boundaries before
+   switching live writes.
 4. Migrate checkpoint manifests and filesystem operations; make services lazy.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
    exports and their mirrored in-memory journals completely.

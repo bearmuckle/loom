@@ -16,9 +16,10 @@ use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
-    AgentInteractionStatus, AgentRunAttemptRecord, AgentRunSnapshot, AgentRunState,
-    AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord, ApprovalDecision,
-    Checkpoint, CheckpointFile, ServerEventEnvelope, ToolResult, WorkspaceConfig, WorkspaceControl,
+    AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
+    AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
+    ApprovalDecision, Checkpoint, CheckpointFile, ServerEventEnvelope, ToolResult, WorkspaceConfig,
+    WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -28,8 +29,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 25;
-const DATABASE_SCHEMA_VERSION: u32 = 25;
+pub const CURRENT_SCHEMA_VERSION: u32 = 26;
+const DATABASE_SCHEMA_VERSION: u32 = 26;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -86,6 +87,26 @@ CREATE INDEX IF NOT EXISTS runs_by_session_activity
     ON run_summaries(session_id, updated_at DESC, run_id DESC);
 CREATE INDEX IF NOT EXISTS runs_by_state_activity
     ON run_summaries(state, updated_at DESC, run_id DESC);
+CREATE TABLE IF NOT EXISTS run_plan_steps (
+    run_id BLOB NOT NULL,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    step_id TEXT NOT NULL CHECK(length(step_id) <= 256),
+    description TEXT NOT NULL CHECK(length(description) <= 16384),
+    PRIMARY KEY(run_id, ordinal),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS run_evidence (
+    run_id BLOB NOT NULL,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    label TEXT NOT NULL CHECK(length(label) <= 16384),
+    uri TEXT NOT NULL CHECK(length(uri) <= 16384),
+    PRIMARY KEY(run_id, ordinal),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS run_attempts (
     run_id BLOB NOT NULL,
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -836,6 +857,7 @@ pub struct DurableStateWrite<'a> {
     pub usage: Option<&'a UsageLedger>,
     pub idempotency: Option<&'a BTreeMap<RequestId, DurableIdempotencyRecord>>,
     pub run_summaries: Option<&'a BTreeMap<RunId, DurableRunSummary>>,
+    pub run_plans: Option<&'a BTreeMap<RunId, AgentPlan>>,
     pub run_messages: Option<&'a BTreeMap<RunId, Vec<DurableRunMessage>>>,
     pub run_activities: Option<&'a DurableRunActivities>,
     pub filesystem_records: Option<&'a [DurableFilesystemRecord]>,
@@ -1609,6 +1631,38 @@ impl FilePersistence {
         })
     }
 
+    /// Loads a run's ordered plan steps without decoding its runtime snapshot.
+    pub fn load_run_plan(&self, run_id: RunId) -> Result<AgentPlan> {
+        if !self.path.exists() {
+            return Ok(AgentPlan { steps: Vec::new() });
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT step_id, description FROM run_plan_steps WHERE run_id=?1 ORDER BY ordinal",
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prepare run plan: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+                Ok(AgentPlanStep {
+                    id: row.get(0)?,
+                    description: row.get(1)?,
+                })
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read run plan: {error}"), true)
+            })?;
+        let mut steps = Vec::new();
+        for row in rows {
+            steps.push(row.map_err(|error| {
+                persistence_error(format!("could not read run plan: {error}"), true)
+            })?);
+        }
+        Ok(AgentPlan { steps })
+    }
+
     fn load_run_summaries_matching<P: rusqlite::Params>(
         &self,
         predicate: &str,
@@ -1711,6 +1765,13 @@ impl FilePersistence {
                     interactions: None,
                 },
             );
+        }
+        drop(statement);
+        let evidence = load_run_evidence_rows(&connection, summaries.keys().copied())?;
+        for (run_id, links) in evidence {
+            if let Some(summary) = summaries.get_mut(&run_id) {
+                summary.snapshot.evidence = links;
+            }
         }
         Ok(summaries)
     }
@@ -3243,6 +3304,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            run_plans: None,
             run_messages: None,
             run_activities: None,
             filesystem_records: None,
@@ -3272,6 +3334,7 @@ impl FilePersistence {
             usage: None,
             idempotency: None,
             run_summaries: None,
+            run_plans: None,
             run_messages: None,
             run_activities: None,
             filesystem_records: None,
@@ -3314,6 +3377,9 @@ impl FilePersistence {
             save_run_summary_rows(&transaction, run_summaries)?;
             save_run_attempt_rows(&transaction, run_summaries)?;
             save_run_execution_state_rows(&transaction, run_summaries)?;
+        }
+        if let Some(run_plans) = write.run_plans {
+            save_run_plan_rows(&transaction, run_plans, write.run_summaries)?;
         }
         if let Some(run_activities) = write.run_activities {
             save_run_activity_rows(&transaction, run_activities)?;
@@ -4916,7 +4982,9 @@ fn save_run_summary_rows(
                 false,
             ));
         }
-        let snapshot = serde_json::to_string(&summary.snapshot).map_err(|error| {
+        let mut snapshot_record = summary.snapshot.clone();
+        snapshot_record.evidence.clear();
+        let snapshot = serde_json::to_string(&snapshot_record).map_err(|error| {
             persistence_error(format!("could not encode run summary: {error}"), false)
         })?;
         if snapshot.len() > 1024 * 1024 {
@@ -4985,8 +5053,193 @@ fn save_run_summary_rows(
                     true,
                 )
             })?;
+        save_run_evidence_rows(
+            transaction,
+            *run_id,
+            summary.snapshot.session_id,
+            &summary.snapshot.evidence,
+        )?;
     }
     save_run_interaction_rows(transaction, summaries)?;
+    Ok(())
+}
+
+fn save_run_evidence_rows(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    session_id: AgentSessionId,
+    evidence: &[loom_core::EvidenceLink],
+) -> Result<()> {
+    for (ordinal, link) in evidence.iter().enumerate() {
+        if link.label.len() > 16_384 || link.uri.len() > 16_384 {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "run evidence field exceeds its maximum supported size",
+                false,
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO run_evidence(run_id, session_id, ordinal, label, uri)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id, ordinal) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    label=excluded.label,
+                    uri=excluded.uri
+                 WHERE run_evidence.session_id IS NOT excluded.session_id
+                    OR run_evidence.label IS NOT excluded.label
+                    OR run_evidence.uri IS NOT excluded.uri",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    session_id.as_uuid().as_bytes().as_slice(),
+                    i64::try_from(ordinal).map_err(|_| {
+                        LoomError::new(ErrorCode::Persistence, "too many evidence links", false)
+                    })?,
+                    link.label,
+                    link.uri,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save evidence for run {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM run_evidence WHERE run_id=?1 AND ordinal >= ?2",
+            params![
+                run_id.as_uuid().as_bytes().as_slice(),
+                i64::try_from(evidence.len()).map_err(|_| {
+                    LoomError::new(ErrorCode::Persistence, "too many evidence links", false)
+                })?,
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prune evidence for run {run_id}: {error}"),
+                true,
+            )
+        })?;
+    Ok(())
+}
+
+fn load_run_evidence_rows(
+    connection: &Connection,
+    run_ids: impl Iterator<Item = RunId>,
+) -> Result<BTreeMap<RunId, Vec<loom_core::EvidenceLink>>> {
+    let run_ids = run_ids.collect::<Vec<_>>();
+    let mut evidence = BTreeMap::<RunId, Vec<loom_core::EvidenceLink>>::new();
+    for chunk in run_ids.chunks(500) {
+        let placeholders = (1..=chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT run_id, label, uri FROM run_evidence
+             WHERE run_id IN ({placeholders}) ORDER BY run_id, ordinal"
+        );
+        let values = chunk
+            .iter()
+            .map(|run_id| rusqlite::types::Value::Blob(run_id.as_uuid().as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let mut statement = connection.prepare(&sql).map_err(|error| {
+            persistence_error(format!("could not prepare run evidence: {error}"), true)
+        })?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    loom_core::EvidenceLink {
+                        label: row.get(1)?,
+                        uri: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read run evidence: {error}"), true)
+            })?;
+        for row in rows {
+            let (run_id, link) = row.map_err(|error| {
+                persistence_error(format!("could not read run evidence: {error}"), true)
+            })?;
+            let run_id = RunId::from_uuid(decode_uuid(&run_id, "evidence run id")?);
+            evidence.entry(run_id).or_default().push(link);
+        }
+    }
+    Ok(evidence)
+}
+
+fn save_run_plan_rows(
+    transaction: &Transaction<'_>,
+    plans: &BTreeMap<RunId, AgentPlan>,
+    summaries: Option<&BTreeMap<RunId, DurableRunSummary>>,
+) -> Result<()> {
+    for (run_id, plan) in plans {
+        let session_id = summaries
+            .and_then(|summaries| summaries.get(run_id))
+            .map(|summary| summary.snapshot.session_id)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("run plan {run_id} has no matching run summary"),
+                    false,
+                )
+            })?;
+        for (ordinal, step) in plan.steps.iter().enumerate() {
+            if step.id.len() > 256 || step.description.len() > 16_384 {
+                return Err(LoomError::new(
+                    ErrorCode::Persistence,
+                    "run plan step exceeds its maximum supported size",
+                    false,
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO run_plan_steps(run_id, session_id, ordinal, step_id, description)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(run_id, ordinal) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        step_id=excluded.step_id,
+                        description=excluded.description
+                     WHERE run_plan_steps.session_id IS NOT excluded.session_id
+                        OR run_plan_steps.step_id IS NOT excluded.step_id
+                        OR run_plan_steps.description IS NOT excluded.description",
+                    params![
+                        run_id.as_uuid().as_bytes().as_slice(),
+                        session_id.as_uuid().as_bytes().as_slice(),
+                        i64::try_from(ordinal).map_err(|_| {
+                            LoomError::new(ErrorCode::Persistence, "too many plan steps", false)
+                        })?,
+                        step.id,
+                        step.description,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save plan for run {run_id}: {error}"),
+                        true,
+                    )
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_plan_steps WHERE run_id=?1 AND ordinal >= ?2",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    i64::try_from(plan.steps.len()).map_err(|_| {
+                        LoomError::new(ErrorCode::Persistence, "too many plan steps", false)
+                    })?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune plan for run {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
     Ok(())
 }
 
@@ -7186,7 +7439,10 @@ mod tests {
                 updated_at: Timestamp::from_unix_millis(2000),
                 completed_at: Some(Timestamp::from_unix_millis(2000)),
                 summary: Some("finished".to_owned()),
-                evidence: Vec::new(),
+                evidence: vec![loom_core::EvidenceLink {
+                    label: "Build output".to_owned(),
+                    uri: "file:///workspace/build.log".to_owned(),
+                }],
             },
             usage: UsageSnapshot {
                 input_tokens: 13,
@@ -7198,6 +7454,15 @@ mod tests {
             interactions: None,
         };
         let run_summaries = BTreeMap::from([(run_id, run_summary)]);
+        let run_plans = BTreeMap::from([(
+            run_id,
+            AgentPlan {
+                steps: vec![AgentPlanStep {
+                    id: "inspect".to_owned(),
+                    description: "Inspect the relevant source and build output".to_owned(),
+                }],
+            },
+        )]);
         let activity_call = loom_model::ToolCall {
             id: loom_core::ToolCallId::new(),
             name: "read_file".to_owned(),
@@ -7284,6 +7549,7 @@ mod tests {
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
+                run_plans: Some(&run_plans),
                 run_messages: Some(&run_messages),
                 run_activities: Some(&run_activities),
                 filesystem_records: Some(&filesystem_records),
@@ -7371,6 +7637,7 @@ mod tests {
                     usage: None,
                     idempotency: None,
                     run_summaries: None,
+                    run_plans: None,
                     run_messages: None,
                     run_activities: Some(&completed_activities),
                     filesystem_records: None,
@@ -7399,6 +7666,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: None,
+                run_plans: None,
                 run_messages: None,
                 run_activities: Some(&completed_activities),
                 filesystem_records: None,
@@ -7431,6 +7699,10 @@ mod tests {
         );
         assert_eq!(loaded_record.response, serde_json::json!({"sessions": []}));
         assert_eq!(persistence.load_run_summaries().unwrap(), run_summaries);
+        assert_eq!(
+            persistence.load_run_plan(run_id).unwrap(),
+            run_plans[&run_id]
+        );
         assert_eq!(
             persistence
                 .load_session_usage(session.id, &BTreeSet::new())
@@ -7507,7 +7779,8 @@ mod tests {
                     providers: Some(&DurableProviderState::default()),
                     usage: Some(&UsageLedger::default()),
                     idempotency: Some(&BTreeMap::new()),
-                    run_summaries: Some(&BTreeMap::new()),
+                    run_summaries: Some(&run_summaries),
+                    run_plans: Some(&BTreeMap::new()),
                     run_messages: None,
                     run_activities: None,
                     filesystem_records: Some(&[DurableFilesystemRecord {
@@ -7519,6 +7792,14 @@ mod tests {
                     sections: &[("", serde_json::json!({"invalid": true}))],
                 })
                 .is_err()
+        );
+        assert_eq!(
+            persistence.load_run_plan(run_id).unwrap(),
+            run_plans[&run_id]
+        );
+        assert_eq!(
+            persistence.load_run_summary(run_id).unwrap(),
+            run_summaries.get(&run_id).cloned()
         );
         assert_eq!(
             persistence
@@ -7543,6 +7824,28 @@ mod tests {
         assert_eq!(retained_filesystem.checkpoints, vec![checkpoint.clone()]);
 
         let connection = Connection::open(&path).unwrap();
+        let summary_json: String = connection
+            .query_row(
+                "SELECT snapshot FROM run_summaries WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            serde_json::from_str::<AgentRunSnapshot>(&summary_json)
+                .unwrap()
+                .evidence
+                .is_empty(),
+            "evidence belongs in typed rows rather than the snapshot payload"
+        );
+        let plan_rows: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM run_plan_steps WHERE run_id=?1",
+                [run_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(plan_rows, run_plans[&run_id].steps.len() as i64);
         let plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT revision, config FROM workspace_configs WHERE workspace_id=?1",
@@ -7683,6 +7986,7 @@ mod tests {
                 usage: Some(&usage),
                 idempotency: Some(&idempotency),
                 run_summaries: Some(&run_summaries),
+                run_plans: None,
                 run_messages: None,
                 run_activities: None,
                 filesystem_records: Some(&empty_filesystem_records),
@@ -7786,6 +8090,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_plans: None,
                 run_messages: Some(&run_messages),
                 run_activities: None,
                 filesystem_records: None,
@@ -7909,6 +8214,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_plans: None,
                 run_messages: Some(&run_messages),
                 run_activities: None,
                 filesystem_records: None,
@@ -7935,6 +8241,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_plans: None,
                 run_messages: Some(&mismatched_messages),
                 run_activities: None,
                 filesystem_records: None,
@@ -7971,6 +8278,7 @@ mod tests {
                     usage: None,
                     idempotency: None,
                     run_summaries: Some(&run_summaries),
+                    run_plans: None,
                     run_messages: Some(&assembled_messages),
                     run_activities: None,
                     filesystem_records: None,
@@ -8003,6 +8311,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&run_summaries),
+                run_plans: None,
                 run_messages: Some(&assembled_messages),
                 run_activities: None,
                 filesystem_records: None,
@@ -8269,6 +8578,7 @@ mod tests {
                     usage: None,
                     idempotency: None,
                     run_summaries: Some(summary),
+                    run_plans: None,
                     run_messages: None,
                     run_activities: None,
                     filesystem_records: None,
@@ -8555,6 +8865,7 @@ mod tests {
                 usage: None,
                 idempotency: None,
                 run_summaries: Some(&summaries),
+                run_plans: None,
                 run_messages: None,
                 run_activities: Some(&activities),
                 filesystem_records: None,
