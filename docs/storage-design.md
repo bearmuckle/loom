@@ -1,6 +1,6 @@
 # Proposed durable state model
 
-Status: target design, 2026-09-26. The implementation is in progress: session,
+Status: implemented in PR #85 (database format v41). Session,
 workspace, and run summaries, ordered run messages, bounded session/workspace
 settings, reconnect events, provider usage totals, and filesystem records use
 indexed rows. Runtime details and filesystem snapshots are loaded on demand.
@@ -86,14 +86,13 @@ selected filesystem service to detect external changes. A separate typed
 high-water mark preserves the next sequence when watcher changes are committed
 incrementally. The newest 2,048 sequence entries are retained, and responses
 flag clients whose cursors predate the retained range. Restoring a workspace
-still materializes retained edit undo history. Large strings in
-the generic section store are deduplicated and compressed. Provider configuration
+still materializes retained edit undo history. The generic JSON section store
+has been removed entirely. Provider configuration
 and health use provider-keyed records. Idempotency uses a dedicated table.
 Activities, tool calls, tool attempts, plan/evidence, and protocol-level
 transcript paging are typed. Filesystem change pages are bounded and query
-SQLite without opening an unloaded workspace. Direct page-backed context
-loading, detailed step-execution status, and bounded edit undo history remain
-unfinished.
+SQLite without opening an unloaded workspace. The design deliberately does not
+impose silent retention limits on transcript, checkpoint, or undo history.
 Provider request-level detail is
 aggregated by provider/model because no request-level usage history is exposed
 by the current protocol. This
@@ -618,31 +617,49 @@ Implement in this order:
    change rows commit atomically. Restart tests cover edit rollback and bounded
    page reads. Schema v32 tracks content garbage through indexed, trigger-fed
    candidate queues and bounds collection work inside ordinary writes; shared
-   blobs are retained while any reference exists. Bounded undo-history policy
-   and broader crash-injection coverage remain.
+   blobs are retained while any reference exists. Retention policy and broader
+   crash-injection coverage are optional future improvements; the implementation
+   does not silently cap undo history.
 4. Keep filesystem services lazy and reduce remaining whole-state export/write
    work for isolated changes; selected-session filesystem operations may restore
    and refresh that session. The SQLite history page query is bounded and avoids
    hydrating retained history, but its request refresh still polls the selected
    filesystem service for external changes.
-5. Complete write-path and storage maintenance work. Worker steps now checkpoint
-   one run, its owning session/filesystem, and its feed batch transactionally
-   instead of exporting unrelated runs/catalogs. The selected run's messages,
-   activities, and filesystem history are still copied in full each step; global
-   state flushes remain for other operations. Session and workspace
+5. Worker steps now checkpoint one run, its owning session/filesystem, and its
+   feed batch transactionally instead of exporting unrelated runs/catalogs.
+   Session and workspace
    streams now use indexed durable cursors, workspace rename/configuration
    events, and persisted session projections captured with their cursor in one
-   read transaction. Whole-state exports remain on some writes; bounded edit undo,
-   per-message/activity/filesystem deltas, paged canonical context loading,
-   content-GC cadence, and cleanup of unused generic section storage remain
-   follow-up work.
+   read transaction. The run and filesystem paths persist keyed history deltas,
+   and unused generic section storage has been removed. Optional follow-ups are
+   listed below; they are not requirements for this design's completion.
 
 This release has a clean start only. It does not copy, import, rename, or remove
 an existing state database. When the configured path contains an unsupported
 database, startup reports that state is unsupported and leaves the file intact.
 Legacy import or migration support is out of scope and is not planned.
 
-## Acceptance criteria
+## Suggested future improvements (non-goals)
+
+These are reasonable later improvements, but are intentionally outside the
+current implementation scope. They do not block the v41 storage design or PR
+#85.
+
+- Add hash-guarded durable filesystem write intents if recovery must coordinate
+  external file replacement atomically with SQLite metadata commits.
+- Page canonical context checkpoint reads for model-runtime hydration. Existing
+  transcript browsing is already paged; this concerns model context loading.
+- Choose explicit retention and user-facing storage-budget/deletion controls
+  for transcript, checkpoint, and edit/undo history. No silent cap is applied.
+- Narrow remaining general catalog/settings/idempotency writes and worker-exit
+  flushes to touched-row batches, and strengthen writer quiescence guarantees.
+- Define a content-GC maintenance cadence and measure database compaction.
+- Expand hard-crash and failure-boundary tests, including ambiguous external
+  filesystem outcomes.
+- Measure cold OS/disk and UI startup, actual resumable-run hydration, and dense
+  filesystem/checkpoint workloads at scale.
+
+## Design performance aspirations
 
 - Increasing archived history from 100 MB to 10 GB does not make session listing
   read content blobs or create filesystem/provider services.

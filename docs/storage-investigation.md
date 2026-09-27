@@ -218,7 +218,7 @@ duplicated run JSON snapshots with typed rows; later schemas normalized run
 options and deduplicated runtime profiles/content. The current fixture includes
 those features plus retained transcript content.
 
-The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded reconnect-feed/idempotency/filesystem-change retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. Transcript and checkpoint history remain indefinite. The CLI and native UI now drain their locally owned backends on graceful teardown. Session and workspace event cursors now carry a backend-instance epoch and resync on restart; persisted session projections and their feed cursors are captured in one read transaction. Broader failure injection, retention/deletion controls, and cold end-to-end application startup proof remain in the PR checklist.
+The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded reconnect-feed/idempotency/filesystem-change retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. Transcript, checkpoint, and edit/undo history remain indefinite by design; choosing retention and deletion controls is a suggested future improvement. The CLI and native UI now drain their locally owned backends on graceful teardown. Session and workspace event cursors carry a backend-instance epoch and resync on restart; persisted session projections and their feed cursors are captured in one read transaction. Further failure injection and cold end-to-end startup measurements are optional future improvements, not PR completion blockers.
 
 ## Baseline findings before the redesign
 
@@ -230,13 +230,12 @@ checkpoints, archived runs, and journal history.
 
 The current worker path checkpoints only the active run, its owning session and
 filesystem, and the captured feed batch in one transaction. It avoids enumerating
-other runs/catalogs and acknowledges feed rows only after commit. The active run's
-full message/activity history and the owning filesystem's retained history are
-still copied on each step; feed retention's global ranking scan is amortized at
-64 event sequences or 4 MiB of new encoded payload. General state flushes for
-catalog/settings/idempotency changes and worker completion still use the full
-state path. Delta writes for transcript/activity/filesystem history and a write
-scaling benchmark remain follow-up work.
+other runs/catalogs and acknowledges feed rows only after commit. Transcript, activity, and filesystem history use keyed deltas on this path.
+Feed retention's global ranking scan is amortized at 64 event sequences or 4
+MiB of new encoded payload. Some catalog/settings/idempotency mutations and
+worker completion still use broader state flushes; narrowing these is an
+optional future improvement. Benchmarks for the implemented run checkpoint
+delta path are documented in [the storage design](storage-design.md).
 
 This is roughly 15.58 MB of serialized input per save in this sample, plus typed
 clones and intermediate JSON allocations. It is not a measurement of physical

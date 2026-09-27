@@ -4,12 +4,13 @@ Loom stores persistent backend state in a SQLite database at the configured
 persistence path. Native UI clients use one user-level database at
 `$LOOM_STATE_DIR/loom/state.db` (or the platform state-directory fallback),
 so workspaces and sessions remain available regardless of the startup folder.
-The database uses SQLite's WAL journal and `synchronous = FULL`; each logical
-state group is a row in the `sections` table and updates are committed in one
-transaction. Workspaces, sessions, journals, runs, session filesystem metadata
-and checkpoints, provider state, usage, models, policies, workspace
-worker-node configuration, and idempotency records are kept in independent
-sections, so changing one group does not rewrite the others.
+The database uses SQLite's WAL journal and `synchronous = FULL`. Durable state
+uses typed, indexed domain tables for workspaces, sessions, runs, transcripts,
+activities, filesystem metadata and history, checkpoints, provider state,
+usage, policies, worker-node configuration, and idempotency records. Large
+immutable payloads use a compressed, content-addressed store inside SQLite.
+Run and filesystem checkpoint paths write keyed deltas for changed history
+instead of replacing retained history on every update.
 
 Workspace configuration is keyed by workspace ID and contains worker
 WebSocket URLs, a monotonically increasing revision, and the session-card CPU
@@ -34,12 +35,14 @@ session only and the UI warns that it will not reconnect after restart. Linux
 uses Secret Service, which requires an available user session/keyring. Browser
 peer-token behavior is unchanged.
 
-The current schema version is stored on every section. The configured path
-must be a SQLite database; other file formats and unsupported schema versions
-are rejected. Loom does not import or migrate older project-based state.
+The database format is version 41. Unsupported formats and schema versions are
+rejected without modifying the existing file. Loom does not import or migrate
+older state, and there is no generic JSON section store retained for legacy
+compatibility.
 
-SQLite checkpoints and WAL files are managed by SQLite. The application keeps
-the existing event-retention and idempotency-retention limits; compaction is
-performed by SQLite checkpointing and its normal page reuse. Detailed history
-is loaded by section, while interrupted runs continue through the existing
-recovery path and are persisted as recovery state.
+SQLite checkpoints and WAL files are managed by SQLite. Reconnect events,
+idempotency responses, and filesystem change pages have explicit retention
+bounds. Transcript, checkpoint, and edit/undo history currently have no
+retention limit. Interrupted runs recover through the typed run state and
+existing recovery rules. See [the storage design](storage-design.md) for the
+implemented model and suggested future improvements.
