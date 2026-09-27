@@ -4,7 +4,7 @@
 - For UI work, prefer existing `gpui-kit` components when they fit the interaction; build custom controls only when the component library does not provide a suitable option.
 - Before opening a PR, check workspace line coverage locally with `cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80`; coverage must be at least 80%.
 - Before pushing a PR or PR update, run reasonable checks for the changed code, following `.github/workflows/ci.yml` and any relevant build workflow. For Rust changes, run formatting, Clippy, and tests for the affected scope; include relevant native or wasm builds when those targets are affected. Report checks that cannot be run.
-- Use `sccache` globally to speed up builds across worktrees; install and configure it if missing. Keep target directories project scoped, and share them only between worktrees of the same project.
+- Use `sccache` globally to speed up builds across worktrees; install and configure it if missing.
 - For Rust logging, use the existing `log` facade (`log::debug!`, `log::info!`, `log::warn!`, or `log::error!`) so output follows the configured native and wasm logger. Do not add direct `println!` or `eprintln!` logging.
 
 # Commit attribution
