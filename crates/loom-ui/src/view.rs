@@ -94,6 +94,9 @@ const PHONE_SIDEBAR_WIDTH: Pixels = px(300.);
 const COMPACT_REVIEW_WIDTH: Pixels = px(440.);
 const FULL_REVIEW_WIDTH: Pixels = px(600.);
 const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(760.);
+// GPUI's text utilities use rems; native display scaling and browser zoom
+// are applied when the window converts them to pixels.
+const BASE_FONT_SIZE: f32 = 17.;
 
 #[derive(Clone, Copy, Debug)]
 struct ResponsiveLayout {
@@ -1653,18 +1656,18 @@ impl Render for TimelineView {
                                 .bg(rgb(0x171c25))
                                 .border_1()
                                 .border_color(rgb(0x293244))
-                                .text_sm()
+                                .text_size(px(14.))
                                 .text_color(rgb(0xb7c0d0))
                                 .child(
                                     div()
-                                        .text_base()
+                                        .text_size(px(16.))
                                         .text_color(rgb(0xf3f4f6))
                                         .child("Ready when you are"),
                                 )
                                 .child(
                                     div()
                                         .mt_1()
-                                        .text_sm()
+                                        .text_size(px(14.))
                                         .text_color(rgb(0x8f98a6))
                                         .child("Describe a task below and Loom will keep the work, decisions, and results together."),
                                 ),
@@ -7296,7 +7299,7 @@ impl LoomView {
                                 div()
                                     .w_full()
                                     .text_left()
-                                    .text_size(px(12.))
+                                    .text_size(gpui_kit::rems(0.75))
                                     .text_color(header_color)
                                     .child(format!(
                                         "{} {title}{count_label} · {}",
@@ -9832,6 +9835,7 @@ impl LoomView {
 
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_rem_size(px(BASE_FONT_SIZE));
         window.set_window_title(&format!("Loom - {}", self.active_session.name));
         #[cfg(target_family = "wasm")]
         if !self.browser_window_initialized {
@@ -10317,7 +10321,7 @@ impl Render for LoomView {
             .flex_col()
             .bg(rgb(0x111318))
             .text_color(rgb(0xe5e7eb))
-            .text_size(px(13.))
+            .text_size(gpui_kit::rems(0.8125))
             // Initializes the per-frame selection registry before selectable
             // text participants prepaint and register themselves.
             .child(TextSelectionLayer)
