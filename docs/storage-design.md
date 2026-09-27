@@ -34,8 +34,10 @@ history. Large strings in
 the generic section store are deduplicated and compressed. Provider configuration
 and health use provider-keyed records. Idempotency uses a dedicated table.
 Activities, tool calls, tool attempts, plan/evidence, and protocol-level
-transcript paging are typed. Direct page-backed context loading, detailed
-step-execution status, and bounded filesystem history reads remain unfinished.
+transcript paging are typed. Filesystem change pages are bounded and query
+SQLite without opening an unloaded workspace. Direct page-backed context
+loading, detailed step-execution status, and bounded edit undo history remain
+unfinished.
 Provider request-level detail is
 aggregated by provider/model because no request-level usage history is exposed
 by the current protocol. This
@@ -468,9 +470,10 @@ Implement in this order:
    and on-demand run detail loads.
    Server-side fragment buffering now flushes at the 50 ms / 32 KiB thresholds,
    on step persistence, and at run completion; time- and byte-threshold tests
-   cover durable partial output and UTF-8-safe chunking. Migration of tools and
-   tool-attempt records and loading the canonical context directly from bounded
-   persistence pages remain to be completed.
+   cover durable partial output and UTF-8-safe chunking. Tools, tool attempts,
+   activities, plans/evidence, and context-compaction summaries now use typed
+   rows. Loading canonical context directly from bounded persistence pages
+   remains to be completed.
 3. Move execution, approvals, idempotency, and publication to transactional domain
    commands. Protocol 4.0 approval and input commands now carry the run-attempt
    identity and expected control revision, and stale commands are rejected;
@@ -502,12 +505,17 @@ Implement in this order:
    live runs are overlaid from memory. Schema v26 stores ordered plan steps and
    evidence links in child rows and removes those vectors from run/runtime JSON
    snapshots. Schema v27 stores ordered filesystem edit history and change
-   records separately; undo bytes use the shared content store, and change
-   lookups use the per-session sequence key. Restart tests cover edit rollback.
-   Repository/directory metadata normalization and crash-injection coverage
-   remain. Test crash boundaries before switching live writes.
-4. Normalize remaining repository/directory metadata, bound change-history
-   retention, and make filesystem services lazy.
+   records separately; undo bytes use the shared content store. Schema v28
+   normalizes repository and directory mounts. Schema v29 stores typed context
+   checkpoints. Schema v30 separates the filesystem sequence high-water mark,
+   bounds change history, and pages changes directly from SQLite without
+   restoring an unloaded filesystem service. The typed sequence high-water mark
+   and appended change rows commit atomically. Restart tests cover edit rollback
+   and lazy page reads with an unavailable filesystem root. Bounded undo-history
+   policy and broader crash-injection coverage remain.
+4. Keep filesystem services lazy and reduce remaining whole-state export/write
+   work for isolated changes; selected-session filesystem operations may restore
+   that session, while startup and history-page reads stay filesystem-free.
 5. Introduce scoped feeds, retention/GC, and storage maintenance; remove section
    exports and their mirrored in-memory journals completely.
 

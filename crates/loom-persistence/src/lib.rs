@@ -8796,6 +8796,27 @@ mod tests {
                 .changes,
             vec![watcher_change]
         );
+        let invalid_change = SessionFilesystemChange {
+            sequence: EventSequence::new(3),
+            session_id: AgentSessionId::new(),
+            path: "wrong-session.txt".to_owned(),
+            kind: WorkspaceChangeKind::Created,
+            revision: None,
+        };
+        assert!(
+            persistence
+                .save_filesystem_changes(session.id, EventSequence::new(3), &[invalid_change],)
+                .is_err()
+        );
+        assert_eq!(
+            persistence
+                .load_filesystem_record(session.id)
+                .unwrap()
+                .unwrap()
+                .payload["filesystem"]["next_sequence"],
+            serde_json::json!(2),
+            "sequence high-water and change rows commit atomically"
+        );
         assert_eq!(loaded_filesystem.repositories, repositories);
         assert_eq!(loaded_filesystem.directories, directories);
         assert_eq!(loaded_filesystem.checkpoints, vec![checkpoint.clone()]);
