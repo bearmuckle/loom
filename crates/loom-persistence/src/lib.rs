@@ -245,11 +245,25 @@ CREATE TABLE IF NOT EXISTS run_messages (
         CHECK(content_hash IS NULL OR length(content_hash) = 32),
     name TEXT,
     tool_call_id BLOB CHECK(tool_call_id IS NULL OR length(tool_call_id) = 16),
-    tool_calls TEXT NOT NULL CHECK(length(tool_calls) <= 1048576),
     PRIMARY KEY(run_id, ordinal),
     FOREIGN KEY(run_id, session_id)
         REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
 ) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS run_message_tool_calls (
+    run_id BLOB NOT NULL,
+    message_ordinal INTEGER NOT NULL CHECK(message_ordinal >= 0),
+    call_ordinal INTEGER NOT NULL CHECK(call_ordinal >= 0),
+    tool_call_id BLOB NOT NULL CHECK(length(tool_call_id) = 16),
+    name TEXT NOT NULL CHECK(length(name) <= 4096),
+    arguments_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE RESTRICT
+        CHECK(length(arguments_hash) = 32),
+    PRIMARY KEY(run_id, message_ordinal, call_ordinal),
+    UNIQUE(run_id, message_ordinal, tool_call_id),
+    FOREIGN KEY(run_id, message_ordinal)
+        REFERENCES run_messages(run_id, ordinal) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS run_message_tool_calls_by_id
+    ON run_message_tool_calls(run_id, tool_call_id);
 CREATE TABLE IF NOT EXISTS run_context_checkpoints (
     run_id BLOB PRIMARY KEY NOT NULL CHECK(length(run_id) = 16),
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -601,6 +615,14 @@ END;
 CREATE TRIGGER IF NOT EXISTS gc_tool_attempts_update AFTER UPDATE OF result_hash ON run_tool_attempts
 WHEN OLD.result_hash IS NOT NULL AND OLD.result_hash IS NOT NEW.result_hash BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.result_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_message_tool_calls_delete AFTER DELETE ON run_message_tool_calls BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.arguments_hash);
+END;
+CREATE TRIGGER IF NOT EXISTS gc_message_tool_calls_update
+AFTER UPDATE OF arguments_hash ON run_message_tool_calls
+WHEN OLD.arguments_hash IS NOT NEW.arguments_hash BEGIN
+    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.arguments_hash);
 END;
 CREATE TRIGGER IF NOT EXISTS gc_runtime_configurations_delete AFTER DELETE ON runtime_configurations BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash)
@@ -2611,9 +2633,10 @@ impl FilePersistence {
             return Ok(Vec::new());
         }
         let connection = self.connection()?;
+        let tool_calls_by_message = load_run_message_tool_calls(&connection, run_id, None, None)?;
         let mut statement = connection
             .prepare(
-                "SELECT ordinal, role, content_hash, name, tool_call_id, tool_calls
+                "SELECT ordinal, role, content_hash, name, tool_call_id
                       FROM run_messages WHERE run_id=?1 ORDER BY ordinal",
             )
             .map_err(|error| {
@@ -2627,17 +2650,15 @@ impl FilePersistence {
                     row.get::<_, Option<Vec<u8>>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<Vec<u8>>>(4)?,
-                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(|error| {
                 persistence_error(format!("could not read run messages: {error}"), true)
             })?;
         rows.map(|row| {
-            let (ordinal, role, content_hash, name, tool_call_id, tool_calls) =
-                row.map_err(|error| {
-                    persistence_error(format!("could not read run message: {error}"), true)
-                })?;
+            let (ordinal, role, content_hash, name, tool_call_id) = row.map_err(|error| {
+                persistence_error(format!("could not read run message: {error}"), true)
+            })?;
             let role = parse_message_role(&role)?;
             let ordinal = u64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
@@ -2673,20 +2694,16 @@ impl FilePersistence {
                     )
                 })?);
             }
-            let tool_calls = serde_json::from_str(&tool_calls).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    format!("persisted tool calls are malformed: {error}"),
-                    false,
-                )
-            })?;
             let tool_call_id = decode_optional_tool_call_id(tool_call_id)?;
             Ok(DurableRunMessage {
                 role,
                 content,
                 name,
                 tool_call_id,
-                tool_calls,
+                tool_calls: tool_calls_by_message
+                    .get(&ordinal)
+                    .cloned()
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -3032,7 +3049,7 @@ impl FilePersistence {
                                 0
                             )
                         ),
-                        m.name, m.tool_call_id, m.tool_calls
+                        m.name, m.tool_call_id
                  FROM run_messages m
                  WHERE m.run_id=?1 AND (?2 IS NULL OR m.ordinal < ?2)
                  ORDER BY m.ordinal DESC LIMIT ?3",
@@ -3054,33 +3071,27 @@ impl FilePersistence {
                         row.get::<_, i64>(2)?,
                         row.get::<_, Option<String>>(3)?,
                         row.get::<_, Option<Vec<u8>>>(4)?,
-                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .map_err(|error| {
                 persistence_error(format!("could not query run message page: {error}"), true)
             })?;
+        let tool_calls_by_message =
+            load_run_message_tool_calls(&connection, run_id, before_ordinal, Some(limit as usize))?;
         rows.map(|row| {
-            let (ordinal, role, content_bytes, name, tool_call_id, tool_calls) =
-                row.map_err(|error| {
-                    persistence_error(format!("could not read run message header: {error}"), true)
-                })?;
-            let tool_calls = serde_json::from_str(&tool_calls).map_err(|error| {
+            let (ordinal, role, content_bytes, name, tool_call_id) = row.map_err(|error| {
+                persistence_error(format!("could not read run message header: {error}"), true)
+            })?;
+            let ordinal = u64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
-                    format!("persisted tool calls are malformed: {error}"),
+                    "persisted message ordinal is negative",
                     false,
                 )
             })?;
             Ok(DurableRunMessageHeader {
-                ordinal: u64::try_from(ordinal).map_err(|_| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        "persisted message ordinal is negative",
-                        false,
-                    )
-                })?,
+                ordinal,
                 role: parse_message_role(&role)?,
                 content_bytes: u64::try_from(content_bytes).map_err(|_| {
                     LoomError::new(
@@ -3091,7 +3102,10 @@ impl FilePersistence {
                 })?,
                 name,
                 tool_call_id: decode_optional_tool_call_id(tool_call_id)?,
-                tool_calls,
+                tool_calls: tool_calls_by_message
+                    .get(&ordinal)
+                    .cloned()
+                    .unwrap_or_default(),
             })
         })
         .collect()
@@ -3158,8 +3172,8 @@ impl FilePersistence {
         transaction
             .execute(
                 "INSERT INTO run_messages(
-                    run_id, session_id, ordinal, role, content_hash, name, tool_call_id, tool_calls
-                 ) VALUES (?1, ?2, ?3, 'assistant', NULL, NULL, NULL, '[]')
+                    run_id, session_id, ordinal, role, content_hash, name, tool_call_id
+                 ) VALUES (?1, ?2, ?3, 'assistant', NULL, NULL, NULL)
                  ON CONFLICT(run_id, ordinal) DO NOTHING",
                 params![
                     run_id_bytes.as_slice(),
@@ -4895,6 +4909,9 @@ fn collect_unused_content(transaction: &Transaction<'_>, candidate_limit: usize)
                 SELECT 1 FROM run_tool_attempts
                 WHERE run_tool_attempts.result_hash=content_objects.hash
              ) AND NOT EXISTS (
+                SELECT 1 FROM run_message_tool_calls
+                WHERE run_message_tool_calls.arguments_hash=content_objects.hash
+             ) AND NOT EXISTS (
                 SELECT 1 FROM runtime_configurations
                 WHERE runtime_configurations.system_instructions_hash=content_objects.hash
                    OR runtime_configurations.repository_instructions_hash=content_objects.hash
@@ -5435,6 +5452,88 @@ fn delete_run_message_fragments(
     Ok(())
 }
 
+fn load_run_message_tool_calls(
+    connection: &Connection,
+    run_id: RunId,
+    before_ordinal: Option<i64>,
+    limit: Option<usize>,
+) -> Result<BTreeMap<u64, Vec<loom_model::ToolCall>>> {
+    let mut calls = BTreeMap::<u64, Vec<loom_model::ToolCall>>::new();
+    let limit = limit.map(|limit| i64::try_from(limit).unwrap_or(i64::MAX));
+    let mut statement = connection
+        .prepare(
+            "SELECT c.message_ordinal,c.tool_call_id,c.name,c.arguments_hash
+         FROM run_message_tool_calls c
+         WHERE c.run_id=?1 AND (?2 IS NULL OR c.message_ordinal<?2)
+           AND (?3 IS NULL OR c.message_ordinal IN (
+             SELECT ordinal FROM run_messages
+             WHERE run_id=?1 AND (?2 IS NULL OR ordinal<?2)
+             ORDER BY ordinal DESC LIMIT ?3
+           ))
+         ORDER BY c.message_ordinal DESC,c.call_ordinal",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prepare run message tool calls: {error}"),
+                true,
+            )
+        })?;
+    let rows = statement
+        .query_map(
+            params![
+                run_id.as_uuid().as_bytes().as_slice(),
+                before_ordinal,
+                limit
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read run message tool calls: {error}"),
+                true,
+            )
+        })?;
+    for row in rows {
+        let (ordinal, id, name, hash) = row.map_err(|error| {
+            persistence_error(
+                format!("could not read run message tool call: {error}"),
+                true,
+            )
+        })?;
+        let ordinal = u64::try_from(ordinal).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted message ordinal is negative",
+                false,
+            )
+        })?;
+        let arguments = decode_content(connection, &hash)?;
+        let arguments = serde_json::from_str(&arguments).map_err(|error| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!("persisted tool arguments are malformed: {error}"),
+                false,
+            )
+        })?;
+        calls
+            .entry(ordinal)
+            .or_default()
+            .push(loom_model::ToolCall {
+                id: loom_core::ToolCallId::from_uuid(decode_uuid(&id, "tool-call id")?),
+                name,
+                arguments,
+            });
+    }
+    Ok(calls)
+}
+
 fn save_run_message_rows(
     transaction: &Transaction<'_>,
     messages_by_run: &BTreeMap<RunId, Vec<DurableRunMessage>>,
@@ -5450,6 +5549,23 @@ fn save_run_message_rows(
         .map_err(|error| {
             persistence_error(format!("could not stage run messages: {error}"), true)
         })?;
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_message_tool_calls (
+                run_id BLOB NOT NULL, message_ordinal INTEGER NOT NULL,
+                call_ordinal INTEGER NOT NULL, tool_call_id BLOB NOT NULL,
+                name TEXT NOT NULL, arguments_hash BLOB NOT NULL,
+                PRIMARY KEY(run_id, message_ordinal, call_ordinal),
+                UNIQUE(run_id, message_ordinal, tool_call_id)
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_run_message_tool_calls;",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not stage run message tool calls: {error}"),
+                true,
+            )
+        })?;
     for (run_id, messages) in messages_by_run {
         let session_id: Vec<u8> = transaction
             .query_row(
@@ -5464,19 +5580,6 @@ fn save_run_message_rows(
                 )
             })?;
         for (ordinal, message) in messages.iter().enumerate() {
-            let tool_calls = serde_json::to_string(&message.tool_calls).map_err(|error| {
-                persistence_error(
-                    format!("could not encode run message tool calls: {error}"),
-                    false,
-                )
-            })?;
-            if tool_calls.len() > 1024 * 1024 {
-                return Err(LoomError::new(
-                    ErrorCode::Persistence,
-                    "run message tool calls exceed the maximum supported size",
-                    false,
-                ));
-            }
             let run_id_bytes = run_id.as_uuid().as_bytes();
             let ordinal = i64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
@@ -5534,21 +5637,63 @@ fn save_run_message_rows(
             let tool_call_id = message
                 .tool_call_id
                 .map(|id| id.as_uuid().as_bytes().to_vec());
+            for (call_ordinal, call) in message.tool_calls.iter().enumerate() {
+                if call.name.len() > 4096 {
+                    return Err(LoomError::invalid_request(
+                        "run message tool name exceeds the maximum supported size",
+                    ));
+                }
+                let arguments = serde_json::to_vec(&call.arguments).map_err(|error| {
+                    persistence_error(format!("could not encode tool arguments: {error}"), false)
+                })?;
+                if arguments.len() > 1024 * 1024 {
+                    return Err(LoomError::invalid_request(
+                        "run message tool arguments exceed the maximum supported size",
+                    ));
+                }
+                let arguments_hash = store_content(transaction, &arguments)?;
+                let call_ordinal = i64::try_from(call_ordinal).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "too many tool calls in message",
+                        false,
+                    )
+                })?;
+                transaction
+                    .execute(
+                        "INSERT INTO _loom_wanted_run_message_tool_calls
+                     (run_id,message_ordinal,call_ordinal,tool_call_id,name,arguments_hash)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                        params![
+                            run_id_bytes.as_slice(),
+                            ordinal,
+                            call_ordinal,
+                            call.id.as_uuid().as_bytes().as_slice(),
+                            call.name,
+                            arguments_hash
+                        ],
+                    )
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not stage run message tool call: {error}"),
+                            true,
+                        )
+                    })?;
+            }
             transaction
                 .execute(
                     "INSERT INTO run_messages(run_id, session_id, ordinal, role, content_hash,
-                    name, tool_call_id, tool_calls)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    name, tool_call_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(run_id, ordinal) DO UPDATE SET
                     session_id=excluded.session_id, role=excluded.role,
                     content_hash=excluded.content_hash, name=excluded.name,
-                    tool_call_id=excluded.tool_call_id, tool_calls=excluded.tool_calls
+                    tool_call_id=excluded.tool_call_id
                  WHERE run_messages.session_id IS NOT excluded.session_id
                     OR run_messages.role IS NOT excluded.role
                     OR run_messages.content_hash IS NOT excluded.content_hash
                     OR run_messages.name IS NOT excluded.name
-                    OR run_messages.tool_call_id IS NOT excluded.tool_call_id
-                    OR run_messages.tool_calls IS NOT excluded.tool_calls",
+                    OR run_messages.tool_call_id IS NOT excluded.tool_call_id",
                     params![
                         run_id_bytes.as_slice(),
                         session_id,
@@ -5556,12 +5701,47 @@ fn save_run_message_rows(
                         message_role_name(message.role),
                         content_hash,
                         message.name,
-                        tool_call_id,
-                        tool_calls
+                        tool_call_id
                     ],
                 )
                 .map_err(|error| {
                     persistence_error(format!("could not save run message: {error}"), true)
+                })?;
+            transaction
+                .execute(
+                    "DELETE FROM run_message_tool_calls AS saved
+                 WHERE saved.run_id=?1 AND saved.message_ordinal=?2 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_message_tool_calls wanted
+                    WHERE wanted.run_id=saved.run_id
+                      AND wanted.message_ordinal=saved.message_ordinal
+                      AND wanted.call_ordinal=saved.call_ordinal
+                      AND wanted.tool_call_id=saved.tool_call_id
+                      AND wanted.name=saved.name
+                      AND wanted.arguments_hash=saved.arguments_hash
+                 )",
+                    params![run_id_bytes.as_slice(), ordinal],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not prune run message tool calls: {error}"),
+                        true,
+                    )
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO run_message_tool_calls
+                 (run_id,message_ordinal,call_ordinal,tool_call_id,name,arguments_hash)
+                 SELECT run_id,message_ordinal,call_ordinal,tool_call_id,name,arguments_hash
+                 FROM _loom_wanted_run_message_tool_calls
+                 WHERE run_id=?1 AND message_ordinal=?2
+                 ON CONFLICT(run_id,message_ordinal,call_ordinal) DO NOTHING",
+                    params![run_id_bytes.as_slice(), ordinal],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save run message tool calls: {error}"),
+                        true,
+                    )
                 })?;
             if fragments_match == Some(true) {
                 delete_run_message_fragments(transaction, *run_id, ordinal)?;
