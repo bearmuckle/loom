@@ -18,6 +18,11 @@ members = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+# Include GPUI Kit's merged web clipboard-read fix until it is published.
+gpui-base = { path = "vendor/gpui-kit/crates/base" }
+gpui-component = { path = "vendor/gpui-kit/crates/component" }
+
 # CI builds the full GPUI/wgpu stack in debug mode, which produces very large
 # incremental artifacts and can exhaust the CI runner's disk. Line-tables-only
 # debug info keeps panic backtraces useful while cutting target/ size sharply.
