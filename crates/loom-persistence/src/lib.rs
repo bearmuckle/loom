@@ -9216,6 +9216,7 @@ mod tests {
     use super::*;
     use loom_session::{SessionManager, WorkspaceManager};
     use serde::{Deserialize, Serialize};
+    use std::process::Command;
     use uuid::Uuid;
 
     #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -9304,6 +9305,54 @@ mod tests {
         drop(clone);
         let replacement = FilePersistence::open_exclusive_writer(&path).unwrap();
         drop(replacement);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".loom-owner.lock");
+        fs::remove_file(PathBuf::from(lock_path)).unwrap();
+    }
+
+    fn run_exclusive_writer_probe(path: &Path, should_be_owned: bool) {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::exclusive_writer_subprocess_probe")
+            .arg("--nocapture")
+            .env("LOOM_TEST_OWNER_PROBE_PATH", path)
+            .env("LOOM_TEST_OWNER_EXPECTED", should_be_owned.to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "subprocess ownership probe failed");
+    }
+
+    #[test]
+    fn exclusive_writer_subprocess_probe() {
+        let Ok(path) = std::env::var("LOOM_TEST_OWNER_PROBE_PATH") else {
+            return;
+        };
+        let should_be_owned = std::env::var("LOOM_TEST_OWNER_EXPECTED")
+            .unwrap()
+            .parse::<bool>()
+            .unwrap();
+        match FilePersistence::open_exclusive_writer(path) {
+            Ok(writer) => {
+                assert!(!should_be_owned, "another process should own this database");
+                drop(writer);
+            }
+            Err(error) => {
+                assert!(
+                    should_be_owned,
+                    "unexpected exclusive writer error: {error}"
+                );
+                assert_eq!(error.code, ErrorCode::Conflict);
+            }
+        }
+    }
+
+    #[test]
+    fn exclusive_writer_lock_is_enforced_across_processes() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let writer = FilePersistence::open_exclusive_writer(&path).unwrap();
+        run_exclusive_writer_probe(&path, true);
+        drop(writer);
+        run_exclusive_writer_probe(&path, false);
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".loom-owner.lock");
         fs::remove_file(PathBuf::from(lock_path)).unwrap();
