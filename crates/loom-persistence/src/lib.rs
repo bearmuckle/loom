@@ -2,8 +2,9 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Write},
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
@@ -845,6 +846,27 @@ impl RestoreNode {
 #[derive(Clone, Debug)]
 pub struct FilePersistence {
     path: PathBuf,
+    connection: Arc<Mutex<Option<Connection>>>,
+}
+
+struct CachedConnection<'a>(MutexGuard<'a, Option<Connection>>);
+
+impl Deref for CachedConnection<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+            .as_ref()
+            .expect("cached SQLite connection is initialized")
+    }
+}
+
+impl DerefMut for CachedConnection<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+            .as_mut()
+            .expect("cached SQLite connection is initialized")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -970,7 +992,10 @@ impl FilePersistence {
             ));
         }
 
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            connection: Arc::new(Mutex::new(None)),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -2353,6 +2378,7 @@ impl FilePersistence {
                 persistence_error(format!("could not read run activity row: {error}"), true)
             })?;
         drop(statement);
+        drop(connection);
 
         let calls = self
             .load_run_tool_calls(run_id)?
@@ -2364,6 +2390,7 @@ impl FilePersistence {
             .into_iter()
             .map(|record| (record.id, record.result))
             .collect::<BTreeMap<_, _>>();
+        let connection = self.connection()?;
         let mut activities = Vec::with_capacity(rows.len());
         for (
             expected_ordinal,
@@ -3888,28 +3915,11 @@ impl FilePersistence {
         })
     }
 
-    fn connection(&self) -> Result<Connection> {
-        let connection = Connection::open(&self.path).map_err(|error| {
-            persistence_error(
-                format!("could not open persistence database: {error}"),
-                true,
-            )
-        })?;
-        connection
-            .busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|error| {
-                persistence_error(format!("could not configure persistence: {error}"), true)
-            })?;
-        connection
-            .execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")
-            .map_err(|error| {
-                persistence_error(format!("could not configure persistence: {error}"), true)
-            })?;
-        initialize_schema(&connection)?;
-        Ok(connection)
+    fn connection(&self) -> Result<CachedConnection<'_>> {
+        self.cached_connection(false)
     }
 
-    fn connection_for_write(&self) -> Result<Connection> {
+    fn connection_for_write(&self) -> Result<CachedConnection<'_>> {
         if let Some(parent) = self
             .path
             .parent()
@@ -3925,7 +3935,44 @@ impl FilePersistence {
                 )
             })?;
         }
-        self.connection()
+        self.cached_connection(true)
+    }
+
+    fn cached_connection(&self, create: bool) -> Result<CachedConnection<'_>> {
+        let mut cached = self.connection.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "persistence connection lock was poisoned",
+                true,
+            )
+        })?;
+        if cached.is_none() {
+            if !create && !self.path.is_file() {
+                return Err(persistence_error(
+                    "persistence database does not exist".to_owned(),
+                    false,
+                ));
+            }
+            let connection = Connection::open(&self.path).map_err(|error| {
+                persistence_error(
+                    format!("could not open persistence database: {error}"),
+                    true,
+                )
+            })?;
+            connection
+                .busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| {
+                    persistence_error(format!("could not configure persistence: {error}"), true)
+                })?;
+            connection
+                .execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL;")
+                .map_err(|error| {
+                    persistence_error(format!("could not configure persistence: {error}"), true)
+                })?;
+            initialize_schema(&connection)?;
+            *cached = Some(connection);
+        }
+        Ok(CachedConnection(cached))
     }
 }
 
@@ -7870,6 +7917,39 @@ mod tests {
                 value: "durable".to_owned()
             }
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sqlite_connections_are_lazy_shared_by_clones_and_observe_other_handles() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let first = FilePersistence::open(&path).unwrap();
+        let clone = first.clone();
+        assert!(!first.exists());
+        assert!(first.load_section::<Fixture>("state", 1).unwrap().is_none());
+        assert!(!first.exists(), "read-only construction must stay lazy");
+        assert!(Arc::ptr_eq(&first.connection, &clone.connection));
+
+        first
+            .save_sections(1, &[("state", serde_json::json!({"value": "first"}))])
+            .unwrap();
+        let second_handle = FilePersistence::open(&path).unwrap();
+        assert_eq!(
+            clone.load_section::<Fixture>("state", 1).unwrap(),
+            Some(Fixture {
+                value: "first".to_owned()
+            })
+        );
+        second_handle
+            .save_sections(1, &[("state", serde_json::json!({"value": "second"}))])
+            .unwrap();
+        assert_eq!(
+            first.load_section::<Fixture>("state", 1).unwrap(),
+            Some(Fixture {
+                value: "second".to_owned()
+            })
+        );
+        drop((first, clone, second_handle));
         fs::remove_file(path).unwrap();
     }
 

@@ -450,7 +450,11 @@ remote clients use the same API; the browser does not become another state owner
 Implement in this order:
 
 1. Establish the typed schema/store, ownership guard, and summary queries. Add
-   phase timings and row/byte counters.
+   phase timings and row/byte counters. `FilePersistence` lazily opens one SQLite
+   connection and shares it across clones, avoiding per-operation open/PRAGMA/
+   schema-check work while leaving missing databases untouched during reads.
+   Calls through one handle are serialized; coordination across separately opened
+   handles or processes still needs an explicit ownership policy.
 2. Finish message-fragment and immutable-content streaming, then migrate tools
    and activities; add paging and canonical context loading. Make startup and
    history independent of filesystems. The persistence layer now appends streamed
