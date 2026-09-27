@@ -5367,22 +5367,21 @@ impl InProcessConnection {
                     after_sequence
                 };
                 if let Some(workspace_id) = workspace_id {
-                    self.backend.workspace_records()?.get(workspace_id)?;
-                    let events = self.workspace_events_since(workspace_id, after_sequence)?;
-                    let workspace_events_supported = self
+                    if !self
                         .negotiated_capabilities()?
                         .as_ref()
                         .is_some_and(|capabilities| {
                             capabilities.contains(Capability::SubscribeWorkspaceEvents)
-                        });
-                    let events = if workspace_events_supported {
-                        events
-                    } else {
-                        events
-                            .into_iter()
-                            .filter(|event| matches!(event, WorkspaceFeedEvent::Session(_)))
-                            .collect()
-                    };
+                        })
+                    {
+                        return Err(LoomError::new(
+                            ErrorCode::CapabilityDenied,
+                            "connection did not negotiate capability SubscribeWorkspaceEvents",
+                            false,
+                        ));
+                    }
+                    self.backend.workspace_records()?.get(workspace_id)?;
+                    let events = self.workspace_events_since(workspace_id, after_sequence)?;
                     let durable_cursor = self.feed_workspace_cursor(workspace_id)?;
                     let latest_sequence = self.latest_workspace_event_sequence(workspace_id)?;
                     let journal = self.backend.journal()?;
@@ -5457,21 +5456,9 @@ impl InProcessConnection {
                             stream_epoch: current_stream_epoch,
                         });
                     }
-                    if workspace_events_supported {
-                        return Ok(ServerResponse::WorkspaceEvents {
-                            workspace_id,
-                            events,
-                            stream_epoch: current_stream_epoch,
-                        });
-                    }
-                    return Ok(ServerResponse::SessionEvents {
-                        events: events
-                            .into_iter()
-                            .filter_map(|event| match event {
-                                WorkspaceFeedEvent::Session(event) => Some(event),
-                                WorkspaceFeedEvent::Workspace(_) => None,
-                            })
-                            .collect(),
+                    return Ok(ServerResponse::WorkspaceEvents {
+                        workspace_id,
+                        events,
                         stream_epoch: current_stream_epoch,
                     });
                 }
@@ -11695,7 +11682,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_feed_capability_keeps_protocol_40_response_compatible() {
+    fn workspace_event_requests_require_workspace_event_capability() {
         let path = std::env::temp_dir().join(format!(
             "loom-server-workspace-feed-capability-{}.db",
             WorkspaceId::new()
@@ -11717,22 +11704,21 @@ mod tests {
             .result
             .unwrap();
 
-        let legacy = backend.connect();
-        let v40 = ProtocolVersion::new(4, 0);
-        let legacy_capabilities = CapabilitySet::new([Capability::SubscribeSessionEvents]);
-        let negotiated = legacy.request(RequestEnvelope::with_version(
-            v40,
+        let limited = backend.connect();
+        let limited_capabilities = CapabilitySet::new([Capability::SubscribeSessionEvents]);
+        let negotiated = limited.request(RequestEnvelope::with_version(
+            CURRENT_PROTOCOL_VERSION,
             ClientRequest::Negotiate {
-                client_version: v40,
-                capabilities: legacy_capabilities,
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: limited_capabilities,
             },
         ));
         assert!(matches!(
             negotiated.result,
             Ok(ServerResponse::Negotiated(_))
         ));
-        let legacy_events = legacy.request(RequestEnvelope::with_version(
-            v40,
+        let unsupported_events = limited.request(RequestEnvelope::with_version(
+            CURRENT_PROTOCOL_VERSION,
             ClientRequest::GetSessionEvents {
                 session_id: None,
                 workspace_id: Some(workspace.id),
@@ -11740,12 +11726,9 @@ mod tests {
                 stream_epoch: None,
             },
         ));
-        let ServerResponse::SessionEvents { events, .. } = legacy_events.result.unwrap() else {
-            panic!("protocol 4.0 clients must receive the legacy SessionEvents response");
-        };
-        assert!(
-            events.is_empty(),
-            "workspace-only rows must not leak to v4.0 clients"
+        assert_eq!(
+            unsupported_events.result.unwrap_err().code,
+            ErrorCode::CapabilityDenied
         );
 
         let current = backend.connect();

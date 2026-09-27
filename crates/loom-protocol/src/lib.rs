@@ -875,9 +875,7 @@ pub enum WorkspaceEvent {
     ConfigChanged { revision: u64 },
 }
 
-/// Unified entries in a workspace reconnect stream. Untagged serde preserves
-/// compatibility with older workspace stream payloads containing only session
-/// envelopes.
+/// Unified entries in a workspace reconnect stream.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
@@ -1115,30 +1113,6 @@ mod run_message_protocol_tests {
             serde_json::from_slice::<ServerResponse>(&encoded).unwrap(),
             response
         );
-
-        // Older peers serialized plain session envelopes directly in workspace
-        // snapshots; the untagged feed entry keeps that payload readable.
-        let legacy_session = ServerEventEnvelope {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence: EventSequence::new(9),
-            session_id,
-            event: ServerEvent::AgentSessionArchived { session_id },
-        };
-        let legacy = serde_json::json!({
-            "type": "workspace_events_snapshot",
-            "data": {
-                "workspace_id": workspace_id,
-                "sessions": [],
-                "events": [legacy_session],
-                "oldest_sequence": 9,
-                "latest_sequence": 9,
-                "stream_epoch": null
-            }
-        });
-        let decoded: ServerResponse = serde_json::from_value(legacy).unwrap();
-        assert!(matches!(decoded,
-            ServerResponse::WorkspaceEventsSnapshot { events, .. }
-                if matches!(events.as_slice(), [WorkspaceFeedEvent::Session(_)])));
     }
 
     #[test]
