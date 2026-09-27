@@ -1233,7 +1233,8 @@ impl FilePersistence {
     /// Releases exclusive writer ownership after the backend has stopped and
     /// joined every worker. Cloned store handles share this ownership slot.
     pub fn release_exclusive_writer(&self) -> Result<()> {
-        self.owner_lock
+        let lock_file = self
+            .owner_lock
             .lock()
             .map_err(|_| {
                 LoomError::new(
@@ -1243,6 +1244,14 @@ impl FilePersistence {
                 )
             })?
             .take();
+        if let Some(lock_file) = lock_file {
+            lock_file.unlock().map_err(|error| {
+                persistence_error(
+                    format!("could not release persistence owner lock: {error}"),
+                    true,
+                )
+            })?;
+        }
         Ok(())
     }
 
