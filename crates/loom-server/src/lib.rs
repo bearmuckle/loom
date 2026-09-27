@@ -2325,10 +2325,12 @@ impl InProcessBackend {
 
         let active_run_summaries = persistence.load_active_run_summaries()?;
         let active_run_count = active_run_summaries.len();
+        let mut lazy_run_count = 0;
         let mut run_summaries = BTreeMap::new();
         let mut restored_runs = BTreeMap::new();
         for (run_id, summary) in active_run_summaries {
             let snapshot = summary.snapshot;
+            let run_state = snapshot.state;
             let evidence = snapshot.evidence.clone();
             let usage = summary.usage;
             let section = format!("run:{run_id}");
@@ -2341,6 +2343,17 @@ impl InProcessBackend {
                     section: section.clone(),
                 },
             );
+            let execution_state = persistence.load_run_execution_state(run_id)?;
+            let safely_dormant = matches!(
+                run_state,
+                AgentRunState::AwaitingApproval | AgentRunState::NeedsInput | AgentRunState::Paused
+            ) && execution_state
+                .as_ref()
+                .is_some_and(|state| state.pending_tool_execution.is_none());
+            if safely_dormant {
+                lazy_run_count += 1;
+                continue;
+            }
             let mut runtime_state = persistence
                 .load_section::<AgentRuntimeState>(&section, CURRENT_SCHEMA_VERSION)?
                 .ok_or_else(|| {
@@ -2350,16 +2363,13 @@ impl InProcessBackend {
                         false,
                     )
                 })?;
-            let execution_state =
-                persistence
-                    .load_run_execution_state(run_id)?
-                    .ok_or_else(|| {
-                        LoomError::new(
-                            ErrorCode::RecoveryRequired,
-                            format!("persisted run {run_id} has no typed execution state"),
-                            true,
-                        )
-                    })?;
+            let execution_state = execution_state.ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    format!("persisted run {run_id} has no typed execution state"),
+                    true,
+                )
+            })?;
             hydrate_runtime_execution_state(&mut runtime_state, execution_state)?;
             runtime_state.plan = persistence.load_run_plan(run_id)?;
             runtime_state.run.evidence = evidence;
@@ -2423,6 +2433,7 @@ impl InProcessBackend {
                 needs_persist = true;
             }
         }
+        let restored_run_count = restored_runs.len();
         *self.persisted_runs()? = run_summaries;
         *self.runs()? = restored_runs;
         if needs_persist {
@@ -2430,8 +2441,10 @@ impl InProcessBackend {
         }
         let lazy_filesystem_count = self.persisted_session_filesystems()?.len();
         log::info!(
-            "restored {} resumable runs and left {} filesystem services lazy in {} ms total",
+            "indexed {} resumable runs, restored {} runtimes, deferred {} dormant runtimes, and left {} filesystem services lazy in {} ms total",
             active_run_count,
+            restored_run_count,
+            lazy_run_count,
             lazy_filesystem_count,
             startup_started.elapsed().as_millis()
         );
@@ -7531,6 +7544,8 @@ mod tests {
 
         let backend = InProcessBackend::new_persistent(&persistence).unwrap();
         assert!(backend.journal().unwrap().events.is_empty());
+        assert!(backend.runs().unwrap().is_empty());
+        assert!(backend.persisted_runs().unwrap().contains_key(&run_id));
         let connection = backend.connect();
         negotiate_m3(&connection);
         let recovered_session = connection.request(RequestEnvelope::new(
