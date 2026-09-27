@@ -172,25 +172,29 @@ per-session run lookup latency, and database size. Set `LOOM_SCALE_SESSIONS` and
 
 | Sessions / runs / feed events | Database size | Population | Catalog + active + feed header p50 | One-session feed read p50 | Full-feed decode p50 | Per-session run query p50 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 / 10,000 / 10,000 | 11,575,296 bytes | 1,937 ms | 7.274 ms | 0.047 ms | 59.384 ms | 0.015 ms |
-| 20,000 / 20,000 / 20,000 | 22,753,280 bytes | 4,368 ms | 11.972 ms | 0.049 ms | 128.945 ms | 0.014 ms |
-| 100,000 / 100,000 / 100,000 | 113,315,840 bytes | 24,826 ms | 63.333 ms | 0.025 ms | 527.073 ms | 0.015 ms |
+| 10,000 / 10,000 / 10,000 | 9,195,520 bytes | 2,071 ms | 5.115 ms | 0.048 ms | 61.455 ms | 0.016 ms |
+| 100,000 / 100,000 / 100,000 | 81,297,408 bytes | 25,771 ms | 50.535 ms | 0.025 ms | 519.335 ms | 0.016 ms |
 
-A fresh 10,000-row run on 2026-09-27 measured 11,587,584 bytes, 1,892 ms
-population, 6.786 ms catalog/active/feed-header p50, 0.045 ms per-session
-feed p50, 61.798 ms full-feed decode p50, and 0.015 ms indexed run lookup p50.
-The small run-to-run variation is expected; this is a local synthetic fixture,
-not a platform-independent latency guarantee.
+Before schema v33, the same 100k fixture occupied 113,315,840 bytes. Schema v33
+replaces each run's duplicated JSON snapshot with typed columns for task, model,
+attempt identity, control revision, state and timestamps, while the optional
+summary is stored as text and evidence remains in ordered rows. This reduced
+the fixture by 32,018,432 bytes (28.3%), below the 100 MB target. `dbstat`
+reports that at 100k the largest remaining objects are `feed_events` (19.3 MB),
+`run_summaries` (15.2 MB), and `sessions_visible` (8.2 MB). The index-heavy
+catalog and feed shape remains visible in the other `dbstat` rows printed by
+the harness. Schema v33 also makes the model a directly queryable column, but
+intentionally does not add a model index without a query that needs it.
 
-The per-session run lookup and one-session feed read stayed flat. Startup now
-loads only the small feed header; a diagnostic full-feed decode still grows
-approximately with event count, but it is no longer on the restore path. The
-100k fixture exceeds the 100 MB size target at 113,315,840 bytes despite having
-only small session/run snapshots and one session-created event per session. It
-omits runtime payloads, transcripts, filesystem snapshots, large activity or
-output payloads, and UI initialization, so it is a failing lower-bound fixture,
-not a realistic full-application measurement. The 10 GB target and before/after
-comparison against the previous storage model remain unmeasured.
+These are optimized local synthetic measurements, not a platform-independent
+latency guarantee. The fixture includes small session/run snapshots and one
+session-created event per session; it omits runtime configuration, transcripts,
+filesystem snapshots, large activity/output payloads, and UI initialization.
+Thus the 81.3 MB result is not proof that realistic 100k state fits the target.
+The 10 GB target and before/after comparison against the previous storage model
+remain unmeasured. The persistence harness reports per-table/index allocation
+from SQLite `dbstat` to make future size work attributable rather than relying
+only on a total database file size.
 
 ## Saves scale with all retained history
 

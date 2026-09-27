@@ -17,6 +17,7 @@ use loom_protocol::{
     AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ServerEvent, ServerEventEnvelope,
 };
 use loom_session::SessionManager;
+use rusqlite::Connection;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_count = env::var("LOOM_SCALE_SESSIONS")
@@ -177,6 +178,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writeln!(output, "sessions: {session_count}; runs: {run_count}")?;
     writeln!(output, "durable reconnect events: {}", feed.events.len())?;
     writeln!(output, "database bytes: {database_bytes}")?;
+    let connection = Connection::open(&path)?;
+    let mut statement = connection.prepare(
+        "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC LIMIT 12",
+    )?;
+    let storage_objects = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    writeln!(output, "largest SQLite storage objects:")?;
+    for (name, bytes) in storage_objects {
+        writeln!(output, "  {name}: {bytes} bytes")?;
+    }
     writeln!(output, "one-transaction population: {}", fmt(write_elapsed))?;
     writeln!(
         output,

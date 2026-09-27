@@ -9,7 +9,10 @@ interrupted during planning, model execution, or evaluation are transactionally
 marked paused and hydrated only when a later operation needs their runtime;
 uncertain in-flight tool effects still use the eager recovery path.
 The redundant generic `models` section is no longer written or read; model
-discovery is reconstructed from the provider registry.
+discovery is reconstructed from the provider registry. Schema v33 stores run
+summary fields as typed columns instead of repeating them in a JSON snapshot;
+evidence remains in ordered child rows. This reduced the 100k synthetic store
+fixture by 28.3%.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at that

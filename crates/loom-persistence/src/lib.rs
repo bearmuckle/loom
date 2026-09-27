@@ -31,8 +31,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 32;
-const DATABASE_SCHEMA_VERSION: u32 = 32;
+pub const CURRENT_SCHEMA_VERSION: u32 = 33;
+const DATABASE_SCHEMA_VERSION: u32 = 33;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -74,6 +74,8 @@ CREATE INDEX IF NOT EXISTS sessions_archived
 CREATE TABLE IF NOT EXISTS run_summaries (
     run_id BLOB PRIMARY KEY NOT NULL CHECK(length(run_id) = 16),
     session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE CHECK(length(session_id) = 16),
+    attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+    control_revision INTEGER NOT NULL CHECK(control_revision >= 0),
     state TEXT NOT NULL CHECK(state IN (
         'planning', 'executing', 'awaiting_approval', 'paused', 'needs_input',
         'evaluating', 'completed', 'failed', 'cancelled'
@@ -81,7 +83,9 @@ CREATE TABLE IF NOT EXISTS run_summaries (
     started_at INTEGER NOT NULL CHECK(started_at >= 0),
     updated_at INTEGER NOT NULL CHECK(updated_at >= started_at),
     completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
-    snapshot TEXT NOT NULL CHECK(length(snapshot) <= 1048576),
+    task TEXT NOT NULL CHECK(length(task) <= 1048576),
+    model TEXT NOT NULL CHECK(length(model) <= 256),
+    summary TEXT CHECK(summary IS NULL OR length(summary) <= 1048576),
     input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
     output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
     cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
@@ -1973,8 +1977,8 @@ impl FilePersistence {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(&format!(
-                "SELECT run_id, session_id, state, started_at, updated_at, completed_at,
-                        snapshot, input_tokens, output_tokens, cached_input_tokens,
+                "SELECT run_id, session_id, attempt_id, control_revision, state, started_at, updated_at, completed_at,
+                        task, model, summary, input_tokens, output_tokens, cached_input_tokens,
                         tool_calls, cost_micros, elapsed_ms
                  FROM run_summaries {predicate}
                  ORDER BY updated_at DESC, run_id DESC {limit}"
@@ -1985,19 +1989,29 @@ impl FilePersistence {
         let rows = statement
             .query_map(params, |row| {
                 Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, i64>(11)?,
-                    row.get::<_, i64>(12)?,
+                    (
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ),
+                    (
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                    ),
+                    (
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, i64>(14)?,
+                        row.get::<_, i64>(15)?,
+                        row.get::<_, i64>(16)?,
+                    ),
                 ))
             })
             .map_err(|error| {
@@ -2006,31 +2020,44 @@ impl FilePersistence {
         let mut summaries = BTreeMap::new();
         for row in rows {
             let (
-                run_id,
-                session_id,
-                state,
-                started,
-                updated,
-                completed,
-                snapshot,
-                input_tokens,
-                output_tokens,
-                cached_input_tokens,
-                tool_calls,
-                cost_micros,
-                elapsed_ms,
+                (
+                    run_id,
+                    session_id,
+                    attempt_id,
+                    control_revision,
+                    state,
+                    started,
+                    updated,
+                    completed,
+                ),
+                (task, model, summary),
+                (
+                    input_tokens,
+                    output_tokens,
+                    cached_input_tokens,
+                    tool_calls,
+                    cost_micros,
+                    elapsed_ms,
+                ),
             ) = row.map_err(|error| {
                 persistence_error(format!("could not read run summaries: {error}"), true)
             })?;
             let run_id = RunId::from_uuid(decode_uuid(&run_id, "run id")?);
             let session_id = AgentSessionId::from_uuid(decode_uuid(&session_id, "run session id")?);
-            let snapshot: AgentRunSnapshot = serde_json::from_str(&snapshot).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    format!("persisted run summary is malformed: {error}"),
-                    false,
-                )
-            })?;
+            let snapshot = AgentRunSnapshot {
+                id: run_id,
+                session_id,
+                attempt_id: RunAttemptId::from_uuid(decode_uuid(&attempt_id, "run attempt id")?),
+                control_revision: decode_counter(control_revision, "run control revision")?,
+                task,
+                model: ModelId::new(model),
+                state: parse_run_state(&state)?,
+                started_at: decode_timestamp(started)?,
+                updated_at: decode_timestamp(updated)?,
+                completed_at: completed.map(decode_timestamp).transpose()?,
+                summary,
+                evidence: Vec::new(),
+            };
             let usage = UsageSnapshot {
                 input_tokens: decode_counter(input_tokens, "input tokens")?,
                 output_tokens: decode_counter(output_tokens, "output tokens")?,
@@ -2039,20 +2066,6 @@ impl FilePersistence {
                 cost_micros: decode_counter(cost_micros, "cost")?,
                 elapsed_ms: decode_counter(elapsed_ms, "elapsed time")?,
             };
-            let completed = completed.map(decode_timestamp).transpose()?;
-            if snapshot.id != run_id
-                || snapshot.session_id != session_id
-                || run_state_name(snapshot.state) != state
-                || snapshot.started_at != decode_timestamp(started)?
-                || snapshot.updated_at != decode_timestamp(updated)?
-                || snapshot.completed_at != completed
-            {
-                return Err(LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    "persisted run summary columns do not match its payload",
-                    false,
-                ));
-            }
             summaries.insert(
                 run_id,
                 DurableRunSummary {
@@ -5885,12 +5898,14 @@ fn save_run_summary_rows(
                 false,
             ));
         }
-        let mut snapshot_record = summary.snapshot.clone();
-        snapshot_record.evidence.clear();
-        let snapshot = serde_json::to_string(&snapshot_record).map_err(|error| {
-            persistence_error(format!("could not encode run summary: {error}"), false)
-        })?;
-        if snapshot.len() > 1024 * 1024 {
+        if summary.snapshot.task.len() > 1024 * 1024
+            || summary.snapshot.model.as_str().len() > 256
+            || summary
+                .snapshot
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.len() > 1024 * 1024)
+        {
             return Err(LoomError::new(
                 ErrorCode::Persistence,
                 "run summary exceeds its maximum supported size",
@@ -5902,16 +5917,21 @@ fn save_run_summary_rows(
         transaction
             .execute(
                 "INSERT INTO run_summaries(
-                    run_id, session_id, state, started_at, updated_at, completed_at, snapshot,
+                    run_id, session_id, attempt_id, control_revision, state, started_at, updated_at,
+                    completed_at, task, model, summary,
                     input_tokens, output_tokens, cached_input_tokens, tool_calls, cost_micros, elapsed_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(run_id) DO UPDATE SET
                     session_id=excluded.session_id,
+                    attempt_id=excluded.attempt_id,
+                    control_revision=excluded.control_revision,
                     state=excluded.state,
                     started_at=excluded.started_at,
                     updated_at=excluded.updated_at,
                     completed_at=excluded.completed_at,
-                    snapshot=excluded.snapshot,
+                    task=excluded.task,
+                    model=excluded.model,
+                    summary=excluded.summary,
                     input_tokens=excluded.input_tokens,
                     output_tokens=excluded.output_tokens,
                     cached_input_tokens=excluded.cached_input_tokens,
@@ -5919,11 +5939,15 @@ fn save_run_summary_rows(
                     cost_micros=excluded.cost_micros,
                     elapsed_ms=excluded.elapsed_ms
                  WHERE run_summaries.session_id IS NOT excluded.session_id
+                    OR run_summaries.attempt_id IS NOT excluded.attempt_id
+                    OR run_summaries.control_revision IS NOT excluded.control_revision
                     OR run_summaries.state IS NOT excluded.state
                     OR run_summaries.started_at IS NOT excluded.started_at
                     OR run_summaries.updated_at IS NOT excluded.updated_at
                     OR run_summaries.completed_at IS NOT excluded.completed_at
-                    OR run_summaries.snapshot IS NOT excluded.snapshot
+                    OR run_summaries.task IS NOT excluded.task
+                    OR run_summaries.model IS NOT excluded.model
+                    OR run_summaries.summary IS NOT excluded.summary
                     OR run_summaries.input_tokens IS NOT excluded.input_tokens
                     OR run_summaries.output_tokens IS NOT excluded.output_tokens
                     OR run_summaries.cached_input_tokens IS NOT excluded.cached_input_tokens
@@ -5933,6 +5957,8 @@ fn save_run_summary_rows(
                 params![
                     run_id_bytes.as_slice(),
                     session_id_bytes.as_slice(),
+                    summary.snapshot.attempt_id.as_uuid().as_bytes().as_slice(),
+                    encode_counter(summary.snapshot.control_revision, "run control revision")?,
                     run_state_name(summary.snapshot.state),
                     encode_timestamp(summary.snapshot.started_at)?,
                     encode_timestamp(summary.snapshot.updated_at)?,
@@ -5941,7 +5967,9 @@ fn save_run_summary_rows(
                         .completed_at
                         .map(encode_timestamp)
                         .transpose()?,
-                    snapshot,
+                    summary.snapshot.task,
+                    summary.snapshot.model.as_str(),
+                    summary.snapshot.summary,
                     encode_counter(summary.usage.input_tokens, "input token count")?,
                     encode_counter(summary.usage.output_tokens, "output token count")?,
                     encode_counter(summary.usage.cached_input_tokens, "cached input token count")?,
@@ -8751,7 +8779,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=30;")
+            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=32;")
             .unwrap();
         let original_journal_mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -8778,7 +8806,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 30);
+        assert_eq!(version, 32);
         assert_eq!(journal_mode, original_journal_mode);
         assert!(!has_feed_meta);
         fs::remove_file(path).unwrap();
@@ -9774,20 +9802,14 @@ mod tests {
             directory_plan.contains("sqlite_autoindex_session_directories_2"),
             "{directory_plan}"
         );
-        let summary_json: String = connection
+        let summary_text: Option<String> = connection
             .query_row(
-                "SELECT snapshot FROM run_summaries WHERE run_id=?1",
+                "SELECT summary FROM run_summaries WHERE run_id=?1",
                 [run_id.as_uuid().as_bytes().as_slice()],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            serde_json::from_str::<AgentRunSnapshot>(&summary_json)
-                .unwrap()
-                .evidence
-                .is_empty(),
-            "evidence belongs in typed rows rather than the snapshot payload"
-        );
+        assert_eq!(summary_text.as_deref(), Some("finished"));
         let plan_rows: i64 = connection
             .query_row(
                 "SELECT count(*) FROM run_plan_steps WHERE run_id=?1",
