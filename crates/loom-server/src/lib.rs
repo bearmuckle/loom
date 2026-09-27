@@ -7163,6 +7163,34 @@ mod tests {
         };
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].session_id, session_id);
+
+        let initial = connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionInitialState { session_id },
+        ));
+        let ServerResponse::AgentSessionInitialState(initial) = initial.result.unwrap() else {
+            panic!("unexpected initial state response");
+        };
+        assert_eq!(initial.cursor, events[0].sequence);
+        let renamed = connection.request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+            session_id,
+            name: "Renamed after snapshot".to_owned(),
+        }));
+        assert!(matches!(
+            renamed.result,
+            Ok(ServerResponse::AgentSessionRenamed(_))
+        ));
+        let resumed = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            after_sequence: Some(initial.cursor),
+        }));
+        let ServerResponse::SessionEvents { events } = resumed.result.unwrap() else {
+            panic!("unexpected incremental event response");
+        };
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].event,
+            ServerEvent::AgentSessionRenamed { .. }
+        ));
     }
 
     #[test]
