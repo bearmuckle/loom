@@ -12503,6 +12503,8 @@ mod loom_view_render_tests {
                         provider: local_provider_id,
                         display_name: "Gateway model".to_owned(),
                         context_window: Some(32_000),
+                        max_input_tokens: None,
+                        max_output_tokens: None,
                         capabilities: ModelCapabilities::default(),
                     }],
                     credential_id: Some("gateway-key".to_owned()),

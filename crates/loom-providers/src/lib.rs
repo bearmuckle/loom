@@ -382,6 +382,8 @@ impl ProviderConfig {
                 provider: id,
                 display_name: "OpenAI model".to_owned(),
                 context_window: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
                 capabilities: ModelCapabilities {
                     streaming: true,
                     tool_calling: true,
@@ -402,6 +404,8 @@ impl ProviderConfig {
             provider: ProviderId::new("ollama"),
             display_name: "Ollama local model".to_owned(),
             context_window: Some(32_768),
+            max_input_tokens: None,
+            max_output_tokens: None,
             capabilities: ModelCapabilities {
                 streaming: false,
                 tool_calling: true,
@@ -451,6 +455,8 @@ pub fn github_copilot_descriptor() -> ModelDescriptor {
         provider: ProviderId::new(GITHUB_COPILOT_PROVIDER_ID),
         display_name: "GitHub Copilot GPT-6 Luna".to_owned(),
         context_window: Some(128_000),
+        max_input_tokens: Some(8_192),
+        max_output_tokens: Some(4_096),
         capabilities: ModelCapabilities {
             streaming: false,
             tool_calling: true,
@@ -714,6 +720,8 @@ impl ProviderRegistry {
                     provider: ProviderId::new("openai-compatible"),
                     display_name: "OpenAI-compatible demo model".to_owned(),
                     context_window: Some(16_384),
+                    max_input_tokens: None,
+                    max_output_tokens: None,
                     capabilities: ModelCapabilities {
                         streaming: false,
                         tool_calling: true,
@@ -1039,6 +1047,20 @@ impl ProviderRegistry {
                             .iter()
                             .find(|configured| configured.id.as_str() == id)
                             .and_then(|configured| configured.context_window)
+                    }),
+                    max_input_tokens: discovered_input_tokens(model).or_else(|| {
+                        config
+                            .models
+                            .iter()
+                            .find(|configured| configured.id.as_str() == id)
+                            .and_then(|configured| configured.max_input_tokens)
+                    }),
+                    max_output_tokens: discovered_output_tokens(model).or_else(|| {
+                        config
+                            .models
+                            .iter()
+                            .find(|configured| configured.id.as_str() == id)
+                            .and_then(|configured| configured.max_output_tokens)
                     }),
                     capabilities: config
                         .models
@@ -1606,6 +1628,8 @@ pub fn deterministic_descriptor() -> ModelDescriptor {
         provider: ProviderId::new("deterministic"),
         display_name: "Deterministic M1 demo".to_owned(),
         context_window: Some(16_384),
+        max_input_tokens: None,
+        max_output_tokens: None,
         capabilities: ModelCapabilities {
             streaming: true,
             tool_calling: true,
@@ -1745,6 +1769,8 @@ impl GitHubCopilotProvider {
                 provider: ProviderId::new(GITHUB_COPILOT_PROVIDER_ID),
                 display_name: "GitHub Copilot model".to_owned(),
                 context_window: Some(128_000),
+                max_input_tokens: None,
+                max_output_tokens: None,
                 capabilities: ModelCapabilities {
                     streaming: false,
                     tool_calling: true,
@@ -1847,6 +1873,10 @@ impl GitHubCopilotProvider {
                                 .then_some(self.descriptor.context_window)
                                 .flatten()
                         }),
+                        max_input_tokens: discovered_input_tokens(model)
+                            .or(self.descriptor.max_input_tokens),
+                        max_output_tokens: discovered_output_tokens(model)
+                            .or(self.descriptor.max_output_tokens),
                         capabilities: self.descriptor.capabilities.clone(),
                     },
                     github_copilot_supports_tool_calls(model),
@@ -1943,7 +1973,6 @@ fn openai_model_supported(model: &str) -> bool {
 fn discovered_context_window(model: &serde_json::Value) -> Option<u32> {
     [
         "/capabilities/limits/max_context_window_tokens",
-        "/capabilities/limits/max_prompt_tokens",
         "/context_length",
     ]
     .iter()
@@ -1951,6 +1980,27 @@ fn discovered_context_window(model: &serde_json::Value) -> Option<u32> {
     .filter_map(|value| u32::try_from(value).ok())
     .filter(|value| *value > 0)
     .min()
+}
+
+fn discovered_input_tokens(model: &serde_json::Value) -> Option<u32> {
+    [
+        "/capabilities/limits/max_prompt_tokens",
+        "/capabilities/limits/max_input_tokens",
+    ]
+    .iter()
+    .filter_map(|path| model.pointer(path).and_then(serde_json::Value::as_u64))
+    .filter_map(|value| u32::try_from(value).ok())
+    .filter(|value| *value > 0)
+    .min()
+}
+
+fn discovered_output_tokens(model: &serde_json::Value) -> Option<u32> {
+    ["/capabilities/limits/max_output_tokens"]
+        .iter()
+        .filter_map(|path| model.pointer(path).and_then(serde_json::Value::as_u64))
+        .filter_map(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .min()
 }
 
 fn github_copilot_supports_tool_calls(model: &serde_json::Value) -> bool {
@@ -2046,6 +2096,8 @@ impl OpenAiCompatibleProvider {
                 provider: ProviderId::new("openai-compatible"),
                 display_name: "OpenAI-compatible model".to_owned(),
                 context_window: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
                 capabilities: ModelCapabilities {
                     streaming: false,
                     tool_calling: true,
@@ -2166,6 +2218,8 @@ impl OllamaProvider {
             provider: ProviderId::new("ollama"),
             display_name: "Ollama local model".to_owned(),
             context_window: Some(32_768),
+            max_input_tokens: None,
+            max_output_tokens: None,
             capabilities: ModelCapabilities {
                 streaming: false,
                 tool_calling: true,
@@ -3475,6 +3529,47 @@ mod tests {
                 }) if message == expected
             ));
         }
+
+        let mut decoder = StreamDecoder::responses("copilot".to_owned());
+        let mut sink = CollectingSink::default();
+        decoder
+            .accept(
+                &serde_json::json!({
+                    "type":"response.output_text.delta",
+                    "delta":"partial answer"
+                }),
+                &mut BTreeMap::new(),
+                &mut sink,
+            )
+            .unwrap();
+        decoder
+            .accept(
+                &serde_json::json!({
+                    "type":"response.incomplete",
+                    "response":{
+                        "status":"incomplete",
+                        "incomplete_details":{"reason":"max_output_tokens"},
+                        "usage":{"input_tokens":17,"output_tokens":3}
+                    }
+                }),
+                &mut BTreeMap::new(),
+                &mut sink,
+            )
+            .unwrap();
+        decoder.finish(&mut sink).unwrap();
+        assert!(matches!(
+            sink.events.as_slice(),
+            [
+                ModelStreamEvent::TextDelta { text },
+                ModelStreamEvent::Usage { usage },
+                ModelStreamEvent::Completed {
+                    reason: FinishReason::ErrorWithMessage { message }
+                }
+            ] if text == "partial answer"
+                && usage.input_tokens == 17
+                && usage.output_tokens == 3
+                && message == "copilot response was incomplete: max_output_tokens"
+        ));
     }
 
     #[test]
@@ -3535,8 +3630,17 @@ mod tests {
             discovered_context_window(
                 &serde_json::json!({"capabilities": {"limits": {"max_context_window_tokens": 64000, "max_prompt_tokens": 32000}}})
             ),
-            Some(32000)
+            Some(64000)
         );
+        let limits = serde_json::json!({
+            "capabilities": {"limits": {
+                "max_context_window_tokens": 64000,
+                "max_prompt_tokens": 32000,
+                "max_output_tokens": 8192
+            }}
+        });
+        assert_eq!(discovered_input_tokens(&limits), Some(32_000));
+        assert_eq!(discovered_output_tokens(&limits), Some(8_192));
         for model in [
             serde_json::json!({}),
             serde_json::json!({"context_length": 0}),
@@ -3568,7 +3672,7 @@ mod tests {
                 &mut models_stream,
                 "application/json",
                 r#"{"data":[
-                    {"id":"agentic-model","capabilities":{"supports":{"tool_calls":true},"limits":{"max_context_window_tokens":64000,"max_prompt_tokens":32000}}},
+                    {"id":"agentic-model","capabilities":{"supports":{"tool_calls":true},"limits":{"max_context_window_tokens":64000,"max_prompt_tokens":32000,"max_output_tokens":8192}}},
                     {"id":"chat-model","capabilities":{"supports":{"tool_calls":false}}},
                     {"id":"unknown-model","capabilities":{"supports":{}}}
                 ]}"#,
@@ -3584,7 +3688,9 @@ mod tests {
         );
 
         let models = provider.discover_models().unwrap();
-        assert_eq!(models[0].context_window, Some(32_000));
+        assert_eq!(models[0].context_window, Some(64_000));
+        assert_eq!(models[0].max_input_tokens, Some(32_000));
+        assert_eq!(models[0].max_output_tokens, Some(8_192));
 
         assert_eq!(
             models
@@ -4072,6 +4178,8 @@ mod tests {
             provider: ProviderId::new("fixture"),
             display_name: "Fixture model".to_owned(),
             context_window: Some(8_000),
+            max_input_tokens: None,
+            max_output_tokens: None,
             capabilities: ModelCapabilities::default(),
         };
 
@@ -4136,6 +4244,8 @@ mod tests {
             provider: ProviderId::new("fixture"),
             display_name: "Second model".to_owned(),
             context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
             capabilities: ModelCapabilities::default(),
         };
         registry
@@ -4185,6 +4295,8 @@ mod tests {
             provider: copilot_provider,
             display_name: "Untrusted saved model".to_owned(),
             context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
             capabilities: ModelCapabilities::default(),
         });
         configs.push(ProviderConfig::github_copilot(CredentialRef::new(
@@ -4234,6 +4346,8 @@ mod tests {
                         provider: provider_id,
                         display_name: "Model".to_owned(),
                         context_window: None,
+                        max_input_tokens: None,
+                        max_output_tokens: None,
                         capabilities: ModelCapabilities::default(),
                     },
                     Some(old_reference.clone()),
@@ -4306,6 +4420,8 @@ mod tests {
             provider: provider_id.clone(),
             display_name: "Fixture model".to_owned(),
             context_window: None,
+            max_input_tokens: None,
+            max_output_tokens: None,
             capabilities: ModelCapabilities::default(),
         };
 
@@ -4431,6 +4547,8 @@ mod tests {
             provider: ProviderId::new("gateway"),
             display_name: "Configured model".to_owned(),
             context_window: Some(4_096),
+            max_input_tokens: None,
+            max_output_tokens: None,
             capabilities: ModelCapabilities {
                 tool_calling: true,
                 ..Default::default()
@@ -4560,6 +4678,8 @@ mod tests {
             provider: ProviderId::new(GITHUB_COPILOT_PROVIDER_ID),
             display_name: "GitHub Copilot".to_owned(),
             context_window: Some(128_000),
+            max_input_tokens: None,
+            max_output_tokens: None,
             capabilities: ModelCapabilities::default(),
         };
         let mut provider = GitHubCopilotProvider::with_endpoints(
