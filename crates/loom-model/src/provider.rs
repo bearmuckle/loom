@@ -262,6 +262,10 @@ pub struct ProviderSummary {
     pub display_name: String,
     pub models: Vec<ModelDescriptor>,
     pub credential_id: Option<String>,
+    /// Whether this backend supports configuring this provider with an API key.
+    /// Missing on older peers, where it defaults to false.
+    #[serde(default)]
+    pub api_key_configurable: bool,
     pub health: ProviderHealth,
 }
 

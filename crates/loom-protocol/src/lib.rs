@@ -472,6 +472,10 @@ pub enum ClientRequest {
     ConfigureGitHubCopilot {
         access_token: String,
     },
+    ConfigureApiKeyProvider {
+        provider_id: ProviderId,
+        api_key: String,
+    },
     StartGitHubCopilotLogin,
     GetGitHubCopilotLoginStatus {
         login_id: String,
@@ -580,6 +584,7 @@ impl ClientRequest {
             Self::ListModels => None,
             Self::ListProviders => Some(Capability::ListProviders),
             Self::ConfigureGitHubCopilot { .. }
+            | Self::ConfigureApiKeyProvider { .. }
             | Self::StartGitHubCopilotLogin
             | Self::GetGitHubCopilotLoginStatus { .. } => Some(Capability::ConfigureProviders),
             Self::DiscoverProviderModels { .. } => Some(Capability::ListProviders),

@@ -1384,6 +1384,7 @@ pub(crate) struct LoomView {
     pub(crate) about_open: bool,
     pub(crate) providers: Vec<ProviderSummary>,
     providers_node_id: Option<String>,
+    provider_api_key_input: Option<Entity<InputState>>,
     pub(crate) theme_choice: ThemeChoice,
     appearance_subscription: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
@@ -1763,6 +1764,7 @@ impl LoomView {
             about_open: false,
             providers: Vec::new(),
             providers_node_id: None,
+            provider_api_key_input: None,
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -2139,6 +2141,7 @@ impl LoomView {
             about_open: false,
             providers: Vec::new(),
             providers_node_id: None,
+            provider_api_key_input: None,
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -2302,6 +2305,7 @@ impl LoomView {
             about_open: false,
             providers: Vec::new(),
             providers_node_id: None,
+            provider_api_key_input: None,
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -2519,6 +2523,7 @@ impl LoomView {
             about_open: false,
             providers: Vec::new(),
             providers_node_id: None,
+            provider_api_key_input: None,
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -2747,8 +2752,24 @@ impl LoomView {
         }
         cx.spawn(async move |view, cx| {
             let result = list_models_from_backend(&backend).await;
+            let provider_response = backend
+                .submit(RequestEnvelope::new(ClientRequest::ListProviders))
+                .wait()
+                .await;
             view.update(cx, |view, cx| {
                 view.model_refreshes_in_flight.remove(&node_id);
+                if view.providers_node_id.as_deref() == Some(node_id.as_str()) {
+                    match provider_response.result {
+                        Ok(ServerResponse::Providers { providers }) => {
+                            view.providers = providers;
+                        }
+                        Err(error) => view.record_backend_error("list providers", error),
+                        Ok(response) => view.record_backend_error(
+                            "list providers",
+                            unexpected_response("provider list", response),
+                        ),
+                    }
+                }
                 match result {
                     Ok(catalog) => {
                         view.record_model_discovery_errors(catalog.discovery_errors);
@@ -6073,13 +6094,73 @@ impl LoomView {
         cx.notify();
     }
 
+    fn configure_api_key_provider(
+        &mut self,
+        provider_id: loom_model::ProviderId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node_id) = self.providers_node_id.clone() else {
+            return;
+        };
+        let api_key = self
+            .provider_api_key_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        if api_key.trim().is_empty() {
+            self.record_status("Enter an API key before configuring the provider");
+            return;
+        }
+        if !self
+            .node_backends
+            .get(&node_id)
+            .is_some_and(BackendWorker::secure_for_secrets)
+        {
+            self.record_status(
+                "Provider API keys require a secure worker connection (wss:// or loopback ws://)",
+            );
+            return;
+        }
+        if let Some(input) = &self.provider_api_key_input {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        self.dispatch_to_node(
+            cx,
+            node_id.clone(),
+            ClientRequest::ConfigureApiKeyProvider {
+                provider_id,
+                api_key,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::ProviderConfigured) => {
+                    view.record_status(format!("Provider configured on {node_id}"));
+                    view.open_providers_for_node(node_id, cx);
+                    view.refresh_models_for_node_async(
+                        view.providers_node_id.clone().unwrap_or_default(),
+                        cx,
+                    );
+                }
+                Err(error) => view.record_backend_error("configure provider", error),
+                Ok(response) => view.record_backend_error(
+                    "configure provider",
+                    unexpected_response("provider configuration", response),
+                ),
+            },
+        );
+    }
+
     pub(crate) fn close_providers(
         &mut self,
         _: &ClickEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.providers_open = false;
+        if let Some(input) = &self.provider_api_key_input {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        self.provider_api_key_input = None;
         cx.notify();
     }
 
@@ -9115,6 +9196,26 @@ impl LoomView {
         let github_models = github_provider.map_or(0, |provider| provider.models.len());
 
         let mut local_body = div().flex().flex_col().gap_1();
+        if local_providers
+            .iter()
+            .any(|provider| provider.api_key_configurable)
+            && let Some(input) = self.provider_api_key_input.as_ref()
+        {
+            local_body = local_body.child(
+                div()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(0x171c25))
+                    .border_1()
+                    .border_color(rgb(0x293244))
+                    .child("Enter a provider API key")
+                    .child(
+                        div()
+                            .mt_2()
+                            .child(KitInput::new(input).id("provider-api-key-input").small()),
+                    ),
+            );
+        }
         if local_providers.is_empty() {
             local_body = local_body.child(
                 div()
@@ -9129,28 +9230,79 @@ impl LoomView {
             );
         } else {
             for provider in local_providers {
-                local_body =
-                    local_body.child(
+                let api_key_configurable = provider.api_key_configurable;
+                let provider_id = provider.id.clone();
+                let mut provider_card = div()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(0x171c25))
+                    .border_1()
+                    .border_color(rgb(0x293244))
+                    .child(
                         div()
-                            .p_3()
-                            .rounded_lg()
-                            .bg(rgb(0x171c25))
-                            .border_1()
-                            .border_color(rgb(0x293244))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0xf3f4f6))
-                                    .child(provider.display_name.clone()),
-                            )
-                            .child(div().mt_1().text_xs().text_color(rgb(0x8f98a6)).child(
-                                format!(
-                                    "{} model{} available",
-                                    provider.models.len(),
-                                    if provider.models.len() == 1 { "" } else { "s" }
-                                ),
+                            .text_sm()
+                            .text_color(rgb(0xf3f4f6))
+                            .child(provider.display_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(rgb(0x8f98a6))
+                            .child(format!(
+                                "{} model{} available",
+                                provider.models.len(),
+                                if provider.models.len() == 1 { "" } else { "s" }
                             )),
+                    )
+                    .child(div().mt_1().text_xs().text_color(rgb(0x8f98a6)).child(
+                        if provider.credential_id.is_some() {
+                            "API key configured".to_owned()
+                        } else {
+                            "API key not configured".to_owned()
+                        },
+                    ));
+                if api_key_configurable {
+                    provider_card = provider_card.child(
+                        div()
+                            .id(format!("configure-api-key-{}", provider.id.as_str()))
+                            .mt_2()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .bg(rgb(0x242833))
+                            .hover(|style| style.bg(rgb(0x293244)))
+                            .text_sm()
+                            .cursor_pointer()
+                            .child("Save API key")
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.configure_api_key_provider(provider_id.clone(), window, cx);
+                            })),
                     );
+                    if provider.credential_id.is_some() {
+                        let node_id = self
+                            .providers_node_id
+                            .clone()
+                            .unwrap_or_else(|| self.default_backend_node_id.clone());
+                        provider_card = provider_card.child(
+                            div()
+                                .id(format!("refresh-provider-models-{}", provider.id.as_str()))
+                                .mt_1()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x242833))
+                                .hover(|style| style.bg(rgb(0x293244)))
+                                .text_sm()
+                                .cursor_pointer()
+                                .child("Refresh models")
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.refresh_models_for_node_async(node_id.clone(), cx);
+                                })),
+                        );
+                    }
+                }
+                local_body = local_body.child(provider_card);
             }
         }
 
@@ -9634,6 +9786,19 @@ impl Render for LoomView {
                 },
             ));
             self.rename_input_state = Some(input);
+        }
+        if self.providers_open && self.provider_api_key_input.is_none() {
+            self.provider_api_key_input = Some(cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Provider API key")
+                    .masked(true)
+            }));
+        }
+        if !self.providers_open {
+            if let Some(input) = &self.provider_api_key_input {
+                input.update(cx, |state, cx| state.set_value("", window, cx));
+            }
+            self.provider_api_key_input = None;
         }
         if let Some(path) = self.pending_source_path.take() {
             let input = cx.new(|cx| {
@@ -12100,6 +12265,7 @@ mod loom_view_render_tests {
                         capabilities: ModelCapabilities::default(),
                     }],
                     credential_id: Some("gateway-key".to_owned()),
+                    api_key_configurable: true,
                     health: ProviderHealth::default(),
                 },
                 ProviderSummary {
@@ -12108,6 +12274,7 @@ mod loom_view_render_tests {
                     display_name: "GitHub Copilot".to_owned(),
                     models: Vec::new(),
                     credential_id: None,
+                    api_key_configurable: false,
                     health: ProviderHealth::default(),
                 },
                 ProviderSummary {
@@ -12116,6 +12283,7 @@ mod loom_view_render_tests {
                     display_name: "Ollama".to_owned(),
                     models: Vec::new(),
                     credential_id: None,
+                    api_key_configurable: false,
                     health: ProviderHealth::default(),
                 },
             ];

@@ -96,10 +96,12 @@ The hook runs `cargo fmt --all -- --check`. CI also runs Clippy, tests, and
 build checks.
 
 Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
-`LOOM_MODEL`, or connect to a remote backend with `LOOM_REMOTE_URL` and
-`LOOM_TOKEN`. GitHub Copilot login is available in the UI. Treat provider
-credentials as sensitive; they are used by the backend, and backend state
-storage is not an encrypted secret vault.
+`LOOM_MODEL`, or enter an API key for a supported configured provider in the
+Providers dialog. API keys entered there are stored in a credential file next
+to that backend's SQLite database, separately for each backend installation.
+GitHub Copilot login is available in the UI. Treat provider credentials as
+sensitive; they are used by the backend, and backend state storage is not an
+encrypted secret vault.
 
 ## Contributing
 
