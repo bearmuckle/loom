@@ -34,6 +34,10 @@ request IDs retain their bounded compatibility cache.
 Schema v38 stores content objects up to 4 KiB inline, compressing them when that
 saves at least ten percent. Larger objects retain the chunked, shared-blob
 representation and bounded range reads.
+Schema v39 stores each reconnect event's workspace ID beside its session ID,
+with an index over workspace and global sequence. Per-workspace retained
+boundaries make a workspace stream's stale-cursor check independent of events
+from other workspaces; older schemas remain rejected without migration.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at that
@@ -42,8 +46,9 @@ Sequence values remain globally allocated. Startup loads only the feed header;
 event payloads and per-session retained-boundary metadata load on demand. Cursor
 requests now pair the session scope and sequence with the backend's random node
 identity. A backend restart invalidates the previous epoch and forces an
-authoritative resync. Dedicated store epochs and workspace-scoped streams remain
-unfinished; aggregate retained feed size grows with the number of sessions.
+authoritative resync. Workspace-scoped event reads use the same global sequence
+and backend epoch, but track workspace-specific retained boundaries. Aggregate
+retained feed size still grows with the number of sessions.
 Message role, run/session ownership, order, tool-call metadata, and content
 references are stored separately from runtime execution state. Message-emitted
 tool calls are ordered child rows, and their argument JSON is shared through
@@ -406,12 +411,16 @@ full event payloads. Initial projection reads use before/after sequence checks;
 event reads report no cursor later than the read cursor or latest included event.
 Clients request a fresh initial state when retention invalidates the first cursor.
 Session cursors now include a backend-instance epoch and a mismatch returns an
-authoritative snapshot. Snapshot projection still checks its sequence before
-and after reading, then fetches events from that cursor; this closes the ordinary
-snapshot/subscription gap but is not a single database read transaction. There
-is no workspace stream, and global pressure may expire a quiet session's entire
-retained feed. Compact revision notifications and transactionally captured
-snapshot cursors remain target work.
+authoritative snapshot. Workspace-scoped reads use that epoch and a materialized
+workspace index over the same global sequence, with workspace-specific pruning
+boundaries. They aggregate session-addressed events and stale snapshots include
+the current session catalog. Workspace-only changes such as renames or config
+updates do not yet emit feed rows. Snapshot projection still checks its sequence
+before and after reading, then fetches events from that cursor; this closes the
+ordinary snapshot/subscription gap but is not a single database read transaction.
+Global pressure may expire a quiet session's entire retained feed. Compact
+revision notifications and transactionally captured snapshot cursors remain
+target work.
 
 An expired cursor returns `ResyncRequired`, followed by an authoritative snapshot
 with a fresh cursor read in the same SQLite read transaction. Subscribe after that
@@ -613,11 +622,11 @@ Implement in this order:
    and refresh that session. The SQLite history page query is bounded and avoids
    hydrating retained history, but its request refresh still polls the selected
    filesystem service for external changes.
-5. Finish scoped feeds, retention policy, and storage maintenance. Session
-   cursors now include a backend-instance epoch; add workspace streams and
-   capture the snapshot cursor transactionally. Define the cadence for queued
-   content-GC candidates and remove section exports and mirrored in-memory
-   journals completely.
+5. Finish scoped feeds, retention policy, and storage maintenance. Session and
+   workspace streams now use indexed durable cursors; capture the snapshot and
+   its cursor transactionally, and add workspace-only change notifications.
+   Define the cadence for queued content-GC candidates and remove section
+   exports and mirrored in-memory journals completely.
 
 This release has a clean start only. It does not copy, import, rename, or remove
 an existing state database. When the configured path contains an unsupported

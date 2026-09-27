@@ -18,8 +18,8 @@ use loom_core::{
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedSessionCursor, DurableFeedState, DurableFilesystemEdit,
-    DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
+    CURRENT_SCHEMA_VERSION, DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor,
+    DurableFilesystemEdit, DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
     DurableRunContextCheckpoint, DurableRunMessage, DurableRunRuntimeConfig, DurableRunSummary,
     DurableSessionSettings, DurableStateWrite, FilePersistence,
 };
@@ -698,6 +698,55 @@ impl EventJournal {
             })
             .cloned()
             .collect()
+    }
+
+    fn workspace_events_since(
+        &self,
+        session_ids: &BTreeSet<AgentSessionId>,
+        after_sequence: Option<EventSequence>,
+    ) -> Vec<ServerEventEnvelope> {
+        self.events
+            .iter()
+            .filter(|event| {
+                session_ids.contains(&event.session_id)
+                    && after_sequence.is_none_or(|sequence| event.sequence > sequence)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn workspace_oldest_sequence(
+        &self,
+        session_ids: &BTreeSet<AgentSessionId>,
+    ) -> Option<EventSequence> {
+        self.events
+            .iter()
+            .find(|event| session_ids.contains(&event.session_id))
+            .map(|event| event.sequence)
+    }
+
+    fn workspace_latest_sequence(
+        &self,
+        session_ids: &BTreeSet<AgentSessionId>,
+    ) -> Option<EventSequence> {
+        self.events
+            .iter()
+            .rev()
+            .find(|event| session_ids.contains(&event.session_id))
+            .map(|event| event.sequence)
+    }
+
+    fn workspace_cursor_is_stale(
+        &self,
+        session_ids: &BTreeSet<AgentSessionId>,
+        after_sequence: Option<EventSequence>,
+    ) -> bool {
+        let (Some(after), Some(oldest)) =
+            (after_sequence, self.workspace_oldest_sequence(session_ids))
+        else {
+            return false;
+        };
+        after.next() < oldest
     }
 
     fn recent_events(&self, session_id: AgentSessionId, limit: usize) -> Vec<ServerEventEnvelope> {
@@ -3586,6 +3635,32 @@ impl InProcessConnection {
         Ok(deduplicate_events(events))
     }
 
+    fn workspace_events_since(
+        &self,
+        workspace_id: WorkspaceId,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        let session_ids = self
+            .backend
+            .sessions()?
+            .list_in_workspace(Some(workspace_id), true)
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<BTreeSet<_>>();
+        let mut events = match &self.backend.persistence {
+            Some(persistence) => {
+                persistence.load_feed_workspace_events_since(workspace_id, after_sequence)?
+            }
+            None => Vec::new(),
+        };
+        events.extend(
+            self.backend
+                .journal()?
+                .workspace_events_since(&session_ids, after_sequence),
+        );
+        Ok(deduplicate_events(events))
+    }
+
     fn session_events_with_safe_cursor(
         &self,
         session_id: AgentSessionId,
@@ -3629,6 +3704,38 @@ impl InProcessConnection {
             .map(|persistence| persistence.load_feed_session_cursor(session_id))
             .transpose()
             .map(Option::flatten)
+    }
+
+    fn feed_workspace_cursor(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<DurableFeedWorkspaceCursor>> {
+        self.backend
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.load_feed_workspace_cursor(workspace_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn latest_workspace_event_sequence(&self, workspace_id: WorkspaceId) -> Result<EventSequence> {
+        let session_ids = self
+            .backend
+            .sessions()?
+            .list_in_workspace(Some(workspace_id), true)
+            .into_iter()
+            .map(|session| session.id)
+            .collect::<BTreeSet<_>>();
+        let durable = self
+            .feed_workspace_cursor(workspace_id)?
+            .map(|cursor| cursor.latest_sequence)
+            .unwrap_or_default();
+        let live = self
+            .backend
+            .journal()?
+            .workspace_latest_sequence(&session_ids)
+            .unwrap_or_default();
+        Ok(durable.max(live))
     }
 
     fn latest_session_event_sequence(&self, session_id: AgentSessionId) -> Result<EventSequence> {
@@ -4513,11 +4620,17 @@ impl InProcessConnection {
             ClientRequest::ArchiveAgentSession { session_id } => self.archive_session(session_id),
             ClientRequest::GetSessionEvents {
                 session_id,
+                workspace_id,
                 after_sequence,
                 stream_epoch,
             } => {
+                if session_id.is_some() && workspace_id.is_some() {
+                    return Err(LoomError::invalid_request(
+                        "session_id and workspace_id cannot both scope an event stream",
+                    ));
+                }
                 let current_stream_epoch = Some(self.backend.node_id.clone());
-                let stream_epoch_changed = session_id.is_some()
+                let stream_epoch_changed = (session_id.is_some() || workspace_id.is_some())
                     && stream_epoch
                         .as_deref()
                         .is_some_and(|epoch| Some(epoch) != current_stream_epoch.as_deref());
@@ -4526,6 +4639,79 @@ impl InProcessConnection {
                 } else {
                     after_sequence
                 };
+                if let Some(workspace_id) = workspace_id {
+                    self.backend.workspace_records()?.get(workspace_id)?;
+                    let events = self.workspace_events_since(workspace_id, after_sequence)?;
+                    let durable_cursor = self.feed_workspace_cursor(workspace_id)?;
+                    let latest_sequence = self.latest_workspace_event_sequence(workspace_id)?;
+                    let journal = self.backend.journal()?;
+                    let session_ids = self
+                        .backend
+                        .sessions()?
+                        .list_in_workspace(Some(workspace_id), true)
+                        .into_iter()
+                        .map(|session| session.id)
+                        .collect::<BTreeSet<_>>();
+                    // EventJournal.next_sequence stores the last assigned global sequence.
+                    let global_head_sequence = journal.next_sequence;
+                    let history_missing = after_sequence.is_none()
+                        && session_ids.iter().any(|session_id| {
+                            !events.iter().any(|event| {
+                                event.session_id == *session_id
+                                    && matches!(
+                                        &event.event,
+                                        loom_protocol::ServerEvent::AgentSessionCreated { .. }
+                                            | loom_protocol::ServerEvent::AgentSessionForked { .. }
+                                    )
+                            })
+                        });
+                    let cursor_stale = stream_epoch_changed
+                        || history_missing
+                        || match (durable_cursor, after_sequence) {
+                            (Some(cursor), Some(after)) => {
+                                after < cursor.pruned_through
+                                    || after > global_head_sequence
+                                    || (after > cursor.latest_sequence
+                                        && journal.workspace_cursor_is_stale(
+                                            &session_ids,
+                                            after_sequence,
+                                        ))
+                            }
+                            (Some(cursor), None) => cursor.pruned_through.value() > 0,
+                            (None, Some(after)) => {
+                                after > global_head_sequence
+                                    || journal
+                                        .workspace_cursor_is_stale(&session_ids, after_sequence)
+                            }
+                            (None, None) => false,
+                        };
+                    if cursor_stale {
+                        let oldest_sequence = durable_cursor
+                            .and_then(|cursor| cursor.oldest_retained_sequence)
+                            .or_else(|| journal.workspace_oldest_sequence(&session_ids))
+                            .or_else(|| {
+                                durable_cursor
+                                    .filter(|cursor| cursor.pruned_through.value() > 0)
+                                    .map(|cursor| cursor.pruned_through.next())
+                            })
+                            .unwrap_or_else(|| latest_sequence.next());
+                        return Ok(ServerResponse::WorkspaceEventsSnapshot {
+                            workspace_id,
+                            sessions: self
+                                .backend
+                                .sessions()?
+                                .list_in_workspace(Some(workspace_id), true),
+                            events,
+                            oldest_sequence,
+                            latest_sequence,
+                            stream_epoch: current_stream_epoch,
+                        });
+                    }
+                    return Ok(ServerResponse::SessionEvents {
+                        events,
+                        stream_epoch: current_stream_epoch,
+                    });
+                }
                 let (events, session_latest_sequence) = match session_id {
                     Some(session_id) => {
                         let (events, latest) =
@@ -5452,8 +5638,13 @@ impl InProcessConnection {
             } => session_id = Some(*requested_session),
             ClientRequest::GetSessionEvents {
                 session_id: requested_session,
+                workspace_id: None,
                 ..
             } => session_id = *requested_session,
+            ClientRequest::GetSessionEvents {
+                workspace_id: Some(requested_workspace),
+                ..
+            } => workspace_id = Some(*requested_workspace),
             ClientRequest::GetRecentSessionEvents {
                 session_id: requested_session,
                 ..
@@ -5700,6 +5891,7 @@ impl InProcessConnection {
                 request,
                 ClientRequest::GetSessionEvents {
                     session_id: None,
+                    workspace_id: None,
                     ..
                 }
             )
@@ -7404,6 +7596,7 @@ mod tests {
             let events =
                 connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(fork_session_id),
+                    workspace_id: None,
                     after_sequence: None,
                     stream_epoch: None,
                 }));
@@ -7680,6 +7873,7 @@ mod tests {
 
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: None,
             stream_epoch: None,
         }));
@@ -7706,6 +7900,7 @@ mod tests {
         ));
         let resumed = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: Some(initial.cursor),
             stream_epoch: None,
         }));
@@ -7782,6 +7977,7 @@ mod tests {
             let response =
                 connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
+                    workspace_id: None,
                     after_sequence: after,
                     stream_epoch: None,
                 }));
@@ -7917,6 +8113,7 @@ mod tests {
         ));
         let history = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: None,
             stream_epoch: None,
         }));
@@ -8293,6 +8490,7 @@ mod tests {
         await_settled_run(&connection, run_id);
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: None,
             stream_epoch: None,
         }));
@@ -8402,6 +8600,7 @@ mod tests {
             let events = match connection
                 .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
+                    workspace_id: None,
                     after_sequence: None,
                     stream_epoch: None,
                 }))
@@ -8637,6 +8836,7 @@ mod tests {
         );
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: None,
             stream_epoch: None,
         }));
@@ -8695,6 +8895,7 @@ mod tests {
                 let events = match connection
                     .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                         session_id: Some(session_id),
+                        workspace_id: None,
                         after_sequence: None,
                         stream_epoch: None,
                     }))
@@ -9026,6 +9227,7 @@ mod tests {
         let events =
             restored_connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(recovery_session_id),
+                workspace_id: None,
                 after_sequence: None,
                 stream_epoch: None,
             }));
@@ -9259,6 +9461,7 @@ mod tests {
         let events = match connection
             .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session_id),
+                workspace_id: None,
                 after_sequence: None,
                 stream_epoch: None,
             }))
@@ -9705,6 +9908,7 @@ mod tests {
             scoped
                 .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: None,
+                    workspace_id: None,
                     after_sequence: None,
                     stream_epoch: None,
                 }))
@@ -10071,6 +10275,7 @@ mod tests {
         for _ in 0..1_000 {
             let events = observer.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session_id),
+                workspace_id: None,
                 after_sequence: None,
                 stream_epoch: None,
             }));
@@ -10283,6 +10488,7 @@ mod tests {
         negotiate(&connection);
         let stale = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: Some(EventSequence::new(1)),
             stream_epoch: None,
         }));
@@ -10303,6 +10509,7 @@ mod tests {
         let changed_epoch =
             connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session_id),
+                workspace_id: None,
                 after_sequence: Some(EventSequence::new(3)),
                 stream_epoch: Some(previous_stream_epoch.clone()),
             }));
@@ -10321,6 +10528,7 @@ mod tests {
 
         let current = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: Some(EventSequence::new(2)),
             stream_epoch: None,
         }));
@@ -10331,6 +10539,171 @@ mod tests {
         assert_eq!(events[0].sequence, EventSequence::new(3));
 
         fs::remove_dir_all(session_root_base).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "loom-server-workspace-feed-{}.db",
+            WorkspaceId::new()
+        ));
+        let (workspace_a, workspace_b, session_a, session_b, previous_epoch) = {
+            let backend = InProcessBackend::new_persistent(&path).unwrap();
+            backend.set_event_retention(1).unwrap();
+            let connection = backend.connect();
+            negotiate(&connection);
+            let create_workspace = |name: &str| {
+                let response =
+                    connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                        name: name.to_owned(),
+                    }));
+                let ServerResponse::WorkspaceCreated(workspace) = response.result.unwrap() else {
+                    panic!("unexpected workspace response");
+                };
+                workspace.id
+            };
+            let workspace_a = create_workspace("Workspace feed A");
+            let workspace_b = create_workspace("Workspace feed B");
+            let create_session = |workspace_id, name: &str| {
+                let response = connection.request(RequestEnvelope::new(
+                    ClientRequest::CreateAgentSessionInWorkspace {
+                        workspace_id,
+                        name: name.to_owned(),
+                    },
+                ));
+                let ServerResponse::AgentSessionCreated(session) = response.result.unwrap() else {
+                    panic!("unexpected session response");
+                };
+                session.id
+            };
+            let session_a = create_session(workspace_a, "A");
+            let session_b = create_session(workspace_b, "B");
+            for (session_id, label) in [(session_a, "A"), (session_b, "B")] {
+                for revision in 1..=2 {
+                    connection
+                        .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
+                            session_id,
+                            name: format!("{label} {revision}"),
+                        }))
+                        .result
+                        .unwrap();
+                }
+            }
+
+            for workspace_id in [workspace_a, workspace_b] {
+                let response =
+                    connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                        session_id: None,
+                        workspace_id: Some(workspace_id),
+                        after_sequence: None,
+                        stream_epoch: None,
+                    }));
+                let ServerResponse::WorkspaceEventsSnapshot {
+                    workspace_id: returned_workspace,
+                    sessions,
+                    events,
+                    ..
+                } = response.result.unwrap()
+                else {
+                    panic!("expected a snapshot after in-memory feed pruning");
+                };
+                assert_eq!(returned_workspace, workspace_id);
+                assert_eq!(sessions.len(), 1);
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| event.session_id == sessions[0].id)
+                );
+            }
+
+            let ambiguous =
+                connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: Some(session_a),
+                    workspace_id: Some(workspace_a),
+                    after_sequence: None,
+                    stream_epoch: None,
+                }));
+            assert!(ambiguous.result.is_err());
+            let unknown =
+                connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: None,
+                    workspace_id: Some(WorkspaceId::new()),
+                    after_sequence: None,
+                    stream_epoch: None,
+                }));
+            assert!(unknown.result.is_err());
+
+            backend.flush().unwrap();
+            (
+                workspace_a,
+                workspace_b,
+                session_a,
+                session_b,
+                backend.node_id.clone(),
+            )
+        };
+
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let stale = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace_a),
+            after_sequence: Some(EventSequence::new(1)),
+            stream_epoch: None,
+        }));
+        let ServerResponse::WorkspaceEventsSnapshot {
+            workspace_id,
+            sessions,
+            events,
+            oldest_sequence,
+            latest_sequence,
+            stream_epoch: Some(current_epoch),
+        } = stale.result.unwrap()
+        else {
+            panic!("expected a workspace snapshot after persisted pruning");
+        };
+        assert_eq!(workspace_id, workspace_a);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_a);
+        assert!(events.iter().all(|event| event.session_id == session_a));
+        assert!(!events.iter().any(|event| event.session_id == session_b));
+        assert!(oldest_sequence <= latest_sequence);
+        assert_ne!(current_epoch, previous_epoch);
+
+        let events_b = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace_b),
+            after_sequence: None,
+            stream_epoch: None,
+        }));
+        let ServerResponse::WorkspaceEventsSnapshot {
+            sessions,
+            events,
+            latest_sequence: global_cursor,
+            stream_epoch: Some(current_epoch),
+            ..
+        } = events_b.result.unwrap()
+        else {
+            panic!("expected a workspace snapshot after persisted pruning");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_b);
+        assert!(events.iter().all(|event| event.session_id == session_b));
+
+        let advanced_cursor =
+            connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: None,
+                workspace_id: Some(workspace_a),
+                after_sequence: Some(global_cursor),
+                stream_epoch: Some(current_epoch),
+            }));
+        assert!(matches!(
+            advanced_cursor.result.unwrap(),
+            ServerResponse::SessionEvents { events, .. } if events.is_empty()
+        ));
+
         fs::remove_file(path).unwrap();
     }
 

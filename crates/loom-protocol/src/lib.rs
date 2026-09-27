@@ -389,6 +389,11 @@ pub enum ClientRequest {
     },
     GetSessionEvents {
         session_id: Option<AgentSessionId>,
+        /// Workspace-wide event stream scope. Mutually exclusive with `session_id`.
+        #[serde(default)]
+        workspace_id: Option<WorkspaceId>,
+        /// Last global event sequence processed for the selected scope. Workspace event
+        /// sequences can have gaps because unrelated workspaces share the global counter.
         after_sequence: Option<EventSequence>,
         /// Backend-instance identity paired with `after_sequence`.
         #[serde(default)]
@@ -728,6 +733,18 @@ pub enum ServerResponse {
         #[serde(default)]
         stream_epoch: Option<String>,
     },
+    /// Returned when a workspace cursor is stale or the backend epoch changed. `sessions`
+    /// is the current workspace catalog snapshot; `events` contains the retained workspace
+    /// feed. `latest_sequence` is the latest event for this workspace, not the global head.
+    WorkspaceEventsSnapshot {
+        workspace_id: WorkspaceId,
+        sessions: Vec<AgentSessionSnapshot>,
+        events: Vec<ServerEventEnvelope>,
+        oldest_sequence: EventSequence,
+        latest_sequence: EventSequence,
+        #[serde(default)]
+        stream_epoch: Option<String>,
+    },
     Models {
         models: Vec<ModelDescriptor>,
     },
@@ -994,6 +1011,7 @@ mod run_message_protocol_tests {
     fn stream_epoch_fields_default_for_sequence_only_peers() {
         let request = RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(AgentSessionId::new()),
+            workspace_id: None,
             after_sequence: Some(EventSequence::new(12)),
             stream_epoch: None,
         });
@@ -1002,6 +1020,10 @@ mod run_message_protocol_tests {
             .as_object_mut()
             .unwrap()
             .remove("stream_epoch");
+        encoded["request"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_id");
         let decoded: RequestEnvelope = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.request, request.request);
 
@@ -1024,6 +1046,23 @@ mod run_message_protocol_tests {
                 events: Vec::new(),
                 stream_epoch: None,
             }
+        );
+    }
+
+    #[test]
+    fn workspace_event_snapshot_round_trips() {
+        let response = ServerResponse::WorkspaceEventsSnapshot {
+            workspace_id: WorkspaceId::new(),
+            sessions: Vec::new(),
+            events: Vec::new(),
+            oldest_sequence: EventSequence::new(4),
+            latest_sequence: EventSequence::new(9),
+            stream_epoch: Some("epoch".to_owned()),
+        };
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ServerResponse>(&encoded).unwrap(),
+            response
         );
     }
 

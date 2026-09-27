@@ -32,8 +32,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 38;
-const DATABASE_SCHEMA_VERSION: u32 = 38;
+pub const CURRENT_SCHEMA_VERSION: u32 = 39;
+const DATABASE_SCHEMA_VERSION: u32 = 39;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;
@@ -502,13 +502,22 @@ CREATE TABLE IF NOT EXISTS feed_store_meta (
 CREATE TABLE IF NOT EXISTS feed_events (
     sequence INTEGER PRIMARY KEY CHECK(sequence > 0),
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    workspace_id BLOB NOT NULL CHECK(length(workspace_id) = 16),
     payload_codec INTEGER NOT NULL CHECK(payload_codec IN (0, 1)),
     payload BLOB NOT NULL
 ) STRICT;
 CREATE INDEX IF NOT EXISTS feed_events_by_session_sequence
     ON feed_events(session_id, sequence);
+CREATE INDEX IF NOT EXISTS feed_events_by_workspace_sequence
+    ON feed_events(workspace_id, sequence);
 CREATE TABLE IF NOT EXISTS feed_session_meta (
     session_id BLOB PRIMARY KEY NOT NULL CHECK(length(session_id) = 16),
+    first_sequence INTEGER NOT NULL CHECK(first_sequence > 0),
+    latest_sequence INTEGER NOT NULL CHECK(latest_sequence >= first_sequence),
+    pruned_through INTEGER NOT NULL CHECK(pruned_through >= 0)
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS feed_workspace_meta (
+    workspace_id BLOB PRIMARY KEY NOT NULL CHECK(length(workspace_id) = 16),
     first_sequence INTEGER NOT NULL CHECK(first_sequence > 0),
     latest_sequence INTEGER NOT NULL CHECK(latest_sequence >= first_sequence),
     pruned_through INTEGER NOT NULL CHECK(pruned_through >= 0)
@@ -1117,6 +1126,14 @@ pub struct DurableFeedHeader {
 
 #[derive(Clone, Copy, Debug)]
 pub struct DurableFeedSessionCursor {
+    pub first_sequence: EventSequence,
+    pub latest_sequence: EventSequence,
+    pub pruned_through: EventSequence,
+    pub oldest_retained_sequence: Option<EventSequence>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DurableFeedWorkspaceCursor {
     pub first_sequence: EventSequence,
     pub latest_sequence: EventSequence,
     pub pruned_through: EventSequence,
@@ -4370,6 +4387,130 @@ impl FilePersistence {
                 })
             })
             .transpose()
+    }
+
+    /// Loads lightweight retained-boundary metadata for one workspace stream.
+    pub fn load_feed_workspace_cursor(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<DurableFeedWorkspaceCursor>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        let cursor = connection
+            .query_row(
+                "SELECT first_sequence, latest_sequence, pruned_through,
+                        (SELECT MIN(sequence) FROM feed_events WHERE workspace_id=?1)
+                 FROM feed_workspace_meta WHERE workspace_id=?1",
+                [workspace_id.as_uuid().as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read workspace feed cursor: {error}"),
+                    true,
+                )
+            })?;
+        cursor
+            .map(|(first, latest, pruned, oldest)| {
+                Ok(DurableFeedWorkspaceCursor {
+                    first_sequence: EventSequence::new(decode_counter(
+                        first,
+                        "first event sequence",
+                    )?),
+                    latest_sequence: EventSequence::new(decode_counter(
+                        latest,
+                        "latest event sequence",
+                    )?),
+                    pruned_through: EventSequence::new(decode_counter(
+                        pruned,
+                        "pruned event sequence",
+                    )?),
+                    oldest_retained_sequence: oldest
+                        .map(|sequence| decode_counter(sequence, "oldest event sequence"))
+                        .transpose()?
+                        .map(EventSequence::new),
+                })
+            })
+            .transpose()
+    }
+
+    /// Loads retained events belonging to one workspace after a global sequence cursor.
+    pub fn load_feed_workspace_events_since(
+        &self,
+        workspace_id: WorkspaceId,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        self.load_feed_events_by_workspace(workspace_id, after_sequence)
+    }
+
+    fn load_feed_events_by_workspace(
+        &self,
+        workspace_id: WorkspaceId,
+        after_sequence: Option<EventSequence>,
+    ) -> Result<Vec<ServerEventEnvelope>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let after = after_sequence
+            .map(|sequence| {
+                i64::try_from(sequence.value()).map_err(|_| {
+                    LoomError::invalid_request("event cursor exceeds SQLite's integer range")
+                })
+            })
+            .transpose()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, session_id, payload_codec, payload FROM feed_events
+             WHERE workspace_id=?1 AND sequence>?2 ORDER BY sequence ASC",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare workspace event feed page: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map(
+                params![
+                    workspace_id.as_uuid().as_bytes().as_slice(),
+                    after.unwrap_or(0)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read workspace event feed page: {error}"),
+                    true,
+                )
+            })?;
+        rows.map(|row| {
+            let (sequence, session_id, codec, payload) = row.map_err(|error| {
+                persistence_error(
+                    format!("could not read workspace event feed row: {error}"),
+                    true,
+                )
+            })?;
+            decode_feed_event(sequence, session_id, codec, payload)
+        })
+        .collect()
     }
 
     /// Loads a session's retained events after a cursor without hydrating other streams.
@@ -8807,6 +8948,26 @@ fn save_feed_rows_with_limits(
             ));
         }
         previous = sequence;
+        let workspace_id = transaction
+            .query_row(
+                "SELECT workspace_id FROM sessions WHERE id=?1",
+                [event.session_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not resolve event workspace: {error}"), true)
+            })?
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    format!(
+                        "cannot persist event for unknown session {}",
+                        event.session_id
+                    ),
+                    false,
+                )
+            })?;
         let raw_payload = serde_json::to_vec(event).map_err(|error| {
             persistence_error(format!("could not encode event feed entry: {error}"), false)
         })?;
@@ -8837,12 +8998,13 @@ fn save_feed_rows_with_limits(
         };
         transaction
             .execute(
-                "INSERT INTO feed_events(sequence, session_id, payload_codec, payload)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO feed_events(sequence, session_id, workspace_id, payload_codec, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(sequence) DO NOTHING",
                 params![
                     sequence,
                     event.session_id.as_uuid().as_bytes().as_slice(),
+                    workspace_id.as_slice(),
                     payload_codec,
                     payload
                 ],
@@ -8850,6 +9012,16 @@ fn save_feed_rows_with_limits(
             .map_err(|error| {
                 persistence_error(format!("could not save event feed entry: {error}"), true)
             })?;
+        transaction
+            .execute(
+                "INSERT INTO feed_workspace_meta(
+                    workspace_id, first_sequence, latest_sequence, pruned_through
+                 ) VALUES (?1, ?2, ?2, 0)
+                 ON CONFLICT(workspace_id) DO UPDATE SET
+                    latest_sequence=MAX(feed_workspace_meta.latest_sequence, excluded.latest_sequence)",
+                params![workspace_id.as_slice(), sequence],
+            )
+            .map_err(|error| persistence_error(format!("could not save workspace feed cursor: {error}"), true))?;
         transaction
             .execute(
                 "INSERT INTO feed_session_meta(
@@ -8870,7 +9042,8 @@ fn save_feed_rows_with_limits(
         .execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS _loom_pruned_feed (
                 sequence INTEGER PRIMARY KEY,
-                session_id BLOB NOT NULL
+                session_id BLOB NOT NULL,
+                workspace_id BLOB NOT NULL
              ) WITHOUT ROWID;
              DELETE FROM _loom_pruned_feed;",
         )
@@ -8883,7 +9056,7 @@ fn save_feed_rows_with_limits(
     transaction
         .execute(
             "WITH ranked AS (
-                SELECT sequence, session_id,
+                SELECT sequence, session_id, workspace_id,
                        SUM(length(payload)) OVER (
                            PARTITION BY session_id ORDER BY sequence DESC
                        ) AS session_bytes,
@@ -8895,8 +9068,8 @@ fn save_feed_rows_with_limits(
                        ) AS total_bytes
                 FROM feed_events
              )
-             INSERT INTO _loom_pruned_feed(sequence, session_id)
-             SELECT sequence, session_id FROM ranked
+             INSERT INTO _loom_pruned_feed(sequence, session_id, workspace_id)
+             SELECT sequence, session_id, workspace_id FROM ranked
              WHERE session_bytes > ?1 OR session_position > ?2 OR total_bytes > ?3",
             params![
                 session_byte_limit as i64,
@@ -8907,6 +9080,27 @@ fn save_feed_rows_with_limits(
         .map_err(|error| {
             persistence_error(
                 format!("could not select reconnect feed retention: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "WITH pruned AS (
+                SELECT workspace_id, MAX(sequence) AS pruned_through
+                FROM _loom_pruned_feed GROUP BY workspace_id
+             )
+             UPDATE feed_workspace_meta
+             SET pruned_through=MAX(
+                    pruned_through,
+                    (SELECT pruned.pruned_through FROM pruned
+                     WHERE pruned.workspace_id=feed_workspace_meta.workspace_id)
+                 )
+             WHERE workspace_id IN (SELECT workspace_id FROM pruned)",
+            [],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not update pruned workspace feed cursors: {error}"),
                 true,
             )
         })?;
@@ -12384,6 +12578,114 @@ mod tests {
             )
             .unwrap();
         assert!(plan.contains("feed_events_by_session_sequence"), "{plan}");
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn workspace_reconnect_feed_is_isolated_indexed_and_tracks_pruning() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        let workspace_a = WorkspaceId::new();
+        let workspace_b = WorkspaceId::new();
+        let session_a = AgentSessionId::new();
+        let session_b = AgentSessionId::new();
+        let mut manager = SessionManager::default();
+        manager
+            .create_in_workspace_with_id(workspace_a, session_a, "Workspace A")
+            .unwrap();
+        manager
+            .create_in_workspace_with_id(workspace_b, session_b, "Workspace B")
+            .unwrap();
+        let snapshot = |id, workspace_id| AgentSessionSnapshot {
+            id,
+            workspace_id,
+            name: "session".to_owned(),
+            state: AgentSessionState::Idle,
+            created_at: Timestamp::from_unix_millis(1),
+            updated_at: Timestamp::from_unix_millis(1),
+        };
+        let event = |sequence, id, workspace_id| ServerEventEnvelope {
+            protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(sequence),
+            session_id: id,
+            event: loom_protocol::ServerEvent::AgentSessionCreated {
+                snapshot: snapshot(id, workspace_id),
+            },
+        };
+        let feed = DurableFeedState {
+            next_sequence: EventSequence::new(4),
+            retention_limit: 1,
+            events: vec![
+                event(1, session_a, workspace_a),
+                event(2, session_b, workspace_b),
+                event(3, session_a, workspace_a),
+                event(4, session_b, workspace_b),
+            ],
+        };
+        store
+            .save_state_with_sessions_entities_and_feed(
+                CURRENT_SCHEMA_VERSION,
+                &manager.export_state(),
+                &[],
+                Some(&feed),
+                &[],
+            )
+            .unwrap();
+
+        let events_a = store
+            .load_feed_workspace_events_since(workspace_a, None)
+            .unwrap();
+        let events_b = store
+            .load_feed_workspace_events_since(workspace_b, None)
+            .unwrap();
+        assert_eq!(
+            events_a
+                .iter()
+                .map(|e| e.sequence.value())
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(
+            events_b
+                .iter()
+                .map(|e| e.sequence.value())
+                .collect::<Vec<_>>(),
+            vec![4]
+        );
+        let cursor_a = store
+            .load_feed_workspace_cursor(workspace_a)
+            .unwrap()
+            .unwrap();
+        let cursor_b = store
+            .load_feed_workspace_cursor(workspace_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor_a.first_sequence, EventSequence::new(1));
+        assert_eq!(cursor_a.latest_sequence, EventSequence::new(3));
+        assert_eq!(cursor_a.pruned_through, EventSequence::new(1));
+        assert_eq!(
+            cursor_a.oldest_retained_sequence,
+            Some(EventSequence::new(3))
+        );
+        assert_eq!(cursor_b.first_sequence, EventSequence::new(2));
+        assert_eq!(cursor_b.latest_sequence, EventSequence::new(4));
+        assert_eq!(cursor_b.pruned_through, EventSequence::new(2));
+        assert_eq!(
+            cursor_b.oldest_retained_sequence,
+            Some(EventSequence::new(4))
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        let plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT sequence FROM feed_events
+             WHERE workspace_id=?1 AND sequence>?2 ORDER BY sequence LIMIT 20",
+                params![workspace_a.as_uuid().as_bytes().as_slice(), 0_i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("feed_events_by_workspace_sequence"), "{plan}");
         drop(connection);
         fs::remove_file(path).unwrap();
     }

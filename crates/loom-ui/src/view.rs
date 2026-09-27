@@ -3138,6 +3138,7 @@ impl LoomView {
                 self.connection
                     .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                         session_id: Some(session_id),
+                        workspace_id: None,
                         after_sequence,
                         stream_epoch: self.event_stream_epoch.clone(),
                     }));
@@ -3231,6 +3232,7 @@ impl LoomView {
             cx,
             ClientRequest::GetSessionEvents {
                 session_id: Some(self.active_session.id),
+                workspace_id: None,
                 after_sequence: self.after_sequence,
                 stream_epoch: self.event_stream_epoch.clone(),
             },
@@ -4203,6 +4205,7 @@ impl LoomView {
             let events_request =
                 backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
+                    workspace_id: None,
                     after_sequence: cursor,
                     stream_epoch: event_stream_epoch.clone(),
                 }));
@@ -4234,6 +4237,7 @@ impl LoomView {
                     let retry_request =
                         backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                             session_id: Some(session_id),
+                            workspace_id: None,
                             after_sequence: Some(refreshed_cursor),
                             stream_epoch: event_stream_epoch.clone(),
                         }));
@@ -13778,6 +13782,7 @@ mod worker_node_tests {
             session_id_for_request(
                 &ClientRequest::GetSessionEvents {
                     session_id: None,
+                    workspace_id: None,
                     after_sequence: None,
                     stream_epoch: None,
                 },
@@ -13789,6 +13794,7 @@ mod worker_node_tests {
             session_id_for_request(
                 &ClientRequest::GetSessionEvents {
                     session_id: Some(session),
+                    workspace_id: None,
                     after_sequence: None,
                     stream_epoch: None,
                 },

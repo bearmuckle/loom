@@ -433,6 +433,7 @@ async fn m4_demo_remote(
         let response = second
             .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session.id),
+                workspace_id: None,
                 after_sequence: after,
                 stream_epoch: stream_epoch.clone(),
             }))
@@ -758,6 +759,7 @@ fn demonstrate_m3_recovery(
     };
     let events = recovered.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
         session_id: Some(session_id),
+        workspace_id: None,
         after_sequence: None,
         stream_epoch: None,
     }));
@@ -980,6 +982,7 @@ fn stream_run(
     loop {
         let response = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence: after,
             stream_epoch: stream_epoch.clone(),
         }));

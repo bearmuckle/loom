@@ -155,6 +155,7 @@ async fn events(
     match connection
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
+            workspace_id: None,
             after_sequence,
             stream_epoch: None,
         }))
@@ -713,6 +714,7 @@ async fn stale_cursors_return_a_snapshot_fallback() {
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(first.id),
+            workspace_id: None,
             after_sequence: Some(EventSequence::new(1)),
             stream_epoch: None,
         }))
@@ -737,6 +739,7 @@ async fn stale_cursors_return_a_snapshot_fallback() {
     let resumed = connection
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(first.id),
+            workspace_id: None,
             after_sequence: Some(EventSequence::new(6)),
             stream_epoch: Some(stream_epoch.clone()),
         }))
@@ -764,6 +767,7 @@ async fn session_cursor_before_creation_ignores_other_sessions_events() {
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(target_session.id),
+            workspace_id: None,
             after_sequence: Some(EventSequence::default()),
             stream_epoch: None,
         }))

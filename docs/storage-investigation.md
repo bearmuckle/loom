@@ -176,20 +176,21 @@ runs produced:
 
 | Sessions / runs / messages / feed events | Activities / filesystem records / checkpoints | Database size | Population | First-use catalog + active-run + feed-header p50 | One-session feed p50 | Full-feed decode p50 | Transcript page p50 | Content range p50 | Filesystem/checkpoint load p50 | Per-session run lookup p50 |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,000 / 10,000 / 40,000 / 10,000 | 10,000 / 100 / 100 | 25,931,776 bytes | 8,029 ms | 5.425 ms | 0.082 ms | 62.502 ms | 0.203 ms | 0.021 ms | 0.160 ms | 0.016 ms |
-| 100,000 / 100,000 / 400,000 / 100,000 | 100,000 / 1,000 / 1,000 | 256,557,056 bytes | 78,488 ms | 50.097 ms | 0.025 ms | 524.103 ms | 0.239 ms | 0.021 ms | 0.155 ms | 0.015 ms |
+| 10,000 / 10,000 / 40,000 / 10,000 | 10,000 / 100 / 100 | 26,476,544 bytes | 8,378 ms | 5.430 ms | 0.063 ms | 62.068 ms | 0.203 ms | 0.021 ms | 0.138 ms | 0.016 ms |
+| 100,000 / 100,000 / 400,000 / 100,000 | 100,000 / 1,000 / 1,000 | 261,783,552 bytes | 89,528 ms | 53.550 ms | 0.027 ms | 601.732 ms | 0.333 ms | 0.023 ms | 0.191 ms | 0.017 ms |
 
 These are optimized local synthetic measurements, not a platform-independent
 latency guarantee or a cold UI startup measurement. The 100k fixture adds 1,000
 filesystem/checkpoint groups and 64 distinct runtime profiles; the first-use
 load still measures persistence only. Schema v38's inline representation for
 objects up to 4 KiB reduced the earlier 100k transcript fixture from 425 MB to
-229 MB. Adding 100k activity rows, 1,000 checkpoint/edit/change groups, and 64
-runtime profiles yields a 257 MB database and 78.5 second population. The
-measured first-use persistence load is 50.1 ms, with one checkpoint/filesystem
-record load at 0.155 ms. `dbstat` still identifies content objects, transcript
-rows, and feed/index structures as the largest consumers. Cold application
-startup, server recovery, and realistic checkpoint density remain unproven.
+229 MB. Adding 100k activity rows, 1,000 checkpoint/edit/change groups, 64
+runtime profiles, and workspace feed indexing yields a 262 MB database and an
+89.5 second population. The measured first-use persistence load is 53.6 ms, with
+one checkpoint/filesystem record load at 0.191 ms. `dbstat` still identifies
+content objects, transcript rows, and feed/index structures as the largest
+consumers. Cold application startup, server recovery, and realistic checkpoint
+density remain unproven.
 
 Historical schema v33-v36 comparisons used the earlier transcript-free fixture
 and are not directly comparable to these measurements. Schema v33 replaced
@@ -197,7 +198,7 @@ duplicated run JSON snapshots with typed rows; later schemas normalized run
 options and deduplicated runtime profiles/content. The current fixture includes
 those features plus retained transcript content.
 
-The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. The CLI and native UI now drain their locally owned backends on graceful teardown. Event cursors now carry a backend-instance epoch and resync on restart; transactional snapshot capture, workspace streams, retention policy, and end-to-end scale proof remain in the PR checklist.
+The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. The CLI and native UI now drain their locally owned backends on graceful teardown. Session and workspace event cursors now carry a backend-instance epoch and resync on restart; transactional snapshot capture, run/checkpoint retention, broader failure injection, and end-to-end application startup proof remain in the PR checklist.
 
 ## Baseline findings before the redesign
 
