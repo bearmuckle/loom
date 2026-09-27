@@ -806,13 +806,13 @@ fn runtime_state_from_durable_config(
     summary: &PersistedRunSummary,
     config: DurableRunRuntimeConfig,
 ) -> Result<AgentRuntimeState> {
-    let options = serde_json::from_value(config.options).map_err(|error| {
-        LoomError::new(
-            ErrorCode::MalformedPayload,
-            format!("persisted run runtime options are malformed: {error}"),
-            false,
-        )
-    })?;
+    let options = AgentRuntimeOptions {
+        limits: config.limits,
+        context: config.context_options,
+        checkpoint_id: config.checkpoint_id,
+        input_cost_micros_per_1k: config.input_cost_micros_per_1k,
+        output_cost_micros_per_1k: config.output_cost_micros_per_1k,
+    };
     Ok(AgentRuntimeState {
         session_id: summary.snapshot.session_id,
         task: AgentTask {
@@ -2641,7 +2641,11 @@ impl InProcessBackend {
                         system_instructions: state.task.system_instructions.clone(),
                         repository_instructions: state.task.repository_instructions.clone(),
                         approval_policy: state.approval_policy.clone(),
-                        options: json_value(&state.options)?,
+                        limits: state.options.limits.clone(),
+                        context_options: state.options.context.clone(),
+                        checkpoint_id: state.options.checkpoint_id,
+                        input_cost_micros_per_1k: state.options.input_cost_micros_per_1k,
+                        output_cost_micros_per_1k: state.options.output_cost_micros_per_1k,
                         context_inspection,
                     },
                 ))
@@ -7894,14 +7898,8 @@ mod tests {
                 runtime_config.repository_instructions.as_deref(),
                 Some("Keep changes focused.")
             );
-            assert_eq!(
-                runtime_config.options["context"]["context_window"],
-                serde_json::json!(8_192)
-            );
-            assert_eq!(
-                runtime_config.options["limits"]["max_tool_calls"],
-                serde_json::json!(20)
-            );
+            assert_eq!(runtime_config.context_options.context_window, Some(8_192));
+            assert_eq!(runtime_config.limits.max_tool_calls, Some(20));
             let events = match connection
                 .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),

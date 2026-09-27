@@ -18,6 +18,10 @@ options, and token-budget diagnostics) now lives in a run-keyed table; the
 server reconstructs runtime state from this row plus indexed summaries,
 execution state, plans, transcripts, attempts, activities, interactions, and
 context checkpoints. No duplicate whole-run JSON snapshot is written.
+Schema v35 stores approval decisions, session limits, context budgets,
+checkpoint identity, and token cost rates as constrained scalar columns rather
+than JSON text; only the bounded context-inspection diagnostic remains JSON.
+As requested, databases from schema v34 are rejected without import or mutation.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at that
@@ -527,6 +531,10 @@ Implement in this order:
    keyed by run and interaction with attempt/revision, status, prompt, decision,
    and time columns, were persisted separately from the earlier runtime sections; schema
    v34 removes those generic run sections altogether.
+   Schema v35 gives each approval action, limit, context budget, checkpoint
+   reference, and token-cost rate a typed column; the context-inspection
+   diagnostic remains a bounded JSON payload because it is display data rather
+   than a query key.
    Interaction rows, run summaries, and the reconnect feed share one SQLite
    transaction; history is loaded on demand and pending interactions are
    restored before guarded commands are accepted. A command's decision is

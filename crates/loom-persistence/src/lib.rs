@@ -10,8 +10,9 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
-    CheckpointId, ErrorCode, EventSequence, InteractionId, LoomError, RepositoryId, RequestId,
-    Result, RunAttemptId, RunId, StepId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    CheckpointId, ErrorCode, EventSequence, InteractionId, LoomError, PolicyDecision, RepositoryId,
+    RequestId, Result, RunAttemptId, RunId, SessionLimits, StepId, Timestamp, UsageSnapshot,
+    WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
@@ -19,9 +20,9 @@ use loom_protocol::{
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
     AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
-    ApprovalDecision, Checkpoint, CheckpointFile, ContextInspection, ContextSummary,
-    ServerEventEnvelope, SessionDirectory, SessionFilesystemChange, SessionRepository, ToolResult,
-    WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
+    ApprovalDecision, Checkpoint, CheckpointFile, ContextAssemblyOptions, ContextInspection,
+    ContextSummary, ServerEventEnvelope, SessionDirectory, SessionFilesystemChange,
+    SessionRepository, ToolResult, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
 };
 use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
 use loom_session::{SessionManagerState, WorkspaceManagerState};
@@ -31,8 +32,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 34;
-const DATABASE_SCHEMA_VERSION: u32 = 34;
+pub const CURRENT_SCHEMA_VERSION: u32 = 35;
+const DATABASE_SCHEMA_VERSION: u32 = 35;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -103,8 +104,22 @@ CREATE TABLE IF NOT EXISTS run_runtime_config (
     run_id BLOB PRIMARY KEY NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE,
     system_instructions TEXT,
     repository_instructions TEXT,
-    approval_policy TEXT NOT NULL,
-    options TEXT NOT NULL,
+    policy_read TEXT NOT NULL CHECK(policy_read IN ('allow', 'require_approval', 'deny')),
+    policy_write TEXT NOT NULL CHECK(policy_write IN ('allow', 'require_approval', 'deny')),
+    policy_command TEXT NOT NULL CHECK(policy_command IN ('allow', 'require_approval', 'deny')),
+    policy_network TEXT NOT NULL CHECK(policy_network IN ('allow', 'require_approval', 'deny')),
+    policy_destructive TEXT NOT NULL CHECK(policy_destructive IN ('allow', 'require_approval', 'deny')),
+    max_duration_ms INTEGER CHECK(max_duration_ms IS NULL OR max_duration_ms >= 0),
+    max_input_tokens INTEGER CHECK(max_input_tokens IS NULL OR max_input_tokens >= 0),
+    max_output_tokens INTEGER CHECK(max_output_tokens IS NULL OR max_output_tokens >= 0),
+    max_tool_calls INTEGER CHECK(max_tool_calls IS NULL OR max_tool_calls >= 0),
+    max_cost_micros INTEGER CHECK(max_cost_micros IS NULL OR max_cost_micros >= 0),
+    context_window INTEGER CHECK(context_window IS NULL OR context_window >= 0),
+    context_max_input_tokens INTEGER CHECK(context_max_input_tokens IS NULL OR context_max_input_tokens >= 0),
+    context_reserved_output_tokens INTEGER CHECK(context_reserved_output_tokens IS NULL OR context_reserved_output_tokens >= 0),
+    checkpoint_id BLOB CHECK(checkpoint_id IS NULL OR length(checkpoint_id) = 16),
+    input_cost_micros_per_1k INTEGER NOT NULL CHECK(input_cost_micros_per_1k >= 0),
+    output_cost_micros_per_1k INTEGER NOT NULL CHECK(output_cost_micros_per_1k >= 0),
     context_inspection TEXT
 ) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS run_plan_steps (
@@ -1028,7 +1043,11 @@ pub struct DurableRunRuntimeConfig {
     pub system_instructions: Option<String>,
     pub repository_instructions: Option<String>,
     pub approval_policy: ApprovalPolicy,
-    pub options: Value,
+    pub limits: SessionLimits,
+    pub context_options: ContextAssemblyOptions,
+    pub checkpoint_id: Option<CheckpointId>,
+    pub input_cost_micros_per_1k: u64,
+    pub output_cost_micros_per_1k: u64,
     pub context_inspection: Option<ContextInspection>,
 }
 
@@ -1995,7 +2014,13 @@ impl FilePersistence {
         let row = connection
             .query_row(
                 "SELECT system_instructions, repository_instructions,
-                        approval_policy, options, context_inspection
+                        policy_read, policy_write, policy_command, policy_network,
+                        policy_destructive, max_duration_ms, max_input_tokens,
+                        max_output_tokens, max_tool_calls, max_cost_micros,
+                        context_window, context_max_input_tokens,
+                        context_reserved_output_tokens, checkpoint_id,
+                        input_cost_micros_per_1k, output_cost_micros_per_1k,
+                        context_inspection
                  FROM run_runtime_config WHERE run_id=?1",
                 [run_id.as_uuid().as_bytes().as_slice()],
                 |row| {
@@ -2004,7 +2029,21 @@ impl FilePersistence {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
+                        row.get::<_, Option<i64>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<i64>>(12)?,
+                        row.get::<_, Option<i64>>(13)?,
+                        row.get::<_, Option<i64>>(14)?,
+                        row.get::<_, Option<Vec<u8>>>(15)?,
+                        row.get::<_, i64>(16)?,
+                        row.get::<_, i64>(17)?,
+                        row.get::<_, Option<String>>(18)?,
                     ))
                 },
             )
@@ -2015,18 +2054,83 @@ impl FilePersistence {
                     true,
                 )
             })?;
-        row.map(|(system, repository, policy, options, inspection)| {
-            Ok(DurableRunRuntimeConfig {
-                system_instructions: system,
-                repository_instructions: repository,
-                approval_policy: decode_json(&policy, "run approval policy")?,
-                options: decode_json(&options, "run runtime options")?,
-                context_inspection: inspection
-                    .as_deref()
-                    .map(|payload| decode_json(payload, "run context inspection"))
-                    .transpose()?,
-            })
-        })
+        row.map(
+            |(
+                system,
+                repository,
+                policy_read,
+                policy_write,
+                policy_command,
+                policy_network,
+                policy_destructive,
+                max_duration_ms,
+                max_input_tokens,
+                max_output_tokens,
+                max_tool_calls,
+                max_cost_micros,
+                context_window,
+                context_max_input_tokens,
+                context_reserved_output_tokens,
+                checkpoint_id,
+                input_cost_micros_per_1k,
+                output_cost_micros_per_1k,
+                inspection,
+            )| {
+                Ok(DurableRunRuntimeConfig {
+                    system_instructions: system,
+                    repository_instructions: repository,
+                    approval_policy: ApprovalPolicy {
+                        read: decode_policy_decision(&policy_read, "read")?,
+                        write: decode_policy_decision(&policy_write, "write")?,
+                        command: decode_policy_decision(&policy_command, "command")?,
+                        network: decode_policy_decision(&policy_network, "network")?,
+                        destructive: decode_policy_decision(&policy_destructive, "destructive")?,
+                    },
+                    limits: SessionLimits {
+                        max_duration_ms: decode_optional_u64(max_duration_ms, "max duration")?,
+                        max_input_tokens: decode_optional_u64(
+                            max_input_tokens,
+                            "max input tokens",
+                        )?,
+                        max_output_tokens: decode_optional_u64(
+                            max_output_tokens,
+                            "max output tokens",
+                        )?,
+                        max_tool_calls: decode_optional_u64(max_tool_calls, "max tool calls")?,
+                        max_cost_micros: decode_optional_u64(max_cost_micros, "max cost")?,
+                    },
+                    context_options: ContextAssemblyOptions {
+                        context_window: decode_optional_u64(context_window, "context window")?,
+                        max_input_tokens: decode_optional_u64(
+                            context_max_input_tokens,
+                            "context max input tokens",
+                        )?,
+                        reserved_output_tokens: decode_optional_u64(
+                            context_reserved_output_tokens,
+                            "context reserved output tokens",
+                        )?,
+                    },
+                    checkpoint_id: checkpoint_id
+                        .as_deref()
+                        .map(|bytes| {
+                            decode_uuid(bytes, "runtime checkpoint id").map(CheckpointId::from_uuid)
+                        })
+                        .transpose()?,
+                    input_cost_micros_per_1k: decode_counter(
+                        input_cost_micros_per_1k,
+                        "input cost rate",
+                    )?,
+                    output_cost_micros_per_1k: decode_counter(
+                        output_cost_micros_per_1k,
+                        "output cost rate",
+                    )?,
+                    context_inspection: inspection
+                        .as_deref()
+                        .map(|payload| decode_json(payload, "run context inspection"))
+                        .transpose()?,
+                })
+            },
+        )
         .transpose()
     }
 
@@ -5961,18 +6065,6 @@ fn save_run_runtime_config_rows(
     configs: &BTreeMap<RunId, DurableRunRuntimeConfig>,
 ) -> Result<()> {
     for (run_id, config) in configs {
-        let approval_policy = serde_json::to_string(&config.approval_policy).map_err(|error| {
-            persistence_error(
-                format!("could not encode run approval policy: {error}"),
-                false,
-            )
-        })?;
-        let options = serde_json::to_string(&config.options).map_err(|error| {
-            persistence_error(
-                format!("could not encode run runtime options: {error}"),
-                false,
-            )
-        })?;
         let context_inspection = config
             .context_inspection
             .as_ref()
@@ -5992,8 +6084,6 @@ fn save_run_runtime_config_rows(
                 .repository_instructions
                 .as_ref()
                 .is_some_and(|value| value.len() > MAX_RUN_RUNTIME_CONFIG_BYTES)
-            || approval_policy.len() > MAX_RUN_RUNTIME_CONFIG_BYTES
-            || options.len() > MAX_RUN_RUNTIME_CONFIG_BYTES
             || context_inspection
                 .as_ref()
                 .is_some_and(|value| value.len() > MAX_RUN_RUNTIME_CONFIG_BYTES)
@@ -6004,29 +6094,102 @@ fn save_run_runtime_config_rows(
                 false,
             ));
         }
+        let limits = &config.limits;
+        let context = &config.context_options;
+        let max_duration_ms = encode_optional_counter(limits.max_duration_ms, "max duration")?;
+        let max_input_tokens =
+            encode_optional_counter(limits.max_input_tokens, "max input tokens")?;
+        let max_output_tokens =
+            encode_optional_counter(limits.max_output_tokens, "max output tokens")?;
+        let max_tool_calls = encode_optional_counter(limits.max_tool_calls, "max tool calls")?;
+        let max_cost_micros = encode_optional_counter(limits.max_cost_micros, "max cost")?;
+        let context_window = encode_optional_counter(context.context_window, "context window")?;
+        let context_max_input_tokens =
+            encode_optional_counter(context.max_input_tokens, "context max input tokens")?;
+        let context_reserved_output_tokens = encode_optional_counter(
+            context.reserved_output_tokens,
+            "context reserved output tokens",
+        )?;
+        let input_cost_micros_per_1k =
+            encode_counter(config.input_cost_micros_per_1k, "input cost rate")?;
+        let output_cost_micros_per_1k =
+            encode_counter(config.output_cost_micros_per_1k, "output cost rate")?;
         transaction
             .execute(
                 "INSERT INTO run_runtime_config(
                     run_id, system_instructions, repository_instructions,
-                    approval_policy, options, context_inspection
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                    policy_read, policy_write, policy_command, policy_network,
+                    policy_destructive, max_duration_ms, max_input_tokens,
+                    max_output_tokens, max_tool_calls, max_cost_micros,
+                    context_window, context_max_input_tokens,
+                    context_reserved_output_tokens, checkpoint_id,
+                    input_cost_micros_per_1k, output_cost_micros_per_1k,
+                    context_inspection
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+                 )
                  ON CONFLICT(run_id) DO UPDATE SET
                     system_instructions=excluded.system_instructions,
                     repository_instructions=excluded.repository_instructions,
-                    approval_policy=excluded.approval_policy,
-                    options=excluded.options,
+                    policy_read=excluded.policy_read,
+                    policy_write=excluded.policy_write,
+                    policy_command=excluded.policy_command,
+                    policy_network=excluded.policy_network,
+                    policy_destructive=excluded.policy_destructive,
+                    max_duration_ms=excluded.max_duration_ms,
+                    max_input_tokens=excluded.max_input_tokens,
+                    max_output_tokens=excluded.max_output_tokens,
+                    max_tool_calls=excluded.max_tool_calls,
+                    max_cost_micros=excluded.max_cost_micros,
+                    context_window=excluded.context_window,
+                    context_max_input_tokens=excluded.context_max_input_tokens,
+                    context_reserved_output_tokens=excluded.context_reserved_output_tokens,
+                    checkpoint_id=excluded.checkpoint_id,
+                    input_cost_micros_per_1k=excluded.input_cost_micros_per_1k,
+                    output_cost_micros_per_1k=excluded.output_cost_micros_per_1k,
                     context_inspection=excluded.context_inspection
                  WHERE run_runtime_config.system_instructions IS NOT excluded.system_instructions
                     OR run_runtime_config.repository_instructions IS NOT excluded.repository_instructions
-                    OR run_runtime_config.approval_policy IS NOT excluded.approval_policy
-                    OR run_runtime_config.options IS NOT excluded.options
+                    OR run_runtime_config.policy_read IS NOT excluded.policy_read
+                    OR run_runtime_config.policy_write IS NOT excluded.policy_write
+                    OR run_runtime_config.policy_command IS NOT excluded.policy_command
+                    OR run_runtime_config.policy_network IS NOT excluded.policy_network
+                    OR run_runtime_config.policy_destructive IS NOT excluded.policy_destructive
+                    OR run_runtime_config.max_duration_ms IS NOT excluded.max_duration_ms
+                    OR run_runtime_config.max_input_tokens IS NOT excluded.max_input_tokens
+                    OR run_runtime_config.max_output_tokens IS NOT excluded.max_output_tokens
+                    OR run_runtime_config.max_tool_calls IS NOT excluded.max_tool_calls
+                    OR run_runtime_config.max_cost_micros IS NOT excluded.max_cost_micros
+                    OR run_runtime_config.context_window IS NOT excluded.context_window
+                    OR run_runtime_config.context_max_input_tokens IS NOT excluded.context_max_input_tokens
+                    OR run_runtime_config.context_reserved_output_tokens IS NOT excluded.context_reserved_output_tokens
+                    OR run_runtime_config.checkpoint_id IS NOT excluded.checkpoint_id
+                    OR run_runtime_config.input_cost_micros_per_1k IS NOT excluded.input_cost_micros_per_1k
+                    OR run_runtime_config.output_cost_micros_per_1k IS NOT excluded.output_cost_micros_per_1k
                     OR run_runtime_config.context_inspection IS NOT excluded.context_inspection",
                 params![
                     run_id.as_uuid().as_bytes().as_slice(),
                     config.system_instructions,
                     config.repository_instructions,
-                    approval_policy,
-                    options,
+                    encode_policy_decision(config.approval_policy.read),
+                    encode_policy_decision(config.approval_policy.write),
+                    encode_policy_decision(config.approval_policy.command),
+                    encode_policy_decision(config.approval_policy.network),
+                    encode_policy_decision(config.approval_policy.destructive),
+                    max_duration_ms,
+                    max_input_tokens,
+                    max_output_tokens,
+                    max_tool_calls,
+                    max_cost_micros,
+                    context_window,
+                    context_max_input_tokens,
+                    context_reserved_output_tokens,
+                    config
+                        .checkpoint_id
+                        .map(|id| id.as_uuid().as_bytes().to_vec()),
+                    input_cost_micros_per_1k,
+                    output_cost_micros_per_1k,
                     context_inspection,
                 ],
             )
@@ -8516,6 +8679,39 @@ fn decode_counter(counter: i64, field: &str) -> Result<u64> {
     })
 }
 
+fn decode_optional_u64(counter: Option<i64>, field: &str) -> Result<Option<u64>> {
+    counter
+        .map(|value| decode_counter(value, field))
+        .transpose()
+}
+
+fn encode_optional_counter(counter: Option<u64>, field: &str) -> Result<Option<i64>> {
+    counter
+        .map(|value| encode_counter(value, field))
+        .transpose()
+}
+
+fn encode_policy_decision(decision: PolicyDecision) -> &'static str {
+    match decision {
+        PolicyDecision::Allow => "allow",
+        PolicyDecision::RequireApproval => "require_approval",
+        PolicyDecision::Deny => "deny",
+    }
+}
+
+fn decode_policy_decision(value: &str, action: &str) -> Result<PolicyDecision> {
+    match value {
+        "allow" => Ok(PolicyDecision::Allow),
+        "require_approval" => Ok(PolicyDecision::RequireApproval),
+        "deny" => Ok(PolicyDecision::Deny),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted {action} approval decision is invalid"),
+            false,
+        )),
+    }
+}
+
 fn decode_timestamp(timestamp: i64) -> Result<Timestamp> {
     u64::try_from(timestamp)
         .map(Timestamp::from_unix_millis)
@@ -8943,7 +9139,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=33;")
+            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=34;")
             .unwrap();
         let original_journal_mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -8970,7 +9166,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 33);
+        assert_eq!(version, 34);
         assert_eq!(journal_mode, original_journal_mode);
         assert!(!has_feed_meta);
         fs::remove_file(path).unwrap();
@@ -9454,8 +9650,25 @@ mod tests {
         let run_runtime_config = DurableRunRuntimeConfig {
             system_instructions: Some("Use the project conventions".to_owned()),
             repository_instructions: Some("Do not modify generated files".to_owned()),
-            approval_policy: ApprovalPolicy::default(),
-            options: serde_json::json!({"limits": {"max_steps": 12}}),
+            approval_policy: ApprovalPolicy {
+                write: PolicyDecision::Deny,
+                ..ApprovalPolicy::default()
+            },
+            limits: SessionLimits {
+                max_duration_ms: Some(60_000),
+                max_input_tokens: Some(12_000),
+                max_output_tokens: Some(3_000),
+                max_tool_calls: Some(12),
+                max_cost_micros: Some(250_000),
+            },
+            context_options: ContextAssemblyOptions {
+                context_window: Some(16_000),
+                max_input_tokens: Some(12_000),
+                reserved_output_tokens: Some(3_000),
+            },
+            checkpoint_id: Some(CheckpointId::new()),
+            input_cost_micros_per_1k: 17,
+            output_cost_micros_per_1k: 29,
             context_inspection: None,
         };
         let run_runtime_configs = BTreeMap::from([(run_id, run_runtime_config.clone())]);
@@ -9795,6 +10008,29 @@ mod tests {
             persistence.load_run_runtime_config(run_id).unwrap(),
             Some(run_runtime_config)
         );
+        let connection = persistence.connection().unwrap();
+        let (stored_tool_limit, stored_policy, limit_storage_type): (i64, String, String) =
+            connection
+                .query_row(
+                    "SELECT max_tool_calls, policy_write, typeof(max_tool_calls)
+                     FROM run_runtime_config WHERE run_id=?1",
+                    [run_id.as_uuid().as_bytes().as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+        assert_eq!(stored_tool_limit, 12);
+        assert_eq!(stored_policy, "deny");
+        assert_eq!(limit_storage_type, "integer");
+        let runtime_config_columns = connection
+            .prepare("PRAGMA table_info(run_runtime_config)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .unwrap();
+        assert!(!runtime_config_columns.contains("options"));
+        assert!(!runtime_config_columns.contains("approval_policy"));
+        drop(connection);
         assert_eq!(
             persistence.load_run_context_checkpoint(run_id).unwrap(),
             Some(context_checkpoint.clone())

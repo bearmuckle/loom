@@ -178,7 +178,10 @@ per-session run lookup latency, and database size. Set `LOOM_SCALE_SESSIONS` and
 Before schema v33, the same 100k fixture occupied 113,315,840 bytes. Schema v33
 replaced each run's duplicated JSON snapshot with typed columns for task, model,
 attempt identity, control revision, state and timestamps; optional summary text
-and ordered evidence rows remain separate. Current schema v34 measures
+and ordered evidence rows remain separate. The synthetic measurements below
+were collected before the schema v35 runtime-configuration normalization;
+because this fixture contains no runtime configuration, its byte count is not
+expected to change. Schema v34's measured database was
 80,936,960 bytes, 32,378,880 bytes (28.6%) lower and below the 100 MB target. `dbstat`
 reports that at 100k the largest remaining objects are `feed_events` (19.1 MB),
 `run_summaries` (15.2 MB), and `sessions_visible` (8.1 MB). The index-heavy
@@ -187,8 +190,11 @@ the harness. Schema v33 also makes the model a directly queryable column, but
 intentionally does not add a model index without a query that needs it. Schema
 v34 removes the generic per-run runtime section, storing only unique run
 configuration in a run-keyed record and reconstructing the runtime from typed
-summary/execution/history rows. Runtime configuration is absent from this
-synthetic fixture, so its additional size reduction is not measured here.
+summary/execution/history rows. Schema v35 decomposes approval policy and
+runtime limits, context budgets, checkpoint identity, and token-cost rates into
+typed columns; only context-inspection diagnostics remain bounded JSON. Runtime
+configuration is absent from this synthetic fixture, so its storage reduction
+is not measured here.
 
 These are optimized local synthetic measurements, not a platform-independent
 latency guarantee. The fixture includes small session/run snapshots and one
