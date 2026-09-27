@@ -94,6 +94,14 @@ const PHONE_SIDEBAR_WIDTH: Pixels = px(300.);
 const COMPACT_REVIEW_WIDTH: Pixels = px(440.);
 const FULL_REVIEW_WIDTH: Pixels = px(600.);
 const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(760.);
+// GPUI's text utilities use rems; native display scaling and browser zoom
+// are applied when the window converts them to pixels.
+const BASE_FONT_SIZE: f32 = 17.;
+const CONVERSATION_FONT_SIZE: f32 = 15.;
+const DEFAULT_FONT_SCALE_PERCENT: u16 = 100;
+const MIN_FONT_SCALE_PERCENT: u16 = 75;
+const MAX_FONT_SCALE_PERCENT: u16 = 150;
+const FONT_SCALE_STEP_PERCENT: i16 = 5;
 
 #[derive(Clone, Copy, Debug)]
 struct ResponsiveLayout {
@@ -783,6 +791,7 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
         TextView::markdown(id, text)
             .selectable(true)
             .w_full()
+            .text_size(gpui_kit::rems(CONVERSATION_FONT_SIZE / BASE_FONT_SIZE))
             .text_color(rgb(color))
             .into_any()
     } else {
@@ -795,6 +804,7 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
             )
             .selectable(true)
             .w_full()
+            .text_size(gpui_kit::rems(CONVERSATION_FONT_SIZE / BASE_FONT_SIZE))
             .text_color(rgb(color))
             .into_any()
     }
@@ -1406,6 +1416,7 @@ pub(crate) struct LoomView {
     provider_api_key_inputs: BTreeMap<loom_model::ProviderId, Entity<InputState>>,
     provider_setup_status: BTreeMap<loom_model::ProviderId, String>,
     pub(crate) theme_choice: ThemeChoice,
+    font_scale_percent: u16,
     appearance_subscription: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
     event_stream_epoch: Option<String>,
@@ -1653,18 +1664,18 @@ impl Render for TimelineView {
                                 .bg(rgb(0x171c25))
                                 .border_1()
                                 .border_color(rgb(0x293244))
-                                .text_sm()
+                                .text_size(gpui_kit::rems(14. / BASE_FONT_SIZE))
                                 .text_color(rgb(0xb7c0d0))
                                 .child(
                                     div()
-                                        .text_base()
+                                        .text_size(gpui_kit::rems(16. / BASE_FONT_SIZE))
                                         .text_color(rgb(0xf3f4f6))
                                         .child("Ready when you are"),
                                 )
                                 .child(
                                     div()
                                         .mt_1()
-                                        .text_sm()
+                                        .text_size(gpui_kit::rems(14. / BASE_FONT_SIZE))
                                         .text_color(rgb(0x8f98a6))
                                         .child("Describe a task below and Loom will keep the work, decisions, and results together."),
                                 ),
@@ -1790,6 +1801,7 @@ impl LoomView {
             provider_api_key_inputs: BTreeMap::new(),
             provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
+            font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
             appearance_subscription: None,
             after_sequence: None,
             event_stream_epoch: None,
@@ -2176,6 +2188,7 @@ impl LoomView {
             provider_api_key_inputs: BTreeMap::new(),
             provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
+            font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
             appearance_subscription: None,
             after_sequence: None,
             event_stream_epoch: None,
@@ -2344,6 +2357,7 @@ impl LoomView {
             provider_api_key_inputs: BTreeMap::new(),
             provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
+            font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
             appearance_subscription: None,
             after_sequence: None,
             event_stream_epoch: None,
@@ -2571,6 +2585,7 @@ impl LoomView {
             provider_api_key_inputs: BTreeMap::new(),
             provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
+            font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
             appearance_subscription: None,
             after_sequence: None,
             event_stream_epoch: None,
@@ -5424,6 +5439,34 @@ impl LoomView {
         cx.notify();
     }
 
+    fn set_font_scale_percent(
+        &mut self,
+        font_scale_percent: u16,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let font_scale_percent =
+            font_scale_percent.clamp(MIN_FONT_SCALE_PERCENT, MAX_FONT_SCALE_PERCENT);
+        if self.font_scale_percent == font_scale_percent {
+            return;
+        }
+        self.font_scale_percent = font_scale_percent;
+        window.set_rem_size(px(
+            BASE_FONT_SIZE * font_scale_percent as f32 / DEFAULT_FONT_SCALE_PERCENT as f32
+        ));
+        cx.notify();
+    }
+
+    fn adjust_font_scale(&mut self, delta: i16, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_font_scale_percent(
+            (self.font_scale_percent as i16 + delta)
+                .clamp(MIN_FONT_SCALE_PERCENT as i16, MAX_FONT_SCALE_PERCENT as i16)
+                as u16,
+            window,
+            cx,
+        );
+    }
+
     fn persist_and_distribute_workspace_config(
         &self,
         retiring: Option<(String, ClientConnection)>,
@@ -7082,7 +7125,7 @@ impl LoomView {
                 .selected(selected)
                 .px_2()
                 .py_2()
-                .text_sm()
+                .text_size(gpui_kit::rems(0.8125))
                 .child(
                     div()
                         .w_full()
@@ -7296,7 +7339,7 @@ impl LoomView {
                                 div()
                                     .w_full()
                                     .text_left()
-                                    .text_size(px(12.))
+                                    .text_size(gpui_kit::rems(0.75))
                                     .text_color(header_color)
                                     .child(format!(
                                         "{} {title}{count_label} · {}",
@@ -9217,8 +9260,64 @@ impl LoomView {
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.select_theme(choice, window, cx);
                                 }))
-                        }),
+                    }),
                 ),
+            )
+            .child(
+                div()
+                    .mt_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child("Font size")
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child("Relative to the system display scale"),
+                            ),
+                    )
+                    .child(
+                        Button::new("font-scale-decrease")
+                            .label("−")
+                            .small()
+                            .disabled(self.font_scale_percent <= MIN_FONT_SCALE_PERCENT)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.adjust_font_scale(-FONT_SCALE_STEP_PERCENT, window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(px(48.))
+                            .text_center()
+                            .text_sm()
+                            .child(format!("{}%", self.font_scale_percent)),
+                    )
+                    .child(
+                        Button::new("font-scale-increase")
+                            .label("+")
+                            .small()
+                            .disabled(self.font_scale_percent >= MAX_FONT_SCALE_PERCENT)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.adjust_font_scale(FONT_SCALE_STEP_PERCENT, window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("font-scale-reset")
+                            .label("Reset")
+                            .small()
+                            .disabled(self.font_scale_percent == DEFAULT_FONT_SCALE_PERCENT)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.set_font_scale_percent(
+                                    DEFAULT_FONT_SCALE_PERCENT,
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
             )
             .into_any()
     }
@@ -9832,6 +9931,9 @@ impl LoomView {
 
 impl Render for LoomView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        window.set_rem_size(px(
+            BASE_FONT_SIZE * self.font_scale_percent as f32 / DEFAULT_FONT_SCALE_PERCENT as f32
+        ));
         window.set_window_title(&format!("Loom - {}", self.active_session.name));
         #[cfg(target_family = "wasm")]
         if !self.browser_window_initialized {
@@ -10317,7 +10419,7 @@ impl Render for LoomView {
             .flex_col()
             .bg(rgb(0x111318))
             .text_color(rgb(0xe5e7eb))
-            .text_size(px(13.))
+            .text_size(gpui_kit::rems(0.8125))
             // Initializes the per-frame selection registry before selectable
             // text participants prepaint and register themselves.
             .child(TextSelectionLayer)
