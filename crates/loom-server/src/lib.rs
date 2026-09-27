@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, Weak},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use loom_agent::{
@@ -13,8 +13,8 @@ use loom_agent::{
 };
 use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Capability,
-    CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId, Result,
-    SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId, RequestId,
+    Result, SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
@@ -58,6 +58,61 @@ fn json_value<T: Serialize>(value: T) -> Result<Value> {
             false,
         )
     })
+}
+
+fn current_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn validate_retry_horizon(request_id: RequestId, now_ms: u64) -> Result<()> {
+    let Some(issued_at_ms) = request_id.issued_at_unix_millis() else {
+        // UUIDv4 IDs were used by earlier protocol clients. Keep their bounded
+        // count-based cache behavior while new clients use timestamped UUIDv7.
+        return Ok(());
+    };
+    let future_skew_ms = REQUEST_ID_FUTURE_SKEW.as_millis() as u64;
+    if issued_at_ms > now_ms.saturating_add(future_skew_ms) {
+        return Err(LoomError::invalid_request(
+            "request id issue time is too far in the future",
+        ));
+    }
+    if now_ms.saturating_sub(issued_at_ms) > IDEMPOTENCY_RETENTION.as_millis() as u64 {
+        return Err(LoomError::new(
+            ErrorCode::DeadlineExceeded,
+            "retry horizon expired; submit the operation as a new request",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn trim_idempotency_cache(cache: &mut BTreeMap<RequestId, IdempotencyRecord>) {
+    let now = current_unix_millis();
+    let horizon_ms = IDEMPOTENCY_RETENTION.as_millis() as u64;
+    let cutoff = now.saturating_sub(horizon_ms);
+    cache.retain(|request_id, _| {
+        request_id
+            .issued_at_unix_millis()
+            .is_none_or(|issued_at| issued_at >= cutoff)
+    });
+
+    let mut legacy = cache
+        .iter()
+        .filter(|(request_id, _)| request_id.issued_at_unix_millis().is_none())
+        .map(|(request_id, record)| (*request_id, record.created_at))
+        .collect::<Vec<_>>();
+    if legacy.len() > LEGACY_IDEMPOTENCY_RETENTION {
+        let expired_count = legacy.len() - LEGACY_IDEMPOTENCY_RETENTION;
+        legacy.sort_by_key(|(_, created_at)| *created_at);
+        for (request_id, _) in legacy.into_iter().take(expired_count) {
+            cache.remove(&request_id);
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -314,7 +369,9 @@ pub use remote::{
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
-const IDEMPOTENCY_RETENTION: usize = 1024;
+const IDEMPOTENCY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const LEGACY_IDEMPOTENCY_RETENTION: usize = 1024;
+const REQUEST_ID_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 const MAX_REVIEW_CHANGES: usize = 512;
 
 fn filesystem_history_pruned(
@@ -2309,20 +2366,24 @@ impl InProcessBackend {
             provider_health: persistence.load_provider_health()?,
             workspace_configs: persistence.load_workspace_configs()?,
             provider_usage: persistence.load_provider_usage()?,
-            idempotency: persistence
-                .load_idempotency_records()?
-                .into_iter()
-                .map(|(id, record)| {
-                    Ok((
-                        id,
-                        IdempotencyRecord {
-                            created_at: record.created_at,
-                            request: from_json(record.request)?,
-                            response: from_json(record.response)?,
-                        },
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>>>()?,
+            idempotency: {
+                let mut cache = persistence
+                    .load_idempotency_records()?
+                    .into_iter()
+                    .map(|(id, record)| {
+                        Ok((
+                            id,
+                            IdempotencyRecord {
+                                created_at: record.created_at,
+                                request: from_json(record.request)?,
+                                response: from_json(record.response)?,
+                            },
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                trim_idempotency_cache(&mut cache);
+                cache
+            },
         };
         log::info!(
             "loaded persisted catalogs and feed cursors in {} ms",
@@ -3085,16 +3146,7 @@ impl InProcessBackend {
                 response,
             },
         );
-        while cache.len() > IDEMPOTENCY_RETENTION {
-            let Some(first) = cache
-                .iter()
-                .min_by_key(|(_, record)| record.created_at)
-                .map(|(id, _)| *id)
-            else {
-                break;
-            };
-            cache.remove(&first);
-        }
+        trim_idempotency_cache(&mut cache);
         Ok(())
     }
 
@@ -4188,6 +4240,9 @@ impl InProcessConnection {
 
         let durable_mutation = request.request.is_retryable_mutation();
         let retryable = durable_mutation;
+        if retryable && let Err(error) = validate_retry_horizon(request_id, current_unix_millis()) {
+            return ResponseEnvelope::failure(request_id, error);
+        }
         let slot = if retryable {
             match self.backend.request_slot(request_id) {
                 Ok(slot) => Some(slot),
@@ -6006,6 +6061,12 @@ mod tests {
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
     use super::*;
+
+    fn request_id_with_issued_at(issued_at_ms: u64) -> loom_core::RequestId {
+        let mut bytes = *loom_core::RequestId::new().as_uuid().as_bytes();
+        bytes[..6].copy_from_slice(&issued_at_ms.to_be_bytes()[2..]);
+        loom_core::RequestId::from_uuid(uuid::Uuid::from_bytes(bytes))
+    }
 
     #[test]
     fn resumable_runs_without_pending_tool_intent_are_deferred_on_restore() {
@@ -9861,6 +9922,26 @@ mod tests {
         assert!(matches!(
             first.result,
             Ok(ServerResponse::AgentSessionCreated(_))
+        ));
+        let expired_request_id = request_id_with_issued_at(
+            current_unix_millis()
+                .saturating_sub(IDEMPOTENCY_RETENTION.as_millis() as u64)
+                .saturating_sub(1),
+        );
+        let expired = connection.request(RequestEnvelope::with_request_id(
+            expired_request_id,
+            ClientRequest::CreateWorkspace {
+                name: "must not be replayed".to_owned(),
+            },
+        ));
+        assert_eq!(
+            expired.result.unwrap_err().code,
+            ErrorCode::DeadlineExceeded
+        );
+        let workspaces = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+        assert!(matches!(
+            workspaces.result,
+            Ok(ServerResponse::Workspaces { workspaces }) if workspaces.len() == 1
         ));
         fs::remove_file(path).unwrap();
     }

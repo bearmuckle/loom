@@ -86,6 +86,14 @@ by the current protocol. This
 design replaces the version-2 `sections` container. The release does not import
 existing databases: it creates a fresh database and rejects an existing
 unsupported format without changing it.
+
+New retryable requests use UUIDv7 IDs so their issue time is immutable and
+available without another request field. The server rejects retryable requests
+older than the seven-day retry horizon, retains their cached responses for that
+window, and prunes expired records. UUIDv4 IDs from older peers retain the
+previous 1,024-entry bounded-cache behavior because they do not encode an issue
+time. The indexed creation-time column remains available for cleanup and
+inspection.
 See the [investigation](storage-investigation.md) for measurements and code evidence.
 
 ## Decision
@@ -456,7 +464,7 @@ mutable links into the source session's in-progress message/output fragments.
 | Automatic checkpoint for a terminal run | Initially retain 30 days, with user pinning; atomically mark rollback expired and release references before GC |
 | Detailed context inspections and diagnostic traces | Opt-in or time/byte bounded; final summary and required context remain durable |
 | Reconnect events/filesystem change notifications | Bounded disposable feeds with resync |
-| Idempotency | Explicit retry horizon, initially 7 days; expiry indexed by time, not UUID order |
+| Idempotency | Seven-day retry horizon for UUIDv7 requests; reject stale retries before dispatch and retain responses through expiry. UUIDv4 peers keep a bounded compatibility cache. |
 | Usage | Retain useful run totals; roll older detail into aggregates |
 | Filesystem index, model discovery, provider health | Rebuildable caches; never required to read conversation history |
 

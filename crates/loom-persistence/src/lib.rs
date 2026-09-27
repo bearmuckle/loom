@@ -49,7 +49,6 @@ const MAX_CONTENT_GC_CANDIDATES_PER_WRITE: usize = 256;
 const MAX_MANUAL_CONTENT_GC_CANDIDATES: usize = 16_384;
 const MAX_FILESYSTEM_CHANGE_HISTORY: usize = 2048;
 const MAX_FILESYSTEM_CHANGE_PAGE_SIZE: usize = 512;
-const MAX_IDEMPOTENCY_RECORDS: usize = 1024;
 const MAX_IDEMPOTENCY_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_RUN_RUNTIME_CONFIG_BYTES: usize = 1024 * 1024;
 
@@ -6313,13 +6312,6 @@ fn save_idempotency_rows(
     transaction: &Transaction<'_>,
     records: &BTreeMap<RequestId, DurableIdempotencyRecord>,
 ) -> Result<()> {
-    if records.len() > MAX_IDEMPOTENCY_RECORDS {
-        return Err(LoomError::new(
-            ErrorCode::Persistence,
-            "idempotency cache exceeds its configured record limit",
-            false,
-        ));
-    }
     transaction
         .execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_idempotency (
