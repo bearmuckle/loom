@@ -390,6 +390,9 @@ pub enum ClientRequest {
     GetSessionEvents {
         session_id: Option<AgentSessionId>,
         after_sequence: Option<EventSequence>,
+        /// Backend-instance identity paired with `after_sequence`.
+        #[serde(default)]
+        stream_epoch: Option<String>,
     },
     GetRecentSessionEvents {
         session_id: AgentSessionId,
@@ -714,12 +717,16 @@ pub enum ServerResponse {
     RunCheckpoint(Checkpoint),
     SessionEvents {
         events: Vec<ServerEventEnvelope>,
+        #[serde(default)]
+        stream_epoch: Option<String>,
     },
     SessionEventsSnapshot {
         session: AgentSessionSnapshot,
         events: Vec<ServerEventEnvelope>,
         oldest_sequence: EventSequence,
         latest_sequence: EventSequence,
+        #[serde(default)]
+        stream_epoch: Option<String>,
     },
     Models {
         models: Vec<ModelDescriptor>,
@@ -982,6 +989,43 @@ pub fn unsupported_version_error(requested: ProtocolVersion) -> LoomError {
 #[cfg(test)]
 mod run_message_protocol_tests {
     use super::*;
+
+    #[test]
+    fn stream_epoch_fields_default_for_sequence_only_peers() {
+        let request = RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(AgentSessionId::new()),
+            after_sequence: Some(EventSequence::new(12)),
+            stream_epoch: None,
+        });
+        let mut encoded = serde_json::to_value(&request).unwrap();
+        encoded["request"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stream_epoch");
+        let decoded: RequestEnvelope = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.request, request.request);
+
+        let response = ResponseEnvelope::success(
+            RequestId::new(),
+            ServerResponse::SessionEvents {
+                events: Vec::new(),
+                stream_epoch: None,
+            },
+        );
+        let mut encoded = serde_json::to_value(&response).unwrap();
+        encoded["result"]["Ok"]["data"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stream_epoch");
+        let decoded: ResponseEnvelope = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            decoded.result.unwrap(),
+            ServerResponse::SessionEvents {
+                events: Vec::new(),
+                stream_epoch: None,
+            }
+        );
+    }
 
     #[test]
     fn transcript_page_and_range_frames_round_trip_with_their_capability() {

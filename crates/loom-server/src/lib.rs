@@ -4449,7 +4449,18 @@ impl InProcessConnection {
             ClientRequest::GetSessionEvents {
                 session_id,
                 after_sequence,
+                stream_epoch,
             } => {
+                let current_stream_epoch = Some(self.backend.node_id.clone());
+                let stream_epoch_changed = session_id.is_some()
+                    && stream_epoch
+                        .as_deref()
+                        .is_some_and(|epoch| Some(epoch) != current_stream_epoch.as_deref());
+                let after_sequence = if stream_epoch_changed {
+                    None
+                } else {
+                    after_sequence
+                };
                 let (events, session_latest_sequence) = match session_id {
                     Some(session_id) => {
                         let (events, latest) =
@@ -4470,15 +4481,16 @@ impl InProcessConnection {
                     });
                 if let Some(session_id) = session_id {
                     let durable_cursor = self.feed_session_cursor(session_id)?;
-                    let cursor_stale = match (durable_cursor, after_sequence) {
-                        (Some(cursor), Some(after)) => {
-                            after < cursor.pruned_through
-                                || after > cursor.latest_sequence
-                                    && journal.is_cursor_stale(Some(session_id), after_sequence)
-                        }
-                        (None, _) => journal.is_cursor_stale(Some(session_id), after_sequence),
-                        (_, None) => false,
-                    };
+                    let cursor_stale = stream_epoch_changed
+                        || match (durable_cursor, after_sequence) {
+                            (Some(cursor), Some(after)) => {
+                                after < cursor.pruned_through
+                                    || after > cursor.latest_sequence
+                                        && journal.is_cursor_stale(Some(session_id), after_sequence)
+                            }
+                            (None, _) => journal.is_cursor_stale(Some(session_id), after_sequence),
+                            (_, None) => false,
+                        };
                     if cursor_stale || history_missing {
                         let oldest_sequence = durable_cursor
                             .and_then(|cursor| cursor.oldest_retained_sequence)
@@ -4499,14 +4511,19 @@ impl InProcessConnection {
                             oldest_sequence,
                             latest_sequence: session_latest_sequence
                                 .unwrap_or(journal.next_sequence),
+                            stream_epoch: current_stream_epoch,
                         });
                     }
                 }
-                Ok(ServerResponse::SessionEvents { events })
+                Ok(ServerResponse::SessionEvents {
+                    events,
+                    stream_epoch: session_id.map(|_| self.backend.node_id.clone()),
+                })
             }
             ClientRequest::GetRecentSessionEvents { session_id, limit } => {
                 Ok(ServerResponse::SessionEvents {
                     events: self.recent_session_events(session_id, limit as usize)?,
+                    stream_epoch: Some(self.backend.node_id.clone()),
                 })
             }
             ClientRequest::StartSessionAgentRun {
@@ -7313,8 +7330,9 @@ mod tests {
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: None,
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
             panic!("unexpected response");
         };
         assert_eq!(events.len(), 1);
@@ -7338,8 +7356,9 @@ mod tests {
         let resumed = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: Some(initial.cursor),
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = resumed.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = resumed.result.unwrap() else {
             panic!("unexpected incremental event response");
         };
         assert_eq!(events.len(), 1);
@@ -7413,8 +7432,9 @@ mod tests {
                 connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
                     after_sequence: after,
+                    stream_epoch: None,
                 }));
-            let ServerResponse::SessionEvents { events } = response.result.unwrap() else {
+            let ServerResponse::SessionEvents { events, .. } = response.result.unwrap() else {
                 panic!("unexpected response");
             };
             let mut completed = false;
@@ -7547,8 +7567,9 @@ mod tests {
         let history = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: None,
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = history.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = history.result.unwrap() else {
             panic!("unexpected history response");
         };
         assert!(events.iter().any(|event| {
@@ -7922,8 +7943,9 @@ mod tests {
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: None,
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
             panic!("unexpected session event response");
         };
         assert!(events.iter().any(|event| {
@@ -8030,11 +8052,12 @@ mod tests {
                 .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
                     after_sequence: None,
+                    stream_epoch: None,
                 }))
                 .result
                 .unwrap()
             {
-                ServerResponse::SessionEvents { events } => events,
+                ServerResponse::SessionEvents { events, .. } => events,
                 response => panic!("unexpected response: {response:?}"),
             };
             let approval = events
@@ -8264,8 +8287,9 @@ mod tests {
         let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: None,
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
             panic!("unexpected events response");
         };
         assert!(events.len() >= 5);
@@ -8321,11 +8345,12 @@ mod tests {
                     .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                         session_id: Some(session_id),
                         after_sequence: None,
+                        stream_epoch: None,
                     }))
                     .result
                     .unwrap()
                 {
-                    ServerResponse::SessionEvents { events } => events,
+                    ServerResponse::SessionEvents { events, .. } => events,
                     response => panic!("unexpected events response: {response:?}"),
                 };
                 let approval = events.iter().find_map(|event| match &event.event {
@@ -8651,8 +8676,9 @@ mod tests {
             restored_connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(recovery_session_id),
                 after_sequence: None,
+                stream_epoch: None,
             }));
-        let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
             panic!("unexpected recovery event response");
         };
         assert!(events.iter().any(|event| matches!(
@@ -8882,11 +8908,12 @@ mod tests {
             .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session_id),
                 after_sequence: None,
+                stream_epoch: None,
             }))
             .result
             .unwrap()
         {
-            ServerResponse::SessionEvents { events } => events,
+            ServerResponse::SessionEvents { events, .. } => events,
             response => panic!("unexpected response: {response:?}"),
         };
         assert!(events.iter().any(|event| {
@@ -9327,6 +9354,7 @@ mod tests {
                 .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: None,
                     after_sequence: None,
+                    stream_epoch: None,
                 }))
                 .result
                 .unwrap_err()
@@ -9692,8 +9720,9 @@ mod tests {
             let events = observer.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(session_id),
                 after_sequence: None,
+                stream_epoch: None,
             }));
-            let ServerResponse::SessionEvents { events } = events.result.unwrap() else {
+            let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
                 panic!("unexpected events response");
             };
             if events.iter().any(|event| {
@@ -9838,7 +9867,7 @@ mod tests {
     #[test]
     fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
         let path = std::env::temp_dir().join(format!("loom-server-feed-{}.db", WorkspaceId::new()));
-        let (session_id, session_root_base) = {
+        let (session_id, session_root_base, previous_stream_epoch) = {
             let backend = InProcessBackend::new_persistent(&path).unwrap();
             backend.set_event_retention(1).unwrap();
             let connection = backend.connect();
@@ -9869,7 +9898,11 @@ mod tests {
                     .unwrap();
             }
             backend.flush().unwrap();
-            (session.id, backend.session_root_base.clone())
+            (
+                session.id,
+                backend.session_root_base.clone(),
+                backend.node_id.clone(),
+            )
         };
 
         let backend = InProcessBackend::new_persistent(&path).unwrap();
@@ -9879,6 +9912,7 @@ mod tests {
         let stale = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: Some(EventSequence::new(1)),
+            stream_epoch: None,
         }));
         let ServerResponse::SessionEventsSnapshot {
             events,
@@ -9894,11 +9928,31 @@ mod tests {
         assert_eq!(oldest_sequence, EventSequence::new(3));
         assert_eq!(latest_sequence, EventSequence::new(3));
 
+        let changed_epoch =
+            connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                after_sequence: Some(EventSequence::new(3)),
+                stream_epoch: Some(previous_stream_epoch.clone()),
+            }));
+        let ServerResponse::SessionEventsSnapshot {
+            events,
+            latest_sequence,
+            stream_epoch: Some(current_epoch),
+            ..
+        } = changed_epoch.result.unwrap()
+        else {
+            panic!("expected a snapshot after the feed epoch changed");
+        };
+        assert_ne!(current_epoch, previous_stream_epoch);
+        assert_eq!(latest_sequence, EventSequence::new(3));
+        assert_eq!(events.len(), 1);
+
         let current = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence: Some(EventSequence::new(2)),
+            stream_epoch: None,
         }));
-        let ServerResponse::SessionEvents { events } = current.result.unwrap() else {
+        let ServerResponse::SessionEvents { events, .. } = current.result.unwrap() else {
             panic!("expected retained session events");
         };
         assert_eq!(events.len(), 1);

@@ -1389,6 +1389,7 @@ pub(crate) struct LoomView {
     pub(crate) theme_choice: ThemeChoice,
     appearance_subscription: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
+    event_stream_epoch: Option<String>,
     pub(crate) timeline: Vec<TimelineItem>,
     transcript_before_ordinal: Option<u64>,
     transcript_has_older: bool,
@@ -1767,6 +1768,7 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
+            event_stream_epoch: None,
             timeline: Vec::new(),
             transcript_before_ordinal: None,
             transcript_has_older: false,
@@ -2142,6 +2144,7 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
+            event_stream_epoch: None,
             timeline: Vec::new(),
             transcript_before_ordinal: None,
             transcript_has_older: false,
@@ -2304,6 +2307,7 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
+            event_stream_epoch: None,
             timeline: if demo_mode {
                 vec![
                     TimelineItem::User("What can Loom do?".to_owned()),
@@ -2520,6 +2524,7 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
+            event_stream_epoch: None,
             timeline: Vec::new(),
             transcript_before_ordinal: None,
             transcript_has_older: false,
@@ -3134,11 +3139,16 @@ impl LoomView {
                     .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                         session_id: Some(session_id),
                         after_sequence,
+                        stream_epoch: self.event_stream_epoch.clone(),
                     }));
             match response.result? {
-                ServerResponse::SessionEvents { events } => {
+                ServerResponse::SessionEvents {
+                    events,
+                    stream_epoch,
+                } => {
                     self.reset_projection();
                     self.after_sequence = after_sequence;
+                    self.event_stream_epoch = stream_epoch;
                     for event in events {
                         self.after_sequence = Some(event.sequence);
                         self.consume_event(&event.event);
@@ -3154,8 +3164,10 @@ impl LoomView {
                     session,
                     events,
                     latest_sequence,
+                    stream_epoch,
                     ..
                 } if resync_attempt == 0 => {
+                    self.event_stream_epoch = stream_epoch;
                     self.active_session = session;
                     let refreshed = self.connection.request(RequestEnvelope::new(
                         ClientRequest::GetAgentSessionInitialState { session_id },
@@ -3179,9 +3191,11 @@ impl LoomView {
                     session,
                     events,
                     latest_sequence,
+                    stream_epoch,
                     ..
                 } => {
                     self.active_session = session;
+                    self.event_stream_epoch = stream_epoch;
                     self.apply_event_snapshot(events, latest_sequence, fallback);
                     return Ok(());
                 }
@@ -3218,10 +3232,15 @@ impl LoomView {
             ClientRequest::GetSessionEvents {
                 session_id: Some(self.active_session.id),
                 after_sequence: self.after_sequence,
+                stream_epoch: self.event_stream_epoch.clone(),
             },
             |view, response, cx| {
                 match response.result {
-                    Ok(ServerResponse::SessionEvents { events }) => {
+                    Ok(ServerResponse::SessionEvents {
+                        events,
+                        stream_epoch,
+                    }) => {
+                        view.event_stream_epoch = stream_epoch;
                         for event in events {
                             view.after_sequence = Some(event.sequence);
                             view.consume_event(&event.event);
@@ -3231,8 +3250,10 @@ impl LoomView {
                         session,
                         events,
                         latest_sequence,
+                        stream_epoch,
                         ..
                     }) => {
+                        view.event_stream_epoch = stream_epoch;
                         view.active_session = session;
                         view.reset_projection();
                         view.after_sequence = Some(latest_sequence);
@@ -4156,6 +4177,7 @@ impl LoomView {
         }
         self.ensure_session_task_message(session.id);
         let session_id = session.id;
+        let mut event_stream_epoch = self.event_stream_epoch.clone();
         let snapshot_request = backend.submit(RequestEnvelope::new(
             ClientRequest::GetAgentSessionInitialState { session_id },
         ));
@@ -4182,10 +4204,18 @@ impl LoomView {
                 backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
                     after_sequence: cursor,
+                    stream_epoch: event_stream_epoch.clone(),
                 }));
             let mut events = cx
                 .background_spawn(async move { events_request.wait().await })
                 .await;
+            if let Ok(ServerResponse::SessionEventsSnapshot {
+                stream_epoch: Some(epoch),
+                ..
+            }) = &events.result
+            {
+                event_stream_epoch = Some(epoch.clone());
+            }
             if matches!(
                 &events.result,
                 Ok(ServerResponse::SessionEventsSnapshot { .. })
@@ -4205,6 +4235,7 @@ impl LoomView {
                         backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                             session_id: Some(session_id),
                             after_sequence: Some(refreshed_cursor),
+                            stream_epoch: event_stream_epoch.clone(),
                         }));
                     snapshot = refreshed;
                     events = cx
@@ -4270,7 +4301,11 @@ impl LoomView {
             .as_ref()
             .map(|projection| projection.latest_sequence);
         match events_response.result {
-            Ok(ServerResponse::SessionEvents { events }) => {
+            Ok(ServerResponse::SessionEvents {
+                events,
+                stream_epoch,
+            }) => {
+                self.event_stream_epoch = stream_epoch;
                 for event in events {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
@@ -4287,8 +4322,10 @@ impl LoomView {
                 session,
                 events,
                 latest_sequence,
+                stream_epoch,
                 ..
             }) => {
+                self.event_stream_epoch = stream_epoch;
                 self.active_session = session;
                 self.reset_projection();
                 self.after_sequence = Some(latest_sequence);
@@ -11772,6 +11809,7 @@ mod loom_view_render_tests {
             assert_eq!(view.active_session.id, session.id);
             assert_eq!(view.active_session.name, "Loaded session");
             assert!(view.after_sequence.is_some());
+            assert!(view.event_stream_epoch.is_some());
             assert_eq!(view.active_run_id, Some(run_id));
             assert_eq!(view.transcript_before_ordinal, Some(0));
             assert!(view.timeline.iter().any(
@@ -11832,7 +11870,10 @@ mod loom_view_render_tests {
                 ),
                 loom_protocol::ResponseEnvelope::success(
                     loom_core::RequestId::new(),
-                    loom_protocol::ServerResponse::SessionEvents { events: Vec::new() },
+                    loom_protocol::ServerResponse::SessionEvents {
+                        events: Vec::new(),
+                        stream_epoch: None,
+                    },
                 ),
                 cx,
             );
@@ -13737,7 +13778,8 @@ mod worker_node_tests {
             session_id_for_request(
                 &ClientRequest::GetSessionEvents {
                     session_id: None,
-                    after_sequence: None
+                    after_sequence: None,
+                    stream_epoch: None,
                 },
                 active
             ),
@@ -13747,7 +13789,8 @@ mod worker_node_tests {
             session_id_for_request(
                 &ClientRequest::GetSessionEvents {
                     session_id: Some(session),
-                    after_sequence: None
+                    after_sequence: None,
+                    stream_epoch: None,
                 },
                 active
             ),

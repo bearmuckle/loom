@@ -34,8 +34,10 @@ evaluates the retained boundary for the requested session and resumes at that
 session's high-water mark; events in other sessions do not advance its cursor.
 Sequence values remain globally allocated. Startup loads only the feed header;
 event payloads and per-session retained-boundary metadata load on demand. Cursor
-epochs and fully stream-scoped cursors remain unfinished; aggregate retained feed
-size grows with the number of sessions.
+requests now pair the session scope and sequence with the backend's random node
+identity. A backend restart invalidates the previous epoch and forces an
+authoritative resync. Dedicated store epochs and workspace-scoped streams remain
+unfinished; aggregate retained feed size grows with the number of sessions.
 Message role, run/session ownership, order, tool-call metadata, and content
 references are stored separately from runtime execution state. Message-emitted
 tool calls are ordered child rows, and their argument JSON is shared through
@@ -388,10 +390,13 @@ pruned to the same per-session event count. It keeps global sequence numbers and
 full event payloads. Initial projection reads use before/after sequence checks;
 event reads report no cursor later than the read cursor or latest included event.
 Clients request a fresh initial state when retention invalidates the first cursor.
-It has no stream epoch,
-workspace stream, or transactional snapshot/resubscribe cursor. The target still
-requires compact revision notifications and fully scoped cursors; global pressure
-may expire a quiet session's entire retained feed.
+Session cursors now include a backend-instance epoch and a mismatch returns an
+authoritative snapshot. Snapshot projection still checks its sequence before
+and after reading, then fetches events from that cursor; this closes the ordinary
+snapshot/subscription gap but is not a single database read transaction. There
+is no workspace stream, and global pressure may expire a quiet session's entire
+retained feed. Compact revision notifications and transactionally captured
+snapshot cursors remain target work.
 
 An expired cursor returns `ResyncRequired`, followed by an authoritative snapshot
 with a fresh cursor read in the same SQLite read transaction. Subscribe after that
@@ -593,9 +598,11 @@ Implement in this order:
    and refresh that session. The SQLite history page query is bounded and avoids
    hydrating retained history, but its request refresh still polls the selected
    filesystem service for external changes.
-5. Finish scoped feeds, retention policy, and storage maintenance; define the
-   maintenance cadence that drains queued content-GC candidates and remove
-   section exports and mirrored in-memory journals completely.
+5. Finish scoped feeds, retention policy, and storage maintenance. Session
+   cursors now include a backend-instance epoch; add workspace streams and
+   capture the snapshot cursor transactionally. Define the cadence for queued
+   content-GC candidates and remove section exports and mirrored in-memory
+   journals completely.
 
 This release has a clean start only. It does not copy, import, rename, or remove
 an existing state database. When the configured path contains an unsupported

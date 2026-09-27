@@ -156,13 +156,14 @@ async fn events(
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(session_id),
             after_sequence,
+            stream_epoch: None,
         }))
         .await
         .unwrap()
         .result
         .unwrap()
     {
-        ServerResponse::SessionEvents { events }
+        ServerResponse::SessionEvents { events, .. }
         | ServerResponse::SessionEventsSnapshot { events, .. } => events,
         response => panic!("unexpected event response: {response:?}"),
     }
@@ -713,23 +714,41 @@ async fn stale_cursors_return_a_snapshot_fallback() {
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(first.id),
             after_sequence: Some(EventSequence::new(1)),
+            stream_epoch: None,
         }))
         .await
         .unwrap();
-    match response.result.unwrap() {
+    let stream_epoch = match response.result.unwrap() {
         ServerResponse::SessionEventsSnapshot {
             session,
             events,
             oldest_sequence,
             latest_sequence,
+            stream_epoch: Some(stream_epoch),
         } => {
             assert_eq!(session.id, first.id);
             assert_eq!(events.len(), 2);
             assert_eq!(oldest_sequence.value(), 5);
             assert_eq!(latest_sequence.value(), 6);
+            stream_epoch
         }
         response => panic!("expected snapshot fallback, got {response:?}"),
-    }
+    };
+    let resumed = connection
+        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            session_id: Some(first.id),
+            after_sequence: Some(EventSequence::new(6)),
+            stream_epoch: Some(stream_epoch.clone()),
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        resumed.result.unwrap(),
+        ServerResponse::SessionEvents {
+            stream_epoch: Some(epoch),
+            ..
+        } if epoch == stream_epoch
+    ));
     server.stop().await.unwrap();
 }
 
@@ -746,10 +765,11 @@ async fn session_cursor_before_creation_ignores_other_sessions_events() {
         .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(target_session.id),
             after_sequence: Some(EventSequence::default()),
+            stream_epoch: None,
         }))
         .await
         .unwrap();
-    let ServerResponse::SessionEvents { events } = response.result.unwrap() else {
+    let ServerResponse::SessionEvents { events, .. } = response.result.unwrap() else {
         panic!("an unrelated session's prior events must not stale this cursor");
     };
     assert!(events.iter().any(|event| {
