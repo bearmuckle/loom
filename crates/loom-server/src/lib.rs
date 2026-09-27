@@ -7226,6 +7226,222 @@ mod tests {
     }
 
     #[test]
+    fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() {
+        let source = git_repository();
+        let state_dir = workspace();
+        let persistence = state_dir.join("backend.sqlite");
+        let (workspace_id, source_session_id, fork_session_id, checkpoint_id) = {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let connection = backend.connect();
+            negotiate_m5(&connection);
+            let created =
+                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                    name: "Persistent fork workspace".to_owned(),
+                }));
+            let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+                panic!("expected workspace creation");
+            };
+            let created = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Persistent source".to_owned(),
+                },
+            ));
+            let Ok(ServerResponse::AgentSessionCreated(session)) = created.result else {
+                panic!("expected source session creation");
+            };
+            let policy = ApprovalPolicy::auto_approve();
+            let configured = connection.request(RequestEnvelope::new(
+                ClientRequest::SetSessionApprovalPolicy {
+                    session_id: session.id,
+                    policy: policy.clone(),
+                    auto_approve_actions: Some(true),
+                },
+            ));
+            assert!(matches!(
+                configured.result,
+                Ok(ServerResponse::ApprovalPolicy(configured)) if configured == policy
+            ));
+            let attached = connection.request(RequestEnvelope::new(
+                ClientRequest::AttachSessionRepository {
+                    session_id: session.id,
+                    source: source.display().to_string(),
+                    path: "repo".to_owned(),
+                    revision: None,
+                },
+            ));
+            assert!(matches!(
+                attached.result,
+                Ok(ServerResponse::SessionRepositoryAttached(_))
+            ));
+            let edited = connection.request(RequestEnvelope::new(
+                ClientRequest::ApplySessionFilesystemEdit {
+                    session_id: session.id,
+                    edit: WorkspaceEdit {
+                        path: "repo/README.md".to_owned(),
+                        old_text: "source".to_owned(),
+                        new_text: "source branch".to_owned(),
+                        expected_revision: None,
+                    },
+                },
+            ));
+            assert!(matches!(
+                edited.result,
+                Ok(ServerResponse::WorkspaceEditApplied(_))
+            ));
+            let forked =
+                connection.request(RequestEnvelope::new(ClientRequest::ForkAgentSession {
+                    session_id: session.id,
+                    name: "Persistent fork".to_owned(),
+                }));
+            let Ok(ServerResponse::AgentSessionForked(forked)) = forked.result else {
+                panic!("expected fork creation: {:?}", forked.result);
+            };
+            let checkpoint = connection.request(RequestEnvelope::new(
+                ClientRequest::CreateSessionCheckpoint {
+                    session_id: forked.id,
+                    label: "fork baseline".to_owned(),
+                },
+            ));
+            let Ok(ServerResponse::CheckpointCreated(checkpoint)) = checkpoint.result else {
+                panic!("expected fork checkpoint: {:?}", checkpoint.result);
+            };
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&forked.id)
+                .unwrap()
+                .apply_edit(WorkspaceEdit {
+                    path: "repo/README.md".to_owned(),
+                    old_text: "source branch".to_owned(),
+                    new_text: "fork-only change".to_owned(),
+                    expected_revision: None,
+                })
+                .unwrap();
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&forked.id)
+                .unwrap()
+                .poll_changes()
+                .unwrap();
+            backend.flush().unwrap();
+            backend.shutdown().unwrap();
+            (workspace.id, session.id, forked.id, checkpoint.id)
+        };
+
+        {
+            let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+            let connection = backend.connect();
+            negotiate_m5(&connection);
+            let sessions =
+                connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+                    workspace_id,
+                    include_archived: false,
+                }));
+            let Ok(ServerResponse::AgentSessions { sessions }) = sessions.result else {
+                panic!("expected restored sessions");
+            };
+            assert!(
+                sessions
+                    .iter()
+                    .any(|session| session.id == source_session_id)
+            );
+            assert!(sessions.iter().any(|session| session.id == fork_session_id));
+
+            let snapshot = connection.request(RequestEnvelope::new(
+                ClientRequest::GetAgentSessionSnapshot {
+                    session_id: fork_session_id,
+                },
+            ));
+            let Ok(ServerResponse::AgentSessionSnapshot(snapshot)) = snapshot.result else {
+                panic!("expected restored fork snapshot");
+            };
+            assert!(snapshot.auto_approve_actions);
+            assert_eq!(snapshot.approval_policy, ApprovalPolicy::auto_approve());
+
+            let source_repositories = connection.request(RequestEnvelope::new(
+                ClientRequest::ListSessionRepositories {
+                    session_id: source_session_id,
+                },
+            ));
+            let Ok(ServerResponse::SessionRepositories {
+                repositories: source_repositories,
+            }) = source_repositories.result
+            else {
+                panic!("expected restored source repository metadata");
+            };
+            let fork_repositories = connection.request(RequestEnvelope::new(
+                ClientRequest::ListSessionRepositories {
+                    session_id: fork_session_id,
+                },
+            ));
+            let Ok(ServerResponse::SessionRepositories {
+                repositories: fork_repositories,
+            }) = fork_repositories.result
+            else {
+                panic!("expected restored fork repository metadata");
+            };
+            assert_ne!(
+                source_repositories.first().unwrap().id,
+                fork_repositories.first().unwrap().id
+            );
+
+            let read_file = |session_id| {
+                let response =
+                    connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+                        session_id,
+                        path: "repo/README.md".to_owned(),
+                    }));
+                let Ok(ServerResponse::SessionFilesystemFile(file)) = response.result else {
+                    panic!("expected restored session file: {:?}", response.result);
+                };
+                file.content
+            };
+            assert_eq!(read_file(source_session_id), "source branch\n");
+            assert_eq!(read_file(fork_session_id), "fork-only change\n");
+
+            let events =
+                connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    session_id: Some(fork_session_id),
+                    after_sequence: None,
+                    stream_epoch: None,
+                }));
+            let Ok(ServerResponse::SessionEvents { events, .. }) = events.result else {
+                panic!("expected restored fork event stream");
+            };
+            assert!(events.iter().any(|event| {
+                matches!(
+                    &event.event,
+                    loom_protocol::ServerEvent::AgentSessionForked {
+                        source_session_id: source_id,
+                        snapshot,
+                    } if *source_id == source_session_id && snapshot.id == fork_session_id
+                )
+            }));
+
+            let reverted = connection.request(RequestEnvelope::new(
+                ClientRequest::RevertSessionCheckpoint {
+                    session_id: fork_session_id,
+                    checkpoint_id,
+                },
+            ));
+            assert!(
+                matches!(reverted.result, Ok(ServerResponse::CheckpointReverted(_))),
+                "fork checkpoint revert failed: {:?}",
+                reverted.result
+            );
+            assert_eq!(read_file(fork_session_id), "source branch\n");
+            assert_eq!(read_file(source_session_id), "source branch\n");
+            backend.shutdown().unwrap();
+        }
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(persistence.with_extension("session-roots")).unwrap();
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
     fn persisted_session_filesystems_restore_lazily_and_survive_unrelated_writes() {
         let persistence =
             std::env::temp_dir().join(format!("loom-server-state-{}.db", WorkspaceId::new()));

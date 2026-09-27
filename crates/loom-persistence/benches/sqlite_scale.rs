@@ -6,17 +6,21 @@ use std::{
 };
 
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, EventSequence,
-    RunAttemptId, RunId, SessionLimits, Timestamp, UsageSnapshot, WorkspaceId,
+    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
+    CheckpointId, EventSequence, RunAttemptId, RunId, SessionLimits, Timestamp, UsageSnapshot,
+    WorkspaceId,
 };
 use loom_model::ModelId;
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableRunMessage, DurableRunRuntimeConfig,
-    DurableRunSummary, DurableStateWrite, FilePersistence,
+    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableFilesystemEdit, DurableFilesystemRecord,
+    DurableRunActivities, DurableRunMessage, DurableRunRuntimeConfig, DurableRunSummary,
+    DurableStateWrite, FilePersistence,
 };
 use loom_protocol::{
-    AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ContextAssemblyOptions, ServerEvent,
-    ServerEventEnvelope,
+    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+    AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile,
+    ContextAssemblyOptions, ServerEvent, ServerEventEnvelope, SessionFilesystemChange,
+    WorkspaceChangeKind, WorkspaceControl,
 };
 use loom_session::SessionManager;
 use rusqlite::Connection;
@@ -48,12 +52,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut run_summaries = std::collections::BTreeMap::new();
     let mut run_runtime_configs = std::collections::BTreeMap::new();
     let mut run_messages = std::collections::BTreeMap::new();
+    let mut run_activities = DurableRunActivities::new();
+    let mut filesystem_records = Vec::new();
     let mut run_ids = Vec::with_capacity(run_count);
     let system_instructions =
         "Follow repository guidance, make focused changes, and verify behavior. ".repeat(8);
     let repository_instructions =
         "Prefer the existing code patterns and keep generated files unchanged. ".repeat(6);
     for index in 0..run_count {
+        // Cycle through distinct workspace profiles so scale runs exercise profile
+        // lookup and deduplication under realistic configuration diversity.
+        let profile = index % 64;
         let run_id = RunId::new();
         let session_id = session_ids[index % session_ids.len().max(1)];
         let active = index % 100 == 0;
@@ -90,11 +99,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_runtime_configs.insert(
             run_id,
             DurableRunRuntimeConfig {
-                system_instructions: Some(system_instructions.clone()),
-                repository_instructions: Some(repository_instructions.clone()),
+                system_instructions: Some(format!(
+                    "{system_instructions}Workspace profile {profile}."
+                )),
+                repository_instructions: Some(format!(
+                    "{repository_instructions}Repository profile {profile}."
+                )),
                 approval_policy: ApprovalPolicy::default(),
                 limits: SessionLimits {
-                    max_tool_calls: Some(100),
+                    max_tool_calls: Some(100 + profile as u64),
                     ..SessionLimits::default()
                 },
                 context_options: ContextAssemblyOptions {
@@ -107,6 +120,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_cost_micros_per_1k: 3,
                 context_inspection: None,
             },
+        );
+        run_activities.insert(
+            run_id,
+            vec![AgentActivityRecord {
+                id: ActivityId::new(),
+                run_id,
+                parent_id: None,
+                step_id: None,
+                kind: AgentActivityKind::ModelTurn,
+                status: AgentActivityStatus::Completed,
+                started_at: now,
+                completed_at: Some(now),
+                elapsed_ms: Some(250),
+                data: AgentActivityData::ModelTurn {
+                    model: ModelId::new("scale-benchmark"),
+                },
+            }],
         );
         let tool_output = (0..12)
             .map(|line| {
@@ -157,6 +187,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Filesystem history is intentionally sparse: one representative checkpoint,
+    // edit, and change per 100 sessions keeps this orthogonal to the run dimension.
+    for (index, session_id) in session_ids.iter().enumerate().filter(|(i, _)| i % 100 == 0) {
+        let checkpoint_id = CheckpointId::new();
+        let path = format!("src/module_{index}.rs");
+        let content = format!("// checkpoint snapshot for session {index}\nfn run() {{}}\n");
+        filesystem_records.push(DurableFilesystemRecord {
+            session_id: *session_id,
+            root: format!("/workspace/session-{index}"),
+            control: WorkspaceControl::Agent,
+            checkpoints: vec![Checkpoint {
+                id: checkpoint_id,
+                session_id: *session_id,
+                label: "scale benchmark checkpoint".to_owned(),
+                created_at: now,
+                files: std::collections::BTreeMap::from([(
+                    path.clone(),
+                    CheckpointFile {
+                        existed: true,
+                        content: content.clone(),
+                        revision: format!("before-{index}"),
+                        expected_revision: format!("after-{index}"),
+                    },
+                )]),
+            }],
+            edits: vec![DurableFilesystemEdit {
+                path: path.clone(),
+                before: Some(content.clone()),
+                before_bytes: Some(content.as_bytes().to_vec()),
+                after_revision: format!("after-{index}"),
+                source: WorkspaceControl::Agent,
+            }],
+            changes: vec![SessionFilesystemChange {
+                sequence: EventSequence::new(1),
+                session_id: *session_id,
+                path,
+                kind: WorkspaceChangeKind::Modified,
+                revision: Some(format!("after-{index}")),
+            }],
+            repositories: std::collections::BTreeMap::new(),
+            directories: Vec::new(),
+            payload: serde_json::json!({
+                "filesystem": {
+                    "session_id": session_id,
+                    "root": format!("/workspace/session-{index}"),
+                    "control": "agent",
+                    "checkpoints": [],
+                    "edits": [],
+                    "next_sequence": 1,
+                    "changes": []
+                },
+                "fixture": "sparse-filesystem"
+            }),
+        });
+    }
+
     let session_state = sessions.export_state();
     let feed_sequence = u64::try_from(session_count)?;
     let feed = DurableFeedState {
@@ -202,8 +288,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_context_checkpoints: None,
         run_plans: None,
         run_messages: Some(&run_messages),
-        run_activities: None,
-        filesystem_records: None,
+        run_activities: Some(&run_activities),
+        filesystem_records: Some(&filesystem_records),
         records: &[],
         feed: Some(&feed),
         sections: &[],
@@ -221,13 +307,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut full_feed_samples = Vec::with_capacity(5);
     let mut transcript_page_samples = Vec::with_capacity(5);
     let mut content_range_samples = Vec::with_capacity(5);
+    let mut filesystem_load_samples = Vec::with_capacity(5);
     let target_run_id = run_ids.first().copied().ok_or("missing target run")?;
     for _ in 0..5 {
-        let fresh_handle = FilePersistence::open(&path)?;
         let started = Instant::now();
+        let fresh_handle = FilePersistence::open(&path)?;
         let loaded_sessions = fresh_handle.load_sessions()?.ok_or("missing sessions")?;
         let active_runs = fresh_handle.load_active_run_summaries()?;
         let feed_header = fresh_handle.load_feed_header()?.ok_or("missing feed")?;
+        if loaded_sessions.sessions.len() != session_count
+            || active_runs.len() != run_count.div_ceil(100)
+            || feed_header.next_sequence.value() != feed_sequence
+        {
+            return Err("startup load returned incomplete scale fixture".into());
+        }
         startup_samples.push(started.elapsed());
         let stream_started = Instant::now();
         let stream_events = fresh_handle.load_feed_events_since(Some(target_session), None)?;
@@ -247,6 +340,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             usize::try_from(newest_message.content_bytes)?.min(4096),
         )?;
         content_range_samples.push(content_range_started.elapsed());
+        let filesystem_started = Instant::now();
+        let filesystem = fresh_handle
+            .load_filesystem_record(target_session)?
+            .ok_or("missing filesystem fixture")?;
+        if filesystem.checkpoints.len() != 1
+            || filesystem.edits.len() != 1
+            || !filesystem.changes.is_empty()
+        {
+            return Err(format!(
+                "filesystem scale fixture did not round trip: {} checkpoints, {} edits, {} changes",
+                filesystem.checkpoints.len(),
+                filesystem.edits.len(),
+                filesystem.changes.len()
+            )
+            .into());
+        }
+        let changes = fresh_handle.load_filesystem_changes_page(target_session, None, 10)?;
+        if changes.changes.len() != 1 {
+            return Err("filesystem change page did not round trip".into());
+        }
+        filesystem_load_samples.push(filesystem_started.elapsed());
         black_box((
             loaded_sessions,
             active_runs,
@@ -255,6 +369,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             full_feed,
             transcript_page,
             message_content,
+            filesystem,
+            changes,
         ));
     }
     startup_samples.sort_unstable();
@@ -262,6 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     full_feed_samples.sort_unstable();
     transcript_page_samples.sort_unstable();
     content_range_samples.sort_unstable();
+    filesystem_load_samples.sort_unstable();
 
     let lookup_handle = FilePersistence::open(&path)?;
     let mut lookup_samples = Vec::with_capacity(100);
@@ -286,7 +403,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_messages.values().map(Vec::len).sum::<usize>()
     )?;
     writeln!(output, "durable reconnect events: {}", feed.events.len())?;
+    writeln!(
+        output,
+        "run activities: {}",
+        run_activities.values().map(Vec::len).sum::<usize>()
+    )?;
+    writeln!(
+        output,
+        "sparse filesystem records: {}",
+        filesystem_records.len()
+    )?;
+    writeln!(
+        output,
+        "sparse checkpoints: {}",
+        filesystem_records
+            .iter()
+            .map(|record| record.checkpoints.len())
+            .sum::<usize>()
+    )?;
+    writeln!(
+        output,
+        "sparse filesystem edits: {}",
+        filesystem_records
+            .iter()
+            .map(|record| record.edits.len())
+            .sum::<usize>()
+    )?;
+    writeln!(
+        output,
+        "sparse filesystem changes: {}",
+        filesystem_records
+            .iter()
+            .map(|record| record.changes.len())
+            .sum::<usize>()
+    )?;
     writeln!(output, "database bytes: {database_bytes}")?;
+    writeln!(output, "WAL bytes: {}", file_len_or_zero(&wal_path(&path)))?;
     let connection = Connection::open(&path)?;
     let runtime_profile_count: i64 =
         connection.query_row("SELECT COUNT(*) FROM runtime_configurations", [], |row| {
@@ -336,6 +488,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     writeln!(
         output,
+        "checkpoint/filesystem record load p50: {}",
+        fmt(filesystem_load_samples[2])
+    )?;
+    writeln!(
+        output,
         "per-session indexed run lookup p50 (100 queries): {}",
         fmt(lookup_samples[50])
     )?;
@@ -343,6 +500,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(lookup_handle);
     fs::remove_file(path)?;
     Ok(())
+}
+
+fn wal_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    wal_path.into()
+}
+
+fn file_len_or_zero(path: &std::path::Path) -> u64 {
+    fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
 
 fn fmt(duration: Duration) -> String {
