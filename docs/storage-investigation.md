@@ -174,6 +174,7 @@ per-session run lookup latency, and database size. Set `LOOM_SCALE_SESSIONS` and
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | 10,000 / 10,000 / 10,000 | 11,575,296 bytes | 1,937 ms | 7.274 ms | 0.047 ms | 59.384 ms | 0.015 ms |
 | 20,000 / 20,000 / 20,000 | 22,753,280 bytes | 4,368 ms | 11.972 ms | 0.049 ms | 128.945 ms | 0.014 ms |
+| 100,000 / 100,000 / 100,000 | 113,315,840 bytes | 24,826 ms | 63.333 ms | 0.025 ms | 527.073 ms | 0.015 ms |
 
 A fresh 10,000-row run on 2026-09-27 measured 11,587,584 bytes, 1,892 ms
 population, 6.786 ms catalog/active/feed-header p50, 0.045 ms per-session
@@ -184,11 +185,12 @@ not a platform-independent latency guarantee.
 The per-session run lookup and one-session feed read stayed flat. Startup now
 loads only the small feed header; a diagnostic full-feed decode still grows
 approximately with event count, but it is no longer on the restore path. The
-fixture uses small session-created events rather than large activity or output
-payloads and omits runtime payloads, transcripts, filesystem snapshots, and UI
-initialization. It remains a store component benchmark, not full startup. The
-100 MB / 10 GB acceptance targets and before/after comparison against the
-previous storage model remain to be measured.
+100k fixture exceeds the 100 MB size target at 113,315,840 bytes despite having
+only small session/run snapshots and one session-created event per session. It
+omits runtime payloads, transcripts, filesystem snapshots, large activity or
+output payloads, and UI initialization, so it is a failing lower-bound fixture,
+not a realistic full-application measurement. The 10 GB target and before/after
+comparison against the previous storage model remain unmeasured.
 
 ## Saves scale with all retained history
 
