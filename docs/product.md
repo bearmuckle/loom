@@ -2,10 +2,10 @@
 
 ## Product direction
 
-The primary use case is an interactive coding-agent session. A user opens a
-workspace, starts a session, selects one or more repositories for that
-session, gives an agent a goal such as "fix the failing tests" or "add support
-for this API", and follows the agent as it:
+The primary use case is an interactive coding-agent project. A user opens a
+workspace, starts a project, selects one or more repositories for its root
+agent, gives the project a goal such as "fix the failing tests" or "add
+support for this API", and follows the project manager as it:
 
 1. Inspects the repository, existing instructions, history, and relevant
    files.
@@ -18,30 +18,33 @@ for this API", and follows the agent as it:
 7. Presents a reviewable diff and a concise final result.
 
 The user must be able to interrupt, approve, deny, redirect, retry, or take
-over at any point. The agent is not a one-shot prompt wrapper: a session is a
-durable orchestration object containing conversation history, plans, tool
-invocations, approvals, artifacts, child tasks, model usage, and an isolated
-filesystem root containing the repositories it works with.
+over at any point. A project is a durable orchestration object rooted in a
+project-manager session. It owns the user's goal and may delegate bounded code
+or non-code tasks to durable child agent sessions. The manager remains
+accountable for results, communicates with its agents, handles blockers, and
+reviews and integrates code changes. The detailed behavior and implementation
+sequence are in [project sessions and coordinated sub-agents](project-sessions-design.md).
 
-A **workspace** is a durable container for sessions and workspace-level
-settings. It is not a directory, repository, clone, or filesystem root, and
-can exist before any session or repository has been added. Each **session**
-owns its execution context and isolated filesystem root. A session may use
-one or more repositories, each checked out at a stable relative path inside
-that root. Concurrent sessions never share a mutable working tree; the
-backend may use shared immutable Git object storage to create their
-session-owned clones or worktrees efficiently.
+A **workspace** is a durable container for project roots and workspace-level
+settings. It is not a directory, repository, clone, filesystem root, or
+security boundary, and can exist before any project or repository has been
+added. Every agent session belongs to a project; the root session is the
+project manager and descendants are delegated agents. Each code-changing
+agent owns an isolated filesystem/worktree based on its parent's branch and
+revision. Non-code agents need no worktree. Sibling agents never share a
+mutable checkout.
 
-Repositories are inputs to sessions rather than identities for workspaces.
-The same repository can be attached to sessions in different workspaces, and
-one session can work across multiple repositories. Repository selection
-records the source and requested revision; the session's checkout, files,
+Repositories are inputs to agent work rather than identities for workspaces.
+The same repository can be used by projects in different workspaces, and a
+project can work across multiple repositories. Repository selection records
+the source and requested revision; each code agent's checkout, files,
 processes, checkpoints, and diffs remain scoped to its isolated root.
 
 Loom is therefore an agent orchestration application with a code workspace,
 not a code editor with an optional chat panel. The primary objects in the
-product are agent sessions, runs, plans, tool calls, approvals, workspaces,
-and provider/model configurations. The editor, terminal, source control, and
+product are projects, agent sessions, delegated tasks, runs, agent messages,
+plans, tool calls, approvals, workspaces, and provider/model configurations.
+The editor, terminal, source control, and
 diagnostics are the agent's observable working environment as well as tools
 the user can operate directly.
 

@@ -161,6 +161,32 @@ session-centric product model.
 **Exit condition:** the browser client can complete the M1-M5 agent workflows
 against a remote backend using supported browsers.
 
+### M7 - Project sessions and coordinated sub-agents
+
+The detailed domain, protocol, recovery, worktree, and rollout design is in
+[project sessions and coordinated sub-agents](project-sessions-design.md).
+This XL feature is delivered as independently reviewable slices rather than
+one large orchestration change:
+
+- M7.0: represent every root session as a project; add durable parentage,
+  delegated task, message, and integration records; expose capability-gated
+  snapshots and events; recover committed child launches.
+- M7.1: enable direct-child non-code delegation with bounded concurrency,
+  durable parent-child messaging, blocker/result reporting, and restart
+  recovery.
+- M7.2: present projects in workspace navigation and expose child status,
+  output, message history, and individual controls.
+- M7.3: add isolated child worktrees, reviewable diffs, explicit parent-owned
+  integration, conflict handling, and recoverable cleanup.
+- M7.4: enable level-three agents and policy-checked branch-to-branch
+  messaging after nested integration works reliably.
+
+The backend rejects delegation beyond three levels from the beginning, even
+while the first client only exposes direct children. Non-code delegation ships
+before code worktrees; no fixed plan-to-issues-to-build pipeline is required.
+Each slice's exit conditions and verification cases are defined in the design
+document.
+
 ## Quality bar
 
 ### Workspace/session model transition

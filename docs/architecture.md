@@ -158,6 +158,15 @@ and remain scoped to the active session. The client does not own an editable
 buffer, tab/pane layout, language-service state, or orchestration state. A
 remote client receives the same projections over the authenticated transport.
 
+The project-session and coordinated-agent design is specified in
+[project sessions and coordinated sub-agents](project-sessions-design.md).
+A project is a root agent session in a workspace; descendants are ordinary
+agent sessions with durable project and parent relationships. The backend
+owns delegated task state, addressed agent messages, hierarchy limits, child
+lifecycle, and worktree integration state. Do not implement orchestration as
+prompt-only conventions or client-owned state. Project operations are exposed
+through the versioned protocol and capability negotiation.
+
 ## Agent runtime
 
 An agent session is a state machine, not an unbounded loop:
@@ -186,6 +195,9 @@ must support:
   the duration of one step, so control requests are serviceable while a model
   call is open.
 - Parallel child tasks with bounded concurrency and clear parent ownership.
+- Project coordination across durable child sessions, with explicit depth,
+  message, permission, recovery, and integration rules as defined in the
+  project-session design.
 - Per-session limits for time, model tokens, tool calls, processes, and cost.
 - Checkpoints before risky mutations and a way to restore or inspect them.
 - Context compaction that preserves the task, decisions, constraints, and
