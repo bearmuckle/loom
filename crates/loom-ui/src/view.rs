@@ -97,7 +97,7 @@ const TIMELINE_CONTENT_MAX_WIDTH: Pixels = px(760.);
 // GPUI's text utilities use rems; native display scaling and browser zoom
 // are applied when the window converts them to pixels.
 const BASE_FONT_SIZE: f32 = 17.;
-const CONVERSATION_FONT_SIZE: f32 = 16.;
+const CONVERSATION_FONT_SIZE: f32 = 15.;
 const DEFAULT_FONT_SCALE_PERCENT: u16 = 100;
 const MIN_FONT_SCALE_PERCENT: u16 = 75;
 const MAX_FONT_SCALE_PERCENT: u16 = 150;
