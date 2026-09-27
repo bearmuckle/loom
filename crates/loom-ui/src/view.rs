@@ -982,8 +982,8 @@ fn command_group_title(activities: &[AgentActivityRecord]) -> String {
     compact_activity_text(&title, 72)
 }
 
-fn command_group_status(activities: &[AgentActivityRecord]) -> AgentActivityStatus {
-    // Actionable and active work stays visible even after another command fails.
+fn activity_group_status(activities: &[AgentActivityRecord]) -> AgentActivityStatus {
+    // Actionable and active work stays visible even after another activity fails.
     for status in [
         AgentActivityStatus::AwaitingApproval,
         AgentActivityStatus::AwaitingInput,
@@ -991,9 +991,7 @@ fn command_group_status(activities: &[AgentActivityRecord]) -> AgentActivityStat
         AgentActivityStatus::Failed,
         AgentActivityStatus::Cancelled,
     ] {
-        if activities.iter().any(|activity| {
-            matches!(activity.data, AgentActivityData::Command { .. }) && activity.status == status
-        }) {
+        if activities.iter().any(|activity| activity.status == status) {
             return status;
         }
     }
@@ -1398,7 +1396,7 @@ pub(crate) struct LoomView {
     timeline_view: Option<Entity<TimelineView>>,
     pub(crate) activity_records_seen: bool,
     pub(crate) expanded_activities: BTreeSet<ActivityId>,
-    expanded_command_groups: BTreeSet<ActivityId>,
+    expanded_activity_groups: BTreeSet<ActivityId>,
     pub(crate) approval_request_in_flight: bool,
     approval_settings_request_in_flight: bool,
     pub(crate) archive_request_in_flight: bool,
@@ -1777,7 +1775,7 @@ impl LoomView {
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
-            expanded_command_groups: BTreeSet::new(),
+            expanded_activity_groups: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -2153,7 +2151,7 @@ impl LoomView {
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
-            expanded_command_groups: BTreeSet::new(),
+            expanded_activity_groups: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -2323,7 +2321,7 @@ impl LoomView {
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
-            expanded_command_groups: BTreeSet::new(),
+            expanded_activity_groups: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -2533,7 +2531,7 @@ impl LoomView {
             timeline_view: None,
             activity_records_seen: false,
             expanded_activities: BTreeSet::new(),
-            expanded_command_groups: BTreeSet::new(),
+            expanded_activity_groups: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -2954,7 +2952,7 @@ impl LoomView {
         self.transcript_loading = false;
         self.activity_records_seen = false;
         self.expanded_activities.clear();
-        self.expanded_command_groups.clear();
+        self.expanded_activity_groups.clear();
         self.approval_request_in_flight = false;
         self.pending_approval = None;
         self.pending_input = None;
@@ -7028,111 +7026,68 @@ impl LoomView {
                     rows.child(self.render_activity_row(activity, index, activity_index, parent));
             }
         }
-        if let Some(first_command) = activities
+        let group_id = activities[0].id;
+        let status = activity_group_status(activities);
+        let expanded = self.expanded_activity_groups.contains(&group_id)
+            || matches!(
+                status,
+                AgentActivityStatus::AwaitingApproval | AgentActivityStatus::AwaitingInput
+            );
+        let count = activities
             .iter()
-            .find(|activity| matches!(activity.data, AgentActivityData::Command { .. }))
-        {
-            let group_id = first_command.id;
-            let status = command_group_status(activities);
-            let expanded = self.expanded_command_groups.contains(&group_id)
-                || matches!(
-                    status,
-                    AgentActivityStatus::AwaitingApproval | AgentActivityStatus::AwaitingInput
-                );
-            let count = activities
-                .iter()
-                .filter(|activity| matches!(activity.data, AgentActivityData::Command { .. }))
-                .count();
-            let parent_for_toggle = parent.clone();
-            // Collapsible owns visibility; the first command gives the group a
-            // stable identity as more turns and results arrive.
-            return div()
-                .id(("activity-section", index))
-                .w_full()
-                .min_w_0()
-                .mx_2()
-                .my_1()
-                .pl_3()
-                .border_l_1()
-                .border_color(rgb(0x3b4555))
-                .child(
-                    Collapsible::new()
-                        .open(expanded)
-                        .child(
-                            Button::new(("command-group", index))
-                                .w_full()
-                                .ghost()
-                                .small()
-                                .label(format!(
-                                    "{} {} · {count} {} · {}",
-                                    if expanded { "⌄" } else { "›" },
-                                    command_group_title(activities),
-                                    if count == 1 { "command" } else { "commands" },
-                                    activity_status_label(status)
-                                ))
-                                .on_click(move |_, _, cx| {
-                                    parent_for_toggle.update(cx, |this, cx| {
-                                        if !this.expanded_command_groups.remove(&group_id) {
-                                            this.expanded_command_groups.insert(group_id);
-                                        }
-                                        cx.notify();
-                                    });
-                                }),
-                        )
-                        .content(rows),
-                )
-                .into_any();
-        }
-        let model = activities.iter().find_map(|activity| match &activity.data {
-            AgentActivityData::ModelTurn { model } => Some(model.as_str().to_owned()),
-            _ => None,
-        });
-        let turn = activities
-            .iter()
-            .find(|activity| matches!(activity.data, AgentActivityData::ModelTurn { .. }));
+            .filter(|activity| !matches!(activity.data, AgentActivityData::ModelTurn { .. }))
+            .count();
+        let count_label = match count {
+            0 => String::new(),
+            1 => " · 1 activity".to_owned(),
+            count => format!(" · {count} activities"),
+        };
         let title = activity_turn_title(activities);
-        let turn_status = turn.map(|activity| {
-            let duration = activity
-                .elapsed_ms
-                .map_or_else(String::new, format_duration);
-            if duration.is_empty() {
-                activity_status_label(activity.status).to_owned()
-            } else {
-                format!("{} · {duration}", activity_status_label(activity.status))
-            }
-        });
-        let mut section = div()
+        let header_color = rgb(0xf3f4f6).opacity(0.72);
+        let parent_for_toggle = parent.clone();
+        // The first activity gives the group a stable identity as more records arrive.
+        div()
             .id(("activity-section", index))
+            .w_full()
+            .min_w_0()
             .mx_2()
             .my_1()
             .pl_3()
             .border_l_1()
             .border_color(rgb(0x3b4555))
-            .flex()
-            .flex_col()
-            .gap_1()
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child("●")
-                    .child(title)
-                    .when_some(model, |element, model| {
-                        element
-                            .child("·")
-                            .child(div().text_color(rgb(0x64748b)).child(model))
-                    })
-                    .when_some(turn_status, |element, status| {
-                        element
-                            .child("·")
-                            .child(div().text_color(rgb(0x94a3b8)).child(status))
-                    }),
-            );
-        section = section.child(rows);
-        section.into_any()
+                Collapsible::new()
+                    .open(expanded)
+                    .child(
+                        Button::new(("activity-group", index))
+                            .w_full()
+                            .ghost()
+                            .small()
+                            .text_color(header_color)
+                            .child(
+                                div()
+                                    .w_full()
+                                    .text_left()
+                                    .text_size(px(12.))
+                                    .text_color(header_color)
+                                    .child(format!(
+                                        "{} {title}{count_label} · {}",
+                                        if expanded { "⌄" } else { "›" },
+                                        activity_status_label(status)
+                                    )),
+                            )
+                            .on_click(move |_, _, cx| {
+                                parent_for_toggle.update(cx, |this, cx| {
+                                    if !this.expanded_activity_groups.remove(&group_id) {
+                                        this.expanded_activity_groups.insert(group_id);
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .content(rows),
+            )
+            .into_any()
     }
 
     fn render_activity_row(
@@ -10351,9 +10306,9 @@ mod session_name_tests {
 mod display_helper_tests {
     use super::{
         AgentActivityData, AgentActivityRecord, AgentActivityStatus, FileActivityOperation,
-        activity_label, activity_marker, activity_output, activity_turn_title, change_kind_label,
-        command_group_status, command_group_title, command_line, command_output_summary,
-        command_purpose, format_bytes, format_duration, format_percentage,
+        activity_group_status, activity_label, activity_marker, activity_output,
+        activity_turn_title, change_kind_label, command_group_title, command_line,
+        command_output_summary, command_purpose, format_bytes, format_duration, format_percentage,
         is_redundant_completion_summary, run_state_label, session_state_label,
     };
     use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
@@ -10460,7 +10415,7 @@ mod display_helper_tests {
         let unicode = format!("{}final result", "界".repeat(1000));
         assert!(command_output_summary(&unicode).ends_with("final result"));
         assert_eq!(
-            command_group_status(std::slice::from_ref(&test)),
+            activity_group_status(std::slice::from_ref(&test)),
             AgentActivityStatus::Completed
         );
         let failed = AgentActivityRecord {
@@ -10468,7 +10423,7 @@ mod display_helper_tests {
             ..test.clone()
         };
         assert_eq!(
-            command_group_status(&[test.clone(), failed.clone()]),
+            activity_group_status(&[test.clone(), failed.clone()]),
             AgentActivityStatus::Failed
         );
         for status in [
@@ -10477,7 +10432,7 @@ mod display_helper_tests {
             AgentActivityStatus::Started,
         ] {
             assert_eq!(
-                command_group_status(&[
+                activity_group_status(&[
                     failed.clone(),
                     AgentActivityRecord {
                         status,
@@ -10488,7 +10443,7 @@ mod display_helper_tests {
             );
         }
         assert_eq!(
-            command_group_status(&[AgentActivityRecord {
+            activity_group_status(&[AgentActivityRecord {
                 status: AgentActivityStatus::Cancelled,
                 ..test
             }]),
@@ -11450,11 +11405,11 @@ mod loom_view_render_tests {
             let view = view.downcast::<LoomView>().unwrap();
             window.render_frame(cx);
             assert!(window.try_find(("activity", 0u64)).is_none());
-            window.click(("command-group", 0usize), cx);
+            window.click(("activity-group", 0usize), cx);
             window.render_frame(cx);
             assert!(window.try_find(("activity", 0u64)).is_some());
             view.update(cx, |view, _| {
-                assert!(view.expanded_command_groups.contains(&group_id));
+                assert!(view.expanded_activity_groups.contains(&group_id));
                 view.consume_agent_event(&loom_protocol::AgentEvent::ActivityRecorded {
                     run_id,
                     activity: AgentActivityRecord {
@@ -11465,7 +11420,7 @@ mod loom_view_render_tests {
             });
             window.render_frame(cx);
             assert!(window.try_find(("activity", 1u64)).is_some());
-            window.click(("command-group", 0usize), cx);
+            window.click(("activity-group", 0usize), cx);
             window.render_frame(cx);
             assert!(window.try_find(("activity", 0u64)).is_none());
             view.update(cx, |view, cx| {

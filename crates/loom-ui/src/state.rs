@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use gpui_kit::{ListAlignment, ListState, px};
 use loom_core::{AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError};
 use loom_protocol::{
-    AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff,
-    GitDiffLine, GitRepositoryStatus, SessionFilesystemChange, SessionFilesystemFile,
+    AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitDiffLine,
+    GitRepositoryStatus, SessionFilesystemChange, SessionFilesystemFile,
 };
 
 use crate::MAX_TIMELINE_OUTPUT;
@@ -202,9 +202,9 @@ pub(crate) enum TimelineItem {
     },
 }
 
-/// Project consecutive commands into one section, including commands from different
-/// model turns. Other tools, transcript messages, and run boundaries break a group.
-/// Updates replace records in place so late results never reorder the transcript.
+/// Project consecutive activities from one run into one section. Transcript messages,
+/// status items, and run boundaries break a group. Updates replace records in place so
+/// late results never reorder the transcript.
 pub(crate) fn upsert_activity(timeline: &mut Vec<TimelineItem>, activity: AgentActivityRecord) {
     for item in timeline.iter_mut() {
         if let TimelineItem::ActivitySection { activities } = item
@@ -217,28 +217,7 @@ pub(crate) fn upsert_activity(timeline: &mut Vec<TimelineItem>, activity: AgentA
 
     if let Some(TimelineItem::ActivitySection { activities }) = timeline.last_mut() {
         let same_run = activities.iter().all(|item| item.run_id == activity.run_id);
-        let commands_or_turns = activities.iter().all(|item| {
-            matches!(
-                item.data,
-                AgentActivityData::Command { .. } | AgentActivityData::ModelTurn { .. }
-            )
-        });
-        let compatible = match &activity.data {
-            AgentActivityData::ModelTurn { .. } | AgentActivityData::Command { .. } => {
-                commands_or_turns
-            }
-            _ => {
-                !activities
-                    .iter()
-                    .any(|item| matches!(item.data, AgentActivityData::Command { .. }))
-                    && activity.parent_id.is_some_and(|parent| {
-                        activities
-                            .iter()
-                            .any(|item| item.id == parent || item.parent_id == Some(parent))
-                    })
-            }
-        };
-        if same_run && compatible {
+        if same_run {
             activities.push(activity);
             return;
         }
@@ -465,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn commands_do_not_cross_messages_tools_or_run_boundaries() {
+    fn activities_do_not_cross_messages_or_run_boundaries() {
         for separator in [
             TimelineItem::Assistant("Checking another area".to_owned()),
             TimelineItem::User("Next task".to_owned()),
@@ -499,13 +478,13 @@ mod tests {
         };
         upsert_activity(&mut timeline, other_tool.clone());
         upsert_activity(&mut timeline, command(&parent));
-        assert_eq!(timeline.len(), 3);
+        assert_eq!(timeline.len(), 1);
         let other_run = turn(RunId::new());
         upsert_activity(&mut timeline, other_run.clone());
         upsert_activity(&mut timeline, command(&other_run));
-        assert_eq!(timeline.len(), 4);
+        assert_eq!(timeline.len(), 2);
         upsert_activity(&mut timeline, other_tool);
-        assert_eq!(timeline.len(), 4);
+        assert_eq!(timeline.len(), 2);
     }
 
     #[test]
