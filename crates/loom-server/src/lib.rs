@@ -26,8 +26,8 @@ use loom_persistence::{
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentExecutionStateRecord, AgentRunMessageHeader, AgentRunSnapshotProjection,
-    AgentRunTranscriptMessage, AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION,
-    ClientRequest, GitHubCopilotLoginStatus, GitHubRepository,
+    AgentRunTranscriptMessage, AgentSessionInitialState, AgentSessionSnapshotProjection,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, GitHubCopilotLoginStatus, GitHubRepository,
     MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
     MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult,
     RequestEnvelope, ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionDirectory,
@@ -3462,6 +3462,29 @@ impl InProcessConnection {
             .unwrap_or_default())
     }
 
+    fn session_initial_state(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<AgentSessionInitialState> {
+        for _ in 0..4 {
+            let before = self.latest_session_event_sequence(session_id)?;
+            let mut projection = self.session_snapshot_projection(session_id, false)?;
+            let after = self.latest_session_event_sequence(session_id)?;
+            if before == after {
+                projection.latest_sequence = after;
+                return Ok(AgentSessionInitialState {
+                    projection,
+                    cursor: after,
+                });
+            }
+        }
+        Err(LoomError::new(
+            ErrorCode::Conflict,
+            "session changed while reading initial state; retry",
+            true,
+        ))
+    }
+
     fn create_workspace(&self, name: String) -> Result<WorkspaceRecord> {
         self.backend.workspace_records()?.create(name)
     }
@@ -4277,6 +4300,9 @@ impl InProcessConnection {
                     self.session_snapshot_projection(session_id, false)?,
                 ))
             }
+            ClientRequest::GetAgentSessionInitialState { session_id } => Ok(
+                ServerResponse::AgentSessionInitialState(self.session_initial_state(session_id)?),
+            ),
             ClientRequest::RenameAgentSession { session_id, name } => {
                 let (snapshot, record) = self.backend.sessions()?.rename(session_id, name)?;
                 self.backend.journal()?.append_session(record);
@@ -5174,6 +5200,9 @@ impl InProcessConnection {
                 session_id: requested_session,
             }
             | ClientRequest::GetAgentSessionSnapshotMetadata {
+                session_id: requested_session,
+            }
+            | ClientRequest::GetAgentSessionInitialState {
                 session_id: requested_session,
             }
             | ClientRequest::RenameAgentSession {
@@ -7061,7 +7090,6 @@ mod tests {
                 .as_ref()
                 .is_some_and(|run| run.messages.is_empty())
         );
-
         let run = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
             run_id,
         }));
@@ -8291,6 +8319,22 @@ mod tests {
         };
         assert!(
             metadata
+                .active_run
+                .as_ref()
+                .is_some_and(|projection| projection.messages.is_empty())
+        );
+        let initial = restored_connection.request(RequestEnvelope::new(
+            ClientRequest::GetAgentSessionInitialState {
+                session_id: recovery_session_id,
+            },
+        ));
+        let ServerResponse::AgentSessionInitialState(initial) = initial.result.unwrap() else {
+            panic!("unexpected initial session state response");
+        };
+        assert_eq!(initial.cursor, initial.projection.latest_sequence);
+        assert!(
+            initial
+                .projection
                 .active_run
                 .as_ref()
                 .is_some_and(|projection| projection.messages.is_empty())

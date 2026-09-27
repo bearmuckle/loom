@@ -556,6 +556,7 @@ fn session_id_for_request(
         ClientRequest::GetAgentSession { session_id }
         | ClientRequest::GetAgentSessionSnapshot { session_id }
         | ClientRequest::GetAgentSessionSnapshotMetadata { session_id }
+        | ClientRequest::GetAgentSessionInitialState { session_id }
         | ClientRequest::RenameAgentSession { session_id, .. }
         | ClientRequest::ArchiveAgentSession { session_id }
         | ClientRequest::GetRecentSessionEvents { session_id, .. }
@@ -2986,7 +2987,7 @@ impl LoomView {
     pub(crate) fn load_session(&mut self, session: AgentSessionSnapshot) {
         self.activate_session(session);
         let metadata_response = self.connection.request(RequestEnvelope::new(
-            ClientRequest::GetAgentSessionSnapshotMetadata {
+            ClientRequest::GetAgentSessionInitialState {
                 session_id: self.active_session.id,
             },
         ));
@@ -2999,8 +3000,16 @@ impl LoomView {
         } else {
             metadata_response
         };
+        let mut event_cursor = None;
+        let snapshot_result = match snapshot_response.result {
+            Ok(ServerResponse::AgentSessionInitialState(initial)) => {
+                event_cursor = Some(initial.cursor);
+                Ok(ServerResponse::AgentSessionSnapshot(initial.projection))
+            }
+            result => result,
+        };
         let mut needs_transcript_page = false;
-        let fallback_projection = match snapshot_response.result {
+        let fallback_projection = match snapshot_result {
             Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
                 needs_transcript_page = projection
                     .active_run
@@ -3031,7 +3040,7 @@ impl LoomView {
             }
         };
         if let Err(error) = self.collect_events_since(
-            None,
+            event_cursor,
             fallback_projection.and_then(|projection| projection.active_run),
         ) {
             self.record_backend_error("load session events", error);
@@ -3097,6 +3106,7 @@ impl LoomView {
         match response.result? {
             ServerResponse::SessionEvents { events } => {
                 self.reset_projection();
+                self.after_sequence = after_sequence;
                 for event in events {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
@@ -4077,7 +4087,7 @@ impl LoomView {
         self.ensure_session_task_message(session.id);
         let session_id = session.id;
         let snapshot_request = backend.submit(RequestEnvelope::new(
-            ClientRequest::GetAgentSessionSnapshotMetadata { session_id },
+            ClientRequest::GetAgentSessionInitialState { session_id },
         ));
         cx.spawn(async move |view, cx| {
             let mut snapshot = cx
@@ -4091,10 +4101,17 @@ impl LoomView {
                     .wait()
                     .await;
             }
+            let cursor = match &snapshot.result {
+                Ok(ServerResponse::AgentSessionInitialState(initial)) => Some(initial.cursor),
+                _ => None,
+            };
+            if let Ok(ServerResponse::AgentSessionInitialState(initial)) = snapshot.result.clone() {
+                snapshot.result = Ok(ServerResponse::AgentSessionSnapshot(initial.projection));
+            }
             let events_request =
                 backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                     session_id: Some(session_id),
-                    after_sequence: None,
+                    after_sequence: cursor,
                 }));
             let events = cx
                 .background_spawn(async move { events_request.wait().await })
@@ -4153,6 +4170,9 @@ impl LoomView {
             }
         };
         self.reset_projection();
+        self.after_sequence = fallback_projection
+            .as_ref()
+            .map(|projection| projection.latest_sequence);
         match events_response.result {
             Ok(ServerResponse::SessionEvents { events }) => {
                 for event in events {

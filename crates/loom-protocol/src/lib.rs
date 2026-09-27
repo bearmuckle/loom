@@ -135,6 +135,12 @@ pub struct AgentSessionSnapshotProjection {
     pub auto_approve_actions: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentSessionInitialState {
+    pub projection: AgentSessionSnapshotProjection,
+    pub cursor: EventSequence,
+}
+
 fn default_auto_approve_actions() -> bool {
     true
 }
@@ -371,6 +377,9 @@ pub enum ClientRequest {
     GetAgentSessionSnapshotMetadata {
         session_id: AgentSessionId,
     },
+    GetAgentSessionInitialState {
+        session_id: AgentSessionId,
+    },
     RenameAgentSession {
         session_id: AgentSessionId,
         name: String,
@@ -534,7 +543,8 @@ impl ClientRequest {
             Self::SetSessionApprovalPolicy { .. } => Some(Capability::ConfigureApprovalPolicy),
             Self::GetAgentSession { .. }
             | Self::GetAgentSessionSnapshot { .. }
-            | Self::GetAgentSessionSnapshotMetadata { .. } => Some(Capability::ReadAgentSession),
+            | Self::GetAgentSessionSnapshotMetadata { .. }
+            | Self::GetAgentSessionInitialState { .. } => Some(Capability::ReadAgentSession),
             Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
                 Some(Capability::ControlAgentSession)
             }
@@ -679,6 +689,7 @@ pub enum ServerResponse {
     AgentSessionForked(AgentSessionSnapshot),
     AgentSession(AgentSessionSnapshot),
     AgentSessionSnapshot(AgentSessionSnapshotProjection),
+    AgentSessionInitialState(AgentSessionInitialState),
     AgentSessionRenamed(AgentSessionSnapshot),
     AgentSessionArchived(AgentSessionSnapshot),
     AgentRunStarted(AgentRunSnapshot),
