@@ -556,8 +556,10 @@ Implement in this order:
    in-flight tool automatically; it marks the run failed with an unknown
    external outcome and requires an explicit retry. `InProcessBackend::shutdown`
    rejects new requests, pauses and joins active run workers, persists the final
-   state, then releases the owner lock. The host should call it for graceful
-   shutdown; process termination also releases the OS lock. Further execution-
+   state, then releases the owner lock. The CLI now calls it after remote-server
+   stop, successful one-shot runs, and before reopening the database in the
+   recovery demo. The desktop UI host still needs to call it on application
+   teardown; process termination also releases the OS lock. Further execution-
    state normalization and crash-injection coverage remain.
    Schema v22 stores ordered run-attempt identity, state, checkpoint, and timing
    records separately; checkpoint retry adds a new row while earlier attempts

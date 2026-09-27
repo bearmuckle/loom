@@ -95,6 +95,8 @@ fn main() -> Result<(), LoomError> {
             session.id,
             run_id,
         )?;
+    } else {
+        backend.shutdown()?;
     }
     Ok(())
 }
@@ -288,7 +290,9 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
             )
         })?;
     runtime.block_on(async move {
-        let server = RemoteServer::new(backend, auth, config).bind().await?;
+        let server = RemoteServer::new(backend.clone(), auth, config)
+            .bind()
+            .await?;
         println!(
             "Loom remote backend listening at {}",
             server.websocket_url()
@@ -301,7 +305,8 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
                 false,
             )
         })?;
-        server.stop().await
+        server.stop().await?;
+        backend.shutdown()
     })
 }
 
@@ -323,7 +328,9 @@ fn run_m4_demo(options: CliOptions) -> Result<(), LoomError> {
             )
         })?;
     runtime.block_on(async move {
-        let server = RemoteServer::new(backend, auth, config).bind().await?;
+        let server = RemoteServer::new(backend.clone(), auth, config)
+            .bind()
+            .await?;
         let result = m4_demo_remote(
             server.websocket_url().to_owned(),
             token.to_owned(),
@@ -332,7 +339,7 @@ fn run_m4_demo(options: CliOptions) -> Result<(), LoomError> {
         )
         .await;
         let stop_result = server.stop().await;
-        result.and(stop_result)
+        result.and(stop_result).and_then(|()| backend.shutdown())
     })
 }
 
@@ -718,7 +725,7 @@ fn demonstrate_m3_recovery(
             );
         }
     }
-    backend.flush()?;
+    backend.shutdown()?;
     drop(connection);
     drop(backend);
 

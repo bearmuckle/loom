@@ -207,7 +207,7 @@ session-created event per session. It omits transcripts, filesystem snapshots,
 large activity/output payloads, multiple realistic profile combinations, and UI
 initialization, so it does not prove that realistic 100k state fits the target.
 
-The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. Full snapshot capture/write amplification, atomic snapshot/resubscribe, host shutdown integration, retention policy, and end-to-end scale proof remain in the PR checklist.
+The following records the code-level baseline from the initial investigation; it is retained as historical evidence, not a description of every current implementation detail. Several recommendations have since been implemented in PR #85, including a shared SQLite connection, typed indexed catalogs and run state, content-addressed history, lazy reads, bounded retention, and an exclusive backend-owner sidecar lock with an explicit shutdown/drain API. The CLI now invokes shutdown on its graceful exit paths; desktop UI teardown integration, full snapshot capture/write amplification, atomic snapshot/resubscribe, retention policy, and end-to-end scale proof remain in the PR checklist.
 
 ## Baseline findings before the redesign
 
