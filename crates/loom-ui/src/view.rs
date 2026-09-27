@@ -1,5 +1,7 @@
 //! The GPUI view: session navigator, run canvas, composer, and review drawer.
 
+#[cfg(not(target_family = "wasm"))]
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -1333,6 +1335,8 @@ pub(crate) struct LoomView {
     browser_demo_mode: bool,
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
+    #[cfg(not(target_family = "wasm"))]
+    owned_backend: Option<Arc<InProcessBackend>>,
     /// Used for every request made once the view is interactive.
     pub(crate) backend: BackendWorker,
     /// The startup backend remains the default for workspace requests and new sessions.
@@ -1715,6 +1719,8 @@ impl LoomView {
         Self {
             backend,
             connection,
+            #[cfg(not(target_family = "wasm"))]
+            owned_backend: None,
             default_backend_node_id: node_id.clone(),
             node_backends,
             node_names: BTreeMap::new(),
@@ -1856,6 +1862,24 @@ impl Focusable for LoomView {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+impl Drop for LoomView {
+    fn drop(&mut self) {
+        self.shutdown_owned_backend();
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl LoomView {
+    fn shutdown_owned_backend(&self) {
+        if let Some(backend) = &self.owned_backend
+            && let Err(error) = backend.shutdown()
+        {
+            log::warn!("could not drain local backend during UI teardown: {error}");
+        }
+    }
+}
+
 impl LoomView {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn try_new(
@@ -1864,7 +1888,8 @@ impl LoomView {
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
         let mut remote_cleanup_guard = None;
-        let (connection, workspace_root, demo_workspace) = if let Some(remote_url) = &options.remote
+        let (connection, workspace_root, demo_workspace, owned_backend) = if let Some(remote_url) =
+            &options.remote
         {
             info!("connecting to remote backend");
             if worker_url_embeds_credential(remote_url) {
@@ -1892,7 +1917,7 @@ impl LoomView {
                     )
                 })?
                 .unwrap_or_default();
-            (connection, workspace_root, false)
+            (connection, workspace_root, false, None)
         } else {
             let (workspace_root, demo_workspace) = prepare_workspace(options)?;
             info!(
@@ -1927,13 +1952,14 @@ impl LoomView {
                 ClientConnection::InProcess(Box::new(backend.connect())),
                 workspace_root,
                 demo_workspace,
+                Some(backend),
             )
         };
         if options.remote.is_none() {
             info!("negotiating protocol");
             negotiate(&connection)?;
         }
-        Self::initialize_from_connection(
+        let mut view = Self::initialize_from_connection(
             options,
             connection,
             workspace_root,
@@ -1941,7 +1967,9 @@ impl LoomView {
             remote_cleanup_guard,
             focus_handle,
             true,
-        )
+        )?;
+        view.owned_backend = owned_backend;
+        Ok(view)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -2062,6 +2090,8 @@ impl LoomView {
         let mut view = Self {
             backend,
             connection: connection.clone(),
+            #[cfg(not(target_family = "wasm"))]
+            owned_backend: None,
             default_backend_node_id: default_backend_node_id.clone(),
             node_backends,
             node_names,
@@ -10820,9 +10850,9 @@ mod loom_view_render_tests {
             let workspace_root =
                 std::env::temp_dir().join(format!("loom-ui-bootstrap-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&workspace_root).unwrap();
-            let connection = super::ClientConnection::InProcess(Box::new(
-                loom_server::InProcessBackend::new().connect(),
-            ));
+            let local_backend = loom_server::InProcessBackend::new();
+            let connection = super::ClientConnection::InProcess(Box::new(local_backend.connect()));
+            let connection_after_teardown = connection.clone();
             crate::connection::negotiate(&connection).unwrap();
             let mut view = LoomView::initialize_from_connection(
                 &options,
@@ -10834,6 +10864,7 @@ mod loom_view_render_tests {
                 false,
             )
             .unwrap();
+            view.owned_backend = Some(local_backend);
             assert_eq!(view.workspaces.len(), 1);
             assert_eq!(view.sessions.len(), 1);
             assert!(view.models.contains(&ModelId::new("deterministic/demo")));
@@ -10841,6 +10872,13 @@ mod loom_view_render_tests {
             // Avoid starting the live worker's delayed status poll in this synchronous UI test.
             view.worker_nodes.clear();
             let _ = std::fs::remove_dir_all(workspace_root);
+            view.shutdown_owned_backend();
+            assert!(
+                connection_after_teardown
+                    .request(RequestEnvelope::new(ClientRequest::ListWorkspaces))
+                    .result
+                    .is_err()
+            );
             view
         });
     }
