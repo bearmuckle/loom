@@ -168,6 +168,12 @@ per-session run lookup latency, and database size. Set `LOOM_SCALE_SESSIONS` and
 | 10,000 / 10,000 / 10,000 | 11,575,296 bytes | 1,937 ms | 7.274 ms | 0.047 ms | 59.384 ms | 0.015 ms |
 | 20,000 / 20,000 / 20,000 | 22,753,280 bytes | 4,368 ms | 11.972 ms | 0.049 ms | 128.945 ms | 0.014 ms |
 
+A fresh 10,000-row run on 2026-09-27 measured 11,587,584 bytes, 1,892 ms
+population, 6.786 ms catalog/active/feed-header p50, 0.045 ms per-session
+feed p50, 61.798 ms full-feed decode p50, and 0.015 ms indexed run lookup p50.
+The small run-to-run variation is expected; this is a local synthetic fixture,
+not a platform-independent latency guarantee.
+
 The per-session run lookup and one-session feed read stayed flat. Startup now
 loads only the small feed header; a diagnostic full-feed decode still grows
 approximately with event count, but it is no longer on the restore path. The
