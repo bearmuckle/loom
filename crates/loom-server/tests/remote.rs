@@ -54,7 +54,17 @@ async fn server() -> (
     loom_server::IssuedToken,
     loom_server::RunningRemoteServer,
 ) {
-    let backend = InProcessBackend::new();
+    server_with_backend(InProcessBackend::new()).await
+}
+
+async fn server_with_backend(
+    backend: Arc<InProcessBackend>,
+) -> (
+    Arc<InProcessBackend>,
+    Arc<AuthTokenStore>,
+    loom_server::IssuedToken,
+    loom_server::RunningRemoteServer,
+) {
     let auth = Arc::new(AuthTokenStore::new());
     let token = auth
         .insert("remote-test-token", AuthorizationScope::all())
@@ -276,7 +286,12 @@ async fn authorized_client_can_configure_copilot_on_remote_worker() {
 
 #[tokio::test]
 async fn authorized_client_can_configure_api_key_provider_on_remote_worker() {
-    let (_backend, _auth, token, server) = server().await;
+    let providers = loom_providers::ProviderRegistry::configured(Arc::new(
+        loom_providers::InMemoryCredentialStore::default(),
+    ))
+    .unwrap();
+    let backend = InProcessBackend::with_provider_registry(providers);
+    let (_backend, _auth, token, server) = server_with_backend(backend).await;
     let mut connection = WebSocketTransport::new(server.websocket_url(), token.token.clone())
         .connect()
         .await
@@ -287,7 +302,7 @@ async fn authorized_client_can_configure_api_key_provider_on_remote_worker() {
     let response = connection
         .request(RequestEnvelope::new(
             ClientRequest::ConfigureApiKeyProvider {
-                provider_id: loom_model::ProviderId::new("openai-compatible"),
+                provider_id: loom_model::ProviderId::new("openai"),
                 api_key: secret.to_owned(),
             },
         ))
@@ -308,8 +323,10 @@ async fn authorized_client_can_configure_api_key_provider_on_remote_worker() {
     };
     let provider = providers
         .iter()
-        .find(|provider| provider.id.as_str() == "openai-compatible")
-        .expect("OpenAI-compatible provider should be listed");
+        .find(|provider| provider.id.as_str() == "openai")
+        .expect("OpenAI provider should be listed");
+    assert_eq!(provider.kind, loom_model::ProviderKind::OpenAi);
+    assert_eq!(provider.display_name, "OpenAI");
     assert!(provider.api_key_configurable);
     assert!(provider.credential_id.is_some());
     assert!(!format!("{provider:?}").contains(secret));

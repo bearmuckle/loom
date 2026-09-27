@@ -222,6 +222,7 @@ fn estimate_text_tokens(model: &ModelId, text: &str) -> u64 {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     Deterministic,
+    OpenAi,
     OpenAiCompatible,
     Ollama,
     GitHubCopilot,

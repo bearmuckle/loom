@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 
 pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 pub const GITHUB_COPILOT_CREDENTIAL_REF: &str = "github-copilot";
-pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-5.6-luna";
+pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-6-luna";
+pub const OPENAI_PROVIDER_ID: &str = "openai";
+pub const OPENAI_API_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+pub const OPENAI_DEFAULT_MODEL: &str = "gpt-6-luna";
 const GITHUB_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -366,6 +369,32 @@ impl ProviderConfig {
         }
     }
 
+    /// Official OpenAI API, exposed separately from OpenAI-compatible gateways.
+    pub fn openai(model: impl Into<ModelId>) -> Self {
+        let id = ProviderId::new(OPENAI_PROVIDER_ID);
+        Self {
+            id: id.clone(),
+            kind: ProviderKind::OpenAi,
+            display_name: "OpenAI".to_owned(),
+            endpoint: Some(OPENAI_API_ENDPOINT.to_owned()),
+            models: vec![ModelDescriptor {
+                id: model.into(),
+                provider: id,
+                display_name: "OpenAI model".to_owned(),
+                context_window: None,
+                capabilities: ModelCapabilities {
+                    streaming: true,
+                    tool_calling: true,
+                    vision: true,
+                    json_mode: true,
+                },
+            }],
+            credential: None,
+            input_cost_micros_per_1k: 0,
+            output_cost_micros_per_1k: 0,
+        }
+    }
+
     pub fn ollama(endpoint: impl Into<String>, model: impl Into<ModelId>) -> Self {
         let model = model.into();
         let model_descriptor = ModelDescriptor {
@@ -420,7 +449,7 @@ pub fn github_copilot_descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: ModelId::new(GITHUB_COPILOT_DEFAULT_MODEL),
         provider: ProviderId::new(GITHUB_COPILOT_PROVIDER_ID),
-        display_name: "GitHub Copilot GPT-5.6 Luna".to_owned(),
+        display_name: "GitHub Copilot GPT-6 Luna".to_owned(),
         context_window: Some(128_000),
         capabilities: ModelCapabilities {
             streaming: false,
@@ -610,7 +639,10 @@ impl ProviderRegistry {
         };
         let mut migrated = false;
         for config in configs {
-            if config.kind != ProviderKind::OpenAiCompatible {
+            if !matches!(
+                config.kind,
+                ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+            ) {
                 continue;
             }
             let Some(reference) = config.credential.as_ref() else {
@@ -644,6 +676,9 @@ impl ProviderRegistry {
 
     pub fn configured(credentials: Arc<dyn CredentialStore>) -> Result<Self> {
         let registry = Self::with_credentials(Arc::clone(&credentials));
+        let model =
+            std::env::var("LOOM_OPENAI_MODEL").unwrap_or_else(|_| OPENAI_DEFAULT_MODEL.to_owned());
+        registry.register(ProviderConfig::openai(model))?;
         registry.register(ProviderConfig::github_copilot(CredentialRef::new(
             GITHUB_COPILOT_CREDENTIAL_REF,
         )))?;
@@ -799,7 +834,10 @@ impl ProviderRegistry {
         let config = configurations
             .get_mut(provider_id)
             .ok_or_else(|| LoomError::not_found("provider", provider_id.as_str()))?;
-        if config.kind != ProviderKind::OpenAiCompatible {
+        if !matches!(
+            config.kind,
+            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+        ) {
             return Err(LoomError::invalid_request(
                 "API keys can only be configured for API-key providers",
             ));
@@ -872,7 +910,10 @@ impl ProviderRegistry {
                     .credential
                     .as_ref()
                     .map(|reference| reference.as_str().to_owned()),
-                api_key_configurable: config.kind == ProviderKind::OpenAiCompatible,
+                api_key_configurable: matches!(
+                    config.kind,
+                    ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+                ),
                 health: health.get(&config.id).cloned().unwrap_or_default(),
             })
             .collect())
@@ -970,6 +1011,13 @@ impl ProviderRegistry {
                 )
             })?
             .iter()
+            .filter(|model| {
+                config.kind != ProviderKind::OpenAi
+                    || model
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(openai_model_supported)
+            })
             .map(|model| {
                 let id = model
                     .get("id")
@@ -1119,6 +1167,19 @@ impl ProviderRegistry {
                 ))
             }
 
+            ProviderKind::OpenAi => {
+                let endpoint = config.endpoint.as_deref().unwrap_or(OPENAI_API_ENDPOINT);
+                let secret = config
+                    .credential
+                    .as_ref()
+                    .map(|reference| self.resolve_credential(reference))
+                    .transpose()?
+                    .unwrap_or_default();
+                Box::new(OpenAiCompatibleProvider::with_descriptor(
+                    endpoint, secret, descriptor,
+                ))
+            }
+
             ProviderKind::Ollama => {
                 let endpoint = config.endpoint.as_deref().ok_or_else(|| {
                     LoomError::invalid_request(format!(
@@ -1224,8 +1285,10 @@ impl ProviderRegistry {
                     continue;
                 }
                 if config.kind != ProviderKind::GitHubCopilot
-                    && (config.kind != ProviderKind::OpenAiCompatible
-                        || config.credential.is_none())
+                    && (!matches!(
+                        config.kind,
+                        ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+                    ) || config.credential.is_none())
                 {
                     continue;
                 }
@@ -1857,6 +1920,26 @@ struct CopilotAccessToken {
 // Copilot exposes per-model limits under capabilities.limits. Some compatible
 // catalogs expose context_length directly. A prompt cap is also a safe upper
 // bound on our usable window, since the runtime separately reserves output.
+fn openai_model_supported(model: &str) -> bool {
+    matches!(
+        model,
+        "gpt-4.1"
+            | "gpt-4.1-mini"
+            | "gpt-4.1-nano"
+            | "gpt-4o"
+            | "gpt-4o-mini"
+            | "gpt-5"
+            | "gpt-5-mini"
+            | "gpt-5-nano"
+            | "gpt-6-astra"
+            | "gpt-6-sol"
+            | "gpt-6-luna"
+            | "o3"
+            | "o3-mini"
+            | "o4-mini"
+    )
+}
+
 fn discovered_context_window(model: &serde_json::Value) -> Option<u32> {
     [
         "/capabilities/limits/max_context_window_tokens",
@@ -3826,8 +3909,158 @@ mod tests {
                 .iter()
                 .any(|model| model.provider.as_str() == "ollama")
         );
+        let openai_registry =
+            ProviderRegistry::configured(Arc::new(InMemoryCredentialStore::default())).unwrap();
+        let openai = openai_registry
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id.as_str() == OPENAI_PROVIDER_ID)
+            .expect("OpenAI should be a distinct configured provider");
+        assert_eq!(openai.kind, ProviderKind::OpenAi);
+        assert_eq!(openai.display_name, "OpenAI");
+        assert!(openai.api_key_configurable);
+        assert_eq!(
+            openai.models[0].id.as_str(),
+            std::env::var("LOOM_OPENAI_MODEL").unwrap_or_else(|_| OPENAI_DEFAULT_MODEL.to_owned())
+        );
         let serialized = serde_json::to_string(&registry.list_providers().unwrap()).unwrap();
         assert!(!serialized.contains("Bearer"));
+    }
+
+    #[test]
+    fn openai_api_key_is_stored_by_the_worker_and_redacted_from_provider_summaries() {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let registry = ProviderRegistry::with_credentials(credentials.clone());
+        registry
+            .register(ProviderConfig::openai(OPENAI_DEFAULT_MODEL))
+            .unwrap();
+        let scoped_credentials = Arc::new(InMemoryCredentialStore::default());
+        registry
+            .scope_api_key_credentials(scoped_credentials.clone())
+            .unwrap();
+
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(OPENAI_PROVIDER_ID),
+                "openai-test-secret".to_owned(),
+            )
+            .unwrap();
+
+        let provider = registry.list_providers().unwrap().remove(0);
+        let reference = CredentialRef::new(provider.credential_id.as_deref().unwrap());
+        assert_eq!(
+            scoped_credentials.resolve(&reference).unwrap(),
+            "openai-test-secret"
+        );
+        assert!(!format!("{provider:?}").contains("openai-test-secret"));
+        assert!(
+            !serde_json::to_string(&registry.export_configs().unwrap())
+                .unwrap()
+                .contains("openai-test-secret")
+        );
+    }
+
+    #[test]
+    fn openai_model_discovery_uses_official_models_shape_and_filters_unsupported_models() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> std::result::Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request = read_request_headers(&mut stream)?;
+            if !request.starts_with("GET /v1/models ")
+                || !request.contains("Bearer openai-discovery-key")
+            {
+                return Err("OpenAI model request had an unexpected path or credential".to_owned());
+            }
+            write_response(
+                &mut stream,
+                "application/json",
+                r#"{"data":[{"id":"gpt-4.1"},{"id":"text-embedding-3-small"},{"id":"o3-mini"},{"id":"gpt-6-astra"},{"id":"gpt-6-sol"},{"id":"gpt-6-luna"},{"id":"gpt-6-audio"}]}"#,
+            )
+        });
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let registry = ProviderRegistry::with_credentials(credentials);
+        let mut config = ProviderConfig::openai(OPENAI_DEFAULT_MODEL);
+        config.endpoint = Some(format!("http://{address}/v1/chat/completions"));
+        registry.register(config).unwrap();
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(OPENAI_PROVIDER_ID),
+                "openai-discovery-key".to_owned(),
+            )
+            .unwrap();
+
+        let models = registry
+            .discover_models(&ProviderId::new(OPENAI_PROVIDER_ID))
+            .unwrap();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "gpt-4.1",
+                "o3-mini",
+                "gpt-6-astra",
+                "gpt-6-sol",
+                "gpt-6-luna"
+            ]
+        );
+        server
+            .join()
+            .expect("fixture server panicked")
+            .expect("fixture server failed");
+    }
+
+    #[test]
+    fn configured_openai_provider_serves_a_model_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> std::result::Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request = read_request_headers(&mut stream)?;
+            if !request.starts_with("POST /v1/chat/completions ")
+                || !request.contains("Bearer openai-request-key")
+            {
+                return Err(
+                    "OpenAI completion request had an unexpected path or credential".to_owned(),
+                );
+            }
+            write_response(
+                &mut stream,
+                "application/json",
+                r#"{"choices":[{"message":{"content":"OpenAI fixture"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#,
+            )
+        });
+        let registry =
+            ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
+        let mut config = ProviderConfig::openai("fixture-model");
+        config.endpoint = Some(format!("http://{address}/v1/chat/completions"));
+        config.models[0].id = ModelId::new("fixture-model");
+        registry.register(config).unwrap();
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(OPENAI_PROVIDER_ID),
+                "openai-request-key".to_owned(),
+            )
+            .unwrap();
+        let request = ModelRequest {
+            model: ModelId::new("fixture-model"),
+            messages: vec![ModelMessage::new(MessageRole::User, "hello")],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        let mut provider = registry.create_provider(&request.model).unwrap();
+        let events = provider
+            .stream_collected(&request, &CancellationToken::new())
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(event, ModelStreamEvent::TextDelta { text } if text == "OpenAI fixture")));
+        server
+            .join()
+            .expect("fixture server panicked")
+            .expect("fixture server failed");
     }
 
     #[test]

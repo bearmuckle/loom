@@ -649,6 +649,22 @@ fn validate_model_for_node(
     }
 }
 
+fn model_choice_labels(
+    models: &[ModelId],
+    provider_names: Option<&BTreeMap<ModelId, String>>,
+) -> BTreeMap<String, ModelId> {
+    models
+        .iter()
+        .map(|model| {
+            let provider = provider_names
+                .and_then(|names| names.get(model))
+                .map(String::as_str)
+                .unwrap_or("Provider");
+            (format!("{provider} · {}", model.as_str()), model.clone())
+        })
+        .collect()
+}
+
 /// Opens a URL in a new tab/window. Natively this shells out to the OS's
 /// "open" handler; in the browser it's just `window.open`.
 #[cfg(not(target_family = "wasm"))]
@@ -1367,6 +1383,7 @@ pub(crate) struct LoomView {
     pub(crate) models: Vec<ModelId>,
     default_models: Vec<ModelId>,
     node_model_catalogs: BTreeMap<String, Vec<ModelId>>,
+    node_model_provider_names: BTreeMap<String, BTreeMap<ModelId, String>>,
     model_catalog_node_id: Option<String>,
     model_refreshes_in_flight: BTreeSet<String>,
     model_select: Option<Entity<ModelSelectState>>,
@@ -1377,6 +1394,8 @@ pub(crate) struct LoomView {
     default_model_select_items: Vec<String>,
     model_select_value: Option<String>,
     default_model_select_value: Option<String>,
+    model_select_choices: BTreeMap<String, ModelId>,
+    default_model_select_choices: BTreeMap<String, ModelId>,
     agent_mode_select: Option<Entity<ModelSelectState>>,
     agent_mode_select_subscription: Option<Subscription>,
     pub(crate) settings_open: bool,
@@ -1384,7 +1403,8 @@ pub(crate) struct LoomView {
     pub(crate) about_open: bool,
     pub(crate) providers: Vec<ProviderSummary>,
     providers_node_id: Option<String>,
-    provider_api_key_input: Option<Entity<InputState>>,
+    provider_api_key_inputs: BTreeMap<loom_model::ProviderId, Entity<InputState>>,
+    provider_setup_status: BTreeMap<loom_model::ProviderId, String>,
     pub(crate) theme_choice: ThemeChoice,
     appearance_subscription: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
@@ -1747,6 +1767,7 @@ impl LoomView {
             models: vec![model.clone()],
             default_models: vec![model.clone()],
             node_model_catalogs: BTreeMap::from([(node_id.clone(), vec![model])]),
+            node_model_provider_names: BTreeMap::new(),
             model_catalog_node_id: Some(node_id),
             model_refreshes_in_flight: BTreeSet::new(),
             model_select: None,
@@ -1757,6 +1778,8 @@ impl LoomView {
             default_model_select_items: Vec::new(),
             model_select_value: None,
             default_model_select_value: None,
+            model_select_choices: BTreeMap::new(),
+            default_model_select_choices: BTreeMap::new(),
             agent_mode_select: None,
             agent_mode_select_subscription: None,
             settings_open: false,
@@ -1764,7 +1787,8 @@ impl LoomView {
             about_open: false,
             providers: Vec::new(),
             providers_node_id: None,
-            provider_api_key_input: None,
+            provider_api_key_inputs: BTreeMap::new(),
+            provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -2054,7 +2078,9 @@ impl LoomView {
                 )?;
             }
         }
-        let models = list_models(&connection)?;
+        let model_catalog = list_models(&connection)?;
+        let models = model_catalog.models;
+        let model_provider_names = model_catalog.provider_names;
         let model = if models.contains(&options.model) {
             options.model.clone()
         } else {
@@ -2124,6 +2150,10 @@ impl LoomView {
             models: models.clone(),
             default_models: models,
             node_model_catalogs,
+            node_model_provider_names: BTreeMap::from([(
+                default_backend_node_id.clone(),
+                model_provider_names,
+            )]),
             model_catalog_node_id: Some(default_backend_node_id.clone()),
             model_refreshes_in_flight: BTreeSet::new(),
             model_select: None,
@@ -2134,6 +2164,8 @@ impl LoomView {
             default_model_select_items: Vec::new(),
             model_select_value: None,
             default_model_select_value: None,
+            model_select_choices: BTreeMap::new(),
+            default_model_select_choices: BTreeMap::new(),
             agent_mode_select: None,
             agent_mode_select_subscription: None,
             settings_open: false,
@@ -2141,7 +2173,8 @@ impl LoomView {
             about_open: false,
             providers: Vec::new(),
             providers_node_id: None,
-            provider_api_key_input: None,
+            provider_api_key_inputs: BTreeMap::new(),
+            provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -2288,6 +2321,7 @@ impl LoomView {
                 Vec::new()
             },
             node_model_catalogs: BTreeMap::new(),
+            node_model_provider_names: BTreeMap::new(),
             model_catalog_node_id: None,
             model_refreshes_in_flight: BTreeSet::new(),
             model_select: None,
@@ -2298,6 +2332,8 @@ impl LoomView {
             default_model_select_items: Vec::new(),
             model_select_value: None,
             default_model_select_value: None,
+            model_select_choices: BTreeMap::new(),
+            default_model_select_choices: BTreeMap::new(),
             agent_mode_select: None,
             agent_mode_select_subscription: None,
             settings_open: options.is_configured(),
@@ -2305,7 +2341,8 @@ impl LoomView {
             about_open: false,
             providers: Vec::new(),
             providers_node_id: None,
-            provider_api_key_input: None,
+            provider_api_key_inputs: BTreeMap::new(),
+            provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -2450,7 +2487,9 @@ impl LoomView {
             )
             .await?;
         }
-        let models = list_models_async(&connection).await?;
+        let model_catalog = list_models_async(&connection).await?;
+        let models = model_catalog.models;
+        let model_provider_names = model_catalog.provider_names;
         let model = options
             .model()
             .cloned()
@@ -2506,6 +2545,10 @@ impl LoomView {
             models: models.clone(),
             default_models: models,
             node_model_catalogs,
+            node_model_provider_names: BTreeMap::from([(
+                default_backend_node_id.clone(),
+                model_provider_names,
+            )]),
             model_catalog_node_id: None,
             model_refreshes_in_flight: BTreeSet::new(),
             model_select: None,
@@ -2516,6 +2559,8 @@ impl LoomView {
             default_model_select_items: Vec::new(),
             model_select_value: None,
             default_model_select_value: None,
+            model_select_choices: BTreeMap::new(),
+            default_model_select_choices: BTreeMap::new(),
             agent_mode_select: None,
             agent_mode_select_subscription: None,
             settings_open: false,
@@ -2523,7 +2568,8 @@ impl LoomView {
             about_open: false,
             providers: Vec::new(),
             providers_node_id: None,
-            provider_api_key_input: None,
+            provider_api_key_inputs: BTreeMap::new(),
+            provider_setup_status: BTreeMap::new(),
             theme_choice: ThemeChoice::System,
             appearance_subscription: None,
             after_sequence: None,
@@ -2692,13 +2738,15 @@ impl LoomView {
                 return;
             }
         };
-        let mut models = match list_models(&self.connection) {
+        let catalog = match list_models(&self.connection) {
             Ok(models) => models,
             Err(error) => {
                 self.record_status(format!("Could not load available models: {error}"));
                 return;
             }
         };
+        let mut provider_names = catalog.provider_names;
+        let mut models = catalog.models;
         for provider_id in provider_ids {
             let response = self.connection.request(RequestEnvelope::new(
                 ClientRequest::DiscoverProviderModels {
@@ -2707,7 +2755,13 @@ impl LoomView {
             ));
             match response.result {
                 Ok(ServerResponse::Models { models: discovered }) => {
-                    models.extend(discovered.into_iter().map(|model| model.id));
+                    for model in discovered {
+                        provider_names.insert(
+                            model.id.clone(),
+                            crate::connection::provider_name_for_id(provider_id.as_str()),
+                        );
+                        models.push(model.id);
+                    }
                 }
                 Err(error) => self.record_status(format!(
                     "Model discovery unavailable for {}: {}",
@@ -2722,6 +2776,8 @@ impl LoomView {
         }
         models.sort();
         models.dedup();
+        self.node_model_provider_names
+            .insert(self.default_backend_node_id.clone(), provider_names);
         self.apply_models(models);
     }
 
@@ -2773,6 +2829,8 @@ impl LoomView {
                 match result {
                     Ok(catalog) => {
                         view.record_model_discovery_errors(catalog.discovery_errors);
+                        view.node_model_provider_names
+                            .insert(node_id.clone(), catalog.provider_names);
                         let models = catalog.models;
                         view.node_model_catalogs
                             .insert(node_id.clone(), models.clone());
@@ -4834,18 +4892,32 @@ impl LoomView {
     }
 
     fn sync_model_select_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let items = self
-            .models
+        let active_node = self
+            .session_node_ids
+            .get(&self.active_session.id)
+            .map(String::as_str)
+            .unwrap_or(&self.default_backend_node_id);
+        let active_provider_names = self.node_model_provider_names.get(active_node);
+        let default_provider_names = self
+            .node_model_provider_names
+            .get(&self.default_backend_node_id);
+        let model_choices = model_choice_labels(&self.models, active_provider_names);
+        let default_model_choices =
+            model_choice_labels(&self.default_models, default_provider_names);
+        let items = model_choices.keys().cloned().collect::<Vec<_>>();
+        let default_items = default_model_choices.keys().cloned().collect::<Vec<_>>();
+        let model_value = model_choices
             .iter()
-            .map(|model| model.as_str().to_owned())
-            .collect::<Vec<_>>();
-        let default_items = self
-            .default_models
+            .find(|(_, model)| *model == &self.model)
+            .map(|(label, _)| label.clone())
+            .unwrap_or_else(|| self.model.as_str().to_owned());
+        let default_model_value = default_model_choices
             .iter()
-            .map(|model| model.as_str().to_owned())
-            .collect::<Vec<_>>();
-        let model_value = self.model.as_str().to_owned();
-        let default_model_value = self.default_model.as_str().to_owned();
+            .find(|(_, model)| *model == &self.default_model)
+            .map(|(label, _)| label.clone())
+            .unwrap_or_else(|| self.default_model.as_str().to_owned());
+        self.model_select_choices = model_choices;
+        self.default_model_select_choices = default_model_choices;
         let model_needs_sync = self.model_select_items != items
             || self.model_select_value.as_deref() != Some(model_value.as_str());
         let default_model_needs_sync = self.default_model_select_items != default_items
@@ -4875,8 +4947,10 @@ impl LoomView {
             self.model_select_subscription = Some(cx.subscribe(
                 &state,
                 |view, _, event: &SelectEvent<SearchableVec<String>>, cx| {
-                    if let SelectEvent::Confirm(Some(model)) = event {
-                        view.select_model(ModelId::new(model.clone()), cx);
+                    if let SelectEvent::Confirm(Some(model)) = event
+                        && let Some(model) = view.model_select_choices.get(model).cloned()
+                    {
+                        view.select_model(model, cx);
                     }
                 },
             ));
@@ -4911,8 +4985,10 @@ impl LoomView {
             self.default_model_select_subscription = Some(cx.subscribe(
                 &state,
                 |view, _, event: &SelectEvent<SearchableVec<String>>, cx| {
-                    if let SelectEvent::Confirm(Some(model)) = event {
-                        view.select_default_model(ModelId::new(model.clone()), cx);
+                    if let SelectEvent::Confirm(Some(model)) = event
+                        && let Some(model) = view.default_model_select_choices.get(model).cloned()
+                    {
+                        view.select_default_model(model, cx);
                     }
                 },
             ));
@@ -6101,15 +6177,22 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         let Some(node_id) = self.providers_node_id.clone() else {
+            self.provider_setup_status.insert(
+                provider_id,
+                "Choose a worker before saving an API key".to_owned(),
+            );
+            cx.notify();
             return;
         };
         let api_key = self
-            .provider_api_key_input
-            .as_ref()
+            .provider_api_key_inputs
+            .get(&provider_id)
             .map(|input| input.read(cx).value().to_string())
             .unwrap_or_default();
         if api_key.trim().is_empty() {
-            self.record_status("Enter an API key before configuring the provider");
+            self.provider_setup_status
+                .insert(provider_id, "Enter an API key before saving".to_owned());
+            cx.notify();
             return;
         }
         if !self
@@ -6117,23 +6200,47 @@ impl LoomView {
             .get(&node_id)
             .is_some_and(BackendWorker::secure_for_secrets)
         {
-            self.record_status(
-                "Provider API keys require a secure worker connection (wss:// or loopback ws://)",
+            self.provider_setup_status.insert(
+                provider_id,
+                "This worker needs a secure connection to save API keys (wss:// or loopback ws://)"
+                    .to_owned(),
             );
+            cx.notify();
             return;
         }
-        if let Some(input) = &self.provider_api_key_input {
+        if let Some(input) = self.provider_api_key_inputs.get(&provider_id) {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
+        self.provider_setup_status.insert(
+            provider_id.clone(),
+            format!(
+                "Saving API key on {}…",
+                self.node_names
+                    .get(&node_id)
+                    .map(String::as_str)
+                    .unwrap_or("worker")
+            ),
+        );
+        cx.notify();
         self.dispatch_to_node(
             cx,
             node_id.clone(),
             ClientRequest::ConfigureApiKeyProvider {
-                provider_id,
+                provider_id: provider_id.clone(),
                 api_key,
             },
             move |view, response, cx| match response.result {
                 Ok(ServerResponse::ProviderConfigured) => {
+                    view.provider_setup_status.insert(
+                        provider_id.clone(),
+                        format!(
+                            "API key saved on {}",
+                            view.node_names
+                                .get(&node_id)
+                                .map(String::as_str)
+                                .unwrap_or("worker")
+                        ),
+                    );
                     view.record_status(format!("Provider configured on {node_id}"));
                     view.open_providers_for_node(node_id, cx);
                     view.refresh_models_for_node_async(
@@ -6141,11 +6248,21 @@ impl LoomView {
                         cx,
                     );
                 }
-                Err(error) => view.record_backend_error("configure provider", error),
-                Ok(response) => view.record_backend_error(
-                    "configure provider",
-                    unexpected_response("provider configuration", response),
-                ),
+                Err(error) => {
+                    view.provider_setup_status.insert(
+                        provider_id.clone(),
+                        format!("Could not save API key: {}", error.message),
+                    );
+                    view.record_backend_error("configure provider", error);
+                }
+                Ok(response) => {
+                    let error = unexpected_response("provider configuration", response);
+                    view.provider_setup_status.insert(
+                        provider_id.clone(),
+                        format!("Could not save API key: {}", error.message),
+                    );
+                    view.record_backend_error("configure provider", error);
+                }
             },
         );
     }
@@ -6157,10 +6274,11 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         self.providers_open = false;
-        if let Some(input) = &self.provider_api_key_input {
+        for input in self.provider_api_key_inputs.values() {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
-        self.provider_api_key_input = None;
+        self.provider_api_key_inputs.clear();
+        self.provider_setup_status.clear();
         cx.notify();
     }
 
@@ -9196,26 +9314,6 @@ impl LoomView {
         let github_models = github_provider.map_or(0, |provider| provider.models.len());
 
         let mut local_body = div().flex().flex_col().gap_1();
-        if local_providers
-            .iter()
-            .any(|provider| provider.api_key_configurable)
-            && let Some(input) = self.provider_api_key_input.as_ref()
-        {
-            local_body = local_body.child(
-                div()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(0x171c25))
-                    .border_1()
-                    .border_color(rgb(0x293244))
-                    .child("Enter a provider API key")
-                    .child(
-                        div()
-                            .mt_2()
-                            .child(KitInput::new(input).id("provider-api-key-input").small()),
-                    ),
-            );
-        }
         if local_providers.is_empty() {
             local_body = local_body.child(
                 div()
@@ -9263,21 +9361,38 @@ impl LoomView {
                         },
                     ));
                 if api_key_configurable {
+                    if let Some(input) = self.provider_api_key_inputs.get(&provider.id) {
+                        provider_card = provider_card.child(
+                            div().mt_2().child(
+                                KitInput::new(input)
+                                    .id(format!("provider-api-key-input-{}", provider.id.as_str()))
+                                    .small(),
+                            ),
+                        );
+                    }
+                    if let Some(status) = self.provider_setup_status.get(&provider.id) {
+                        provider_card = provider_card.child(
+                            div()
+                                .id(format!("provider-setup-status-{}", provider.id.as_str()))
+                                .mt_2()
+                                .text_xs()
+                                .text_color(rgb(0x8f98a6))
+                                .child(status.clone()),
+                        );
+                    }
                     provider_card = provider_card.child(
-                        div()
-                            .id(format!("configure-api-key-{}", provider.id.as_str()))
-                            .mt_2()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(rgb(0x242833))
-                            .hover(|style| style.bg(rgb(0x293244)))
-                            .text_sm()
-                            .cursor_pointer()
-                            .child("Save API key")
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                view.configure_api_key_provider(provider_id.clone(), window, cx);
-                            })),
+                        div().mt_2().child(
+                            Button::new(format!("configure-api-key-{}", provider.id.as_str()))
+                                .label("Save API key")
+                                .small()
+                                .on_click(cx.listener(move |view, _, window, cx| {
+                                    view.configure_api_key_provider(
+                                        provider_id.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
+                        ),
                     );
                     if provider.credential_id.is_some() {
                         let node_id = self
@@ -9787,18 +9902,30 @@ impl Render for LoomView {
             ));
             self.rename_input_state = Some(input);
         }
-        if self.providers_open && self.provider_api_key_input.is_none() {
-            self.provider_api_key_input = Some(cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("Provider API key")
-                    .masked(true)
-            }));
-        }
-        if !self.providers_open {
-            if let Some(input) = &self.provider_api_key_input {
+        if self.providers_open {
+            for provider in self
+                .providers
+                .iter()
+                .filter(|provider| provider.api_key_configurable)
+            {
+                if !self.provider_api_key_inputs.contains_key(&provider.id) {
+                    let placeholder = format!("{} API key", provider.display_name);
+                    self.provider_api_key_inputs.insert(
+                        provider.id.clone(),
+                        cx.new(|cx| {
+                            InputState::new(window, cx)
+                                .placeholder(placeholder)
+                                .masked(true)
+                        }),
+                    );
+                }
+            }
+        } else {
+            for input in self.provider_api_key_inputs.values() {
                 input.update(cx, |state, cx| state.set_value("", window, cx));
             }
-            self.provider_api_key_input = None;
+            self.provider_api_key_inputs.clear();
+            self.provider_setup_status.clear();
         }
         if let Some(path) = self.pending_source_path.take() {
             let input = cx.new(|cx| {
