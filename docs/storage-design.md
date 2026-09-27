@@ -22,12 +22,15 @@ Schema v35 stores approval decisions, session limits, context budgets,
 checkpoint identity, and token cost rates as constrained scalar columns rather
 than JSON text. Session approval policies use the same constrained per-action
 representation; only the bounded context-inspection diagnostic remains JSON.
-As requested, databases from schemas v34 and v35 are rejected without import
-or mutation. Schema v36 stores system and repository instructions as shared,
+As requested, databases from older schemas are rejected without import or
+mutation. Schema v36 stores system and repository instructions as shared,
 compressed, content-addressed objects and factors reusable policy/limit options
 into content-keyed runtime profiles. Per-run rows hold only a profile reference
 and run-specific context diagnostics. The bounded garbage collector retains
 shared instruction text until its final profile reference is removed.
+Schema v37 persists an indexed expiry for idempotency responses, rejects stale
+UUIDv7 retries before dispatch, and prunes expired rows on startup. UUIDv4
+request IDs retain their bounded compatibility cache.
 The reconnect feed uses a global sequence, with independent per-session retention
 budgets of 4,096 events and 16 MiB of encoded payload. Session snapshot fallback
 evaluates the retained boundary for the requested session and resumes at that

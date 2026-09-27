@@ -93,12 +93,11 @@ fn validate_retry_horizon(request_id: RequestId, now_ms: u64) -> Result<()> {
 
 fn trim_idempotency_cache(cache: &mut BTreeMap<RequestId, IdempotencyRecord>) {
     let now = current_unix_millis();
-    let horizon_ms = IDEMPOTENCY_RETENTION.as_millis() as u64;
-    let cutoff = now.saturating_sub(horizon_ms);
-    cache.retain(|request_id, _| {
-        request_id
-            .issued_at_unix_millis()
-            .is_none_or(|issued_at| issued_at >= cutoff)
+    cache.retain(|request_id, record| {
+        record
+            .expires_at
+            .is_none_or(|expires_at| expires_at.as_unix_millis() > now)
+            || request_id.issued_at_unix_millis().is_none()
     });
 
     let mut legacy = cache
@@ -730,6 +729,7 @@ fn deduplicate_events(events: Vec<ServerEventEnvelope>) -> Vec<ServerEventEnvelo
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct IdempotencyRecord {
     created_at: Timestamp,
+    expires_at: Option<Timestamp>,
     request: ClientRequest,
     response: ResponseEnvelope,
 }
@@ -2342,6 +2342,9 @@ impl InProcessBackend {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
         };
+        persistence.prune_expired_idempotency_records(Timestamp::from_unix_millis(
+            current_unix_millis(),
+        ))?;
         let startup_started = Instant::now();
         let mut needs_persist = false;
         let Some(sessions) = persistence.load_sessions()? else {
@@ -2375,6 +2378,7 @@ impl InProcessBackend {
                             id,
                             IdempotencyRecord {
                                 created_at: record.created_at,
+                                expires_at: record.expires_at,
                                 request: from_json(record.request)?,
                                 response: from_json(record.response)?,
                             },
@@ -2816,6 +2820,7 @@ impl InProcessBackend {
                     *id,
                     DurableIdempotencyRecord {
                         created_at: record.created_at,
+                        expires_at: record.expires_at,
                         request: json_value(&record.request)?,
                         response: json_value(&record.response)?,
                     },
@@ -3142,6 +3147,11 @@ impl InProcessBackend {
             request_id,
             IdempotencyRecord {
                 created_at: Timestamp::now(),
+                expires_at: request_id.issued_at_unix_millis().map(|issued_at| {
+                    Timestamp::from_unix_millis(
+                        issued_at.saturating_add(IDEMPOTENCY_RETENTION.as_millis() as u64),
+                    )
+                }),
                 request,
                 response,
             },

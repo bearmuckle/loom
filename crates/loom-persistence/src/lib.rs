@@ -32,8 +32,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 36;
-const DATABASE_SCHEMA_VERSION: u32 = 36;
+pub const CURRENT_SCHEMA_VERSION: u32 = 37;
+const DATABASE_SCHEMA_VERSION: u32 = 37;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
@@ -485,12 +485,14 @@ CREATE TABLE IF NOT EXISTS provider_usage_totals (
 CREATE TABLE IF NOT EXISTS idempotency_records (
     request_id BLOB PRIMARY KEY NOT NULL CHECK(length(request_id) = 16),
     created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    expires_at INTEGER CHECK(expires_at IS NULL OR expires_at >= created_at),
     request_hash BLOB NOT NULL CHECK(length(request_hash) = 32),
     request TEXT NOT NULL CHECK(length(request) <= 1048576),
     response TEXT NOT NULL CHECK(length(response) <= 1048576)
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS idempotency_expiry
-    ON idempotency_records(created_at, request_id);
+    ON idempotency_records(expires_at, request_id)
+    WHERE expires_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS feed_store_meta (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
     next_sequence INTEGER NOT NULL CHECK(next_sequence >= 0),
@@ -1095,6 +1097,7 @@ pub struct DurableProviderState {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DurableIdempotencyRecord {
     pub created_at: Timestamp,
+    pub expires_at: Option<Timestamp>,
     pub request: Value,
     pub response: Value,
 }
@@ -1893,7 +1896,7 @@ impl FilePersistence {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT request_id, created_at, request_hash, request, response
+                "SELECT request_id, created_at, expires_at, request_hash, request, response
                  FROM idempotency_records ORDER BY created_at, request_id",
             )
             .map_err(|error| {
@@ -1907,9 +1910,10 @@ impl FilePersistence {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             })
             .map_err(|error| {
@@ -1917,9 +1921,10 @@ impl FilePersistence {
             })?;
         let mut records = BTreeMap::new();
         for row in rows {
-            let (id, created_at, request_hash, request, response) = row.map_err(|error| {
-                persistence_error(format!("could not read idempotency records: {error}"), true)
-            })?;
+            let (id, created_at, expires_at, request_hash, request, response) =
+                row.map_err(|error| {
+                    persistence_error(format!("could not read idempotency records: {error}"), true)
+                })?;
             let id = RequestId::from_uuid(decode_uuid(&id, "request id")?);
             let actual_hash = Sha256::digest(request.as_bytes());
             if actual_hash.as_slice() != request_hash {
@@ -1947,12 +1952,30 @@ impl FilePersistence {
                 id,
                 DurableIdempotencyRecord {
                     created_at: decode_timestamp(created_at)?,
+                    expires_at: expires_at.map(decode_timestamp).transpose()?,
                     request,
                     response,
                 },
             );
         }
         Ok(records)
+    }
+
+    /// Removes response-cache rows whose explicit retry horizon has ended.
+    pub fn prune_expired_idempotency_records(&self, now: Timestamp) -> Result<usize> {
+        let connection = self.connection_for_write()?;
+        connection
+            .execute(
+                "DELETE FROM idempotency_records
+                 WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+                [encode_timestamp(now)?],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune expired idempotency records: {error}"),
+                    true,
+                )
+            })
     }
 
     /// Loads all indexed run summaries without reading runtime details or transcripts.
@@ -6363,20 +6386,23 @@ fn save_idempotency_rows(
         transaction
             .execute(
                 "INSERT INTO idempotency_records(
-                    request_id, created_at, request_hash, request, response
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    request_id, created_at, expires_at, request_hash, request, response
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(request_id) DO UPDATE SET
                     created_at=excluded.created_at,
+                    expires_at=excluded.expires_at,
                     request_hash=excluded.request_hash,
                     request=excluded.request,
                     response=excluded.response
                  WHERE idempotency_records.created_at IS NOT excluded.created_at
+                    OR idempotency_records.expires_at IS NOT excluded.expires_at
                     OR idempotency_records.request_hash IS NOT excluded.request_hash
                     OR idempotency_records.request IS NOT excluded.request
                     OR idempotency_records.response IS NOT excluded.response",
                 params![
                     id_bytes.as_slice(),
                     encode_timestamp(record.created_at)?,
+                    record.expires_at.map(encode_timestamp).transpose()?,
                     request_hash.as_slice(),
                     request,
                     response,
@@ -10019,6 +10045,7 @@ mod tests {
             request_id,
             DurableIdempotencyRecord {
                 created_at: Timestamp::from_unix_millis(1234),
+                expires_at: Some(Timestamp::from_unix_millis(604_801_234)),
                 request: serde_json::json!({"method": "list_sessions"}),
                 response: serde_json::json!({"sessions": []}),
             },
@@ -10376,6 +10403,10 @@ mod tests {
         assert_eq!(loaded_idempotency.len(), 1);
         let loaded_record = &loaded_idempotency[&request_id];
         assert_eq!(loaded_record.created_at, Timestamp::from_unix_millis(1234));
+        assert_eq!(
+            loaded_record.expires_at,
+            Some(Timestamp::from_unix_millis(604_801_234))
+        );
         assert_eq!(
             loaded_record.request,
             serde_json::json!({"method": "list_sessions"})
@@ -10753,7 +10784,8 @@ mod tests {
         let idempotency_plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT request_id FROM idempotency_records
-                 WHERE created_at<?1 ORDER BY created_at, request_id LIMIT 32",
+                 WHERE expires_at IS NOT NULL AND expires_at<=?1
+                 ORDER BY expires_at, request_id LIMIT 32",
                 [Timestamp::now().as_unix_millis() as i64],
                 |row| row.get(3),
             )
@@ -10911,6 +10943,13 @@ mod tests {
             "retained transcript, context checkpoint, tool, filesystem undo, and run-instruction content remain reachable"
         );
         drop(connection);
+        assert_eq!(
+            persistence
+                .prune_expired_idempotency_records(Timestamp::now())
+                .unwrap(),
+            1
+        );
+        assert!(persistence.load_idempotency_records().unwrap().is_empty());
         fs::remove_file(path).unwrap();
     }
 
