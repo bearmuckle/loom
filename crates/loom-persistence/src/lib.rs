@@ -8251,6 +8251,52 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_content_objects_are_rejected_during_restore() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        let text = "content whose integrity must survive process restarts ".repeat(200);
+        store
+            .save_sections(
+                CURRENT_SCHEMA_VERSION,
+                &[("content", serde_json::json!({"value": text}))],
+            )
+            .unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let (object_hash, blob_hash): (Vec<u8>, Vec<u8>) = connection
+            .query_row(
+                "SELECT objects.hash, parts.blob_hash
+                 FROM content_objects AS objects
+                 JOIN content_parts AS parts ON parts.content_hash=objects.hash
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        connection
+            .execute(
+                "UPDATE content_blobs SET codec=1, payload=x'0102' WHERE hash=?1",
+                [&blob_hash],
+            )
+            .unwrap();
+        let malformed_compressed = decode_content(&connection, &object_hash).unwrap_err();
+        assert_eq!(malformed_compressed.code, ErrorCode::MalformedPayload);
+
+        connection
+            .execute(
+                "UPDATE content_blobs SET codec=0, payload=x'00' WHERE hash=?1",
+                [&blob_hash],
+            )
+            .unwrap();
+        let damaged_content = decode_content(&connection, &object_hash).unwrap_err();
+        assert_eq!(damaged_content.code, ErrorCode::MalformedPayload);
+
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn typed_session_catalog_round_trips_and_uses_the_picker_index() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let persistence = FilePersistence::open(&path).unwrap();
