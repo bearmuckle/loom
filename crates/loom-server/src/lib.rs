@@ -13,9 +13,9 @@ use loom_agent::{
     AgentRuntimeOptions, AgentRuntimeState, AgentTask, RunControl, RunProgress,
 };
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Capability,
-    CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId, RequestId,
-    Result, SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
+    Capability, CapabilitySet, ErrorCode, EventSequence, LoomError, ProtocolVersion, RepositoryId,
+    RequestId, Result, SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
@@ -27,15 +27,16 @@ use loom_persistence::{
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
-    AgentExecutionStateRecord, AgentRunMessageHeader, AgentRunSnapshotProjection,
-    AgentRunTranscriptMessage, AgentSessionInitialState, AgentSessionSnapshotProjection,
-    CURRENT_PROTOCOL_VERSION, ClientRequest, GitHubCopilotLoginStatus, GitHubRepository,
-    MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
-    MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult,
-    RequestEnvelope, ResponseEnvelope, ServerEventEnvelope, ServerResponse, SessionDirectory,
-    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceEvent, WorkspaceEventEnvelope,
-    WorkspaceFeedEvent, unsupported_version_error,
+    AgentActivityRecord, AgentExecutionStateRecord, AgentRunMessageHeader,
+    AgentRunSnapshotProjection, AgentRunTranscriptMessage, AgentSessionInitialState,
+    AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest,
+    GitHubCopilotLoginStatus, GitHubRepository, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES,
+    MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES,
+    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult, RequestEnvelope, ResponseEnvelope,
+    ServerEventEnvelope, ServerResponse, SessionDirectory, SessionFilesystemChange,
+    SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository, WorkerNodeResources,
+    WorkerNodeStatus, WorkspaceConfig, WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceFeedEvent,
+    unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
@@ -608,6 +609,37 @@ struct EventJournal {
 }
 
 impl EventJournal {
+    /// Capture only the pending session rows owned by one run checkpoint. The
+    /// workspace feed is committed by full-state saves, never worker saves.
+    fn capture_session_feed(
+        &self,
+        session_id: AgentSessionId,
+    ) -> (DurableFeedState, BTreeSet<EventSequence>) {
+        let events = self
+            .pending_events
+            .iter()
+            .filter(|event| event.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let sequences = events.iter().map(|event| event.sequence).collect();
+        (
+            DurableFeedState {
+                next_sequence: self.next_sequence,
+                retention_limit: self.retention_limit,
+                events,
+                workspace_events: Vec::new(),
+            },
+            sequences,
+        )
+    }
+
+    /// Acknowledge precisely the rows included in a successfully committed
+    /// checkpoint; unrelated sessions and workspace events remain pending.
+    fn acknowledge_session_feed(&mut self, sequences: &BTreeSet<EventSequence>) {
+        self.pending_events
+            .retain(|event| !sequences.contains(&event.sequence));
+    }
+
     fn append_session(&mut self, record: SessionEventRecord) {
         let sequence = self.next();
         let event =
@@ -1137,6 +1169,8 @@ struct RunHandle {
     control: RunControl,
     state: Mutex<AgentRuntimeState>,
     message_fragments: Mutex<MessageFragmentState>,
+    activity_deltas: Mutex<PendingActivityDeltas>,
+    event_gate: Mutex<()>,
     fragment_wake: Condvar,
     running: Mutex<bool>,
     idle: Condvar,
@@ -1151,6 +1185,28 @@ struct MessageFragmentState {
     pending: BTreeMap<u64, PendingMessageFragments>,
     pending_bytes: usize,
     pending_since: Option<Instant>,
+}
+
+#[derive(Default)]
+struct PendingActivityDeltas {
+    by_id: BTreeMap<ActivityId, AgentActivityRecord>,
+    appended_order: Vec<ActivityId>,
+}
+
+impl PendingActivityDeltas {
+    fn ordered_values(&self) -> Vec<AgentActivityRecord> {
+        let appended = self.appended_order.iter().copied().collect::<BTreeSet<_>>();
+        self.by_id
+            .iter()
+            .filter(|(id, _)| !appended.contains(id))
+            .map(|(_, activity)| activity.clone())
+            .chain(
+                self.appended_order
+                    .iter()
+                    .filter_map(|id| self.by_id.get(id).cloned()),
+            )
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -1192,6 +1248,8 @@ impl RunHandle {
             control: runtime.control(),
             state: Mutex::new(runtime.export_state()),
             message_fragments: Mutex::new(MessageFragmentState::default()),
+            activity_deltas: Mutex::new(PendingActivityDeltas::default()),
+            event_gate: Mutex::new(()),
             fragment_wake: Condvar::new(),
             runtime: Mutex::new(runtime),
             running: Mutex::new(false),
@@ -1562,15 +1620,25 @@ impl RunHandle {
                 }
             }
             AgentEvent::ActivityRecorded { activity, .. } => {
-                if let Some(existing) = state
+                let updated = if let Some(existing) = state
                     .activities
                     .iter_mut()
                     .find(|existing| existing.id == activity.id)
                 {
                     *existing = activity.clone();
+                    true
                 } else {
                     state.activities.push(activity.clone());
+                    false
+                };
+                let mut deltas = self
+                    .activity_deltas
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !updated && !deltas.by_id.contains_key(&activity.id) {
+                    deltas.appended_order.push(activity.id);
                 }
+                deltas.by_id.insert(activity.id, activity.clone());
             }
             _ => {}
         }
@@ -2880,43 +2948,70 @@ impl InProcessBackend {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
+        let _event_guard = handle
+            .event_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         handle.flush_message_fragments(persistence)?;
-        let state = handle.state();
-        let summary = DurableRunSummary {
-            snapshot: state.run.clone(),
-            usage: state.usage.clone(),
-            attempts: Some(state.attempts.clone()),
-            execution_state: Some(execution_state_from_runtime(&state)?),
-            interactions: Some(state.interactions.clone()),
+        // Project only the checkpoint fields while holding the state lock.
+        // This intentionally excludes the potentially large activities vector;
+        // changed rows come from the ID-keyed queue below.
+        let (session_id, summary, runtime_config, context_checkpoint, plan, messages, activities) = {
+            let state = handle.locked_state();
+            let summary = DurableRunSummary {
+                snapshot: state.run.clone(),
+                usage: state.usage.clone(),
+                attempts: Some(state.attempts.clone()),
+                execution_state: Some(execution_state_from_runtime(&state)?),
+                interactions: Some(state.interactions.clone()),
+            };
+            let mut context_inspection = state.context_inspection.clone();
+            if let Some(inspection) = &mut context_inspection {
+                inspection.summary = None;
+            }
+            let runtime_config = DurableRunRuntimeConfig {
+                system_instructions: state.task.system_instructions.clone(),
+                repository_instructions: state.task.repository_instructions.clone(),
+                approval_policy: state.approval_policy.clone(),
+                limits: state.options.limits.clone(),
+                context_options: state.options.context.clone(),
+                checkpoint_id: state.options.checkpoint_id,
+                input_cost_micros_per_1k: state.options.input_cost_micros_per_1k,
+                output_cost_micros_per_1k: state.options.output_cost_micros_per_1k,
+                context_inspection,
+            };
+            let context_checkpoint =
+                state
+                    .context_checkpoint
+                    .clone()
+                    .map(|summary| DurableRunContextCheckpoint {
+                        session_id: state.session_id,
+                        summary,
+                    });
+            let activities = handle
+                .activity_deltas
+                .lock()
+                .map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::Internal,
+                        "activity delta lock was poisoned",
+                        true,
+                    )
+                })?
+                .ordered_values();
+            (
+                state.session_id,
+                summary,
+                runtime_config,
+                context_checkpoint,
+                state.plan.clone(),
+                durable_run_messages_from_runtime(&state.messages),
+                activities,
+            )
         };
-        let mut context_inspection = state.context_inspection.clone();
-        if let Some(inspection) = &mut context_inspection {
-            inspection.summary = None;
-        }
-        let runtime_config = DurableRunRuntimeConfig {
-            system_instructions: state.task.system_instructions.clone(),
-            repository_instructions: state.task.repository_instructions.clone(),
-            approval_policy: state.approval_policy.clone(),
-            limits: state.options.limits.clone(),
-            context_options: state.options.context.clone(),
-            checkpoint_id: state.options.checkpoint_id,
-            input_cost_micros_per_1k: state.options.input_cost_micros_per_1k,
-            output_cost_micros_per_1k: state.options.output_cost_micros_per_1k,
-            context_inspection,
-        };
-        let context_checkpoint =
-            state
-                .context_checkpoint
-                .clone()
-                .map(|summary| DurableRunContextCheckpoint {
-                    session_id: state.session_id,
-                    summary,
-                });
-        let messages = durable_run_messages_from_runtime(&state.messages);
-        let activities = state.activities.clone();
 
         let filesystem = {
-            let filesystem = self.session_filesystems()?.get(&state.session_id).cloned();
+            let filesystem = self.session_filesystems()?.get(&session_id).cloned();
             if let Some(filesystem) = filesystem {
                 let mut filesystem_state = filesystem.export_state()?;
                 let checkpoints = std::mem::take(&mut filesystem_state.checkpoints);
@@ -2941,7 +3036,7 @@ impl InProcessBackend {
                     .collect::<Vec<_>>();
                 let repositories = self
                     .session_repositories()?
-                    .get(&state.session_id)
+                    .get(&session_id)
                     .cloned()
                     .unwrap_or_default();
                 let persisted = PersistedSessionFilesystem {
@@ -2950,7 +3045,7 @@ impl InProcessBackend {
                     directories: directories.clone(),
                 };
                 Some(DurableFilesystemRecord {
-                    session_id: state.session_id,
+                    session_id,
                     root: persisted.filesystem.root.clone(),
                     control: persisted.filesystem.control,
                     checkpoints,
@@ -2966,14 +3061,7 @@ impl InProcessBackend {
         };
 
         let mut journal = self.journal()?;
-        let event_count = journal.pending_events.len();
-        let workspace_event_count = journal.pending_workspace_events.len();
-        let feed = DurableFeedState {
-            next_sequence: journal.next_sequence,
-            retention_limit: journal.retention_limit,
-            events: journal.pending_events.clone(),
-            workspace_events: journal.pending_workspace_events.clone(),
-        };
+        let (feed, captured_event_sequences) = journal.capture_session_feed(session_id);
         // Full retention ranking scans the retained feed, so amortize it until
         // at least 64 new global event sequences or 4 MiB of pending payloads
         // have arrived. The byte threshold prevents large event bodies from
@@ -2993,7 +3081,7 @@ impl InProcessBackend {
         let accumulated_feed_bytes = prior_feed_bytes.saturating_add(pending_feed_bytes);
         let prune_feed =
             should_prune_worker_feed(sequence, last_pruned, prior_feed_bytes, pending_feed_bytes);
-        let session = self.sessions()?.get(state.session_id)?;
+        let session = self.sessions()?.get(session_id)?;
         let session_next_sequence = self.sessions()?.next_sequence();
         let checkpoint_result = persistence.save_run_checkpoint(DurableRunCheckpointWrite {
             session: &session,
@@ -3002,9 +3090,10 @@ impl InProcessBackend {
             summary: &summary,
             runtime_config: &runtime_config,
             context_checkpoint: context_checkpoint.as_ref(),
-            plan: &state.plan,
+            plan: &plan,
             messages: &messages,
-            activities: &activities,
+            activities: &[],
+            activity_deltas: Some(&activities),
             filesystem: filesystem.as_ref(),
             feed: &feed,
         });
@@ -3020,10 +3109,22 @@ impl InProcessBackend {
             self.feed_bytes_since_prune
                 .store(accumulated_feed_bytes, Ordering::Relaxed);
         }
-        journal.pending_events.drain(..event_count);
-        journal
-            .pending_workspace_events
-            .drain(..workspace_event_count);
+        if !activities.is_empty() {
+            let mut pending = handle
+                .activity_deltas
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for activity in &activities {
+                if pending.by_id.get(&activity.id) == Some(activity) {
+                    pending.by_id.remove(&activity.id);
+                }
+            }
+            let still_pending = pending.by_id.keys().copied().collect::<BTreeSet<_>>();
+            pending
+                .appended_order
+                .retain(|activity_id| still_pending.contains(activity_id));
+        }
+        journal.acknowledge_session_feed(&captured_event_sequences);
         Ok(())
     }
 
@@ -3435,6 +3536,14 @@ impl InProcessBackend {
                 return;
             };
             let handle = handle.upgrade();
+            // Keep journal append and cached-state/dirty-activity application
+            // indivisible relative to a durable worker checkpoint.
+            let _event_guard = handle.as_ref().map(|handle| {
+                handle
+                    .event_gate
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+            });
             let fragment_result = match (event, backend.persistence.as_ref(), handle.as_ref()) {
                 (
                     AgentEvent::AssistantMessageDelta { text, .. },
@@ -3448,7 +3557,7 @@ impl InProcessBackend {
             };
             let recorded = fragment_result
                 .and_then(|()| backend.record_agent_event(session_id, event.clone()));
-            if let Some(handle) = handle {
+            if let Some(handle) = handle.as_ref() {
                 handle.apply_event(event);
                 if let Err(error) = recorded {
                     handle.record_failure(error);
@@ -7009,6 +7118,63 @@ mod tests {
                 .filter(|event| event.session_id == first_session)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn worker_feed_capture_and_acknowledgement_are_session_scoped() {
+        let run_session = AgentSessionId::new();
+        let other_session = AgentSessionId::new();
+        let workspace_id = WorkspaceId::new();
+        let mut journal = EventJournal::default();
+        for (session_id, name) in [(run_session, "run"), (other_session, "other")] {
+            journal.append_session(SessionEventRecord {
+                sequence: EventSequence::default(),
+                session_id,
+                occurred_at: Timestamp::from_unix_millis(1),
+                event: loom_core::SessionEvent::AgentSessionRenamed {
+                    session_id,
+                    name: name.to_owned(),
+                },
+            });
+        }
+        journal.append_workspace(
+            workspace_id,
+            WorkspaceEvent::Renamed {
+                name: "workspace".to_owned(),
+            },
+        );
+
+        let (captured_feed, captured_sequences) = journal.capture_session_feed(run_session);
+        assert_eq!(captured_feed.events.len(), 1);
+        assert_eq!(captured_feed.events[0].session_id, run_session);
+        assert!(captured_feed.workspace_events.is_empty());
+
+        // Capture is non-mutating; a failed persistence call can retry the
+        // same capture because acknowledgement is a separate post-commit step.
+        assert_eq!(journal.pending_events.len(), 2);
+        assert!(
+            journal
+                .pending_events
+                .iter()
+                .any(|event| event.session_id == run_session)
+        );
+        assert!(
+            journal
+                .pending_events
+                .iter()
+                .any(|event| event.session_id == other_session)
+        );
+        assert_eq!(journal.pending_workspace_events.len(), 1);
+
+        // After commit, only the captured session sequences are acknowledged.
+        journal.acknowledge_session_feed(&captured_sequences);
+        assert_eq!(journal.pending_events.len(), 1);
+        assert_eq!(journal.pending_events[0].session_id, other_session);
+        assert_eq!(journal.pending_workspace_events.len(), 1);
+        assert_eq!(
+            journal.pending_workspace_events[0].workspace_id,
+            workspace_id
         );
     }
 

@@ -1248,6 +1248,9 @@ pub struct DurableRunCheckpointWrite<'a> {
     pub plan: &'a AgentPlan,
     pub messages: &'a [DurableRunMessage],
     pub activities: &'a [AgentActivityRecord],
+    /// Activity rows changed since the previous successful worker checkpoint.
+    /// When present, these are upserted without enumerating or pruning history.
+    pub activity_deltas: Option<&'a [AgentActivityRecord]>,
     pub filesystem: Option<&'a DurableFilesystemRecord>,
     pub feed: &'a DurableFeedState,
 }
@@ -5158,8 +5161,12 @@ impl FilePersistence {
         save_run_runtime_config_rows(&transaction, &runtime_configs)?;
         save_run_context_checkpoint_rows(&transaction, &context_checkpoints)?;
         save_run_plan_rows(&transaction, &plans, Some(&summaries))?;
-        save_run_activity_rows(&transaction, &activities)?;
-        save_run_tool_rows(&transaction, &activities, Some(&summaries))?;
+        if let Some(activity_deltas) = write.activity_deltas {
+            save_run_activity_deltas(&transaction, run_id, activity_deltas, &summaries)?;
+        } else {
+            save_run_activity_rows(&transaction, &activities)?;
+            save_run_tool_rows(&transaction, &activities, Some(&summaries))?;
+        }
         save_run_message_rows(&transaction, &messages)?;
         if let Some(filesystem) = write.filesystem {
             save_filesystem_records(&transaction, std::slice::from_ref(filesystem))?;
@@ -8288,6 +8295,253 @@ fn save_run_activity_rows(
     collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
 }
 
+/// Persist only worker-reported activity changes. Existing activity ordinals
+/// are recovered by stable ID; new activities receive the next ordinal. This
+/// path deliberately does not stage or prune the run's complete activity set.
+fn save_run_activity_deltas(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    activities: &[AgentActivityRecord],
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    let run_id_bytes = run_id.as_uuid().as_bytes();
+    let session_id: Vec<u8> = transaction
+        .query_row(
+            "SELECT session_id FROM run_summaries WHERE run_id=?1",
+            [run_id_bytes.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("run {run_id} has no durable summary for activity changes: {error}"),
+                true,
+            )
+        })?;
+    let mut seen = BTreeSet::new();
+    for activity in activities {
+        if activity.run_id != run_id || !seen.insert(activity.id) {
+            return Err(LoomError::invalid_request(
+                "activity deltas must have unique IDs matching their run",
+            ));
+        }
+        if activity.kind != activity_data_kind(&activity.data) {
+            return Err(LoomError::invalid_request(
+                "run activity kind does not match its data",
+            ));
+        }
+        let activity_id = activity.id.as_uuid().as_bytes();
+        let existing: Option<i64> = transaction
+            .query_row(
+                "SELECT ordinal FROM run_activities WHERE run_id=?1 AND activity_id=?2",
+                params![run_id_bytes.as_slice(), activity_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not read activity ordinal: {error}"), true)
+            })?;
+        let ordinal = if let Some(ordinal) = existing {
+            ordinal
+        } else {
+            transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM run_activities WHERE run_id=?1",
+                    [run_id_bytes.as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not allocate activity ordinal: {error}"),
+                        true,
+                    )
+                })?
+        };
+        let normalized_data = normalize_activity_tool_data(&activity.data);
+        let data = serde_json::to_vec(&normalized_data).map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not encode run activity data: {error}"),
+                false,
+            )
+        })?;
+        let data_hash = store_content(transaction, &data)?;
+        let parent_activity_id = activity
+            .parent_id
+            .map(|id| id.as_uuid().as_bytes().to_vec());
+        let step_id = activity.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
+        let tool_call_id =
+            activity_data_tool_call_id(&activity.data).map(|id| id.as_uuid().as_bytes().to_vec());
+        let started_at = i64::try_from(activity.started_at.as_unix_millis())
+            .map_err(|_| LoomError::invalid_request("activity start time is out of range"))?;
+        let completed_at = activity
+            .completed_at
+            .map(|time| {
+                i64::try_from(time.as_unix_millis())
+                    .map_err(|_| LoomError::invalid_request("activity end time is out of range"))
+            })
+            .transpose()?;
+        let elapsed_ms = activity
+            .elapsed_ms
+            .map(|elapsed| {
+                i64::try_from(elapsed)
+                    .map_err(|_| LoomError::invalid_request("activity duration is out of range"))
+            })
+            .transpose()?;
+        transaction.execute(
+            "INSERT INTO run_activities(
+                run_id, session_id, activity_id, ordinal, parent_activity_id,
+                step_id, tool_call_id, kind, status, started_at, completed_at,
+                elapsed_ms, data_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(run_id, activity_id) DO UPDATE SET
+                parent_activity_id=excluded.parent_activity_id, step_id=excluded.step_id,
+                tool_call_id=excluded.tool_call_id, kind=excluded.kind, status=excluded.status,
+                started_at=excluded.started_at, completed_at=excluded.completed_at,
+                elapsed_ms=excluded.elapsed_ms, data_hash=excluded.data_hash
+             WHERE run_activities.parent_activity_id IS NOT excluded.parent_activity_id
+                OR run_activities.step_id IS NOT excluded.step_id
+                OR run_activities.tool_call_id IS NOT excluded.tool_call_id
+                OR run_activities.kind IS NOT excluded.kind OR run_activities.status IS NOT excluded.status
+                OR run_activities.started_at IS NOT excluded.started_at
+                OR run_activities.completed_at IS NOT excluded.completed_at
+                OR run_activities.elapsed_ms IS NOT excluded.elapsed_ms
+                OR run_activities.data_hash IS NOT excluded.data_hash",
+            params![run_id_bytes.as_slice(), session_id.as_slice(), activity_id, ordinal,
+                parent_activity_id.as_deref(), step_id.as_deref(), tool_call_id.as_deref(),
+                activity_kind_name(activity.kind), activity_status_name(activity.status),
+                started_at, completed_at, elapsed_ms, data_hash],
+        ).map_err(|error| persistence_error(format!("could not save activity delta: {error}"), true))?;
+        if let Some((call, result)) = activity_tool_data(&activity.data) {
+            save_run_tool_activity_delta(
+                transaction,
+                run_id,
+                &session_id,
+                activity,
+                call,
+                result,
+                summaries
+                    .get(&run_id)
+                    .and_then(|summary| summary.execution_state.as_ref()),
+            )?;
+        }
+    }
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+}
+
+fn save_run_tool_activity_delta(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    session_id: &[u8],
+    activity: &AgentActivityRecord,
+    call: &loom_model::ToolCall,
+    result: Option<&ToolResult>,
+    execution: Option<&AgentExecutionStateRecord>,
+) -> Result<()> {
+    let run_id_bytes = run_id.as_uuid().as_bytes();
+    let arguments = serde_json::to_vec(&call.arguments).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("could not encode tool-call arguments: {error}"),
+            false,
+        )
+    })?;
+    if call.name.len() > 4096 || arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+        return Err(LoomError::invalid_request(
+            "tool-call data exceeds the maximum supported size",
+        ));
+    }
+    let arguments_hash = store_content(transaction, &arguments)?;
+    let created_at = encode_timestamp(activity.started_at)?;
+    let call_id = call.id.as_uuid().as_bytes();
+    let existing: Option<(Vec<u8>, String, Vec<u8>)> = transaction.query_row(
+        "SELECT session_id, name, arguments_hash FROM run_tool_calls WHERE run_id=?1 AND tool_call_id=?2",
+        params![run_id_bytes.as_slice(), call_id.as_slice()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).optional().map_err(|error| persistence_error(format!("could not read logical tool call: {error}"), true))?;
+    if let Some((stored_session, stored_name, stored_hash)) = existing {
+        if stored_session != session_id || stored_name != call.name || stored_hash != arguments_hash
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted logical tool call is immutable",
+                false,
+            ));
+        }
+    } else {
+        transaction.execute(
+            "INSERT INTO run_tool_calls(run_id,session_id,tool_call_id,name,arguments_hash,created_at)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![run_id_bytes.as_slice(), session_id, call_id.as_slice(), call.name, arguments_hash, created_at],
+        ).map_err(|error| persistence_error(format!("could not save logical tool call: {error}"), true))?;
+    }
+    let activity_id = activity.id.as_uuid().as_bytes();
+    let attempt_number: i64 = if let Some(existing) = transaction
+        .query_row(
+            "SELECT attempt_number FROM run_tool_attempts WHERE run_id=?1 AND activity_id=?2",
+            params![run_id_bytes.as_slice(), activity_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(format!("could not read tool attempt number: {error}"), true)
+        })? {
+        existing
+    } else {
+        transaction.query_row(
+            "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM run_tool_attempts WHERE run_id=?1 AND tool_call_id=?2",
+            params![run_id_bytes.as_slice(), call_id.as_slice()], |row| row.get(0),
+        ).map_err(|error| persistence_error(format!("could not allocate tool attempt number: {error}"), true))?
+    };
+    let state = match activity.status {
+        AgentActivityStatus::Started
+            if execution
+                .and_then(|e| e.pending_tool_execution.as_ref())
+                .is_some_and(|pending| pending.id == call.id) =>
+        {
+            AgentToolAttemptState::Queued
+        }
+        AgentActivityStatus::Started
+            if execution
+                .and_then(|e| e.last_failed_call.as_ref())
+                .is_some_and(|failed| failed.id == call.id) =>
+        {
+            AgentToolAttemptState::OutcomeUnknown
+        }
+        AgentActivityStatus::Started => AgentToolAttemptState::Running,
+        AgentActivityStatus::Completed => AgentToolAttemptState::Completed,
+        AgentActivityStatus::Failed => AgentToolAttemptState::Failed,
+        AgentActivityStatus::AwaitingApproval => AgentToolAttemptState::AwaitingApproval,
+        AgentActivityStatus::AwaitingInput => AgentToolAttemptState::AwaitingInput,
+        AgentActivityStatus::Cancelled => AgentToolAttemptState::Cancelled,
+    };
+    let result_hash = result
+        .map(|result| {
+            let encoded = serde_json::to_vec(result).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("could not encode tool result: {error}"),
+                    false,
+                )
+            })?;
+            store_content(transaction, &encoded)
+        })
+        .transpose()?;
+    let started_at = encode_timestamp(activity.started_at)?;
+    let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
+    transaction.execute(
+        "INSERT INTO run_tool_attempts(run_id,session_id,activity_id,tool_call_id,attempt_number,state,started_at,completed_at,result_hash)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(run_id,activity_id) DO UPDATE SET state=excluded.state,
+            completed_at=excluded.completed_at,result_hash=excluded.result_hash
+         WHERE run_tool_attempts.state IS NOT excluded.state
+            OR run_tool_attempts.completed_at IS NOT excluded.completed_at
+            OR run_tool_attempts.result_hash IS NOT excluded.result_hash",
+        params![run_id_bytes.as_slice(), session_id, activity_id, call_id.as_slice(), attempt_number,
+            tool_attempt_state_name(state), started_at, completed_at, result_hash],
+    ).map_err(|error| persistence_error(format!("could not save tool attempt delta: {error}"), true))?;
+    Ok(())
+}
+
 fn activity_tool_data(
     data: &AgentActivityData,
 ) -> Option<(&loom_model::ToolCall, Option<&ToolResult>)> {
@@ -10347,6 +10601,27 @@ mod tests {
             (run_id, initial_summary.clone()),
             (other_run_id, other_summary.clone()),
         ]);
+        let activity_call = loom_model::ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+        };
+        let initial_activity = AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id,
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::ToolCall,
+            status: AgentActivityStatus::AwaitingApproval,
+            started_at: Timestamp::from_unix_millis(2),
+            completed_at: None,
+            elapsed_ms: None,
+            data: AgentActivityData::ToolCall {
+                call: activity_call.clone(),
+                result: None,
+            },
+        };
+        let initial_activities = BTreeMap::from([(run_id, vec![initial_activity.clone()])]);
         persistence
             .save_state(DurableStateWrite {
                 schema_version: CURRENT_SCHEMA_VERSION,
@@ -10362,7 +10637,7 @@ mod tests {
                 run_context_checkpoints: None,
                 run_plans: None,
                 run_messages: None,
-                run_activities: None,
+                run_activities: Some(&initial_activities),
                 filesystem_records: None,
                 records: &[],
                 feed: None,
@@ -10401,6 +10676,54 @@ mod tests {
             workspace_events: Vec::new(),
         };
         let plan = loom_protocol::AgentPlan { steps: Vec::new() };
+        let mut updated_activity = initial_activity.clone();
+        updated_activity.status = AgentActivityStatus::Completed;
+        updated_activity.completed_at = Some(Timestamp::from_unix_millis(3));
+        updated_activity.elapsed_ms = Some(1);
+        let activity_result = ToolResult {
+            tool_call_id: activity_call.id,
+            name: activity_call.name.clone(),
+            success: true,
+            output: "first attempt result".to_owned(),
+        };
+        updated_activity.data = AgentActivityData::ToolCall {
+            call: activity_call.clone(),
+            result: Some(activity_result.clone()),
+        };
+        let second_activity = AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id,
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::ToolCall,
+            status: AgentActivityStatus::Started,
+            started_at: Timestamp::from_unix_millis(4),
+            completed_at: None,
+            elapsed_ms: None,
+            data: AgentActivityData::ToolCall {
+                call: activity_call.clone(),
+                result: None,
+            },
+        };
+        let third_activity = AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id,
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::ModelTurn,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::from_unix_millis(5),
+            completed_at: Some(Timestamp::from_unix_millis(6)),
+            elapsed_ms: Some(1),
+            data: AgentActivityData::ModelTurn {
+                model: ModelId::new("deterministic-model"),
+            },
+        };
+        let activity_delta = vec![
+            updated_activity.clone(),
+            second_activity.clone(),
+            third_activity.clone(),
+        ];
         let invalid_checkpoint = DurableRunCheckpointWrite {
             session: &changed_session,
             session_next_sequence: EventSequence::new(1),
@@ -10411,6 +10734,7 @@ mod tests {
             plan: &plan,
             messages: &[],
             activities: &[],
+            activity_deltas: Some(&activity_delta),
             filesystem: None,
             feed: &invalid_feed,
         };
@@ -10437,6 +10761,16 @@ mod tests {
             other_summary,
             "a worker checkpoint must leave unrelated runs untouched"
         );
+        assert_eq!(
+            persistence.load_run_activities(run_id).unwrap(),
+            vec![initial_activity.clone()],
+            "feed failure must roll back activity updates and appends"
+        );
+        assert_eq!(
+            persistence.load_run_tool_attempts(run_id).unwrap()[0].attempt_number,
+            1,
+            "feed failure must roll back tool attempt updates"
+        );
 
         let valid_feed = DurableFeedState {
             next_sequence: EventSequence::new(1),
@@ -10461,12 +10795,35 @@ mod tests {
             plan: &plan,
             messages: &[],
             activities: &[],
+            activity_deltas: Some(&activity_delta),
             filesystem: None,
             feed: &valid_feed,
         };
         persistence.save_run_checkpoint(valid_checkpoint).unwrap();
         drop(persistence);
         let reopened = FilePersistence::open(&path).unwrap();
+        assert_eq!(
+            reopened.load_run_activities(run_id).unwrap(),
+            vec![updated_activity, second_activity, third_activity],
+            "activity update and append order must survive restart"
+        );
+        assert_eq!(
+            reopened
+                .load_run_tool_attempts(run_id)
+                .unwrap()
+                .iter()
+                .map(|attempt| attempt.attempt_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "per-activity writes must retain logical tool attempt order"
+        );
+        let attempts = reopened.load_run_tool_attempts(run_id).unwrap();
+        assert_eq!(attempts[0].result.as_ref(), Some(&activity_result));
+        assert_eq!(
+            reopened.load_run_tool_calls(run_id).unwrap().len(),
+            1,
+            "adding a non-tool activity must not prune logical tool-call rows"
+        );
         assert_eq!(
             reopened
                 .load_sessions()
