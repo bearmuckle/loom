@@ -114,6 +114,32 @@ include project/root IDs, parent IDs, depth, task summaries, status, and
 per-agent output cursors. Protocol capability negotiation gates clients that
 do not understand orchestration.
 
+Project orchestration is an intentional client/backend compatibility boundary:
+Loom does not need to keep old clients working against a project-enabled
+backend. Before a client can use the project protocol, require it to upgrade to
+a release that understands the protocol version and project schemas; enforce
+this at negotiation/connection setup rather than relying only on the UI to
+hide new operations. Reject an outdated client with the existing
+`UnsupportedProtocol` error, including the required version in its message,
+before sending any new project capabilities or schemas. Do not send new
+capability values, request/response variants, or event variants to a client
+that has not passed that gate. Once admitted, capability checks still govern
+which project operations that client may use. This avoids requiring old-client
+forward compatibility while preserving an explicit rollout gate. The
+pre-feature version/error envelope must remain sufficient to deliver this
+rejection; do not add a new error enum value that an old client would need to
+decode.
+
+Advance the protocol version for the project contract. Prefer a major version
+change if the new required domain semantics or enum variants are not backward
+compatible; update all supported native/browser clients in the same release
+window. Keep the existing session request surface for root-session operations
+where practical, but clients admitted to the new protocol must treat roots as
+projects. Define the minimum client version and error/update path before
+enabling the backend feature. Backend downgrades to pre-project
+protocol/storage versions are unsupported, including when no child agents
+have been created.
+
 Persist normalized queryable records for project membership/parentage,
 delegated task intent and dependencies, message envelope/body and ordering,
 and worktree/integration state. Use foreign keys and transactions so child
@@ -121,6 +147,20 @@ creation with its initial task, and message acceptance with its event, are
 atomic. Enforce one root per project, same-project parentage, no cycles, and
 maximum depth three in the backend domain service and persistence boundary.
 Do not place growing messages or child lists inside session JSON blobs.
+
+The project foundation requires a forward SQLite migration from the current
+schema version 41 to version 42. In one migration transaction, add the
+normalized project, membership/parentage, delegated-task, addressed-message,
+and worktree/integration structures, then backfill each existing session as
+the root of a project while preserving its session ID, workspace, transcript,
+events, runs, approvals, and filesystem references. Existing session IDs
+remain stable; if project IDs are separate, assign them once and persist the
+mapping. Set `user_version` to 42 only after the backfill and invariants pass.
+Failure must roll back the migration so reopening can retry safely. Older
+schema versions remain unsupported according to the existing storage policy.
+This is a forward-only transition: a pre-v42 backend cannot open the migrated
+database, and no schema downgrade is provided. If an upgrade must be rolled
+back, restore a pre-upgrade backup or move forward with a fix.
 
 Child creation is idempotent and commits its session, task, project link, and
 initial event before execution is scheduled. A crash after commit but before
@@ -143,16 +183,20 @@ and its decision.
 1. Add project/agent hierarchy IDs, depth, delegated-task intent/status,
    message envelope/type, and worktree integration state to shared domain
    types. Define invariants and stable transition/error codes.
-2. Add transactional persistence and migrations for project roots, parentage,
-   task dependencies, addressed messages, and integration records. Represent
-   all existing sessions as roots in projects without children.
-3. Add capability-gated protocol snapshots, commands, and events, with
-   contract tests for ordering, idempotency, authorization, and depth limits.
+2. Add the forward v41-to-v42 transactional migration for project roots,
+   parentage, task dependencies, addressed messages, and integration records.
+   Represent all existing sessions as roots in projects without children.
+3. Advance the protocol contract and enforce the minimum client version at
+   negotiation/connection setup before serving project-aware schemas. Add
+   project snapshots, commands, and events with contract tests for ordering,
+   idempotency, authorization, and depth limits.
 4. Add recovery reconciliation for committed-but-not-launched children and
    interrupted child runs.
 
-**Exit:** existing sessions load as projects, hierarchy invariants are
-backend-enforced, and snapshots/events survive restart and reconnect.
+**Exit:** v41 data migrates to v42 with existing sessions represented as
+projects; unsupported clients are directed to upgrade before using the new
+contract; hierarchy invariants are backend-enforced; snapshots/events survive
+restart and reconnect. Backend downgrade is unsupported and documented.
 
 ### Slice 1: direct-child non-code coordination
 
