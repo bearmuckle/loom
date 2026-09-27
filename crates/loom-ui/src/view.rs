@@ -7216,6 +7216,7 @@ impl LoomView {
                 Select::new(state)
                     .id("session-model-select")
                     .w_full()
+                    .menu_width(px(320.))
                     .small()
                     .accessibility_label("Model for this session")
                     .placeholder("No model is configured")
