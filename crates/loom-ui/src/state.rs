@@ -222,9 +222,18 @@ pub(crate) fn upsert_activity(timeline: &mut Vec<TimelineItem>, activity: AgentA
             return;
         }
     }
-    timeline.push(TimelineItem::ActivitySection {
+    let section = TimelineItem::ActivitySection {
         activities: vec![activity],
-    });
+    };
+    // Transcript restoration loads messages separately from activity records.
+    // If the transcript is already present, the current run's activity belongs
+    // before its final assistant response, not after it.
+    let insertion_index = if matches!(timeline.last(), Some(TimelineItem::Assistant(_))) {
+        timeline.len() - 1
+    } else {
+        timeline.len()
+    };
+    timeline.insert(insertion_index, section);
 }
 
 pub(crate) fn activity_status_label(status: AgentActivityStatus) -> &'static str {
