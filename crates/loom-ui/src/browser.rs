@@ -285,6 +285,7 @@ fn fail_all(state: &Rc<RefCell<SocketState>>, reason: &str) {
 #[derive(Clone)]
 pub(crate) struct BrowserConnection {
     state: Rc<RefCell<SocketState>>,
+    secure_for_secrets: bool,
     // The socket's callbacks borrow these closures for their lifetime; they
     // must stay alive as long as the connection does.
     _on_open: Rc<Closure<dyn FnMut(web_sys::Event)>>,
@@ -362,11 +363,16 @@ impl BrowserConnection {
 
         Ok(Self {
             state,
+            secure_for_secrets: crate::connection::remote_url_is_secure_for_secrets(remote),
             _on_open: Rc::new(on_open),
             _on_message: Rc::new(on_message),
             _on_error: Rc::new(on_error),
             _on_close: Rc::new(on_close),
         })
+    }
+
+    pub(crate) fn secure_for_secrets(&self) -> bool {
+        self.secure_for_secrets
     }
 
     /// Sends a request and awaits its matching response. Requests issued

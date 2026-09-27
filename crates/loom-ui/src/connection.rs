@@ -56,17 +56,21 @@ pub(crate) fn redact_secret(value: &str, secret: &str) -> String {
         .replace(&encoded.to_ascii_lowercase(), "[redacted]")
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn remote_url_is_secure_for_secrets(url: &str) -> bool {
-    if url.starts_with("wss://") {
-        return true;
-    }
-    let Some(authority) = url
-        .strip_prefix("ws://")
-        .map(|url| url.split(['/', '?', '#']).next().unwrap_or_default())
-    else {
+pub(crate) fn remote_url_is_secure_for_secrets(url: &str) -> bool {
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("wss://") {
+        ("wss", rest)
+    } else if let Some(rest) = url.strip_prefix("ws://") {
+        ("ws", rest)
+    } else {
         return false;
     };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    if scheme == "wss" {
+        return true;
+    }
     let host = if let Some(bracketed_host) = authority.strip_prefix('[') {
         bracketed_host.split(']').next().unwrap_or_default()
     } else {
@@ -74,7 +78,10 @@ fn remote_url_is_secure_for_secrets(url: &str) -> bool {
             .rsplit_once(':')
             .map_or(authority, |(host, _)| host)
     };
-    matches!(host, "localhost" | "127.0.0.1" | "::1")
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -248,7 +255,7 @@ impl ClientConnection {
             #[cfg(target_family = "wasm")]
             Self::Disconnected => false,
             #[cfg(target_family = "wasm")]
-            Self::Browser(_) => false,
+            Self::Browser(connection) => connection.secure_for_secrets(),
         }
     }
 
@@ -1103,6 +1110,10 @@ mod tests {
         assert!(remote_url_is_secure_for_secrets("ws://127.0.0.1:8080/ws"));
         assert!(remote_url_is_secure_for_secrets("ws://[::1]:8080/ws"));
         assert!(!remote_url_is_secure_for_secrets("ws://worker.example/ws"));
+        assert!(!remote_url_is_secure_for_secrets(
+            "ws://user:pass@localhost/ws"
+        ));
+        assert!(!remote_url_is_secure_for_secrets("wss:///ws"));
     }
 
     #[test]

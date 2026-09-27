@@ -2035,14 +2035,21 @@ impl InProcessBackend {
     ) -> Result<Arc<Self>> {
         let descriptor = openai_compatible_descriptor(model.into());
         let credentials = github_copilot_credentials()?;
-        credentials.insert(CredentialRef::new("ui-openai-compatible"), api_key.into())?;
+        let api_key = api_key.into();
+        let credential = if api_key.trim().is_empty() {
+            None
+        } else {
+            let reference = CredentialRef::new("ui-openai-compatible");
+            credentials.insert(reference.clone(), api_key)?;
+            Some(reference)
+        };
         let providers = ProviderRegistry::with_credentials(credentials);
         providers.register(ProviderConfig::openai_compatible(
             "openai-compatible",
             "OpenAI-compatible model",
             endpoint,
             descriptor,
-            Some(CredentialRef::new("ui-openai-compatible")),
+            credential,
         ))?;
         providers.register(ProviderConfig::github_copilot(CredentialRef::new(
             GITHUB_COPILOT_CREDENTIAL_REF,
@@ -2104,6 +2111,11 @@ impl InProcessBackend {
         providers: ProviderRegistry,
         persistence: Option<FilePersistence>,
     ) -> Result<Arc<Self>> {
+        if let Some(persistence) = &persistence {
+            let credential_path = persistence.path().with_extension("credentials.json");
+            providers
+                .scope_api_key_credentials(Arc::new(FileCredentialStore::open(credential_path)?))?;
+        }
         let (node_id, node_name) = worker_node_identity();
         let session_root_base = persistence.as_ref().map_or_else(
             || {
@@ -2627,6 +2639,19 @@ impl InProcessBackend {
         let startup_started = Instant::now();
         let mut needs_persist = false;
         let Some(sessions) = persistence.load_sessions()? else {
+            let mut provider_configs = persistence.load_provider_configs()?;
+            let migrated = self
+                .providers
+                .migrate_api_key_credentials(&mut provider_configs)?;
+            self.providers.restore_configs(provider_configs)?;
+            self.providers
+                .restore_health(persistence.load_provider_health()?)?;
+            self.providers
+                .restore_usage(persistence.load_provider_usage()?)?;
+            *self.workspace_configs()? = persistence.load_workspace_configs()?;
+            if migrated {
+                self.persist_state()?;
+            }
             return Ok(());
         };
         let session_settings = persistence.load_session_settings()?;
@@ -2712,7 +2737,14 @@ impl InProcessBackend {
             let mut target = self.auto_approve_actions()?;
             *target = state.auto_approve_actions;
         }
-        self.providers.restore_configs(state.provider_configs)?;
+        let mut provider_configs = state.provider_configs;
+        if self
+            .providers
+            .migrate_api_key_credentials(&mut provider_configs)?
+        {
+            needs_persist = true;
+        }
+        self.providers.restore_configs(provider_configs)?;
         self.providers.restore_health(state.provider_health)?;
         self.providers.restore_usage(state.provider_usage)?;
         *self.workspace_configs()? = state.workspace_configs;
@@ -5791,6 +5823,19 @@ impl InProcessConnection {
                     .configure_github_copilot(access_token)?;
                 Ok(ServerResponse::ProviderConfigured)
             }
+            ClientRequest::ConfigureApiKeyProvider {
+                provider_id,
+                api_key,
+            } => {
+                self.backend
+                    .providers
+                    .configure_api_key_provider(&provider_id, api_key)?;
+                // Do not add this secret-bearing request to the durable
+                // idempotency journal. Persist only the resulting provider
+                // config, which contains an opaque credential reference.
+                self.backend.persist_state()?;
+                Ok(ServerResponse::ProviderConfigured)
+            }
             ClientRequest::StartGitHubCopilotLogin => self.start_github_copilot_login(),
             ClientRequest::GetGitHubCopilotLoginStatus { login_id } => {
                 self.github_copilot_login_status(&login_id)
@@ -6599,7 +6644,8 @@ impl InProcessConnection {
             | ClientRequest::GetGitHubCopilotLoginStatus { .. }
             | ClientRequest::DiscoverProviderModels { .. }
             | ClientRequest::GetProviderHealth { .. } => {}
-            ClientRequest::ConfigureGitHubCopilot { .. } => {}
+            ClientRequest::ConfigureGitHubCopilot { .. }
+            | ClientRequest::ConfigureApiKeyProvider { .. } => {}
         }
 
         if let ClientRequest::AttachSessionRepository { source, .. }
@@ -7011,9 +7057,145 @@ mod tests {
         AgentActivityStatus, AgentInteractionStatus, ApprovalDecision, ClientRequest,
         RequestEnvelope, ServerEvent, ServerResponse, WorkerNodeConfig, WorkspaceConfig,
     };
+    use loom_providers::CredentialStore;
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
     use super::*;
+
+    #[test]
+    fn api_key_provider_configuration_is_backend_scoped_and_recovers_without_persisting_the_secret_in_sqlite()
+     {
+        let root =
+            std::env::temp_dir().join(format!("loom-api-key-scope-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let first_path = root.join("first.sqlite");
+        let second_path = root.join("second.sqlite");
+        let secret = "backend-one-provider-secret";
+
+        let first = InProcessBackend::new_persistent(&first_path).unwrap();
+        let connection = first.connect();
+        negotiate_m3(&connection);
+        let response = connection.request(RequestEnvelope::new(
+            ClientRequest::ConfigureApiKeyProvider {
+                provider_id: ProviderId::new("openai-compatible"),
+                api_key: secret.to_owned(),
+            },
+        ));
+        assert!(matches!(
+            response.result,
+            Ok(ServerResponse::ProviderConfigured)
+        ));
+        let providers = first.provider_registry().list_providers().unwrap();
+        let configured = providers
+            .iter()
+            .find(|provider| provider.id.as_str() == "openai-compatible")
+            .unwrap();
+        assert!(
+            configured
+                .credential_id
+                .as_deref()
+                .unwrap()
+                .starts_with("api-key:")
+        );
+        drop(connection);
+        drop(first);
+
+        let credentials_path = first_path.with_extension("credentials.json");
+        let credential_bytes = fs::read(&credentials_path).unwrap();
+        assert!(
+            credential_bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+        );
+        let database_bytes = fs::read(&first_path).unwrap();
+        assert!(
+            !database_bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes())
+        );
+
+        let reopened = InProcessBackend::new_persistent(&first_path).unwrap();
+        let recovered = reopened
+            .provider_registry()
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id.as_str() == "openai-compatible")
+            .unwrap();
+        assert_eq!(recovered.credential_id, configured.credential_id);
+
+        let separate = InProcessBackend::new_persistent(&second_path).unwrap();
+        let separate_provider = separate
+            .provider_registry()
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id.as_str() == "openai-compatible")
+            .unwrap();
+        assert_eq!(separate_provider.credential_id, None);
+
+        drop(reopened);
+        drop(separate);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_a_backend_migrates_legacy_openai_keys_to_its_scoped_store() {
+        let root =
+            std::env::temp_dir().join(format!("loom-legacy-provider-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let database = root.join("backend.sqlite");
+        let legacy_path = root.join("legacy-credentials.json");
+        let legacy_store = Arc::new(FileCredentialStore::open(&legacy_path).unwrap());
+        let legacy_reference = CredentialRef::new("legacy-openai-key");
+        let secret = "previously-stored-api-key";
+        legacy_store
+            .insert(legacy_reference.clone(), secret)
+            .unwrap();
+
+        let make_registry = || {
+            let registry = ProviderRegistry::with_credentials(legacy_store.clone());
+            registry
+                .register(ProviderConfig::openai_compatible(
+                    "openai-compatible",
+                    "OpenAI-compatible model",
+                    "http://127.0.0.1:8000/v1/chat/completions",
+                    openai_compatible_descriptor(ModelId::new("gateway/model")),
+                    Some(legacy_reference.clone()),
+                ))
+                .unwrap();
+            registry
+        };
+
+        let original =
+            InProcessBackend::with_provider_registry_persistent(make_registry(), &database)
+                .unwrap();
+        original.persist_state().unwrap();
+        drop(original);
+
+        let reopened =
+            InProcessBackend::with_provider_registry_persistent(make_registry(), &database)
+                .unwrap();
+        let provider = reopened
+            .provider_registry()
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id.as_str() == "openai-compatible")
+            .unwrap();
+        assert!(
+            provider
+                .credential_id
+                .as_deref()
+                .is_some_and(|reference| reference.starts_with("api-key:"))
+        );
+        let scoped_path = database.with_extension("credentials.json");
+        let scoped_contents = fs::read_to_string(&scoped_path).unwrap();
+        assert!(scoped_contents.contains(secret));
+        assert_eq!(legacy_store.resolve(&legacy_reference).unwrap(), secret);
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn worker_feed_pruning_threshold_catches_large_payloads_before_count_limit() {

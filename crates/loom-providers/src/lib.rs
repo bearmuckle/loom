@@ -535,6 +535,7 @@ impl UsageLedger {
 pub struct ProviderRegistry {
     configurations: Arc<Mutex<BTreeMap<ProviderId, ProviderConfig>>>,
     credentials: Arc<dyn CredentialStore>,
+    api_key_credentials: Arc<Mutex<Option<Arc<dyn CredentialStore>>>>,
     health: Arc<Mutex<BTreeMap<ProviderId, ProviderHealth>>>,
     usage: Arc<Mutex<UsageLedger>>,
 }
@@ -566,9 +567,71 @@ impl ProviderRegistry {
         Self {
             configurations: Arc::new(Mutex::new(BTreeMap::new())),
             credentials,
+            api_key_credentials: Arc::new(Mutex::new(None)),
             health: Arc::new(Mutex::new(BTreeMap::new())),
             usage: Arc::new(Mutex::new(UsageLedger::default())),
         }
+    }
+
+    /// Scope newly entered API keys to one backend installation while keeping
+    /// legacy and provider-specific credentials in their existing store.
+    pub fn scope_api_key_credentials(&self, credentials: Arc<dyn CredentialStore>) -> Result<()> {
+        *self
+            .api_key_credentials
+            .lock()
+            .map_err(|_| internal_lock_error("API-key credential store"))? = Some(credentials);
+        Ok(())
+    }
+
+    fn resolve_credential(&self, reference: &CredentialRef) -> Result<String> {
+        if reference.as_str().starts_with("api-key:")
+            && let Some(credentials) = self
+                .api_key_credentials
+                .lock()
+                .map_err(|_| internal_lock_error("API-key credential store"))?
+                .as_ref()
+        {
+            return credentials.resolve(reference);
+        }
+        self.credentials.resolve(reference)
+    }
+
+    /// Migrate resolvable legacy OpenAI-compatible credentials into this
+    /// backend's scoped store. The legacy entry remains in place so another
+    /// backend that has not been opened yet can migrate its own saved config.
+    pub fn migrate_api_key_credentials(&self, configs: &mut [ProviderConfig]) -> Result<bool> {
+        let Some(scoped_store) = self
+            .api_key_credentials
+            .lock()
+            .map_err(|_| internal_lock_error("API-key credential store"))?
+            .clone()
+        else {
+            return Ok(false);
+        };
+        let mut migrated = false;
+        for config in configs {
+            if config.kind != ProviderKind::OpenAiCompatible {
+                continue;
+            }
+            let Some(reference) = config.credential.as_ref() else {
+                continue;
+            };
+            if reference.as_str().starts_with("api-key:") {
+                continue;
+            }
+            let Ok(secret) = self.credentials.resolve(reference) else {
+                continue;
+            };
+            let scoped_reference = CredentialRef::new(format!(
+                "api-key:{}:{}",
+                config.id.as_str(),
+                loom_core::RequestId::new()
+            ));
+            scoped_store.store(&scoped_reference, secret)?;
+            config.credential = Some(scoped_reference);
+            migrated = true;
+        }
+        Ok(migrated)
     }
 
     pub fn demo() -> Self {
@@ -716,6 +779,47 @@ impl ProviderRegistry {
         self.register(ProviderConfig::github_copilot(credential))
     }
 
+    /// Attach a user supplied API key to an already registered API-key provider.
+    /// Each setup gets a new opaque credential reference, so separate backend
+    /// registries never share ownership through a predictable global key name.
+    pub fn configure_api_key_provider(
+        &self,
+        provider_id: &ProviderId,
+        api_key: String,
+    ) -> Result<()> {
+        if api_key.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "provider API key must not be empty",
+            ));
+        }
+        let mut configurations = self
+            .configurations
+            .lock()
+            .map_err(|_| internal_lock_error("provider configuration"))?;
+        let config = configurations
+            .get_mut(provider_id)
+            .ok_or_else(|| LoomError::not_found("provider", provider_id.as_str()))?;
+        if config.kind != ProviderKind::OpenAiCompatible {
+            return Err(LoomError::invalid_request(
+                "API keys can only be configured for API-key providers",
+            ));
+        }
+        let reference = CredentialRef::new(format!(
+            "api-key:{}:{}",
+            provider_id.as_str(),
+            loom_core::RequestId::new()
+        ));
+        let credentials = self
+            .api_key_credentials
+            .lock()
+            .map_err(|_| internal_lock_error("API-key credential store"))?
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.credentials));
+        credentials.store(&reference, api_key)?;
+        config.credential = Some(reference);
+        Ok(())
+    }
+
     /// Resolves the GitHub account token used by Copilot and repository
     /// browsing. Callers must keep this token backend-only.
     pub fn github_account_token(&self) -> Result<String> {
@@ -768,6 +872,7 @@ impl ProviderRegistry {
                     .credential
                     .as_ref()
                     .map(|reference| reference.as_str().to_owned()),
+                api_key_configurable: config.kind == ProviderKind::OpenAiCompatible,
                 health: health.get(&config.id).cloned().unwrap_or_default(),
             })
             .collect())
@@ -789,7 +894,7 @@ impl ProviderRegistry {
         config
             .credential
             .as_ref()
-            .is_none_or(|reference| self.credentials.resolve(reference).is_ok())
+            .is_none_or(|reference| self.resolve_credential(reference).is_ok())
     }
 
     pub fn models(&self) -> Result<Vec<ModelDescriptor>> {
@@ -827,7 +932,7 @@ impl ProviderRegistry {
         let credential = config
             .credential
             .as_ref()
-            .map(|reference| self.credentials.resolve(reference))
+            .map(|reference| self.resolve_credential(reference))
             .transpose()?
             .unwrap_or_default();
         // Credentials are attached only to the backend request.
@@ -1006,7 +1111,7 @@ impl ProviderRegistry {
                 let secret = config
                     .credential
                     .as_ref()
-                    .map(|reference| self.credentials.resolve(reference))
+                    .map(|reference| self.resolve_credential(reference))
                     .transpose()?
                     .unwrap_or_default();
                 Box::new(OpenAiCompatibleProvider::with_descriptor(
@@ -1115,16 +1220,31 @@ impl ProviderRegistry {
                 if config.kind == ProviderKind::GitHubCopilot && config.models.len() <= 1 {
                     continue;
                 }
-                if config.kind != ProviderKind::GitHubCopilot {
+                if config.kind != current.kind {
                     continue;
                 }
-                if current.credential != config.credential {
+                if config.kind != ProviderKind::GitHubCopilot
+                    && (config.kind != ProviderKind::OpenAiCompatible
+                        || config.credential.is_none())
+                {
+                    continue;
+                }
+                if config.kind == ProviderKind::GitHubCopilot
+                    && current.credential != config.credential
+                {
+                    continue;
+                }
+                if config
+                    .credential
+                    .as_ref()
+                    .is_some_and(|reference| self.resolve_credential(reference).is_err())
+                {
                     continue;
                 }
             } else if config
                 .credential
                 .as_ref()
-                .is_none_or(|reference| self.credentials.resolve(reference).is_err())
+                .is_none_or(|reference| self.resolve_credential(reference).is_err())
             {
                 continue;
             }
@@ -3852,6 +3972,96 @@ mod tests {
                 .any(|model| model.id.as_str() == "untrusted/saved-model")
         );
         assert_eq!(registry.list_providers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_api_key_configs_migrate_to_separate_backend_credential_files() {
+        let root = std::env::temp_dir().join(format!(
+            "loom-credential-migration-{}",
+            loom_core::RequestId::new()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let legacy_path = root.join("legacy.json");
+        let shared = Arc::new(FileCredentialStore::open(&legacy_path).unwrap());
+        let old_reference = CredentialRef::new("legacy-openai-key");
+        shared
+            .store(&old_reference, "legacy-secret-value".to_owned())
+            .unwrap();
+
+        let make_registry = || {
+            let registry = ProviderRegistry::with_credentials(shared.clone());
+            let provider_id = ProviderId::new("openai-compatible");
+            registry
+                .register(ProviderConfig::openai_compatible(
+                    provider_id.clone(),
+                    "OpenAI-compatible",
+                    "http://127.0.0.1:8000/v1/chat/completions",
+                    ModelDescriptor {
+                        id: ModelId::new("openai-compatible/model"),
+                        provider: provider_id,
+                        display_name: "Model".to_owned(),
+                        context_window: None,
+                        capabilities: ModelCapabilities::default(),
+                    },
+                    Some(old_reference.clone()),
+                ))
+                .unwrap();
+            registry
+        };
+        let first = make_registry();
+        let second = make_registry();
+        let first_scoped =
+            Arc::new(FileCredentialStore::open(root.join("first.credentials.json")).unwrap());
+        let second_scoped =
+            Arc::new(FileCredentialStore::open(root.join("second.credentials.json")).unwrap());
+        first
+            .scope_api_key_credentials(first_scoped.clone())
+            .unwrap();
+        second
+            .scope_api_key_credentials(second_scoped.clone())
+            .unwrap();
+
+        let mut first_configs = first.export_configs().unwrap();
+        let mut second_configs = second.export_configs().unwrap();
+        assert!(
+            first
+                .migrate_api_key_credentials(&mut first_configs)
+                .unwrap()
+        );
+        assert!(
+            second
+                .migrate_api_key_credentials(&mut second_configs)
+                .unwrap()
+        );
+        first.restore_configs(first_configs).unwrap();
+        second.restore_configs(second_configs).unwrap();
+
+        let first_reference = first.list_providers().unwrap()[0]
+            .credential_id
+            .clone()
+            .unwrap();
+        let second_reference = second.list_providers().unwrap()[0]
+            .credential_id
+            .clone()
+            .unwrap();
+        assert_ne!(first_reference, second_reference);
+        assert_eq!(
+            first_scoped
+                .resolve(&CredentialRef::new(first_reference))
+                .unwrap(),
+            "legacy-secret-value"
+        );
+        assert_eq!(
+            second_scoped
+                .resolve(&CredentialRef::new(second_reference))
+                .unwrap(),
+            "legacy-secret-value"
+        );
+        assert_eq!(
+            shared.resolve(&old_reference).unwrap(),
+            "legacy-secret-value"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -275,6 +275,48 @@ async fn authorized_client_can_configure_copilot_on_remote_worker() {
 }
 
 #[tokio::test]
+async fn authorized_client_can_configure_api_key_provider_on_remote_worker() {
+    let (_backend, _auth, token, server) = server().await;
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut connection).await;
+
+    let secret = "remote-provider-key-must-stay-private";
+    let response = connection
+        .request(RequestEnvelope::new(
+            ClientRequest::ConfigureApiKeyProvider {
+                provider_id: loom_model::ProviderId::new("openai-compatible"),
+                api_key: secret.to_owned(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.result,
+        Ok(ServerResponse::ProviderConfigured)
+    ));
+    assert!(!format!("{response:?}").contains(secret));
+
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::ListProviders))
+        .await
+        .unwrap();
+    let Ok(ServerResponse::Providers { providers }) = response.result else {
+        panic!("unexpected provider response: {:?}", response.result);
+    };
+    let provider = providers
+        .iter()
+        .find(|provider| provider.id.as_str() == "openai-compatible")
+        .expect("OpenAI-compatible provider should be listed");
+    assert!(provider.api_key_configurable);
+    assert!(provider.credential_id.is_some());
+    assert!(!format!("{provider:?}").contains(secret));
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn provider_configuration_requires_its_dedicated_capability() {
     let (_backend, auth, _token, server) = server().await;
     let token = auth

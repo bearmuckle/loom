@@ -157,6 +157,21 @@ fn response_can_carry_model_list_without_provider_specific_types() {
 }
 
 #[test]
+fn older_provider_summaries_default_api_key_setup_to_unsupported() {
+    let health = serde_json::to_value(loom_model::ProviderHealth::default()).unwrap();
+    let summary: loom_model::ProviderSummary = serde_json::from_value(serde_json::json!({
+        "id": "openai-compatible",
+        "kind": "open_ai_compatible",
+        "display_name": "OpenAI-compatible",
+        "models": [],
+        "credential_id": null,
+        "health": health
+    }))
+    .unwrap();
+    assert!(!summary.api_key_configurable);
+}
+
+#[test]
 fn worker_status_response_round_trip_preserves_resource_samples() {
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),

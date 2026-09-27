@@ -215,6 +215,25 @@ Provider summaries contain provider/model IDs, capabilities, credential
 reference IDs, and health state, never raw credentials. Normalized provider
 authentication, rate-limit, invalid-response, and unavailable errors retain
 retryability without echoing response bodies or request headers.
+`ProviderSummary.api_key_configurable` is optional and defaults to false so
+new clients do not offer setup on older workers. `ConfigureApiKeyProvider`
+accepts a provider ID and API key for a registered API-key provider and returns
+only `ProviderConfigured`; the secret-bearing request is excluded from the
+durable idempotency journal. The client requires WSS for remote workers
+(loopback WS is allowed) before sending the key.
+
+Provider configuration remains in each backend's SQLite database. Newly
+entered API keys are stored in a sibling `<database-stem>.credentials.json`
+file, with owner-only permissions on Unix. The provider config stores only a
+random credential reference into that backend-specific file, so databases on
+the same host do not discover or reuse each other's new keys. Existing
+OpenAI-compatible configs that point into the legacy host credential file are
+migrated lazily when their backend opens: the key is copied into that
+backend's credential file and the SQLite config is updated. The old entry is
+retained so another existing backend can migrate independently; existing
+provider-specific credentials such as GitHub Copilot remain in their current
+store.
+
 `ConfigureGitHubCopilot` accepts a GitHub device-flow access token only over an
 authenticated connection, stores it in the worker's credential store, and
 returns no credential material. It requires the separate `ConfigureProviders`
