@@ -4435,6 +4435,7 @@ impl LoomView {
             let insertion_index = self.transcript_insertion_index();
             self.timeline
                 .splice(insertion_index..insertion_index, page_items);
+            self.place_restored_activities_after_task();
         } else {
             let insertion_index = self.transcript_insertion_index();
             prepend_timeline_page(&mut self.timeline, page_items, insertion_index);
@@ -4455,6 +4456,33 @@ impl LoomView {
             index += 1;
         }
         index
+    }
+
+    fn place_restored_activities_after_task(&mut self) {
+        if !self
+            .timeline
+            .iter()
+            .any(|item| matches!(item, TimelineItem::User(_)))
+        {
+            return;
+        }
+        let mut activities = Vec::new();
+        self.timeline.retain(|item| {
+            if matches!(item, TimelineItem::ActivitySection { .. }) {
+                activities.push(item.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let insertion_index = self
+            .timeline
+            .iter()
+            .rposition(|item| matches!(item, TimelineItem::User(_)))
+            .expect("user message was checked above")
+            + 1;
+        self.timeline
+            .splice(insertion_index..insertion_index, activities);
     }
 
     pub(crate) fn ensure_session_task_message(&mut self, session_id: AgentSessionId) {
