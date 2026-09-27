@@ -11,6 +11,10 @@ rust-version.workspace = true
 name = "sqlite_scale"
 harness = false
 
+[[bench]]
+name = "checkpoint_delta"
+harness = false
+
 [dependencies]
 loom-core.workspace = true
 loom-model.workspace = true
