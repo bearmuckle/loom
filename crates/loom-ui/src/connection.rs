@@ -8,6 +8,7 @@
 //! shape so the UI (`view.rs`) never needs to know which transport it's
 //! using.
 
+use std::collections::BTreeMap;
 #[cfg(not(target_family = "wasm"))]
 use std::sync::{Arc, Mutex};
 
@@ -797,10 +798,10 @@ pub(crate) async fn attach_session_repository_async(
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub(crate) fn list_models(connection: &ClientConnection) -> Result<Vec<ModelId>, LoomError> {
+pub(crate) fn list_models(connection: &ClientConnection) -> Result<ModelCatalog, LoomError> {
     let response = connection.request(RequestEnvelope::new(ClientRequest::ListModels));
     match response.result? {
-        ServerResponse::Models { models } => Ok(models.into_iter().map(|model| model.id).collect()),
+        ServerResponse::Models { models } => Ok(model_catalog_from_descriptors(models)),
         response => Err(unexpected_response("model list", response)),
     }
 }
@@ -808,19 +809,61 @@ pub(crate) fn list_models(connection: &ClientConnection) -> Result<Vec<ModelId>,
 #[cfg(target_family = "wasm")]
 pub(crate) async fn list_models_async(
     connection: &ClientConnection,
-) -> Result<Vec<ModelId>, LoomError> {
+) -> Result<ModelCatalog, LoomError> {
     let response = connection
         .request(RequestEnvelope::new(ClientRequest::ListModels))
         .await;
     match response.result? {
-        ServerResponse::Models { models } => Ok(models.into_iter().map(|model| model.id).collect()),
+        ServerResponse::Models { models } => Ok(model_catalog_from_descriptors(models)),
         response => Err(unexpected_response("model list", response)),
     }
 }
 
 pub(crate) struct ModelCatalog {
     pub models: Vec<ModelId>,
+    pub provider_names: BTreeMap<ModelId, String>,
     pub discovery_errors: Vec<ModelDiscoveryError>,
+}
+
+fn model_catalog_from_descriptors(descriptors: Vec<loom_model::ModelDescriptor>) -> ModelCatalog {
+    let provider_names = descriptors
+        .iter()
+        .map(|descriptor| {
+            (
+                descriptor.id.clone(),
+                provider_name_for_id(descriptor.provider.as_str()),
+            )
+        })
+        .collect();
+    let models = descriptors
+        .into_iter()
+        .map(|descriptor| descriptor.id)
+        .collect();
+    ModelCatalog {
+        models,
+        provider_names,
+        discovery_errors: Vec::new(),
+    }
+}
+
+pub(crate) fn provider_name_for_id(provider_id: &str) -> String {
+    match provider_id {
+        "openai" => "OpenAI".to_owned(),
+        "github-copilot" => "GitHub Copilot".to_owned(),
+        "ollama" => "Ollama".to_owned(),
+        "deterministic" => "Demo".to_owned(),
+        provider_id => provider_id
+            .split(['-', '_'])
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
 }
 
 pub(crate) struct ModelDiscoveryError {
@@ -830,13 +873,18 @@ pub(crate) struct ModelDiscoveryError {
 
 fn include_discovered_models(
     provider_id: &str,
+    provider_name: &str,
     result: Result<ServerResponse, LoomError>,
     models: &mut Vec<ModelId>,
+    provider_names: &mut BTreeMap<ModelId, String>,
     discovery_errors: &mut Vec<ModelDiscoveryError>,
 ) {
     match result {
         Ok(ServerResponse::Models { models: discovered }) => {
-            models.extend(discovered.into_iter().map(|model| model.id))
+            for model in discovered {
+                provider_names.insert(model.id.clone(), provider_name.to_owned());
+                models.push(model.id);
+            }
         }
         Err(error) => discovery_errors.push(ModelDiscoveryError {
             provider_id: provider_id.to_owned(),
@@ -864,9 +912,19 @@ pub(crate) async fn list_models_from_backend(
         .iter()
         .flat_map(|provider| provider.models.iter().map(|model| model.id.clone()))
         .collect::<Vec<_>>();
+    let mut provider_names = providers
+        .iter()
+        .flat_map(|provider| {
+            provider
+                .models
+                .iter()
+                .map(|model| (model.id.clone(), provider.display_name.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut discovery_errors = Vec::new();
     for provider in providers {
         let provider_id = provider.id.as_str().to_owned();
+        let provider_name = provider.display_name;
         let response = backend
             .submit(RequestEnvelope::new(
                 ClientRequest::DiscoverProviderModels {
@@ -877,8 +935,10 @@ pub(crate) async fn list_models_from_backend(
             .await;
         include_discovered_models(
             &provider_id,
+            &provider_name,
             response.result,
             &mut models,
+            &mut provider_names,
             &mut discovery_errors,
         );
     }
@@ -886,6 +946,7 @@ pub(crate) async fn list_models_from_backend(
     models.dedup();
     Ok(ModelCatalog {
         models,
+        provider_names,
         discovery_errors,
     })
 }
@@ -1194,7 +1255,7 @@ mod tests {
             list_workspace_sessions(&connection, created.id).unwrap(),
             vec![session.clone()]
         );
-        assert!(!list_models(&connection).unwrap().is_empty());
+        assert!(!list_models(&connection).unwrap().models.is_empty());
         assert!(!list_provider_ids(&connection).unwrap().is_empty());
     }
 
@@ -1226,12 +1287,14 @@ mod tests {
 
         include_discovered_models(
             "ollama",
+            "Ollama",
             Err(LoomError::new(
                 ErrorCode::ProviderUnavailable,
                 "Ollama is unavailable",
                 true,
             )),
             &mut models,
+            &mut std::collections::BTreeMap::new(),
             &mut discovery_errors,
         );
 

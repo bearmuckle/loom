@@ -95,9 +95,12 @@ git config core.hooksPath .githooks
 The hook runs `cargo fmt --all -- --check`. CI also runs Clippy, tests, and
 build checks.
 
-Configure providers with `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and
-`LOOM_MODEL`, or enter an API key for a supported configured provider in the
-Providers dialog. API keys entered there are stored in a credential file next
+Configure the official OpenAI provider by entering an API key for the selected
+worker in the Providers dialog. OpenAI models can then be discovered and
+selected for agent runs. The default model is `gpt-6-luna`; override it with
+`LOOM_OPENAI_MODEL`. For an OpenAI-compatible gateway, configure
+`LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and `LOOM_MODEL`. API keys entered in
+the dialog are stored in a credential file next
 to that backend's SQLite database, separately for each backend installation.
 GitHub Copilot login is available in the UI. Treat provider credentials as
 sensitive; they are used by the backend, and backend state storage is not an
