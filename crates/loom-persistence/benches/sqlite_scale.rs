@@ -5,12 +5,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use loom_core::{AgentSessionId, RunAttemptId, RunId, Timestamp, UsageSnapshot, WorkspaceId};
+use loom_core::{
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, RunAttemptId, RunId,
+    Timestamp, UsageSnapshot, WorkspaceId,
+};
 use loom_model::ModelId;
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableRunSummary, DurableStateWrite, FilePersistence,
+    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableRunSummary, DurableStateWrite, FilePersistence,
 };
-use loom_protocol::{AgentRunSnapshot, AgentRunState};
+use loom_protocol::{
+    AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ServerEvent, ServerEventEnvelope,
+};
 use loom_session::SessionManager;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -73,6 +78,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let session_state = sessions.export_state();
+    let feed_sequence = u64::try_from(session_count)?;
+    let feed = DurableFeedState {
+        next_sequence: EventSequence::new(feed_sequence),
+        retention_limit: 4096,
+        events: session_ids
+            .iter()
+            .enumerate()
+            .map(
+                |(index, session_id)| -> Result<_, Box<dyn std::error::Error>> {
+                    let sequence = u64::try_from(index + 1)?;
+                    let snapshot = AgentSessionSnapshot {
+                        id: *session_id,
+                        workspace_id,
+                        name: format!("Session {index}"),
+                        state: AgentSessionState::Idle,
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    Ok(ServerEventEnvelope {
+                        protocol_version: CURRENT_PROTOCOL_VERSION,
+                        sequence: EventSequence::new(sequence),
+                        session_id: *session_id,
+                        event: ServerEvent::AgentSessionCreated { snapshot },
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     let persistence = FilePersistence::open(&path)?;
     let write_started = Instant::now();
     persistence.save_state(DurableStateWrite {
@@ -91,7 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_activities: None,
         filesystem_records: None,
         records: &[],
-        feed: None,
+        feed: Some(&feed),
         sections: &[],
     })?;
     let write_elapsed = write_started.elapsed();
@@ -99,15 +132,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(persistence);
 
     let mut startup_samples = Vec::with_capacity(5);
+    let mut feed_samples = Vec::with_capacity(5);
     for _ in 0..5 {
         let fresh_handle = FilePersistence::open(&path)?;
         let started = Instant::now();
         let loaded_sessions = fresh_handle.load_sessions()?.ok_or("missing sessions")?;
         let active_runs = fresh_handle.load_active_run_summaries()?;
-        black_box((loaded_sessions, active_runs));
         startup_samples.push(started.elapsed());
+        let feed_started = Instant::now();
+        let loaded_feed = fresh_handle.load_feed_state()?.ok_or("missing feed")?;
+        feed_samples.push(feed_started.elapsed());
+        black_box((loaded_sessions, active_runs, loaded_feed));
     }
     startup_samples.sort_unstable();
+    feed_samples.sort_unstable();
 
     let lookup_handle = FilePersistence::open(&path)?;
     let target_session = session_ids
@@ -125,12 +163,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = io::stdout().lock();
     writeln!(output, "storage scale benchmark")?;
     writeln!(output, "sessions: {session_count}; runs: {run_count}")?;
+    writeln!(output, "durable reconnect events: {}", feed.events.len())?;
     writeln!(output, "database bytes: {database_bytes}")?;
     writeln!(output, "one-transaction population: {}", fmt(write_elapsed))?;
     writeln!(
         output,
         "fresh-handle session+active-run load p50: {}",
         fmt(startup_samples[2])
+    )?;
+    writeln!(
+        output,
+        "fresh-handle reconnect feed load p50: {}",
+        fmt(feed_samples[2])
     )?;
     writeln!(
         output,
