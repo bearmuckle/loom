@@ -144,6 +144,28 @@ Sources: [server](../crates/loom-server/src/lib.rs), `restore_persisted`;
 [workspace](../crates/loom-workspace/src/lib.rs), `open`, `restore_state`,
 `snapshot`, and `collect_entries`; [UI startup](../crates/loom-ui/src/main.rs).
 
+## Indexed persistence scale harness
+
+`cargo bench -p loom-persistence --bench sqlite_scale --locked --offline`
+builds a clean database with 10,000 sessions and 10,000 typed run summaries,
+then reports transaction population time, fresh-handle session plus active-run
+summary loading, indexed per-session run lookup latency, and database size. Set
+`LOOM_SCALE_SESSIONS` and `LOOM_SCALE_RUNS` to vary the fixture. On this
+worktree, an optimized run produced:
+
+| Sessions / runs | Database size | Population | Fresh-handle catalog + active summary p50 | Per-session summary query p50 |
+| --- | ---: | ---: | ---: | ---: |
+| 10,000 / 10,000 | 8,409,088 bytes | 1,220 ms | 6.436 ms | 0.015 ms |
+| 20,000 / 20,000 | 16,449,536 bytes | 2,455 ms | 12.115 ms | 0.015 ms |
+
+This confirms the per-session indexed query stayed flat at these fixture sizes;
+loading the complete session catalog and active-run summaries grows with the
+number of rows, as expected. This fixture omits runtime payloads, transcripts,
+filesystem snapshots, reconnect feed history, and UI initialization, so it is a
+store component benchmark rather than a full startup result. The 100 MB / 10 GB
+acceptance targets and before/after comparison against the previous storage
+model remain to be measured.
+
 ## Saves scale with all retained history
 
 `persist_state` clones all runs and filesystem state, exports the other managers,
