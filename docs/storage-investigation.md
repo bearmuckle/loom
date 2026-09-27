@@ -134,8 +134,11 @@ Measurements distinguish database cost from filesystem cost:
 These are component measurements, not end-to-end UI startup timings. The harness
 does not include checkpoint validation, Git/provider setup, recovery persistence,
 or the remainder of UI initialization. It does not establish the exact cause of
-the reported multi-second launch time. Instrument those phases separately in
-the actual executable and record its build profile before claiming a full fix.
+the reported multi-second launch time. The server now logs catalog/feed load time
+and total restore time, including the count of resumable runs and filesystems left
+lazy. More granular recovery phases and actual UI initialization still need
+measurement in representative debug and optimized builds before claiming a full
+startup fix.
 
 Sources: [server](../crates/loom-server/src/lib.rs), `restore_persisted`;
 [workspace](../crates/loom-workspace/src/lib.rs), `open`, `restore_state`,

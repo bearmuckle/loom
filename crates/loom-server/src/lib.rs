@@ -2133,6 +2133,7 @@ impl InProcessBackend {
         let Some(persistence) = self.persistence.clone() else {
             return Ok(());
         };
+        let startup_started = Instant::now();
         let mut needs_persist = false;
         let Some(sessions) = persistence.load_sessions()? else {
             return Ok(());
@@ -2182,6 +2183,10 @@ impl InProcessBackend {
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?,
         };
+        log::info!(
+            "loaded persisted catalogs and bounded feeds in {} ms",
+            startup_started.elapsed().as_millis()
+        );
         let _: Vec<ModelDescriptor> = from_json(required("models")?)?;
         let sessions = SessionManager::from_state(state.sessions)?;
         {
@@ -2234,9 +2239,11 @@ impl InProcessBackend {
             self.persisted_session_filesystems()?.insert(session_id);
         }
 
+        let active_run_summaries = persistence.load_active_run_summaries()?;
+        let active_run_count = active_run_summaries.len();
         let mut run_summaries = BTreeMap::new();
         let mut restored_runs = BTreeMap::new();
-        for (run_id, summary) in persistence.load_active_run_summaries()? {
+        for (run_id, summary) in active_run_summaries {
             let snapshot = summary.snapshot;
             let evidence = snapshot.evidence.clone();
             let usage = summary.usage;
@@ -2336,6 +2343,13 @@ impl InProcessBackend {
         if needs_persist {
             self.persist_state()?;
         }
+        let lazy_filesystem_count = self.persisted_session_filesystems()?.len();
+        log::info!(
+            "restored {} resumable runs and left {} filesystem services lazy in {} ms total",
+            active_run_count,
+            lazy_filesystem_count,
+            startup_started.elapsed().as_millis()
+        );
         Ok(())
     }
 
