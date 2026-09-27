@@ -13,9 +13,9 @@ use loom_core::{
 };
 use loom_model::{MessageRole, ModelId};
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableRunActivities, DurableRunCheckpointWrite,
-    DurableRunMessage, DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
-    DurableStateWrite, FilePersistence,
+    DurableFeedState, DurableRunActivities, DurableRunCheckpointWrite, DurableRunMessage,
+    DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary, DurableStateWrite,
+    FilePersistence,
 };
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentPlan,
@@ -233,7 +233,6 @@ fn seed(
     let run_activities: DurableRunActivities =
         std::collections::BTreeMap::from([(run_id, activities.to_vec())]);
     FilePersistence::open(path)?.save_state(DurableStateWrite {
-        schema_version: CURRENT_SCHEMA_VERSION,
         sessions: &sessions.export_state(),
         workspaces: None,
         settings: None,
@@ -248,9 +247,7 @@ fn seed(
         run_messages: Some(&run_messages),
         run_activities: Some(&run_activities),
         filesystem_records: None,
-        records: &[],
         feed: None,
-        sections: &[],
     })?;
     Ok(())
 }

@@ -12,9 +12,9 @@ use loom_core::{
 };
 use loom_model::ModelId;
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedState, DurableFilesystemEdit, DurableFilesystemRecord,
-    DurableRunActivities, DurableRunMessage, DurableRunRuntimeConfig, DurableRunSummary,
-    DurableStateWrite, FilePersistence,
+    DurableFeedState, DurableFilesystemEdit, DurableFilesystemRecord, DurableRunActivities,
+    DurableRunMessage, DurableRunRuntimeConfig, DurableRunSummary, DurableStateWrite,
+    FilePersistence,
 };
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
@@ -213,6 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )]),
             }],
             edits: vec![DurableFilesystemEdit {
+                id: 1,
                 path: path.clone(),
                 before: Some(content.clone()),
                 before_bytes: Some(content.as_bytes().to_vec()),
@@ -240,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 "fixture": "sparse-filesystem"
             }),
+            delta: None,
         });
     }
 
@@ -276,7 +278,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let persistence = FilePersistence::open(&path)?;
     let write_started = Instant::now();
     persistence.save_state(DurableStateWrite {
-        schema_version: CURRENT_SCHEMA_VERSION,
         sessions: &session_state,
         workspaces: None,
         settings: None,
@@ -291,9 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_messages: Some(&run_messages),
         run_activities: Some(&run_activities),
         filesystem_records: Some(&filesystem_records),
-        records: &[],
         feed: Some(&feed),
-        sections: &[],
     })?;
     let write_elapsed = write_started.elapsed();
     let database_bytes = fs::metadata(&path)?.len();

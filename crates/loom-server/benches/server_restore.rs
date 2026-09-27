@@ -6,8 +6,7 @@ use loom_core::{
 };
 use loom_model::ModelId;
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFilesystemRecord, DurableRunSummary, DurableStateWrite,
-    FilePersistence,
+    DurableFilesystemRecord, DurableRunSummary, DurableStateWrite, FilePersistence,
 };
 use loom_protocol::{
     AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile,
@@ -125,6 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "changes": []
                 }
             }),
+            delta: None,
         });
     }
 
@@ -132,7 +132,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_state = workspaces.export_state();
     let persistence = FilePersistence::open(&path)?;
     persistence.save_state(DurableStateWrite {
-        schema_version: CURRENT_SCHEMA_VERSION,
         sessions: &session_state,
         workspaces: Some(&workspace_state),
         settings: None,
@@ -147,9 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_messages: None,
         run_activities: None,
         filesystem_records: Some(&filesystem_records),
-        records: &[],
         feed: None,
-        sections: &[],
     })?;
     drop(persistence);
     let bytes = [path.clone(), path.with_extension("db-wal")]

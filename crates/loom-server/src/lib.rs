@@ -20,7 +20,7 @@ use loom_core::{
 };
 use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
 use loom_persistence::{
-    CURRENT_SCHEMA_VERSION, DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor,
+    DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor, DurableFilesystemDelta,
     DurableFilesystemEdit, DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
     DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
     DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
@@ -2314,6 +2314,7 @@ impl InProcessBackend {
         persisted.filesystem.edits = edits
             .into_iter()
             .map(|edit| loom_workspace::WorkspaceEditHistory {
+                id: edit.id,
                 path: edit.path,
                 before: edit.before,
                 before_bytes: edit.before_bytes,
@@ -2412,6 +2413,7 @@ impl InProcessBackend {
         persisted.filesystem.edits = edits
             .into_iter()
             .map(|edit| loom_workspace::WorkspaceEditHistory {
+                id: edit.id,
                 path: edit.path,
                 before: edit.before,
                 before_bytes: edit.before_bytes,
@@ -3057,12 +3059,15 @@ impl InProcessBackend {
         let (filesystem_record, filesystem_ack) = {
             let filesystem = self.session_filesystems()?.get(&session_id).cloned();
             if let Some(filesystem) = filesystem {
-                if let Some(versioned) = filesystem.export_state_if_dirty()? {
-                    let mut filesystem_state = versioned.state;
-                    let checkpoints = std::mem::take(&mut filesystem_state.checkpoints);
-                    let edits = std::mem::take(&mut filesystem_state.edits)
+                if let Some(versioned) = filesystem.export_delta_if_dirty()? {
+                    let workspace_delta = versioned.delta;
+                    let filesystem_state = versioned.state;
+                    let checkpoints = workspace_delta.checkpoints;
+                    let edits = workspace_delta
+                        .edits
                         .into_iter()
                         .map(|edit| DurableFilesystemEdit {
+                            id: edit.id,
                             path: edit.path,
                             before: edit.before,
                             before_bytes: edit.before_bytes,
@@ -3070,7 +3075,10 @@ impl InProcessBackend {
                             source: edit.source,
                         })
                         .collect();
-                    let changes = std::mem::take(&mut filesystem_state.changes);
+                    let changes = workspace_delta.changes;
+                    let deleted_checkpoints = workspace_delta.deleted_checkpoints;
+                    let deleted_edits = workspace_delta.deleted_edits;
+                    let deleted_changes = workspace_delta.deleted_changes;
                     let directories = filesystem
                         .mounted_directories()?
                         .into_iter()
@@ -3100,6 +3108,11 @@ impl InProcessBackend {
                             repositories,
                             directories,
                             payload: json_value(persisted)?,
+                            delta: Some(DurableFilesystemDelta {
+                                deleted_checkpoints,
+                                deleted_edits,
+                                deleted_changes,
+                            }),
                         }),
                         Some((filesystem, versioned.generation)),
                     )
@@ -3309,14 +3322,17 @@ impl InProcessBackend {
         let mut filesystem_records = Vec::new();
         let mut filesystem_generations = Vec::new();
         for (session_id, filesystem) in self.session_filesystems()?.iter() {
-            let Some(versioned) = filesystem.export_state_if_dirty()? else {
+            let Some(versioned) = filesystem.export_delta_if_dirty()? else {
                 continue;
             };
-            let mut filesystem_state = versioned.state;
-            let checkpoints = std::mem::take(&mut filesystem_state.checkpoints);
-            let edits = std::mem::take(&mut filesystem_state.edits)
+            let workspace_delta = versioned.delta;
+            let filesystem_state = versioned.state;
+            let checkpoints = workspace_delta.checkpoints;
+            let edits = workspace_delta
+                .edits
                 .into_iter()
                 .map(|edit| DurableFilesystemEdit {
+                    id: edit.id,
                     path: edit.path,
                     before: edit.before,
                     before_bytes: edit.before_bytes,
@@ -3324,7 +3340,10 @@ impl InProcessBackend {
                     source: edit.source,
                 })
                 .collect();
-            let changes = std::mem::take(&mut filesystem_state.changes);
+            let changes = workspace_delta.changes;
+            let deleted_checkpoints = workspace_delta.deleted_checkpoints;
+            let deleted_edits = workspace_delta.deleted_edits;
+            let deleted_changes = workspace_delta.deleted_changes;
             let directories = filesystem
                 .mounted_directories()?
                 .into_iter()
@@ -3352,6 +3371,11 @@ impl InProcessBackend {
                 repositories,
                 directories,
                 payload: json_value(persisted)?,
+                delta: Some(DurableFilesystemDelta {
+                    deleted_checkpoints,
+                    deleted_edits,
+                    deleted_changes,
+                }),
             });
             filesystem_generations.push((filesystem.clone(), versioned.generation));
         }
@@ -3415,7 +3439,6 @@ impl InProcessBackend {
             ));
         }
         let result = persistence.save_state(DurableStateWrite {
-            schema_version: CURRENT_SCHEMA_VERSION,
             sessions: &sessions,
             workspaces: Some(&workspace_records),
             settings: Some(&session_settings),
@@ -3430,9 +3453,7 @@ impl InProcessBackend {
             run_messages: Some(&durable_run_messages),
             run_activities: Some(&durable_run_activities),
             filesystem_records: Some(&filesystem_records),
-            records: &[],
             feed: Some(&feed),
-            sections: &[],
         });
         if result.is_err() {
             self.persistence_failed.store(true, Ordering::SeqCst);
@@ -8128,6 +8149,25 @@ mod tests {
                 .unwrap()
                 .get(&session.id)
                 .unwrap()
+                .apply_edit(WorkspaceEdit {
+                    path: "repo/README.md".to_owned(),
+                    old_text: "persisted session edit".to_owned(),
+                    new_text: "temporary edit to undo".to_owned(),
+                    expected_revision: None,
+                })
+                .unwrap();
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&session.id)
+                .unwrap()
+                .undo_last_agent_edit()
+                .unwrap();
+            backend
+                .session_filesystems()
+                .unwrap()
+                .get(&session.id)
+                .unwrap()
                 .poll_changes()
                 .unwrap();
             backend.flush().unwrap();
@@ -8181,6 +8221,11 @@ mod tests {
             assert!(persisted_filesystem.edits.iter().any(|edit| {
                 edit.path == "repo/README.md" && edit.before.as_deref() == Some("source\n")
             }));
+            assert_eq!(
+                persisted_filesystem.edits.len(),
+                1,
+                "undone edit ID is deleted from durable history"
+            );
             assert!(
                 backend
                     .persistence
@@ -9404,16 +9449,6 @@ mod tests {
             await_settled_run(&connection, run_id);
             backend.flush().unwrap();
             let persisted = FilePersistence::open(&persistence).unwrap();
-            assert!(
-                persisted
-                    .load_section::<serde_json::Value>(
-                        &format!("run:{run_id}"),
-                        CURRENT_SCHEMA_VERSION
-                    )
-                    .unwrap()
-                    .is_none(),
-                "run runtime snapshots must not be stored in generic JSON sections"
-            );
             let runtime_config = persisted.load_run_runtime_config(run_id).unwrap().unwrap();
             assert_eq!(
                 runtime_config.system_instructions.as_deref(),
@@ -9897,7 +9932,6 @@ mod tests {
         let sessions = persistence_store.load_sessions().unwrap().unwrap();
         persistence_store
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &sessions,
                 workspaces: None,
                 settings: None,
@@ -9912,9 +9946,7 @@ mod tests {
                 run_messages: None,
                 run_activities: None,
                 filesystem_records: None,
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
         drop(persistence_store);

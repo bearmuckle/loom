@@ -33,9 +33,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-/// Incremented when the durable workspace-only reconnect event table was added.
-pub const CURRENT_SCHEMA_VERSION: u32 = 40;
-const DATABASE_SCHEMA_VERSION: u32 = 40;
+const DATABASE_SCHEMA_VERSION: u32 = 41;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;
@@ -378,13 +376,13 @@ CREATE TABLE IF NOT EXISTS filesystem_change_state (
 CREATE TABLE IF NOT EXISTS filesystem_edits (
     session_id BLOB NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
         CHECK(length(session_id) = 16),
-    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    edit_id INTEGER NOT NULL CHECK(edit_id > 0),
     path TEXT NOT NULL CHECK(length(path) > 0 AND length(path) <= 4096),
     before_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
         CHECK(before_hash IS NULL OR length(before_hash) = 32),
     after_revision TEXT NOT NULL CHECK(length(after_revision) <= 256),
     source TEXT NOT NULL CHECK(source IN ('agent', 'user')),
-    PRIMARY KEY(session_id, ordinal)
+    PRIMARY KEY(session_id, edit_id)
 ) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS filesystem_changes (
     session_id BLOB NOT NULL REFERENCES session_filesystems(session_id) ON DELETE CASCADE
@@ -532,10 +530,6 @@ CREATE TABLE IF NOT EXISTS feed_workspace_meta (
     latest_sequence INTEGER NOT NULL CHECK(latest_sequence >= first_sequence),
     pruned_through INTEGER NOT NULL CHECK(pruned_through >= 0)
 ) WITHOUT ROWID, STRICT;
-CREATE TABLE IF NOT EXISTS section_meta (
-    name TEXT PRIMARY KEY NOT NULL,
-    schema_version INTEGER NOT NULL
-) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS content_blobs (
     hash BLOB PRIMARY KEY NOT NULL CHECK(length(hash) = 32),
     raw_size INTEGER NOT NULL CHECK(raw_size > 0 AND raw_size <= 262144),
@@ -563,33 +557,12 @@ CREATE TABLE IF NOT EXISTS content_parts (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS content_parts_by_blob
     ON content_parts(blob_hash);
-CREATE TABLE IF NOT EXISTS state_nodes (
-    section TEXT NOT NULL REFERENCES section_meta(name) ON DELETE CASCADE,
-    path TEXT NOT NULL,
-    node_kind INTEGER NOT NULL CHECK(node_kind BETWEEN 0 AND 3),
-    scalar BLOB,
-    content_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT,
-    PRIMARY KEY(section, path),
-    CHECK((node_kind = 2 AND scalar IS NOT NULL AND content_hash IS NULL)
-       OR (node_kind = 3 AND scalar IS NULL AND content_hash IS NOT NULL)
-       OR (node_kind IN (0, 1) AND scalar IS NULL AND content_hash IS NULL))
-) WITHOUT ROWID, STRICT;
-CREATE INDEX IF NOT EXISTS state_nodes_by_section_kind
-    ON state_nodes(section, node_kind);
 CREATE TABLE IF NOT EXISTS content_gc_candidates (
     kind TEXT NOT NULL CHECK(kind IN ('object', 'blob')),
     hash BLOB NOT NULL CHECK(length(hash) = 32),
     PRIMARY KEY(kind, hash)
 ) WITHOUT ROWID, STRICT;
 
-CREATE TRIGGER IF NOT EXISTS gc_state_nodes_delete AFTER DELETE ON state_nodes
-WHEN OLD.content_hash IS NOT NULL BEGIN
-    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
-END;
-CREATE TRIGGER IF NOT EXISTS gc_state_nodes_update AFTER UPDATE OF content_hash ON state_nodes
-WHEN OLD.content_hash IS NOT NULL AND OLD.content_hash IS NOT NEW.content_hash BEGIN
-    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
-END;
 CREATE TRIGGER IF NOT EXISTS gc_checkpoint_files_delete AFTER DELETE ON checkpoint_files BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
 END;
@@ -703,73 +676,6 @@ CREATE TRIGGER IF NOT EXISTS gc_content_parts_update AFTER UPDATE ON content_par
         SELECT 'blob', OLD.blob_hash WHERE OLD.blob_hash IS NOT NEW.blob_hash;
 END;
 ";
-
-#[derive(Default)]
-struct RestoreNode {
-    kind: Option<i64>,
-    scalar: Option<Vec<u8>>,
-    content_hash: Option<Vec<u8>>,
-    children: BTreeMap<String, RestoreNode>,
-}
-
-fn child_path(parent: &str, segment: &str) -> String {
-    if parent.is_empty() {
-        format!("/{segment}")
-    } else {
-        format!("{parent}/{segment}")
-    }
-}
-
-fn object_segment(key: &str) -> String {
-    format!("k{}", key.replace('~', "~0").replace('/', "~1"))
-}
-
-fn array_segment(index: usize) -> String {
-    format!("a{index}")
-}
-
-fn insert_restore_node(
-    root: &mut RestoreNode,
-    path: &str,
-    kind: i64,
-    scalar: Option<Vec<u8>>,
-    content_hash: Option<Vec<u8>>,
-) -> Result<()> {
-    let mut current = root;
-    if !path.is_empty() {
-        for segment in path.trim_start_matches('/').split('/') {
-            current = current.children.entry(segment.to_owned()).or_default();
-        }
-    }
-    if current.kind.replace(kind).is_some() || !current.children.is_empty() {
-        return Err(LoomError::new(
-            ErrorCode::MalformedPayload,
-            "persistence contains duplicate or inconsistent state paths",
-            false,
-        ));
-    }
-    current.scalar = scalar;
-    current.content_hash = content_hash;
-    Ok(())
-}
-
-fn unescape_object_segment(segment: &str) -> Option<String> {
-    let segment = segment.strip_prefix('k')?;
-    let mut decoded = String::with_capacity(segment.len());
-    let mut chars = segment.chars();
-    while let Some(character) = chars.next() {
-        if character == '~' {
-            match chars.next()? {
-                '0' => decoded.push('~'),
-                '1' => decoded.push('/'),
-                _ => return None,
-            }
-        } else {
-            decoded.push(character);
-        }
-    }
-    Some(decoded)
-}
 
 fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> {
     let (raw_size, codec, payload): (i64, i64, Vec<u8>) = connection
@@ -996,104 +902,6 @@ fn decode_content(connection: &Connection, hash: &[u8]) -> Result<String> {
     })
 }
 
-impl RestoreNode {
-    fn into_value(self, connection: &Connection, path: &str) -> Result<Value> {
-        match self.kind.ok_or_else(|| {
-            LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!("persistence state path '{path}' has no value"),
-                false,
-            )
-        })? {
-            0 => {
-                let mut object = serde_json::Map::new();
-                for (segment, child) in self.children {
-                    let key = unescape_object_segment(&segment).ok_or_else(|| {
-                        LoomError::new(
-                            ErrorCode::MalformedPayload,
-                            "persistence contains an invalid object key",
-                            false,
-                        )
-                    })?;
-                    object.insert(
-                        key,
-                        child.into_value(connection, &child_path(path, &segment))?,
-                    );
-                }
-                Ok(Value::Object(object))
-            }
-            1 => {
-                let mut indexed = Vec::with_capacity(self.children.len());
-                for (segment, child) in self.children {
-                    let index = segment
-                        .strip_prefix('a')
-                        .and_then(|value| value.parse::<usize>().ok())
-                        .ok_or_else(|| {
-                            LoomError::new(
-                                ErrorCode::MalformedPayload,
-                                "persistence contains an invalid array index",
-                                false,
-                            )
-                        })?;
-                    indexed.push((
-                        index,
-                        child.into_value(connection, &child_path(path, &segment))?,
-                    ));
-                }
-                indexed.sort_by_key(|(index, _)| *index);
-                if indexed
-                    .iter()
-                    .enumerate()
-                    .any(|(expected, (actual, _))| expected != *actual)
-                {
-                    return Err(LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        "persistence contains a sparse array",
-                        false,
-                    ));
-                }
-                Ok(Value::Array(
-                    indexed.into_iter().map(|(_, value)| value).collect(),
-                ))
-            }
-            2 => self
-                .scalar
-                .as_deref()
-                .ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        "persistence scalar payload is missing",
-                        false,
-                    )
-                })
-                .and_then(|payload| {
-                    serde_json::from_slice(payload).map_err(|error| {
-                        LoomError::new(
-                            ErrorCode::MalformedPayload,
-                            format!("persistence contains malformed JSON data: {error}"),
-                            false,
-                        )
-                    })
-                }),
-            3 => {
-                let hash = self.content_hash.ok_or_else(|| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        "persistence content reference is missing",
-                        false,
-                    )
-                })?;
-                Ok(Value::String(decode_content(connection, &hash)?))
-            }
-            _ => Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persistence contains an unknown node kind",
-                false,
-            )),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct FilePersistence {
     path: PathBuf,
@@ -1278,6 +1086,14 @@ pub struct DurableFilesystemRecord {
     pub repositories: BTreeMap<RepositoryId, SessionRepository>,
     pub directories: Vec<SessionDirectory>,
     pub payload: Value,
+    pub delta: Option<DurableFilesystemDelta>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DurableFilesystemDelta {
+    pub deleted_checkpoints: Vec<CheckpointId>,
+    pub deleted_edits: Vec<u64>,
+    pub deleted_changes: Vec<EventSequence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1288,6 +1104,7 @@ pub struct DurableFilesystemChangesPage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableFilesystemEdit {
+    pub id: u64,
     pub path: String,
     pub before: Option<String>,
     pub before_bytes: Option<Vec<u8>>,
@@ -1296,7 +1113,6 @@ pub struct DurableFilesystemEdit {
 }
 
 pub struct DurableStateWrite<'a> {
-    pub schema_version: u32,
     pub sessions: &'a SessionManagerState,
     pub workspaces: Option<&'a WorkspaceManagerState>,
     pub settings: Option<&'a DurableSessionSettings>,
@@ -1311,9 +1127,7 @@ pub struct DurableStateWrite<'a> {
     pub run_messages: Option<&'a BTreeMap<RunId, Vec<DurableRunMessage>>>,
     pub run_activities: Option<&'a DurableRunActivities>,
     pub filesystem_records: Option<&'a [DurableFilesystemRecord]>,
-    pub records: &'a [(String, Value)],
     pub feed: Option<&'a DurableFeedState>,
-    pub sections: &'a [(&'a str, Value)],
 }
 
 impl FilePersistence {
@@ -1440,203 +1254,76 @@ impl FilePersistence {
         self.path.is_file()
     }
 
-    pub fn load_section<T: DeserializeOwned>(
-        &self,
-        section: &str,
-        expected_version: u32,
-    ) -> Result<Option<T>> {
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let connection = self.connection()?;
-        let row = connection
-            .query_row(
-                "SELECT schema_version FROM section_meta WHERE name = ?1",
-                [section],
-                |row| row.get::<_, u32>(0),
-            )
-            .optional()
-            .map_err(|error| {
-                persistence_error(format!("could not read section '{section}': {error}"), true)
-            })?;
-        let Some(schema_version) = row else {
-            return Ok(None);
-        };
-        if schema_version != expected_version {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!(
-                    "unsupported persistence schema version {schema_version} (expected {expected_version})"
-                ),
-                false,
-            ));
-        }
-        let mut root = RestoreNode::default();
-        {
-            let mut statement = connection
-                .prepare(
-                    "SELECT path, node_kind, scalar, content_hash
-                     FROM state_nodes WHERE section = ?1 ORDER BY path",
-                )
-                .map_err(|error| {
-                    persistence_error(
-                        format!("could not prepare section '{section}': {error}"),
-                        true,
-                    )
-                })?;
-            let rows = statement
-                .query_map([section], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, Option<Vec<u8>>>(3)?,
-                    ))
-                })
-                .map_err(|error| {
-                    persistence_error(format!("could not read section '{section}': {error}"), true)
-                })?;
-            for row in rows {
-                let (path, kind, scalar, content_hash) = row.map_err(|error| {
-                    persistence_error(format!("could not read section '{section}': {error}"), true)
-                })?;
-                insert_restore_node(&mut root, &path, kind, scalar, content_hash)?;
-            }
-        }
-        root.into_value(&connection, "")
-            .and_then(|value| {
-                serde_json::from_value(value).map_err(|error| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        format!("persistence section '{section}' has invalid data: {error}"),
-                        false,
-                    )
-                })
-            })
-            .map(Some)
-    }
-
-    /// Loads one subtree from a section without decoding sibling records.
-    pub fn load_section_path<T: DeserializeOwned>(
-        &self,
-        section: &str,
-        path: &str,
-        expected_version: u32,
-    ) -> Result<Option<T>> {
-        if !path.is_empty() && !path.starts_with('/') {
-            return Err(LoomError::invalid_request(
-                "persistence subtree path must be empty or start with '/'",
-            ));
-        }
-        if !self.path.exists() {
-            return Ok(None);
-        }
-        let connection = self.connection()?;
-        let version = connection
-            .query_row(
-                "SELECT schema_version FROM section_meta WHERE name=?1",
-                [section],
-                |row| row.get::<_, u32>(0),
-            )
-            .optional()
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not inspect section '{section}': {error}"),
-                    true,
-                )
-            })?;
-        let Some(version) = version else {
-            return Ok(None);
-        };
-        if version != expected_version {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!(
-                    "unsupported persistence schema version {version} (expected {expected_version})"
-                ),
-                false,
-            ));
-        }
-        let mut root = RestoreNode::default();
-        let mut found = false;
-        {
-            let mut statement = connection
-                .prepare(
-                    "SELECT path, node_kind, scalar, content_hash FROM state_nodes
-                     WHERE section=?1 AND (path=?2 OR substr(path, 1, length(?2)+1)=?2 || '/')
-                     ORDER BY path",
-                )
-                .map_err(|error| {
-                    persistence_error(
-                        format!("could not prepare section '{section}': {error}"),
-                        true,
-                    )
-                })?;
-            let rows = statement
-                .query_map(params![section, path], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, Option<Vec<u8>>>(3)?,
-                    ))
-                })
-                .map_err(|error| {
-                    persistence_error(format!("could not read section '{section}': {error}"), true)
-                })?;
-            for row in rows {
-                let (stored_path, kind, scalar, content_hash) = row.map_err(|error| {
-                    persistence_error(format!("could not read section '{section}': {error}"), true)
-                })?;
-                found = true;
-                let relative_path = &stored_path[path.len()..];
-                insert_restore_node(&mut root, relative_path, kind, scalar, content_hash)?;
-            }
-        }
-        if !found {
-            return Ok(None);
-        }
-        let value = root.into_value(&connection, path)?;
-        serde_json::from_value(value).map(Some).map_err(|error| {
-            LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!("persistence subtree '{section}{path}' has invalid data: {error}"),
-                false,
-            )
+    /// Persists the typed session catalog without rewriting unrelated state.
+    pub fn save_state_with_sessions(&self, sessions: &SessionManagerState) -> Result<()> {
+        self.save_state(DurableStateWrite {
+            sessions,
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: None,
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: None,
+            filesystem_records: None,
+            feed: None,
         })
     }
 
-    /// Lists section names in a namespace, such as individually persisted runs.
-    pub fn list_sections_with_prefix(&self, prefix: &str) -> Result<Vec<String>> {
-        if !self.path.exists() {
-            return Ok(Vec::new());
-        }
-        let connection = self.connection()?;
-        let mut statement = connection
-            .prepare(
-                "SELECT name FROM section_meta WHERE substr(name, 1, length(?1))=?1 ORDER BY name",
-            )
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not list persistence sections: {error}"),
-                    true,
-                )
-            })?;
-        let rows = statement
-            .query_map([prefix], |row| row.get(0))
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not list persistence sections: {error}"),
-                    true,
-                )
-            })?;
-        rows.collect::<std::result::Result<Vec<String>, _>>()
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not list persistence sections: {error}"),
-                    true,
-                )
-            })
+    /// Persists the typed catalogs and reconnect feed atomically.
+    pub fn save_state_with_catalogs_and_feed(
+        &self,
+        sessions: &SessionManagerState,
+        workspaces: &WorkspaceManagerState,
+        feed: Option<&DurableFeedState>,
+    ) -> Result<()> {
+        self.save_state(DurableStateWrite {
+            sessions,
+            workspaces: Some(workspaces),
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: None,
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: None,
+            filesystem_records: None,
+            feed,
+        })
+    }
+
+    /// Persists the typed session catalog and reconnect feed atomically.
+    pub fn save_state_with_sessions_and_feed(
+        &self,
+        sessions: &SessionManagerState,
+        feed: Option<&DurableFeedState>,
+    ) -> Result<()> {
+        self.save_state(DurableStateWrite {
+            sessions,
+            workspaces: None,
+            settings: None,
+            workspace_configs: None,
+            providers: None,
+            usage: None,
+            idempotency: None,
+            run_summaries: None,
+            run_runtime_configs: None,
+            run_context_checkpoints: None,
+            run_plans: None,
+            run_messages: None,
+            run_activities: None,
+            filesystem_records: None,
+            feed,
+        })
     }
 
     /// Loads the indexed session catalog and its lifecycle sequence cursor.
@@ -2709,7 +2396,7 @@ impl FilePersistence {
         Ok(summaries)
     }
 
-    /// Loads a run's typed attempt history independently of its runtime section.
+    /// Loads a run's typed attempt history independently of its runtime details.
     pub fn load_run_attempts(&self, run_id: RunId) -> Result<Vec<AgentRunAttemptRecord>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -2917,7 +2604,7 @@ impl FilePersistence {
     }
 
     /// Loads a run's approval and input interaction history independently of
-    /// its summary and runtime section.
+    /// its summary and runtime details.
     pub fn load_run_interactions(&self, run_id: RunId) -> Result<Vec<AgentInteractionRecord>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -4249,8 +3936,8 @@ impl FilePersistence {
         let edit_rows = {
             let mut statement = connection
                 .prepare(
-                    "SELECT path, before_hash, after_revision, source FROM filesystem_edits
-                     WHERE session_id=?1 ORDER BY ordinal",
+                    "SELECT edit_id, path, before_hash, after_revision, source FROM filesystem_edits
+                     WHERE session_id=?1 ORDER BY edit_id",
                 )
                 .map_err(|error| {
                     persistence_error(format!("could not prepare filesystem edits: {error}"), true)
@@ -4258,10 +3945,11 @@ impl FilePersistence {
             let rows = statement
                 .query_map([session_id.as_uuid().as_bytes().as_slice()], |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<Vec<u8>>>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(|error| {
@@ -4273,7 +3961,7 @@ impl FilePersistence {
                 })?
         };
         let mut edits = Vec::with_capacity(edit_rows.len());
-        for (path, before_hash, after_revision, source) in edit_rows {
+        for (edit_id, path, before_hash, after_revision, source) in edit_rows {
             let before_bytes = before_hash
                 .as_deref()
                 .map(|hash| load_content_range(&connection, hash, 0, MAX_CONTENT_BYTES))
@@ -4282,6 +3970,13 @@ impl FilePersistence {
                 .as_ref()
                 .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
             edits.push(DurableFilesystemEdit {
+                id: u64::try_from(edit_id).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted edit id is invalid",
+                        false,
+                    )
+                })?,
                 path,
                 before,
                 before_bytes,
@@ -4362,6 +4057,7 @@ impl FilePersistence {
             repositories,
             directories,
             payload,
+            delta: None,
         }))
     }
 
@@ -4945,97 +4641,6 @@ impl FilePersistence {
         Ok(events)
     }
 
-    /// Persists typed session rows and the remaining bounded state snapshot atomically.
-    pub fn save_state_with_sessions(
-        &self,
-        schema_version: u32,
-        sessions: &SessionManagerState,
-        sections: &[(&str, Value)],
-    ) -> Result<()> {
-        self.save_state_with_sessions_and_entities(schema_version, sessions, &[], sections)
-    }
-
-    /// Persists session rows, individual entity records, and auxiliary state atomically.
-    pub fn save_state_with_sessions_and_entities(
-        &self,
-        schema_version: u32,
-        sessions: &SessionManagerState,
-        records: &[(String, Value)],
-        sections: &[(&str, Value)],
-    ) -> Result<()> {
-        self.save_state_with_sessions_entities_and_feed(
-            schema_version,
-            sessions,
-            records,
-            None,
-            sections,
-        )
-    }
-
-    /// Persists catalog rows, entity records, the event feed, and auxiliary state atomically.
-    pub fn save_state_with_sessions_entities_and_feed(
-        &self,
-        schema_version: u32,
-        sessions: &SessionManagerState,
-        records: &[(String, Value)],
-        feed: Option<&DurableFeedState>,
-        sections: &[(&str, Value)],
-    ) -> Result<()> {
-        self.save_state(DurableStateWrite {
-            schema_version,
-            sessions,
-            workspaces: None,
-            settings: None,
-            workspace_configs: None,
-            providers: None,
-            usage: None,
-            idempotency: None,
-            run_summaries: None,
-            run_runtime_configs: None,
-            run_context_checkpoints: None,
-            run_plans: None,
-            run_messages: None,
-            run_activities: None,
-            filesystem_records: None,
-            records,
-            feed,
-            sections,
-        })
-    }
-
-    /// Persists typed session and workspace catalogs with entity records atomically.
-    pub fn save_state_with_catalogs_entities_and_feed(
-        &self,
-        schema_version: u32,
-        sessions: &SessionManagerState,
-        workspaces: &WorkspaceManagerState,
-        records: &[(String, Value)],
-        feed: Option<&DurableFeedState>,
-        sections: &[(&str, Value)],
-    ) -> Result<()> {
-        self.save_state(DurableStateWrite {
-            schema_version,
-            sessions,
-            workspaces: Some(workspaces),
-            settings: None,
-            workspace_configs: None,
-            providers: None,
-            usage: None,
-            idempotency: None,
-            run_summaries: None,
-            run_runtime_configs: None,
-            run_context_checkpoints: None,
-            run_plans: None,
-            run_messages: None,
-            run_activities: None,
-            filesystem_records: None,
-            records,
-            feed,
-            sections,
-        })
-    }
-
-    /// Persists catalogs and settings with entity records and the feed atomically.
     pub fn save_state(&self, write: DurableStateWrite<'_>) -> Result<()> {
         let connection = self.connection_for_write()?;
         let transaction = connection.unchecked_transaction().map_err(|error| {
@@ -5090,17 +4695,6 @@ impl FilePersistence {
         }
         if let Some(feed) = write.feed {
             save_feed_rows(&transaction, feed)?;
-        }
-        for (name, value) in write.sections {
-            save_section_nodes(&transaction, name, write.schema_version, value)?;
-        }
-        for (name, value) in write.records {
-            if !name.starts_with("run:") {
-                return Err(LoomError::invalid_request(
-                    "individually stored run detail must use the run section prefix",
-                ));
-            }
-            save_section_nodes(&transaction, name, write.schema_version, value)?;
         }
         transaction.commit().map_err(|error| {
             persistence_error(
@@ -5258,25 +4852,6 @@ impl FilePersistence {
         })
     }
 
-    pub fn save_sections(&self, schema_version: u32, sections: &[(&str, Value)]) -> Result<()> {
-        let connection = self.connection_for_write()?;
-        let transaction = connection.unchecked_transaction().map_err(|error| {
-            persistence_error(
-                format!("could not begin persistence transaction: {error}"),
-                true,
-            )
-        })?;
-        for (name, value) in sections {
-            save_section_nodes(&transaction, name, schema_version, value)?;
-        }
-        transaction.commit().map_err(|error| {
-            persistence_error(
-                format!("could not commit persistence transaction: {error}"),
-                true,
-            )
-        })
-    }
-
     fn connection(&self) -> Result<CachedConnection<'_>> {
         self.cached_connection(false)
     }
@@ -5358,9 +4933,9 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         ));
     }
 
-    // Inspect before changing persistent SQLite settings. In particular, opening
-    // a database from the old section format must not even switch its journal
-    // mode; this release deliberately starts with an empty database only.
+    // Inspect before changing persistent SQLite settings. Unsupported databases
+    // must not even have their journal mode changed; this release starts with a
+    // new database only.
     let has_user_tables: bool = connection
         .query_row(
             "SELECT EXISTS(
@@ -5421,114 +4996,6 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             true,
         )
     })?;
-    Ok(())
-}
-
-fn save_section_nodes(
-    transaction: &Transaction<'_>,
-    name: &str,
-    schema_version: u32,
-    value: &Value,
-) -> Result<()> {
-    if name.is_empty() {
-        return Err(LoomError::invalid_request(
-            "persistence section name must not be empty",
-        ));
-    }
-    transaction
-        .execute(
-            "INSERT INTO section_meta(name, schema_version) VALUES (?1, ?2)
-             ON CONFLICT(name) DO UPDATE SET schema_version=excluded.schema_version",
-            params![name, schema_version],
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not write section '{name}': {error}"), true)
-        })?;
-    transaction
-        .execute_batch("CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_nodes (path TEXT PRIMARY KEY) WITHOUT ROWID;")
-        .map_err(|error| persistence_error(format!("could not stage section '{name}': {error}"), true))?;
-    transaction
-        .execute("DELETE FROM _loom_wanted_nodes", [])
-        .map_err(|error| {
-            persistence_error(format!("could not stage section '{name}': {error}"), true)
-        })?;
-
-    let mut nodes = Vec::new();
-    flatten_value(value, "", &mut nodes)?;
-    for (path, kind, scalar, content) in nodes {
-        let content_hash = match content {
-            Some(content) => Some(store_content(transaction, &content)?),
-            None => None,
-        };
-        transaction
-            .execute("INSERT INTO _loom_wanted_nodes(path) VALUES (?1)", [&path])
-            .map_err(|error| {
-                persistence_error(format!("could not stage section '{name}': {error}"), true)
-            })?;
-        transaction
-            .execute(
-                "INSERT INTO state_nodes(section, path, node_kind, scalar, content_hash)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(section, path) DO UPDATE SET
-                    node_kind=excluded.node_kind, scalar=excluded.scalar, content_hash=excluded.content_hash
-                 WHERE state_nodes.node_kind IS NOT excluded.node_kind
-                    OR state_nodes.scalar IS NOT excluded.scalar
-                    OR state_nodes.content_hash IS NOT excluded.content_hash",
-                params![name, path, kind, scalar, content_hash],
-            )
-            .map_err(|error| persistence_error(format!("could not write section '{name}': {error}"), true))?;
-    }
-    transaction
-        .execute(
-            "DELETE FROM state_nodes
-             WHERE section=?1 AND NOT EXISTS (
-                 SELECT 1 FROM _loom_wanted_nodes wanted WHERE wanted.path=state_nodes.path
-             )",
-            [name],
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not prune section '{name}': {error}"), true)
-        })?;
-    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)?;
-    Ok(())
-}
-
-type EncodedNode = (String, i64, Option<Vec<u8>>, Option<Vec<u8>>);
-
-fn flatten_value(value: &Value, path: &str, nodes: &mut Vec<EncodedNode>) -> Result<()> {
-    match value {
-        Value::Object(object) => {
-            nodes.push((path.to_owned(), 0, None, None));
-            for (key, value) in object {
-                flatten_value(value, &child_path(path, &object_segment(key)), nodes)?;
-            }
-        }
-        Value::Array(array) => {
-            nodes.push((path.to_owned(), 1, None, None));
-            for (index, value) in array.iter().enumerate() {
-                flatten_value(value, &child_path(path, &array_segment(index)), nodes)?;
-            }
-        }
-        Value::String(value) if value.len() >= EXTERNAL_STRING_THRESHOLD => {
-            if value.len() > MAX_CONTENT_BYTES {
-                return Err(LoomError::new(
-                    ErrorCode::Persistence,
-                    "state text exceeds the maximum supported size",
-                    false,
-                ));
-            }
-            nodes.push((path.to_owned(), 3, None, Some(value.as_bytes().to_vec())));
-        }
-        _ => {
-            let scalar = serde_json::to_vec(value).map_err(|error| {
-                persistence_error(
-                    format!("could not encode persistence value: {error}"),
-                    false,
-                )
-            })?;
-            nodes.push((path.to_owned(), 2, Some(scalar), None));
-        }
-    }
     Ok(())
 }
 
@@ -5660,8 +5127,6 @@ fn collect_unused_content(transaction: &Transaction<'_>, candidate_limit: usize)
              WHERE hash IN (
                  SELECT hash FROM content_gc_candidates
                  WHERE kind='object' ORDER BY hash LIMIT ?1
-             ) AND NOT EXISTS (
-                SELECT 1 FROM state_nodes WHERE state_nodes.content_hash=content_objects.hash
              ) AND NOT EXISTS (
                 SELECT 1 FROM checkpoint_files
                 WHERE checkpoint_files.content_hash=content_objects.hash
@@ -9136,9 +8601,41 @@ fn save_filesystem_records(
             .map_err(|error| {
                 persistence_error(format!("could not save filesystem sequence: {error}"), true)
             })?;
-        save_checkpoint_rows(transaction, record.session_id, &record.checkpoints)?;
-        save_filesystem_edit_rows(transaction, record.session_id, &record.edits)?;
-        save_filesystem_change_rows(transaction, record.session_id, &record.changes)?;
+        if let Some(delta) = &record.delta {
+            save_checkpoint_delta_rows(
+                transaction,
+                record.session_id,
+                &record.checkpoints,
+                &delta.deleted_checkpoints,
+            )?;
+            save_filesystem_edit_delta_rows(
+                transaction,
+                record.session_id,
+                &record.edits,
+                &delta.deleted_edits,
+            )?;
+            save_filesystem_change_rows(transaction, record.session_id, &record.changes)?;
+            for sequence in &delta.deleted_changes {
+                transaction
+                    .execute(
+                        "DELETE FROM filesystem_changes WHERE session_id=?1 AND sequence=?2",
+                        params![
+                            record.session_id.as_uuid().as_bytes().as_slice(),
+                            encode_counter(sequence.value(), "filesystem sequence")?
+                        ],
+                    )
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not delete filesystem change: {error}"),
+                            true,
+                        )
+                    })?;
+            }
+        } else {
+            save_checkpoint_rows(transaction, record.session_id, &record.checkpoints)?;
+            save_filesystem_edit_rows(transaction, record.session_id, &record.edits)?;
+            save_filesystem_change_rows(transaction, record.session_id, &record.changes)?;
+        }
         save_session_repository_rows(transaction, record.session_id, &record.repositories)?;
         save_session_directory_rows(transaction, record.session_id, &record.directories)?;
     }
@@ -9151,7 +8648,15 @@ fn save_filesystem_edit_rows(
     session_id: AgentSessionId,
     edits: &[DurableFilesystemEdit],
 ) -> Result<()> {
-    for (ordinal, edit) in edits.iter().enumerate() {
+    transaction
+        .execute(
+            "DELETE FROM filesystem_edits WHERE session_id=?1",
+            [session_id.as_uuid().as_bytes().as_slice()],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not replace filesystem edits: {error}"), true)
+        })?;
+    for edit in edits {
         if edit.path.is_empty()
             || edit.path.len() > 4096
             || edit.after_revision.len() > 256
@@ -9177,9 +8682,9 @@ fn save_filesystem_edit_rows(
         transaction
             .execute(
                 "INSERT INTO filesystem_edits(
-                    session_id, ordinal, path, before_hash, after_revision, source
+                    session_id, edit_id, path, before_hash, after_revision, source
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(session_id, ordinal) DO UPDATE SET
+                 ON CONFLICT(session_id, edit_id) DO UPDATE SET
                     path=excluded.path,
                     before_hash=excluded.before_hash,
                     after_revision=excluded.after_revision,
@@ -9190,9 +8695,11 @@ fn save_filesystem_edit_rows(
                     OR filesystem_edits.source IS NOT excluded.source",
                 params![
                     session_id.as_uuid().as_bytes().as_slice(),
-                    i64::try_from(ordinal).map_err(|_| {
-                        LoomError::new(ErrorCode::Persistence, "too many filesystem edits", false)
-                    })?,
+                    i64::try_from(edit.id).map_err(|_| LoomError::new(
+                        ErrorCode::Persistence,
+                        "invalid filesystem edit id",
+                        false
+                    ))?,
                     edit.path,
                     before_hash,
                     edit.after_revision,
@@ -9203,19 +8710,120 @@ fn save_filesystem_edit_rows(
                 persistence_error(format!("could not save filesystem edit: {error}"), true)
             })?;
     }
-    transaction
-        .execute(
-            "DELETE FROM filesystem_edits WHERE session_id=?1 AND ordinal >= ?2",
-            params![
-                session_id.as_uuid().as_bytes().as_slice(),
-                i64::try_from(edits.len()).map_err(|_| {
-                    LoomError::new(ErrorCode::Persistence, "too many filesystem edits", false)
-                })?,
-            ],
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not prune filesystem edits: {error}"), true)
-        })?;
+    Ok(())
+}
+
+fn save_filesystem_edit_delta_rows(
+    transaction: &Transaction<'_>,
+    session_id: AgentSessionId,
+    edits: &[DurableFilesystemEdit],
+    deleted: &[u64],
+) -> Result<()> {
+    for id in deleted {
+        transaction
+            .execute(
+                "DELETE FROM filesystem_edits WHERE session_id=?1 AND edit_id=?2",
+                params![
+                    session_id.as_uuid().as_bytes().as_slice(),
+                    i64::try_from(*id)
+                        .map_err(|_| LoomError::invalid_request("invalid filesystem edit id"))?
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not delete filesystem edit: {error}"), true)
+            })?;
+    }
+    for edit in edits {
+        if edit.id == 0
+            || edit.path.is_empty()
+            || edit.path.len() > 4096
+            || edit.after_revision.len() > 256
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "filesystem edit metadata is invalid",
+                false,
+            ));
+        }
+        let before = edit
+            .before_bytes
+            .as_deref()
+            .or_else(|| edit.before.as_ref().map(String::as_bytes));
+        let before_hash = before
+            .map(|bytes| store_content(transaction, bytes))
+            .transpose()?;
+        transaction.execute("INSERT INTO filesystem_edits(session_id,edit_id,path,before_hash,after_revision,source) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(session_id,edit_id) DO UPDATE SET path=excluded.path,before_hash=excluded.before_hash,after_revision=excluded.after_revision,source=excluded.source", params![session_id.as_uuid().as_bytes().as_slice(), i64::try_from(edit.id).map_err(|_| LoomError::invalid_request("invalid filesystem edit id"))?, edit.path, before_hash, edit.after_revision, workspace_control_name(edit.source)]).map_err(|error| persistence_error(format!("could not save filesystem edit delta: {error}"), true))?;
+    }
+    Ok(())
+}
+
+fn save_checkpoint_delta_rows(
+    transaction: &Transaction<'_>,
+    session_id: AgentSessionId,
+    checkpoints: &[Checkpoint],
+    deleted: &[CheckpointId],
+) -> Result<()> {
+    for checkpoint in checkpoints {
+        if checkpoint.session_id != session_id || checkpoint.label.trim().is_empty() {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "checkpoint identity or label is invalid",
+                false,
+            ));
+        }
+        let sid = session_id.as_uuid().as_bytes();
+        let cid = checkpoint.id.as_uuid().as_bytes();
+        transaction.execute("INSERT INTO checkpoints(session_id,checkpoint_id,label,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(session_id,checkpoint_id) DO UPDATE SET label=excluded.label,created_at=excluded.created_at WHERE checkpoints.label IS NOT excluded.label OR checkpoints.created_at IS NOT excluded.created_at", params![sid.as_slice(),cid.as_slice(),checkpoint.label,encode_timestamp(checkpoint.created_at)?]).map_err(|error| persistence_error(format!("could not save checkpoint delta: {error}"), true))?;
+        let mut wanted = BTreeSet::new();
+        for (path, file) in &checkpoint.files {
+            if path.trim().is_empty() || file.content.len() > MAX_CONTENT_BYTES {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "checkpoint file is invalid",
+                    false,
+                ));
+            }
+            wanted.insert(path.clone());
+            let hash = store_content(transaction, file.content.as_bytes())?;
+            transaction.execute("INSERT INTO checkpoint_files(session_id,checkpoint_id,path,existed,revision,expected_revision,content_hash) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(session_id,checkpoint_id,path) DO UPDATE SET existed=excluded.existed,revision=excluded.revision,expected_revision=excluded.expected_revision,content_hash=excluded.content_hash WHERE checkpoint_files.existed IS NOT excluded.existed OR checkpoint_files.revision IS NOT excluded.revision OR checkpoint_files.expected_revision IS NOT excluded.expected_revision OR checkpoint_files.content_hash IS NOT excluded.content_hash",params![sid.as_slice(),cid.as_slice(),path,if file.existed{1_i64}else{0_i64},file.revision,file.expected_revision,hash]).map_err(|error|persistence_error(format!("could not save checkpoint file delta: {error}"),true))?;
+        }
+        let mut statement = transaction
+            .prepare("SELECT path FROM checkpoint_files WHERE session_id=?1 AND checkpoint_id=?2")
+            .map_err(|error| {
+                persistence_error(format!("could not inspect checkpoint files: {error}"), true)
+            })?;
+        let rows = statement
+            .query_map(params![sid.as_slice(), cid.as_slice()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not inspect checkpoint files: {error}"), true)
+            })?;
+        let existing = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| {
+                persistence_error(format!("could not inspect checkpoint files: {error}"), true)
+            })?;
+        drop(statement);
+        for path in existing {
+            if !wanted.contains(&path) {
+                transaction.execute("DELETE FROM checkpoint_files WHERE session_id=?1 AND checkpoint_id=?2 AND path=?3",params![sid.as_slice(),cid.as_slice(),path]).map_err(|error|persistence_error(format!("could not delete checkpoint file: {error}"),true))?;
+            }
+        }
+    }
+    for id in deleted {
+        transaction
+            .execute(
+                "DELETE FROM checkpoints WHERE session_id=?1 AND checkpoint_id=?2",
+                params![
+                    session_id.as_uuid().as_bytes().as_slice(),
+                    id.as_uuid().as_bytes().as_slice()
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not delete checkpoint: {error}"), true)
+            })?;
+    }
     Ok(())
 }
 
@@ -10540,11 +10148,22 @@ mod tests {
         value: String,
     }
 
+    fn invalid_feed_for_rollback() -> DurableFeedState {
+        DurableFeedState {
+            next_sequence: EventSequence::new(u64::MAX),
+            retention_limit: 250,
+            events: Vec::new(),
+            workspace_events: Vec::new(),
+        }
+    }
+
     #[test]
     fn session_projection_reader_keeps_run_and_cursor_on_one_sqlite_snapshot() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let store = FilePersistence::open(&path).unwrap();
-        store.save_sections(CURRENT_SCHEMA_VERSION, &[]).unwrap();
+        store
+            .save_state_with_sessions(&SessionManager::default().export_state())
+            .unwrap();
 
         let session_id = AgentSessionId::new();
         let workspace_id = WorkspaceId::new();
@@ -10611,28 +10230,6 @@ mod tests {
         assert_eq!(fresh.latest_run.as_ref().unwrap().snapshot.task, "after");
         assert_eq!(fresh.latest_sequence, Some(EventSequence::new(2)));
         drop(store);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn file_store_round_trips_section_data_atomically() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let store = FilePersistence::open(&path).unwrap();
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[("state", serde_json::json!({"value": "durable"}))],
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .load_section::<Fixture>("state", CURRENT_SCHEMA_VERSION)
-                .unwrap()
-                .unwrap(),
-            Fixture {
-                value: "durable".to_owned()
-            }
-        );
         fs::remove_file(path).unwrap();
     }
 
@@ -10714,7 +10311,6 @@ mod tests {
         )]);
         persistence
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &sessions.export_state(),
                 workspaces: None,
                 settings: None,
@@ -10729,9 +10325,7 @@ mod tests {
                 run_messages: Some(&initial_transcript),
                 run_activities: Some(&initial_activities),
                 filesystem_records: None,
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
 
@@ -11028,31 +10622,10 @@ mod tests {
         let first = FilePersistence::open(&path).unwrap();
         let clone = first.clone();
         assert!(!first.exists());
-        assert!(first.load_section::<Fixture>("state", 1).unwrap().is_none());
+        assert!(first.load_sessions().unwrap().is_none());
         assert!(!first.exists(), "read-only construction must stay lazy");
         assert!(Arc::ptr_eq(&first.connection, &clone.connection));
-
-        first
-            .save_sections(1, &[("state", serde_json::json!({"value": "first"}))])
-            .unwrap();
-        let second_handle = FilePersistence::open(&path).unwrap();
-        assert_eq!(
-            clone.load_section::<Fixture>("state", 1).unwrap(),
-            Some(Fixture {
-                value: "first".to_owned()
-            })
-        );
-        second_handle
-            .save_sections(1, &[("state", serde_json::json!({"value": "second"}))])
-            .unwrap();
-        assert_eq!(
-            first.load_section::<Fixture>("state", 1).unwrap(),
-            Some(Fixture {
-                value: "second".to_owned()
-            })
-        );
-        drop((first, clone, second_handle));
-        fs::remove_file(path).unwrap();
+        drop((first, clone));
     }
 
     #[test]
@@ -11139,43 +10712,9 @@ mod tests {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         fs::write(&path, b"{not json").unwrap();
         let store = FilePersistence::open(&path).unwrap();
-        let error = store
-            .save_sections(CURRENT_SCHEMA_VERSION, &[("state", serde_json::json!({}))])
-            .unwrap_err();
+        let error = store.load_feed_header().unwrap_err();
         assert_eq!(error.code, ErrorCode::Persistence);
         assert!(!path.with_extension("json.legacy").exists());
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn file_store_reports_missing_schema_and_malformed_sections() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let store = FilePersistence::open(&path).unwrap();
-        assert!(
-            store
-                .load_section::<Fixture>("missing", 1)
-                .unwrap()
-                .is_none()
-        );
-        assert!(!store.exists());
-        store
-            .save_sections(1, &[("state", serde_json::json!({"value": "old"}))])
-            .unwrap();
-        assert_eq!(
-            store.load_section::<Fixture>("state", 2).unwrap_err().code,
-            ErrorCode::MalformedPayload
-        );
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute(
-                "UPDATE state_nodes SET scalar = ?1 WHERE section = 'state' AND path = '/kvalue'",
-                [b"invalid json".as_slice()],
-            )
-            .unwrap();
-        assert_eq!(
-            store.load_section::<Fixture>("state", 1).unwrap_err().code,
-            ErrorCode::MalformedPayload
-        );
         fs::remove_file(path).unwrap();
     }
 
@@ -11216,19 +10755,6 @@ mod tests {
         let session_id = AgentSessionId::new();
         let run_id = RunId::new();
         assert!(!store.exists());
-        assert!(
-            store
-                .load_section::<Value>("missing", CURRENT_SCHEMA_VERSION)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            store
-                .load_section_path::<Value>("missing", "/run", CURRENT_SCHEMA_VERSION)
-                .unwrap()
-                .is_none()
-        );
-        assert!(store.list_sections_with_prefix("run:").unwrap().is_empty());
         assert!(store.load_sessions().unwrap().is_none());
         assert!(store.load_workspaces().unwrap().is_none());
         assert!(store.load_run_messages(run_id).unwrap().is_empty());
@@ -11288,42 +10814,7 @@ mod tests {
     }
 
     #[test]
-    fn sections_are_updated_without_rewriting_other_sections() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let store = FilePersistence::open(&path).unwrap();
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[
-                    ("sessions", serde_json::json!({"count": 1})),
-                    ("journal", serde_json::json!({"events": 3})),
-                ],
-            )
-            .unwrap();
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[("sessions", serde_json::json!({"count": 2}))],
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .load_section::<serde_json::Value>("journal", CURRENT_SCHEMA_VERSION)
-                .unwrap(),
-            Some(serde_json::json!({"events": 3}))
-        );
-        assert_eq!(
-            store
-                .load_section::<serde_json::Value>("sessions", CURRENT_SCHEMA_VERSION)
-                .unwrap()
-                .unwrap()["count"],
-            2
-        );
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn section_format_is_rejected_without_importing_or_modifying_it() {
+    fn database_with_user_tables_is_rejected_without_importing_or_modifying_it() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let repeated = "large checkpoint content ".repeat(1000);
         let legacy_value = serde_json::json!({
@@ -11356,10 +10847,7 @@ mod tests {
 
         let store = FilePersistence::open(&path).unwrap();
         assert_eq!(
-            store
-                .load_section::<Value>("legacy", CURRENT_SCHEMA_VERSION)
-                .unwrap_err()
-                .code,
+            store.load_feed_header().unwrap_err().code,
             ErrorCode::MalformedPayload
         );
         let connection = Connection::open(&path).unwrap();
@@ -11375,14 +10863,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(raw_payload, serde_json::to_vec(&legacy_value).unwrap());
-        let v3_schema_exists: bool = connection
+        let typed_schema_exists: bool = connection
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='state_nodes')",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!v3_schema_exists);
+        assert!(!typed_schema_exists);
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -11395,7 +10883,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=35;")
+            .execute_batch("CREATE TABLE sentinel(value TEXT); PRAGMA user_version=40;")
             .unwrap();
         let original_journal_mode: String = connection
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -11422,92 +10910,36 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 35);
+        assert_eq!(version, 40);
         assert_eq!(journal_mode, original_journal_mode);
         assert!(!has_feed_meta);
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn unchanged_tree_nodes_are_not_updated() {
+    fn fresh_database_uses_typed_schema_without_generic_section_tables() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let store = FilePersistence::open(&path).unwrap();
-        let value = serde_json::json!({"session": {"name": "alpha", "sequence": 1}});
         store
-            .save_sections(CURRENT_SCHEMA_VERSION, &[("sessions", value.clone())])
-            .unwrap();
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE node_updates(count INTEGER NOT NULL);
-                 INSERT INTO node_updates VALUES (0);
-                 CREATE TRIGGER count_node_updates AFTER UPDATE ON state_nodes
-                 BEGIN UPDATE node_updates SET count = count + 1; END;",
-            )
-            .unwrap();
-        drop(connection);
-
-        store
-            .save_sections(CURRENT_SCHEMA_VERSION, &[("sessions", value)])
-            .unwrap();
-        let connection = Connection::open(&path).unwrap();
-        let updates: u32 = connection
-            .query_row("SELECT count FROM node_updates", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(updates, 0);
-        drop(connection);
-
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[(
-                    "sessions",
-                    serde_json::json!({"session": {"name": "beta", "sequence": 1}}),
-                )],
-            )
-            .unwrap();
-        let connection = Connection::open(&path).unwrap();
-        let updates: u32 = connection
-            .query_row("SELECT count FROM node_updates", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(updates, 1);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn large_text_is_deduplicated_and_compressed() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let store = FilePersistence::open(&path).unwrap();
-        let text = "checkpoint content that compresses well ".repeat(2_000);
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[
-                    ("one", serde_json::json!({"content": text})),
-                    ("two", serde_json::json!({"content": text})),
-                ],
-            )
+            .save_state_with_sessions(&SessionManager::default().export_state())
             .unwrap();
 
         let connection = Connection::open(&path).unwrap();
-        let (blob_count, codec, payload_size, raw_size): (i64, i64, i64, i64) = connection
+        let generic_tables: i64 = connection
             .query_row(
-                "SELECT COUNT(*), MAX(codec), MAX(length(payload)), MAX(raw_size) FROM content_blobs",
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name IN ('section_meta', 'state_nodes')",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(blob_count, 1);
-        assert_eq!(codec, 1);
-        assert!(payload_size < raw_size);
-        assert_eq!(
-            store
-                .load_section::<Value>("two", CURRENT_SCHEMA_VERSION)
-                .unwrap()
-                .unwrap()["content"],
-            text
-        );
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(generic_tables, 0);
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
         drop(connection);
+        drop(store);
         fs::remove_file(path).unwrap();
     }
 
@@ -11555,140 +10987,14 @@ mod tests {
     }
 
     #[test]
-    fn content_collection_is_reference_aware_and_uses_queued_candidates() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let store = FilePersistence::open(&path).unwrap();
-        let shared = "shared retained transcript content ".repeat(500);
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[
-                    ("first", serde_json::json!({"content": shared})),
-                    ("second", serde_json::json!({"content": shared})),
-                ],
-            )
-            .unwrap();
-        let connection = Connection::open(&path).unwrap();
-        let shared_hash: Vec<u8> = connection
-            .query_row("SELECT hash FROM content_objects LIMIT 1", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let shared_blob_hash: Vec<u8> = connection
-            .query_row(
-                "SELECT blob_hash FROM content_parts WHERE content_hash=?1 LIMIT 1",
-                [&shared_hash],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        let replacement = "replacement object with distinct bytes ".repeat(500);
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[("first", serde_json::json!({"content": replacement}))],
-            )
-            .unwrap();
-        let shared_references: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM state_nodes WHERE content_hash=?1",
-                [&shared_hash],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(shared_references, 1);
-
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[("second", serde_json::json!({"content": "small"}))],
-            )
-            .unwrap();
-        let shared_object_exists: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM content_objects WHERE hash=?1)",
-                [&shared_hash],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!shared_object_exists);
-        let shared_blob_exists: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM content_blobs WHERE hash=?1)",
-                [&shared_blob_hash],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!shared_blob_exists);
-        let pending_candidates: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM content_gc_candidates WHERE hash=?1",
-                [&shared_hash],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(pending_candidates, 0);
-        drop(connection);
-        drop(store);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn bounded_content_collection_can_drain_a_candidate_backlog() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let store = FilePersistence::open(&path).unwrap();
-        let values = (0..300)
-            .map(|index| {
-                (
-                    format!("item-{index}"),
-                    Value::String(format!("unique content {index} ").repeat(500)),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>();
-        store
-            .save_sections(CURRENT_SCHEMA_VERSION, &[("bulk", Value::Object(values))])
-            .unwrap();
-        store
-            .save_sections(CURRENT_SCHEMA_VERSION, &[("bulk", serde_json::json!({}))])
-            .unwrap();
-        let connection = Connection::open(&path).unwrap();
-        let before_collection: i64 = connection
-            .query_row("SELECT COUNT(*) FROM content_gc_candidates", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert!(before_collection > 0);
-
-        store.collect_garbage(512).unwrap();
-        let (objects, blobs, candidates): (i64, i64, i64) = connection
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM content_objects),
-                        (SELECT COUNT(*) FROM content_blobs),
-                        (SELECT COUNT(*) FROM content_gc_candidates)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!((objects, blobs, candidates), (0, 0, 0));
-        assert!(store.collect_garbage(0).is_err());
-        drop(connection);
-        drop(store);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn corrupt_content_objects_are_rejected_during_restore() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let store = FilePersistence::open(&path).unwrap();
         let text = "content whose integrity must survive process restarts ".repeat(200);
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[("content", serde_json::json!({"value": text}))],
-            )
-            .unwrap();
-
         let connection = Connection::open(&path).unwrap();
+        initialize_schema(&connection).unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        store_content(&transaction, text.as_bytes()).unwrap();
+        transaction.commit().unwrap();
         let (object_hash, blob_hash): (Vec<u8>, Vec<u8>) = connection
             .query_row(
                 "SELECT objects.hash, parts.blob_hash
@@ -11736,9 +11042,7 @@ mod tests {
         manager.archive(first.id).unwrap();
         let state = manager.export_state();
 
-        persistence
-            .save_state_with_sessions(CURRENT_SCHEMA_VERSION, &state, &[])
-            .unwrap();
+        persistence.save_state_with_sessions(&state).unwrap();
         let restored = persistence.load_sessions().unwrap().unwrap();
         assert_eq!(restored, state);
         assert_eq!(
@@ -11771,9 +11075,7 @@ mod tests {
             )
             .unwrap();
         drop(connection);
-        persistence
-            .save_state_with_sessions(CURRENT_SCHEMA_VERSION, &state, &[])
-            .unwrap();
+        persistence.save_state_with_sessions(&state).unwrap();
         let connection = Connection::open(&path).unwrap();
         let updates: i64 = connection
             .query_row("SELECT count FROM session_updates", [], |row| row.get(0))
@@ -11793,33 +11095,13 @@ mod tests {
         let state = manager.export_state();
 
         persistence
-            .save_state_with_catalogs_entities_and_feed(
-                CURRENT_SCHEMA_VERSION,
+            .save_state_with_catalogs_and_feed(
                 &SessionManager::default().export_state(),
                 &state,
-                &[],
                 None,
-                &[],
             )
             .unwrap();
         assert_eq!(persistence.load_workspaces().unwrap().unwrap(), state);
-
-        let mut changed_manager = WorkspaceManager::default();
-        let changed = changed_manager.create("Changed workspace").unwrap();
-        assert!(
-            persistence
-                .save_state_with_catalogs_entities_and_feed(
-                    CURRENT_SCHEMA_VERSION,
-                    &SessionManager::default().export_state(),
-                    &changed_manager.export_state(),
-                    &[],
-                    None,
-                    &[("", serde_json::json!({"invalid": true}))],
-                )
-                .is_err()
-        );
-        assert_eq!(persistence.load_workspaces().unwrap().unwrap(), state);
-        assert!(!state.workspaces.contains_key(&changed.id));
 
         let connection = Connection::open(&path).unwrap();
         let plan: String = connection
@@ -11842,13 +11124,10 @@ mod tests {
             .unwrap();
         drop(connection);
         persistence
-            .save_state_with_catalogs_entities_and_feed(
-                CURRENT_SCHEMA_VERSION,
+            .save_state_with_catalogs_and_feed(
                 &SessionManager::default().export_state(),
                 &state,
-                &[],
                 None,
-                &[],
             )
             .unwrap();
         let connection = Connection::open(&path).unwrap();
@@ -12082,6 +11361,7 @@ mod tests {
             control: WorkspaceControl::Agent,
             checkpoints: vec![checkpoint.clone()],
             edits: vec![DurableFilesystemEdit {
+                id: 1,
                 path: "src/main.rs".to_owned(),
                 before: Some("before contents".to_owned()),
                 before_bytes: Some(b"before contents".to_vec()),
@@ -12109,10 +11389,10 @@ mod tests {
                 },
                 "details": "checkpoint state ".repeat(500)
             }),
+            delta: None,
         }];
         persistence
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &sessions.export_state(),
                 workspaces: Some(&workspaces.export_state()),
                 settings: Some(&settings),
@@ -12127,9 +11407,7 @@ mod tests {
                 run_messages: Some(&run_messages),
                 run_activities: Some(&run_activities),
                 filesystem_records: Some(&filesystem_records),
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
         assert_eq!(
@@ -12198,11 +11476,10 @@ mod tests {
             result: Some(tool_result.clone()),
         };
         let completed_activities = BTreeMap::from([(run_id, vec![completed_activity])]);
-        let invalid_sections = [("", serde_json::json!({"invalid": true}))];
+        let invalid_feed = invalid_feed_for_rollback();
         assert!(
             persistence
                 .save_state(DurableStateWrite {
-                    schema_version: CURRENT_SCHEMA_VERSION,
                     sessions: &sessions.export_state(),
                     workspaces: None,
                     settings: None,
@@ -12217,9 +11494,7 @@ mod tests {
                     run_messages: None,
                     run_activities: Some(&completed_activities),
                     filesystem_records: None,
-                    records: &[],
-                    feed: None,
-                    sections: &invalid_sections,
+                    feed: Some(&invalid_feed),
                 })
                 .is_err()
         );
@@ -12233,7 +11508,6 @@ mod tests {
         );
         persistence
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &sessions.export_state(),
                 workspaces: None,
                 settings: None,
@@ -12248,9 +11522,7 @@ mod tests {
                 run_messages: None,
                 run_activities: Some(&completed_activities),
                 filesystem_records: None,
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
         assert_eq!(
@@ -12509,10 +11781,10 @@ mod tests {
         assert!(loaded_filesystem.payload.get("repositories").is_none());
         assert!(loaded_filesystem.payload.get("directories").is_none());
 
+        let invalid_feed = invalid_feed_for_rollback();
         assert!(
             persistence
                 .save_state(DurableStateWrite {
-                    schema_version: CURRENT_SCHEMA_VERSION,
                     sessions: &sessions.export_state(),
                     workspaces: Some(&workspaces.export_state()),
                     settings: Some(&DurableSessionSettings::default()),
@@ -12530,9 +11802,7 @@ mod tests {
                         checkpoints: Vec::new(),
                         ..filesystem_records[0].clone()
                     }]),
-                    records: &[],
-                    feed: None,
-                    sections: &[("", serde_json::json!({"invalid": true}))],
+                    feed: Some(&invalid_feed),
                 })
                 .is_err()
         );
@@ -12774,7 +12044,6 @@ mod tests {
         }];
         persistence
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &sessions.export_state(),
                 workspaces: Some(&workspaces.export_state()),
                 settings: Some(&settings),
@@ -12789,9 +12058,7 @@ mod tests {
                 run_messages: None,
                 run_activities: None,
                 filesystem_records: Some(&empty_filesystem_records),
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
         assert!(
@@ -12895,7 +12162,6 @@ mod tests {
         );
         persistence
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &manager.export_state(),
                 workspaces: None,
                 settings: None,
@@ -12910,9 +12176,7 @@ mod tests {
                 run_messages: Some(&run_messages),
                 run_activities: None,
                 filesystem_records: None,
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
 
@@ -13104,7 +12368,6 @@ mod tests {
         );
         persistence
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &manager.export_state(),
                 workspaces: None,
                 settings: None,
@@ -13119,9 +12382,7 @@ mod tests {
                 run_messages: Some(&run_messages),
                 run_activities: None,
                 filesystem_records: None,
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
         let after_stale_snapshot = persistence.load_run_messages(run_id).unwrap();
@@ -13133,7 +12394,6 @@ mod tests {
         mismatched_messages.get_mut(&run_id).unwrap()[2].content = "replacement tail".to_owned();
         persistence
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &manager.export_state(),
                 workspaces: None,
                 settings: None,
@@ -13148,9 +12408,7 @@ mod tests {
                 run_messages: Some(&mismatched_messages),
                 run_activities: None,
                 filesystem_records: None,
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
         let after_mismatch = persistence.load_run_messages(run_id).unwrap();
@@ -13169,10 +12427,10 @@ mod tests {
         let mut assembled_messages = run_messages.clone();
         assembled_messages.get_mut(&run_id).unwrap()[1].content = "seedhello world!".to_owned();
         assembled_messages.get_mut(&run_id).unwrap()[2].content = "partial".to_owned();
+        let invalid_feed = invalid_feed_for_rollback();
         assert!(
             persistence
                 .save_state(DurableStateWrite {
-                    schema_version: CURRENT_SCHEMA_VERSION,
                     sessions: &manager.export_state(),
                     workspaces: None,
                     settings: None,
@@ -13187,9 +12445,7 @@ mod tests {
                     run_messages: Some(&assembled_messages),
                     run_activities: None,
                     filesystem_records: None,
-                    records: &[],
-                    feed: None,
-                    sections: &[("", serde_json::json!({"invalid": true}))],
+                    feed: Some(&invalid_feed),
                 })
                 .is_err()
         );
@@ -13207,7 +12463,6 @@ mod tests {
         assert_eq!(retained_fragments, 5);
         persistence
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &manager.export_state(),
                 workspaces: None,
                 settings: None,
@@ -13222,9 +12477,7 @@ mod tests {
                 run_messages: Some(&assembled_messages),
                 run_activities: None,
                 filesystem_records: None,
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
         let after_consolidation = persistence.load_run_messages(run_id).unwrap();
@@ -13317,126 +12570,12 @@ mod tests {
     }
 
     #[test]
-    fn typed_session_rows_roll_back_with_the_rest_of_the_state_write() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let persistence = FilePersistence::open(&path).unwrap();
-        let mut manager = SessionManager::default();
-        manager
-            .create_in_workspace(WorkspaceId::new(), "Atomic session")
-            .unwrap();
-        let state = manager.export_state();
-
-        assert!(
-            persistence
-                .save_state_with_sessions(
-                    CURRENT_SCHEMA_VERSION,
-                    &state,
-                    &[("", serde_json::json!({"invalid": true}))],
-                )
-                .is_err()
-        );
-        assert!(persistence.load_sessions().unwrap().is_none());
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn run_sections_can_be_listed_and_loaded_by_subtree() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let store = FilePersistence::open(&path).unwrap();
-        let first = format!("run:{}", Uuid::new_v4());
-        let second = format!("run:{}", Uuid::new_v4());
-        store
-            .save_sections(
-                CURRENT_SCHEMA_VERSION,
-                &[
-                    (
-                        &first,
-                        serde_json::json!({
-                            "run": {"state": "completed"},
-                            "messages": ["small summary", "large transcript".repeat(1_000)]
-                        }),
-                    ),
-                    (
-                        &second,
-                        serde_json::json!({"run": {"state": "failed"}, "messages": []}),
-                    ),
-                ],
-            )
-            .unwrap();
-        assert_eq!(store.list_sections_with_prefix("run:").unwrap().len(), 2);
-        assert_eq!(
-            store
-                .load_section_path::<Value>(&first, "/krun", CURRENT_SCHEMA_VERSION)
-                .unwrap()
-                .unwrap(),
-            serde_json::json!({"state": "completed"})
-        );
-        assert!(
-            store
-                .load_section_path::<Value>(&first, "/kmissing", CURRENT_SCHEMA_VERSION)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            store
-                .load_section_path::<Value>(&first, "krun", CURRENT_SCHEMA_VERSION)
-                .unwrap_err()
-                .code,
-            ErrorCode::InvalidRequest
-        );
-        assert_eq!(
-            store
-                .load_section_path::<Value>(&first, "/krun", CURRENT_SCHEMA_VERSION + 1)
-                .unwrap_err()
-                .code,
-            ErrorCode::MalformedPayload
-        );
-        let full_section = store
-            .load_section_path::<Value>(&first, "", CURRENT_SCHEMA_VERSION)
-            .unwrap()
-            .unwrap();
-        assert_eq!(full_section["run"]["state"], "completed");
-        assert_eq!(
-            store
-                .load_section_path::<String>(&first, "/krun", CURRENT_SCHEMA_VERSION)
-                .unwrap_err()
-                .code,
-            ErrorCode::MalformedPayload
-        );
-        assert!(
-            store
-                .load_section_path::<Value>("run:missing", "/krun", CURRENT_SCHEMA_VERSION)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            store
-                .load_section::<String>(&first, CURRENT_SCHEMA_VERSION)
-                .unwrap_err()
-                .code,
-            ErrorCode::MalformedPayload
-        );
-        assert!(
-            store
-                .load_section::<Value>("run:missing", CURRENT_SCHEMA_VERSION)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            store
-                .load_section::<Value>(&first, CURRENT_SCHEMA_VERSION + 1)
-                .unwrap_err()
-                .code,
-            ErrorCode::MalformedPayload
-        );
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn run_message_pages_reject_invalid_limits_and_cursors() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let store = FilePersistence::open(&path).unwrap();
-        store.save_sections(CURRENT_SCHEMA_VERSION, &[]).unwrap();
+        store
+            .save_state_with_sessions(&SessionManager::default().export_state())
+            .unwrap();
         let run_id = RunId::new();
         assert!(
             store
@@ -13568,7 +12707,6 @@ mod tests {
                     feed: &DurableFeedState|
          -> Result<()> {
             persistence.save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions,
                 workspaces: None,
                 settings: None,
@@ -13583,9 +12721,7 @@ mod tests {
                 run_messages: None,
                 run_activities: None,
                 filesystem_records: None,
-                records: &[],
                 feed: Some(feed),
-                sections: &[],
             })
         };
         save(&initial_sessions, &run_summaries, &feed).unwrap();
@@ -13725,7 +12861,6 @@ mod tests {
         feed.next_sequence = EventSequence::new(2);
         reopened
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &resolving_sessions,
                 workspaces: None,
                 settings: None,
@@ -13740,9 +12875,7 @@ mod tests {
                 run_messages: None,
                 run_activities: None,
                 filesystem_records: None,
-                records: &[],
                 feed: Some(&feed),
-                sections: &[],
             })
             .unwrap();
         assert_eq!(
@@ -13777,7 +12910,6 @@ mod tests {
         let evaluating_summaries = BTreeMap::from([(run_id, summary)]);
         reopened
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &resolving_sessions,
                 workspaces: None,
                 settings: None,
@@ -13792,9 +12924,7 @@ mod tests {
                 run_messages: None,
                 run_activities: None,
                 filesystem_records: None,
-                records: &[],
                 feed: Some(&feed),
-                sections: &[],
             })
             .unwrap();
         assert_eq!(
@@ -13953,7 +13083,6 @@ mod tests {
         let activities = BTreeMap::from([(run_id, activities)]);
         persistence
             .save_state(DurableStateWrite {
-                schema_version: CURRENT_SCHEMA_VERSION,
                 sessions: &sessions.export_state(),
                 workspaces: None,
                 settings: None,
@@ -13968,9 +13097,7 @@ mod tests {
                 run_messages: None,
                 run_activities: Some(&activities),
                 filesystem_records: None,
-                records: &[],
                 feed: None,
-                sections: &[],
             })
             .unwrap();
 
@@ -14065,13 +13192,7 @@ mod tests {
             workspace_events: Vec::new(),
         };
         store
-            .save_state_with_sessions_entities_and_feed(
-                CURRENT_SCHEMA_VERSION,
-                &sessions,
-                &[],
-                Some(&feed),
-                &[],
-            )
+            .save_state_with_sessions_and_feed(&sessions, Some(&feed))
             .unwrap();
         let header = store.load_feed_header().unwrap().unwrap();
         assert_eq!(header.next_sequence, EventSequence::new(4));
@@ -14234,13 +13355,7 @@ mod tests {
             workspace_events: Vec::new(),
         };
         store
-            .save_state_with_sessions_entities_and_feed(
-                CURRENT_SCHEMA_VERSION,
-                &manager.export_state(),
-                &[],
-                Some(&feed),
-                &[],
-            )
+            .save_state_with_sessions_and_feed(&manager.export_state(), Some(&feed))
             .unwrap();
 
         let events_a = store
@@ -14320,12 +13435,9 @@ mod tests {
             workspace_events: vec![workspace_event(1, "First"), workspace_event(2, "Second")],
         };
         store
-            .save_state_with_sessions_entities_and_feed(
-                CURRENT_SCHEMA_VERSION,
+            .save_state_with_sessions_and_feed(
                 &SessionManager::default().export_state(),
-                &[],
                 Some(&feed),
-                &[],
             )
             .unwrap();
         let events = store
@@ -14365,13 +13477,7 @@ mod tests {
             workspace_events: Vec::new(),
         };
         store
-            .save_state_with_sessions_entities_and_feed(
-                CURRENT_SCHEMA_VERSION,
-                &manager.export_state(),
-                &[],
-                Some(&empty_feed),
-                &[],
-            )
+            .save_state_with_sessions_and_feed(&manager.export_state(), Some(&empty_feed))
             .unwrap();
         let feed = DurableFeedState {
             next_sequence: EventSequence::new(3),
