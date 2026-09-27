@@ -20,7 +20,8 @@ execution state, plans, transcripts, attempts, activities, interactions, and
 context checkpoints. No duplicate whole-run JSON snapshot is written.
 Schema v35 stores approval decisions, session limits, context budgets,
 checkpoint identity, and token cost rates as constrained scalar columns rather
-than JSON text; only the bounded context-inspection diagnostic remains JSON.
+than JSON text. Session approval policies use the same constrained per-action
+representation; only the bounded context-inspection diagnostic remains JSON.
 As requested, databases from schemas v34 and v35 are rejected without import
 or mutation. Schema v36 stores system and repository instructions as shared,
 compressed, content-addressed objects and factors reusable policy/limit options

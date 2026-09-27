@@ -437,7 +437,11 @@ CREATE INDEX IF NOT EXISTS workspaces_by_activity
     ON workspaces(updated_at DESC, id DESC);
 CREATE TABLE IF NOT EXISTS session_settings (
     session_id BLOB PRIMARY KEY NOT NULL CHECK(length(session_id) = 16),
-    approval_policy TEXT NOT NULL CHECK(length(approval_policy) <= 16384),
+    policy_read TEXT NOT NULL CHECK(policy_read IN ('allow', 'require_approval', 'deny')),
+    policy_write TEXT NOT NULL CHECK(policy_write IN ('allow', 'require_approval', 'deny')),
+    policy_command TEXT NOT NULL CHECK(policy_command IN ('allow', 'require_approval', 'deny')),
+    policy_network TEXT NOT NULL CHECK(policy_network IN ('allow', 'require_approval', 'deny')),
+    policy_destructive TEXT NOT NULL CHECK(policy_destructive IN ('allow', 'require_approval', 'deny')),
     auto_approve_actions INTEGER NOT NULL CHECK(auto_approve_actions IN (0, 1))
 ) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS workspace_configs (
@@ -1517,7 +1521,11 @@ impl FilePersistence {
         }
         let connection = self.connection()?;
         let mut statement = connection
-            .prepare("SELECT session_id, approval_policy, auto_approve_actions FROM session_settings ORDER BY session_id")
+            .prepare(
+                "SELECT session_id, policy_read, policy_write, policy_command, policy_network,
+                             policy_destructive, auto_approve_actions
+                      FROM session_settings ORDER BY session_id",
+            )
             .map_err(|error| {
                 persistence_error(format!("could not prepare session settings: {error}"), true)
             })?;
@@ -1526,7 +1534,11 @@ impl FilePersistence {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
                 ))
             })
             .map_err(|error| {
@@ -1534,17 +1546,18 @@ impl FilePersistence {
             })?;
         let mut settings = DurableSessionSettings::default();
         for row in rows {
-            let (id, policy, auto_approve) = row.map_err(|error| {
-                persistence_error(format!("could not read session settings: {error}"), true)
-            })?;
+            let (id, read, write, command, network, destructive, auto_approve) =
+                row.map_err(|error| {
+                    persistence_error(format!("could not read session settings: {error}"), true)
+                })?;
             let id = AgentSessionId::from_uuid(decode_uuid(&id, "session id")?);
-            let policy = serde_json::from_str(&policy).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    format!("persisted approval policy is malformed: {error}"),
-                    false,
-                )
-            })?;
+            let policy = ApprovalPolicy {
+                read: decode_policy_decision(&read, "read")?,
+                write: decode_policy_decision(&write, "write")?,
+                command: decode_policy_decision(&command, "command")?,
+                network: decode_policy_decision(&network, "network")?,
+                destructive: decode_policy_decision(&destructive, "destructive")?,
+            };
             let auto_approve = match auto_approve {
                 0 => false,
                 1 => true,
@@ -5765,16 +5778,6 @@ fn save_session_settings_rows(
             .get(&id)
             .copied()
             .unwrap_or_default();
-        let policy = serde_json::to_string(&policy).map_err(|error| {
-            persistence_error(format!("could not encode approval policy: {error}"), false)
-        })?;
-        if policy.len() > 16_384 {
-            return Err(LoomError::new(
-                ErrorCode::Persistence,
-                "approval policy exceeds the maximum supported size",
-                false,
-            ));
-        }
         let session_id = id.as_uuid().as_bytes();
         transaction
             .execute(
@@ -5786,14 +5789,32 @@ fn save_session_settings_rows(
             })?;
         transaction
             .execute(
-                "INSERT INTO session_settings(session_id, approval_policy, auto_approve_actions)
-                 VALUES (?1, ?2, ?3)
+                "INSERT INTO session_settings(
+                    session_id, policy_read, policy_write, policy_command,
+                    policy_network, policy_destructive, auto_approve_actions
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(session_id) DO UPDATE SET
-                    approval_policy=excluded.approval_policy,
+                    policy_read=excluded.policy_read,
+                    policy_write=excluded.policy_write,
+                    policy_command=excluded.policy_command,
+                    policy_network=excluded.policy_network,
+                    policy_destructive=excluded.policy_destructive,
                     auto_approve_actions=excluded.auto_approve_actions
-                 WHERE session_settings.approval_policy IS NOT excluded.approval_policy
+                 WHERE session_settings.policy_read IS NOT excluded.policy_read
+                    OR session_settings.policy_write IS NOT excluded.policy_write
+                    OR session_settings.policy_command IS NOT excluded.policy_command
+                    OR session_settings.policy_network IS NOT excluded.policy_network
+                    OR session_settings.policy_destructive IS NOT excluded.policy_destructive
                     OR session_settings.auto_approve_actions IS NOT excluded.auto_approve_actions",
-                params![session_id.as_slice(), policy, auto_approve],
+                params![
+                    session_id.as_slice(),
+                    encode_policy_decision(policy.read),
+                    encode_policy_decision(policy.write),
+                    encode_policy_decision(policy.command),
+                    encode_policy_decision(policy.network),
+                    encode_policy_decision(policy.destructive),
+                    auto_approve,
+                ],
             )
             .map_err(|error| {
                 persistence_error(
@@ -10137,6 +10158,50 @@ mod tests {
             "identical runtime configurations share one profile"
         );
         drop(connection);
+        let mut changed_runtime_config = run_runtime_configs[&run_id].clone();
+        changed_runtime_config.approval_policy.write = PolicyDecision::Allow;
+        let mut changed_configs = BTreeMap::from([(run_id, changed_runtime_config.clone())]);
+        let mut connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let transaction = connection.transaction().unwrap();
+        save_run_runtime_config_rows(&transaction, &changed_configs).unwrap();
+        transaction.commit().unwrap();
+        let remaining_profiles: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_configurations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            remaining_profiles, 2,
+            "the shared old profile remains in use"
+        );
+        drop(connection);
+        assert_eq!(
+            persistence.load_run_runtime_config(run_id).unwrap(),
+            Some(changed_runtime_config.clone())
+        );
+        assert_eq!(
+            persistence.load_run_runtime_config(second_run_id).unwrap(),
+            Some(run_runtime_configs[&run_id].clone())
+        );
+
+        changed_configs.insert(second_run_id, changed_runtime_config.clone());
+        let mut connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let transaction = connection.transaction().unwrap();
+        save_run_runtime_config_rows(&transaction, &changed_configs).unwrap();
+        transaction.commit().unwrap();
+        let remaining_profiles: i64 = connection
+            .query_row("SELECT COUNT(*) FROM runtime_configurations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining_profiles, 1, "the unused profile is collected");
+        drop(connection);
+        assert_eq!(
+            persistence.load_run_runtime_config(second_run_id).unwrap(),
+            Some(changed_runtime_config)
+        );
         assert_eq!(
             persistence.load_run_context_checkpoint(run_id).unwrap(),
             Some(context_checkpoint.clone())
@@ -10297,6 +10362,24 @@ mod tests {
         assert_eq!(retained_filesystem.checkpoints, vec![checkpoint.clone()]);
 
         let connection = Connection::open(&path).unwrap();
+        let (stored_policy, policy_storage_type): (String, String) = connection
+            .query_row(
+                "SELECT policy_write, typeof(policy_write) FROM session_settings
+                 WHERE session_id=?1",
+                [session.id.as_uuid().as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored_policy, "require_approval");
+        assert_eq!(policy_storage_type, "text");
+        let settings_columns = connection
+            .prepare("PRAGMA table_info(session_settings)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .unwrap();
+        assert!(!settings_columns.contains("approval_policy"));
         let repo_plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT path FROM session_repositories
