@@ -1236,6 +1236,22 @@ pub struct DurableRunMessageHeader {
 
 pub type DurableRunActivities = BTreeMap<RunId, Vec<AgentActivityRecord>>;
 
+/// A worker checkpoint contains only one run and its owning session filesystem.
+/// Catalogs and idempotency records are persisted by the broader state flush.
+pub struct DurableRunCheckpointWrite<'a> {
+    pub session: &'a AgentSessionSnapshot,
+    pub session_next_sequence: EventSequence,
+    pub prune_feed: bool,
+    pub summary: &'a DurableRunSummary,
+    pub runtime_config: &'a DurableRunRuntimeConfig,
+    pub context_checkpoint: Option<&'a DurableRunContextCheckpoint>,
+    pub plan: &'a AgentPlan,
+    pub messages: &'a [DurableRunMessage],
+    pub activities: &'a [AgentActivityRecord],
+    pub filesystem: Option<&'a DurableFilesystemRecord>,
+    pub feed: &'a DurableFeedState,
+}
+
 #[derive(Clone, Debug)]
 pub struct DurableFilesystemRecord {
     pub session_id: AgentSessionId,
@@ -5104,6 +5120,63 @@ impl FilePersistence {
         })
     }
 
+    /// Atomically checkpoints one worker run, its owner filesystem, and the
+    /// captured event-feed state without enumerating or pruning other catalogs.
+    pub fn save_run_checkpoint(&self, write: DurableRunCheckpointWrite<'_>) -> Result<()> {
+        let run_id = write.summary.snapshot.id;
+        if write.session.id != write.summary.snapshot.session_id
+            || write
+                .activities
+                .iter()
+                .any(|activity| activity.run_id != run_id)
+            || write.filesystem.is_some_and(|filesystem| {
+                filesystem.session_id != write.summary.snapshot.session_id
+            })
+        {
+            return Err(LoomError::invalid_request(
+                "run checkpoint records must belong to the same run and session",
+            ));
+        }
+        let summaries = BTreeMap::from([(run_id, write.summary.clone())]);
+        let runtime_configs = BTreeMap::from([(run_id, write.runtime_config.clone())]);
+        let context_checkpoints = BTreeMap::from([(run_id, write.context_checkpoint.cloned())]);
+        let plans = BTreeMap::from([(run_id, write.plan.clone())]);
+        let messages = BTreeMap::from([(run_id, write.messages.to_vec())]);
+        let activities = BTreeMap::from([(run_id, write.activities.to_vec())]);
+
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin run checkpoint transaction: {error}"),
+                true,
+            )
+        })?;
+        save_session_checkpoint_row(&transaction, write.session, write.session_next_sequence)?;
+        save_run_summary_rows(&transaction, &summaries)?;
+        save_run_attempt_rows(&transaction, &summaries)?;
+        save_run_execution_state_rows(&transaction, &summaries)?;
+        save_run_runtime_config_rows(&transaction, &runtime_configs)?;
+        save_run_context_checkpoint_rows(&transaction, &context_checkpoints)?;
+        save_run_plan_rows(&transaction, &plans, Some(&summaries))?;
+        save_run_activity_rows(&transaction, &activities)?;
+        save_run_tool_rows(&transaction, &activities, Some(&summaries))?;
+        save_run_message_rows(&transaction, &messages)?;
+        if let Some(filesystem) = write.filesystem {
+            save_filesystem_records(&transaction, std::slice::from_ref(filesystem))?;
+        }
+        if write.prune_feed {
+            save_feed_rows(&transaction, write.feed)?;
+        } else {
+            save_feed_rows_incremental(&transaction, write.feed)?;
+        }
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit run checkpoint transaction: {error}"),
+                true,
+            )
+        })
+    }
+
     /// Collects a bounded batch of content objects and blobs queued by reference changes.
     /// Ordinary writes process smaller batches; callers can repeat this method to drain a
     /// backlog without scanning all stored content on every transaction.
@@ -6502,6 +6575,61 @@ fn save_session_rows(transaction: &Transaction<'_>, state: &SessionManagerState)
         )
         .map_err(|error| {
             persistence_error(format!("could not prune session catalog: {error}"), true)
+        })?;
+    Ok(())
+}
+
+fn save_session_checkpoint_row(
+    transaction: &Transaction<'_>,
+    session: &AgentSessionSnapshot,
+    next_sequence: EventSequence,
+) -> Result<()> {
+    let next_sequence = i64::try_from(next_sequence.value()).map_err(|_| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            "session lifecycle sequence exceeds SQLite's integer range",
+            false,
+        )
+    })?;
+    transaction
+        .execute(
+            "INSERT INTO session_store_meta(singleton, next_sequence) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET
+                next_sequence=MAX(session_store_meta.next_sequence, excluded.next_sequence)",
+            [next_sequence],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not save session sequence: {error}"), true)
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO sessions(id, workspace_id, name, state, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                workspace_id=excluded.workspace_id,
+                name=excluded.name,
+                state=excluded.state,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at
+             WHERE sessions.workspace_id IS NOT excluded.workspace_id
+                OR sessions.name IS NOT excluded.name
+                OR sessions.state IS NOT excluded.state
+                OR sessions.created_at IS NOT excluded.created_at
+                OR sessions.updated_at IS NOT excluded.updated_at",
+            params![
+                session.id.as_uuid().as_bytes().as_slice(),
+                session.workspace_id.as_uuid().as_bytes().as_slice(),
+                session.name,
+                session_state_name(session.state),
+                encode_timestamp(session.created_at)?,
+                encode_timestamp(session.updated_at)?,
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not save session checkpoint {}: {error}", session.id),
+                true,
+            )
         })?;
     Ok(())
 }
@@ -9227,6 +9355,35 @@ fn save_feed_rows_with_limits(
     session_byte_limit: usize,
     total_byte_limit: usize,
 ) -> Result<()> {
+    save_feed_rows_with_limits_and_pruning(
+        transaction,
+        feed,
+        session_byte_limit,
+        total_byte_limit,
+        true,
+    )
+}
+
+fn save_feed_rows_incremental(
+    transaction: &Transaction<'_>,
+    feed: &DurableFeedState,
+) -> Result<()> {
+    save_feed_rows_with_limits_and_pruning(
+        transaction,
+        feed,
+        MAX_DURABLE_FEED_SESSION_BYTES,
+        MAX_DURABLE_FEED_TOTAL_BYTES,
+        false,
+    )
+}
+
+fn save_feed_rows_with_limits_and_pruning(
+    transaction: &Transaction<'_>,
+    feed: &DurableFeedState,
+    session_byte_limit: usize,
+    total_byte_limit: usize,
+    prune: bool,
+) -> Result<()> {
     let next_sequence = i64::try_from(feed.next_sequence.value()).map_err(|_| {
         LoomError::new(
             ErrorCode::Persistence,
@@ -9436,6 +9593,10 @@ fn save_feed_rows_with_limits(
             params![event.workspace_id.as_uuid().as_bytes().as_slice(), sequence],
         ).map_err(|error| persistence_error(format!("could not save workspace feed cursor: {error}"), true))?;
     }
+    save_feed_store_meta(transaction, next_sequence, retention_limit)?;
+    if !prune {
+        return Ok(());
+    }
     transaction
         .execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS _loom_pruned_feed (
@@ -9526,20 +9687,6 @@ fn save_feed_rows_with_limits(
         })?;
     transaction
         .execute(
-            "INSERT INTO feed_store_meta(singleton, next_sequence, retention_limit)
-             VALUES (1, ?1, ?2)
-             ON CONFLICT(singleton) DO UPDATE SET
-                next_sequence=excluded.next_sequence,
-                retention_limit=excluded.retention_limit
-             WHERE feed_store_meta.next_sequence IS NOT excluded.next_sequence
-                OR feed_store_meta.retention_limit IS NOT excluded.retention_limit",
-            params![next_sequence, retention_limit],
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not save event feed cursor: {error}"), true)
-        })?;
-    transaction
-        .execute(
             "DELETE FROM feed_events WHERE sequence IN (
                 SELECT sequence FROM _loom_pruned_feed
              )",
@@ -9602,6 +9749,28 @@ fn save_feed_rows_with_limits(
         )
         .map_err(|error| {
             persistence_error(format!("could not prune workspace feed: {error}"), true)
+        })?;
+    Ok(())
+}
+
+fn save_feed_store_meta(
+    transaction: &Transaction<'_>,
+    next_sequence: i64,
+    retention_limit: i64,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO feed_store_meta(singleton, next_sequence, retention_limit)
+             VALUES (1, ?1, ?2)
+             ON CONFLICT(singleton) DO UPDATE SET
+                next_sequence=MAX(feed_store_meta.next_sequence, excluded.next_sequence),
+                retention_limit=excluded.retention_limit
+             WHERE feed_store_meta.next_sequence < excluded.next_sequence
+                OR feed_store_meta.retention_limit IS NOT excluded.retention_limit",
+            params![next_sequence, retention_limit],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not save event feed cursor: {error}"), true)
         })?;
     Ok(())
 }
@@ -10139,6 +10308,198 @@ mod tests {
                 value: "durable".to_owned()
             }
         );
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut sessions = SessionManager::default();
+        let (session, _) = sessions
+            .create_in_workspace(WorkspaceId::new(), "worker session")
+            .unwrap();
+        let run_id = RunId::new();
+        let other_run_id = RunId::new();
+        let make_summary = |id, task: &str| DurableRunSummary {
+            snapshot: AgentRunSnapshot {
+                id,
+                attempt_id: loom_core::RunAttemptId::new(),
+                control_revision: 0,
+                session_id: session.id,
+                task: task.to_owned(),
+                model: ModelId::new("deterministic-model"),
+                state: AgentRunState::Planning,
+                started_at: Timestamp::from_unix_millis(1),
+                updated_at: Timestamp::from_unix_millis(1),
+                completed_at: None,
+                summary: None,
+                evidence: Vec::new(),
+            },
+            usage: UsageSnapshot::default(),
+            attempts: None,
+            execution_state: None,
+            interactions: None,
+        };
+        let initial_summary = make_summary(run_id, "before");
+        let other_summary = make_summary(other_run_id, "unrelated run");
+        let initial_runs = BTreeMap::from([
+            (run_id, initial_summary.clone()),
+            (other_run_id, other_summary.clone()),
+        ]);
+        persistence
+            .save_state(DurableStateWrite {
+                schema_version: CURRENT_SCHEMA_VERSION,
+                sessions: &sessions.export_state(),
+                workspaces: None,
+                settings: None,
+                workspace_configs: None,
+                providers: None,
+                usage: None,
+                idempotency: None,
+                run_summaries: Some(&initial_runs),
+                run_runtime_configs: None,
+                run_context_checkpoints: None,
+                run_plans: None,
+                run_messages: None,
+                run_activities: None,
+                filesystem_records: None,
+                records: &[],
+                feed: None,
+                sections: &[],
+            })
+            .unwrap();
+
+        let mut updated_summary = initial_summary.clone();
+        updated_summary.snapshot.task = "after checkpoint".to_owned();
+        let runtime_config = DurableRunRuntimeConfig {
+            system_instructions: None,
+            repository_instructions: None,
+            approval_policy: ApprovalPolicy::default(),
+            limits: loom_core::SessionLimits::default(),
+            context_options: ContextAssemblyOptions::default(),
+            checkpoint_id: None,
+            input_cost_micros_per_1k: 0,
+            output_cost_micros_per_1k: 0,
+            context_inspection: None,
+        };
+        let mut changed_session = session.clone();
+        changed_session.state = AgentSessionState::Planning;
+        changed_session.updated_at = Timestamp::now();
+        let invalid_session_id = AgentSessionId::new();
+        let invalid_feed = DurableFeedState {
+            next_sequence: EventSequence::new(1),
+            retention_limit: 250,
+            events: vec![ServerEventEnvelope {
+                protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(1),
+                session_id: invalid_session_id,
+                event: loom_protocol::ServerEvent::AgentSessionCreated {
+                    snapshot: changed_session.clone(),
+                },
+            }],
+            workspace_events: Vec::new(),
+        };
+        let plan = loom_protocol::AgentPlan { steps: Vec::new() };
+        let invalid_checkpoint = DurableRunCheckpointWrite {
+            session: &changed_session,
+            session_next_sequence: EventSequence::new(1),
+            prune_feed: false,
+            summary: &updated_summary,
+            runtime_config: &runtime_config,
+            context_checkpoint: None,
+            plan: &plan,
+            messages: &[],
+            activities: &[],
+            filesystem: None,
+            feed: &invalid_feed,
+        };
+        assert!(persistence.save_run_checkpoint(invalid_checkpoint).is_err());
+        assert_eq!(
+            persistence.load_run_summary(run_id).unwrap().unwrap(),
+            initial_summary,
+            "feed failure must roll back the run summary"
+        );
+        assert_eq!(
+            persistence
+                .load_sessions()
+                .unwrap()
+                .unwrap()
+                .sessions
+                .get(&session.id)
+                .unwrap()
+                .state,
+            AgentSessionState::Idle,
+            "feed failure must roll back the owning session projection"
+        );
+        assert_eq!(
+            persistence.load_run_summary(other_run_id).unwrap().unwrap(),
+            other_summary,
+            "a worker checkpoint must leave unrelated runs untouched"
+        );
+
+        let valid_feed = DurableFeedState {
+            next_sequence: EventSequence::new(1),
+            retention_limit: 250,
+            events: vec![ServerEventEnvelope {
+                protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(1),
+                session_id: session.id,
+                event: loom_protocol::ServerEvent::AgentSessionCreated {
+                    snapshot: changed_session.clone(),
+                },
+            }],
+            workspace_events: Vec::new(),
+        };
+        let valid_checkpoint = DurableRunCheckpointWrite {
+            session: &changed_session,
+            session_next_sequence: EventSequence::new(1),
+            prune_feed: false,
+            summary: &updated_summary,
+            runtime_config: &runtime_config,
+            context_checkpoint: None,
+            plan: &plan,
+            messages: &[],
+            activities: &[],
+            filesystem: None,
+            feed: &valid_feed,
+        };
+        persistence.save_run_checkpoint(valid_checkpoint).unwrap();
+        drop(persistence);
+        let reopened = FilePersistence::open(&path).unwrap();
+        assert_eq!(
+            reopened
+                .load_sessions()
+                .unwrap()
+                .unwrap()
+                .sessions
+                .get(&session.id)
+                .unwrap()
+                .state,
+            AgentSessionState::Planning
+        );
+        assert_eq!(
+            reopened
+                .load_run_summary(run_id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .task,
+            "after checkpoint"
+        );
+        assert_eq!(
+            reopened.load_run_summary(other_run_id).unwrap().unwrap(),
+            other_summary
+        );
+        assert_eq!(
+            reopened
+                .load_feed_events_since(Some(session.id), None)
+                .unwrap()
+                .len(),
+            1,
+            "feed rows and the session/run projections commit together"
+        );
+        drop(reopened);
         fs::remove_file(path).unwrap();
     }
 

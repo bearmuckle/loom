@@ -110,6 +110,12 @@ impl SessionManager {
             .ok_or_else(|| LoomError::not_found("agent session", session_id))
     }
 
+    /// Returns the workspace-wide lifecycle sequence high-water mark without
+    /// cloning the session catalog.
+    pub fn next_sequence(&self) -> EventSequence {
+        self.next_sequence
+    }
+
     pub fn list_in_workspace(
         &self,
         workspace_id: Option<WorkspaceId>,

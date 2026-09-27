@@ -224,9 +224,19 @@ The following records the code-level baseline from the initial investigation; it
 
 `persist_state` clones all runs and filesystem state, exports the other managers,
 converts every section to `Value`, and submits all 13 sections for serialization
-and UPSERT in one transaction. This happens after successful durable mutation
-requests and after each completed agent step. A small rename therefore traverses
-and serializes unrelated checkpoints, archived runs, and journal history.
+and UPSERT in one transaction. This was also the run-step path at the time of
+the initial baseline: a small rename or completed agent step traversed unrelated
+checkpoints, archived runs, and journal history.
+
+The current worker path checkpoints only the active run, its owning session and
+filesystem, and the captured feed batch in one transaction. It avoids enumerating
+other runs/catalogs and acknowledges feed rows only after commit. The active run's
+full message/activity history and the owning filesystem's retained history are
+still copied on each step; feed retention's global ranking scan is amortized at
+64 event sequences or 4 MiB of new encoded payload. General state flushes for
+catalog/settings/idempotency changes and worker completion still use the full
+state path. Delta writes for transcript/activity/filesystem history and a write
+scaling benchmark remain follow-up work.
 
 This is roughly 15.58 MB of serialized input per save in this sample, plus typed
 clones and intermediate JSON allocations. It is not a measurement of physical

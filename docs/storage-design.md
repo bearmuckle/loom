@@ -625,12 +625,17 @@ Implement in this order:
    and refresh that session. The SQLite history page query is bounded and avoids
    hydrating retained history, but its request refresh still polls the selected
    filesystem service for external changes.
-5. Complete write-path and storage maintenance work. Session and workspace
+5. Complete write-path and storage maintenance work. Worker steps now checkpoint
+   one run, its owning session/filesystem, and its feed batch transactionally
+   instead of exporting unrelated runs/catalogs. The selected run's messages,
+   activities, and filesystem history are still copied in full each step; global
+   state flushes remain for other operations. Session and workspace
    streams now use indexed durable cursors, workspace rename/configuration
    events, and persisted session projections captured with their cursor in one
    read transaction. Whole-state exports remain on some writes; bounded edit undo,
-   paged canonical context loading, content-GC cadence, and cleanup of unused
-   generic section storage remain follow-up work.
+   per-message/activity/filesystem deltas, paged canonical context loading,
+   content-GC cadence, and cleanup of unused generic section storage remain
+   follow-up work.
 
 This release has a clean start only. It does not copy, import, rename, or remove
 an existing state database. When the configured path contains an unsupported

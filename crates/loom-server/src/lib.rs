@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, Weak},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -20,8 +21,9 @@ use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, Prov
 use loom_persistence::{
     CURRENT_SCHEMA_VERSION, DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor,
     DurableFilesystemEdit, DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
-    DurableRunContextCheckpoint, DurableRunMessage, DurableRunRuntimeConfig, DurableRunSummary,
-    DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
+    DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
+    DurableRunRuntimeConfig, DurableRunSummary, DurableSessionProjectionRead,
+    DurableSessionSettings, DurableStateWrite, FilePersistence,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -68,6 +70,19 @@ fn current_unix_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+const FEED_PRUNE_AFTER_NEW_SEQUENCES: u64 = 64;
+const FEED_PRUNE_AFTER_NEW_BYTES: usize = 4 * 1024 * 1024;
+
+fn should_prune_worker_feed(
+    next_sequence: u64,
+    last_pruned_sequence: u64,
+    accumulated_bytes: usize,
+    pending_bytes: usize,
+) -> bool {
+    next_sequence.saturating_sub(last_pruned_sequence) >= FEED_PRUNE_AFTER_NEW_SEQUENCES
+        || accumulated_bytes.saturating_add(pending_bytes) >= FEED_PRUNE_AFTER_NEW_BYTES
 }
 
 fn validate_retry_horizon(request_id: RequestId, now_ms: u64) -> Result<()> {
@@ -1681,6 +1696,8 @@ pub struct InProcessBackend {
     runs: Mutex<BTreeMap<loom_core::RunId, Arc<RunHandle>>>,
     persisted_runs: Mutex<BTreeMap<loom_core::RunId, PersistedRunSummary>>,
     journal: Mutex<EventJournal>,
+    last_feed_pruned_sequence: AtomicU64,
+    feed_bytes_since_prune: AtomicUsize,
     session_filesystems: Mutex<BTreeMap<AgentSessionId, Workspace>>,
     persisted_session_filesystems: Mutex<BTreeSet<AgentSessionId>>,
     session_filesystem_restore: Mutex<()>,
@@ -1998,6 +2015,8 @@ impl InProcessBackend {
             runs: Mutex::new(BTreeMap::new()),
             persisted_runs: Mutex::new(BTreeMap::new()),
             journal: Mutex::new(EventJournal::default()),
+            last_feed_pruned_sequence: AtomicU64::new(0),
+            feed_bytes_since_prune: AtomicUsize::new(0),
             session_filesystems: Mutex::new(BTreeMap::new()),
             persisted_session_filesystems: Mutex::new(BTreeSet::new()),
             session_filesystem_restore: Mutex::new(()),
@@ -2797,6 +2816,156 @@ impl InProcessBackend {
         self.persist_state_with_recovery_updates(&BTreeMap::new())
     }
 
+    /// Persists the current worker checkpoint without enumerating unrelated runs,
+    /// catalogs, or session filesystems. The journal lock is retained through the
+    /// transaction so only the captured event prefix can be acknowledged.
+    fn persist_run_checkpoint(&self, handle: &RunHandle) -> Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+        handle.flush_message_fragments(persistence)?;
+        let state = handle.state();
+        let summary = DurableRunSummary {
+            snapshot: state.run.clone(),
+            usage: state.usage.clone(),
+            attempts: Some(state.attempts.clone()),
+            execution_state: Some(execution_state_from_runtime(&state)?),
+            interactions: Some(state.interactions.clone()),
+        };
+        let mut context_inspection = state.context_inspection.clone();
+        if let Some(inspection) = &mut context_inspection {
+            inspection.summary = None;
+        }
+        let runtime_config = DurableRunRuntimeConfig {
+            system_instructions: state.task.system_instructions.clone(),
+            repository_instructions: state.task.repository_instructions.clone(),
+            approval_policy: state.approval_policy.clone(),
+            limits: state.options.limits.clone(),
+            context_options: state.options.context.clone(),
+            checkpoint_id: state.options.checkpoint_id,
+            input_cost_micros_per_1k: state.options.input_cost_micros_per_1k,
+            output_cost_micros_per_1k: state.options.output_cost_micros_per_1k,
+            context_inspection,
+        };
+        let context_checkpoint =
+            state
+                .context_checkpoint
+                .clone()
+                .map(|summary| DurableRunContextCheckpoint {
+                    session_id: state.session_id,
+                    summary,
+                });
+        let messages = durable_run_messages_from_runtime(&state.messages);
+        let activities = state.activities.clone();
+
+        let filesystem = {
+            let filesystem = self.session_filesystems()?.get(&state.session_id).cloned();
+            if let Some(filesystem) = filesystem {
+                let mut filesystem_state = filesystem.export_state()?;
+                let checkpoints = std::mem::take(&mut filesystem_state.checkpoints);
+                let edits = std::mem::take(&mut filesystem_state.edits)
+                    .into_iter()
+                    .map(|edit| DurableFilesystemEdit {
+                        path: edit.path,
+                        before: edit.before,
+                        before_bytes: edit.before_bytes,
+                        after_revision: edit.after_revision,
+                        source: edit.source,
+                    })
+                    .collect();
+                let changes = std::mem::take(&mut filesystem_state.changes);
+                let directories = filesystem
+                    .mounted_directories()?
+                    .into_iter()
+                    .map(|(path, source)| SessionDirectory {
+                        path,
+                        source: source.display().to_string(),
+                    })
+                    .collect::<Vec<_>>();
+                let repositories = self
+                    .session_repositories()?
+                    .get(&state.session_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let persisted = PersistedSessionFilesystem {
+                    filesystem: filesystem_state,
+                    repositories: repositories.clone(),
+                    directories: directories.clone(),
+                };
+                Some(DurableFilesystemRecord {
+                    session_id: state.session_id,
+                    root: persisted.filesystem.root.clone(),
+                    control: persisted.filesystem.control,
+                    checkpoints,
+                    edits,
+                    changes,
+                    repositories,
+                    directories,
+                    payload: json_value(persisted)?,
+                })
+            } else {
+                None
+            }
+        };
+
+        let mut journal = self.journal()?;
+        let event_count = journal.pending_events.len();
+        let workspace_event_count = journal.pending_workspace_events.len();
+        let feed = DurableFeedState {
+            next_sequence: journal.next_sequence,
+            retention_limit: journal.retention_limit,
+            events: journal.pending_events.clone(),
+            workspace_events: journal.pending_workspace_events.clone(),
+        };
+        // Full retention ranking scans the retained feed, so amortize it until
+        // at least 64 new global event sequences or 4 MiB of pending payloads
+        // have arrived. The byte threshold prevents large event bodies from
+        // overshooting the total feed retention budget between pruning passes.
+        let sequence = feed.next_sequence.value();
+        let last_pruned = self.last_feed_pruned_sequence.load(Ordering::Relaxed);
+        let pending_feed_bytes = serde_json::to_vec(&(&feed.events, &feed.workspace_events))
+            .map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    format!("could not size pending event feed: {error}"),
+                    false,
+                )
+            })?
+            .len();
+        let prior_feed_bytes = self.feed_bytes_since_prune.load(Ordering::Relaxed);
+        let accumulated_feed_bytes = prior_feed_bytes.saturating_add(pending_feed_bytes);
+        let prune_feed =
+            should_prune_worker_feed(sequence, last_pruned, prior_feed_bytes, pending_feed_bytes);
+        let session = self.sessions()?.get(state.session_id)?;
+        let session_next_sequence = self.sessions()?.next_sequence();
+        persistence.save_run_checkpoint(DurableRunCheckpointWrite {
+            session: &session,
+            session_next_sequence,
+            prune_feed,
+            summary: &summary,
+            runtime_config: &runtime_config,
+            context_checkpoint: context_checkpoint.as_ref(),
+            plan: &state.plan,
+            messages: &messages,
+            activities: &activities,
+            filesystem: filesystem.as_ref(),
+            feed: &feed,
+        })?;
+        if prune_feed {
+            self.last_feed_pruned_sequence
+                .store(sequence, Ordering::Relaxed);
+            self.feed_bytes_since_prune.store(0, Ordering::Relaxed);
+        } else {
+            self.feed_bytes_since_prune
+                .store(accumulated_feed_bytes, Ordering::Relaxed);
+        }
+        journal.pending_events.drain(..event_count);
+        journal
+            .pending_workspace_events
+            .drain(..workspace_event_count);
+        Ok(())
+    }
+
     fn persist_state_with_recovery_updates(
         &self,
         recovery_updates: &BTreeMap<loom_core::RunId, DurableRunSummary>,
@@ -3001,6 +3170,9 @@ impl InProcessBackend {
         if result.is_ok() {
             journal.pending_events.clear();
             journal.pending_workspace_events.clear();
+            self.last_feed_pruned_sequence
+                .store(feed.next_sequence.value(), Ordering::Relaxed);
+            self.feed_bytes_since_prune.store(0, Ordering::Relaxed);
         }
         result
     }
@@ -3233,7 +3405,7 @@ impl InProcessBackend {
                                 handle.record_failure(error);
                                 break;
                             }
-                            if let Err(error) = backend.persist_state() {
+                            if let Err(error) = backend.persist_run_checkpoint(&handle) {
                                 handle.record_failure(error);
                                 break;
                             }
@@ -3250,6 +3422,9 @@ impl InProcessBackend {
                             break;
                         }
                     }
+                }
+                if let Err(error) = backend.persist_state() {
+                    handle.record_failure(error);
                 }
                 handle.set_running(false);
                 if fragment_flusher.is_some_and(|flusher| flusher.join().is_err()) {
@@ -6521,6 +6696,34 @@ mod tests {
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
     use super::*;
+
+    #[test]
+    fn worker_feed_pruning_threshold_catches_large_payloads_before_count_limit() {
+        assert!(!should_prune_worker_feed(
+            10,
+            0,
+            0,
+            FEED_PRUNE_AFTER_NEW_BYTES - 1
+        ));
+        assert!(should_prune_worker_feed(
+            10,
+            0,
+            0,
+            FEED_PRUNE_AFTER_NEW_BYTES
+        ));
+        assert!(should_prune_worker_feed(
+            64,
+            0,
+            0,
+            FEED_PRUNE_AFTER_NEW_BYTES - 1
+        ));
+        assert!(should_prune_worker_feed(
+            10,
+            0,
+            FEED_PRUNE_AFTER_NEW_BYTES / 2,
+            FEED_PRUNE_AFTER_NEW_BYTES / 2
+        ));
+    }
 
     fn request_id_with_issued_at(issued_at_ms: u64) -> loom_core::RequestId {
         let mut bytes = *loom_core::RequestId::new().as_uuid().as_bytes();
