@@ -1452,6 +1452,8 @@ pub(crate) struct LoomView {
     local_directory_sources_available: bool,
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
     project_snapshot: Option<loom_core::ProjectSnapshot>,
+    /// Retain known project hierarchies while selection changes to another root.
+    project_tree_snapshots: Vec<loom_core::ProjectSnapshot>,
     project_child_review: Option<(
         loom_core::ProjectWorktreeRecord,
         loom_protocol::GitRepositoryStatus,
@@ -1660,14 +1662,74 @@ fn find_session_tree_item<'a>(items: &'a [TreeItem], session_id: &str) -> Option
     None
 }
 
+#[cfg(test)]
 fn project_session_list_projection(
     sessions: &[AgentSessionSnapshot],
     active_session_id: AgentSessionId,
     project: Option<&loom_core::ProjectSnapshot>,
 ) -> SessionListProjection {
-    let Some(project) = project else {
+    project_session_list_projection_for_projects(
+        sessions,
+        active_session_id,
+        project.into_iter().collect(),
+    )
+}
+
+fn project_session_list_projection_for_projects(
+    sessions: &[AgentSessionSnapshot],
+    active_session_id: AgentSessionId,
+    projects: Vec<&loom_core::ProjectSnapshot>,
+) -> SessionListProjection {
+    if projects.is_empty() {
         return session_list_projection(sessions, active_session_id);
-    };
+    }
+    let mut tree = Vec::new();
+    let mut included = BTreeSet::new();
+    for project in projects {
+        let projection =
+            project_session_list_projection_for_project(sessions, active_session_id, project);
+        if let Some(root) = projection
+            .tree
+            .into_iter()
+            .find(|node| node.session_id == project.root_session_id)
+            && included.insert(root.session_id)
+        {
+            fn include_descendants(
+                node: &SessionTreeNode,
+                included: &mut BTreeSet<AgentSessionId>,
+            ) {
+                included.insert(node.session_id);
+                for child in &node.children {
+                    include_descendants(child, included);
+                }
+            }
+            include_descendants(&root, &mut included);
+            tree.push(root);
+        }
+    }
+    for session in sessions {
+        if included.insert(session.id) {
+            tree.push(SessionTreeNode {
+                session_id: session.id,
+                label: session.name.clone(),
+                children: Vec::new(),
+            });
+        }
+    }
+    tree.sort_by_key(|node| {
+        sessions
+            .iter()
+            .position(|session| session.id == node.session_id)
+            .unwrap_or(usize::MAX)
+    });
+    session_list_projection_from_tree(tree, active_session_id)
+}
+
+fn project_session_list_projection_for_project(
+    sessions: &[AgentSessionSnapshot],
+    active_session_id: AgentSessionId,
+    project: &loom_core::ProjectSnapshot,
+) -> SessionListProjection {
     let sessions_by_id = sessions
         .iter()
         .map(|session| (session.id, session))
@@ -2179,6 +2241,7 @@ impl LoomView {
             local_directory_sources_available: true,
             sessions: Vec::new(),
             project_snapshot: None,
+            project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
             project_messages: Vec::new(),
@@ -2576,6 +2639,7 @@ impl LoomView {
                 Vec::new()
             },
             project_snapshot: None,
+            project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
             project_messages: Vec::new(),
@@ -2745,6 +2809,7 @@ impl LoomView {
                 Vec::new()
             },
             project_snapshot: None,
+            project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
             project_messages: Vec::new(),
@@ -2999,6 +3064,7 @@ impl LoomView {
                 Vec::new()
             },
             project_snapshot: None,
+            project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
             project_messages: Vec::new(),
@@ -3635,6 +3701,9 @@ impl LoomView {
                     Ok(ServerResponse::ProjectSnapshot(snapshot)) => {
                         reload_sessions =
                             project_snapshot_has_unloaded_agent_sessions(&snapshot, &view.sessions);
+                        view.project_tree_snapshots
+                            .retain(|known| known.project_id != snapshot.project_id);
+                        view.project_tree_snapshots.push(snapshot.clone());
                         view.project_snapshot = Some(snapshot);
                         view.project_messages_stale = true;
                     }
@@ -4282,6 +4351,9 @@ impl LoomView {
             ))
             .result
         {
+            self.project_tree_snapshots
+                .retain(|known| known.project_id != snapshot.project_id);
+            self.project_tree_snapshots.push(snapshot.clone());
             self.project_snapshot = Some(snapshot);
             self.project_messages_stale = true;
         }
@@ -8388,10 +8460,18 @@ impl LoomView {
     }
 
     pub(crate) fn render_session_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let projection = project_session_list_projection(
+        let mut tree_projects = self.project_tree_snapshots.iter().collect::<Vec<_>>();
+        if let Some(active_project) = self.project_snapshot.as_ref()
+            && !tree_projects
+                .iter()
+                .any(|known| known.project_id == active_project.project_id)
+        {
+            tree_projects.push(active_project);
+        }
+        let projection = project_session_list_projection_for_projects(
             &self.sessions,
             self.active_session.id,
-            self.project_snapshot.as_ref(),
+            tree_projects,
         );
         let tree_nodes = projection.tree;
         let tree_items = tree_nodes.iter().map(session_tree_item).collect::<Vec<_>>();
@@ -15130,10 +15210,10 @@ mod worker_node_tests {
         format_worker_node_resources, initial_worker_nodes, local_source_available,
         mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
         order_session_nodes, project_child_control_actions, project_session_list_projection,
-        project_snapshot_has_unloaded_agent_sessions, remove_worker_node_entry,
-        safe_worker_url_label, session_id_for_request, session_list_projection,
-        session_node_indicator_state, session_node_pulse, session_owner_status,
-        source_choice_is_allowed, source_dialog_initial_state,
+        project_session_list_projection_for_projects, project_snapshot_has_unloaded_agent_sessions,
+        remove_worker_node_entry, safe_worker_url_label, session_id_for_request,
+        session_list_projection, session_node_indicator_state, session_node_pulse,
+        session_owner_status, source_choice_is_allowed, source_dialog_initial_state,
         transition_worker_connection_to_connecting, update_worker_node_status,
         validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
         worker_node_name_for_id, worker_url_embeds_credential,
@@ -15583,6 +15663,35 @@ mod worker_node_tests {
         let grandchild_projection =
             project_session_list_projection(&sessions, grandchild_id, Some(&project));
         assert_eq!(grandchild_projection.selected_index, Some(2));
+
+        let other_project_id = loom_core::ProjectId::from_uuid(*other_id.as_uuid());
+        let other_project = loom_core::ProjectSnapshot {
+            project_id: other_project_id,
+            root_session_id: other_id,
+            agents: vec![loom_core::ProjectAgentRecord {
+                session_id: other_id,
+                project_id: other_project_id,
+                parent_session_id: None,
+                depth: 1,
+                state: AgentSessionState::Idle,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: Timestamp::from_unix_millis(1),
+            }],
+            tasks: Vec::new(),
+            worktrees: Vec::new(),
+        };
+        let switched_project_projection = project_session_list_projection_for_projects(
+            &sessions,
+            other_id,
+            vec![&project, &other_project],
+        );
+        assert_eq!(switched_project_projection.selected_index, Some(3));
+        assert_eq!(
+            switched_project_projection.tree[0].children[0].children[0].session_id,
+            grandchild_id
+        );
+        assert_eq!(switched_project_projection.tree[1].session_id, other_id);
     }
 
     #[test]
