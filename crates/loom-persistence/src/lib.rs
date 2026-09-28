@@ -13427,6 +13427,11 @@ mod tests {
     use std::process::Command;
     use uuid::Uuid;
 
+    // The cross-process owner-lock test spawns a child while holding a lock
+    // file. Serialize it with the drop/reacquire tests so a forked child cannot
+    // transiently retain another test's flock descriptor.
+    static EXCLUSIVE_WRITER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[derive(Debug, Deserialize, PartialEq, Serialize)]
     struct Fixture {
         value: String,
@@ -13922,6 +13927,7 @@ mod tests {
 
     #[test]
     fn exclusive_writer_ownership_is_shared_by_clones_and_released_on_drop() {
+        let _guard = EXCLUSIVE_WRITER_TEST_LOCK.lock().unwrap();
         let test_dir = std::env::temp_dir().join(format!(
             "loom-persistence-owner-{}-{}",
             std::process::id(),
@@ -13946,12 +13952,39 @@ mod tests {
                 .code,
             ErrorCode::Conflict
         );
+        // The shared lock remains owned until the final clone is dropped.
+        drop(clone);
+        let replacement = FilePersistence::open_exclusive_writer(&path).unwrap();
+        drop(replacement);
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".loom-owner.lock");
+        fs::remove_file(PathBuf::from(lock_path)).unwrap();
+        fs::remove_dir(test_dir).unwrap();
+    }
+
+    #[test]
+    fn exclusive_writer_can_be_released_explicitly_through_a_clone() {
+        let _guard = EXCLUSIVE_WRITER_TEST_LOCK.lock().unwrap();
+        let test_dir = std::env::temp_dir().join(format!(
+            "loom-persistence-owner-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        fs::create_dir(&test_dir).unwrap();
+        let path = test_dir.join("state.db");
+        let writer = FilePersistence::open_exclusive_writer(&path).unwrap();
+        let clone = writer.clone();
+        drop(writer);
+        assert_eq!(
+            FilePersistence::open_exclusive_writer(&path)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
         clone.release_exclusive_writer().unwrap();
         let replacement = FilePersistence::open_exclusive_writer(&path).unwrap();
         drop(replacement);
         drop(clone);
-        let replacement = FilePersistence::open_exclusive_writer(&path).unwrap();
-        drop(replacement);
         let mut lock_path = path.as_os_str().to_os_string();
         lock_path.push(".loom-owner.lock");
         fs::remove_file(PathBuf::from(lock_path)).unwrap();
@@ -13996,6 +14029,7 @@ mod tests {
 
     #[test]
     fn exclusive_writer_lock_is_enforced_across_processes() {
+        let _guard = EXCLUSIVE_WRITER_TEST_LOCK.lock().unwrap();
         let test_dir = std::env::temp_dir().join(format!(
             "loom-persistence-owner-{}-{}",
             std::process::id(),

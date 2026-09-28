@@ -6923,8 +6923,7 @@ impl InProcessConnection {
         if self.backend.persistence.is_none()
             && matches!(
                 &request,
-                ClientRequest::CreateProjectChild { .. }
-                    | ClientRequest::SendProjectAgentMessage { .. }
+                ClientRequest::SendProjectAgentMessage { .. }
                     | ClientRequest::ListProjectAgentMessages { .. }
                     | ClientRequest::ControlProjectChild { .. }
                     | ClientRequest::GetProjectChildReview { .. }
@@ -7091,11 +7090,6 @@ impl InProcessConnection {
                     self.load_project_snapshot_for_session(session_id)?,
                 ))
             }
-            ClientRequest::CreateProjectChild {
-                parent_session_id,
-                child_name,
-                spec,
-            } => self.create_project_child(request_id, parent_session_id, child_name, spec),
             ClientRequest::SendProjectAgentMessage { message } => {
                 self.send_project_agent_message(request_id, message)
             }
@@ -8905,6 +8899,10 @@ impl InProcessConnection {
                         true,
                     )
                 })?;
+                // Child creation uses this same lock. Refresh the hierarchy
+                // after acquiring it so a descendant committed while this
+                // cancellation was waiting is included in the subtree walk.
+                let project = self.load_project_snapshot(project_id)?;
                 task = persistence
                     .load_delegated_task(task_id)?
                     .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
@@ -10747,10 +10745,6 @@ impl InProcessConnection {
             }
             | ClientRequest::ForkAgentSession {
                 session_id: requested_session,
-                ..
-            }
-            | ClientRequest::CreateProjectChild {
-                parent_session_id: requested_session,
                 ..
             } => session_id = Some(*requested_session),
             ClientRequest::GetSessionEvents {
@@ -12909,8 +12903,9 @@ mod tests {
         for _ in 0..1_000 {
             let response =
                 connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
-            let Ok(ServerResponse::AgentRun(snapshot)) = response.result else {
-                panic!("unexpected run response");
+            let snapshot = match response.result {
+                Ok(ServerResponse::AgentRun(snapshot)) => snapshot,
+                result => panic!("unexpected run response for {run_id}: {result:?}"),
             };
             last_snapshot = Some(snapshot.clone());
             if !matches!(
@@ -14884,6 +14879,26 @@ mod tests {
             protocol_8_negotiation.result.unwrap_err().code,
             ErrorCode::UnsupportedProtocol
         );
+        let protocol_9_connection = backend.connect();
+        let protocol_9_discovery = protocol_9_connection.request(RequestEnvelope::with_version(
+            ProtocolVersion::new(9, 0),
+            ClientRequest::DiscoverCapabilities,
+        ));
+        assert_eq!(
+            protocol_9_discovery.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
+        let protocol_9_negotiation = protocol_9_connection.request(RequestEnvelope::with_version(
+            CURRENT_PROTOCOL_VERSION,
+            ClientRequest::Negotiate {
+                client_version: ProtocolVersion::new(9, 0),
+                capabilities: backend.supported_capabilities.clone(),
+            },
+        ));
+        assert_eq!(
+            protocol_9_negotiation.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
 
         let capability_limited_connection = backend.connect();
         let capability_limited = CapabilitySet::new(
@@ -16250,22 +16265,22 @@ mod tests {
             response => panic!("unexpected session response: {response:?}"),
         };
 
-        let create = ClientRequest::CreateProjectChild {
-            parent_session_id: root,
-            child_name: "worker-1".into(),
-            spec: loom_core::DelegatedTaskSpec {
-                intent: "Review a bounded task".into(),
-                model_id: "deterministic/demo".into(),
-                context_references: vec![],
-                dependencies: vec![],
-                code_change: false,
-                permissions: loom_core::ProjectAgentPermissions::default(),
-            },
+        let create_spec = loom_core::DelegatedTaskSpec {
+            intent: "Review a bounded task".into(),
+            model_id: "deterministic/demo".into(),
+            context_references: vec![],
+            dependencies: vec![],
+            code_change: false,
+            permissions: loom_core::ProjectAgentPermissions::default(),
         };
         let request_id = RequestId::new();
-        let response =
-            connection.request(RequestEnvelope::with_request_id(request_id, create.clone()));
-        let (task, child) = match response.result.unwrap() {
+        let response = connection.create_project_child(
+            request_id,
+            root,
+            "worker-1".into(),
+            create_spec.clone(),
+        );
+        let (task, child) = match response.unwrap() {
             ServerResponse::ProjectChildCreated { task, child } => (task, child),
             response => panic!("unexpected child response: {response:?}"),
         };
@@ -16284,37 +16299,13 @@ mod tests {
                     && snapshot.root_session_id == root
                     && snapshot.agents.len() == 2
         ));
-        assert_eq!(
-            backend
-                .connect()
-                .request(RequestEnvelope::with_request_id(request_id, create.clone()))
-                .result
-                .unwrap_err()
-                .code,
-            ErrorCode::InvalidRequest
-        );
-        let scoped_tokens = AuthTokenStore::new();
-        let scoped_token = scoped_tokens
-            .issue(AuthorizationScope::for_sessions(
-                [root],
-                CapabilitySet::new([Capability::ReadAgentSession]),
-            ))
-            .unwrap();
-        let scoped_connection =
-            backend.connect_authenticated(scoped_tokens.authenticate(&scoped_token.token).unwrap());
-        negotiate(&scoped_connection);
-        assert_eq!(
-            scoped_connection
-                .request(RequestEnvelope::with_request_id(request_id, create.clone()))
-                .result
-                .unwrap_err()
-                .code,
-            ErrorCode::AuthorizationDenied
-        );
         assert!(matches!(
-            connection
-                .request(RequestEnvelope::with_request_id(request_id, create.clone()))
-                .result,
+            connection.create_project_child(
+                request_id,
+                root,
+                "worker-1".into(),
+                create_spec.clone(),
+            ),
             Ok(ServerResponse::ProjectChildCreated { task: repeated, child: repeated_child })
                 if repeated.task_id == task.task_id && repeated_child.session_id == child.session_id
         ));
@@ -16463,49 +16454,50 @@ mod tests {
             wrong_direction.result,
             Err(error) if error.code == ErrorCode::AuthorizationDenied
         ));
-        let code_change =
-            connection.request(RequestEnvelope::new(ClientRequest::CreateProjectChild {
-                parent_session_id: root,
-                child_name: "coder".into(),
-                spec: loom_core::DelegatedTaskSpec {
-                    intent: "Change code".into(),
-                    model_id: "deterministic/demo".into(),
-                    context_references: vec![],
-                    dependencies: vec![],
-                    code_change: true,
-                    permissions: loom_core::ProjectAgentPermissions::default(),
-                },
-            }));
+        let code_change = connection.create_project_child(
+            RequestId::new(),
+            root,
+            "coder".into(),
+            loom_core::DelegatedTaskSpec {
+                intent: "Change code".into(),
+                model_id: "deterministic/demo".into(),
+                context_references: vec![],
+                dependencies: vec![],
+                code_change: true,
+                permissions: loom_core::ProjectAgentPermissions::default(),
+            },
+        );
         assert!(matches!(
-            code_change.result,
+            code_change,
             Err(ref error)
                 if error.code == ErrorCode::InvalidRequest
                     && error.message.contains("exactly one Git repository")
         ));
 
         for index in 1..4 {
-            let result =
-                connection.request(RequestEnvelope::new(ClientRequest::CreateProjectChild {
-                    parent_session_id: root,
-                    child_name: format!("worker-{index}"),
-                    spec: loom_core::DelegatedTaskSpec {
-                        intent: format!("Task {index}"),
-                        model_id: "deterministic/demo".into(),
-                        context_references: vec![],
-                        dependencies: vec![],
-                        code_change: false,
-                        permissions: loom_core::ProjectAgentPermissions::default(),
-                    },
-                }));
+            let result = connection.create_project_child(
+                RequestId::new(),
+                root,
+                format!("worker-{index}"),
+                loom_core::DelegatedTaskSpec {
+                    intent: format!("Task {index}"),
+                    model_id: "deterministic/demo".into(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
+                },
+            );
             assert!(matches!(
-                result.result,
+                result,
                 Ok(ServerResponse::ProjectChildCreated { .. })
             ));
         }
-        let over_capacity_request = RequestEnvelope::new(ClientRequest::CreateProjectChild {
-            parent_session_id: root,
-            child_name: "worker-5".into(),
-            spec: loom_core::DelegatedTaskSpec {
+        let additional_child = connection.create_project_child(
+            RequestId::new(),
+            root,
+            "worker-5".into(),
+            loom_core::DelegatedTaskSpec {
                 intent: "One too many".into(),
                 model_id: "deterministic/demo".into(),
                 context_references: vec![],
@@ -16513,8 +16505,7 @@ mod tests {
                 code_change: false,
                 permissions: loom_core::ProjectAgentPermissions::default(),
             },
-        });
-        let additional_child = connection.request(over_capacity_request).result;
+        );
         assert!(
             matches!(
                 additional_child,
@@ -16522,31 +16513,20 @@ mod tests {
             ),
             "unexpected additional child response: {additional_child:?}"
         );
-        backend.idempotency().unwrap().remove(&request_id);
         assert!(matches!(
-            connection
-                .request(RequestEnvelope::with_request_id(request_id, create.clone()))
-                .result,
-            Ok(ServerResponse::ProjectChildCreated { task: replayed, child: replayed_child })
-                if replayed.task_id == task.task_id && replayed_child.session_id == child.session_id
-        ));
-        let changed_retry = ClientRequest::CreateProjectChild {
-            parent_session_id: root,
-            child_name: "different-child".into(),
-            spec: loom_core::DelegatedTaskSpec {
-                intent: "Changed request under reused ID".into(),
-                model_id: "deterministic/demo".into(),
-                context_references: vec![],
-                dependencies: vec![],
-                code_change: false,
-                permissions: loom_core::ProjectAgentPermissions::default(),
-            },
-        };
-        backend.idempotency().unwrap().remove(&request_id);
-        assert!(matches!(
-            connection
-                .request(RequestEnvelope::with_request_id(request_id, changed_retry))
-                .result,
+            connection.create_project_child(
+                request_id,
+                root,
+                "different-child".into(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Changed request under reused ID".into(),
+                    model_id: "deterministic/demo".into(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
+                },
+            ),
             Err(error) if error.code == ErrorCode::InvalidRequest
         ));
         drop(connection);
@@ -16816,6 +16796,403 @@ mod tests {
     }
 
     #[test]
+    fn nested_code_child_worktree_integrates_through_parent_to_root() {
+        let temp = workspace();
+        let source = git_repository();
+        let persistence_path = temp.join("state.sqlite");
+        let mut model = ScriptedOpenAiEndpoint::start();
+        let model_endpoint = model.endpoint.clone();
+        let model_id = ModelId::new("fixture/nested-worktree-integration");
+        let mut backend = InProcessBackend::with_provider_registry_persistent(
+            scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+            &persistence_path,
+        )
+        .unwrap();
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
+        let supported_capabilities = backend
+            .supported_capabilities
+            .iter()
+            .copied()
+            .chain([Capability::CreateNestedProjectChild])
+            .collect::<Vec<_>>();
+        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
+            CapabilitySet::new(supported_capabilities);
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
+
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Nested project worktree integration".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Root manager".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                        config: WorkspaceConfig {
+                            project_agent_concurrency: 1,
+                            ..WorkspaceConfig::default()
+                        },
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::WorkspaceConfigUpdated)
+        ));
+        let root_repository = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::AttachSessionRepository {
+                    session_id: root,
+                    source: source.display().to_string(),
+                    path: "repo".to_owned(),
+                    revision: None,
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::SessionRepositoryAttached(repository) => repository,
+            response => panic!("unexpected repository response: {response:?}"),
+        };
+        let root_git = connection.session_git(root, root_repository.id).unwrap();
+        let root_base_revision = root_git.status().unwrap().head.unwrap();
+
+        let manager_permissions = loom_core::ProjectAgentPermissions {
+            delegation: true,
+            worktree_creation: true,
+            review: true,
+            integration: true,
+            ..loom_core::ProjectAgentPermissions::default()
+        };
+        let (manager_task, manager_agent) = match connection
+            .create_project_child(
+                RequestId::new(),
+                root,
+                "code-manager".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Integrate a reviewed nested code change.".to_owned(),
+                    model_id: model_id.as_str().to_owned(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: true,
+                    permissions: manager_permissions,
+                },
+            )
+            .unwrap()
+        {
+            ServerResponse::ProjectChildCreated { task, child } => (task, child),
+            response => panic!("unexpected manager creation response: {response:?}"),
+        };
+        assert_eq!(manager_task.status, loom_core::DelegatedTaskStatus::Running);
+        assert!(manager_task.code_change);
+        assert_eq!(manager_task.permissions, manager_permissions);
+        let manager_session = manager_agent.session_id;
+        let project_id = manager_task.project_id;
+        let persistence = backend.persistence.as_ref().unwrap();
+        let manager_worktree = persistence
+            .load_project_worktree_by_task(manager_task.task_id)
+            .unwrap()
+            .expect("code manager should have a durable worktree");
+        assert_eq!(manager_worktree.status, ProjectWorktreeStatus::Ready);
+        assert_eq!(manager_worktree.parent_session_id, root);
+        assert_eq!(manager_worktree.parent_repository_id, root_repository.id);
+        assert_eq!(manager_worktree.base_revision, root_base_revision);
+        let manager_git = connection
+            .session_git(manager_session, manager_worktree.child_repository_id)
+            .unwrap();
+        assert_eq!(
+            manager_git.status().unwrap().head.as_deref(),
+            Some(root_base_revision.as_str())
+        );
+
+        // Keep the manager's only workspace slot occupied while the nested
+        // child is created, reviewed, and integrated into its checkout.
+        let manager_turn = model.next_for_child();
+        assert!(request_has_tool(
+            &manager_turn.request,
+            "delegate_project_task"
+        ));
+        assert!(request_has_tool(
+            &manager_turn.request,
+            "review_project_child"
+        ));
+        assert!(request_has_tool(
+            &manager_turn.request,
+            "integrate_project_child"
+        ));
+
+        let (grandchild_task, grandchild_agent) = match connection
+            .create_project_child(
+                RequestId::new(),
+                manager_session,
+                "nested-code-child".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Commit the nested result for integration.".to_owned(),
+                    model_id: model_id.as_str().to_owned(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: true,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
+                },
+            )
+            .unwrap()
+        {
+            ServerResponse::ProjectChildCreated { task, child } => (task, child),
+            response => panic!("unexpected nested child creation response: {response:?}"),
+        };
+        assert_eq!(
+            grandchild_task.status,
+            loom_core::DelegatedTaskStatus::Queued
+        );
+        assert_eq!(grandchild_task.requester_session_id, manager_session);
+        let grandchild_worktree = persistence
+            .load_project_worktree_by_task(grandchild_task.task_id)
+            .unwrap()
+            .expect("nested code child should have a durable worktree");
+        assert_eq!(grandchild_worktree.status, ProjectWorktreeStatus::Ready);
+        assert_eq!(grandchild_worktree.parent_session_id, manager_session);
+        assert_eq!(
+            grandchild_worktree.parent_repository_id,
+            manager_worktree.child_repository_id
+        );
+        assert_eq!(
+            grandchild_worktree.base_revision, root_base_revision,
+            "nested worktree should branch from the manager checkout HEAD"
+        );
+        let grandchild_checkout = connection
+            .session_filesystem(grandchild_agent.session_id)
+            .unwrap()
+            .root()
+            .join(&grandchild_worktree.relative_path);
+        fs::write(
+            grandchild_checkout.join("nested-result.txt"),
+            "grandchild result\n",
+        )
+        .unwrap();
+        let git = |arguments: &[&str]| {
+            let output = Command::new("git")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
+                .args(["-C", grandchild_checkout.to_str().unwrap()])
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                arguments,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["config", "user.name", "Loom Test"]);
+        git(&["config", "user.email", "loom@example.test"]);
+        git(&["add", "--", "nested-result.txt"]);
+        git(&["commit", "-qm", "nested result"]);
+        let grandchild_git = connection
+            .session_git(
+                grandchild_agent.session_id,
+                grandchild_worktree.child_repository_id,
+            )
+            .unwrap();
+        let grandchild_revision = grandchild_git.status().unwrap().head.unwrap();
+        assert_ne!(grandchild_revision, grandchild_worktree.base_revision);
+        persistence
+            .update_delegated_task_status(
+                grandchild_task.task_id,
+                loom_core::DelegatedTaskStatus::Completed,
+                Timestamp::now(),
+            )
+            .unwrap();
+
+        let review =
+            connection.request(RequestEnvelope::new(ClientRequest::GetProjectChildReview {
+                project_id,
+                manager_session_id: manager_session,
+                task_id: grandchild_task.task_id,
+            }));
+        let ServerResponse::ProjectChildReview {
+            worktree: reviewed_grandchild,
+            status: grandchild_status,
+            diff,
+        } = review.result.unwrap()
+        else {
+            panic!("unexpected nested child review response");
+        };
+        assert_eq!(reviewed_grandchild.status, ProjectWorktreeStatus::Ready);
+        assert_eq!(
+            grandchild_status.head.as_deref(),
+            Some(grandchild_revision.as_str())
+        );
+        assert!(diff.patch.contains("grandchild result"));
+        assert_eq!(
+            root_git.status().unwrap().head.as_deref(),
+            Some(root_base_revision.as_str()),
+            "reviewing the grandchild must not advance the root checkout"
+        );
+        assert!(
+            !root_git.root().join("nested-result.txt").exists(),
+            "the nested change should not reach root before either integration"
+        );
+
+        let integration =
+            connection.request(RequestEnvelope::new(ClientRequest::IntegrateProjectChild {
+                project_id,
+                manager_session_id: manager_session,
+                task_id: grandchild_task.task_id,
+                expected_parent_revision: grandchild_worktree.base_revision.clone(),
+            }));
+        let ServerResponse::ProjectChildWorktreeUpdated(integrated_grandchild) =
+            integration.result.unwrap()
+        else {
+            panic!("unexpected nested child integration response");
+        };
+        assert_eq!(
+            integrated_grandchild.status,
+            ProjectWorktreeStatus::Integrated
+        );
+        assert_eq!(
+            integrated_grandchild.integrated_revision.as_deref(),
+            Some(grandchild_revision.as_str())
+        );
+        assert_eq!(
+            manager_git.status().unwrap().head.as_deref(),
+            Some(grandchild_revision.as_str()),
+            "integrating the grandchild should advance the manager checkout"
+        );
+        let manager_checkout = connection
+            .session_filesystem(manager_session)
+            .unwrap()
+            .root()
+            .join(&manager_worktree.relative_path);
+        assert_eq!(
+            fs::read_to_string(manager_checkout.join("nested-result.txt")).unwrap(),
+            "grandchild result\n"
+        );
+        assert_eq!(
+            root_git.status().unwrap().head.as_deref(),
+            Some(root_base_revision.as_str()),
+            "the grandchild integration should stop at its manager parent"
+        );
+
+        model.respond_with_text(
+            manager_turn,
+            "The nested result is integrated and the delegated work is complete.",
+        );
+        let manager_run_id = persistence
+            .load_latest_run_summary_for_session(manager_session)
+            .unwrap()
+            .expect("manager run should have a durable checkpoint")
+            .snapshot
+            .id;
+        assert_eq!(
+            await_settled_run(&connection, manager_run_id).state,
+            AgentRunState::Completed
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = persistence
+                .load_delegated_task(manager_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == loom_core::DelegatedTaskStatus::Completed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "manager should complete after its child is integrated; status={status:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let root_review =
+            connection.request(RequestEnvelope::new(ClientRequest::GetProjectChildReview {
+                project_id,
+                manager_session_id: root,
+                task_id: manager_task.task_id,
+            }));
+        let ServerResponse::ProjectChildReview {
+            worktree: reviewed_manager,
+            status: manager_status,
+            diff: manager_diff,
+        } = root_review.result.unwrap()
+        else {
+            panic!("unexpected manager review response");
+        };
+        assert_eq!(reviewed_manager.status, ProjectWorktreeStatus::Ready);
+        assert_eq!(
+            manager_status.head.as_deref(),
+            Some(grandchild_revision.as_str())
+        );
+        assert!(manager_diff.patch.contains("grandchild result"));
+        assert_eq!(
+            reviewed_manager.base_revision, root_base_revision,
+            "manager worktree should retain its original root-relative base"
+        );
+
+        let root_integration =
+            connection.request(RequestEnvelope::new(ClientRequest::IntegrateProjectChild {
+                project_id,
+                manager_session_id: root,
+                task_id: manager_task.task_id,
+                expected_parent_revision: manager_worktree.base_revision.clone(),
+            }));
+        let ServerResponse::ProjectChildWorktreeUpdated(integrated_manager) =
+            root_integration.result.unwrap()
+        else {
+            panic!("unexpected manager integration response");
+        };
+        assert_eq!(integrated_manager.status, ProjectWorktreeStatus::Integrated);
+        assert_eq!(
+            integrated_manager.integrated_revision.as_deref(),
+            Some(grandchild_revision.as_str())
+        );
+        assert_eq!(
+            root_git.status().unwrap().head.as_deref(),
+            Some(grandchild_revision.as_str()),
+            "integrating the manager should advance root to the nested result"
+        );
+        assert_eq!(
+            fs::read_to_string(root_git.root().join("nested-result.txt")).unwrap(),
+            "grandchild result\n"
+        );
+
+        drop(connection);
+        backend.shutdown().unwrap();
+        drop(backend);
+        drop(model);
+        fs::remove_dir_all(temp).unwrap();
+        fs::remove_dir_all(source).unwrap();
+    }
+
+    #[test]
     fn project_concurrency_limit_queues_additional_children() {
         let (endpoint, request_seen) = slow_model_endpoint();
         let path = std::env::temp_dir().join(format!(
@@ -16870,10 +17247,11 @@ mod tests {
         ));
 
         let create_child = |child_name: &str| {
-            connection.request(RequestEnvelope::new(ClientRequest::CreateProjectChild {
-                parent_session_id: root,
-                child_name: child_name.to_owned(),
-                spec: loom_core::DelegatedTaskSpec {
+            connection.create_project_child(
+                RequestId::new(),
+                root,
+                child_name.to_owned(),
+                loom_core::DelegatedTaskSpec {
                     intent: format!("Review {child_name}"),
                     model_id: "slow/model".into(),
                     context_references: vec![],
@@ -16881,17 +17259,17 @@ mod tests {
                     code_change: false,
                     permissions: loom_core::ProjectAgentPermissions::default(),
                 },
-            }))
+            )
         };
 
-        let first = match create_child("worker-1").result.unwrap() {
+        let first = match create_child("worker-1").unwrap() {
             ServerResponse::ProjectChildCreated { task, child } => (task, child),
             response => panic!("unexpected first child response: {response:?}"),
         };
         request_seen
             .recv_timeout(Duration::from_secs(3))
             .expect("first child should begin its provider request");
-        let second = match create_child("worker-2").result.unwrap() {
+        let second = match create_child("worker-2").unwrap() {
             ServerResponse::ProjectChildCreated { task, child } => (task, child),
             response => panic!("unexpected second child response: {response:?}"),
         };
@@ -17406,6 +17784,1688 @@ mod tests {
     }
 
     #[test]
+    fn project_child_control_covers_lifecycle_and_parent_grants() {
+        let temp = std::env::temp_dir().join(format!(
+            "loom-project-child-control-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let mut model = ScriptedOpenAiEndpoint::start();
+        let model_endpoint = model.endpoint.clone();
+        let model_id = ModelId::new("fixture/project-child-control");
+        let provider_registry =
+            || scripted_project_provider_registry(&model_endpoint, model_id.clone());
+        let backend = InProcessBackend::with_provider_registry_persistent(
+            provider_registry(),
+            temp.join("state.sqlite"),
+        )
+        .unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Project child control test".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let manager_session_id = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Manager".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        let child_session_id = AgentSessionId::new();
+        let task_id = loom_core::TaskId::new();
+        let project_id = ProjectId::from_uuid(*manager_session_id.as_uuid());
+        let created_at = Timestamp::now();
+        let child_name = "Queued child".to_owned();
+        let child = AgentSessionSnapshot {
+            id: child_session_id,
+            workspace_id: workspace.id,
+            name: child_name.clone(),
+            state: AgentSessionState::Idle,
+            created_at,
+            updated_at: created_at,
+        };
+        let task = loom_core::DelegatedTaskRecord {
+            task_id,
+            project_id,
+            requester_session_id: manager_session_id,
+            target_session_id: child_session_id,
+            child_name,
+            intent: "Remain queued until the manager continues the child".to_owned(),
+            model_id: "missing-provider/model".to_owned(),
+            context_references: vec![],
+            dependencies: vec![],
+            code_change: false,
+            permissions: loom_core::ProjectAgentPermissions::default(),
+            status: loom_core::DelegatedTaskStatus::Queued,
+            created_at,
+            updated_at: created_at,
+        };
+        let persistence = backend.persistence.as_ref().unwrap();
+        persistence
+            .create_project_child(
+                RequestId::new(),
+                &child,
+                backend.sessions().unwrap().next_sequence().next(),
+                &task,
+            )
+            .unwrap();
+        let (_, created_event) = backend
+            .sessions()
+            .unwrap()
+            .create_in_workspace_with_id(workspace.id, child_session_id, task.child_name.clone())
+            .unwrap();
+        backend.journal().unwrap().append_session(created_event);
+        let filesystem = backend
+            .create_session_filesystem(workspace.id, child_session_id)
+            .unwrap();
+        backend
+            .session_filesystems()
+            .unwrap()
+            .insert(child_session_id, filesystem);
+        backend
+            .session_repositories()
+            .unwrap()
+            .insert(child_session_id, BTreeMap::new());
+
+        let control_task = |task_id, action| {
+            connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+                project_id,
+                manager_session_id,
+                task_id,
+                action,
+            }))
+        };
+        let control = |action| control_task(task_id, action);
+        let continued = control(ProjectChildControlAction::Continue);
+        let ServerResponse::ProjectChildControlled { task, run } = continued.result.unwrap() else {
+            panic!("unexpected child continue response");
+        };
+        assert_eq!(task.status, loom_core::DelegatedTaskStatus::Blocked);
+        assert!(run.is_none());
+
+        let retried = control(ProjectChildControlAction::Continue);
+        let ServerResponse::ProjectChildControlled { task, run } = retried.result.unwrap() else {
+            panic!("unexpected blocked child continue response");
+        };
+        assert_eq!(task.status, loom_core::DelegatedTaskStatus::Blocked);
+        assert!(run.is_none());
+
+        for action in [
+            ProjectChildControlAction::Pause,
+            ProjectChildControlAction::Interrupt,
+            ProjectChildControlAction::RetryFailedStep,
+        ] {
+            assert_eq!(
+                control(action).result.unwrap_err().code,
+                ErrorCode::InvalidState
+            );
+        }
+
+        let resumable_session_id = AgentSessionId::new();
+        let resumable_task = loom_core::DelegatedTaskRecord {
+            task_id: loom_core::TaskId::new(),
+            project_id,
+            requester_session_id: manager_session_id,
+            target_session_id: resumable_session_id,
+            child_name: "Resumable child".to_owned(),
+            intent: "Pause and then continue this child".to_owned(),
+            model_id: model_id.as_str().to_owned(),
+            context_references: vec![],
+            dependencies: vec![],
+            code_change: false,
+            permissions: loom_core::ProjectAgentPermissions::default(),
+            status: loom_core::DelegatedTaskStatus::Queued,
+            created_at,
+            updated_at: created_at,
+        };
+        let resumable_child = AgentSessionSnapshot {
+            id: resumable_session_id,
+            workspace_id: workspace.id,
+            name: resumable_task.child_name.clone(),
+            state: AgentSessionState::Idle,
+            created_at,
+            updated_at: created_at,
+        };
+        persistence
+            .create_project_child(
+                RequestId::new(),
+                &resumable_child,
+                backend.sessions().unwrap().next_sequence().next(),
+                &resumable_task,
+            )
+            .unwrap();
+        let (_, created_event) = backend
+            .sessions()
+            .unwrap()
+            .create_in_workspace_with_id(
+                workspace.id,
+                resumable_session_id,
+                resumable_child.name.clone(),
+            )
+            .unwrap();
+        backend.journal().unwrap().append_session(created_event);
+        let filesystem = backend
+            .create_session_filesystem(workspace.id, resumable_session_id)
+            .unwrap();
+        backend
+            .session_filesystems()
+            .unwrap()
+            .insert(resumable_session_id, filesystem);
+        backend
+            .session_repositories()
+            .unwrap()
+            .insert(resumable_session_id, BTreeMap::new());
+        connection
+            .request(RequestEnvelope::new(
+                ClientRequest::SetSessionApprovalPolicy {
+                    session_id: resumable_session_id,
+                    policy: ApprovalPolicy::default(),
+                    auto_approve_actions: Some(false),
+                },
+            ))
+            .result
+            .unwrap();
+
+        let continue_resumable = || {
+            connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+                project_id,
+                manager_session_id,
+                task_id: resumable_task.task_id,
+                action: ProjectChildControlAction::Continue,
+            }))
+        };
+        let started = continue_resumable();
+        let ServerResponse::ProjectChildControlled { run, .. } = started.result.unwrap() else {
+            panic!("unexpected resumable child response");
+        };
+        let run_id = run.expect("queued child should start a run").id;
+        let first_model_turn = model.next_for_child();
+        model.respond_with_tool(
+            first_model_turn,
+            "ask_user",
+            serde_json::json!({"prompt": "Which option should I use?"}),
+        );
+        assert_eq!(
+            await_settled_run(&connection, run_id).state,
+            AgentRunState::NeedsInput
+        );
+        for action in [
+            ProjectChildControlAction::Continue,
+            ProjectChildControlAction::Pause,
+        ] {
+            assert_eq!(
+                control_task(resumable_task.task_id, action)
+                    .result
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidState
+            );
+        }
+        let waiting_snapshot = match connection
+            .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentRun(snapshot) => snapshot,
+            response => panic!("unexpected waiting child response: {response:?}"),
+        };
+        connection
+            .request(RequestEnvelope::new(ClientRequest::SendAgentMessage {
+                run_id,
+                attempt_id: waiting_snapshot.attempt_id,
+                expected_control_revision: waiting_snapshot.control_revision,
+                message: "Use the first option".to_owned(),
+            }))
+            .result
+            .unwrap();
+        let approval_turn = model.next_for_child();
+        model.respond_with_tool(
+            approval_turn,
+            "apply_patch",
+            serde_json::json!({
+                "path": "controlled-child.txt",
+                "old_text": "before",
+                "new_text": "after"
+            }),
+        );
+        assert_eq!(
+            await_settled_run(&connection, run_id).state,
+            AgentRunState::AwaitingApproval
+        );
+        let paused = connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+            project_id,
+            manager_session_id,
+            task_id: resumable_task.task_id,
+            action: ProjectChildControlAction::Pause,
+        }));
+        let ServerResponse::ProjectChildControlled { run, .. } = paused.result.unwrap() else {
+            panic!("unexpected child pause response");
+        };
+        assert!(matches!(run, Some(run)
+            if run.id == run_id && run.state == AgentRunState::Paused));
+        let paused_again = control_task(resumable_task.task_id, ProjectChildControlAction::Pause);
+        let ServerResponse::ProjectChildControlled { run, .. } = paused_again.result.unwrap()
+        else {
+            panic!("unexpected repeated child pause response");
+        };
+        assert!(matches!(run, Some(run)
+            if run.id == run_id && run.state == AgentRunState::Paused));
+
+        let resumed = continue_resumable();
+        let ServerResponse::ProjectChildControlled { run, .. } = resumed.result.unwrap() else {
+            panic!("unexpected child resume response");
+        };
+        assert!(matches!(run, Some(run)
+            if run.id == run_id && run.state == AgentRunState::AwaitingApproval));
+        let retry_while_awaiting_approval = control_task(
+            resumable_task.task_id,
+            ProjectChildControlAction::RetryFailedStep,
+        );
+        let ServerResponse::ProjectChildControlled { run, .. } =
+            retry_while_awaiting_approval.result.unwrap()
+        else {
+            panic!("unexpected retry response for a run awaiting approval");
+        };
+        assert!(matches!(run, Some(run)
+            if run.id == run_id && run.state == AgentRunState::AwaitingApproval));
+        let approval_events =
+            connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: Some(resumable_session_id),
+                workspace_id: None,
+                after_sequence: None,
+                stream_epoch: None,
+            }));
+        let ServerResponse::SessionEvents {
+            events: approval_events,
+            ..
+        } = approval_events.result.unwrap()
+        else {
+            panic!("unexpected child approval events response");
+        };
+        let (approval_call_id, approval_attempt_id, approval_control_revision) = approval_events
+            .iter()
+            .find_map(|event| match &event.event {
+                ServerEvent::Agent {
+                    event:
+                        AgentEvent::ToolApprovalRequired {
+                            call,
+                            attempt_id,
+                            control_revision,
+                            ..
+                        },
+                } if call.name == "apply_patch" => Some((call.id, *attempt_id, *control_revision)),
+                _ => None,
+            })
+            .expect("resumed child should retain its pending tool approval");
+        connection
+            .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+                run_id,
+                attempt_id: approval_attempt_id,
+                expected_control_revision: approval_control_revision,
+                tool_call_id: approval_call_id,
+            }))
+            .result
+            .unwrap();
+        let completion_turn = model.next_for_child();
+        model.respond_with_text(completion_turn, "The child completed after approval.");
+        assert_eq!(
+            await_settled_run(&connection, run_id).state,
+            AgentRunState::Completed
+        );
+        for action in [
+            ProjectChildControlAction::Continue,
+            ProjectChildControlAction::Pause,
+            ProjectChildControlAction::Interrupt,
+            ProjectChildControlAction::RetryFailedStep,
+        ] {
+            assert_eq!(
+                connection
+                    .request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+                        project_id,
+                        manager_session_id,
+                        task_id: resumable_task.task_id,
+                        action,
+                    }))
+                    .result
+                    .unwrap_err()
+                    .code,
+                ErrorCode::InvalidState
+            );
+        }
+
+        let grandchild_session_id = AgentSessionId::new();
+        let grandchild_task = loom_core::DelegatedTaskRecord {
+            task_id: loom_core::TaskId::new(),
+            project_id,
+            requester_session_id: child_session_id,
+            target_session_id: grandchild_session_id,
+            child_name: "Grandchild".to_owned(),
+            intent: "Remain queued under the delegated manager".to_owned(),
+            model_id: "missing-provider/model".to_owned(),
+            context_references: vec![],
+            dependencies: vec![],
+            code_change: false,
+            permissions: loom_core::ProjectAgentPermissions::default(),
+            status: loom_core::DelegatedTaskStatus::Queued,
+            created_at,
+            updated_at: created_at,
+        };
+        let grandchild = AgentSessionSnapshot {
+            id: grandchild_session_id,
+            workspace_id: workspace.id,
+            name: grandchild_task.child_name.clone(),
+            state: AgentSessionState::Idle,
+            created_at,
+            updated_at: created_at,
+        };
+        persistence
+            .create_project_child(
+                RequestId::new(),
+                &grandchild,
+                backend.sessions().unwrap().next_sequence().next(),
+                &grandchild_task,
+            )
+            .unwrap();
+        let (_, created_event) = backend
+            .sessions()
+            .unwrap()
+            .create_in_workspace_with_id(
+                workspace.id,
+                grandchild_session_id,
+                grandchild.name.clone(),
+            )
+            .unwrap();
+        backend.journal().unwrap().append_session(created_event);
+        let filesystem = backend
+            .create_session_filesystem(workspace.id, grandchild_session_id)
+            .unwrap();
+        backend
+            .session_filesystems()
+            .unwrap()
+            .insert(grandchild_session_id, filesystem);
+        backend
+            .session_repositories()
+            .unwrap()
+            .insert(grandchild_session_id, BTreeMap::new());
+        let child_manager_control =
+            connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+                project_id,
+                manager_session_id: child_session_id,
+                task_id: grandchild_task.task_id,
+                action: ProjectChildControlAction::Cancel,
+            }));
+        assert_eq!(
+            control_task(grandchild_task.task_id, ProjectChildControlAction::Cancel)
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest,
+            "the root manager cannot control a non-direct descendant"
+        );
+        assert_eq!(
+            child_manager_control.result.unwrap_err().code,
+            ErrorCode::AuthorizationDenied,
+            "a child manager without parent-granted control permission cannot control its child"
+        );
+        assert!(matches!(
+            control(ProjectChildControlAction::Cancel).result,
+            Ok(ServerResponse::ProjectChildControlled { task, run: None })
+                if task.status == loom_core::DelegatedTaskStatus::Cancelled
+        ));
+        assert_eq!(
+            control(ProjectChildControlAction::Continue)
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidState
+        );
+
+        drop(connection);
+        backend.shutdown().unwrap();
+        drop(backend);
+        drop(model);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn durable_manager_wait_releases_workspace_slot_and_resumes_once() {
+        let temp = std::env::temp_dir().join(format!(
+            "loom-project-manager-wait-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let persistence_path = temp.join("state.sqlite");
+        let mut model = ScriptedOpenAiEndpoint::start();
+        let model_endpoint = model.endpoint.clone();
+        let model_id = ModelId::new("fixture/project-manager-wait");
+        let mut backend = InProcessBackend::with_provider_registry_persistent(
+            scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+            &persistence_path,
+        )
+        .unwrap();
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
+        let supported_capabilities = backend
+            .supported_capabilities
+            .iter()
+            .copied()
+            .chain([Capability::CreateNestedProjectChild])
+            .collect::<Vec<_>>();
+        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
+            CapabilitySet::new(supported_capabilities);
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Project manager wait e2e".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Manager".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                        config: WorkspaceConfig {
+                            project_agent_concurrency: 1,
+                            ..WorkspaceConfig::default()
+                        },
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::WorkspaceConfigUpdated)
+        ));
+
+        let root_run_id = match connection
+            .request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Coordinate a bounded investigation with a submanager.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            response => panic!("unexpected run response: {response:?}"),
+        };
+
+        let root_delegate = model.next_for_manager();
+        assert!(request_has_tool(
+            &root_delegate.request,
+            "delegate_project_task"
+        ));
+        model.respond_with_tool(
+            root_delegate,
+            "delegate_project_task",
+            serde_json::json!({
+                "child_name": "submanager",
+                "intent": "Delegate one focused investigation, wait for it, and report the result.",
+                "model_id": model_id,
+                "permissions": { "delegation": true, "inspection": true }
+            }),
+        );
+        // Keep the root's next turn open while the delegated manager runs.
+        let root_followup = model.next_for_manager();
+
+        let project_id = ProjectId::from_uuid(*root.as_uuid());
+        let persistence = backend.persistence.as_ref().unwrap();
+        let manager_task = persistence
+            .list_project_tasks(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.child_name == "submanager")
+            .expect("root delegation should create the submanager task");
+
+        let manager_delegate = model.next_for_child();
+        assert!(request_has_tool(
+            &manager_delegate.request,
+            "delegate_project_task"
+        ));
+        model.respond_with_tool(
+            manager_delegate,
+            "delegate_project_task",
+            serde_json::json!({
+                "child_name": "investigator",
+                "intent": "Complete a short investigation and report the finding.",
+                "model_id": model_id,
+                "dependencies": []
+            }),
+        );
+
+        let manager_wait = model.next_for_child();
+        assert!(request_has_tool(
+            &manager_wait.request,
+            "wait_for_project_children"
+        ));
+        let grandchild_task = persistence
+            .list_project_tasks(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.requester_session_id == manager_task.target_session_id)
+            .expect("submanager delegation should create its child task");
+        assert_eq!(
+            grandchild_task.status,
+            loom_core::DelegatedTaskStatus::Queued
+        );
+        let manager_run_id = persistence
+            .load_latest_run_summary_for_session(manager_task.target_session_id)
+            .unwrap()
+            .expect("submanager run should have a durable checkpoint")
+            .snapshot
+            .id;
+        model.respond_with_tool(
+            manager_wait,
+            "wait_for_project_children",
+            serde_json::json!({ "task_ids": [grandchild_task.task_id] }),
+        );
+
+        assert_eq!(
+            await_settled_run(&connection, manager_run_id).state,
+            AgentRunState::Paused
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (manager_task_after_park, grandchild_task_after_park) = loop {
+            let manager_task = persistence
+                .load_delegated_task(manager_task.task_id)
+                .unwrap()
+                .unwrap();
+            let grandchild_task = persistence
+                .load_delegated_task(grandchild_task.task_id)
+                .unwrap()
+                .unwrap();
+            if manager_task.status == loom_core::DelegatedTaskStatus::Blocked
+                && grandchild_task.status == loom_core::DelegatedTaskStatus::Running
+            {
+                break (manager_task, grandchild_task);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "parked manager should release its slot and start its queued child; manager={:?}, child={:?}",
+                manager_task.status,
+                grandchild_task.status
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            manager_task_after_park.status,
+            loom_core::DelegatedTaskStatus::Blocked
+        );
+        assert_eq!(
+            grandchild_task_after_park.status,
+            loom_core::DelegatedTaskStatus::Running
+        );
+        let wait = persistence
+            .list_project_manager_waits_by_child(grandchild_task.task_id)
+            .unwrap()
+            .into_iter()
+            .find(|wait| wait.manager_session_id == manager_task.target_session_id)
+            .expect("parked submanager wait should be durable");
+        assert_eq!(wait.status, loom_core::ProjectManagerWaitStatus::Waiting);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Timestamp::now() <= wait.created_at {
+            assert!(
+                Instant::now() < deadline,
+                "clock should advance past the durable wait timestamp before creating a newer task"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        let sibling = connection
+            .create_project_child(
+                RequestId::new(),
+                root,
+                "root-sibling".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Complete a short independent follow-up.".to_owned(),
+                    model_id: model_id.as_str().to_owned(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
+                },
+            )
+            .unwrap();
+        let sibling_task = match sibling {
+            ServerResponse::ProjectChildCreated { task, .. } => task,
+            response => panic!("unexpected sibling task response: {response:?}"),
+        };
+        assert!(sibling_task.created_at > wait.created_at);
+        assert_eq!(sibling_task.status, loom_core::DelegatedTaskStatus::Queued);
+
+        let grandchild_turn = model.next_for_child();
+        model.respond_with_text(
+            grandchild_turn,
+            "The investigation is complete: the finding is confirmed.",
+        );
+        assert_eq!(
+            await_settled_run(
+                &connection,
+                persistence
+                    .load_latest_run_summary_for_session(grandchild_task.target_session_id)
+                    .unwrap()
+                    .expect("grandchild run should have a durable checkpoint")
+                    .snapshot
+                    .id
+            )
+            .state,
+            AgentRunState::Completed
+        );
+
+        let resumed_manager_turn = model.next_for_child();
+        let wait_call_id = wait.tool_call_id.to_string();
+        let wait_results = resumed_manager_turn.request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == wait_call_id
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("\"return_ready\":true"))
+            })
+            .count();
+        assert_eq!(wait_results, 1, "the durable join should resume once");
+        assert!(request_has_tool(
+            &resumed_manager_turn.request,
+            "wait_for_project_children"
+        ));
+        assert_eq!(
+            persistence
+                .load_delegated_task(manager_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Running
+        );
+        assert_eq!(
+            persistence
+                .load_delegated_task(sibling_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Queued,
+            "the older ready join must claim the only workspace slot first"
+        );
+        assert_eq!(
+            persistence
+                .load_project_manager_wait(wait.wait_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::ProjectManagerWaitStatus::Resuming
+        );
+        model.respond_with_text(
+            resumed_manager_turn,
+            "The investigator confirmed the finding; the delegated work is complete.",
+        );
+        assert_eq!(
+            await_settled_run(&connection, manager_run_id).state,
+            AgentRunState::Completed
+        );
+        assert_eq!(
+            persistence
+                .load_project_manager_wait(wait.wait_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::ProjectManagerWaitStatus::Consumed
+        );
+        let manager_join_results = persistence
+            .load_run_messages(manager_run_id)
+            .unwrap()
+            .into_iter()
+            .filter(|message| {
+                message.role == loom_model::MessageRole::Tool
+                    && message.name.as_deref() == Some("wait_for_project_children")
+                    && message.tool_call_id == Some(wait.tool_call_id)
+            })
+            .count();
+        assert_eq!(manager_join_results, 1);
+        assert_eq!(
+            persistence
+                .load_delegated_task(grandchild_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Completed
+        );
+        let sibling_turn = model.next_for_child();
+        assert_eq!(
+            persistence
+                .load_delegated_task(manager_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Completed
+        );
+        let sibling_run_id = persistence
+            .load_latest_run_summary_for_session(sibling_task.target_session_id)
+            .unwrap()
+            .expect("root sibling should have started after the manager completed")
+            .snapshot
+            .id;
+        assert_eq!(
+            persistence
+                .load_delegated_task(sibling_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Running
+        );
+        model.respond_with_text(sibling_turn, "The independent follow-up is complete.");
+        assert_eq!(
+            await_settled_run(&connection, sibling_run_id).state,
+            AgentRunState::Completed
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = persistence
+                .load_delegated_task(sibling_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == loom_core::DelegatedTaskStatus::Completed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "completed sibling run should release its delegated task slot; status={status:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        model.respond_with_text(
+            root_followup,
+            "The submanager completed the investigation and confirmed the finding.",
+        );
+        assert_eq!(
+            await_settled_run(&connection, root_run_id).state,
+            AgentRunState::Completed
+        );
+
+        drop(connection);
+        backend.shutdown().unwrap();
+        drop(backend);
+        drop(model);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn durable_manager_wait_recovers_after_restart_and_resumes_once() {
+        let temp = std::env::temp_dir().join(format!(
+            "loom-project-manager-wait-restart-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let persistence_path = temp.join("state.sqlite");
+        let mut model = ScriptedOpenAiEndpoint::start();
+        let model_endpoint = model.endpoint.clone();
+        let model_id = ModelId::new("fixture/project-manager-wait-restart");
+        let provider_registry =
+            || scripted_project_provider_registry(&model_endpoint, model_id.clone());
+        let mut backend = InProcessBackend::with_provider_registry_persistent(
+            provider_registry(),
+            &persistence_path,
+        )
+        .unwrap();
+        // The manager's persisted delegation grant is exercised only while
+        // building the depth-two hierarchy in this test backend.
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
+        let supported_capabilities = backend
+            .supported_capabilities
+            .iter()
+            .copied()
+            .chain([Capability::CreateNestedProjectChild])
+            .collect::<Vec<_>>();
+        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
+            CapabilitySet::new(supported_capabilities);
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
+
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Project manager wait restart e2e".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Project root".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                        config: WorkspaceConfig {
+                            project_agent_concurrency: 1,
+                            ..WorkspaceConfig::default()
+                        },
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::WorkspaceConfigUpdated)
+        ));
+
+        let (manager_task, manager_session) = match connection
+            .create_project_child(
+                RequestId::new(),
+                root,
+                "submanager".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Delegate one child, wait for it, and summarize its result.".to_owned(),
+                    model_id: model_id.as_str().to_owned(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions {
+                        delegation: true,
+                        inspection: true,
+                        ..loom_core::ProjectAgentPermissions::default()
+                    },
+                },
+            )
+            .unwrap()
+        {
+            ServerResponse::ProjectChildCreated { task, child } => (task, child),
+            response => panic!("unexpected manager creation response: {response:?}"),
+        };
+        assert_eq!(manager_task.requester_session_id, root);
+        assert_eq!(manager_session.depth, 2);
+
+        let manager_delegate = model.next_for_child();
+        assert!(request_has_tool(
+            &manager_delegate.request,
+            "delegate_project_task"
+        ));
+
+        // Create an older queued prerequisite while the manager holds the
+        // single workspace slot. After the manager parks, it takes the slot.
+        // The grandchild depends on it, so the wait and queued grandchild stay
+        // pending while the prerequisite is paused during shutdown.
+        let sibling = connection
+            .create_project_child(
+                RequestId::new(),
+                root,
+                "older-sibling".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Complete a short independent follow-up.".to_owned(),
+                    model_id: model_id.as_str().to_owned(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
+                },
+            )
+            .unwrap();
+        let sibling_task = match sibling {
+            ServerResponse::ProjectChildCreated { task, .. } => task,
+            response => panic!("unexpected sibling task response: {response:?}"),
+        };
+        assert_eq!(sibling_task.status, loom_core::DelegatedTaskStatus::Queued);
+        let timestamp_deadline = Instant::now() + Duration::from_secs(2);
+        while Timestamp::now() <= sibling_task.created_at {
+            assert!(
+                Instant::now() < timestamp_deadline,
+                "clock should advance before creating the joined grandchild"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        model.respond_with_tool(
+            manager_delegate,
+            "delegate_project_task",
+            serde_json::json!({
+                "child_name": "investigator",
+                "intent": "Complete a bounded investigation and report the finding.",
+                "model_id": model_id,
+                "dependencies": [sibling_task.task_id]
+            }),
+        );
+        let manager_wait = model.next_for_child();
+        assert!(request_has_tool(
+            &manager_wait.request,
+            "wait_for_project_children"
+        ));
+
+        let project_id = ProjectId::from_uuid(*root.as_uuid());
+        let persistence = backend.persistence.as_ref().unwrap();
+        let grandchild_task = persistence
+            .list_project_tasks(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.requester_session_id == manager_session.session_id)
+            .expect("manager delegation should create the grandchild task");
+        assert!(sibling_task.created_at < grandchild_task.created_at);
+        assert_eq!(
+            grandchild_task.status,
+            loom_core::DelegatedTaskStatus::Queued
+        );
+        let manager_run_id = persistence
+            .load_latest_run_summary_for_session(manager_session.session_id)
+            .unwrap()
+            .expect("manager run should have a durable checkpoint")
+            .snapshot
+            .id;
+        model.respond_with_tool(
+            manager_wait,
+            "wait_for_project_children",
+            serde_json::json!({ "task_ids": [grandchild_task.task_id] }),
+        );
+        assert_eq!(
+            await_settled_run(&connection, manager_run_id).state,
+            AgentRunState::Paused
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (manager_task_after_park, sibling_after_park, grandchild_after_park) = loop {
+            let manager_task = persistence
+                .load_delegated_task(manager_task.task_id)
+                .unwrap()
+                .unwrap();
+            let sibling_task = persistence
+                .load_delegated_task(sibling_task.task_id)
+                .unwrap()
+                .unwrap();
+            let grandchild_task = persistence
+                .load_delegated_task(grandchild_task.task_id)
+                .unwrap()
+                .unwrap();
+            if manager_task.status == loom_core::DelegatedTaskStatus::Blocked
+                && sibling_task.status == loom_core::DelegatedTaskStatus::Running
+                && grandchild_task.status == loom_core::DelegatedTaskStatus::Queued
+            {
+                break (manager_task, sibling_task, grandchild_task);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "parked manager should admit only the older sibling; manager={:?}, sibling={:?}, grandchild={:?}",
+                manager_task.status,
+                sibling_task.status,
+                grandchild_task.status
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            manager_task_after_park.status,
+            loom_core::DelegatedTaskStatus::Blocked
+        );
+        assert_eq!(
+            sibling_after_park.status,
+            loom_core::DelegatedTaskStatus::Running
+        );
+        assert_eq!(
+            grandchild_after_park.status,
+            loom_core::DelegatedTaskStatus::Queued
+        );
+        let wait = persistence
+            .list_project_manager_waits_by_child(grandchild_task.task_id)
+            .unwrap()
+            .into_iter()
+            .find(|wait| wait.manager_session_id == manager_session.session_id)
+            .expect("parked manager wait should be durable");
+        assert_eq!(wait.status, loom_core::ProjectManagerWaitStatus::Waiting);
+        let manager_execution = persistence
+            .load_run_execution_state(manager_run_id)
+            .unwrap()
+            .expect("manager continuation should be persisted");
+        assert!(manager_execution.pending_project_join.is_some());
+        let sibling_turn = model.next_for_child();
+        assert!(!request_has_tool(
+            &sibling_turn.request,
+            "wait_for_project_children"
+        ));
+        let sibling_stream = hold_scripted_model_stream_until_cancelled(sibling_turn);
+        drop(connection);
+        backend.shutdown().unwrap();
+        sibling_stream.join().unwrap();
+        assert_eq!(
+            persistence
+                .load_project_manager_wait(wait.wait_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::ProjectManagerWaitStatus::Waiting
+        );
+        assert!(
+            persistence
+                .load_run_execution_state(manager_run_id)
+                .unwrap()
+                .unwrap()
+                .pending_project_join
+                .is_some()
+        );
+        assert!(
+            persistence
+                .load_latest_run_summary_for_session(grandchild_task.target_session_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(backend);
+
+        let reopened = InProcessBackend::with_provider_registry_persistent(
+            provider_registry(),
+            &persistence_path,
+        )
+        .unwrap();
+        assert!(
+            !reopened
+                .supported_capabilities
+                .contains(Capability::CreateNestedProjectChild)
+        );
+        let reopened_connection = reopened.connect();
+        negotiate(&reopened_connection);
+        let reopened_persistence = reopened.persistence.as_ref().unwrap();
+        let sibling_run_id = reopened_persistence
+            .load_latest_run_summary_for_session(sibling_task.target_session_id)
+            .unwrap()
+            .expect("prerequisite run should be durable after shutdown")
+            .snapshot
+            .id;
+        assert_eq!(
+            reopened_persistence
+                .load_run_summary(manager_run_id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .state,
+            AgentRunState::Paused
+        );
+        assert!(
+            reopened_persistence
+                .load_run_execution_state(manager_run_id)
+                .unwrap()
+                .unwrap()
+                .pending_project_join
+                .is_some()
+        );
+        assert_eq!(
+            reopened_persistence
+                .load_project_manager_wait(wait.wait_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::ProjectManagerWaitStatus::Waiting
+        );
+        assert_eq!(
+            reopened_persistence
+                .load_run_summary(sibling_run_id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .state,
+            AgentRunState::Paused
+        );
+        assert_eq!(
+            reopened_persistence
+                .load_delegated_task(sibling_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Blocked
+        );
+        assert_eq!(
+            reopened_persistence
+                .load_delegated_task(grandchild_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Queued
+        );
+
+        // The grandchild remains queued because its prerequisite was paused.
+        // Resume and finish that prerequisite, then complete the admitted
+        // grandchild; its completion should resume the manager exactly once.
+        let resumed_prerequisite =
+            reopened_connection.request(RequestEnvelope::new(ClientRequest::ResumeAgentRun {
+                run_id: sibling_run_id,
+            }));
+        let ServerResponse::AgentRun(resumed_prerequisite) = resumed_prerequisite.result.unwrap()
+        else {
+            panic!("unexpected prerequisite resume response");
+        };
+        assert_ne!(resumed_prerequisite.state, AgentRunState::Paused);
+        let prerequisite_turn = model.next_for_child();
+        model.respond_with_text(
+            prerequisite_turn,
+            "The independent prerequisite is complete.",
+        );
+        assert_eq!(
+            await_settled_run(&reopened_connection, sibling_run_id).state,
+            AgentRunState::Completed
+        );
+
+        let grandchild_turn = model.next_for_child();
+        let grandchild_run_id = reopened_persistence
+            .load_latest_run_summary_for_session(grandchild_task.target_session_id)
+            .unwrap()
+            .expect("restart should admit the queued grandchild")
+            .snapshot
+            .id;
+        model.respond_with_text(
+            grandchild_turn,
+            "The investigation is complete: the finding is confirmed.",
+        );
+        assert_eq!(
+            await_settled_run(&reopened_connection, grandchild_run_id).state,
+            AgentRunState::Completed
+        );
+
+        let resumed_manager_turn = model.next_for_child();
+        let wait_call_id = wait.tool_call_id.to_string();
+        let wait_results = resumed_manager_turn.request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == wait_call_id
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("\"return_ready\":true"))
+            })
+            .count();
+        assert_eq!(
+            wait_results, 1,
+            "the persisted wait result should replay once"
+        );
+        assert_eq!(
+            reopened_persistence
+                .load_project_manager_wait(wait.wait_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::ProjectManagerWaitStatus::Resuming
+        );
+        model.respond_with_text(
+            resumed_manager_turn,
+            "The investigator confirmed the finding; delegated work is complete.",
+        );
+        assert_eq!(
+            await_settled_run(&reopened_connection, manager_run_id).state,
+            AgentRunState::Completed
+        );
+        assert_eq!(
+            reopened_persistence
+                .load_project_manager_wait(wait.wait_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::ProjectManagerWaitStatus::Consumed
+        );
+        let durable_wait_results = reopened_persistence
+            .load_run_messages(manager_run_id)
+            .unwrap()
+            .into_iter()
+            .filter(|message| {
+                message.role == loom_model::MessageRole::Tool
+                    && message.name.as_deref() == Some("wait_for_project_children")
+                    && message.tool_call_id == Some(wait.tool_call_id)
+            })
+            .count();
+        assert_eq!(durable_wait_results, 1);
+        assert_eq!(
+            reopened_persistence
+                .load_delegated_task(grandchild_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Completed
+        );
+
+        drop(reopened_connection);
+        reopened.shutdown().unwrap();
+        drop(reopened);
+        drop(model);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn cancelled_prerequisite_blocks_child_and_releases_manager_wait_once() {
+        let temp = std::env::temp_dir().join(format!(
+            "loom-project-manager-wait-cancelled-dependency-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let persistence_path = temp.join("state.sqlite");
+        let mut model = ScriptedOpenAiEndpoint::start();
+        let model_endpoint = model.endpoint.clone();
+        let model_id = ModelId::new("fixture/project-manager-wait-cancelled-dependency");
+        let provider_registry =
+            || scripted_project_provider_registry(&model_endpoint, model_id.clone());
+        let mut backend = InProcessBackend::with_provider_registry_persistent(
+            provider_registry(),
+            &persistence_path,
+        )
+        .unwrap();
+        // Nested delegation is enabled only for the test backend used to build
+        // the root -> manager -> dependent child hierarchy.
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
+        let supported_capabilities = backend
+            .supported_capabilities
+            .iter()
+            .copied()
+            .chain([Capability::CreateNestedProjectChild])
+            .collect::<Vec<_>>();
+        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
+            CapabilitySet::new(supported_capabilities);
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
+
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Failed dependency manager wait e2e".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Project root".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                        config: WorkspaceConfig {
+                            project_agent_concurrency: 1,
+                            ..WorkspaceConfig::default()
+                        },
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::WorkspaceConfigUpdated)
+        ));
+
+        let (manager_task, manager_session) = match connection
+            .create_project_child(
+                RequestId::new(),
+                root,
+                "submanager".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Delegate one task, wait for its result, and report it.".to_owned(),
+                    model_id: model_id.as_str().to_owned(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions {
+                        delegation: true,
+                        inspection: true,
+                        ..loom_core::ProjectAgentPermissions::default()
+                    },
+                },
+            )
+            .unwrap()
+        {
+            ServerResponse::ProjectChildCreated { task, child } => (task, child),
+            response => panic!("unexpected manager creation response: {response:?}"),
+        };
+        assert_eq!(manager_task.requester_session_id, root);
+        assert_eq!(manager_session.depth, 2);
+
+        let manager_delegate = model.next_for_child();
+        assert!(request_has_tool(
+            &manager_delegate.request,
+            "delegate_project_task"
+        ));
+
+        // The older direct child becomes the prerequisite and takes the only
+        // slot when the manager parks. Cancelling it makes the dependent task
+        // Blocked, which must release the manager's wait as return-ready.
+        let prerequisite = connection
+            .create_project_child(
+                RequestId::new(),
+                root,
+                "prerequisite".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Complete the prerequisite investigation.".to_owned(),
+                    model_id: model_id.as_str().to_owned(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
+                },
+            )
+            .unwrap();
+        let prerequisite_task = match prerequisite {
+            ServerResponse::ProjectChildCreated { task, .. } => task,
+            response => panic!("unexpected prerequisite task response: {response:?}"),
+        };
+        assert_eq!(
+            prerequisite_task.status,
+            loom_core::DelegatedTaskStatus::Queued
+        );
+        let timestamp_deadline = Instant::now() + Duration::from_secs(2);
+        while Timestamp::now() <= prerequisite_task.created_at {
+            assert!(
+                Instant::now() < timestamp_deadline,
+                "clock should advance before creating the dependent child"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        model.respond_with_tool(
+            manager_delegate,
+            "delegate_project_task",
+            serde_json::json!({
+                "child_name": "dependent",
+                "intent": "Run only after the prerequisite task completes.",
+                "model_id": model_id,
+                "dependencies": [prerequisite_task.task_id]
+            }),
+        );
+        let manager_wait = model.next_for_child();
+        assert!(request_has_tool(
+            &manager_wait.request,
+            "wait_for_project_children"
+        ));
+
+        let project_id = ProjectId::from_uuid(*root.as_uuid());
+        let persistence = backend.persistence.as_ref().unwrap();
+        let dependent_task = persistence
+            .list_project_tasks(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.requester_session_id == manager_session.session_id)
+            .expect("manager delegation should create its dependent child");
+        assert!(prerequisite_task.created_at < dependent_task.created_at);
+        assert_eq!(
+            dependent_task.status,
+            loom_core::DelegatedTaskStatus::Queued
+        );
+        let manager_run_id = persistence
+            .load_latest_run_summary_for_session(manager_session.session_id)
+            .unwrap()
+            .expect("manager run should have a durable checkpoint")
+            .snapshot
+            .id;
+        model.respond_with_tool(
+            manager_wait,
+            "wait_for_project_children",
+            serde_json::json!({ "task_ids": [dependent_task.task_id] }),
+        );
+        let settle_deadline = Instant::now() + Duration::from_secs(5);
+        let manager_after_wait = loop {
+            let response = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun {
+                run_id: manager_run_id,
+            }));
+            let ServerResponse::AgentRun(snapshot) = response.result.unwrap() else {
+                panic!("unexpected manager run response");
+            };
+            if !matches!(
+                snapshot.state,
+                AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+            ) {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < settle_deadline,
+                "manager did not park; wait={:?}, execution={:?}, messages={:?}",
+                persistence
+                    .list_project_manager_waits_by_child(dependent_task.task_id)
+                    .unwrap(),
+                persistence
+                    .load_run_execution_state(manager_run_id)
+                    .unwrap(),
+                persistence
+                    .load_run_messages(manager_run_id)
+                    .unwrap()
+                    .into_iter()
+                    .map(|message| (
+                        message.role,
+                        message.name,
+                        message.tool_call_id,
+                        message.content
+                    ))
+                    .collect::<Vec<_>>()
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(manager_after_wait.state, AgentRunState::Paused);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let manager_status = persistence
+                .load_delegated_task(manager_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status;
+            let prerequisite_status = persistence
+                .load_delegated_task(prerequisite_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status;
+            let dependent_status = persistence
+                .load_delegated_task(dependent_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status;
+            if manager_status == loom_core::DelegatedTaskStatus::Blocked
+                && prerequisite_status == loom_core::DelegatedTaskStatus::Running
+                && dependent_status == loom_core::DelegatedTaskStatus::Queued
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "manager should park with only its prerequisite admitted; manager={manager_status:?}, prerequisite={prerequisite_status:?}, dependent={dependent_status:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let wait = persistence
+            .list_project_manager_waits_by_child(dependent_task.task_id)
+            .unwrap()
+            .into_iter()
+            .find(|wait| wait.manager_session_id == manager_session.session_id)
+            .expect("manager wait should be durable");
+        assert_eq!(wait.status, loom_core::ProjectManagerWaitStatus::Waiting);
+
+        let prerequisite_turn = model.next_for_child();
+        assert!(!request_has_tool(
+            &prerequisite_turn.request,
+            "wait_for_project_children"
+        ));
+        let prerequisite_stream = hold_scripted_model_stream_until_cancelled(prerequisite_turn);
+        let cancel = connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+            project_id,
+            manager_session_id: root,
+            task_id: prerequisite_task.task_id,
+            action: loom_protocol::ProjectChildControlAction::Cancel,
+        }));
+        let ServerResponse::ProjectChildControlled {
+            task: cancelled_prerequisite,
+            run: cancelled_run,
+        } = cancel.result.unwrap()
+        else {
+            panic!("unexpected prerequisite cancellation response");
+        };
+        assert_eq!(
+            cancelled_prerequisite.status,
+            loom_core::DelegatedTaskStatus::Cancelled
+        );
+        assert!(matches!(cancelled_run, Some(run)
+            if run.state == AgentRunState::Cancelled));
+        prerequisite_stream.join().unwrap();
+
+        let resumed_manager_turn = model.next_for_child();
+        let wait_call_id = wait.tool_call_id.to_string();
+        let wait_result_messages = resumed_manager_turn.request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| {
+                message["role"] == "tool"
+                    && message["tool_call_id"] == wait_call_id
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains("\"return_ready\":true"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(wait_result_messages.len(), 1);
+        let wait_result: serde_json::Value =
+            serde_json::from_str(wait_result_messages[0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(wait_result["return_ready"], true);
+        assert_eq!(
+            wait_result["children"][0]["task_id"],
+            dependent_task.task_id.to_string()
+        );
+        assert_eq!(wait_result["children"][0]["status"], "blocked");
+        assert_eq!(
+            persistence
+                .load_delegated_task(dependent_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Blocked
+        );
+        assert_eq!(
+            persistence
+                .load_project_manager_wait(wait.wait_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::ProjectManagerWaitStatus::Resuming
+        );
+
+        // The blocked child is return-ready, but remains nonterminal for the
+        // manager's completion guard. Hold its next provider turn open and
+        // cancel the manager for cleanup after verifying the one replay.
+        let manager_turn_stream = hold_scripted_model_stream_until_cancelled(resumed_manager_turn);
+        let cancel_manager =
+            connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+                project_id,
+                manager_session_id: root,
+                task_id: manager_task.task_id,
+                action: loom_protocol::ProjectChildControlAction::Cancel,
+            }));
+        let ServerResponse::ProjectChildControlled {
+            task: cancelled_manager,
+            run: cancelled_manager_run,
+        } = cancel_manager.result.unwrap()
+        else {
+            panic!("unexpected manager cancellation response");
+        };
+        assert_eq!(
+            cancelled_manager.status,
+            loom_core::DelegatedTaskStatus::Cancelled
+        );
+        assert!(matches!(cancelled_manager_run, Some(run)
+            if run.id == manager_run_id && run.state == AgentRunState::Cancelled));
+        manager_turn_stream.join().unwrap();
+        assert_eq!(
+            persistence
+                .load_project_manager_wait(wait.wait_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::ProjectManagerWaitStatus::Abandoned
+        );
+        let durable_wait_results = persistence
+            .load_run_messages(manager_run_id)
+            .unwrap()
+            .into_iter()
+            .filter(|message| {
+                message.role == loom_model::MessageRole::Tool
+                    && message.name.as_deref() == Some("wait_for_project_children")
+                    && message.tool_call_id == Some(wait.tool_call_id)
+            })
+            .count();
+        assert_eq!(durable_wait_results, 1);
+        assert!(
+            persistence
+                .load_latest_run_summary_for_session(dependent_task.target_session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        drop(connection);
+        backend.shutdown().unwrap();
+        drop(backend);
+        drop(model);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn project_coordination_exchange_and_transcripts_survive_restart() {
         let temp = std::env::temp_dir().join(format!(
             "loom-project-coordination-e2e-{}",
@@ -17902,6 +19962,304 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_project_child_cascades_deepest_first_and_survives_restart() {
+        fn hold_model_stream_until_cancelled(
+            request: ScriptedModelRequest,
+        ) -> thread::JoinHandle<()> {
+            thread::spawn(move || {
+                let mut stream = request.stream;
+                if stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                    )
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = stream.flush();
+                for _ in 0..3_000 {
+                    if stream
+                        .write_all(
+                            b"data: {\"choices\":[{\"delta\":{\"content\":\"holding\"}}]}\n\n",
+                        )
+                        .is_err()
+                        || stream.flush().is_err()
+                    {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            })
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "loom-project-cancel-cascade-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let persistence_path = temp.join("state.sqlite");
+        let mut model = ScriptedOpenAiEndpoint::start();
+        let model_endpoint = model.endpoint.clone();
+        let model_id = ModelId::new("fixture/project-cancel-cascade");
+        let provider_registry =
+            || scripted_project_provider_registry(&model_endpoint, model_id.clone());
+        let mut backend = InProcessBackend::with_provider_registry_persistent(
+            provider_registry(),
+            &persistence_path,
+        )
+        .unwrap();
+        // Nested delegation stays disabled by default; this test enables it
+        // only on the backend instance it uses to build the three-level tree.
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
+        let supported_capabilities = backend
+            .supported_capabilities
+            .iter()
+            .copied()
+            .chain([Capability::CreateNestedProjectChild])
+            .collect::<Vec<_>>();
+        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
+            CapabilitySet::new(supported_capabilities);
+        *backend
+            .self_reference
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
+
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Project cancellation cascade e2e".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Project root".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+
+        let (manager_task, manager_session) = match connection
+            .create_project_child(
+                RequestId::new(),
+                root,
+                "manager".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Delegate one bounded investigation, then wait for direction."
+                        .to_owned(),
+                    model_id: model_id.as_str().to_owned(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions {
+                        delegation: true,
+                        ..loom_core::ProjectAgentPermissions::default()
+                    },
+                },
+            )
+            .unwrap()
+        {
+            ServerResponse::ProjectChildCreated { task, child } => (task, child),
+            response => panic!("unexpected manager creation response: {response:?}"),
+        };
+        assert_eq!(manager_task.requester_session_id, root);
+        assert_eq!(manager_session.depth, 2);
+
+        let manager_delegate = model.next_for_child();
+        assert!(request_has_tool(
+            &manager_delegate.request,
+            "delegate_project_task"
+        ));
+        model.respond_with_tool(
+            manager_delegate,
+            "delegate_project_task",
+            serde_json::json!({
+                "child_name": "grandchild",
+                "intent": "Run a short investigation and report the finding.",
+                "model_id": model_id,
+                "permissions": {}
+            }),
+        );
+
+        let project_id = ProjectId::from_uuid(*root.as_uuid());
+        let persistence = backend.persistence.as_ref().unwrap();
+        // Keep both active model calls open. The manager has delegation tools;
+        // the grandchild was given no delegation permission.
+        let mut manager_turn = None;
+        let mut grandchild_turn = None;
+        for _ in 0..2 {
+            let request = model.next_for_child();
+            if request_has_tool(&request.request, "delegate_project_task") {
+                assert!(manager_turn.replace(request).is_none());
+            } else {
+                assert!(grandchild_turn.replace(request).is_none());
+            }
+        }
+        assert!(
+            manager_turn.is_some(),
+            "manager should remain active after delegation"
+        );
+        assert!(
+            grandchild_turn.is_some(),
+            "grandchild run should have started"
+        );
+        let manager_turn = manager_turn.unwrap();
+        let grandchild_turn = grandchild_turn.unwrap();
+        let manager_stream = hold_model_stream_until_cancelled(manager_turn);
+        let grandchild_stream = hold_model_stream_until_cancelled(grandchild_turn);
+        let grandchild_task = persistence
+            .list_project_tasks(project_id)
+            .unwrap()
+            .into_iter()
+            .find(|task| task.requester_session_id == manager_session.session_id)
+            .expect("manager delegation should create the grandchild task");
+        let grandchild_agent = persistence
+            .load_project_snapshot(project_id)
+            .unwrap()
+            .unwrap()
+            .agents
+            .into_iter()
+            .find(|agent| agent.session_id == grandchild_task.target_session_id)
+            .expect("grandchild should belong to the project hierarchy");
+        assert_eq!(
+            grandchild_agent.parent_session_id,
+            Some(manager_session.session_id)
+        );
+        assert_eq!(grandchild_agent.depth, 3);
+        let manager_run_id = persistence
+            .load_latest_run_summary_for_session(manager_session.session_id)
+            .unwrap()
+            .expect("manager run should be durable")
+            .snapshot
+            .id;
+        let grandchild_run_id = persistence
+            .load_latest_run_summary_for_session(grandchild_task.target_session_id)
+            .unwrap()
+            .expect("grandchild run should be durable")
+            .snapshot
+            .id;
+        assert_eq!(
+            grandchild_task.requester_session_id,
+            manager_session.session_id
+        );
+
+        let sequence_before_cancel = backend.journal().unwrap().latest_sequence(None);
+        let cancel_response =
+            connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+                project_id,
+                manager_session_id: root,
+                task_id: manager_task.task_id,
+                action: ProjectChildControlAction::Cancel,
+            }));
+        let ServerResponse::ProjectChildControlled { task, run } = cancel_response.result.unwrap()
+        else {
+            panic!("unexpected cancellation response");
+        };
+        assert_eq!(task.status, loom_core::DelegatedTaskStatus::Cancelled);
+        assert!(matches!(run, Some(run)
+            if run.id == manager_run_id && run.state == AgentRunState::Cancelled));
+
+        let updates = backend
+            .journal()
+            .unwrap()
+            .events_since(None, sequence_before_cancel)
+            .into_iter()
+            .filter_map(|event| match event.event {
+                ServerEvent::ProjectTaskUpdated { task }
+                    if task.status == loom_core::DelegatedTaskStatus::Cancelled
+                        && (task.task_id == manager_task.task_id
+                            || task.task_id == grandchild_task.task_id) =>
+                {
+                    Some(task.task_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            updates,
+            vec![grandchild_task.task_id, manager_task.task_id],
+            "subtree task cancellation events should be deepest-first"
+        );
+        assert_eq!(
+            persistence
+                .load_delegated_task(grandchild_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Cancelled
+        );
+        assert_eq!(
+            persistence
+                .load_latest_run_summary_for_session(grandchild_task.target_session_id)
+                .unwrap()
+                .unwrap()
+                .snapshot
+                .state,
+            AgentRunState::Cancelled
+        );
+
+        manager_stream.join().unwrap();
+        grandchild_stream.join().unwrap();
+        drop(connection);
+        backend.shutdown().unwrap();
+        drop(backend);
+        drop(model);
+
+        let reopened = InProcessBackend::with_provider_registry_persistent(
+            provider_registry(),
+            &persistence_path,
+        )
+        .unwrap();
+        let reopened_persistence = reopened.persistence.as_ref().unwrap();
+        let recovered = reopened_persistence
+            .load_project_snapshot(project_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.agents.len(), 3);
+        assert_eq!(recovered.tasks.len(), 2);
+        for task_id in [manager_task.task_id, grandchild_task.task_id] {
+            assert_eq!(
+                reopened_persistence
+                    .load_delegated_task(task_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                loom_core::DelegatedTaskStatus::Cancelled
+            );
+        }
+        let recovered_manager_run = reopened_persistence
+            .load_latest_run_summary_for_session(manager_session.session_id)
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(recovered_manager_run.id, manager_run_id);
+        assert_eq!(recovered_manager_run.state, AgentRunState::Cancelled);
+        let recovered_grandchild_run = reopened_persistence
+            .load_latest_run_summary_for_session(grandchild_task.target_session_id)
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        assert_eq!(recovered_grandchild_run.id, grandchild_run_id);
+        assert_eq!(recovered_grandchild_run.state, AgentRunState::Cancelled);
+        drop(reopened);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn delegated_children_require_durable_storage_on_ephemeral_backends() {
         let backend = InProcessBackend::new();
         let connection = backend.connect();
@@ -17939,26 +20297,11 @@ mod tests {
             ServerResponse::AgentSessionCreated(session) => session.id,
             response => panic!("unexpected session response: {response:?}"),
         };
-        let response =
-            connection.request(RequestEnvelope::new(ClientRequest::CreateProjectChild {
-                parent_session_id: root,
-                child_name: "worker".into(),
-                spec: loom_core::DelegatedTaskSpec {
-                    intent: "Durably owned work".into(),
-                    model_id: "deterministic/demo".into(),
-                    context_references: vec![],
-                    dependencies: vec![],
-                    code_change: false,
-                    permissions: loom_core::ProjectAgentPermissions::default(),
-                },
-            }));
         assert!(
-            matches!(
-                response.result,
-                Err(ref error) if error.code == ErrorCode::CapabilityDenied
-            ),
-            "unexpected ephemeral child response: {:?}",
-            response.result
+            !connection
+                .project_delegation_enabled_for_session(root)
+                .unwrap(),
+            "delegation tools should be unavailable without durable storage"
         );
         fs::remove_dir_all(&backend.session_root_base).unwrap();
     }
@@ -18070,6 +20413,33 @@ mod tests {
     struct ScriptedModelRequest {
         request: serde_json::Value,
         stream: TcpStream,
+    }
+
+    fn hold_scripted_model_stream_until_cancelled(
+        request: ScriptedModelRequest,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let mut stream = request.stream;
+            if stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .is_err()
+            {
+                return;
+            }
+            let _ = stream.flush();
+            for _ in 0..3_000 {
+                if stream
+                    .write_all(b"data: {\"choices\":[{\"delta\":{\"content\":\"holding\"}}]}\n\n")
+                    .is_err()
+                    || stream.flush().is_err()
+                {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        })
     }
 
     struct ScriptedOpenAiEndpoint {

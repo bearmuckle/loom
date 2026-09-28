@@ -1,9 +1,9 @@
 use loom_core::{
     AgentMessageDraft, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, Capability,
-    CapabilitySet, DelegatedTaskRecord, DelegatedTaskSpec, EventSequence, LoomError,
-    ProjectAgentRecord, ProjectId, ProjectSnapshot, ProjectWorktreeCleanupDisposition,
-    ProjectWorktreeRecord, ProtocolVersion, RepositoryId, RequestId, RunId, SessionEvent,
-    SessionEventRecord, SessionLimits, ToolCallId, UsageSnapshot, WorkspaceId,
+    CapabilitySet, DelegatedTaskRecord, EventSequence, LoomError, ProjectAgentRecord, ProjectId,
+    ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProtocolVersion,
+    RepositoryId, RequestId, RunId, SessionEvent, SessionEventRecord, SessionLimits, ToolCallId,
+    UsageSnapshot, WorkspaceId,
 };
 use loom_model::{
     ModelDescriptor, ModelId, ModelMessage, ProviderHealth, ProviderId, ProviderSummary,
@@ -52,7 +52,7 @@ pub use workspace::{
     WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(9, 0);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(10, 0);
 pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
 pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
 pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
@@ -398,11 +398,6 @@ pub enum ClientRequest {
     GetProjectSnapshotForSession {
         session_id: AgentSessionId,
     },
-    CreateProjectChild {
-        parent_session_id: AgentSessionId,
-        child_name: String,
-        spec: DelegatedTaskSpec,
-    },
     SendProjectAgentMessage {
         message: AgentMessageDraft,
     },
@@ -615,11 +610,6 @@ impl ClientRequest {
             Self::GetProjectSnapshot { .. } | Self::GetProjectSnapshotForSession { .. } => {
                 Some(Capability::ReadProject)
             }
-            Self::CreateProjectChild { spec, .. } => Some(if spec.code_change {
-                Capability::CreateProjectWorktree
-            } else {
-                Capability::CreateProjectChild
-            }),
             Self::SendProjectAgentMessage { .. } => Some(Capability::SendProjectAgentMessage),
             Self::ListProjectAgentMessages { .. } => Some(Capability::ReadProjectAgentMessages),
             Self::ControlProjectChild { .. } => Some(Capability::ControlProjectChild),
@@ -674,7 +664,6 @@ impl ClientRequest {
                 | Self::RegisterWorkspace { .. }
                 | Self::RenameWorkspace { .. }
                 | Self::CreateAgentSessionInWorkspace { .. }
-                | Self::CreateProjectChild { .. }
                 | Self::ControlProjectChild { .. }
                 | Self::IntegrateProjectChild { .. }
                 | Self::CleanupProjectChildWorktree { .. }
@@ -1157,7 +1146,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(9, 0));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(10, 0));
         let project_id = ProjectId::new();
         let request = ClientRequest::GetProjectSnapshot { project_id };
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
@@ -1215,36 +1204,9 @@ mod run_message_protocol_tests {
     }
 
     #[test]
-    fn delegated_child_and_addressed_message_protocol_round_trip() {
+    fn addressed_project_message_protocol_round_trip() {
         let parent = AgentSessionId::new();
         let project_id = ProjectId::new();
-        let child_request = ClientRequest::CreateProjectChild {
-            parent_session_id: parent,
-            child_name: "worker".into(),
-            spec: DelegatedTaskSpec {
-                intent: "Inspect protocol compatibility".into(),
-                model_id: "deterministic/demo".into(),
-                context_references: vec![loom_core::TaskContextReference {
-                    label: "Plan".into(),
-                    uri: "docs/project-sessions-design.md".into(),
-                }],
-                dependencies: vec![],
-                code_change: true,
-                permissions: loom_core::ProjectAgentPermissions::default(),
-            },
-        };
-        assert_eq!(
-            child_request.required_capability(),
-            Some(Capability::CreateProjectWorktree)
-        );
-        assert!(child_request.is_retryable_mutation());
-        assert_eq!(
-            decode_request(&encode_request(&RequestEnvelope::new(child_request.clone())).unwrap())
-                .unwrap()
-                .request,
-            child_request
-        );
-
         let draft = AgentMessageDraft {
             project_id,
             task_id: Some(loom_core::TaskId::new()),
@@ -1423,6 +1385,19 @@ mod run_message_protocol_tests {
                 stream_epoch: None,
             }
         );
+    }
+
+    #[test]
+    fn child_creation_is_not_a_client_protocol_request() {
+        let raw_request = serde_json::json!({
+            "protocol_version": CURRENT_PROTOCOL_VERSION,
+            "request_id": RequestId::new(),
+            "request": {
+                "type": "create_project_child",
+                "data": {}
+            }
+        });
+        assert!(decode_request(raw_request.to_string().as_bytes()).is_err());
     }
 
     #[test]

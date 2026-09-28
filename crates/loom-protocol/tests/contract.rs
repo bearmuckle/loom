@@ -399,7 +399,9 @@ fn capability_discovery_accepts_current_major_and_rejects_old_major() {
     assert!(!ProtocolVersion::new(7, 0).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(7, 99).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(8, 0).is_compatible_with(CURRENT_PROTOCOL_VERSION));
-    assert!(ProtocolVersion::new(9, 99).is_compatible_with(CURRENT_PROTOCOL_VERSION));
+    assert!(!ProtocolVersion::new(9, 0).is_compatible_with(CURRENT_PROTOCOL_VERSION));
+    assert!(!ProtocolVersion::new(9, 99).is_compatible_with(CURRENT_PROTOCOL_VERSION));
+    assert!(ProtocolVersion::new(10, 99).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(4, 1).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(3, 9).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(2, 9).is_compatible_with(CURRENT_PROTOCOL_VERSION));

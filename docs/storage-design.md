@@ -41,30 +41,39 @@ successful upgrade, rollback on failure, and safe retry after interruption.
 M7.4 advances v47 to v48 for branch-messaging authorization and durable
 manager wait/join state. Because that milestone is already on the draft
 branch, a separately persisted review-run grant advances storage to v49 and
-the negotiated contract to protocol 9.0. New per-run and delegated-task grants
+the negotiated contract to protocol 9.0. Protocol 10.0 then removes the raw
+client child-creation request so only the run-granted manager tool can create
+children; this protocol-only boundary does not change schema v49. New per-run and delegated-task grants
 remain independent and default off for existing records. The v47-to-v48 and
 v48-to-v49 migrations are forward-only: a v48-only backend must reject the
 upgraded database, and no backend or schema downgrade is supported. Require
-protocol 9.0 clients before exposing the current contract; protocol 8.x clients
-must upgrade. Deployments must ensure or force that upgrade; old-client forward
-compatibility is not supported.
+protocol 10.0 clients before exposing the current contract; protocol 9.x and
+older clients must upgrade. Deployments must ensure or force that upgrade;
+old-client forward compatibility is not supported.
 
 The implementation includes the v48 branch-message grant and manager-wait
 schema, the v49 review-grant column, runtime wait continuation, serialized
 workspace admission, and recovery path. It abandons waits for terminal managers
 and moves dependents with failed or cancelled prerequisites into a blocked
 state. Descendant cascade cancellation and nested permission/worktree paths
-are implemented in the current worktree. Oldest-first admission across ready
-joins and queued tasks is implemented, pending end-to-end fairness validation.
-Level-three delegation stays unavailable behind the unadvertised
-`CreateNestedProjectChild` capability until restart/cap-one, cascade recovery,
-and fairness are validated.
+are implemented in the current worktree. Focused end-to-end tests validate
+deepest-first cancellation with terminal state persistence, cap-one wait/join,
+oldest-first admission across ready joins and queued tasks, and parked-wait
+recovery across restart with exactly-once resumption. Interruption during an
+in-progress cascade recovery and failed-run prerequisite wakeup still need
+end-to-end validation. A process restart repairs committed run/task changes,
+but does not resume an interrupted cascade; untouched queued descendants may
+be admitted. Nested worktree integration is validated across both parent
+edges, and explicitly granted non-adjacent branch messaging has end-to-end
+coverage. Level-three delegation stays unavailable behind the unadvertised
+`CreateNestedProjectChild` capability until durable cascade recovery is
+addressed.
 
 Every request envelope is checked against the supported protocol major before
 dispatch, including capability discovery. `Negotiate` also checks its embedded
 client version. Clients may discover capabilities before explicit negotiation
-only after sending a supported protocol-9 envelope; protocol-8 and older
-clients are rejected before receiving protocol-9 schemas or capability values.
+only after sending a supported protocol-10 envelope; protocol-9 and older
+clients are rejected before receiving protocol-10 schemas or capability values.
 
 ## Data model
 

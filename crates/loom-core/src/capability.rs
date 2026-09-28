@@ -43,6 +43,8 @@ pub enum Capability {
     ReadSessionFilesystem,
     WriteSessionFilesystem,
     ReadProject,
+    /// Allows a project run to receive the server-bound delegation tool when
+    /// its persisted run grant also permits delegation.
     CreateProjectChild,
     /// Enables depth-two managers to create depth-three agents after rollout validation.
     CreateNestedProjectChild,

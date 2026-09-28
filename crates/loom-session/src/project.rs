@@ -421,4 +421,261 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn reparenting_moves_a_member_and_rejects_a_subtree_that_exceeds_max_depth() {
+        let mut manager = ProjectManager::default();
+        let root = AgentSessionId::new();
+        let project_id = manager.create_project(root).unwrap().id;
+        let left = AgentSessionId::new();
+        let right = AgentSessionId::new();
+        let leaf = AgentSessionId::new();
+        manager.add_agent(project_id, left, root).unwrap();
+        manager.add_agent(project_id, right, root).unwrap();
+        manager.add_agent(project_id, leaf, left).unwrap();
+
+        let moved = manager.set_parent(project_id, leaf, right).unwrap();
+        assert_eq!(moved.parent_session_id, Some(right));
+        assert_eq!(moved.depth, 3);
+        assert_eq!(manager.membership(project_id, left).unwrap().depth, 2);
+
+        let mut too_deep = ProjectManager::default();
+        let root = AgentSessionId::new();
+        let project_id = too_deep.create_project(root).unwrap().id;
+        let branch = AgentSessionId::new();
+        let parent = AgentSessionId::new();
+        let leaf = AgentSessionId::new();
+        too_deep.add_agent(project_id, branch, root).unwrap();
+        too_deep.add_agent(project_id, parent, root).unwrap();
+        too_deep.add_agent(project_id, leaf, branch).unwrap();
+        assert_eq!(
+            too_deep
+                .set_parent(project_id, branch, parent)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_project_manager_snapshots() {
+        let mut source = ProjectManager::default();
+        let root = AgentSessionId::new();
+        let project_id = source.create_project(root).unwrap().id;
+        let child = AgentSessionId::new();
+        source.add_agent(project_id, child, root).unwrap();
+        let valid = source.export_state();
+
+        let mut wrong_project_key = valid.clone();
+        let project = wrong_project_key.projects.remove(&project_id).unwrap();
+        wrong_project_key.projects.insert(ProjectId::new(), project);
+        assert!(matches!(
+            ProjectManager::from_state(wrong_project_key)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        ));
+
+        let mut missing_parent = valid.clone();
+        missing_parent
+            .projects
+            .get_mut(&project_id)
+            .unwrap()
+            .members
+            .get_mut(&child)
+            .unwrap()
+            .parent_session_id = None;
+        assert_eq!(
+            ProjectManager::from_state(missing_parent).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+
+        let mut absent_parent = valid.clone();
+        absent_parent
+            .projects
+            .get_mut(&project_id)
+            .unwrap()
+            .members
+            .get_mut(&child)
+            .unwrap()
+            .parent_session_id = Some(AgentSessionId::new());
+        assert_eq!(
+            ProjectManager::from_state(absent_parent).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+
+        let mut wrong_depth = valid.clone();
+        wrong_depth
+            .projects
+            .get_mut(&project_id)
+            .unwrap()
+            .members
+            .get_mut(&child)
+            .unwrap()
+            .depth = 3;
+        assert_eq!(
+            ProjectManager::from_state(wrong_depth).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+
+        let mut wrong_member_key = valid.clone();
+        let project = wrong_member_key.projects.get_mut(&project_id).unwrap();
+        let membership = project.members.remove(&child).unwrap();
+        project.members.insert(AgentSessionId::new(), membership);
+        assert_eq!(
+            ProjectManager::from_state(wrong_member_key)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+
+        let mut invalid_root = valid.clone();
+        invalid_root
+            .projects
+            .get_mut(&project_id)
+            .unwrap()
+            .members
+            .get_mut(&root)
+            .unwrap()
+            .depth = 2;
+        assert_eq!(
+            ProjectManager::from_state(invalid_root).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+
+        let mut invalid_membership_project = valid.clone();
+        invalid_membership_project
+            .projects
+            .get_mut(&project_id)
+            .unwrap()
+            .members
+            .get_mut(&child)
+            .unwrap()
+            .project_id = ProjectId::new();
+        assert_eq!(
+            ProjectManager::from_state(invalid_membership_project)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+
+        let mut zero_depth = valid.clone();
+        zero_depth
+            .projects
+            .get_mut(&project_id)
+            .unwrap()
+            .members
+            .get_mut(&child)
+            .unwrap()
+            .depth = 0;
+        assert_eq!(
+            ProjectManager::from_state(zero_depth).unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+
+        let mut excessive_depth = valid.clone();
+        excessive_depth
+            .projects
+            .get_mut(&project_id)
+            .unwrap()
+            .members
+            .get_mut(&child)
+            .unwrap()
+            .depth = MAX_AGENT_DEPTH + 1;
+        assert_eq!(
+            ProjectManager::from_state(excessive_depth)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+
+        let mut second_manager = ProjectManager::default();
+        let second_root = AgentSessionId::new();
+        let second_project = second_manager.create_project(second_root).unwrap();
+        let mut duplicate_member_state = valid.clone();
+        let mut second_project = second_project;
+        second_project.members.insert(
+            child,
+            AgentMembership {
+                project_id: second_project.id,
+                session_id: child,
+                parent_session_id: Some(second_root),
+                depth: 2,
+                created_at: Timestamp::now(),
+            },
+        );
+        duplicate_member_state
+            .projects
+            .insert(second_project.id, second_project);
+        assert_eq!(
+            ProjectManager::from_state(duplicate_member_state)
+                .unwrap_err()
+                .code,
+            ErrorCode::MalformedPayload
+        );
+    }
+
+    #[test]
+    fn project_manager_rejects_missing_members_and_duplicate_registration() {
+        let root = AgentSessionId::new();
+        let mut manager = ProjectManager::default();
+        let project = manager.create_project(root).unwrap();
+        let project_id = project.id;
+        assert_eq!(
+            manager.create_project(root).unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        let child = AgentSessionId::new();
+        manager.add_agent(project_id, child, root).unwrap();
+        assert_eq!(
+            manager.add_agent(project_id, child, root).unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            manager
+                .add_agent(ProjectId::new(), AgentSessionId::new(), root)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            manager
+                .set_parent(project_id, root, child)
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            manager
+                .set_parent(project_id, child, AgentSessionId::new())
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            manager
+                .set_parent(project_id, AgentSessionId::new(), root)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            manager.get(ProjectId::new()).unwrap_err().code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            manager
+                .membership(project_id, AgentSessionId::new())
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+        assert_eq!(
+            manager
+                .validate_concurrency(ProjectId::new(), 0)
+                .unwrap_err()
+                .code,
+            ErrorCode::NotFound
+        );
+    }
 }
