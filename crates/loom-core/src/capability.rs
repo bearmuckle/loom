@@ -44,6 +44,7 @@ pub enum Capability {
     WriteSessionFilesystem,
     ReadProject,
     CreateProjectChild,
+    ControlProjectChild,
     SendProjectAgentMessage,
     ReadProjectAgentMessages,
 }

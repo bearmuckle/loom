@@ -203,6 +203,7 @@ fn fixture(
         project_delegation_enabled: false,
         project_messaging_enabled: false,
         project_inspection_enabled: false,
+        project_child_control_enabled: false,
     };
     let messages = (0..rows)
         .map(|index| message(index, "representative persisted transcript row ".repeat(4)))

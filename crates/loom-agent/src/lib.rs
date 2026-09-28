@@ -52,6 +52,9 @@ pub struct AgentRuntimeOptions {
     /// Persisted grant for direct-child project status inspection.
     #[serde(default)]
     pub project_inspection_enabled: bool,
+    /// Persisted grant for direct-child lifecycle controls.
+    #[serde(default)]
+    pub project_child_control_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
