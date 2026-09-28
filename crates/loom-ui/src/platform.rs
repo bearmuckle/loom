@@ -6,7 +6,12 @@
 
 #[cfg(test)]
 use std::{collections::BTreeMap, sync::Mutex};
-use std::{env, fs, path::PathBuf, sync::Arc};
+use std::{
+    env, fs,
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use loom_core::{ErrorCode, LoomError, WorkspaceId};
 use loom_model::ModelId;
@@ -152,6 +157,7 @@ pub(crate) struct UiOptions {
     pub(crate) api_key: Option<String>,
     pub(crate) remote: Option<String>,
     pub(crate) token: Option<String>,
+    pub(crate) reset_state: bool,
 }
 
 impl UiOptions {
@@ -169,6 +175,7 @@ impl UiOptions {
         let api_key = env::var("LOOM_API_KEY").ok();
         let mut remote = env::var("LOOM_REMOTE_URL").ok();
         let token = env::var("LOOM_TOKEN").ok();
+        let mut reset_state = false;
         let mut args = args.into_iter().skip(1);
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -227,9 +234,12 @@ impl UiOptions {
                     demo = true;
                     model = ModelId::new("deterministic/demo");
                 }
+                "--reset-state" => {
+                    reset_state = true;
+                }
                 "--help" | "-h" => {
                     return Err(LoomError::invalid_request(
-                        "usage: loom-ui [--project PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] [--remote URL] [--demo]",
+                        "usage: loom-ui [--project PATH] [--task DESCRIPTION] [--model ID] [--endpoint URL] [--remote URL] [--reset-state] [--demo]",
                     ));
                 }
                 unknown => {
@@ -248,8 +258,55 @@ impl UiOptions {
             api_key,
             remote,
             token,
+            reset_state,
         })
     }
+}
+
+/// Ensures the local state database can be opened by this build. An
+/// incompatible database is wiped only when the operator passed
+/// `--reset-state` or explicitly confirmed the interactive prompt; otherwise
+/// the error is returned so the GUI reports it instead of failing silently.
+pub(crate) fn prepare_backend_state(options: &UiOptions) -> Result<(), LoomError> {
+    if options.remote.is_some() || options.demo {
+        return Ok(());
+    }
+    let path = backend_persistence_path();
+    let status = loom_persistence::FilePersistence::schema_status(&path)?;
+    if status.is_compatible() {
+        return Ok(());
+    }
+    let wipe = options.reset_state || confirm_state_wipe(&path, status)?;
+    if !wipe {
+        return Err(loom_persistence::incompatible_database_error(&path, status));
+    }
+    loom_persistence::FilePersistence::reset_database(&path)
+}
+
+fn confirm_state_wipe(
+    path: &Path,
+    status: loom_persistence::SchemaStatus,
+) -> Result<bool, LoomError> {
+    if !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprintln!(
+        "Loom state database '{}' uses {} and cannot be opened by this build.",
+        path.display(),
+        status.description()
+    );
+    eprint!("Wipe it and start with an empty database? [y/N] ");
+    io::stderr()
+        .flush()
+        .map_err(|error| LoomError::new(ErrorCode::Internal, format!("{error}"), true))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| LoomError::new(ErrorCode::Internal, format!("{error}"), true))?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 pub(crate) fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomError> {
@@ -366,6 +423,7 @@ mod tests {
             "http://127.0.0.1:8000/v1/chat/completions".to_owned(),
             "--remote".to_owned(),
             "ws://127.0.0.1:8080/ws".to_owned(),
+            "--reset-state".to_owned(),
         ])
         .unwrap();
         assert_eq!(options.project, Some(PathBuf::from("/tmp/project")));
@@ -376,6 +434,7 @@ mod tests {
             Some("http://127.0.0.1:8000/v1/chat/completions")
         );
         assert_eq!(options.remote.as_deref(), Some("ws://127.0.0.1:8080/ws"));
+        assert!(options.reset_state);
         assert!(!options.demo);
     }
 

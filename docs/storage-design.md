@@ -2,108 +2,41 @@
 
 ## Status
 
-The project-session rollout upgrades forward through schema version 51. The
-v41-to-v42 migration backfills existing sessions as project roots, v43 adds the
-durable project-message delivery cursor to run execution state, and v44 stores
-the per-run project-delegation grant. V45 adds separate per-run messaging and
-inspection grants, defaulting them off for runs already in the database. V46
-adds a separate per-run child-control grant, also defaulting off for existing
-runs. Each migration records its own resulting version only after its schema
-change succeeds, so an interrupted multi-step upgrade can resume at the next
-missing migration. Incompatible databases are rejected without modification;
-backend downgrades and schema downgrade migrations are unsupported. The
-v46-to-v47 migration adds normalized project worktree records with ownership,
-base/result and integration revisions, conflict paths, lifecycle status, and
-cleanup disposition. Per-run code-worktree and integration grants default to
-disabled. After that migration, a v46-only backend cannot open a database. If
-an upgrade must be rolled back, restore a pre-upgrade backup or move forward
-with a fix.
+Loom stores durable backend state in one SQLite database with a single
+baseline schema, currently version 1. Loom is pre-1.0: there is no migration
+ladder and no legacy import path. A database written by any other Loom
+revision is rejected unchanged, and the operator must wipe it before starting
+from a new database. When the domain model changes, the baseline version and
+the typed schema definitions change together; incremental migrations are
+deliberately not supported.
 
-Schema v51 adds a run-wide `timeline_ordinal` to persisted transcript messages
-and activity records. The runtime assigns it as each item is created; activity
-status updates keep the original ordinal. Transcript pages and activity
-snapshots expose that same key so clients merge both streams by durable order.
-The v50-to-v51 migration is forward-only. Pre-v51 rows did not preserve a
-cross-stream order, so their migration assigns a stable legacy order; exact
-historical interleaving cannot be recovered from the old schema.
+Per-run project-agent grants are stored as one versioned JSON payload
+(`run_runtime_config.project_grants`), and delegated-task grants as
+`delegated_tasks.permissions`. Both use Serde defaults: unknown keys are
+ignored and missing keys default to disabled, so a new grant is a code change
+rather than a schema change. JSON is otherwise reserved for small bounded
+configuration or diagnostic payloads that are not used as query keys.
 
-The v41-to-v42 migration adds project hierarchy, delegated-task, and addressed
-message records and backfills one root project per
-existing session without changing session IDs or deleting existing history.
-Run the schema changes and backfill atomically, validate parent/root and
-workspace ownership invariants before updating `PRAGMA user_version`, and leave
-the database unchanged if migration fails. The v42-to-v43 migration adds the
-per-run project-message cursor used to checkpoint inbox delivery with the
-transcript. The v43-to-v44 migration adds `project_delegation_enabled` to each
-run runtime configuration. The v44-to-v45 migration adds
-`project_messaging_enabled` and `project_inspection_enabled`; the v45-to-v46
-migration adds `project_child_control_enabled`. These grants remain separate,
-so existing runs do not acquire new capabilities during an upgrade. Existing
-runs default to disabled; new runs persist each project capability grant
-chosen at start so restart recovery exposes the same tool set. The v46-to-v47
-migration adds the independent worktree and integration grants; existing runs
-receive neither grant. The v48-to-v49 migration adds a separate review-run
-grant, defaulting it off for existing runs. Each migration should be tested for
-successful upgrade, rollback on failure, and safe retry after interruption.
-
-M7.4 advances v47 to v48 for branch-messaging authorization and durable
-manager wait/join state. Because that milestone is already on the draft
-branch, a separately persisted review-run grant advances storage to v49 and
-the negotiated contract to protocol 9.0. Protocol 10.0 then removes the raw
-client child-creation request so only the run-granted manager tool can create
-children; this protocol-only boundary does not change schema. Schema v50 adds
-durable cancellation-cascade intent and the ordered subtree snapshot needed
-for recovery. New per-run and delegated-task grants remain independent and
-default off for existing records. The v47-to-v48, v48-to-v49, v49-to-v50, and
-v50-to-v51 migrations are forward-only: a v50-only backend must reject the
-upgraded database, and no backend or schema downgrade is supported. Require
-protocol 11.0 clients before exposing the current contract; protocol 10.x and
-older clients must upgrade. Deployments must ensure or force that upgrade;
-old-client forward compatibility is not supported.
-
-Protocol 11.0 carries the shared run timeline ordinal in activity records,
-message headers, transcript pages, and run snapshots. Protocol 10 clients must
-upgrade before the backend serves this contract; forward compatibility with
-old clients is unsupported.
-
-The implementation includes the v48 branch-message grant and manager-wait
-schema, the v49 review-grant column, v50 cancellation-recovery tables, and the
-v51 cross-stream timeline-order columns.
-Each active cascade stores its root task, requesting manager, and ordered
-task/session members before any task or run transition. Startup restores
-runtimes, replays pending cascades idempotently, persists resulting events, and
-only then reconciles or admits queued work. The scheduler skips projects with
-pending intents, and child creation is fenced until recovery completes. The
-v49-to-v50 migration creates both normalized tables atomically without changing
-protocol or task/run statuses; no downgrade path exists.
-
-The implementation abandons waits for terminal managers and moves dependents
-with failed or cancelled prerequisites into a blocked state. Focused end-to-end
-tests validate deepest-first cancellation, terminal task/run state after an
-injected interruption and restart, both prerequisite outcomes, cap-one
-wait/join, oldest-first admission across ready joins and queued tasks, and
-parked-wait recovery with exactly-once resumption. Nested worktree integration
-is validated across both parent edges, and explicitly granted non-adjacent
-branch messaging has end-to-end coverage. Depth-three delegation is enabled.
-
-Every request envelope is checked against the supported protocol major before
-dispatch, including capability discovery. `Negotiate` also checks its embedded
-client version. Clients may discover capabilities before explicit negotiation
-only after sending a supported protocol-10 envelope; protocol-9 and older
-clients are rejected before receiving protocol-10 schemas or capability values.
+Wiping is always opt-in. On startup the native client and CLI inspect the
+database without modifying it; an incompatible file is reported and wiped only
+when `--reset-state` is passed or the user confirms an interactive prompt on a
+terminal. The wipe removes the database and its SQLite sidecar files and
+refuses to run while another backend holds the writer lock.
 
 ## Data model
 
 Typed, indexed tables are the source of truth for workspaces, sessions, runs, attempts, messages, activities, approvals and other interactions, provider state, usage, checkpoints, and filesystem history. Query and ownership fields are represented as columns and indexed for the operations that use them. Growing histories are stored as ordered child rows rather than arrays inside aggregate JSON documents.
 
+Transcript and tool state are deliberately shallow. A transcript message is one `run_messages` row; its model tool calls and its streamed fragment descriptors are versioned JSON payloads on that row (`tool_calls`, `fragments`). A logical tool call is one `run_tool_calls` row, and its execution attempts are a versioned JSON payload on that row (`attempts`). Message tool-call arguments and tool results are stored inline in those payloads, while streamed fragment bytes remain content-addressed so they stay compressed and deduplicated. JSON is used here only for child collections that are always read and written with their parent; the query keys (run, message ordinal, tool-call id) remain columns. These JSON payloads tolerate added fields without a schema change.
+
 Large immutable values—including message bodies, tool output, checkpoint file contents, and undo bytes—are stored in a shared content-addressed store inside SQLite. Equal content is deduplicated, small objects can be stored inline, and larger objects are compressed and chunked. Rows refer to content by hash; garbage collection removes content only after it becomes unreachable.
 
-The generic JSON section store has been removed. JSON remains suitable for small bounded configuration or diagnostic payloads that are not used as query keys. Runtime objects, locks, provider clients, filesystem watchers, and UI caches are reconstructed and are not persisted.
+Runtime objects, locks, provider clients, filesystem watchers, and UI caches are reconstructed and are not persisted.
 
 The workspace-config JSON stores `project_agent_concurrency` with a serde
 default of four (valid values are one through sixteen). Existing config blobs
 without the field remain readable, and the setting needs no separate SQLite
-schema migration; the delegated-task table already persists queued work. A
+schema change; the delegated-task table already persists queued work. A
 project may have at most fifty queued or active delegated tasks.
 
 ## Transactions and incremental writes
@@ -132,7 +65,7 @@ A run-checkpoint benchmark seeded 10,000 transcript rows and 10,000 activity row
 
 ## Suggested future improvements (non-goals)
 
-These items are outside the implemented design and do not block PR #85:
+These items are outside the implemented design:
 
 - Add hash-guarded write intents to reconcile physical filesystem changes with SQLite commits after a crash.
 - Load canonical model context from bounded pages; transcript browsing is already paged.

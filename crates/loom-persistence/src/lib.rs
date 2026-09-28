@@ -38,16 +38,16 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const DATABASE_SCHEMA_VERSION: u32 = 51;
-const RUN_TIMELINE_PREVIOUS_SCHEMA_VERSION: u32 = 50;
-const PROJECT_WORKTREE_SCHEMA_VERSION: u32 = 47;
-const PROJECT_CHILD_CONTROL_SCHEMA_VERSION: u32 = 46;
-const PROJECT_MANAGER_WAIT_SCHEMA_VERSION: u32 = 48;
-const PROJECT_CANCELLATION_CASCADE_SCHEMA_VERSION: u32 = 49;
-const PROJECT_SCHEMA_VERSION: u32 = 42;
-const PROJECT_MESSAGE_SCHEMA_VERSION: u32 = 43;
-const PROJECT_DELEGATION_SCHEMA_VERSION: u32 = 44;
-const PROJECT_COORDINATION_SCHEMA_VERSION: u32 = 45;
+/// Baseline schema version for the current typed model.
+///
+/// Loom is pre-1.0 and deliberately has **no migration ladder**: this constant
+/// is the only supported layout. A database written by any other Loom revision
+/// is rejected and must be wiped by the operator. When the model changes, bump
+/// this value and adjust [`DATABASE_SCHEMA`] (and the companion schema
+/// fragments) in place; do not reintroduce incremental migrations or legacy
+/// import paths. New optional state should prefer a versioned JSON payload
+/// column over a new column that would need its own migration.
+const DATABASE_SCHEMA_VERSION: u32 = 1;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;
@@ -187,22 +187,10 @@ CREATE TABLE IF NOT EXISTS run_runtime_config (
     configuration_hash BLOB NOT NULL REFERENCES runtime_configurations(configuration_hash) ON DELETE RESTRICT
         CHECK(length(configuration_hash) = 32),
     context_inspection TEXT,
-    project_delegation_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_delegation_enabled IN (0, 1)),
-    project_messaging_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_messaging_enabled IN (0, 1)),
-    project_inspection_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_inspection_enabled IN (0, 1)),
-    project_child_control_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_child_control_enabled IN (0, 1)),
-    project_worktree_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_worktree_enabled IN (0, 1)),
-    project_review_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_review_enabled IN (0, 1)),
-    project_integration_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_integration_enabled IN (0, 1)),
-    project_branch_messaging_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_branch_messaging_enabled IN (0, 1))
+    -- One versioned JSON payload holds every per-run project-agent grant.
+    -- Adding a grant is a serde-default field, not a schema migration.
+    project_grants TEXT NOT NULL DEFAULT '{}'
+        CHECK(length(CAST(project_grants AS BLOB)) <= 4096)
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS run_runtime_config_by_configuration
     ON run_runtime_config(configuration_hash);
@@ -325,25 +313,16 @@ CREATE TABLE IF NOT EXISTS run_messages (
         CHECK(content_hash IS NULL OR length(content_hash) = 32),
     name TEXT,
     tool_call_id BLOB CHECK(tool_call_id IS NULL OR length(tool_call_id) = 16),
+    -- Message tool calls and streamed fragment descriptors are versioned JSON
+    -- payloads on the message row, so a transcript message is one row.
+    tool_calls TEXT NOT NULL DEFAULT '[]'
+        CHECK(length(CAST(tool_calls AS BLOB)) <= 16777216),
+    fragments TEXT NOT NULL DEFAULT '[]'
+        CHECK(length(CAST(fragments AS BLOB)) <= 1048576),
     PRIMARY KEY(run_id, ordinal),
     FOREIGN KEY(run_id, session_id)
         REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
 ) WITHOUT ROWID, STRICT;
-CREATE TABLE IF NOT EXISTS run_message_tool_calls (
-    run_id BLOB NOT NULL,
-    message_ordinal INTEGER NOT NULL CHECK(message_ordinal >= 0),
-    call_ordinal INTEGER NOT NULL CHECK(call_ordinal >= 0),
-    tool_call_id BLOB NOT NULL CHECK(length(tool_call_id) = 16),
-    name TEXT NOT NULL CHECK(length(name) <= 4096),
-    arguments_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE RESTRICT
-        CHECK(length(arguments_hash) = 32),
-    PRIMARY KEY(run_id, message_ordinal, call_ordinal),
-    UNIQUE(run_id, message_ordinal, tool_call_id),
-    FOREIGN KEY(run_id, message_ordinal)
-        REFERENCES run_messages(run_id, ordinal) ON DELETE CASCADE
-) WITHOUT ROWID, STRICT;
-CREATE INDEX IF NOT EXISTS run_message_tool_calls_by_id
-    ON run_message_tool_calls(run_id, tool_call_id);
 CREATE TABLE IF NOT EXISTS run_context_checkpoints (
     run_id BLOB PRIMARY KEY NOT NULL CHECK(length(run_id) = 16),
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -395,50 +374,13 @@ CREATE TABLE IF NOT EXISTS run_tool_calls (
     arguments_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE RESTRICT
         CHECK(length(arguments_hash) = 32),
     created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    -- Tool execution attempts are a versioned JSON payload on the logical call.
+    attempts TEXT NOT NULL DEFAULT '[]'
+        CHECK(length(CAST(attempts AS BLOB)) <= 16777216),
     PRIMARY KEY(run_id, tool_call_id),
     FOREIGN KEY(run_id, session_id)
         REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
 ) WITHOUT ROWID, STRICT;
-CREATE TABLE IF NOT EXISTS run_tool_attempts (
-    run_id BLOB NOT NULL,
-    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
-    activity_id BLOB NOT NULL CHECK(length(activity_id) = 16),
-    tool_call_id BLOB NOT NULL CHECK(length(tool_call_id) = 16),
-    attempt_number INTEGER NOT NULL CHECK(attempt_number > 0),
-    state TEXT NOT NULL CHECK(state IN (
-        'queued', 'running', 'awaiting_approval', 'awaiting_input',
-        'completed', 'failed', 'cancelled', 'outcome_unknown'
-    )),
-    started_at INTEGER NOT NULL CHECK(started_at >= 0),
-    completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
-    result_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
-        CHECK(result_hash IS NULL OR length(result_hash) = 32),
-    PRIMARY KEY(run_id, activity_id),
-    UNIQUE(run_id, tool_call_id, attempt_number),
-    FOREIGN KEY(run_id, session_id)
-        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE,
-    FOREIGN KEY(run_id, tool_call_id)
-        REFERENCES run_tool_calls(run_id, tool_call_id) ON DELETE CASCADE,
-    FOREIGN KEY(run_id, activity_id)
-        REFERENCES run_activities(run_id, activity_id) ON DELETE CASCADE
-) WITHOUT ROWID, STRICT;
-CREATE INDEX IF NOT EXISTS run_tool_attempts_by_call
-    ON run_tool_attempts(run_id, tool_call_id, attempt_number);
-CREATE TABLE IF NOT EXISTS run_message_fragments (
-    run_id BLOB NOT NULL,
-    message_ordinal INTEGER NOT NULL CHECK(message_ordinal >= 0),
-    fragment_ordinal INTEGER NOT NULL CHECK(fragment_ordinal >= 0),
-    byte_offset INTEGER NOT NULL CHECK(byte_offset >= 0),
-    byte_length INTEGER NOT NULL CHECK(byte_length > 0 AND byte_length <= 32768),
-    content_hash BLOB NOT NULL REFERENCES content_objects(hash) ON DELETE RESTRICT
-        CHECK(length(content_hash) = 32),
-    PRIMARY KEY(run_id, message_ordinal, fragment_ordinal),
-    UNIQUE(run_id, message_ordinal, byte_offset),
-    FOREIGN KEY(run_id, message_ordinal)
-        REFERENCES run_messages(run_id, ordinal) ON DELETE CASCADE
-) WITHOUT ROWID, STRICT;
-CREATE INDEX IF NOT EXISTS run_message_fragments_by_range
-    ON run_message_fragments(run_id, message_ordinal, byte_offset);
 CREATE TABLE IF NOT EXISTS session_filesystems (
     session_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
         CHECK(length(session_id) = 16),
@@ -666,13 +608,6 @@ CREATE TRIGGER IF NOT EXISTS gc_context_checkpoints_update AFTER UPDATE OF summa
 WHEN OLD.summary_hash IS NOT NEW.summary_hash BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.summary_hash);
 END;
-CREATE TRIGGER IF NOT EXISTS gc_message_fragments_delete AFTER DELETE ON run_message_fragments BEGIN
-    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
-END;
-CREATE TRIGGER IF NOT EXISTS gc_message_fragments_update AFTER UPDATE OF content_hash ON run_message_fragments
-WHEN OLD.content_hash IS NOT NEW.content_hash BEGIN
-    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.content_hash);
-END;
 CREATE TRIGGER IF NOT EXISTS gc_activities_delete AFTER DELETE ON run_activities BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.data_hash);
 END;
@@ -684,22 +619,6 @@ CREATE TRIGGER IF NOT EXISTS gc_tool_calls_delete AFTER DELETE ON run_tool_calls
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.arguments_hash);
 END;
 CREATE TRIGGER IF NOT EXISTS gc_tool_calls_update AFTER UPDATE OF arguments_hash ON run_tool_calls
-WHEN OLD.arguments_hash IS NOT NEW.arguments_hash BEGIN
-    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.arguments_hash);
-END;
-CREATE TRIGGER IF NOT EXISTS gc_tool_attempts_delete AFTER DELETE ON run_tool_attempts
-WHEN OLD.result_hash IS NOT NULL BEGIN
-    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.result_hash);
-END;
-CREATE TRIGGER IF NOT EXISTS gc_tool_attempts_update AFTER UPDATE OF result_hash ON run_tool_attempts
-WHEN OLD.result_hash IS NOT NULL AND OLD.result_hash IS NOT NEW.result_hash BEGIN
-    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.result_hash);
-END;
-CREATE TRIGGER IF NOT EXISTS gc_message_tool_calls_delete AFTER DELETE ON run_message_tool_calls BEGIN
-    INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.arguments_hash);
-END;
-CREATE TRIGGER IF NOT EXISTS gc_message_tool_calls_update
-AFTER UPDATE OF arguments_hash ON run_message_tool_calls
 WHEN OLD.arguments_hash IS NOT NEW.arguments_hash BEGIN
     INSERT OR IGNORE INTO content_gc_candidates(kind, hash) VALUES ('object', OLD.arguments_hash);
 END;
@@ -770,6 +689,9 @@ CREATE TABLE IF NOT EXISTS delegated_tasks (
     intent TEXT NOT NULL CHECK(length(trim(intent)) > 0),
     model_id TEXT NOT NULL CHECK(length(trim(model_id)) > 0),
     code_change INTEGER NOT NULL CHECK(code_change IN (0, 1)),
+    -- One versioned JSON payload holds the child's independent grants.
+    permissions TEXT NOT NULL DEFAULT '{}'
+        CHECK(length(CAST(permissions AS BLOB)) <= 4096),
     status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'blocked', 'completed', 'failed', 'cancelled')),
     created_at INTEGER NOT NULL CHECK(created_at >= 0),
     updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
@@ -830,30 +752,6 @@ CREATE INDEX IF NOT EXISTS project_agent_messages_by_target
     ON project_agent_messages(project_id, target_session_id, project_sequence);
 CREATE INDEX IF NOT EXISTS project_agent_messages_by_sender
     ON project_agent_messages(project_id, sender_session_id, project_sequence);
-";
-
-const PROJECT_TASK_PERMISSION_COLUMNS: &str = "
-ALTER TABLE delegated_tasks
-    ADD COLUMN permission_delegation INTEGER NOT NULL DEFAULT 0
-    CHECK(permission_delegation IN (0, 1));
-ALTER TABLE delegated_tasks
-    ADD COLUMN permission_branch_messaging INTEGER NOT NULL DEFAULT 0
-    CHECK(permission_branch_messaging IN (0, 1));
-ALTER TABLE delegated_tasks
-    ADD COLUMN permission_child_control INTEGER NOT NULL DEFAULT 0
-    CHECK(permission_child_control IN (0, 1));
-ALTER TABLE delegated_tasks
-    ADD COLUMN permission_inspection INTEGER NOT NULL DEFAULT 0
-    CHECK(permission_inspection IN (0, 1));
-ALTER TABLE delegated_tasks
-    ADD COLUMN permission_worktree_creation INTEGER NOT NULL DEFAULT 0
-    CHECK(permission_worktree_creation IN (0, 1));
-ALTER TABLE delegated_tasks
-    ADD COLUMN permission_review INTEGER NOT NULL DEFAULT 0
-    CHECK(permission_review IN (0, 1));
-ALTER TABLE delegated_tasks
-    ADD COLUMN permission_integration INTEGER NOT NULL DEFAULT 0
-    CHECK(permission_integration IN (0, 1));
 ";
 
 const PROJECT_WORKTREE_SCHEMA: &str = "
@@ -1297,6 +1195,50 @@ pub struct DurableRunRuntimeConfig {
     pub project_branch_messaging_enabled: bool,
 }
 
+/// Versioned JSON payload persisted in `run_runtime_config.project_grants`.
+///
+/// This is the single storage representation for the per-run project-agent
+/// grants. Unknown keys are ignored and missing keys default to `false`, so a
+/// new grant is added here without a schema migration.
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
+#[serde(default)]
+struct RunProjectGrants {
+    delegation: bool,
+    messaging: bool,
+    inspection: bool,
+    child_control: bool,
+    worktree: bool,
+    review: bool,
+    integration: bool,
+    branch_messaging: bool,
+}
+
+impl RunProjectGrants {
+    fn of(config: &DurableRunRuntimeConfig) -> Self {
+        Self {
+            delegation: config.project_delegation_enabled,
+            messaging: config.project_messaging_enabled,
+            inspection: config.project_inspection_enabled,
+            child_control: config.project_child_control_enabled,
+            worktree: config.project_worktree_enabled,
+            review: config.project_review_enabled,
+            integration: config.project_integration_enabled,
+            branch_messaging: config.project_branch_messaging_enabled,
+        }
+    }
+
+    fn apply(self, config: &mut DurableRunRuntimeConfig) {
+        config.project_delegation_enabled = self.delegation;
+        config.project_messaging_enabled = self.messaging;
+        config.project_inspection_enabled = self.inspection;
+        config.project_child_control_enabled = self.child_control;
+        config.project_worktree_enabled = self.worktree;
+        config.project_review_enabled = self.review;
+        config.project_integration_enabled = self.integration;
+        config.project_branch_messaging_enabled = self.branch_messaging;
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableRunContextCheckpoint {
     pub session_id: AgentSessionId,
@@ -1440,6 +1382,142 @@ pub struct DurableStateWrite<'a> {
     pub feed: Option<&'a DurableFeedState>,
 }
 
+/// Compatibility of an on-disk Loom state database with the current build.
+///
+/// Loom is pre-1.0 and has no migration ladder, so a database that is not at
+/// the current baseline must be wiped by the operator before it can be opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchemaStatus {
+    /// No state database exists yet; opening creates the baseline schema.
+    Absent,
+    /// The database is at the current baseline schema version.
+    Current,
+    /// The database was written at a different schema version.
+    OtherVersion(u32),
+    /// The file exists but is not a recognizable SQLite database.
+    Unrecognized,
+}
+
+impl SchemaStatus {
+    /// Whether the database can be opened without wiping it.
+    pub fn is_compatible(self) -> bool {
+        matches!(self, Self::Absent | Self::Current)
+    }
+
+    /// Short description used in prompts and error messages.
+    pub fn description(self) -> String {
+        match self {
+            Self::Absent => "no existing database".to_owned(),
+            Self::Current => format!("schema version {DATABASE_SCHEMA_VERSION}"),
+            Self::OtherVersion(version) => format!("schema version {version}"),
+            Self::Unrecognized => "an unrecognized format".to_owned(),
+        }
+    }
+}
+
+/// Error raised when an incompatible database is opened without an explicit
+/// wipe. It tells the operator how to reset state instead of failing silently.
+pub fn incompatible_database_error(path: &Path, status: SchemaStatus) -> LoomError {
+    LoomError::new(
+        ErrorCode::MalformedPayload,
+        format!(
+            "persistence database '{}' uses {}; this build requires schema version \
+             {DATABASE_SCHEMA_VERSION} and does not migrate or import existing state. \
+             Re-run with state reset enabled (for example `--reset-state`) to wipe it, \
+             or point Loom at a different state path.",
+            path.display(),
+            status.description()
+        ),
+        false,
+    )
+}
+
+/// Inspects an on-disk database and, only when `wipe_if_incompatible` is true,
+/// wipes it so a fresh baseline can be created. Never wipes implicitly.
+pub fn prepare_database(path: &Path, wipe_if_incompatible: bool) -> Result<SchemaStatus> {
+    let status = FilePersistence::schema_status(path)?;
+    if status.is_compatible() || !wipe_if_incompatible {
+        return Ok(status);
+    }
+    FilePersistence::reset_database(path)?;
+    Ok(SchemaStatus::Absent)
+}
+
+/// The database file plus the SQLite sidecar files that must be removed
+/// together for a clean wipe.
+fn database_files(path: &Path) -> [PathBuf; 4] {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    let mut journal = path.as_os_str().to_os_string();
+    journal.push("-journal");
+    [
+        path.to_path_buf(),
+        PathBuf::from(wal),
+        PathBuf::from(shm),
+        PathBuf::from(journal),
+    ]
+}
+
+fn map_schema_version(version: u32) -> SchemaStatus {
+    if version == DATABASE_SCHEMA_VERSION {
+        SchemaStatus::Current
+    } else if version == 0 {
+        // A SQLite file that has not been initialized yet; `initialize_schema`
+        // decides whether it is empty or an unrecognized layout.
+        SchemaStatus::Absent
+    } else {
+        SchemaStatus::OtherVersion(version)
+    }
+}
+
+/// Reads `PRAGMA user_version` through a read-only connection. Returns `None`
+/// when the file cannot be opened read-only or is not a SQLite database.
+fn schema_status_via_read_only_sqlite(path: &Path) -> Option<SchemaStatus> {
+    let connection =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .ok()?;
+    Some(map_schema_version(version))
+}
+
+/// Reads the schema version from the SQLite file header without opening the
+/// database. Used when a read-only SQLite connection is unavailable.
+fn schema_status_from_header(path: &Path) -> Result<SchemaStatus> {
+    let mut header = [0u8; 100];
+    let mut file = fs::File::open(path).map_err(|error| {
+        persistence_error(
+            format!(
+                "could not read persistence database '{}': {error}",
+                path.display()
+            ),
+            true,
+        )
+    })?;
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(SchemaStatus::Unrecognized);
+        }
+        Err(error) => {
+            return Err(persistence_error(
+                format!(
+                    "could not read persistence database '{}': {error}",
+                    path.display()
+                ),
+                true,
+            ));
+        }
+    }
+    if &header[..16] != b"SQLite format 3\0" {
+        return Ok(SchemaStatus::Unrecognized);
+    }
+    let version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
+    Ok(map_schema_version(version))
+}
+
 impl FilePersistence {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
         Self::open(path)
@@ -1571,6 +1649,85 @@ impl FilePersistence {
 
     pub fn exists(&self) -> bool {
         self.path.is_file()
+    }
+
+    /// Inspects the schema version of an existing database without modifying
+    /// it or taking the writer lock. Tries a read-only SQLite connection first
+    /// (which sees a WAL), then falls back to reading the file header directly
+    /// so an unsupported database is never touched.
+    pub fn schema_status(path: &Path) -> Result<SchemaStatus> {
+        if !path.is_file() {
+            return Ok(SchemaStatus::Absent);
+        }
+        if let Some(status) = schema_status_via_read_only_sqlite(path) {
+            return Ok(status);
+        }
+        schema_status_from_header(path)
+    }
+
+    /// Deletes the database and its SQLite sidecar files so a new baseline can
+    /// be created. Refuses while another backend holds the writer lock, so a
+    /// wipe cannot corrupt a running instance.
+    pub fn reset_database(path: &Path) -> Result<()> {
+        if path.as_os_str().is_empty() {
+            return Err(LoomError::invalid_request(
+                "persistence path must not be empty",
+            ));
+        }
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".loom-owner.lock");
+        let lock_file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(lock_path))
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not open persistence owner lock: {error}"),
+                    true,
+                )
+            })?;
+        match lock_file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(LoomError::conflict(format!(
+                    "cannot wipe persistence database '{}' while another backend owns it",
+                    path.display()
+                )));
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(persistence_error(
+                    format!("could not acquire persistence owner lock: {error}"),
+                    true,
+                ));
+            }
+        }
+        for candidate in database_files(path) {
+            match fs::remove_file(&candidate) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(persistence_error(
+                        format!(
+                            "could not remove persistence file '{}': {error}",
+                            candidate.display()
+                        ),
+                        true,
+                    ));
+                }
+            }
+        }
+        lock_file.unlock().map_err(|error| {
+            persistence_error(
+                format!("could not release persistence owner lock: {error}"),
+                true,
+            )
+        })?;
+        Ok(())
     }
 
     /// Persists the typed session catalog without rewriting unrelated state.
@@ -3990,11 +4147,7 @@ impl FilePersistence {
                         context_window, context_max_input_tokens,
                         context_reserved_output_tokens, checkpoint_id,
                         input_cost_micros_per_1k, output_cost_micros_per_1k,
-                        context_inspection, project_delegation_enabled,
-                        project_messaging_enabled, project_inspection_enabled,
-                        project_child_control_enabled, project_worktree_enabled,
-                        project_review_enabled, project_integration_enabled,
-                        project_branch_messaging_enabled
+                        context_inspection, project_grants
                  FROM run_runtime_config
                  JOIN runtime_configurations USING(configuration_hash)
                  WHERE run_id=?1",
@@ -4020,14 +4173,7 @@ impl FilePersistence {
                         row.get::<_, i64>(16)?,
                         row.get::<_, i64>(17)?,
                         row.get::<_, Option<String>>(18)?,
-                        row.get::<_, i64>(19)?,
-                        row.get::<_, i64>(20)?,
-                        row.get::<_, i64>(21)?,
-                        row.get::<_, i64>(22)?,
-                        row.get::<_, i64>(23)?,
-                        row.get::<_, i64>(24)?,
-                        row.get::<_, i64>(25)?,
-                        row.get::<_, i64>(26)?,
+                        row.get::<_, String>(19)?,
                     ))
                 },
             )
@@ -4059,16 +4205,9 @@ impl FilePersistence {
                 input_cost_micros_per_1k,
                 output_cost_micros_per_1k,
                 inspection,
-                project_delegation_enabled,
-                project_messaging_enabled,
-                project_inspection_enabled,
-                project_child_control_enabled,
-                project_worktree_enabled,
-                project_review_enabled,
-                project_integration_enabled,
-                project_branch_messaging_enabled,
+                project_grants,
             )| {
-                Ok(DurableRunRuntimeConfig {
+                let mut config = DurableRunRuntimeConfig {
                     system_instructions: system
                         .as_deref()
                         .map(|hash| decode_content(connection, hash))
@@ -4126,15 +4265,18 @@ impl FilePersistence {
                         .as_deref()
                         .map(|payload| decode_json(payload, "run context inspection"))
                         .transpose()?,
-                    project_delegation_enabled: project_delegation_enabled != 0,
-                    project_messaging_enabled: project_messaging_enabled != 0,
-                    project_inspection_enabled: project_inspection_enabled != 0,
-                    project_child_control_enabled: project_child_control_enabled != 0,
-                    project_worktree_enabled: project_worktree_enabled != 0,
-                    project_review_enabled: project_review_enabled != 0,
-                    project_integration_enabled: project_integration_enabled != 0,
-                    project_branch_messaging_enabled: project_branch_messaging_enabled != 0,
-                })
+                    project_delegation_enabled: false,
+                    project_messaging_enabled: false,
+                    project_inspection_enabled: false,
+                    project_child_control_enabled: false,
+                    project_worktree_enabled: false,
+                    project_review_enabled: false,
+                    project_integration_enabled: false,
+                    project_branch_messaging_enabled: false,
+                };
+                decode_json::<RunProjectGrants>(&project_grants, "run project grants")?
+                    .apply(&mut config);
+                Ok(config)
             },
         )
         .transpose()
@@ -4609,10 +4751,10 @@ impl FilePersistence {
             return Ok(Vec::new());
         }
         let connection = self.connection()?;
-        let tool_calls_by_message = load_run_message_tool_calls(&connection, run_id, None, None)?;
         let mut statement = connection
             .prepare(
-                "SELECT ordinal, timeline_ordinal, role, content_hash, name, tool_call_id
+                "SELECT ordinal, timeline_ordinal, role, content_hash, name, tool_call_id,
+                        tool_calls
                       FROM run_messages WHERE run_id=?1 ORDER BY ordinal",
             )
             .map_err(|error| {
@@ -4627,13 +4769,14 @@ impl FilePersistence {
                     row.get::<_, Option<Vec<u8>>>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(|error| {
                 persistence_error(format!("could not read run messages: {error}"), true)
             })?;
         rows.map(|row| {
-            let (ordinal, timeline_ordinal, role, content_hash, name, tool_call_id) =
+            let (ordinal, timeline_ordinal, role, content_hash, name, tool_call_id, tool_calls) =
                 row.map_err(|error| {
                     persistence_error(format!("could not read run message: {error}"), true)
                 })?;
@@ -4652,6 +4795,14 @@ impl FilePersistence {
                     false,
                 )
             })?;
+            let tool_calls: Vec<loom_model::ToolCall> =
+                serde_json::from_str(&tool_calls).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted message tool calls are malformed: {error}"),
+                        false,
+                    )
+                })?;
             let mut content = content_hash
                 .map(|hash| decode_content(&connection, &hash))
                 .transpose()?
@@ -4686,16 +4837,12 @@ impl FilePersistence {
                 content,
                 name,
                 tool_call_id,
-                tool_calls: tool_calls_by_message
-                    .get(&ordinal)
-                    .cloned()
-                    .unwrap_or_default(),
+                tool_calls,
             })
         })
         .collect()
     }
 
-    /// Loads typed activity metadata and its content-addressed activity data.
     pub fn load_run_activities(&self, run_id: RunId) -> Result<Vec<AgentActivityRecord>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -4931,10 +5078,8 @@ impl FilePersistence {
     ) -> Result<Vec<AgentToolAttemptRecord>> {
         let mut statement = connection
             .prepare(
-                "SELECT session_id, activity_id, tool_call_id, attempt_number, state,
-                        started_at, completed_at, result_hash
-                 FROM run_tool_attempts WHERE run_id=?1
-                 ORDER BY started_at, attempt_number",
+                "SELECT session_id, tool_call_id, attempts FROM run_tool_calls
+                 WHERE run_id=?1 ORDER BY created_at, tool_call_id",
             )
             .map_err(|error| {
                 persistence_error(
@@ -4947,12 +5092,7 @@ impl FilePersistence {
                 Ok((
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
-                    row.get::<_, Option<Vec<u8>>>(7)?,
+                    row.get::<_, String>(2)?,
                 ))
             })
             .map_err(|error| {
@@ -4966,61 +5106,38 @@ impl FilePersistence {
                 )
             })?;
         drop(statement);
-        rows.into_iter()
-            .map(
-                |(
+        let mut records = Vec::new();
+        for (session_id, tool_call_id, attempts) in rows {
+            let session_id =
+                AgentSessionId::from_uuid(decode_uuid(&session_id, "tool-attempt session id")?);
+            let call_id = loom_core::ToolCallId::from_uuid(decode_uuid(
+                &tool_call_id,
+                "tool-attempt tool-call id",
+            )?);
+            for attempt in decode_stored_attempts(&attempts)? {
+                let activity_id = ActivityId::from_uuid(decode_uuid(
+                    &decode_hash_hex(&attempt.activity_id, "tool attempt activity id")?,
+                    "tool attempt activity id",
+                )?);
+                records.push(AgentToolAttemptRecord {
+                    run_id,
                     session_id,
-                    activity_id,
-                    tool_call_id,
-                    attempt_number,
-                    state,
-                    started_at,
-                    completed_at,
-                    result_hash,
-                )| {
-                    let result = result_hash
-                        .as_deref()
-                        .map(|hash| decode_content(connection, hash))
-                        .transpose()?
-                        .map(|json| {
-                            serde_json::from_str::<ToolResult>(&json).map_err(|error| {
-                                LoomError::new(
-                                    ErrorCode::MalformedPayload,
-                                    format!("persisted tool result is malformed: {error}"),
-                                    false,
-                                )
-                            })
-                        })
-                        .transpose()?;
-                    Ok(AgentToolAttemptRecord {
-                        run_id,
-                        session_id: AgentSessionId::from_uuid(decode_uuid(
-                            &session_id,
-                            "tool-attempt session id",
-                        )?),
-                        id: ActivityId::from_uuid(decode_uuid(
-                            &activity_id,
-                            "tool-attempt activity id",
-                        )?),
-                        call_id: loom_core::ToolCallId::from_uuid(decode_uuid(
-                            &tool_call_id,
-                            "tool-attempt tool-call id",
-                        )?),
-                        attempt_number: u32::try_from(attempt_number).map_err(|_| {
-                            LoomError::new(
-                                ErrorCode::MalformedPayload,
-                                "persisted tool-attempt number is out of range",
-                                false,
-                            )
-                        })?,
-                        state: parse_tool_attempt_state(&state)?,
-                        started_at: decode_timestamp(started_at)?,
-                        completed_at: completed_at.map(decode_timestamp).transpose()?,
-                        result,
-                    })
-                },
-            )
-            .collect()
+                    id: activity_id,
+                    call_id,
+                    attempt_number: attempt.attempt_number,
+                    state: parse_tool_attempt_state(&attempt.state)?,
+                    started_at: decode_timestamp(attempt.started_at)?,
+                    completed_at: attempt.completed_at.map(decode_timestamp).transpose()?,
+                    result: attempt.result,
+                });
+            }
+        }
+        records.sort_by(|left, right| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then(left.attempt_number.cmp(&right.attempt_number))
+        });
+        Ok(records)
     }
 
     /// Loads the newest bounded page of message headers. Use the returned
@@ -5049,20 +5166,11 @@ impl FilePersistence {
         let mut statement = connection
             .prepare(
                 "SELECT m.ordinal, m.timeline_ordinal, m.role,
-                        MAX(
-                            COALESCE(
-                                (SELECT raw_size FROM content_objects WHERE hash=m.content_hash),
-                                0
-                            ),
-                            COALESCE(
-                                (SELECT MAX(fragment.byte_offset + fragment.byte_length)
-                                 FROM run_message_fragments fragment
-                                 WHERE fragment.run_id=m.run_id
-                                   AND fragment.message_ordinal=m.ordinal),
-                                0
-                            )
+                        COALESCE(
+                            (SELECT raw_size FROM content_objects WHERE hash=m.content_hash),
+                            0
                         ),
-                        m.name, m.tool_call_id
+                        m.name, m.tool_call_id, m.tool_calls, m.fragments
                  FROM run_messages m
                  WHERE m.run_id=?1 AND (?2 IS NULL OR m.ordinal < ?2)
                  ORDER BY m.ordinal DESC LIMIT ?3",
@@ -5085,19 +5193,27 @@ impl FilePersistence {
                         row.get::<_, i64>(3)?,
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, Option<Vec<u8>>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
                     ))
                 },
             )
             .map_err(|error| {
                 persistence_error(format!("could not query run message page: {error}"), true)
             })?;
-        let tool_calls_by_message =
-            load_run_message_tool_calls(&connection, run_id, before_ordinal, Some(limit as usize))?;
         rows.map(|row| {
-            let (ordinal, timeline_ordinal, role, content_bytes, name, tool_call_id) = row
-                .map_err(|error| {
-                    persistence_error(format!("could not read run message header: {error}"), true)
-                })?;
+            let (
+                ordinal,
+                timeline_ordinal,
+                role,
+                content_bytes,
+                name,
+                tool_call_id,
+                tool_calls,
+                fragments,
+            ) = row.map_err(|error| {
+                persistence_error(format!("could not read run message header: {error}"), true)
+            })?;
             let ordinal = u64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
@@ -5112,23 +5228,30 @@ impl FilePersistence {
                     false,
                 )
             })?;
+            let content_bytes = u64::try_from(content_bytes).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted message content size is negative",
+                    false,
+                )
+            })?;
+            let fragment_bytes = fragment_total(&decode_stored_fragments(&fragments)?).unwrap_or(0);
+            let tool_calls: Vec<loom_model::ToolCall> =
+                serde_json::from_str(&tool_calls).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted message tool calls are malformed: {error}"),
+                        false,
+                    )
+                })?;
             Ok(DurableRunMessageHeader {
                 ordinal,
                 timeline_ordinal,
                 role: parse_message_role(&role)?,
-                content_bytes: u64::try_from(content_bytes).map_err(|_| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        "persisted message content size is negative",
-                        false,
-                    )
-                })?,
+                content_bytes: content_bytes.max(fragment_bytes),
                 name,
                 tool_call_id: decode_optional_tool_call_id(tool_call_id)?,
-                tool_calls: tool_calls_by_message
-                    .get(&ordinal)
-                    .cloned()
-                    .unwrap_or_default(),
+                tool_calls,
             })
         })
         .collect()
@@ -5155,13 +5278,9 @@ impl FilePersistence {
                 "message fragments must end on UTF-8 character boundaries",
             ));
         }
-        let message_ordinal = i64::try_from(message_ordinal)
+        let message_ordinal_value = i64::try_from(message_ordinal)
             .map_err(|_| LoomError::invalid_request("message ordinal is out of range"))?;
-        let fragment_ordinal = i64::try_from(fragment_ordinal)
-            .map_err(|_| LoomError::invalid_request("fragment ordinal is out of range"))?;
-        let byte_offset = i64::try_from(byte_offset)
-            .map_err(|_| LoomError::invalid_request("message byte offset is out of range"))?;
-        let byte_length = i64::try_from(content.len())
+        let byte_length = u64::try_from(content.len())
             .map_err(|_| LoomError::invalid_request("message fragment is too large"))?;
         byte_offset
             .checked_add(byte_length)
@@ -5195,23 +5314,24 @@ impl FilePersistence {
         transaction
             .execute(
                 "INSERT INTO run_messages(
-                    run_id, session_id, ordinal, role, content_hash, name, tool_call_id
-                 ) VALUES (?1, ?2, ?3, 'assistant', NULL, NULL, NULL)
+                    run_id, session_id, ordinal, role, content_hash, name, tool_call_id,
+                    tool_calls, fragments
+                 ) VALUES (?1, ?2, ?3, 'assistant', NULL, NULL, NULL, '[]', '[]')
                  ON CONFLICT(run_id, ordinal) DO NOTHING",
                 params![
                     run_id_bytes.as_slice(),
                     session_id_bytes.as_slice(),
-                    message_ordinal
+                    message_ordinal_value
                 ],
             )
             .map_err(|error| {
                 persistence_error(format!("could not create streamed message: {error}"), true)
             })?;
-        let role: String = transaction
+        let (role, fragments_payload): (String, String) = transaction
             .query_row(
-                "SELECT role FROM run_messages WHERE run_id=?1 AND ordinal=?2",
-                params![run_id_bytes.as_slice(), message_ordinal],
-                |row| row.get(0),
+                "SELECT role, fragments FROM run_messages WHERE run_id=?1 AND ordinal=?2",
+                params![run_id_bytes.as_slice(), message_ordinal_value],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| {
                 persistence_error(format!("could not verify streamed message: {error}"), true)
@@ -5227,7 +5347,7 @@ impl FilePersistence {
                  FROM run_messages message
                  LEFT JOIN content_objects content ON content.hash=message.content_hash
                  WHERE message.run_id=?1 AND message.ordinal=?2",
-                params![run_id_bytes.as_slice(), message_ordinal],
+                params![run_id_bytes.as_slice(), message_ordinal_value],
                 |row| row.get(0),
             )
             .optional()
@@ -5237,24 +5357,23 @@ impl FilePersistence {
                     true,
                 )
             })?;
-        let base_offset = base_size.unwrap_or(0);
-        let content_hash = store_content(&transaction, content)?;
-        let existing: Option<(i64, i64, Vec<u8>)> = transaction
-            .query_row(
-                "SELECT byte_offset, byte_length, content_hash
-                 FROM run_message_fragments
-                 WHERE run_id=?1 AND message_ordinal=?2 AND fragment_ordinal=?3",
-                params![run_id_bytes.as_slice(), message_ordinal, fragment_ordinal],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        let base_offset = u64::try_from(base_size.unwrap_or(0)).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted message content size is negative",
+                false,
             )
-            .optional()
-            .map_err(|error| {
-                persistence_error(format!("could not check message fragment: {error}"), true)
-            })?;
-        if let Some((existing_offset, existing_length, existing_hash)) = existing {
-            if existing_offset == byte_offset
-                && existing_length == byte_length
-                && existing_hash == content_hash
+        })?;
+        let content_hash = store_content(&transaction, content)?;
+        let content_hash = encode_hash_hex(&content_hash);
+        let mut fragments = decode_stored_fragments(&fragments_payload)?;
+        if let Some(existing) = fragments
+            .iter()
+            .find(|fragment| fragment.fragment_ordinal == fragment_ordinal)
+        {
+            if existing.byte_offset == byte_offset
+                && existing.byte_length == byte_length
+                && existing.content_hash == content_hash
             {
                 transaction.commit().map_err(|error| {
                     persistence_error(
@@ -5268,42 +5387,41 @@ impl FilePersistence {
                 "message fragment retry conflicts with the committed fragment",
             ));
         }
-        let expected: Option<(i64, i64)> = transaction
-            .query_row(
-                "SELECT fragment_ordinal, byte_offset + byte_length
-                 FROM run_message_fragments
-                 WHERE run_id=?1 AND message_ordinal=?2
-                 ORDER BY fragment_ordinal DESC LIMIT 1",
-                params![run_id_bytes.as_slice(), message_ordinal],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not read message fragment tail: {error}"),
-                    true,
-                )
-            })?;
-        if expected.is_some_and(|(ordinal, offset)| {
-            ordinal.checked_add(1) != Some(fragment_ordinal) || offset != byte_offset
-        }) || (expected.is_none() && (fragment_ordinal != 0 || byte_offset != base_offset))
+        let contiguous = match fragments
+            .iter()
+            .max_by_key(|fragment| fragment.fragment_ordinal)
         {
+            Some(tail) => {
+                tail.fragment_ordinal.checked_add(1) == Some(fragment_ordinal)
+                    && tail.byte_offset.checked_add(tail.byte_length) == Some(byte_offset)
+            }
+            None => fragment_ordinal == 0 && byte_offset == base_offset,
+        };
+        if !contiguous {
             return Err(LoomError::invalid_request(
                 "message fragments must be appended contiguously in order",
             ));
         }
+        fragments.push(StoredFragment {
+            fragment_ordinal,
+            byte_offset,
+            byte_length,
+            content_hash,
+        });
+        fragments.sort_by_key(|fragment| fragment.fragment_ordinal);
+        let fragments_payload = serde_json::to_string(&fragments).map_err(|error| {
+            persistence_error(
+                format!("could not encode message fragments: {error}"),
+                false,
+            )
+        })?;
         transaction
             .execute(
-                "INSERT INTO run_message_fragments(
-                    run_id, message_ordinal, fragment_ordinal, byte_offset, byte_length, content_hash
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "UPDATE run_messages SET fragments=?3 WHERE run_id=?1 AND ordinal=?2",
                 params![
                     run_id_bytes.as_slice(),
-                    message_ordinal,
-                    fragment_ordinal,
-                    byte_offset,
-                    byte_length,
-                    content_hash
+                    message_ordinal_value,
+                    fragments_payload
                 ],
             )
             .map_err(|error| {
@@ -5324,14 +5442,11 @@ impl FilePersistence {
         let message_ordinal = i64::try_from(message_ordinal)
             .map_err(|_| LoomError::invalid_request("message ordinal is out of range"))?;
         let connection = self.connection()?;
-        let tail: Option<(i64, i64)> = connection
+        let payload: Option<String> = connection
             .query_row(
-                "SELECT fragment_ordinal, byte_offset + byte_length
-                 FROM run_message_fragments
-                 WHERE run_id=?1 AND message_ordinal=?2
-                 ORDER BY fragment_ordinal DESC LIMIT 1",
+                "SELECT fragments FROM run_messages WHERE run_id=?1 AND ordinal=?2",
                 params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )
             .optional()
             .map_err(|error| {
@@ -5340,26 +5455,29 @@ impl FilePersistence {
                     true,
                 )
             })?;
-        if let Some((fragment_ordinal, byte_offset)) = tail {
-            return Ok((
-                u64::try_from(fragment_ordinal)
-                    .ok()
-                    .and_then(|ordinal| ordinal.checked_add(1))
-                    .ok_or_else(|| {
+        if let Some(payload) = payload {
+            let mut fragments = decode_stored_fragments(&payload)?;
+            fragments.sort_by_key(|fragment| fragment.fragment_ordinal);
+            if let Some(tail) = fragments.last() {
+                return Ok((
+                    tail.fragment_ordinal.checked_add(1).ok_or_else(|| {
                         LoomError::new(
                             ErrorCode::MalformedPayload,
                             "persisted message fragment ordinal is out of range",
                             false,
                         )
                     })?,
-                u64::try_from(byte_offset).map_err(|_| {
-                    LoomError::new(
-                        ErrorCode::MalformedPayload,
-                        "persisted message fragment offset is out of range",
-                        false,
-                    )
-                })?,
-            ));
+                    tail.byte_offset
+                        .checked_add(tail.byte_length)
+                        .ok_or_else(|| {
+                            LoomError::new(
+                                ErrorCode::MalformedPayload,
+                                "persisted message fragment offset is out of range",
+                                false,
+                            )
+                        })?,
+                ));
+            }
         }
         let base_size: Option<i64> = connection
             .query_row(
@@ -6748,19 +6866,6 @@ impl FilePersistence {
                     .map_err(|error| {
                         persistence_error(format!("could not reset run transcript: {error}"), true)
                     })?;
-                // Fragments for base rows cascade, while orphaned streamed rows
-                // need explicit removal during a transcript-generation reset.
-                transaction
-                    .execute(
-                        "DELETE FROM run_message_fragments WHERE run_id=?1",
-                        [run_id.as_uuid().as_bytes().as_slice()],
-                    )
-                    .map_err(|error| {
-                        persistence_error(
-                            format!("could not reset run transcript fragments: {error}"),
-                            true,
-                        )
-                    })?;
             }
             BTreeMap::from([(run_id, delta.messages.clone())])
         } else {
@@ -6936,66 +7041,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     if database_version == DATABASE_SCHEMA_VERSION {
         return Ok(());
     }
-    if database_version == RUN_TIMELINE_PREVIOUS_SCHEMA_VERSION {
-        return migrate_v50_to_v51(connection);
-    }
-    if database_version == PROJECT_CANCELLATION_CASCADE_SCHEMA_VERSION {
-        migrate_v49_to_v50(connection)?;
-        return migrate_v50_to_v51(connection);
-    }
-    if database_version == 41 {
-        migrate_v41_to_v42(connection)?;
-        migrate_v42_to_v43(connection)?;
-        migrate_v43_to_v44(connection)?;
-        migrate_v44_to_v45(connection)?;
-        migrate_v45_to_v46(connection)?;
-        migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v51(connection);
-    }
-    if database_version == PROJECT_SCHEMA_VERSION {
-        migrate_v42_to_v43(connection)?;
-        migrate_v43_to_v44(connection)?;
-        migrate_v44_to_v45(connection)?;
-        migrate_v45_to_v46(connection)?;
-        migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v51(connection);
-    }
-    if database_version == PROJECT_MESSAGE_SCHEMA_VERSION {
-        migrate_v43_to_v44(connection)?;
-        migrate_v44_to_v45(connection)?;
-        migrate_v45_to_v46(connection)?;
-        migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v51(connection);
-    }
-    if database_version == PROJECT_DELEGATION_SCHEMA_VERSION {
-        migrate_v44_to_v45(connection)?;
-        migrate_v45_to_v46(connection)?;
-        migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v51(connection);
-    }
-    if database_version == PROJECT_COORDINATION_SCHEMA_VERSION {
-        migrate_v45_to_v46(connection)?;
-        migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v51(connection);
-    }
-    if database_version == PROJECT_CHILD_CONTROL_SCHEMA_VERSION {
-        migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v51(connection);
-    }
-    if database_version == PROJECT_WORKTREE_SCHEMA_VERSION {
-        return migrate_v47_to_v51(connection);
-    }
-    if database_version == PROJECT_MANAGER_WAIT_SCHEMA_VERSION {
-        migrate_v48_to_v49(connection)?;
-        migrate_v49_to_v50(connection)?;
-        return migrate_v50_to_v51(connection);
-    }
+
+    // Loom is pre-1.0: there is no migration ladder and no legacy import. A
+    // database that was not written at the current baseline is rejected
+    // unchanged and must be wiped by the operator.
     if database_version != 0 {
-        return Err(LoomError::new(
-            ErrorCode::MalformedPayload,
-            format!("unsupported persistence database version {database_version}"),
-            false,
-        ));
+        return Err(unsupported_database_error(database_version));
     }
 
     // Inspect before changing persistent SQLite settings. Unsupported databases
@@ -7017,11 +7068,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             )
         })?;
     if has_user_tables {
-        return Err(LoomError::new(
-            ErrorCode::MalformedPayload,
-            "this database uses an unsupported persistence format; this version starts with a new database and does not import or modify existing state",
-            false,
-        ));
+        return Err(unsupported_database_error(0));
     }
 
     connection
@@ -7052,14 +7099,6 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         .map_err(|error| {
             persistence_error(
                 format!("could not create project task schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(PROJECT_TASK_PERMISSION_COLUMNS)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project-agent permission columns: {error}"),
                 true,
             )
         })?;
@@ -7104,500 +7143,19 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_v47_to_v50(connection: &Connection) -> Result<()> {
-    migrate_v47_to_v48(connection)?;
-    migrate_v48_to_v49(connection)?;
-    migrate_v49_to_v50(connection)
-}
-
-fn migrate_v47_to_v51(connection: &Connection) -> Result<()> {
-    migrate_v47_to_v50(connection)?;
-    migrate_v50_to_v51(connection)
-}
-
-fn migrate_v50_to_v51(connection: &Connection) -> Result<()> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin run timeline migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE run_messages
-                ADD COLUMN timeline_ordinal INTEGER NOT NULL DEFAULT 0
-                CHECK(timeline_ordinal >= 0);
-             ALTER TABLE run_activities
-                ADD COLUMN timeline_ordinal INTEGER NOT NULL DEFAULT 0
-                CHECK(timeline_ordinal >= 0);
-             UPDATE run_messages
-                SET timeline_ordinal = ordinal;
-             UPDATE run_activities
-                SET timeline_ordinal = ordinal + COALESCE(
-                    (SELECT MAX(message.ordinal) + 1
-                     FROM run_messages message
-                     WHERE message.run_id = run_activities.run_id),
-                    0
-                );",
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not add run timeline order: {error}"), true)
-        })?;
-    transaction
-        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record run timeline schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit run timeline migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
-}
-
-fn migrate_v48_to_v49(connection: &Connection) -> Result<()> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin project review-grant migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE run_runtime_config
-                ADD COLUMN project_review_enabled INTEGER NOT NULL DEFAULT 0
-                CHECK(project_review_enabled IN (0, 1));",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not add durable project review grant: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .pragma_update(
-            None,
-            "user_version",
-            PROJECT_CANCELLATION_CASCADE_SCHEMA_VERSION,
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record project review-grant schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit project review-grant migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
-}
-
-fn migrate_v49_to_v50(connection: &Connection) -> Result<()> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin project cancellation recovery migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project cancellation recovery schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .pragma_update(None, "user_version", RUN_TIMELINE_PREVIOUS_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record project cancellation recovery schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit project cancellation recovery migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
-}
-
-fn migrate_v44_to_v45(connection: &Connection) -> Result<()> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin project coordination grant migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE run_runtime_config
-                ADD COLUMN project_messaging_enabled INTEGER NOT NULL DEFAULT 0
-                CHECK(project_messaging_enabled IN (0, 1));
-             ALTER TABLE run_runtime_config
-                ADD COLUMN project_inspection_enabled INTEGER NOT NULL DEFAULT 0
-                CHECK(project_inspection_enabled IN (0, 1));",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not add durable project coordination grants: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .pragma_update(None, "user_version", PROJECT_COORDINATION_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record project coordination schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit project coordination grant migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
-}
-
-fn migrate_v45_to_v46(connection: &Connection) -> Result<()> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin project child-control grant migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE run_runtime_config
-                ADD COLUMN project_child_control_enabled INTEGER NOT NULL DEFAULT 0
-                CHECK(project_child_control_enabled IN (0, 1));",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not add durable project child-control grant: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .pragma_update(None, "user_version", PROJECT_CHILD_CONTROL_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record project child-control schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit project child-control grant migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
-}
-
-fn migrate_v46_to_v47(connection: &Connection) -> Result<()> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin project worktree migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(PROJECT_WORKTREE_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project worktree schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE run_runtime_config
-                ADD COLUMN project_worktree_enabled INTEGER NOT NULL DEFAULT 0
-                CHECK(project_worktree_enabled IN (0, 1));
-             ALTER TABLE run_runtime_config
-                ADD COLUMN project_integration_enabled INTEGER NOT NULL DEFAULT 0
-                CHECK(project_integration_enabled IN (0, 1));",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not add durable project worktree grants: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .pragma_update(None, "user_version", PROJECT_WORKTREE_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record project worktree schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit project worktree migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
-}
-
-fn migrate_v47_to_v48(connection: &Connection) -> Result<()> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin project-agent permission migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(PROJECT_TASK_PERMISSION_COLUMNS)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not add durable delegated-task permissions: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE run_runtime_config
-                ADD COLUMN project_branch_messaging_enabled INTEGER NOT NULL DEFAULT 0
-                CHECK(project_branch_messaging_enabled IN (0, 1));",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not add durable project-agent permissions: {error}"),
-                true,
-            )
-        })?;
-    let has_run_execution_state: bool = transaction
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_execution_state')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not inspect run execution-state schema: {error}"),
-                true,
-            )
-        })?;
-    if has_run_execution_state {
-        transaction
-            .execute_batch(
-                "ALTER TABLE run_execution_state
-                    ADD COLUMN pending_project_join TEXT CHECK(
-                        pending_project_join IS NULL OR length(pending_project_join) <= 1048576
-                    );",
-            )
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not add durable project join continuation: {error}"),
-                    true,
-                )
-            })?;
-    }
-    transaction
-        .execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project manager wait schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .pragma_update(None, "user_version", PROJECT_MANAGER_WAIT_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record project-agent permission schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit project-agent permission migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
-}
-
-fn migrate_v41_to_v42(connection: &Connection) -> Result<()> {
-    // Keep the schema change, backfill, and version bump in one transaction. A
-    // failed backfill leaves a v41 database that can safely retry on next open.
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin persistence migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(
-            "CREATE TABLE sessions_hierarchy (
-                project_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
-                    CHECK(length(project_id) = 16),
-                session_id BLOB PRIMARY KEY NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
-                    CHECK(length(session_id) = 16),
-                parent_session_id BLOB REFERENCES sessions(id) ON DELETE CASCADE
-                    CHECK(parent_session_id IS NULL OR length(parent_session_id) = 16),
-                depth INTEGER NOT NULL CHECK(depth BETWEEN 1 AND 3),
-                CHECK(parent_session_id IS NULL OR parent_session_id != session_id),
-                CHECK((parent_session_id IS NULL AND depth = 1)
-                   OR (parent_session_id IS NOT NULL AND depth > 1)),
-                CHECK(parent_session_id IS NOT NULL OR project_id = session_id),
-                UNIQUE(project_id, session_id),
-                FOREIGN KEY(project_id, parent_session_id)
-                    REFERENCES sessions_hierarchy(project_id, session_id) ON DELETE CASCADE
-             ) WITHOUT ROWID, STRICT;
-             CREATE INDEX sessions_hierarchy_by_project
-                ON sessions_hierarchy(project_id, depth, session_id);
-             CREATE INDEX sessions_hierarchy_by_parent
-                ON sessions_hierarchy(parent_session_id, session_id)
-                WHERE parent_session_id IS NOT NULL;
-             CREATE TRIGGER sessions_hierarchy_parent_depth_insert
-             BEFORE INSERT ON sessions_hierarchy
-             WHEN NEW.parent_session_id IS NOT NULL AND NOT EXISTS (
-                 SELECT 1 FROM sessions_hierarchy AS parent
-                 WHERE parent.project_id=NEW.project_id
-                   AND parent.session_id=NEW.parent_session_id
-                   AND parent.depth + 1=NEW.depth
-             )
-             BEGIN
-                 SELECT RAISE(ABORT, 'project parent must belong to same project at previous depth');
-             END;
-             CREATE TRIGGER sessions_hierarchy_parent_depth_update
-             BEFORE UPDATE OF project_id, parent_session_id, depth ON sessions_hierarchy
-             WHEN NEW.parent_session_id IS NOT NULL AND NOT EXISTS (
-                 SELECT 1 FROM sessions_hierarchy AS parent
-                 WHERE parent.project_id=NEW.project_id
-                   AND parent.session_id=NEW.parent_session_id
-                   AND parent.depth + 1=NEW.depth
-             )
-             BEGIN
-                 SELECT RAISE(ABORT, 'project parent must belong to same project at previous depth');
-             END;",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project hierarchy schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(PROJECT_TASK_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project task schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute(
-            "INSERT INTO sessions_hierarchy(project_id, session_id, parent_session_id, depth)
-             SELECT id, id, NULL, 1 FROM sessions",
-            [],
-        )
-        .map_err(|error| {
-            persistence_error(format!("could not backfill project roots: {error}"), true)
-        })?;
-    transaction
-        .pragma_update(None, "user_version", PROJECT_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record persistence schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit persistence migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
-}
-
-fn migrate_v42_to_v43(connection: &Connection) -> Result<()> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin project inbox migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE run_execution_state
-                ADD COLUMN last_project_message_sequence INTEGER NOT NULL DEFAULT 0
-                CHECK(last_project_message_sequence >= 0);",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not add durable project inbox cursor: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .pragma_update(None, "user_version", PROJECT_MESSAGE_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record project inbox schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit project inbox migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
-}
-
-fn migrate_v43_to_v44(connection: &Connection) -> Result<()> {
-    let transaction = connection.unchecked_transaction().map_err(|error| {
-        persistence_error(
-            format!("could not begin project delegation grant migration: {error}"),
-            true,
-        )
-    })?;
-    transaction
-        .execute_batch(
-            "ALTER TABLE run_runtime_config
-                ADD COLUMN project_delegation_enabled INTEGER NOT NULL DEFAULT 0
-                CHECK(project_delegation_enabled IN (0, 1));",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not add durable project delegation grant: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .pragma_update(None, "user_version", PROJECT_DELEGATION_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record project delegation schema version: {error}"),
-                true,
-            )
-        })?;
-    transaction.commit().map_err(|error| {
-        persistence_error(
-            format!("could not commit project delegation migration: {error}"),
-            true,
-        )
-    })?;
-    Ok(())
+fn unsupported_database_error(database_version: u32) -> LoomError {
+    let found = if database_version == 0 {
+        "an unrecognized format".to_owned()
+    } else {
+        format!("schema version {database_version}")
+    };
+    LoomError::new(
+        ErrorCode::MalformedPayload,
+        format!(
+            "persistence database uses {found}; this build requires schema version {DATABASE_SCHEMA_VERSION} and does not migrate or import existing state. Wipe the state database to start fresh."
+        ),
+        false,
+    )
 }
 
 fn insert_delegated_task(
@@ -7606,16 +7164,19 @@ fn insert_delegated_task(
     request_fingerprint: &[u8],
     task: &DelegatedTaskRecord,
 ) -> Result<()> {
+    let permissions = serde_json::to_string(&task.permissions).map_err(|error| {
+        persistence_error(
+            format!("could not encode delegated task permissions: {error}"),
+            false,
+        )
+    })?;
     transaction
         .execute(
             "INSERT INTO delegated_tasks(
                 task_id, request_id, request_fingerprint, project_id, requester_session_id, target_session_id,
-                child_name, intent, model_id, code_change, permission_delegation,
-                permission_branch_messaging, permission_child_control, permission_inspection,
-                permission_worktree_creation, permission_review, permission_integration,
+                child_name, intent, model_id, code_change, permissions,
                 status, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                       ?15, ?16, ?17, ?18, ?19, ?20)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 task.task_id.as_uuid().as_bytes().as_slice(),
                 request_id.as_uuid().as_bytes().as_slice(),
@@ -7627,13 +7188,7 @@ fn insert_delegated_task(
                 task.intent,
                 task.model_id,
                 i64::from(task.code_change),
-                i64::from(task.permissions.delegation),
-                i64::from(task.permissions.branch_messaging),
-                i64::from(task.permissions.child_control),
-                i64::from(task.permissions.inspection),
-                i64::from(task.permissions.worktree_creation),
-                i64::from(task.permissions.review),
-                i64::from(task.permissions.integration),
+                permissions,
                 delegated_task_status_name(task.status),
                 encode_timestamp(task.created_at)?,
                 encode_timestamp(task.updated_at)?,
@@ -8351,10 +7906,7 @@ fn load_delegated_task(
     let row = connection
         .query_row(
             "SELECT task_id, project_id, requester_session_id, target_session_id, child_name,
-                    intent, model_id, code_change, status, created_at, updated_at,
-                    permission_delegation, permission_branch_messaging, permission_child_control,
-                    permission_inspection, permission_worktree_creation, permission_review,
-                    permission_integration
+                    intent, model_id, code_change, permissions, status, created_at, updated_at
              FROM delegated_tasks WHERE task_id=?1",
             [task_id.as_bytes().as_slice()],
             |row| {
@@ -8368,15 +7920,9 @@ fn load_delegated_task(
                     row.get::<_, String>(6)?,
                     row.get::<_, i64>(7)?,
                     row.get::<_, String>(8)?,
-                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
-                    row.get::<_, i64>(12)?,
-                    row.get::<_, i64>(13)?,
-                    row.get::<_, i64>(14)?,
-                    row.get::<_, i64>(15)?,
-                    row.get::<_, i64>(16)?,
-                    row.get::<_, i64>(17)?,
                 ))
             },
         )
@@ -8393,20 +7939,16 @@ fn load_delegated_task(
         intent,
         model_id,
         code_change,
+        permissions,
         status,
         created_at,
         updated_at,
-        permission_delegation,
-        permission_branch_messaging,
-        permission_child_control,
-        permission_inspection,
-        permission_worktree_creation,
-        permission_review,
-        permission_integration,
     )) = row
     else {
         return Ok(None);
     };
+    let permissions: ProjectAgentPermissions =
+        decode_json(&permissions, "delegated task permissions")?;
     let task_id = TaskId::from_uuid(decode_uuid(&task_id, "delegated task id")?);
     let mut context_statement = connection
         .prepare("SELECT label, uri FROM delegated_task_context_references WHERE task_id=?1 ORDER BY ordinal")
@@ -8473,15 +8015,7 @@ fn load_delegated_task(
         context_references,
         dependencies,
         code_change: code_change != 0,
-        permissions: ProjectAgentPermissions {
-            delegation: permission_delegation != 0,
-            branch_messaging: permission_branch_messaging != 0,
-            child_control: permission_child_control != 0,
-            inspection: permission_inspection != 0,
-            worktree_creation: permission_worktree_creation != 0,
-            review: permission_review != 0,
-            integration: permission_integration != 0,
-        },
+        permissions,
         status: parse_delegated_task_status(&status)?,
         created_at: decode_timestamp(created_at)?,
         updated_at: decode_timestamp(updated_at)?,
@@ -8814,20 +8348,11 @@ fn collect_unused_content(transaction: &Transaction<'_>, candidate_limit: usize)
                 SELECT 1 FROM run_context_checkpoints
                 WHERE run_context_checkpoints.summary_hash=content_objects.hash
              ) AND NOT EXISTS (
-                SELECT 1 FROM run_message_fragments
-                WHERE run_message_fragments.content_hash=content_objects.hash
-             ) AND NOT EXISTS (
                 SELECT 1 FROM run_activities
                 WHERE run_activities.data_hash=content_objects.hash
              ) AND NOT EXISTS (
                 SELECT 1 FROM run_tool_calls
                 WHERE run_tool_calls.arguments_hash=content_objects.hash
-             ) AND NOT EXISTS (
-                SELECT 1 FROM run_tool_attempts
-                WHERE run_tool_attempts.result_hash=content_objects.hash
-             ) AND NOT EXISTS (
-                SELECT 1 FROM run_message_tool_calls
-                WHERE run_message_tool_calls.arguments_hash=content_objects.hash
              ) AND NOT EXISTS (
                 SELECT 1 FROM runtime_configurations
                 WHERE runtime_configurations.system_instructions_hash=content_objects.hash
@@ -9108,6 +8633,181 @@ fn decode_optional_step_id(id: Option<Vec<u8>>) -> Result<Option<StepId>> {
         .transpose()
 }
 
+/// One streamed message fragment descriptor stored in `run_messages.fragments`.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct StoredFragment {
+    fragment_ordinal: u64,
+    byte_offset: u64,
+    byte_length: u64,
+    content_hash: String,
+}
+
+/// One tool execution attempt stored in `run_tool_calls.attempts`.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct StoredToolAttempt {
+    activity_id: String,
+    attempt_number: u32,
+    state: String,
+    started_at: i64,
+    completed_at: Option<i64>,
+    result: Option<ToolResult>,
+}
+
+fn decode_stored_attempts(payload: &str) -> Result<Vec<StoredToolAttempt>> {
+    serde_json::from_str(payload).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted tool attempts are malformed: {error}"),
+            false,
+        )
+    })
+}
+
+/// Inserts or updates one execution attempt on its logical tool call.
+#[allow(clippy::too_many_arguments)]
+fn upsert_stored_attempt(
+    transaction: &Transaction<'_>,
+    run_id_bytes: &[u8],
+    call_id: ToolCallId,
+    activity_id: ActivityId,
+    state: AgentToolAttemptState,
+    started_at: i64,
+    completed_at: Option<i64>,
+    result: Option<ToolResult>,
+) -> Result<()> {
+    let payload: Option<String> = transaction
+        .query_row(
+            "SELECT attempts FROM run_tool_calls WHERE run_id=?1 AND tool_call_id=?2",
+            params![run_id_bytes, call_id.as_uuid().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(format!("could not read tool attempts: {error}"), true)
+        })?;
+    let Some(payload) = payload else {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "tool attempt has no logical tool-call row",
+            false,
+        ));
+    };
+    let mut attempts = decode_stored_attempts(&payload)?;
+    let activity_hex = encode_hash_hex(activity_id.as_uuid().as_bytes());
+    if let Some(slot) = attempts
+        .iter_mut()
+        .find(|attempt| attempt.activity_id == activity_hex)
+    {
+        slot.state = tool_attempt_state_name(state).to_owned();
+        slot.started_at = started_at;
+        slot.completed_at = completed_at;
+        slot.result = result;
+    } else {
+        let attempt_number = attempts
+            .iter()
+            .map(|attempt| attempt.attempt_number)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "tool call has too many execution attempts",
+                    false,
+                )
+            })?;
+        attempts.push(StoredToolAttempt {
+            activity_id: activity_hex,
+            attempt_number,
+            state: tool_attempt_state_name(state).to_owned(),
+            started_at,
+            completed_at,
+            result,
+        });
+        attempts.sort_by_key(|attempt| attempt.attempt_number);
+    }
+    let payload = serde_json::to_string(&attempts).map_err(|error| {
+        persistence_error(format!("could not encode tool attempts: {error}"), false)
+    })?;
+    transaction
+        .execute(
+            "UPDATE run_tool_calls SET attempts=?3 WHERE run_id=?1 AND tool_call_id=?2",
+            params![
+                run_id_bytes,
+                call_id.as_uuid().as_bytes().as_slice(),
+                payload
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not save tool attempt: {error}"), true)
+        })?;
+    Ok(())
+}
+
+fn encode_hash_hex(hash: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(hash.len() * 2);
+    for byte in hash {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_hash_hex(value: &str, field: &str) -> Result<Vec<u8>> {
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted {field} is not a valid hex hash"),
+            false,
+        ));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        let (hi, lo) = match (hex_nibble(bytes[index]), hex_nibble(bytes[index + 1])) {
+            (Some(hi), Some(lo)) => (hi, lo),
+            _ => {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("persisted {field} is not a valid hex hash"),
+                    false,
+                ));
+            }
+        };
+        out.push((hi << 4) | lo);
+        index += 2;
+    }
+    Ok(out)
+}
+
+fn decode_stored_fragments(payload: &str) -> Result<Vec<StoredFragment>> {
+    serde_json::from_str(payload).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("persisted message fragments are malformed: {error}"),
+            false,
+        )
+    })
+}
+
+fn fragment_total(fragments: &[StoredFragment]) -> Option<u64> {
+    fragments
+        .iter()
+        .filter_map(|fragment| fragment.byte_offset.checked_add(fragment.byte_length))
+        .max()
+}
+
 fn load_run_message_fragments(
     connection: &Connection,
     run_id: RunId,
@@ -9122,29 +8822,24 @@ fn load_run_message_fragments(
             false,
         )
     })?;
-    let total: Option<i64> = connection
+    let payload: Option<String> = connection
         .query_row(
-            "SELECT MAX(byte_offset + byte_length) FROM run_message_fragments
-             WHERE run_id=?1 AND message_ordinal=?2",
+            "SELECT fragments FROM run_messages WHERE run_id=?1 AND ordinal=?2",
             params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
             |row| row.get(0),
         )
+        .optional()
         .map_err(|error| {
-            persistence_error(
-                format!("could not read message fragment size: {error}"),
-                true,
-            )
+            persistence_error(format!("could not read message fragments: {error}"), true)
         })?;
-    let Some(total) = total else {
+    let Some(payload) = payload else {
         return Ok(Vec::new());
     };
-    let total = u64::try_from(total).map_err(|_| {
-        LoomError::new(
-            ErrorCode::MalformedPayload,
-            "persisted message fragment size is negative",
-            false,
-        )
-    })?;
+    let mut fragments = decode_stored_fragments(&payload)?;
+    fragments.sort_by_key(|fragment| fragment.fragment_ordinal);
+    let Some(total) = fragment_total(&fragments) else {
+        return Ok(Vec::new());
+    };
     if byte_offset >= total {
         return Ok(Vec::new());
     }
@@ -9162,89 +8857,12 @@ fn load_run_message_fragments(
     if end == byte_offset {
         return Ok(output);
     }
-    let start_i64 = i64::try_from(byte_offset)
-        .map_err(|_| LoomError::invalid_request("message byte offset is out of range"))?;
-    let end_i64 = i64::try_from(end).map_err(|_| {
-        LoomError::new(
-            ErrorCode::MalformedPayload,
-            "message size is out of range",
-            false,
-        )
-    })?;
-    let mut statement = connection
-        .prepare(
-            "SELECT byte_offset, byte_length, content_hash
-             FROM run_message_fragments
-             WHERE run_id=?1 AND message_ordinal=?2
-               AND byte_offset < ?4 AND byte_offset + byte_length > ?3
-             ORDER BY byte_offset",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not prepare message content range: {error}"),
-                true,
-            )
-        })?;
-    let rows = statement
-        .query_map(
-            params![
-                run_id.as_uuid().as_bytes().as_slice(),
-                message_ordinal,
-                start_i64,
-                end_i64
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                ))
-            },
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not query message content range: {error}"),
-                true,
-            )
-        })?;
     let mut cursor = byte_offset;
-    for row in rows {
-        let (fragment_offset, fragment_length, hash) = row.map_err(|error| {
-            persistence_error(
-                format!("could not read message content range: {error}"),
-                true,
-            )
-        })?;
-        let fragment_offset = u64::try_from(fragment_offset).map_err(|_| {
-            LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted fragment offset is negative",
-                false,
-            )
-        })?;
-        let fragment_length = usize::try_from(fragment_length).map_err(|_| {
-            LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted fragment length is invalid",
-                false,
-            )
-        })?;
-        let fragment = decode_content(connection, &hash)?.into_bytes();
-        if fragment.len() != fragment_length || fragment_offset > cursor {
-            return Err(LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted message fragments contain a gap or invalid length",
-                false,
-            ));
-        }
-        let fragment_end = fragment_offset
-            .checked_add(u64::try_from(fragment_length).map_err(|_| {
-                LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    "persisted fragment length is out of range",
-                    false,
-                )
-            })?)
+    for fragment in &fragments {
+        let fragment_offset = fragment.byte_offset;
+        let fragment_end = fragment
+            .byte_offset
+            .checked_add(fragment.byte_length)
             .ok_or_else(|| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
@@ -9252,6 +8870,32 @@ fn load_run_message_fragments(
                     false,
                 )
             })?;
+        if fragment_end <= cursor {
+            continue;
+        }
+        if fragment_offset > cursor {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted message fragments contain a gap or invalid length",
+                false,
+            ));
+        }
+        let fragment_length = usize::try_from(fragment.byte_length).map_err(|_| {
+            LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted fragment length is invalid",
+                false,
+            )
+        })?;
+        let hash = decode_hash_hex(&fragment.content_hash, "fragment content hash")?;
+        let bytes = decode_content(connection, &hash)?.into_bytes();
+        if bytes.len() != fragment_length {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted message fragments contain a gap or invalid length",
+                false,
+            ));
+        }
         let copy_start = cursor.max(fragment_offset);
         let copy_end = end.min(fragment_end);
         let local_start = usize::try_from(copy_start - fragment_offset).map_err(|_| {
@@ -9268,7 +8912,7 @@ fn load_run_message_fragments(
                 false,
             )
         })?;
-        output.extend_from_slice(&fragment[local_start..local_end]);
+        output.extend_from_slice(&bytes[local_start..local_end]);
         cursor = copy_end;
         if cursor == end {
             break;
@@ -9290,59 +8934,45 @@ fn run_message_fragments_match(
     message_ordinal: i64,
     canonical_content: &[u8],
 ) -> Result<Option<bool>> {
-    let fragments = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT byte_offset, content_hash
-                 FROM run_message_fragments
-                 WHERE run_id=?1 AND message_ordinal=?2
-                 ORDER BY fragment_ordinal",
+    let payload: Option<String> = transaction
+        .query_row(
+            "SELECT fragments FROM run_messages WHERE run_id=?1 AND ordinal=?2",
+            params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read message fragments for consolidation: {error}"),
+                true,
             )
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not prepare message fragment consolidation: {error}"),
-                    true,
-                )
-            })?;
-        let rows = statement
-            .query_map(
-                params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not query message fragments for consolidation: {error}"),
-                    true,
-                )
-            })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not read message fragments for consolidation: {error}"),
-                    true,
-                )
-            })?
+        })?;
+    let Some(payload) = payload else {
+        return Ok(None);
     };
+    let mut fragments = decode_stored_fragments(&payload)?;
     if fragments.is_empty() {
         return Ok(None);
     }
-    for (byte_offset, content_hash) in fragments {
-        let byte_offset = usize::try_from(byte_offset).map_err(|_| {
+    fragments.sort_by_key(|fragment| fragment.fragment_ordinal);
+    for fragment in &fragments {
+        let byte_offset = usize::try_from(fragment.byte_offset).map_err(|_| {
             LoomError::new(
                 ErrorCode::MalformedPayload,
                 "persisted fragment offset is out of range",
                 false,
             )
         })?;
-        let fragment = decode_content(transaction, &content_hash)?.into_bytes();
-        let Some(fragment_end) = byte_offset.checked_add(fragment.len()) else {
+        let hash = decode_hash_hex(&fragment.content_hash, "fragment content hash")?;
+        let bytes = decode_content(transaction, &hash)?.into_bytes();
+        let Some(fragment_end) = byte_offset.checked_add(bytes.len()) else {
             return Err(LoomError::new(
                 ErrorCode::MalformedPayload,
                 "persisted fragment range overflows",
                 false,
             ));
         };
-        if canonical_content.get(byte_offset..fragment_end) != Some(fragment.as_slice()) {
+        if canonical_content.get(byte_offset..fragment_end) != Some(bytes.as_slice()) {
             return Ok(Some(false));
         }
     }
@@ -9356,8 +8986,8 @@ fn delete_run_message_fragments(
 ) -> Result<()> {
     transaction
         .execute(
-            "DELETE FROM run_message_fragments
-             WHERE run_id=?1 AND message_ordinal=?2",
+            "UPDATE run_messages SET fragments='[]'
+             WHERE run_id=?1 AND ordinal=?2",
             params![run_id.as_uuid().as_bytes().as_slice(), message_ordinal],
         )
         .map_err(|error| {
@@ -9367,88 +8997,6 @@ fn delete_run_message_fragments(
             )
         })?;
     Ok(())
-}
-
-fn load_run_message_tool_calls(
-    connection: &Connection,
-    run_id: RunId,
-    before_ordinal: Option<i64>,
-    limit: Option<usize>,
-) -> Result<BTreeMap<u64, Vec<loom_model::ToolCall>>> {
-    let mut calls = BTreeMap::<u64, Vec<loom_model::ToolCall>>::new();
-    let limit = limit.map(|limit| i64::try_from(limit).unwrap_or(i64::MAX));
-    let mut statement = connection
-        .prepare(
-            "SELECT c.message_ordinal,c.tool_call_id,c.name,c.arguments_hash
-         FROM run_message_tool_calls c
-         WHERE c.run_id=?1 AND (?2 IS NULL OR c.message_ordinal<?2)
-           AND (?3 IS NULL OR c.message_ordinal IN (
-             SELECT ordinal FROM run_messages
-             WHERE run_id=?1 AND (?2 IS NULL OR ordinal<?2)
-             ORDER BY ordinal DESC LIMIT ?3
-           ))
-         ORDER BY c.message_ordinal DESC,c.call_ordinal",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not prepare run message tool calls: {error}"),
-                true,
-            )
-        })?;
-    let rows = statement
-        .query_map(
-            params![
-                run_id.as_uuid().as_bytes().as_slice(),
-                before_ordinal,
-                limit
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                ))
-            },
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not read run message tool calls: {error}"),
-                true,
-            )
-        })?;
-    for row in rows {
-        let (ordinal, id, name, hash) = row.map_err(|error| {
-            persistence_error(
-                format!("could not read run message tool call: {error}"),
-                true,
-            )
-        })?;
-        let ordinal = u64::try_from(ordinal).map_err(|_| {
-            LoomError::new(
-                ErrorCode::MalformedPayload,
-                "persisted message ordinal is negative",
-                false,
-            )
-        })?;
-        let arguments = decode_content(connection, &hash)?;
-        let arguments = serde_json::from_str(&arguments).map_err(|error| {
-            LoomError::new(
-                ErrorCode::MalformedPayload,
-                format!("persisted tool arguments are malformed: {error}"),
-                false,
-            )
-        })?;
-        calls
-            .entry(ordinal)
-            .or_default()
-            .push(loom_model::ToolCall {
-                id: loom_core::ToolCallId::from_uuid(decode_uuid(&id, "tool-call id")?),
-                name,
-                arguments,
-            });
-    }
-    Ok(calls)
 }
 
 fn save_run_message_rows(
@@ -9467,23 +9015,6 @@ fn save_run_message_rows(
         )
         .map_err(|error| {
             persistence_error(format!("could not stage run messages: {error}"), true)
-        })?;
-    transaction
-        .execute_batch(
-            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_message_tool_calls (
-                run_id BLOB NOT NULL, message_ordinal INTEGER NOT NULL,
-                call_ordinal INTEGER NOT NULL, tool_call_id BLOB NOT NULL,
-                name TEXT NOT NULL, arguments_hash BLOB NOT NULL,
-                PRIMARY KEY(run_id, message_ordinal, call_ordinal),
-                UNIQUE(run_id, message_ordinal, tool_call_id)
-             ) WITHOUT ROWID, STRICT;
-             DELETE FROM _loom_wanted_run_message_tool_calls;",
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not stage run message tool calls: {error}"),
-                true,
-            )
         })?;
     for (run_id, messages) in messages_by_run {
         let session_id: Vec<u8> = transaction
@@ -9570,6 +9101,32 @@ fn save_run_message_rows(
                     }
                 }
             };
+            let tool_calls = serde_json::to_string(&message.tool_calls).map_err(|error| {
+                persistence_error(
+                    format!("could not encode message tool calls: {error}"),
+                    false,
+                )
+            })?;
+            if tool_calls.len() > 16 * 1024 * 1024 {
+                return Err(LoomError::invalid_request(
+                    "run message tool calls exceed the maximum supported size",
+                ));
+            }
+            for call in &message.tool_calls {
+                if call.name.len() > 4096 {
+                    return Err(LoomError::invalid_request(
+                        "run message tool name exceeds the maximum supported size",
+                    ));
+                }
+                let arguments = serde_json::to_vec(&call.arguments).map_err(|error| {
+                    persistence_error(format!("could not encode tool arguments: {error}"), false)
+                })?;
+                if arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+                    return Err(LoomError::invalid_request(
+                        "run message tool arguments exceed the maximum supported size",
+                    ));
+                }
+            }
             transaction
                 .execute(
                     "INSERT INTO _loom_wanted_run_messages(run_id, ordinal) VALUES (?1, ?2)",
@@ -9581,65 +9138,23 @@ fn save_run_message_rows(
             let tool_call_id = message
                 .tool_call_id
                 .map(|id| id.as_uuid().as_bytes().to_vec());
-            for (call_ordinal, call) in message.tool_calls.iter().enumerate() {
-                if call.name.len() > 4096 {
-                    return Err(LoomError::invalid_request(
-                        "run message tool name exceeds the maximum supported size",
-                    ));
-                }
-                let arguments = serde_json::to_vec(&call.arguments).map_err(|error| {
-                    persistence_error(format!("could not encode tool arguments: {error}"), false)
-                })?;
-                if arguments.len() > 1024 * 1024 {
-                    return Err(LoomError::invalid_request(
-                        "run message tool arguments exceed the maximum supported size",
-                    ));
-                }
-                let arguments_hash = store_content(transaction, &arguments)?;
-                let call_ordinal = i64::try_from(call_ordinal).map_err(|_| {
-                    LoomError::new(
-                        ErrorCode::Persistence,
-                        "too many tool calls in message",
-                        false,
-                    )
-                })?;
-                transaction
-                    .execute(
-                        "INSERT INTO _loom_wanted_run_message_tool_calls
-                     (run_id,message_ordinal,call_ordinal,tool_call_id,name,arguments_hash)
-                     VALUES (?1,?2,?3,?4,?5,?6)",
-                        params![
-                            run_id_bytes.as_slice(),
-                            ordinal,
-                            call_ordinal,
-                            call.id.as_uuid().as_bytes().as_slice(),
-                            call.name,
-                            arguments_hash
-                        ],
-                    )
-                    .map_err(|error| {
-                        persistence_error(
-                            format!("could not stage run message tool call: {error}"),
-                            true,
-                        )
-                    })?;
-            }
             transaction
                 .execute(
                     "INSERT INTO run_messages(run_id, session_id, ordinal, timeline_ordinal,
-                    role, content_hash, name, tool_call_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    role, content_hash, name, tool_call_id, tool_calls)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(run_id, ordinal) DO UPDATE SET
                     session_id=excluded.session_id,
                     timeline_ordinal=excluded.timeline_ordinal, role=excluded.role,
                     content_hash=excluded.content_hash, name=excluded.name,
-                    tool_call_id=excluded.tool_call_id
+                    tool_call_id=excluded.tool_call_id, tool_calls=excluded.tool_calls
                  WHERE run_messages.session_id IS NOT excluded.session_id
                     OR run_messages.timeline_ordinal IS NOT excluded.timeline_ordinal
                     OR run_messages.role IS NOT excluded.role
                     OR run_messages.content_hash IS NOT excluded.content_hash
                     OR run_messages.name IS NOT excluded.name
-                    OR run_messages.tool_call_id IS NOT excluded.tool_call_id",
+                    OR run_messages.tool_call_id IS NOT excluded.tool_call_id
+                    OR run_messages.tool_calls IS NOT excluded.tool_calls",
                     params![
                         run_id_bytes.as_slice(),
                         session_id,
@@ -9648,47 +9163,12 @@ fn save_run_message_rows(
                         message_role_name(message.role),
                         content_hash,
                         message.name,
-                        tool_call_id
+                        tool_call_id,
+                        tool_calls
                     ],
                 )
                 .map_err(|error| {
                     persistence_error(format!("could not save run message: {error}"), true)
-                })?;
-            transaction
-                .execute(
-                    "DELETE FROM run_message_tool_calls AS saved
-                 WHERE saved.run_id=?1 AND saved.message_ordinal=?2 AND NOT EXISTS (
-                    SELECT 1 FROM _loom_wanted_run_message_tool_calls wanted
-                    WHERE wanted.run_id=saved.run_id
-                      AND wanted.message_ordinal=saved.message_ordinal
-                      AND wanted.call_ordinal=saved.call_ordinal
-                      AND wanted.tool_call_id=saved.tool_call_id
-                      AND wanted.name=saved.name
-                      AND wanted.arguments_hash=saved.arguments_hash
-                 )",
-                    params![run_id_bytes.as_slice(), ordinal],
-                )
-                .map_err(|error| {
-                    persistence_error(
-                        format!("could not prune run message tool calls: {error}"),
-                        true,
-                    )
-                })?;
-            transaction
-                .execute(
-                    "INSERT INTO run_message_tool_calls
-                 (run_id,message_ordinal,call_ordinal,tool_call_id,name,arguments_hash)
-                 SELECT run_id,message_ordinal,call_ordinal,tool_call_id,name,arguments_hash
-                 FROM _loom_wanted_run_message_tool_calls
-                 WHERE run_id=?1 AND message_ordinal=?2
-                 ON CONFLICT(run_id,message_ordinal,call_ordinal) DO NOTHING",
-                    params![run_id_bytes.as_slice(), ordinal],
-                )
-                .map_err(|error| {
-                    persistence_error(
-                        format!("could not save run message tool calls: {error}"),
-                        true,
-                    )
                 })?;
             if fragments_match == Some(true) {
                 delete_run_message_fragments(transaction, *run_id, ordinal)?;
@@ -9697,13 +9177,9 @@ fn save_run_message_rows(
         if prune_missing {
             transaction
                 .execute(
-                    "DELETE FROM run_messages WHERE run_id=?1 AND NOT EXISTS (
+                    "DELETE FROM run_messages WHERE run_id=?1 AND fragments='[]' AND NOT EXISTS (
                 SELECT 1 FROM _loom_wanted_run_messages wanted
                 WHERE wanted.run_id=run_messages.run_id AND wanted.ordinal=run_messages.ordinal
-                ) AND NOT EXISTS (
-                   SELECT 1 FROM run_message_fragments fragment
-                   WHERE fragment.run_id=run_messages.run_id
-                     AND fragment.message_ordinal=run_messages.ordinal
                 )",
                     [run_id.as_uuid().as_bytes().as_slice()],
                 )
@@ -10349,6 +9825,13 @@ fn save_run_runtime_config_rows(
                     false,
                 )
             })?;
+        let project_grants =
+            serde_json::to_string(&RunProjectGrants::of(config)).map_err(|error| {
+                persistence_error(
+                    format!("could not encode run project grants: {error}"),
+                    false,
+                )
+            })?;
         if config
             .system_instructions
             .as_ref()
@@ -10360,6 +9843,7 @@ fn save_run_runtime_config_rows(
             || context_inspection
                 .as_ref()
                 .is_some_and(|value| value.len() > MAX_RUN_RUNTIME_CONFIG_BYTES)
+            || project_grants.len() > MAX_RUN_RUNTIME_CONFIG_BYTES
         {
             return Err(LoomError::new(
                 ErrorCode::Persistence,
@@ -10481,45 +9965,20 @@ fn save_run_runtime_config_rows(
         transaction
             .execute(
                 "INSERT INTO run_runtime_config(
-                    run_id, configuration_hash, context_inspection,
-                    project_delegation_enabled, project_messaging_enabled,
-                    project_inspection_enabled, project_child_control_enabled,
-                    project_worktree_enabled, project_review_enabled,
-                    project_integration_enabled, project_branch_messaging_enabled
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                    run_id, configuration_hash, context_inspection, project_grants
+                 ) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(run_id) DO UPDATE SET
                     configuration_hash=excluded.configuration_hash,
                     context_inspection=excluded.context_inspection,
-                    project_delegation_enabled=excluded.project_delegation_enabled,
-                    project_messaging_enabled=excluded.project_messaging_enabled,
-                    project_inspection_enabled=excluded.project_inspection_enabled,
-                    project_child_control_enabled=excluded.project_child_control_enabled,
-                    project_worktree_enabled=excluded.project_worktree_enabled,
-                    project_review_enabled=excluded.project_review_enabled,
-                    project_integration_enabled=excluded.project_integration_enabled,
-                    project_branch_messaging_enabled=excluded.project_branch_messaging_enabled
+                    project_grants=excluded.project_grants
                  WHERE run_runtime_config.configuration_hash IS NOT excluded.configuration_hash
                     OR run_runtime_config.context_inspection IS NOT excluded.context_inspection
-                    OR run_runtime_config.project_delegation_enabled IS NOT excluded.project_delegation_enabled
-                    OR run_runtime_config.project_messaging_enabled IS NOT excluded.project_messaging_enabled
-                    OR run_runtime_config.project_inspection_enabled IS NOT excluded.project_inspection_enabled
-                    OR run_runtime_config.project_child_control_enabled IS NOT excluded.project_child_control_enabled
-                    OR run_runtime_config.project_worktree_enabled IS NOT excluded.project_worktree_enabled
-                    OR run_runtime_config.project_review_enabled IS NOT excluded.project_review_enabled
-                    OR run_runtime_config.project_integration_enabled IS NOT excluded.project_integration_enabled
-                    OR run_runtime_config.project_branch_messaging_enabled IS NOT excluded.project_branch_messaging_enabled",
+                    OR run_runtime_config.project_grants IS NOT excluded.project_grants",
                 params![
                     run_id.as_uuid().as_bytes().as_slice(),
                     configuration_hash,
                     context_inspection,
-                    i64::from(config.project_delegation_enabled),
-                    i64::from(config.project_messaging_enabled),
-                    i64::from(config.project_inspection_enabled),
-                    i64::from(config.project_child_control_enabled),
-                    i64::from(config.project_worktree_enabled),
-                    i64::from(config.project_review_enabled),
-                    i64::from(config.project_integration_enabled),
-                    i64::from(config.project_branch_messaging_enabled),
+                    project_grants,
                 ],
             )
             .map_err(|error| {
@@ -11769,11 +11228,17 @@ fn save_run_tool_activity_delta(
     let arguments_hash = store_content(transaction, &arguments)?;
     let created_at = encode_timestamp(activity.started_at)?;
     let call_id = call.id.as_uuid().as_bytes();
-    let existing: Option<(Vec<u8>, String, Vec<u8>)> = transaction.query_row(
-        "SELECT session_id, name, arguments_hash FROM run_tool_calls WHERE run_id=?1 AND tool_call_id=?2",
-        params![run_id_bytes.as_slice(), call_id.as_slice()],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    ).optional().map_err(|error| persistence_error(format!("could not read logical tool call: {error}"), true))?;
+    let existing: Option<(Vec<u8>, String, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT session_id, name, arguments_hash FROM run_tool_calls
+             WHERE run_id=?1 AND tool_call_id=?2",
+            params![run_id_bytes.as_slice(), call_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(format!("could not read logical tool call: {error}"), true)
+        })?;
     if let Some((stored_session, stored_name, stored_hash)) = existing {
         if stored_session != session_id || stored_name != call.name || stored_hash != arguments_hash
         {
@@ -11784,41 +11249,54 @@ fn save_run_tool_activity_delta(
             ));
         }
     } else {
-        transaction.execute(
-            "INSERT INTO run_tool_calls(run_id,session_id,tool_call_id,name,arguments_hash,created_at)
-             VALUES (?1,?2,?3,?4,?5,?6)",
-            params![run_id_bytes.as_slice(), session_id, call_id.as_slice(), call.name, arguments_hash, created_at],
-        ).map_err(|error| persistence_error(format!("could not save logical tool call: {error}"), true))?;
+        transaction
+            .execute(
+                "INSERT INTO run_tool_calls(run_id,session_id,tool_call_id,name,arguments_hash,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    run_id_bytes.as_slice(),
+                    session_id,
+                    call_id.as_slice(),
+                    call.name,
+                    arguments_hash,
+                    created_at
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save logical tool call: {error}"), true)
+            })?;
     }
-    let activity_id = activity.id.as_uuid().as_bytes();
-    let attempt_number: i64 = if let Some(existing) = transaction
-        .query_row(
-            "SELECT attempt_number FROM run_tool_attempts WHERE run_id=?1 AND activity_id=?2",
-            params![run_id_bytes.as_slice(), activity_id.as_slice()],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|error| {
-            persistence_error(format!("could not read tool attempt number: {error}"), true)
-        })? {
-        existing
-    } else {
-        transaction.query_row(
-            "SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM run_tool_attempts WHERE run_id=?1 AND tool_call_id=?2",
-            params![run_id_bytes.as_slice(), call_id.as_slice()], |row| row.get(0),
-        ).map_err(|error| persistence_error(format!("could not allocate tool attempt number: {error}"), true))?
-    };
-    let state = match activity.status {
+    let state = tool_attempt_state_for(activity, call, execution);
+    let started_at = encode_timestamp(activity.started_at)?;
+    let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
+    upsert_stored_attempt(
+        transaction,
+        run_id_bytes.as_slice(),
+        call.id,
+        activity.id,
+        state,
+        started_at,
+        completed_at,
+        result.cloned(),
+    )
+}
+
+fn tool_attempt_state_for(
+    activity: &AgentActivityRecord,
+    call: &loom_model::ToolCall,
+    execution: Option<&AgentExecutionStateRecord>,
+) -> AgentToolAttemptState {
+    match activity.status {
         AgentActivityStatus::Started
             if execution
-                .and_then(|e| e.pending_tool_execution.as_ref())
+                .and_then(|execution| execution.pending_tool_execution.as_ref())
                 .is_some_and(|pending| pending.id == call.id) =>
         {
             AgentToolAttemptState::Queued
         }
         AgentActivityStatus::Started
             if execution
-                .and_then(|e| e.last_failed_call.as_ref())
+                .and_then(|execution| execution.last_failed_call.as_ref())
                 .is_some_and(|failed| failed.id == call.id) =>
         {
             AgentToolAttemptState::OutcomeUnknown
@@ -11829,33 +11307,7 @@ fn save_run_tool_activity_delta(
         AgentActivityStatus::AwaitingApproval => AgentToolAttemptState::AwaitingApproval,
         AgentActivityStatus::AwaitingInput => AgentToolAttemptState::AwaitingInput,
         AgentActivityStatus::Cancelled => AgentToolAttemptState::Cancelled,
-    };
-    let result_hash = result
-        .map(|result| {
-            let encoded = serde_json::to_vec(result).map_err(|error| {
-                LoomError::new(
-                    ErrorCode::MalformedPayload,
-                    format!("could not encode tool result: {error}"),
-                    false,
-                )
-            })?;
-            store_content(transaction, &encoded)
-        })
-        .transpose()?;
-    let started_at = encode_timestamp(activity.started_at)?;
-    let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
-    transaction.execute(
-        "INSERT INTO run_tool_attempts(run_id,session_id,activity_id,tool_call_id,attempt_number,state,started_at,completed_at,result_hash)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-         ON CONFLICT(run_id,activity_id) DO UPDATE SET state=excluded.state,
-            completed_at=excluded.completed_at,result_hash=excluded.result_hash
-         WHERE run_tool_attempts.state IS NOT excluded.state
-            OR run_tool_attempts.completed_at IS NOT excluded.completed_at
-            OR run_tool_attempts.result_hash IS NOT excluded.result_hash",
-        params![run_id_bytes.as_slice(), session_id, activity_id, call_id.as_slice(), attempt_number,
-            tool_attempt_state_name(state), started_at, completed_at, result_hash],
-    ).map_err(|error| persistence_error(format!("could not save tool attempt delta: {error}"), true))?;
-    Ok(())
+    }
 }
 
 fn activity_tool_data(
@@ -11982,12 +11434,7 @@ fn save_run_tool_rows(
                 run_id BLOB NOT NULL, tool_call_id BLOB NOT NULL,
                 PRIMARY KEY(run_id, tool_call_id)
              ) WITHOUT ROWID, STRICT;
-             CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_tool_attempts (
-                run_id BLOB NOT NULL, activity_id BLOB NOT NULL,
-                PRIMARY KEY(run_id, activity_id)
-             ) WITHOUT ROWID, STRICT;
-             DELETE FROM _loom_wanted_run_tool_calls;
-             DELETE FROM _loom_wanted_run_tool_attempts;",
+             DELETE FROM _loom_wanted_run_tool_calls;",
         )
         .map_err(|error| {
             persistence_error(format!("could not stage run tool rows: {error}"), true)
@@ -12011,7 +11458,7 @@ fn save_run_tool_rows(
             .and_then(|summary| summary.execution_state.as_ref());
         let mut logical_calls =
             BTreeMap::<loom_core::ToolCallId, (&loom_model::ToolCall, Timestamp)>::new();
-        let mut attempt_numbers = BTreeMap::<loom_core::ToolCallId, u32>::new();
+        let mut attempts_by_call = BTreeMap::<loom_core::ToolCallId, Vec<StoredToolAttempt>>::new();
         for activity in activities {
             if activity.run_id != *run_id {
                 return Err(LoomError::invalid_request(
@@ -12110,117 +11557,47 @@ fn save_run_tool_rows(
                         persistence_error(format!("could not stage tool call: {error}"), true)
                     })?;
             }
-
-            let attempt_number = attempt_numbers.entry(call.id).or_default();
-            *attempt_number = attempt_number.checked_add(1).ok_or_else(|| {
+            let state = tool_attempt_state_for(activity, call, execution);
+            let started_at = encode_timestamp(activity.started_at)?;
+            let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
+            let attempts = attempts_by_call.entry(call.id).or_default();
+            let attempt_number = u32::try_from(attempts.len() + 1).map_err(|_| {
                 LoomError::new(
                     ErrorCode::Persistence,
                     "tool call has too many execution attempts",
                     false,
                 )
             })?;
-            let state = match activity.status {
-                AgentActivityStatus::Started
-                    if execution
-                        .and_then(|execution| execution.pending_tool_execution.as_ref())
-                        .is_some_and(|pending| pending.id == call.id) =>
-                {
-                    AgentToolAttemptState::Queued
-                }
-                AgentActivityStatus::Started
-                    if execution
-                        .and_then(|execution| execution.last_failed_call.as_ref())
-                        .is_some_and(|failed| failed.id == call.id) =>
-                {
-                    AgentToolAttemptState::OutcomeUnknown
-                }
-                AgentActivityStatus::Started => AgentToolAttemptState::Running,
-                AgentActivityStatus::Completed => AgentToolAttemptState::Completed,
-                AgentActivityStatus::Failed => AgentToolAttemptState::Failed,
-                AgentActivityStatus::AwaitingApproval => AgentToolAttemptState::AwaitingApproval,
-                AgentActivityStatus::AwaitingInput => AgentToolAttemptState::AwaitingInput,
-                AgentActivityStatus::Cancelled => AgentToolAttemptState::Cancelled,
-            };
-            let result_hash = result
-                .map(|result| {
-                    let result = serde_json::to_vec(result).map_err(|error| {
-                        LoomError::new(
-                            ErrorCode::MalformedPayload,
-                            format!("could not encode tool result: {error}"),
-                            false,
-                        )
-                    })?;
-                    store_content(transaction, &result)
-                })
-                .transpose()?;
-            let started_at = encode_timestamp(activity.started_at)?;
-            let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
-            let activity_id = activity.id.as_uuid().as_bytes();
+            attempts.push(StoredToolAttempt {
+                activity_id: encode_hash_hex(activity.id.as_uuid().as_bytes()),
+                attempt_number,
+                state: tool_attempt_state_name(state).to_owned(),
+                started_at,
+                completed_at,
+                result: result.cloned(),
+            });
+        }
+        for (call_id, attempts) in &attempts_by_call {
+            let payload = serde_json::to_string(attempts).map_err(|error| {
+                persistence_error(format!("could not encode tool attempts: {error}"), false)
+            })?;
             transaction
                 .execute(
-                    "INSERT INTO run_tool_attempts(
-                        run_id, session_id, activity_id, tool_call_id, attempt_number, state,
-                        started_at, completed_at, result_hash
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(run_id, activity_id) DO UPDATE SET
-                        session_id=excluded.session_id,
-                        tool_call_id=excluded.tool_call_id,
-                        attempt_number=excluded.attempt_number,
-                        state=excluded.state,
-                        started_at=excluded.started_at,
-                        completed_at=excluded.completed_at,
-                        result_hash=excluded.result_hash
-                     WHERE run_tool_attempts.session_id IS NOT excluded.session_id
-                        OR run_tool_attempts.tool_call_id IS NOT excluded.tool_call_id
-                        OR run_tool_attempts.attempt_number IS NOT excluded.attempt_number
-                        OR run_tool_attempts.state IS NOT excluded.state
-                        OR run_tool_attempts.started_at IS NOT excluded.started_at
-                        OR run_tool_attempts.completed_at IS NOT excluded.completed_at
-                        OR run_tool_attempts.result_hash IS NOT excluded.result_hash",
+                    "UPDATE run_tool_calls SET attempts=?3
+                     WHERE run_id=?1 AND tool_call_id=?2",
                     params![
                         run_id_bytes.as_slice(),
-                        session_id.as_slice(),
-                        activity_id,
-                        call.id.as_uuid().as_bytes().as_slice(),
-                        i64::from(*attempt_number),
-                        tool_attempt_state_name(state),
-                        started_at,
-                        completed_at,
-                        result_hash,
+                        call_id.as_uuid().as_bytes().as_slice(),
+                        payload
                     ],
                 )
                 .map_err(|error| {
                     persistence_error(
-                        format!("could not save tool attempt {}: {error}", activity.id),
+                        format!("could not save tool attempts for {call_id}: {error}"),
                         true,
                     )
                 })?;
-            transaction
-                .execute(
-                    "INSERT INTO _loom_wanted_run_tool_attempts(run_id, activity_id)
-                     VALUES (?1, ?2)",
-                    params![run_id_bytes.as_slice(), activity_id],
-                )
-                .map_err(|error| {
-                    persistence_error(format!("could not stage tool attempt: {error}"), true)
-                })?;
         }
-        transaction
-            .execute(
-                "DELETE FROM run_tool_attempts
-                 WHERE run_id=?1 AND NOT EXISTS (
-                    SELECT 1 FROM _loom_wanted_run_tool_attempts wanted
-                    WHERE wanted.run_id=run_tool_attempts.run_id
-                      AND wanted.activity_id=run_tool_attempts.activity_id
-                 )",
-                [run_id_bytes.as_slice()],
-            )
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not prune tool attempts for {run_id}: {error}"),
-                    true,
-                )
-            })?;
         transaction
             .execute(
                 "DELETE FROM run_tool_calls
@@ -13933,6 +13310,21 @@ mod tests {
         value: String,
     }
 
+    fn stored_fragment_count(path: &std::path::Path, run_id: RunId) -> usize {
+        let connection = Connection::open(path).unwrap();
+        let mut statement = connection
+            .prepare("SELECT fragments FROM run_messages WHERE run_id=?1")
+            .unwrap();
+        let counts = statement
+            .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap()
+            .map(|row| decode_stored_fragments(&row.unwrap()).unwrap().len())
+            .collect::<Vec<_>>();
+        counts.into_iter().sum()
+    }
+
     fn invalid_feed_for_rollback() -> DurableFeedState {
         DurableFeedState {
             next_sequence: EventSequence::new(u64::MAX),
@@ -14807,506 +14199,6 @@ mod tests {
     }
 
     #[test]
-    fn v48_upgrade_adds_review_grant_disabled_for_existing_runs() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE run_runtime_config(
-                    run_id BLOB PRIMARY KEY,
-                    project_delegation_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_messaging_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_branch_messaging_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_inspection_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_child_control_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_worktree_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_integration_enabled INTEGER NOT NULL DEFAULT 0
-                 );
-                 INSERT INTO run_runtime_config(
-                    run_id, project_delegation_enabled, project_branch_messaging_enabled
-                 ) VALUES (x'01', 1, 1);
-                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 PRAGMA user_version=48;",
-            )
-            .unwrap();
-
-        initialize_schema(&connection).unwrap();
-
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let grants: (i64, i64, i64) = connection
-            .query_row(
-                "SELECT project_delegation_enabled, project_branch_messaging_enabled,
-                        project_review_enabled
-                 FROM run_runtime_config WHERE run_id=x'01'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        let has_cascade_tables: bool = connection
-            .query_row(
-                "SELECT COUNT(*)=2 FROM sqlite_master
-                 WHERE type='table' AND name IN (
-                    'project_cancellation_cascades',
-                    'project_cancellation_cascade_members'
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        assert_eq!(grants, (1, 1, 0));
-        assert!(has_cascade_tables);
-    }
-
-    #[test]
-    fn v50_upgrade_assigns_stable_legacy_run_timeline_order() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 INSERT INTO run_messages(run_id, ordinal) VALUES (x'01', 0), (x'01', 1);
-                 INSERT INTO run_activities(run_id, ordinal) VALUES (x'01', 0), (x'01', 1);
-                 PRAGMA user_version=50;",
-            )
-            .unwrap();
-
-        initialize_schema(&connection).unwrap();
-
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let messages: Vec<i64> = connection
-            .prepare("SELECT timeline_ordinal FROM run_messages ORDER BY ordinal")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect();
-        let activities: Vec<i64> = connection
-            .prepare("SELECT timeline_ordinal FROM run_activities ORDER BY ordinal")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(|row| row.unwrap())
-            .collect();
-        assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        assert_eq!(messages, vec![0, 1]);
-        assert_eq!(activities, vec![2, 3]);
-    }
-
-    #[test]
-    fn v42_upgrade_adds_durable_project_message_cursor() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
-                 CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
-                 CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
-                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 PRAGMA user_version=42;",
-            )
-            .unwrap();
-
-        initialize_schema(&connection).unwrap();
-
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let has_cursor: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM pragma_table_info('run_execution_state')
-                    WHERE name='last_project_message_sequence'
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        connection
-            .execute("INSERT INTO run_execution_state(run_id) VALUES (x'01')", [])
-            .unwrap();
-        let cursor: i64 = connection
-            .query_row(
-                "SELECT last_project_message_sequence FROM run_execution_state",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        assert!(has_cursor);
-        assert_eq!(cursor, 0);
-        connection
-            .execute("INSERT INTO run_runtime_config(run_id) VALUES (x'01')", [])
-            .unwrap();
-        let delegation_enabled: i64 = connection
-            .query_row(
-                "SELECT project_delegation_enabled FROM run_runtime_config WHERE run_id=x'01'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(delegation_enabled, 0);
-        let (messaging_enabled, inspection_enabled): (i64, i64) = connection
-            .query_row(
-                "SELECT project_messaging_enabled, project_inspection_enabled
-                 FROM run_runtime_config WHERE run_id=x'01'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!((messaging_enabled, inspection_enabled), (0, 0));
-    }
-
-    #[test]
-    fn v44_upgrade_adds_separate_default_disabled_coordination_grants() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE run_runtime_config(
-                    run_id BLOB PRIMARY KEY,
-                    project_delegation_enabled INTEGER NOT NULL DEFAULT 0
-                );
-                 INSERT INTO run_runtime_config(run_id, project_delegation_enabled)
-                    VALUES (x'01', 1);
-                 CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
-                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 PRAGMA user_version=44;",
-            )
-            .unwrap();
-
-        migrate_v44_to_v45(&connection).unwrap();
-        let intermediate_version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(intermediate_version, PROJECT_COORDINATION_SCHEMA_VERSION);
-
-        initialize_schema(&connection).unwrap();
-
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let grants: (i64, i64, i64, i64) = connection
-            .query_row(
-                "SELECT project_delegation_enabled, project_messaging_enabled,
-                        project_inspection_enabled, project_child_control_enabled
-                 FROM run_runtime_config WHERE run_id=x'01'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        assert_eq!(grants, (1, 0, 0, 0));
-    }
-
-    #[test]
-    fn v45_upgrade_adds_default_disabled_child_control_grant() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE run_runtime_config(
-                    run_id BLOB PRIMARY KEY,
-                    project_delegation_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_messaging_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_inspection_enabled INTEGER NOT NULL DEFAULT 0
-                );
-                 INSERT INTO run_runtime_config(
-                    run_id, project_delegation_enabled, project_messaging_enabled,
-                    project_inspection_enabled
-                 ) VALUES (x'01', 1, 1, 1);
-                 CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
-                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 PRAGMA user_version=45;",
-            )
-            .unwrap();
-
-        initialize_schema(&connection).unwrap();
-
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let grants: (i64, i64, i64, i64) = connection
-            .query_row(
-                "SELECT project_delegation_enabled, project_messaging_enabled,
-                        project_inspection_enabled, project_child_control_enabled
-                 FROM run_runtime_config WHERE run_id=x'01'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        assert_eq!(grants, (1, 1, 1, 0));
-    }
-
-    #[test]
-    fn v46_upgrade_adds_normalized_project_worktree_state() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE run_runtime_config(
-                    run_id BLOB PRIMARY KEY,
-                    project_delegation_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_messaging_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_inspection_enabled INTEGER NOT NULL DEFAULT 0,
-                    project_child_control_enabled INTEGER NOT NULL DEFAULT 0
-                 );
-                 INSERT INTO run_runtime_config(run_id) VALUES (x'01');
-                 CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
-                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 PRAGMA user_version=46;",
-            )
-            .unwrap();
-
-        initialize_schema(&connection).unwrap();
-
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let table_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
-                 AND name IN ('project_worktrees', 'project_worktree_conflict_paths')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let default_grants: (i64, i64) = connection
-            .query_row(
-                "SELECT project_worktree_enabled, project_integration_enabled
-                 FROM run_runtime_config WHERE run_id=x'01'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        connection
-            .execute(
-                "UPDATE run_runtime_config SET project_worktree_enabled=1,
-                 project_integration_enabled=0 WHERE run_id=x'01'",
-                [],
-            )
-            .unwrap();
-        let independent_grants: (i64, i64) = connection
-            .query_row(
-                "SELECT project_worktree_enabled, project_integration_enabled
-                 FROM run_runtime_config WHERE run_id=x'01'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        assert_eq!(table_count, 2);
-        assert_eq!(default_grants, (0, 0));
-        assert_eq!(independent_grants, (1, 0));
-    }
-
-    #[test]
-    fn v47_upgrade_adds_default_disabled_task_and_branch_messaging_grants() {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
-                 INSERT INTO delegated_tasks(task_id) VALUES (x'01');
-                 CREATE TABLE run_runtime_config(
-                    run_id BLOB PRIMARY KEY,
-                    project_messaging_enabled INTEGER NOT NULL DEFAULT 0
-                 );
-                 INSERT INTO run_runtime_config(run_id, project_messaging_enabled)
-                    VALUES (x'02', 1);
-                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 PRAGMA user_version=47;",
-            )
-            .unwrap();
-
-        initialize_schema(&connection).unwrap();
-
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let task_permissions: (i64, i64, i64, i64, i64, i64, i64) = connection
-            .query_row(
-                "SELECT permission_delegation, permission_branch_messaging,
-                        permission_child_control, permission_inspection,
-                        permission_worktree_creation, permission_review, permission_integration
-                 FROM delegated_tasks WHERE task_id=x'01'",
-                [],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                },
-            )
-            .unwrap();
-        let (direct_messaging, branch_messaging): (i64, i64) = connection
-            .query_row(
-                "SELECT project_messaging_enabled, project_branch_messaging_enabled
-                 FROM run_runtime_config WHERE run_id=x'02'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-
-        assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        assert_eq!(task_permissions, (0, 0, 0, 0, 0, 0, 0));
-        assert_eq!((direct_messaging, branch_messaging), (1, 0));
-    }
-
-    #[test]
-    fn v41_upgrade_preserves_sessions_as_project_roots() {
-        type PersistedHierarchyRow = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, i64);
-
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE sessions (
-                    id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
-                    workspace_id BLOB NOT NULL CHECK(length(workspace_id) = 16),
-                    name TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
-                 ) WITHOUT ROWID, STRICT;
-                 CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
-                 CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
-                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 PRAGMA user_version=41;",
-            )
-            .unwrap();
-        let root_a = Uuid::new_v4();
-        let root_b = Uuid::new_v4();
-        let workspace = Uuid::new_v4();
-        for (id, name) in [(root_a, "first"), (root_b, "second")] {
-            connection
-                .execute(
-                    "INSERT INTO sessions VALUES (?1, ?2, ?3, 'idle', 1, 1)",
-                    params![id.as_bytes(), workspace.as_bytes(), name],
-                )
-                .unwrap();
-        }
-
-        initialize_schema(&connection).unwrap();
-
-        let roots: Vec<PersistedHierarchyRow> = {
-            let mut statement = connection
-                .prepare(
-                    "SELECT project_id, session_id, parent_session_id, depth
-                     FROM sessions_hierarchy ORDER BY session_id",
-                )
-                .unwrap();
-            statement
-                .query_map([], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                })
-                .unwrap()
-                .map(|row| row.unwrap())
-                .collect()
-        };
-        assert_eq!(roots.len(), 2);
-        assert!(roots.iter().all(|(project, session, parent, depth)| {
-            project == session && parent.is_none() && *depth == 1
-        }));
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        for table in [
-            "delegated_tasks",
-            "delegated_task_context_references",
-            "delegated_task_dependencies",
-            "project_message_sequences",
-            "project_agent_messages",
-        ] {
-            let exists: bool = connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
-                    [table],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(exists, "v41 migration did not create {table}");
-        }
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn v41_upgrade_rolls_back_and_can_be_retried() {
-        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE sessions (
-                    id BLOB PRIMARY KEY NOT NULL CHECK(length(id) = 16),
-                    workspace_id BLOB NOT NULL CHECK(length(workspace_id) = 16),
-                    name TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
-                 ) WITHOUT ROWID, STRICT;
-                 CREATE TABLE sessions_hierarchy(unexpected TEXT);
-                 CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
-                 CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
-                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
-                 PRAGMA user_version=41;",
-            )
-            .unwrap();
-        let session_id = Uuid::new_v4();
-        let workspace_id = Uuid::new_v4();
-        connection
-            .execute(
-                "INSERT INTO sessions VALUES (?1, ?2, 'retry', 'idle', 1, 1)",
-                params![session_id.as_bytes(), workspace_id.as_bytes()],
-            )
-            .unwrap();
-
-        assert!(initialize_schema(&connection).is_err());
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 41);
-        let project_index_exists: bool = connection
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='sessions_hierarchy_by_project')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(!project_index_exists);
-
-        connection
-            .execute_batch("DROP TABLE sessions_hierarchy;")
-            .unwrap();
-        initialize_schema(&connection).unwrap();
-        let root_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM sessions_hierarchy", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(root_count, 1);
-        let version: u32 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, DATABASE_SCHEMA_VERSION);
-        drop(connection);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn fresh_database_uses_typed_schema_without_generic_section_tables() {
         let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
         let store = FilePersistence::open(&path).unwrap();
@@ -15331,6 +14223,190 @@ mod tests {
         drop(connection);
         drop(store);
         fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn baseline_schema_consolidates_project_grants_into_single_json_columns() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        store
+            .save_state_with_sessions(&SessionManager::default().export_state())
+            .unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+
+        let run_columns: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM pragma_table_info('run_runtime_config')
+                 WHERE name LIKE 'project_%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(run_columns, vec!["project_grants".to_owned()]);
+
+        let task_columns: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM pragma_table_info('delegated_tasks')
+                 WHERE name LIKE 'permission_%' OR name = 'permissions' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(task_columns, vec!["permissions".to_owned()]);
+
+        drop(connection);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn baseline_schema_folds_transcript_and_tool_state_into_parent_rows() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let store = FilePersistence::open(&path).unwrap();
+        store
+            .save_state_with_sessions(&SessionManager::default().export_state())
+            .unwrap();
+
+        let connection = Connection::open(&path).unwrap();
+        let child_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN (
+                    'run_message_fragments', 'run_message_tool_calls', 'run_tool_attempts'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_tables, 0);
+
+        let message_columns: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM pragma_table_info('run_messages')
+                 WHERE name IN ('tool_calls', 'fragments') ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            message_columns,
+            vec!["fragments".to_owned(), "tool_calls".to_owned()]
+        );
+
+        let call_columns: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM pragma_table_info('run_tool_calls')
+                 WHERE name = 'attempts'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(call_columns, vec!["attempts".to_owned()]);
+
+        drop(connection);
+        drop(store);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn project_grants_json_is_forward_and_backward_compatible() {
+        // Missing keys default to disabled and unknown keys are ignored, so a
+        // future grant is added without a schema migration.
+        let grants: RunProjectGrants = decode_json(
+            r#"{"delegation":true,"future_grant":true}"#,
+            "run project grants",
+        )
+        .unwrap();
+        let mut config = DurableRunRuntimeConfig {
+            system_instructions: None,
+            repository_instructions: None,
+            approval_policy: ApprovalPolicy::default(),
+            limits: SessionLimits::default(),
+            context_options: ContextAssemblyOptions::default(),
+            checkpoint_id: None,
+            input_cost_micros_per_1k: 0,
+            output_cost_micros_per_1k: 0,
+            context_inspection: None,
+            project_delegation_enabled: false,
+            project_messaging_enabled: true,
+            project_inspection_enabled: false,
+            project_child_control_enabled: false,
+            project_worktree_enabled: false,
+            project_review_enabled: false,
+            project_integration_enabled: false,
+            project_branch_messaging_enabled: false,
+        };
+        grants.apply(&mut config);
+        assert!(config.project_delegation_enabled);
+        assert!(!config.project_messaging_enabled);
+        assert_eq!(
+            RunProjectGrants::of(&config),
+            RunProjectGrants {
+                delegation: true,
+                ..RunProjectGrants::default()
+            }
+        );
+
+        // Round trip through the stored representation.
+        let payload = serde_json::to_string(&RunProjectGrants::of(&config)).unwrap();
+        let restored: RunProjectGrants = decode_json(&payload, "run project grants").unwrap();
+        assert!(restored.delegation);
+        assert!(!restored.messaging);
+    }
+
+    #[test]
+    fn schema_status_detects_incompatible_state_and_resets_only_on_request() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        assert_eq!(
+            FilePersistence::schema_status(&path).unwrap(),
+            SchemaStatus::Absent
+        );
+
+        let store = FilePersistence::open(&path).unwrap();
+        store
+            .save_state_with_sessions(&SessionManager::default().export_state())
+            .unwrap();
+        assert_eq!(
+            FilePersistence::schema_status(&path).unwrap(),
+            SchemaStatus::Current
+        );
+        drop(store);
+
+        // Simulate a database written by an older Loom revision.
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .pragma_update(None, "user_version", 40u32)
+                .unwrap();
+        }
+        assert_eq!(
+            FilePersistence::schema_status(&path).unwrap(),
+            SchemaStatus::OtherVersion(40)
+        );
+
+        // Inspecting and refusing to wipe must leave the file untouched.
+        assert_eq!(
+            prepare_database(&path, false).unwrap(),
+            SchemaStatus::OtherVersion(40)
+        );
+        assert!(path.is_file());
+
+        // An explicit wipe removes the database and its sidecars.
+        assert_eq!(prepare_database(&path, true).unwrap(), SchemaStatus::Absent);
+        assert!(!path.is_file());
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -16243,6 +15319,10 @@ mod tests {
         );
         assert_eq!(persistence.load_workspace_configs().unwrap(), configs);
         assert_eq!(
+            persistence.load_run_runtime_config(run_id).unwrap(),
+            Some(run_runtime_config.clone())
+        );
+        assert_eq!(
             persistence.load_provider_configs().unwrap(),
             vec![provider_config]
         );
@@ -16891,9 +15971,12 @@ mod tests {
         let content_count: i64 = connection
             .query_row("SELECT COUNT(*) FROM content_objects", [], |row| row.get(0))
             .unwrap();
+        // Message tool calls and tool attempts are inline JSON now, so the
+        // reachable content objects are the transcript, context checkpoint,
+        // logical tool-call arguments, filesystem undo, and run instructions.
         assert!(
-            content_count >= 8,
-            "retained transcript, context checkpoint, tool, filesystem undo, and run-instruction content remain reachable"
+            content_count >= 7,
+            "retained transcript, context checkpoint, logical tool-call, filesystem undo, and run-instruction content remain reachable"
         );
         drop(connection);
         assert_eq!(
@@ -17236,15 +16319,7 @@ mod tests {
         let after_mismatch = persistence.load_run_messages(run_id).unwrap();
         assert_eq!(after_mismatch[1].content, "seedhello world!");
         assert_eq!(after_mismatch[2].content, "partial");
-        let fragments_after_mismatch: i64 = Connection::open(&path)
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM run_message_fragments WHERE run_id=?1",
-                [run_id.as_uuid().as_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(fragments_after_mismatch, 5);
+        assert_eq!(stored_fragment_count(&path, run_id), 5);
 
         let mut assembled_messages = run_messages.clone();
         assembled_messages.get_mut(&run_id).unwrap()[1].content = "seedhello world!".to_owned();
@@ -17274,15 +16349,7 @@ mod tests {
         let after_rollback = persistence.load_run_messages(run_id).unwrap();
         assert_eq!(after_rollback[1].content, "seedhello world!");
         assert_eq!(after_rollback[2].content, "partial");
-        let retained_fragments: i64 = Connection::open(&path)
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM run_message_fragments WHERE run_id=?1",
-                [run_id.as_uuid().as_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(retained_fragments, 5);
+        assert_eq!(stored_fragment_count(&path, run_id), 5);
         persistence
             .save_state(DurableStateWrite {
                 sessions: &manager.export_state(),
@@ -17305,15 +16372,7 @@ mod tests {
         let after_consolidation = persistence.load_run_messages(run_id).unwrap();
         assert_eq!(after_consolidation[1].content, "seedhello world!");
         assert_eq!(after_consolidation[2].content, "partial");
-        let remaining_fragments: i64 = Connection::open(&path)
-            .unwrap()
-            .query_row(
-                "SELECT COUNT(*) FROM run_message_fragments WHERE run_id=?1",
-                [run_id.as_uuid().as_bytes().as_slice()],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(remaining_fragments, 0);
+        assert_eq!(stored_fragment_count(&path, run_id), 0);
         assert!(
             persistence
                 .load_run_message_page(run_id, None, 101)
@@ -17339,19 +16398,6 @@ mod tests {
             )
             .unwrap();
         assert!(page_plan.contains("PRIMARY KEY"), "{page_plan}");
-        let range_plan: String = connection
-            .query_row(
-                "EXPLAIN QUERY PLAN SELECT byte_offset FROM run_message_fragments
-                 WHERE run_id=?1 AND message_ordinal=?2 AND byte_offset<?3
-                 ORDER BY byte_offset",
-                params![run_id.as_uuid().as_bytes().as_slice(), 2_i64, 6_i64],
-                |row| row.get(3),
-            )
-            .unwrap();
-        assert!(
-            range_plan.contains("run_message_fragments_by_range"),
-            "{range_plan}"
-        );
         let content_range_plan: String = connection
             .query_row(
                 "EXPLAIN QUERY PLAN SELECT byte_offset, byte_length, blob_hash

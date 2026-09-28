@@ -35,8 +35,9 @@ browser support. `loom-ui` is organized into:
   responses and events.
 - `connection`: the transport-independent protocol client plus the connection
   worker that executes requests off the UI thread.
-- `text_input`: the text buffer and input element.
-- `theme`: window chrome, decorations, and colour.
+- `theme`: the semantic colour palette resolved against the active
+  `gpui-kit` theme. Window chrome and decorations are provided by
+  `gpui-kit`'s window root, not by Loom.
 - `platform`: native adapters (process arguments, workspace preparation, local
   credential storage, repository bootstrap) that a browser target cannot use
   unchanged.
@@ -79,9 +80,12 @@ Suggested backend boundaries:
   local model servers, authentication, rate limits, and provider health.
 - `loom-context`: context inspection and assembly, repository/system
   instructions, summaries, compaction, and explicit token budgets.
-- `loom-persistence`: atomic, sectioned SQLite state storage used by the
-  in-process backend. Its JSON section payloads are an implementation detail;
-  domain and protocol types remain provider-neutral.
+- `loom-persistence`: typed, indexed SQLite state storage with a single
+  baseline schema used by the in-process backend. Durable state is written in
+  per-mutation transactions, and large immutable payloads live in a
+  content-addressed store inside SQLite. There is no migration ladder, so an
+  incompatible database is rejected and must be wiped; domain and protocol
+  types remain provider-neutral.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
   result normalization, and tool adapters.
 - `loom-workspace`: session-root file trees, file contents, watches, edits,
@@ -172,15 +176,11 @@ through the versioned protocol and capability negotiation.
 An agent session is a state machine, not an unbounded loop:
 
 ```text
-queued -> planning -> awaiting_approval -> executing -> evaluating
-                         ^                    |          |
-                         |                    +----------+
-                         |                         |
-                         +---------- paused -------+
-                                      |
-                         +---- needs_input <-------+
-                                      |
-                         completed / failed / cancelled
+planning -> executing <-> evaluating -> completed / failed / cancelled
+                |
+                +-> awaiting_approval / needs_input / paused
+                          |
+                          +-> (resume) -> awaiting_approval / needs_input / executing
 ```
 
 Each iteration has a durable record containing the provider/model, input
@@ -257,12 +257,13 @@ cost records, and transport or status failures map to stable Loom error
 codes. Provider configuration summaries never contain credential material or
 raw keys.
 
-The persistence layer stores a versioned backend snapshot through an atomic
-temporary-file replacement. It includes session state, the authoritative
-event journal, serializable agent runtime state, workspace state and
-checkpoints, policy decisions, provider health, and usage ledgers. A runtime
-that was executing during a process crash is recovered in `paused` state so a
-new connection must explicitly resume it.
+The persistence layer stores typed SQLite tables covering session state, the
+authoritative event journal, serializable agent runtime state, workspace state
+and checkpoints, policy decisions, provider health, and usage ledgers. Loom is
+pre-1.0 and has no migration ladder: a database written by another revision is
+rejected unchanged and must be wiped. A runtime that was executing during a
+process crash is recovered in `paused` state so a new connection must
+explicitly resume it.
 
 Remote access uses the same domain services through a transport adapter:
 

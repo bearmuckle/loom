@@ -7,8 +7,12 @@ so workspaces and sessions remain available regardless of the startup folder.
 The database uses SQLite's WAL journal and `synchronous = FULL`. Durable state
 uses typed, indexed domain tables for workspaces, sessions, runs, transcripts,
 activities, filesystem metadata and history, checkpoints, provider state,
-usage, policies, worker-node configuration, and idempotency records. Large
-immutable payloads use a compressed, content-addressed store inside SQLite.
+usage, policies, worker-node configuration, and idempotency records. A
+transcript message is one `run_messages` row whose tool calls and streamed
+fragment descriptors are versioned JSON payloads, and a logical tool call is one
+`run_tool_calls` row whose execution attempts are a versioned JSON payload.
+Large immutable payloads use a compressed, content-addressed store inside
+SQLite.
 Run and filesystem checkpoint paths write keyed deltas for changed history
 instead of replacing retained history on every update.
 
@@ -35,11 +39,21 @@ session only and the UI warns that it will not reconnect after restart. Linux
 uses Secret Service, which requires an available user session/keyring. Browser
 peer-token behavior is unchanged.
 
-The current database schema is version 51. Loom upgrades supported databases
-forward from v41 through v51; unknown formats and versions are rejected
-without modifying the existing file. Backend and schema downgrades are
-unsupported, and there is no generic JSON section store retained for legacy
-compatibility.
+The database has a single baseline schema, currently version 1. Loom is
+pre-1.0, so there is no migration ladder and no legacy import: a database
+written by any other revision is rejected unchanged and must be wiped by the
+operator. When the model changes, the baseline version and the schema
+definitions change together. Per-run project-agent grants are stored as one
+versioned JSON payload (`run_runtime_config.project_grants`) and delegated-task
+grants as `delegated_tasks.permissions`, so adding a grant is a code change
+rather than a schema change. JSON is otherwise used only for small bounded
+configuration, diagnostic payloads, and child collections read with their
+parent; it is not used for query keys.
+
+When a database from another revision is found, Loom reports it and offers to
+wipe it: pass `--reset-state`, or confirm the interactive prompt when running
+in a terminal. Loom never wipes state implicitly, and it refuses to wipe a
+database that another backend currently owns.
 
 SQLite checkpoints and WAL files are managed by SQLite. Reconnect events,
 idempotency responses, and filesystem change pages have explicit retention
