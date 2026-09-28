@@ -4917,9 +4917,14 @@ impl InProcessBackend {
                 }
                 if handle.control.is_stopping() {
                     let state = handle.state().run.state;
-                    if !matches!(
+                    // Only active runs need to be parked. Awaiting approval and
+                    // waiting for input are already durable, resumable stops and
+                    // must not be downgraded to Paused by shutdown.
+                    if matches!(
                         state,
-                        AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                        AgentRunState::Planning
+                            | AgentRunState::Executing
+                            | AgentRunState::Evaluating
                     ) {
                         let mut runtime = handle.try_runtime()?;
                         runtime.pause()?;
@@ -4930,14 +4935,19 @@ impl InProcessBackend {
             }
             handle.join_worker()?;
         }
-        self.persist_state()?;
+        // A fail-stopped backend must not write more state, but shutdown still
+        // has to release database ownership so a restart can reopen it.
+        let persist_result = if self.persistence_failed.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            self.persist_state()
+        };
         if let Some(persistence) = self.persistence.as_ref() {
             persistence.release_exclusive_writer()?;
         }
         *shutting_down = 2;
-        Ok(())
+        persist_result
     }
-
     fn append_recovery_events(
         self: &Arc<Self>,
         session_id: AgentSessionId,
@@ -21449,7 +21459,9 @@ mod tests {
                     name: "durable idempotency".to_owned(),
                 },
             );
-            (workspace.id, connection.request(request))
+            let response = connection.request(request);
+            backend.shutdown().unwrap();
+            (workspace.id, response)
         };
         let backend = InProcessBackend::new_persistent(&path).unwrap();
         let connection = backend.connect();
@@ -21523,6 +21535,7 @@ mod tests {
         assert_eq!(retried.result.unwrap_err().code, ErrorCode::Persistence);
         let listed = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
         assert_eq!(listed.result.unwrap_err().code, ErrorCode::Persistence);
+        backend.shutdown().unwrap();
         drop(connection);
         drop(backend);
         let reopened = InProcessBackend::new_persistent(&path).unwrap();
@@ -21571,11 +21584,13 @@ mod tests {
                     .unwrap();
             }
             backend.flush().unwrap();
-            (
+            let recovered = (
                 session.id,
                 backend.session_root_base.clone(),
                 backend.node_id.clone(),
-            )
+            );
+            backend.shutdown().unwrap();
+            recovered
         };
 
         let backend = InProcessBackend::new_persistent(&path).unwrap();
@@ -21732,13 +21747,15 @@ mod tests {
             assert!(unknown.result.is_err());
 
             backend.flush().unwrap();
-            (
+            let recovered = (
                 workspace_a,
                 workspace_b,
                 session_a,
                 session_b,
                 backend.node_id.clone(),
-            )
+            );
+            backend.shutdown().unwrap();
+            recovered
         };
 
         let backend = InProcessBackend::new_persistent(&path).unwrap();
@@ -21845,7 +21862,9 @@ mod tests {
                 .result
                 .unwrap();
             backend.flush().unwrap();
-            workspace.id
+            let workspace_id = workspace.id;
+            backend.shutdown().unwrap();
+            workspace_id
         };
 
         let backend = InProcessBackend::new_persistent(&path).unwrap();
