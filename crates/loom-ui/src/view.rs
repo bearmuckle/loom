@@ -3432,6 +3432,10 @@ impl LoomView {
 
     pub(crate) fn consume_event(&mut self, event: &ServerEvent) {
         match event {
+            ServerEvent::ProjectTaskUpdated { .. }
+            | ServerEvent::ProjectAgentMessageAccepted { .. }
+            | ServerEvent::ProjectAgentCreated { .. }
+            | ServerEvent::ProjectAgentUpdated { .. } => {}
             ServerEvent::AgentSessionCreated { snapshot } => {
                 self.active_session = snapshot.clone();
                 self.session_state = snapshot.state;

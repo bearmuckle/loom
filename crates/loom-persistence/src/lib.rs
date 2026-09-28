@@ -35,8 +35,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const DATABASE_SCHEMA_VERSION: u32 = 43;
+const DATABASE_SCHEMA_VERSION: u32 = 44;
 const PROJECT_SCHEMA_VERSION: u32 = 42;
+const PROJECT_MESSAGE_SCHEMA_VERSION: u32 = 43;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;
@@ -173,7 +174,9 @@ CREATE TABLE IF NOT EXISTS run_runtime_config (
     run_id BLOB PRIMARY KEY NOT NULL REFERENCES run_summaries(run_id) ON DELETE CASCADE,
     configuration_hash BLOB NOT NULL REFERENCES runtime_configurations(configuration_hash) ON DELETE RESTRICT
         CHECK(length(configuration_hash) = 32),
-    context_inspection TEXT
+    context_inspection TEXT,
+    project_delegation_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK(project_delegation_enabled IN (0, 1))
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS run_runtime_config_by_configuration
     ON run_runtime_config(configuration_hash);
@@ -1120,6 +1123,7 @@ pub struct DurableRunRuntimeConfig {
     pub input_cost_micros_per_1k: u64,
     pub output_cost_micros_per_1k: u64,
     pub context_inspection: Option<ContextInspection>,
+    pub project_delegation_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2998,7 +3002,7 @@ impl FilePersistence {
                         context_window, context_max_input_tokens,
                         context_reserved_output_tokens, checkpoint_id,
                         input_cost_micros_per_1k, output_cost_micros_per_1k,
-                        context_inspection
+                        context_inspection, project_delegation_enabled
                  FROM run_runtime_config
                  JOIN runtime_configurations USING(configuration_hash)
                  WHERE run_id=?1",
@@ -3024,6 +3028,7 @@ impl FilePersistence {
                         row.get::<_, i64>(16)?,
                         row.get::<_, i64>(17)?,
                         row.get::<_, Option<String>>(18)?,
+                        row.get::<_, i64>(19)?,
                     ))
                 },
             )
@@ -3055,6 +3060,7 @@ impl FilePersistence {
                 input_cost_micros_per_1k,
                 output_cost_micros_per_1k,
                 inspection,
+                project_delegation_enabled,
             )| {
                 Ok(DurableRunRuntimeConfig {
                     system_instructions: system
@@ -3114,6 +3120,7 @@ impl FilePersistence {
                         .as_deref()
                         .map(|payload| decode_json(payload, "run context inspection"))
                         .transpose()?,
+                    project_delegation_enabled: project_delegation_enabled != 0,
                 })
             },
         )
@@ -5794,10 +5801,15 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     }
     if database_version == 41 {
         migrate_v41_to_v42(connection)?;
-        return migrate_v42_to_v43(connection);
+        migrate_v42_to_v43(connection)?;
+        return migrate_v43_to_v44(connection);
     }
     if database_version == PROJECT_SCHEMA_VERSION {
-        return migrate_v42_to_v43(connection);
+        migrate_v42_to_v43(connection)?;
+        return migrate_v43_to_v44(connection);
+    }
+    if database_version == PROJECT_MESSAGE_SCHEMA_VERSION {
+        return migrate_v43_to_v44(connection);
     }
     if database_version != 0 {
         return Err(LoomError::new(
@@ -5996,7 +6008,7 @@ fn migrate_v42_to_v43(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
-        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .pragma_update(None, "user_version", PROJECT_MESSAGE_SCHEMA_VERSION)
         .map_err(|error| {
             persistence_error(
                 format!("could not record project inbox schema version: {error}"),
@@ -6006,6 +6018,42 @@ fn migrate_v42_to_v43(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(|error| {
         persistence_error(
             format!("could not commit project inbox migration: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
+fn migrate_v43_to_v44(connection: &Connection) -> Result<()> {
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not begin project delegation grant migration: {error}"),
+            true,
+        )
+    })?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE run_runtime_config
+                ADD COLUMN project_delegation_enabled INTEGER NOT NULL DEFAULT 0
+                CHECK(project_delegation_enabled IN (0, 1));",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not add durable project delegation grant: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record project delegation schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit project delegation migration: {error}"),
             true,
         )
     })?;
@@ -8175,17 +8223,22 @@ fn save_run_runtime_config_rows(
             })?;
         transaction
             .execute(
-                "INSERT INTO run_runtime_config(run_id, configuration_hash, context_inspection)
-                 VALUES (?1, ?2, ?3)
+                "INSERT INTO run_runtime_config(
+                    run_id, configuration_hash, context_inspection,
+                    project_delegation_enabled
+                 ) VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(run_id) DO UPDATE SET
                     configuration_hash=excluded.configuration_hash,
-                    context_inspection=excluded.context_inspection
+                    context_inspection=excluded.context_inspection,
+                    project_delegation_enabled=excluded.project_delegation_enabled
                  WHERE run_runtime_config.configuration_hash IS NOT excluded.configuration_hash
-                    OR run_runtime_config.context_inspection IS NOT excluded.context_inspection",
+                    OR run_runtime_config.context_inspection IS NOT excluded.context_inspection
+                    OR run_runtime_config.project_delegation_enabled IS NOT excluded.project_delegation_enabled",
                 params![
                     run_id.as_uuid().as_bytes().as_slice(),
                     configuration_hash,
                     context_inspection,
+                    i64::from(config.project_delegation_enabled),
                 ],
             )
             .map_err(|error| {
@@ -11751,6 +11804,7 @@ mod tests {
             input_cost_micros_per_1k: 0,
             output_cost_micros_per_1k: 0,
             context_inspection: None,
+            project_delegation_enabled: false,
         };
         let mut changed_session = session.clone();
         changed_session.state = AgentSessionState::Planning;
@@ -12346,6 +12400,7 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
+                 CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
                  PRAGMA user_version=42;",
             )
             .unwrap();
@@ -12375,9 +12430,20 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
         assert!(has_cursor);
         assert_eq!(cursor, 0);
+        connection
+            .execute("INSERT INTO run_runtime_config(run_id) VALUES (x'01')", [])
+            .unwrap();
+        let delegation_enabled: i64 = connection
+            .query_row(
+                "SELECT project_delegation_enabled FROM run_runtime_config WHERE run_id=x'01'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(delegation_enabled, 0);
     }
 
     #[test]
@@ -12397,6 +12463,7 @@ mod tests {
                     updated_at INTEGER NOT NULL
                  ) WITHOUT ROWID, STRICT;
                  CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
+                 CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
                  PRAGMA user_version=41;",
             )
             .unwrap();
@@ -12436,7 +12503,7 @@ mod tests {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
         for table in [
             "delegated_tasks",
             "delegated_task_context_references",
@@ -12473,6 +12540,7 @@ mod tests {
                  ) WITHOUT ROWID, STRICT;
                  CREATE TABLE sessions_hierarchy(unexpected TEXT);
                  CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
+                 CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
                  PRAGMA user_version=41;",
             )
             .unwrap();
@@ -12512,7 +12580,7 @@ mod tests {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
         drop(connection);
         fs::remove_file(path).unwrap();
     }
@@ -13123,6 +13191,7 @@ mod tests {
             input_cost_micros_per_1k: 17,
             output_cost_micros_per_1k: 29,
             context_inspection: None,
+            project_delegation_enabled: true,
         };
         let run_runtime_configs = BTreeMap::from([
             (run_id, run_runtime_config.clone()),

@@ -200,6 +200,7 @@ fn fixture(
         input_cost_micros_per_1k: 0,
         output_cost_micros_per_1k: 0,
         context_inspection: None,
+        project_delegation_enabled: false,
     };
     let messages = (0..rows)
         .map(|index| message(index, "representative persisted transcript row ".repeat(4)))

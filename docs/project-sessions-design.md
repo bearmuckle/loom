@@ -6,11 +6,13 @@ This document turns [GitHub issue #17](https://github.com/bearmuckle/loom/issues
 “Project sessions and coordinated sub-agents,” into an implementation design.
 It is the design and sequencing plan for the feature. The issue is XL-sized, so
 delivery is split into reviewable slices. The current draft implementation has
-landed the project hierarchy, protocol 5.0 contract, forward v41-to-v43 SQLite
+landed the project hierarchy, protocol 5.0 contract, forward v41-to-v44 SQLite
 migrations, durable child/task creation, persisted child model selection,
 restart scheduling for queued children, dependency gating, reconciliation of
 task status from persisted runs, and durable parent-child message delivery at
-safe model-turn boundaries. Worktree-backed code tasks, controls, UI, and
+safe model-turn boundaries. Root managers can create bounded non-code child
+tasks through a write-approved agent tool; its grant survives run recovery.
+Manager messaging tools, worktree-backed code tasks, controls, UI, and
 integration remain future slices.
 
 The feature makes a root agent session a **project**: the durable owner of a
@@ -164,7 +166,7 @@ maximum depth three in the backend domain service and persistence boundary.
 Do not place growing messages or child lists inside session JSON blobs.
 
 The project foundation requires forward SQLite migrations from schema version
-41 through version 43. The v41-to-v42 migration adds the
+41 through version 44. The v41-to-v42 migration adds the
 normalized project, membership/parentage, delegated-task, addressed-message,
 and worktree/integration structures, then backfill each existing session as
 the root of a project while preserving its session ID, workspace, transcript,
@@ -172,10 +174,11 @@ events, runs, approvals, and filesystem references. Existing session IDs
 remain stable; if project IDs are separate, assign them once and persist the
 mapping. Set `user_version` to 42 only after the backfill and invariants pass.
 The v42-to-v43 migration adds the per-run project-message cursor used to
-checkpoint inbox delivery atomically with the agent transcript. Each migration
-rolls back independently and can be retried safely. Older schema versions
-remain unsupported according to the existing storage policy. This is a
-forward-only transition: a pre-v43 backend cannot open the migrated database,
+checkpoint inbox delivery atomically with the agent transcript. The v43-to-v44
+migration adds the per-run project-delegation grant so a recovered manager
+retains only the project tool authorization captured when its run started.
+Each migration rolls back independently and can be retried safely. This is a
+forward-only transition: a pre-v44 backend cannot open the migrated database,
 and no schema downgrade is provided. If an upgrade must be rolled back, restore
 a pre-upgrade backup or move forward with a fix.
 
@@ -200,7 +203,7 @@ and its decision.
 1. **Implemented:** add project/agent hierarchy IDs, depth, delegated-task
    intent/status, message envelope/type, and worktree integration state to
    shared domain types; enforce the core hierarchy invariants.
-2. **Implemented:** add the forward v41-to-v43 migrations and represent
+2. **Implemented:** add the forward v41-to-v44 migrations and represent
    existing sessions as project roots.
 3. **Implemented:** advance to protocol 5.0 and reject older clients during
    negotiation before serving project-aware schemas.
@@ -209,7 +212,7 @@ and its decision.
    tasks when dependencies complete. Existing run recovery keeps interrupted
    work paused or blocked rather than starting a duplicate child run.
 
-**Exit:** v41 data migrates through v43 with existing sessions represented as
+**Exit:** v41 data migrates through v44 with existing sessions represented as
 projects; unsupported clients are directed to upgrade before using the new
 contract; hierarchy invariants are backend-enforced; snapshots and durable
 records survive restart and reconnect. Backend downgrade is unsupported and
@@ -218,8 +221,11 @@ occurs after record commit but before notification persistence.
 
 ### Slice 1: direct-child non-code coordination
 
-1. Add a project-manager tool/service to create one bounded child task with
-   selected relevant context, limits, and explicit code-change intent.
+1. **Implemented:** expose a root-only `delegate_project_task` agent tool with
+   bounded non-code inputs, optional model selection, and durable retry
+   identity. Child creation remains behind the existing write approval policy.
+   Persist its capability grant with the run so recovery restores the same
+   tool surface without retaining backend or caller objects.
 2. Enforce configurable bounded parallelism and project membership; create
    the child durably before scheduling its independent agent runtime.
 3. **Implemented:** deliver parent-child messages from the durable inbox at

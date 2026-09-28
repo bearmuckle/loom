@@ -168,7 +168,7 @@ The detailed domain, protocol, recovery, worktree, and rollout design is in
 This XL feature is delivered as independently reviewable slices rather than
 one large orchestration change:
 
-- M7.0: migrate SQLite v41 through v43 and represent every existing root session
+- M7.0: migrate SQLite v41 through v44 and represent every existing root session
   as a project; add durable parentage, delegated task, message, and integration
   records; advance the protocol contract; require clients to meet the minimum
   supported version before serving project-aware messages; recover committed
@@ -189,7 +189,7 @@ before code worktrees; no fixed plan-to-issues-to-build pipeline is required.
 Each slice's exit conditions and verification cases are defined in the design
 document.
 
-The v41-to-v43 database transition is forward-only. Backend downgrades to a
+The v41-to-v44 database transition is forward-only. Backend downgrades to a
 pre-project version are unsupported. Older clients are not required to parse
 the new protocol: the backend must reject them during negotiation with the
 existing `UnsupportedProtocol` response before sending project schemas.

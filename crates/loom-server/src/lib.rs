@@ -14,11 +14,14 @@ use loom_agent::{
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy,
-    Capability, CapabilitySet, ErrorCode, EventSequence, LoomError, ProjectAgentRecord, ProjectId,
-    ProjectSnapshot, ProtocolVersion, RepositoryId, RequestId, Result, RunAttemptId,
-    SessionEventRecord, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    Capability, CapabilitySet, DelegatedTaskSpec, ErrorCode, EventSequence, LoomError,
+    ProjectAgentRecord, ProjectId, ProjectSnapshot, ProtocolVersion, RepositoryId, RequestId,
+    Result, RunAttemptId, SessionEventRecord, TaskContextReference, Timestamp, UsageSnapshot,
+    WorkspaceId, WorkspaceRecord,
 };
-use loom_model::{ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId};
+use loom_model::{
+    ModelCapabilities, ModelDescriptor, ModelId, ModelMessage, ProviderId, ToolCall, ToolDefinition,
+};
 use loom_persistence::{
     DurableFeedSessionCursor, DurableFeedState, DurableFeedWorkspaceCursor, DurableFilesystemDelta,
     DurableFilesystemEdit, DurableFilesystemRecord, DurableIdempotencyRecord, DurableProviderState,
@@ -45,7 +48,7 @@ use loom_providers::{
     UsageLedger, deterministic_descriptor,
 };
 use loom_session::{SessionManager, WorkspaceManager};
-use loom_tools::ToolExecutor;
+use loom_tools::{ToolExecutor, ToolExtension, ToolResult};
 use loom_vcs::GitService;
 use loom_workspace::Workspace;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1103,6 +1106,7 @@ fn runtime_state_from_durable_config(
         checkpoint_id: config.checkpoint_id,
         input_cost_micros_per_1k: config.input_cost_micros_per_1k,
         output_cost_micros_per_1k: config.output_cost_micros_per_1k,
+        project_delegation_enabled: config.project_delegation_enabled,
     };
     Ok(AgentRuntimeState {
         session_id: summary.snapshot.session_id,
@@ -1856,6 +1860,127 @@ pub struct InProcessBackend {
     durable_request_gate: Mutex<()>,
     #[cfg(test)]
     fail_next_state_save: AtomicBool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegateProjectTaskArguments {
+    child_name: String,
+    intent: String,
+    #[serde(default)]
+    model_id: Option<String>,
+    #[serde(default)]
+    context_references: Vec<TaskContextReference>,
+    #[serde(default)]
+    dependencies: Vec<loom_core::TaskId>,
+}
+
+struct ProjectDelegationTools {
+    backend: Weak<InProcessBackend>,
+    session_id: AgentSessionId,
+    project_id: ProjectId,
+    model_id: ModelId,
+}
+
+impl ToolExtension for ProjectDelegationTools {
+    fn definitions(&self) -> Vec<ToolDefinition> {
+        vec![ToolDefinition {
+            name: "delegate_project_task".to_owned(),
+            description: "Create a bounded non-code child agent task in this project. The child uses the current model unless model_id is supplied. Code changes are not supported by this tool yet.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "child_name": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "intent": {"type": "string", "minLength": 1, "maxLength": 16384},
+                    "model_id": {"type": "string", "minLength": 1, "maxLength": 512},
+                    "context_references": {
+                        "type": "array",
+                        "maxItems": 128,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "uri": {"type": "string"}
+                            },
+                            "required": ["label", "uri"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "dependencies": {
+                        "type": "array",
+                        "maxItems": 128,
+                        "items": {"type": "string", "format": "uuid"}
+                    }
+                },
+                "required": ["child_name", "intent"],
+                "additionalProperties": false
+            }),
+        }]
+    }
+
+    fn action_kind(&self, call: &ToolCall) -> Option<loom_core::ActionKind> {
+        (call.name == "delegate_project_task").then_some(loom_core::ActionKind::Write)
+    }
+
+    fn execute(&self, call: &ToolCall) -> ToolResult {
+        let arguments =
+            match serde_json::from_value::<DelegateProjectTaskArguments>(call.arguments.clone()) {
+                Ok(arguments) => arguments,
+                Err(error) => {
+                    return ToolResult::failure(
+                        call,
+                        format!("invalid project delegation arguments: {error}"),
+                    );
+                }
+            };
+        let Some(backend) = self.backend.upgrade() else {
+            return ToolResult::failure(call, "project backend is no longer available");
+        };
+        let connection = InProcessConnection {
+            backend,
+            negotiated_capabilities: Arc::new(Mutex::new(None)),
+            auth: None,
+        };
+        match connection.load_project_snapshot(self.project_id) {
+            Ok(project) if project.root_session_id == self.session_id => {}
+            Ok(_) => {
+                return ToolResult::failure(call, "project delegation grant is no longer valid");
+            }
+            Err(error) => return ToolResult::failure(call, error.message),
+        }
+        let request_id = RequestId::from_uuid(*call.id.as_uuid());
+        let spec = DelegatedTaskSpec {
+            intent: arguments.intent,
+            model_id: arguments
+                .model_id
+                .unwrap_or_else(|| self.model_id.as_str().to_owned()),
+            context_references: arguments.context_references,
+            dependencies: arguments.dependencies,
+            code_change: false,
+        };
+        match connection.create_project_child(
+            request_id,
+            self.session_id,
+            arguments.child_name,
+            spec,
+        ) {
+            Ok(ServerResponse::ProjectChildCreated { task, child }) => ToolResult {
+                tool_call_id: call.id,
+                name: call.name.clone(),
+                success: true,
+                output: serde_json::to_string(&serde_json::json!({
+                    "task_id": task.task_id,
+                    "child_session_id": child.session_id,
+                    "status": task.status,
+                    "child_name": task.child_name,
+                    "intent": task.intent,
+                }))
+                .unwrap_or_else(|error| format!("could not encode delegation result: {error}")),
+            },
+            Ok(_) => ToolResult::failure(call, "project delegation returned an unexpected result"),
+            Err(error) => ToolResult::failure(call, error.message),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2942,6 +3067,12 @@ impl InProcessBackend {
                 };
             let tools = ToolExecutor::new_with_workspace(workspace)
                 .with_github_token(self.providers.github_account_token().ok());
+            let tools = self.with_project_delegation_tool(
+                tools,
+                runtime_state.session_id,
+                runtime_state.task.model.clone(),
+                runtime_state.options.project_delegation_enabled,
+            )?;
             let mut runtime = AgentRuntime::from_state(runtime_state, provider, tools)?;
             if runtime.session_id() != session.id {
                 return Err(LoomError::new(
@@ -3138,6 +3269,7 @@ impl InProcessBackend {
                 input_cost_micros_per_1k: state.options.input_cost_micros_per_1k,
                 output_cost_micros_per_1k: state.options.output_cost_micros_per_1k,
                 context_inspection,
+                project_delegation_enabled: state.options.project_delegation_enabled,
             };
             let context_checkpoint =
                 state
@@ -3440,6 +3572,7 @@ impl InProcessBackend {
                         input_cost_micros_per_1k: state.options.input_cost_micros_per_1k,
                         output_cost_micros_per_1k: state.options.output_cost_micros_per_1k,
                         context_inspection,
+                        project_delegation_enabled: state.options.project_delegation_enabled,
                     },
                 ))
             })
@@ -3998,6 +4131,70 @@ impl InProcessBackend {
         Ok(())
     }
 
+    fn project_delegation_tool(
+        &self,
+        session_id: AgentSessionId,
+        model_id: ModelId,
+        enabled: bool,
+    ) -> Result<Option<Arc<dyn ToolExtension>>> {
+        if !enabled
+            || !self
+                .supported_capabilities
+                .contains(Capability::CreateProjectChild)
+        {
+            return Ok(None);
+        }
+        let Some(persistence) = &self.persistence else {
+            return Ok(None);
+        };
+        let project_id = ProjectId::from_uuid(*session_id.as_uuid());
+        let Some(project) = persistence.load_project_snapshot(project_id)? else {
+            return Ok(None);
+        };
+        if project.root_session_id != session_id {
+            return Ok(None);
+        }
+        let backend = self
+            .self_reference
+            .lock()
+            .map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    "backend self reference lock was poisoned",
+                    true,
+                )
+            })?
+            .clone();
+        if backend.strong_count() == 0 {
+            return Err(LoomError::new(
+                ErrorCode::Internal,
+                "project delegation tools require a registered backend",
+                true,
+            ));
+        }
+        Ok(Some(Arc::new(ProjectDelegationTools {
+            backend,
+            session_id,
+            project_id,
+            model_id,
+        })))
+    }
+
+    fn with_project_delegation_tool(
+        &self,
+        tools: ToolExecutor,
+        session_id: AgentSessionId,
+        model_id: ModelId,
+        enabled: bool,
+    ) -> Result<ToolExecutor> {
+        Ok(
+            match self.project_delegation_tool(session_id, model_id, enabled)? {
+                Some(extension) => tools.with_extension(extension),
+                None => tools,
+            },
+        )
+    }
+
     pub fn event_retention(&self) -> Result<usize> {
         Ok(self.journal()?.retention_limit.max(1))
     }
@@ -4093,6 +4290,12 @@ impl InProcessConnection {
         };
         let tools = ToolExecutor::new_with_workspace(workspace)
             .with_github_token(self.backend.providers.github_account_token().ok());
+        let tools = self.backend.with_project_delegation_tool(
+            tools,
+            state.session_id,
+            state.task.model.clone(),
+            state.options.project_delegation_enabled,
+        )?;
         let runtime = AgentRuntime::from_state(state, provider, tools)?;
         let handle = self.backend.register_runtime(runtime);
         self.backend.runs()?.insert(run_id, Arc::clone(&handle));
@@ -7158,6 +7361,38 @@ impl InProcessConnection {
         Ok(())
     }
 
+    fn project_delegation_enabled_for_session(&self, session_id: AgentSessionId) -> Result<bool> {
+        if !self
+            .backend
+            .supported_capabilities
+            .contains(Capability::CreateProjectChild)
+        {
+            return Ok(false);
+        }
+        let Some(persistence) = &self.backend.persistence else {
+            return Ok(false);
+        };
+        let project_id = ProjectId::from_uuid(*session_id.as_uuid());
+        let Some(project) = persistence.load_project_snapshot(project_id)? else {
+            return Ok(false);
+        };
+        if project.root_session_id != session_id {
+            return Ok(false);
+        }
+        if let Some(auth) = &self.auth {
+            let session = self.backend.sessions()?.get(session_id)?;
+            if !auth
+                .scope()
+                .allows_capability(Capability::CreateProjectChild)
+                || !auth.scope().allows_session(session_id)
+                || !auth.scope().allows_workspace(session.workspace_id)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn authorize_request(&self, request: &ClientRequest) -> Result<()> {
         let Some(auth) = &self.auth else {
             return Ok(());
@@ -7613,12 +7848,20 @@ impl InProcessConnection {
                 input.repository_instructions = Some(instructions);
             }
         }
+        input.options.project_delegation_enabled = false;
         if let Some(persistence) = self.backend.persistence.as_ref()
             && let Some(project) =
                 persistence.load_project_snapshot(ProjectId::from_uuid(*session.id.as_uuid()))?
             && project.root_session_id == session.id
         {
-            let manager_instructions = "You are the project manager for this project. You own the user's overall goal, delegate bounded tasks, monitor child status and messages, synthesize results, escalate blockers or decisions to the user, and remain responsible for the final outcome. Project messages are authoritative coordination input; review and respond to them before continuing the overall goal.";
+            input.options.project_delegation_enabled =
+                provider.descriptor().capabilities.tool_calling
+                    && self.project_delegation_enabled_for_session(session.id)?;
+            let manager_instructions = if input.options.project_delegation_enabled {
+                "You are the project manager for this project. You own the user's overall goal, delegate bounded tasks when useful, synthesize results, escalate blockers or decisions to the user, and remain responsible for the final outcome. Use the project delegation tool only for bounded non-code tasks."
+            } else {
+                "You are the project manager for this project. You own the user's overall goal, coordinate within the tools available to this run, synthesize results, escalate blockers or decisions to the user, and remain responsible for the final outcome."
+            };
             input.system_instructions = Some(match input.system_instructions.take() {
                 Some(existing) if !existing.trim().is_empty() => {
                     format!("{existing}\n\n{manager_instructions}")
@@ -7630,6 +7873,12 @@ impl InProcessConnection {
         input.options.checkpoint_id = Some(checkpoint.id);
         let tools = ToolExecutor::new_with_workspace(workspace)
             .with_github_token(self.backend.providers.github_account_token().ok());
+        let tools = self.backend.with_project_delegation_tool(
+            tools,
+            session.id,
+            input.model.clone(),
+            input.options.project_delegation_enabled,
+        )?;
         let policy = self.policy(session.id)?;
         let mut agent_task = AgentTask::new(input.task, input.model)?;
         agent_task.system_instructions = input.system_instructions;
@@ -12251,6 +12500,127 @@ mod tests {
                 .result,
             Err(error) if error.code == ErrorCode::InvalidRequest
         ));
+        drop(connection);
+        drop(backend);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn project_manager_tool_creates_an_idempotent_non_code_child() {
+        let temp = std::env::temp_dir().join(format!(
+            "loom-project-delegation-tool-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let backend = InProcessBackend::new_persistent(temp.join("state.sqlite")).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Project tool test".into(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Manager".into(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        assert!(
+            connection
+                .project_delegation_enabled_for_session(root)
+                .unwrap()
+        );
+        let tokens = AuthTokenStore::new();
+        let read_only = tokens
+            .issue(AuthorizationScope::for_sessions(
+                [root],
+                CapabilitySet::new([Capability::StartAgentRun, Capability::ReadAgentSession]),
+            ))
+            .unwrap();
+        let read_only_connection =
+            backend.connect_authenticated(tokens.authenticate(&read_only.token).unwrap());
+        assert!(
+            !read_only_connection
+                .project_delegation_enabled_for_session(root)
+                .unwrap()
+        );
+        let delegation_grant = tokens
+            .issue(AuthorizationScope::for_sessions(
+                [root],
+                CapabilitySet::new([Capability::StartAgentRun, Capability::CreateProjectChild]),
+            ))
+            .unwrap();
+        let delegation_connection =
+            backend.connect_authenticated(tokens.authenticate(&delegation_grant.token).unwrap());
+        assert!(
+            delegation_connection
+                .project_delegation_enabled_for_session(root)
+                .unwrap()
+        );
+        let extension = backend
+            .project_delegation_tool(root, ModelId::new("deterministic/demo"), true)
+            .unwrap()
+            .expect("root project tool");
+        let tools = ToolExecutor::new_with_workspace(connection.session_filesystem(root).unwrap())
+            .with_extension(extension);
+        let call = ToolCall {
+            id: ToolCallId::new(),
+            name: "delegate_project_task".to_owned(),
+            arguments: serde_json::json!({
+                "child_name": "protocol reviewer",
+                "intent": "Review the protocol compatibility design",
+                "context_references": [{"label": "Design", "uri": "docs/project-sessions-design.md"}],
+                "dependencies": []
+            }),
+        };
+
+        assert!(
+            tools
+                .definitions()
+                .iter()
+                .any(|definition| definition.name == "delegate_project_task")
+        );
+        assert_eq!(tools.action_kind(&call), Some(loom_core::ActionKind::Write));
+        let first = tools.execute(&call);
+        assert!(first.success, "{}", first.output);
+        let first_output: serde_json::Value = serde_json::from_str(&first.output).unwrap();
+        let task_id = first_output["task_id"].as_str().unwrap();
+        let repeated = tools.execute(&call);
+        assert!(repeated.success, "{}", repeated.output);
+        let repeated_output: serde_json::Value = serde_json::from_str(&repeated.output).unwrap();
+        assert_eq!(repeated_output["task_id"].as_str(), Some(task_id));
+
+        let snapshot = backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_project_snapshot(ProjectId::from_uuid(*root.as_uuid()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.agents.len(), 2);
+        let task_id = task_id.parse::<loom_core::TaskId>().unwrap();
+        let task = backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_delegated_task(task_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.model_id, "deterministic/demo");
+        assert!(!task.code_change);
         drop(connection);
         drop(backend);
         fs::remove_dir_all(temp).unwrap();

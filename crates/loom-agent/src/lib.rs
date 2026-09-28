@@ -21,7 +21,7 @@ pub use loom_protocol::{
     AgentInteractionRecord, AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState,
     ApprovalDecision, FileActivityOperation,
 };
-use loom_tools::{ToolExecutor, ToolKind, ToolResult, tool_definitions};
+use loom_tools::{ToolExecutor, ToolKind, ToolResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -43,6 +43,9 @@ pub struct AgentRuntimeOptions {
     pub checkpoint_id: Option<loom_core::CheckpointId>,
     pub input_cost_micros_per_1k: u64,
     pub output_cost_micros_per_1k: u64,
+    /// Persisted grant for server-provided project delegation tools.
+    #[serde(default)]
+    pub project_delegation_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1568,7 +1571,8 @@ impl AgentRuntime {
                     run_id: self.run.id,
                     call: call.clone(),
                 });
-                let Some(kind) = ToolKind::from_name(&call.name) else {
+                let kind = ToolKind::from_name(&call.name);
+                let Some(action_kind) = self.tools.action_kind(&call) else {
                     let output = format!("unknown tool '{}'", call.name);
                     let result = ToolResult {
                         tool_call_id: call.id,
@@ -1602,11 +1606,7 @@ impl AgentRuntime {
                     .tools
                     .policy_evaluation(&call, &self.approval_policy)
                     .unwrap_or_else(|| {
-                        PolicyEvaluation::evaluate(
-                            &self.approval_policy,
-                            kind.action_kind(),
-                            &call.name,
-                        )
+                        PolicyEvaluation::evaluate(&self.approval_policy, action_kind, &call.name)
                     });
                 ctx.events.push(AgentEvent::ToolPolicyEvaluated {
                     run_id: self.run.id,
@@ -1677,7 +1677,7 @@ impl AgentRuntime {
                     ctx.finished = true;
                     return Ok(StreamFlow::Stop);
                 }
-                if kind == ToolKind::ProposePlan {
+                if kind == Some(ToolKind::ProposePlan) {
                     let steps = call
                         .arguments
                         .get("steps")
@@ -1758,7 +1758,7 @@ impl AgentRuntime {
                     });
                     return Ok(StreamFlow::Stop);
                 }
-                if kind == ToolKind::AskUser {
+                if kind == Some(ToolKind::AskUser) {
                     let Some(prompt) = call
                         .arguments
                         .get("prompt")
@@ -2265,7 +2265,7 @@ impl AgentRuntime {
             reserve,
         )?;
         let tools = if provider.descriptor().capabilities.tool_calling {
-            tool_definitions()
+            self.tools.definitions()
         } else {
             Vec::new()
         };
@@ -2723,6 +2723,7 @@ mod tests {
 
     use loom_core::{AgentSessionId, LimitKind, SessionLimits};
     use loom_providers::DeterministicProvider;
+    use loom_tools::ToolExtension;
 
     use super::*;
 
@@ -2858,6 +2859,91 @@ mod tests {
 
         fn reset(&mut self) {
             self.cursor = 0;
+        }
+    }
+
+    struct ExtensionToolProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+        saw_extension_tool: Arc<AtomicBool>,
+    }
+
+    impl ModelProvider for ExtensionToolProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                self.saw_extension_tool.store(
+                    request
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "agent_extension_tool"),
+                    Ordering::SeqCst,
+                );
+                vec![ModelStreamEvent::ToolCallDelta {
+                    call: ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: "agent_extension_tool".to_owned(),
+                        arguments: serde_json::json!({}),
+                    },
+                }]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "The extension ran.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
+    struct TestToolExtension {
+        called: Arc<AtomicBool>,
+    }
+
+    impl ToolExtension for TestToolExtension {
+        fn definitions(&self) -> Vec<loom_model::ToolDefinition> {
+            vec![loom_model::ToolDefinition {
+                name: "agent_extension_tool".to_owned(),
+                description: "Test-only server extension.".to_owned(),
+                input_schema: serde_json::json!({"type": "object", "additionalProperties": false}),
+            }]
+        }
+
+        fn action_kind(&self, call: &ToolCall) -> Option<loom_core::ActionKind> {
+            (call.name == "agent_extension_tool").then_some(loom_core::ActionKind::Read)
+        }
+
+        fn execute(&self, call: &ToolCall) -> ToolResult {
+            self.called.store(true, Ordering::SeqCst);
+            ToolResult {
+                tool_call_id: call.id,
+                name: call.name.clone(),
+                success: true,
+                output: "extension completed".to_owned(),
+            }
         }
     }
 
@@ -3216,6 +3302,43 @@ mod tests {
                 .any(|message| message.role == MessageRole::Tool
                     && message.content == "plan proposed")
         );
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_runtime_exposes_and_executes_server_tool_extensions() {
+        let root = workspace();
+        let tool_called = Arc::new(AtomicBool::new(false));
+        let schema_exposed = Arc::new(AtomicBool::new(false));
+        let mut descriptor = loom_providers::deterministic_descriptor();
+        descriptor.id = ModelId::new("deterministic/extension");
+        let provider = ExtensionToolProvider {
+            descriptor,
+            cursor: 0,
+            saw_extension_tool: Arc::clone(&schema_exposed),
+        };
+        let tools = ToolExecutor::new(&root)
+            .unwrap()
+            .with_extension(Arc::new(TestToolExtension {
+                called: Arc::clone(&tool_called),
+            }));
+        let task = AgentTask::new(
+            "run the server extension",
+            ModelId::new("deterministic/extension"),
+        )
+        .unwrap();
+        let mut runtime = AgentRuntime::new(AgentSessionId::new(), task, Box::new(provider), tools);
+
+        let events = runtime.start().unwrap();
+
+        assert!(schema_exposed.load(Ordering::SeqCst));
+        assert!(tool_called.load(Ordering::SeqCst));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallCompleted { result, .. }
+                if result.name == "agent_extension_tool" && result.success
+        )));
         assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
         fs::remove_dir_all(root).unwrap();
     }

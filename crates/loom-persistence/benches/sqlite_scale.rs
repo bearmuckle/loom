@@ -119,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input_cost_micros_per_1k: 1,
                 output_cost_micros_per_1k: 3,
                 context_inspection: None,
+                project_delegation_enabled: false,
             },
         );
         run_activities.insert(
