@@ -430,16 +430,16 @@ cascade, and cross-type scheduling validation is complete.
    effect. A manager is prevented from reporting completion while a child is
    active or its code result still needs integration.
 4. **Partially implemented:** apply the configured concurrency limit across
-   the workspace, serialize admission at that scope, and restart queued tasks
-   when a slot is released. Ready joins and queued tasks share an oldest-first
-   admission queue; restart, cap-one, and cross-type fairness need end-to-end
-   validation. Failed or cancelled
+   the workspace through one serialized drain. Task creation, retry, resume,
+   and recovery all drain ready joins and queued tasks oldest-first before
+   consuming capacity. Restart, cap-one, and cross-type fairness need
+   end-to-end validation. Failed or cancelled
    prerequisites move dependents to blocked and make them return-ready to a
    waiting manager; verify this failure path end-to-end.
 5. **Partially implemented:** keep manager control scoped to direct children.
    Cancelling a child now cancels or interrupts its descendants deepest-first;
-   pausing or interrupting a manager run remains local. Derive branch progress
-   from durable child task states while keeping each run's own state distinct.
+   pausing or interrupting a manager run remains local. Recursive branch rows
+   now show durable task status separately from the child session/run state.
    Owner-edge controls are implemented; cascade recovery still needs validation.
 6. **Implemented, pending end-to-end validation:** preserve upward code
    ownership: a depth-two agent reviews and integrates a
@@ -449,8 +449,10 @@ cascade, and cross-type scheduling validation is complete.
    work for explicit recovery.
 7. **Implemented, pending end-to-end validation:** project sessions render
    recursively, nest under their persisted parent, and reveal their owner chain
-   when selected. Controls and review actions target the owning parent-child
-   edge, and the root activity timeline includes authorized descendant inboxes.
+   when selected. Controls, review, and integration actions are gated by the
+   owning parent's grants and target its direct child edge. Integration is
+   offered after a review result exists. The root activity timeline merges
+   successful descendant inbox reads even when another recipient read fails.
 
 **Exit:** three-level projects coordinate safely, recover after restart, keep
 workspace concurrency bounded, preserve explicit grants, deliver branch

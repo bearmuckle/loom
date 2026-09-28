@@ -4098,20 +4098,18 @@ impl InProcessBackend {
         self: &Arc<Self>,
         reconcile_persisted_runs: bool,
     ) -> Result<()> {
-        enum AdmissionCandidate {
-            ManagerWait(loom_core::ProjectManagerWaitRecord),
-            DelegatedTask(loom_core::DelegatedTaskRecord),
-        }
-
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
         };
-        let session_ids = self
-            .sessions()?
-            .list_in_workspace(None, true)
-            .into_iter()
+        let sessions = self.sessions()?.list_in_workspace(None, true);
+        let session_ids = sessions
+            .iter()
             .map(|session| session.id)
             .collect::<Vec<_>>();
+        let workspace_ids = sessions
+            .iter()
+            .map(|session| session.workspace_id)
+            .collect::<BTreeSet<_>>();
         let mut project_ids = BTreeSet::new();
         for session_id in session_ids {
             let project_id = ProjectId::from_uuid(*session_id.as_uuid());
@@ -4120,7 +4118,6 @@ impl InProcessBackend {
             }
         }
         let connection = self.connect();
-        let mut queued_tasks = Vec::new();
         for project_id in project_ids {
             let mut project_tasks = persistence.list_project_tasks(project_id)?;
             for task in &mut project_tasks {
@@ -4192,60 +4189,11 @@ impl InProcessBackend {
                         event: ServerEvent::ProjectTaskUpdated { task: task.clone() },
                     });
                 }
-                if task.status == loom_core::DelegatedTaskStatus::Queued {
-                    queued_tasks.push(task.clone());
-                }
             }
         }
-        let mut admission_candidates = queued_tasks
-            .into_iter()
-            .map(|task| {
-                (
-                    task.created_at,
-                    task.task_id.to_string(),
-                    AdmissionCandidate::DelegatedTask(task),
-                )
-            })
-            .collect::<Vec<_>>();
-        for mut wait in persistence.list_unfinished_project_manager_waits()? {
-            if abandon_project_manager_wait_if_run_terminal(persistence, &wait)? {
-                continue;
-            }
-            if wait.status == loom_core::ProjectManagerWaitStatus::Waiting
-                && let Some(summary) = project_manager_wait_result_summary(persistence, &wait)?
-                && persistence.transition_project_manager_wait(
-                    wait.wait_id,
-                    loom_core::ProjectManagerWaitStatus::Waiting,
-                    loom_core::ProjectManagerWaitStatus::Ready,
-                    Some(&summary),
-                    Timestamp::now(),
-                )?
-            {
-                wait.status = loom_core::ProjectManagerWaitStatus::Ready;
-                wait.result_summary = Some(summary);
-            }
-            if wait.status == loom_core::ProjectManagerWaitStatus::Ready
-                || (reconcile_persisted_runs
-                    && wait.status == loom_core::ProjectManagerWaitStatus::Resuming)
-            {
-                admission_candidates.push((
-                    wait.created_at,
-                    wait.wait_id.to_string(),
-                    AdmissionCandidate::ManagerWait(wait),
-                ));
-            }
-        }
-        admission_candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
-
-        for (_, _, candidate) in admission_candidates {
-            match candidate {
-                AdmissionCandidate::ManagerWait(wait) => {
-                    connection.resume_project_manager_wait(&wait, reconcile_persisted_runs)?;
-                }
-                AdmissionCandidate::DelegatedTask(mut task) => {
-                    connection.schedule_project_task_if_ready(&mut task)?;
-                }
-            }
+        for workspace_id in workspace_ids {
+            connection
+                .drain_workspace_project_admissions(workspace_id, reconcile_persisted_runs)?;
         }
         Ok(())
     }
@@ -8390,6 +8338,17 @@ impl InProcessConnection {
                 true,
             )
         })?;
+        let parent_snapshot = self.backend.sessions()?.get(parent_session_id)?;
+        let workspace_admission = self
+            .backend
+            .workspace_project_admission(parent_snapshot.workspace_id)?;
+        let workspace_admission_guard = workspace_admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "workspace project scheduling lock was poisoned",
+                true,
+            )
+        })?;
         let state_persist_guard = self.backend.state_persist_gate.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -8423,10 +8382,9 @@ impl InProcessConnection {
                 "project already has {MAX_NONTERMINAL_PROJECT_TASKS} queued or active tasks"
             )));
         }
-        let parent_snapshot = self.backend.sessions()?.get(parent_session_id)?;
         let child_session_id = AgentSessionId::new();
-        let timestamp = loom_core::Timestamp::now();
-        let child_snapshot = AgentSessionSnapshot {
+        let mut timestamp = loom_core::Timestamp::now();
+        let mut child_snapshot = AgentSessionSnapshot {
             id: child_session_id,
             workspace_id: parent_snapshot.workspace_id,
             name: child_name.clone(),
@@ -8435,7 +8393,7 @@ impl InProcessConnection {
             updated_at: timestamp,
         };
         let task_id = loom_core::TaskId::new();
-        let task = loom_core::DelegatedTaskRecord {
+        let mut task = loom_core::DelegatedTaskRecord {
             task_id,
             project_id,
             requester_session_id: parent_session_id,
@@ -8505,6 +8463,15 @@ impl InProcessConnection {
                 updated_at: timestamp,
             });
             precreated_child_filesystem = Some(child_filesystem);
+        }
+        timestamp = loom_core::Timestamp::now();
+        child_snapshot.created_at = timestamp;
+        child_snapshot.updated_at = timestamp;
+        task.created_at = timestamp;
+        task.updated_at = timestamp;
+        if let Some(worktree) = initial_worktree.as_mut() {
+            worktree.created_at = timestamp;
+            worktree.updated_at = timestamp;
         }
         let next_sequence = self.backend.sessions()?.next_sequence().next();
         let create_result = match initial_worktree.as_ref() {
@@ -8620,7 +8587,11 @@ impl InProcessConnection {
         }
         drop(state_persist_guard);
         drop(admission_guard);
-        self.schedule_project_task_if_ready(&mut persisted_task)?;
+        self.drain_workspace_project_admissions_locked(parent_snapshot.workspace_id, false)?;
+        if let Some(updated_task) = persistence.load_delegated_task(persisted_task.task_id)? {
+            persisted_task = updated_task;
+        }
+        drop(workspace_admission_guard);
         Ok(ServerResponse::ProjectChildCreated {
             task: persisted_task,
             child,
@@ -8847,6 +8818,7 @@ impl InProcessConnection {
                                 true,
                             )
                         })?;
+                        self.drain_workspace_project_admissions_locked(workspace_id, false)?;
                         let running_tasks = self
                             .workspace_project_tasks(workspace_id)?
                             .iter()
@@ -9859,10 +9831,106 @@ impl InProcessConnection {
         Ok(tasks)
     }
 
-    fn resume_project_manager_wait(
+    fn drain_workspace_project_admissions(
+        &self,
+        workspace_id: WorkspaceId,
+        recovering: bool,
+    ) -> Result<()> {
+        let admission = self.backend.workspace_project_admission(workspace_id)?;
+        let _admission = admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "workspace project scheduling lock was poisoned",
+                true,
+            )
+        })?;
+        self.drain_workspace_project_admissions_locked(workspace_id, recovering)
+    }
+
+    /// Runs while the workspace admission lock is held, selecting and admitting
+    /// every currently eligible task and manager wait in one oldest-first pass.
+    fn drain_workspace_project_admissions_locked(
+        &self,
+        workspace_id: WorkspaceId,
+        recovering: bool,
+    ) -> Result<()> {
+        enum Candidate {
+            ManagerWait(loom_core::ProjectManagerWaitRecord),
+            DelegatedTask(loom_core::DelegatedTaskRecord),
+        }
+
+        let Some(persistence) = self.backend.persistence.as_ref() else {
+            return Ok(());
+        };
+        let mut candidates = self
+            .workspace_project_tasks(workspace_id)?
+            .into_iter()
+            .filter(|task| task.status == loom_core::DelegatedTaskStatus::Queued)
+            .map(|task| {
+                (
+                    task.created_at,
+                    task.task_id.to_string(),
+                    Candidate::DelegatedTask(task),
+                )
+            })
+            .collect::<Vec<_>>();
+        for mut wait in persistence.list_unfinished_project_manager_waits()? {
+            if self
+                .backend
+                .sessions()?
+                .get(wait.manager_session_id)?
+                .workspace_id
+                != workspace_id
+            {
+                continue;
+            }
+            if abandon_project_manager_wait_if_run_terminal(persistence, &wait)? {
+                continue;
+            }
+            if wait.status == loom_core::ProjectManagerWaitStatus::Waiting
+                && let Some(summary) = project_manager_wait_result_summary(persistence, &wait)?
+                && persistence.transition_project_manager_wait(
+                    wait.wait_id,
+                    loom_core::ProjectManagerWaitStatus::Waiting,
+                    loom_core::ProjectManagerWaitStatus::Ready,
+                    Some(&summary),
+                    Timestamp::now(),
+                )?
+            {
+                wait.status = loom_core::ProjectManagerWaitStatus::Ready;
+                wait.result_summary = Some(summary);
+            }
+            if !matches!(
+                wait.status,
+                loom_core::ProjectManagerWaitStatus::Ready
+                    | loom_core::ProjectManagerWaitStatus::Resuming
+            ) || (wait.status == loom_core::ProjectManagerWaitStatus::Resuming && !recovering)
+            {
+                continue;
+            }
+            candidates.push((
+                wait.created_at,
+                wait.wait_id.to_string(),
+                Candidate::ManagerWait(wait),
+            ));
+        }
+        candidates.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+        for (_, _, candidate) in candidates {
+            match candidate {
+                Candidate::ManagerWait(wait) => {
+                    self.resume_project_manager_wait_under_admission(&wait)?;
+                }
+                Candidate::DelegatedTask(mut task) => {
+                    self.schedule_project_task_if_ready_under_admission(&mut task)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn resume_project_manager_wait_under_admission(
         &self,
         wait: &loom_core::ProjectManagerWaitRecord,
-        _recovering: bool,
     ) -> Result<()> {
         let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
             LoomError::new(
@@ -9872,16 +9940,6 @@ impl InProcessConnection {
             )
         })?;
         let manager_session = self.backend.sessions()?.get(wait.manager_session_id)?;
-        let admission = self
-            .backend
-            .workspace_project_admission(manager_session.workspace_id)?;
-        let _admission = admission.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "workspace project scheduling lock was poisoned",
-                true,
-            )
-        })?;
 
         let Some(mut current_wait) = persistence.load_project_manager_wait(wait.wait_id)? else {
             return Ok(());
@@ -10040,20 +10098,28 @@ impl InProcessConnection {
         &self,
         task: &mut loom_core::DelegatedTaskRecord,
     ) -> Result<()> {
+        let workspace_id = self
+            .backend
+            .sessions()?
+            .get(task.target_session_id)?
+            .workspace_id;
+        self.drain_workspace_project_admissions(workspace_id, false)?;
+        if let Some(persistence) = self.backend.persistence.as_ref()
+            && let Some(updated_task) = persistence.load_delegated_task(task.task_id)?
+        {
+            *task = updated_task;
+        }
+        Ok(())
+    }
+
+    fn schedule_project_task_if_ready_under_admission(
+        &self,
+        task: &mut loom_core::DelegatedTaskRecord,
+    ) -> Result<()> {
         if task.status != loom_core::DelegatedTaskStatus::Queued {
             return Ok(());
         }
         let target_session = self.backend.sessions()?.get(task.target_session_id)?;
-        let admission = self
-            .backend
-            .workspace_project_admission(target_session.workspace_id)?;
-        let _admission = admission.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "workspace project scheduling lock was poisoned",
-                true,
-            )
-        })?;
         let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
             LoomError::new(
                 ErrorCode::UnsupportedCapability,
@@ -11315,6 +11381,7 @@ impl InProcessConnection {
                 true,
             )
         })?;
+        self.drain_workspace_project_admissions_locked(workspace_id, false)?;
         let task = persistence
             .load_delegated_task(task.task_id)?
             .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;

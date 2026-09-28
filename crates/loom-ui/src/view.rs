@@ -1621,6 +1621,11 @@ fn project_session_list_projection(
         .filter(|agent| agent.session_id != project.root_session_id)
         .map(|agent| (agent.session_id, agent))
         .collect::<BTreeMap<_, _>>();
+    let tasks_by_target = project
+        .tasks
+        .iter()
+        .map(|task| (task.target_session_id, task))
+        .collect::<BTreeMap<_, _>>();
     let mut agents_by_parent =
         BTreeMap::<AgentSessionId, Vec<&loom_core::ProjectAgentRecord>>::new();
     for agent in project
@@ -1642,24 +1647,42 @@ fn project_session_list_projection(
     fn agent_label(
         session: &AgentSessionSnapshot,
         agent: &loom_core::ProjectAgentRecord,
+        task: Option<&loom_core::DelegatedTaskRecord>,
     ) -> String {
+        let task_state = task.map_or_else(
+            || session_state_label(agent.state),
+            |task| project_task_status_label(task.status),
+        );
         let task_summary = agent
             .task_summary
             .as_deref()
             .map(|summary| format!(" — {summary}"))
             .unwrap_or_default();
         format!(
-            "↳ {} · {}{}",
+            "↳ {} · task {} · run {}{}",
             session.name,
+            task_state,
             session_state_label(agent.state),
             task_summary
         )
+    }
+
+    fn project_task_status_label(status: loom_core::DelegatedTaskStatus) -> &'static str {
+        match status {
+            loom_core::DelegatedTaskStatus::Queued => "queued",
+            loom_core::DelegatedTaskStatus::Running => "running",
+            loom_core::DelegatedTaskStatus::Blocked => "blocked",
+            loom_core::DelegatedTaskStatus::Completed => "completed",
+            loom_core::DelegatedTaskStatus::Failed => "failed",
+            loom_core::DelegatedTaskStatus::Cancelled => "cancelled",
+        }
     }
 
     fn build_agent_node(
         session_id: AgentSessionId,
         sessions_by_id: &BTreeMap<AgentSessionId, &AgentSessionSnapshot>,
         agents_by_id: &BTreeMap<AgentSessionId, &loom_core::ProjectAgentRecord>,
+        tasks_by_target: &BTreeMap<AgentSessionId, &loom_core::DelegatedTaskRecord>,
         agents_by_parent: &BTreeMap<AgentSessionId, Vec<&loom_core::ProjectAgentRecord>>,
         visited: &mut BTreeSet<AgentSessionId>,
     ) -> Option<SessionTreeNode> {
@@ -1667,9 +1690,10 @@ fn project_session_list_projection(
             return None;
         }
         let session = sessions_by_id.get(&session_id)?;
-        let label = agents_by_id
-            .get(&session_id)
-            .map_or_else(|| session.name.clone(), |agent| agent_label(session, agent));
+        let label = agents_by_id.get(&session_id).map_or_else(
+            || session.name.clone(),
+            |agent| agent_label(session, agent, tasks_by_target.get(&session_id).copied()),
+        );
         let children = agents_by_parent
             .get(&session_id)
             .into_iter()
@@ -1679,6 +1703,7 @@ fn project_session_list_projection(
                     agent.session_id,
                     sessions_by_id,
                     agents_by_id,
+                    tasks_by_target,
                     agents_by_parent,
                     visited,
                 )
@@ -1710,6 +1735,7 @@ fn project_session_list_projection(
                 agent.session_id,
                 &sessions_by_id,
                 &agents_by_id,
+                &tasks_by_target,
                 &agents_by_parent,
                 &mut visited,
             )
@@ -1722,6 +1748,7 @@ fn project_session_list_projection(
             agent.session_id,
             &sessions_by_id,
             &agents_by_id,
+            &tasks_by_target,
             &agents_by_parent,
             &mut visited,
         ) {
@@ -3592,7 +3619,7 @@ impl LoomView {
         self.project_messages_loading = true;
         cx.spawn(async move |view, cx| {
             let mut messages = Vec::new();
-            let mut failure = None;
+            let mut first_failure = None;
             for session_id in recipients {
                 let mut cursor = cursors.get(&session_id).copied();
                 loop {
@@ -3625,17 +3652,19 @@ impl LoomView {
                             break;
                         }
                         Err(error) => {
-                            failure = Some(error);
+                            if first_failure.is_none() {
+                                first_failure = Some(error);
+                            }
                             break;
                         }
                         Ok(response) => {
-                            failure = Some(unexpected_response("project messages", response));
+                            if first_failure.is_none() {
+                                first_failure =
+                                    Some(unexpected_response("project messages", response));
+                            }
                             break;
                         }
                     }
-                }
-                if failure.is_some() {
-                    break;
                 }
             }
             view.update(cx, |view, cx| {
@@ -3647,27 +3676,26 @@ impl LoomView {
                 {
                     return;
                 }
-                let succeeded = failure.is_none();
                 view.project_messages_loading = false;
-                if let Some(error) = failure {
+                view.project_message_cursors = cursors;
+                for message in messages {
+                    if !view
+                        .project_messages
+                        .iter()
+                        .any(|existing| existing.message_id == message.message_id)
+                    {
+                        view.project_messages.push(message);
+                    }
+                }
+                view.project_messages
+                    .sort_by_key(|message| message.project_sequence);
+                view.rebuild_project_message_timeline();
+                let had_failure = first_failure.is_some();
+                if let Some(error) = first_failure {
                     view.project_messages_stale = true;
                     view.record_backend_error("load project messages", error);
-                } else {
-                    view.project_message_cursors = cursors;
-                    for message in messages {
-                        if !view
-                            .project_messages
-                            .iter()
-                            .any(|existing| existing.message_id == message.message_id)
-                        {
-                            view.project_messages.push(message);
-                        }
-                    }
-                    view.project_messages
-                        .sort_by_key(|message| message.project_sequence);
-                    view.rebuild_project_message_timeline();
                 }
-                if succeeded && view.project_messages_stale {
+                if !had_failure && view.project_messages_stale {
                     view.refresh_project_messages(cx);
                 }
                 cx.notify();
@@ -8158,28 +8186,49 @@ impl LoomView {
                     .find(|task| task.target_session_id == child.session_id)
             {
                 let project_id = project.project_id;
-                for action in project_child_control_actions(child.state, task.status) {
-                    let control_view = menu_view.clone();
-                    let task_id = task.task_id;
-                    let action_label = if action == ProjectChildControlAction::Cancel
-                        && (child.state == AgentSessionState::Failed
-                            || task.status == loom_core::DelegatedTaskStatus::Failed)
-                    {
-                        "Cancel remaining descendants"
-                    } else {
-                        project_child_control_label(action)
-                    };
-                    menu = menu.item(PopupMenuItem::new(action_label).on_click(move |_, _, cx| {
-                        control_view.update(cx, |view, cx| {
-                            view.control_project_child_from_ui(
-                                manager_session_id,
-                                project_id,
-                                task_id,
-                                action,
-                                cx,
-                            );
-                        });
-                    }));
+                let manager_permissions = if manager_session_id == project.root_session_id {
+                    Some((true, true, true))
+                } else {
+                    project
+                        .tasks
+                        .iter()
+                        .find(|manager_task| manager_task.target_session_id == manager_session_id)
+                        .map(|manager_task| {
+                            (
+                                manager_task.permissions.child_control,
+                                manager_task.permissions.review,
+                                manager_task.permissions.integration,
+                            )
+                        })
+                };
+                let (can_control, can_review, can_integrate) =
+                    manager_permissions.unwrap_or_default();
+                if can_control {
+                    for action in project_child_control_actions(child.state, task.status) {
+                        let control_view = menu_view.clone();
+                        let task_id = task.task_id;
+                        let action_label = if action == ProjectChildControlAction::Cancel
+                            && (child.state == AgentSessionState::Failed
+                                || task.status == loom_core::DelegatedTaskStatus::Failed)
+                        {
+                            "Cancel remaining descendants"
+                        } else {
+                            project_child_control_label(action)
+                        };
+                        menu = menu.item(PopupMenuItem::new(action_label).on_click(
+                            move |_, _, cx| {
+                                control_view.update(cx, |view, cx| {
+                                    view.control_project_child_from_ui(
+                                        manager_session_id,
+                                        project_id,
+                                        task_id,
+                                        action,
+                                        cx,
+                                    );
+                                });
+                            },
+                        ));
+                    }
                 }
                 if task.code_change
                     && let Some(worktree) = project
@@ -8194,11 +8243,13 @@ impl LoomView {
                             | loom_core::DelegatedTaskStatus::Failed
                             | loom_core::DelegatedTaskStatus::Cancelled
                     );
-                    if !matches!(
-                        worktree.status,
-                        loom_core::ProjectWorktreeStatus::CleanupPending
-                            | loom_core::ProjectWorktreeStatus::Removed
-                    ) {
+                    if can_review
+                        && !matches!(
+                            worktree.status,
+                            loom_core::ProjectWorktreeStatus::CleanupPending
+                                | loom_core::ProjectWorktreeStatus::Removed
+                        )
+                    {
                         let review_view = menu_view.clone();
                         menu = menu.item(PopupMenuItem::new("Review child changes").on_click(
                             move |_, _, cx| {
@@ -8213,9 +8264,11 @@ impl LoomView {
                             },
                         ));
                     }
-                    if terminal
+                    if can_integrate
+                        && terminal
                         && task.status == loom_core::DelegatedTaskStatus::Completed
                         && worktree.status == loom_core::ProjectWorktreeStatus::Ready
+                        && worktree.result_revision.is_some()
                     {
                         let integrate_view = menu_view.clone();
                         let expected_parent_revision = worktree.base_revision.clone();
@@ -14991,7 +15044,22 @@ mod worker_node_tests {
                     updated_at: Timestamp::from_unix_millis(2),
                 },
             ],
-            tasks: vec![],
+            tasks: vec![loom_core::DelegatedTaskRecord {
+                task_id: loom_core::TaskId::new(),
+                project_id,
+                requester_session_id: root_id,
+                target_session_id: child_id,
+                child_name: "Researcher".to_owned(),
+                intent: "Review protocol changes".to_owned(),
+                model_id: "test-model".to_owned(),
+                context_references: Vec::new(),
+                dependencies: Vec::new(),
+                code_change: false,
+                permissions: loom_core::ProjectAgentPermissions::default(),
+                status: loom_core::DelegatedTaskStatus::Blocked,
+                created_at: Timestamp::from_unix_millis(1),
+                updated_at: Timestamp::from_unix_millis(2),
+            }],
             worktrees: vec![],
         };
 
@@ -15003,7 +15071,8 @@ mod worker_node_tests {
                 (root_id, "Project · Project".to_owned()),
                 (
                     child_id,
-                    "↳ Researcher · Working — Review protocol changes".to_owned()
+                    "↳ Researcher · task blocked · run Working — Review protocol changes"
+                        .to_owned()
                 ),
                 (other_id, "Other session".to_owned()),
             ]
