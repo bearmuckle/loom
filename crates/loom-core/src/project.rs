@@ -28,6 +28,9 @@ pub struct ProjectSnapshot {
     pub project_id: ProjectId,
     pub root_session_id: AgentSessionId,
     pub agents: Vec<ProjectAgentRecord>,
+    /// Durable task intent and lifecycle state for delegated project agents.
+    #[serde(default)]
+    pub tasks: Vec<DelegatedTaskRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -147,6 +150,7 @@ mod tests {
                     updated_at: Timestamp::now(),
                 },
             ],
+            tasks: vec![],
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let decoded: ProjectSnapshot = serde_json::from_str(&json).unwrap();

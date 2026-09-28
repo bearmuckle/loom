@@ -57,6 +57,16 @@ pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
 pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
 pub const MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES: u32 = 32 * 1024;
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectChildControlAction {
+    Continue,
+    RetryFailedStep,
+    Pause,
+    Interrupt,
+    Cancel,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerNodeResources {
     pub cpu_count: usize,
@@ -401,6 +411,12 @@ pub enum ClientRequest {
         after_project_sequence: Option<u64>,
         limit: u32,
     },
+    ControlProjectChild {
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+        action: ProjectChildControlAction,
+    },
     RenameAgentSession {
         session_id: AgentSessionId,
         name: String,
@@ -584,6 +600,7 @@ impl ClientRequest {
             Self::CreateProjectChild { .. } => Some(Capability::CreateProjectChild),
             Self::SendProjectAgentMessage { .. } => Some(Capability::SendProjectAgentMessage),
             Self::ListProjectAgentMessages { .. } => Some(Capability::ReadProjectAgentMessages),
+            Self::ControlProjectChild { .. } => Some(Capability::ControlProjectChild),
             Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
                 Some(Capability::ControlAgentSession)
             }
@@ -631,6 +648,7 @@ impl ClientRequest {
                 | Self::RenameWorkspace { .. }
                 | Self::CreateAgentSessionInWorkspace { .. }
                 | Self::CreateProjectChild { .. }
+                | Self::ControlProjectChild { .. }
                 | Self::SetWorkspaceConfigForWorkspace { .. }
                 | Self::AttachSessionRepository { .. }
                 | Self::DetachSessionRepository { .. }
@@ -741,6 +759,10 @@ pub enum ServerResponse {
     ProjectAgentMessages {
         messages: Vec<AgentMessageRecord>,
         next_after_project_sequence: Option<u64>,
+    },
+    ProjectChildControlled {
+        task: DelegatedTaskRecord,
+        run: Option<AgentRunSnapshot>,
     },
     AgentSessionRenamed(AgentSessionSnapshot),
     AgentSessionArchived(AgentSessionSnapshot),
@@ -1142,6 +1164,7 @@ mod run_message_protocol_tests {
                 output_cursor: EventSequence::default(),
                 updated_at: loom_core::Timestamp::from_unix_millis(1),
             }],
+            tasks: vec![],
         };
         let response = ServerResponse::ProjectSnapshot(snapshot);
         let encoded = encode_response(&ResponseEnvelope::success(
@@ -1220,6 +1243,26 @@ mod run_message_protocol_tests {
                 .unwrap()
                 .request,
             list_request
+        );
+
+        let control_request = ClientRequest::ControlProjectChild {
+            project_id,
+            manager_session_id: parent,
+            task_id: loom_core::TaskId::new(),
+            action: ProjectChildControlAction::Pause,
+        };
+        assert_eq!(
+            control_request.required_capability(),
+            Some(Capability::ControlProjectChild)
+        );
+        assert!(control_request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(
+                &encode_request(&RequestEnvelope::new(control_request.clone())).unwrap()
+            )
+            .unwrap()
+            .request,
+            control_request
         );
 
         let message = AgentMessageRecord {

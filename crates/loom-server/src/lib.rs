@@ -36,11 +36,11 @@ use loom_protocol::{
     AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest,
     GitHubCopilotLoginStatus, GitHubRepository, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES,
     MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES,
-    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult, RequestEnvelope, ResponseEnvelope,
-    ServerEvent, ServerEventEnvelope, ServerResponse, SessionDirectory, SessionFilesystemChange,
-    SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository, WorkerNodeResources,
-    WorkerNodeStatus, WorkspaceConfig, WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceFeedEvent,
-    unsupported_version_error,
+    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult, ProjectChildControlAction,
+    RequestEnvelope, ResponseEnvelope, ServerEvent, ServerEventEnvelope, ServerResponse,
+    SessionDirectory, SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot,
+    SessionRepository, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceEvent,
+    WorkspaceEventEnvelope, WorkspaceFeedEvent, unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
@@ -1894,14 +1894,6 @@ struct SendProjectAgentMessageArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListProjectChildrenArguments {}
-
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ProjectChildControlAction {
-    Continue,
-    RetryFailedStep,
-    Cancel,
-}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -4709,6 +4701,17 @@ impl InProcessBackend {
                 message: message.clone(),
             },
         });
+        if draft.target_session_id != project.root_session_id {
+            let sequence = self.journal()?.next();
+            self.journal()?.append_event(ServerEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence,
+                session_id: project.root_session_id,
+                event: ServerEvent::ProjectAgentMessageAccepted {
+                    message: message.clone(),
+                },
+            });
+        }
         Ok(ServerResponse::ProjectAgentMessageAccepted(message))
     }
 
@@ -5983,7 +5986,13 @@ impl InProcessConnection {
             );
         }
         let durable_mutation = request.request.is_retryable_mutation();
-        let _durable_request_guard = if durable_mutation {
+        // Child controls can wait for an in-flight model call to observe its
+        // stop flag. Keep them out of the global mutation gate, as the direct
+        // run controls are, so the request that stops a child is never queued
+        // behind unrelated durable writes.
+        let serialize_durable_request = durable_mutation
+            && !matches!(&request.request, ClientRequest::ControlProjectChild { .. });
+        let _durable_request_guard = if serialize_durable_request {
             match self.backend.durable_request_gate.lock() {
                 Ok(guard) => Some(guard),
                 Err(_) => {
@@ -6148,6 +6157,7 @@ impl InProcessConnection {
                 ClientRequest::CreateProjectChild { .. }
                     | ClientRequest::SendProjectAgentMessage { .. }
                     | ClientRequest::ListProjectAgentMessages { .. }
+                    | ClientRequest::ControlProjectChild { .. }
             )
         {
             return Err(LoomError::new(
@@ -6328,6 +6338,16 @@ impl InProcessConnection {
                 after_project_sequence.unwrap_or(0),
                 limit,
             ),
+            ClientRequest::ControlProjectChild {
+                project_id,
+                manager_session_id,
+                task_id,
+                action,
+            } => {
+                let (task, run) =
+                    self.control_project_child(manager_session_id, project_id, task_id, action)?;
+                Ok(ServerResponse::ProjectChildControlled { task, run })
+            }
             ClientRequest::RenameAgentSession { session_id, name } => {
                 let (snapshot, record) = self.backend.sessions()?.rename(session_id, name)?;
                 self.backend.journal()?.append_session(record);
@@ -7713,6 +7733,74 @@ impl InProcessConnection {
                     ));
                 }
             }
+            ProjectChildControlAction::Pause => {
+                let snapshot = run.as_ref().ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::InvalidState,
+                        "the delegated task has no child run to pause",
+                        false,
+                    )
+                })?;
+                match snapshot.state {
+                    AgentRunState::Planning
+                    | AgentRunState::Executing
+                    | AgentRunState::AwaitingApproval
+                    | AgentRunState::Evaluating => {
+                        let response = self.stop_run(snapshot.id, RunStop::Pause)?;
+                        let ServerResponse::AgentRun(snapshot) = response else {
+                            return Err(LoomError::new(
+                                ErrorCode::Internal,
+                                "project child pause returned an unexpected response",
+                                false,
+                            ));
+                        };
+                        run = Some(snapshot);
+                    }
+                    AgentRunState::Paused => {}
+                    AgentRunState::NeedsInput => {
+                        return Err(LoomError::new(
+                            ErrorCode::InvalidState,
+                            "the child is waiting for user input and cannot be paused",
+                            false,
+                        ));
+                    }
+                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled => {
+                        return Err(LoomError::new(
+                            ErrorCode::InvalidState,
+                            "the child run is finished and cannot be paused",
+                            false,
+                        ));
+                    }
+                }
+            }
+            ProjectChildControlAction::Interrupt => {
+                let snapshot = run.as_ref().ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::InvalidState,
+                        "the delegated task has no child run to interrupt",
+                        false,
+                    )
+                })?;
+                if matches!(
+                    snapshot.state,
+                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                ) {
+                    return Err(LoomError::new(
+                        ErrorCode::InvalidState,
+                        "the child run is already finished",
+                        false,
+                    ));
+                }
+                let response = self.stop_run(snapshot.id, RunStop::Interrupt)?;
+                let ServerResponse::AgentRun(snapshot) = response else {
+                    return Err(LoomError::new(
+                        ErrorCode::Internal,
+                        "project child interrupt returned an unexpected response",
+                        false,
+                    ));
+                };
+                run = Some(snapshot);
+            }
             ProjectChildControlAction::RetryFailedStep => {
                 let snapshot = run.as_ref().ok_or_else(|| {
                     LoomError::new(
@@ -8122,6 +8210,7 @@ impl InProcessConnection {
                 output_cursor: EventSequence::default(),
                 updated_at: root.updated_at,
             }],
+            tasks: Vec::new(),
         })
     }
 
@@ -8159,6 +8248,7 @@ impl InProcessConnection {
                 output_cursor: EventSequence::default(),
                 updated_at: root.updated_at,
             }],
+            tasks: Vec::new(),
         })
     }
 
@@ -8410,6 +8500,34 @@ impl InProcessConnection {
                 session_id: requested_session,
                 ..
             } => session_id = Some(*requested_session),
+            ClientRequest::ControlProjectChild {
+                manager_session_id,
+                task_id,
+                ..
+            } => {
+                session_id = Some(*manager_session_id);
+                let Some(task) = self
+                    .backend
+                    .persistence
+                    .as_ref()
+                    .map(|persistence| persistence.load_delegated_task(*task_id))
+                    .transpose()?
+                    .flatten()
+                else {
+                    return Err(LoomError::not_found("delegated task", task_id));
+                };
+                if !auth.scope().allows_session(task.target_session_id) {
+                    return Err(unauthorized_session(task.target_session_id));
+                }
+                let target = self.backend.sessions()?.get(task.target_session_id)?;
+                if !auth.scope().allows_workspace(target.workspace_id) {
+                    return Err(LoomError::new(
+                        ErrorCode::AuthorizationDenied,
+                        "token is not authorized for the child task's workspace",
+                        false,
+                    ));
+                }
+            }
             ClientRequest::SendProjectAgentMessage { message } => {
                 if !auth.scope().allows_session(message.sender_session_id) {
                     return Err(unauthorized_session(message.sender_session_id));
@@ -9039,6 +9157,44 @@ impl InProcessConnection {
 
     fn archive_session(&self, session_id: AgentSessionId) -> Result<ServerResponse> {
         let session = self.backend.sessions()?.get(session_id)?;
+        let project = self
+            .backend
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.load_project_snapshot_for_session(session_id))
+            .transpose()?
+            .flatten()
+            .filter(|project| project.root_session_id == session_id);
+        if let Some(project) = &project {
+            let unfinished_task = project.tasks.iter().any(|task| {
+                !matches!(
+                    task.status,
+                    loom_core::DelegatedTaskStatus::Completed
+                        | loom_core::DelegatedTaskStatus::Failed
+                        | loom_core::DelegatedTaskStatus::Cancelled
+                )
+            });
+            let unfinished_child = project.agents.iter().any(|agent| {
+                agent.session_id != session_id
+                    && matches!(
+                        agent.state,
+                        AgentSessionState::Queued
+                            | AgentSessionState::Planning
+                            | AgentSessionState::AwaitingApproval
+                            | AgentSessionState::Paused
+                            | AgentSessionState::Executing
+                            | AgentSessionState::Evaluating
+                            | AgentSessionState::NeedsInput
+                    )
+            });
+            if unfinished_task || unfinished_child {
+                return Err(LoomError::new(
+                    ErrorCode::InvalidState,
+                    "finish or cancel every child task before archiving this project",
+                    false,
+                ));
+            }
+        }
         if matches!(
             session.state,
             AgentSessionState::Queued
@@ -9069,6 +9225,21 @@ impl InProcessConnection {
                     )
                 })?;
             self.stop_run(run_id, RunStop::Interrupt)?;
+        }
+
+        if let Some(project) = project {
+            let mut descendants = project
+                .agents
+                .into_iter()
+                .filter(|agent| {
+                    agent.session_id != session_id && agent.state != AgentSessionState::Archived
+                })
+                .collect::<Vec<_>>();
+            descendants.sort_by_key(|agent| std::cmp::Reverse(agent.depth));
+            for agent in descendants {
+                let (_, record) = self.backend.sessions()?.archive(agent.session_id)?;
+                self.backend.journal()?.append_session(record);
+            }
         }
 
         let (snapshot, record) = self.backend.sessions()?.archive(session_id)?;
@@ -13324,6 +13495,129 @@ mod tests {
     }
 
     #[test]
+    fn archiving_project_requires_terminal_children_then_archives_the_tree() {
+        let temp = std::env::temp_dir().join(format!(
+            "loom-project-archive-policy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("state.sqlite");
+        let backend = InProcessBackend::new_persistent(&path).unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Archive policy".into(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Manager".into(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        let child_id = AgentSessionId::new();
+        let created_at = Timestamp::now();
+        let child = AgentSessionSnapshot {
+            id: child_id,
+            workspace_id: workspace.id,
+            name: "Child".into(),
+            state: AgentSessionState::Idle,
+            created_at,
+            updated_at: created_at,
+        };
+        let task = loom_core::DelegatedTaskRecord {
+            task_id: loom_core::TaskId::new(),
+            project_id: ProjectId::from_uuid(*root.id.as_uuid()),
+            requester_session_id: root.id,
+            target_session_id: child_id,
+            child_name: child.name.clone(),
+            intent: "Wait for manager direction".into(),
+            model_id: "deterministic/demo".into(),
+            context_references: vec![],
+            dependencies: vec![],
+            code_change: false,
+            status: loom_core::DelegatedTaskStatus::Queued,
+            created_at,
+            updated_at: created_at,
+        };
+        backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .create_project_child(
+                RequestId::new(),
+                &child,
+                backend.sessions().unwrap().next_sequence().next(),
+                &task,
+            )
+            .unwrap();
+        let (_, created_event) = backend
+            .sessions()
+            .unwrap()
+            .create_in_workspace_with_id(workspace.id, child_id, child.name.clone())
+            .unwrap();
+        backend.journal().unwrap().append_session(created_event);
+
+        assert_eq!(
+            connection
+                .request(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
+                    session_id: root.id,
+                }))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::InvalidState
+        );
+        assert_eq!(
+            backend.sessions().unwrap().get(root.id).unwrap().state,
+            AgentSessionState::Idle
+        );
+
+        backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .update_delegated_task_status(
+                task.task_id,
+                loom_core::DelegatedTaskStatus::Cancelled,
+                Timestamp::now(),
+            )
+            .unwrap();
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
+                    session_id: root.id,
+                }))
+                .result,
+            Ok(ServerResponse::AgentSessionArchived(session))
+                if session.state == AgentSessionState::Archived
+        ));
+        assert_eq!(
+            backend.sessions().unwrap().get(child_id).unwrap().state,
+            AgentSessionState::Archived
+        );
+
+        drop(connection);
+        drop(backend);
+        let _ = fs::remove_dir_all(temp);
+        let _ = fs::remove_dir_all(path.with_extension("session-roots"));
+        let _ = fs::remove_file(path.with_extension("credentials.json"));
+    }
+
+    #[test]
     fn delegated_children_and_direct_messages_are_durable_and_bounded() {
         let temp =
             std::env::temp_dir().join(format!("loom-project-agents-{}", uuid::Uuid::new_v4()));
@@ -13431,6 +13725,21 @@ mod tests {
         assert!(
             matches!(snapshot, ServerResponse::ProjectSnapshot(snapshot) if snapshot.agents.len() == 2)
         );
+        let ServerResponse::ProjectSnapshot(project_snapshot) = connection
+            .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
+                project_id: ProjectId::from_uuid(*root.as_uuid()),
+            }))
+            .result
+            .unwrap()
+        else {
+            panic!("expected project snapshot")
+        };
+        assert!(
+            project_snapshot
+                .tasks
+                .iter()
+                .any(|candidate| candidate.task_id == task.task_id)
+        );
 
         let message = loom_core::AgentMessageDraft {
             project_id: ProjectId::from_uuid(*root.as_uuid()),
@@ -13449,6 +13758,23 @@ mod tests {
                 ))
                 .result,
             Ok(ServerResponse::ProjectAgentMessageAccepted(_))
+        ));
+        let root_events =
+            connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                session_id: Some(root),
+                workspace_id: None,
+                after_sequence: Some(EventSequence::default()),
+                stream_epoch: None,
+            }));
+        assert!(matches!(
+            root_events.result,
+            Ok(ServerResponse::SessionEvents { events, .. })
+                if events.iter().any(|event| matches!(
+                    &event.event,
+                    ServerEvent::ProjectAgentMessageAccepted { message: accepted }
+                        if accepted.project_id == message.project_id
+                            && accepted.target_session_id == child.session_id
+                ))
         ));
         let messages = connection.request(RequestEnvelope::new(
             ClientRequest::ListProjectAgentMessages {
@@ -13884,6 +14210,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.agents.len(), 2);
+        assert!(
+            snapshot
+                .tasks
+                .iter()
+                .any(|task| task.task_id.to_string() == task_id)
+        );
         let task_id = task_id.parse::<loom_core::TaskId>().unwrap();
         let task_id_string = task_id.to_string();
         let task = backend
@@ -13932,6 +14264,23 @@ mod tests {
                 &idle_task,
             )
             .unwrap();
+        let (_, created_event) = backend
+            .sessions()
+            .unwrap()
+            .create_in_workspace_with_id(workspace.id, idle_child_id, idle_child.name.clone())
+            .unwrap();
+        backend.journal().unwrap().append_session(created_event);
+        let filesystem = backend
+            .create_session_filesystem(workspace.id, idle_child_id)
+            .unwrap();
+        backend
+            .session_filesystems()
+            .unwrap()
+            .insert(idle_child_id, filesystem);
+        backend
+            .session_repositories()
+            .unwrap()
+            .insert(idle_child_id, BTreeMap::new());
         let direction_call = ToolCall {
             id: ToolCallId::new(),
             name: "send_project_agent_message".to_owned(),
@@ -13963,6 +14312,20 @@ mod tests {
         );
         let cancellation = tools.execute(&cancel_call);
         assert!(cancellation.success, "{}", cancellation.output);
+        let direct_control = connection
+            .request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+                project_id: idle_task.project_id,
+                manager_session_id: root,
+                task_id: idle_task.task_id,
+                action: ProjectChildControlAction::Cancel,
+            }))
+            .result
+            .unwrap();
+        assert!(matches!(
+            direct_control,
+            ServerResponse::ProjectChildControlled { task, .. }
+                if task.status == loom_core::DelegatedTaskStatus::Cancelled
+        ));
         assert_eq!(
             persistence
                 .load_delegated_task(idle_task.task_id)

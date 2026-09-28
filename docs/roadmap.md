@@ -168,17 +168,18 @@ The detailed domain, protocol, recovery, worktree, and rollout design is in
 This XL feature is delivered as independently reviewable slices rather than
 one large orchestration change:
 
-- M7.0: migrate SQLite v41 through v46 and represent every existing root session
+- **M7.0 complete:** migrate SQLite v41 through v46 and represent every existing root session
   as a project; add durable parentage, delegated task, message, and integration
   records; advance the protocol contract; require clients to meet the minimum
   supported version before serving project-aware messages; recover committed
   child launches.
-- M7.1: enable direct-child non-code delegation with bounded concurrency,
+- **M7.1 complete:** enable direct-child non-code delegation with bounded concurrency,
   durable parent-child messaging, blocker/result reporting, manager status
   inspection, restart recovery, and manager-directed continue/cancel/failed-tool
   retry controls.
-- M7.2: present projects in workspace navigation and expose child status,
-  output, message history, and individual controls.
+- **M7.2 complete:** present projects in workspace navigation and expose child
+  status, transcript output, durable message history, and individual controls.
+  Project archive waits for terminal child tasks, then archives the project tree.
 - M7.3: add isolated child worktrees, reviewable diffs, explicit parent-owned
   integration, conflict handling, and recoverable cleanup.
 - M7.4: enable level-three agents and policy-checked branch-to-branch

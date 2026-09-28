@@ -6,7 +6,9 @@
 use std::collections::BTreeSet;
 
 use gpui_kit::{ListAlignment, ListState, px};
-use loom_core::{AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError};
+use loom_core::{
+    AgentMessageRecord, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError,
+};
 use loom_protocol::{
     AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitDiffLine,
     GitRepositoryStatus, SessionFilesystemChange, SessionFilesystemFile,
@@ -171,6 +173,7 @@ pub(crate) enum TimelineItem {
     ActivitySection {
         activities: Vec<AgentActivityRecord>,
     },
+    ProjectMessage(AgentMessageRecord),
     Plan {
         steps: Vec<String>,
         completed: BTreeSet<u32>,

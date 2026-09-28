@@ -18,8 +18,12 @@ and session status. A manager tool can continue a paused child, retry its
 failed tool step, or cancel it. The workspace navigator now groups a project root with its direct
 children and shows child task summaries and live state; loading the navigator
 from a child session resolves the containing project. The project message
-timeline and direct per-child UI controls, worktree-backed code tasks, and
-integration remain future slices. Workspace
+timeline now displays durable parent-child messages with separate project
+activity styling. Child context menus provide pause/resume/interrupt/cancel
+controls, and project-root views refresh from workspace event cursors after
+reconnect. Project archive waits until child tasks are terminal, then archives
+the descendants with the root. Worktree-backed code tasks and integration
+remain future slices. Workspace
 settings configure the maximum number of delegated agents running in parallel
 (default four, range one to sixteen); additional tasks remain durable and
 queued. A project can have up to fifty queued or active delegated tasks.
@@ -80,8 +84,11 @@ the bound is not supported. Dependencies are explicit; a dependent task is not
 started until its prerequisites reach an acceptable terminal state. Completion,
 failure, cancellation, and blockers all return control to the manager, which
 can inspect output and decide whether to retry, redirect, continue, or ask the
-user. Project stop/archive behavior must be explicit for descendants and their
-worktrees; shutdown or disconnect must not erase coordination state.
+user. Pausing or interrupting the project manager affects only the manager run;
+child runs remain independent. Archiving a project is rejected while any child
+task is queued, blocked, or running. Once all child tasks are terminal,
+archiving the root also archives its descendant sessions. Shutdown or
+disconnect must not erase coordination state.
 
 Message acceptance means the addressed message has committed durably. Messages
 are ordered per project and retain sender, recipient, type, timestamps, and
@@ -127,11 +134,15 @@ are handled; a child must never inherit a mutable attachment accidentally.
 
 Add versioned protocol operations and projections for project snapshots,
 children, delegated tasks, addressed messages, agent controls, and worktree
-integration. Proposed operation families are `CreateChildAgent`,
+integration. The current contract includes `CreateProjectChild`,
 `GetProjectSnapshot` (including lookup from any member session),
-`SendAgentMessage`, `ListAgentMessages`, and
-`ControlChildAgent` (pause/resume/interrupt/cancel); names are provisional and
-must follow existing request conventions. Events cover child creation and
+`SendProjectAgentMessage`, `ListProjectAgentMessages`, and
+`ControlProjectChild` (pause/resume/interrupt/cancel); future worktree
+operations remain provisional and must follow existing request conventions.
+`ProjectSnapshot` carries task IDs, intent, and lifecycle status so clients can
+address child controls without deriving identity from labels. The client
+control request is authorized against the project root and child membership;
+the manager agent tool continues to require its persisted run grant. Events cover child creation and
 status transitions, task updates, messages, blockers, worktree changes,
 review decisions, integration results, and cleanup disposition. Snapshots
 include project/root IDs, parent IDs, depth, task summaries, status, and
@@ -284,19 +295,21 @@ restart. Existing run-recovery behavior remains covered by its restart tests.
 1. **Implemented:** label root sessions as projects in workspace navigation
    and group their direct children under the root; the root migration preserves
    existing sessions.
-2. **Partially implemented:** show direct-child task summaries and live
-   session state in the project tree. Show blocker and latest-result details
-   in the timeline in step 4.
-3. Selecting a child opens its existing transcript/output view. Add explicit
-   per-child pause/resume/interrupt/cancel controls using existing `gpui-kit`
-   components where suitable.
-4. Show manager-child messages in the project activity timeline, visually
-   distinct from user conversation and tool activity. Expose reconnect cursors
-   and stale-state refresh through existing protocol projections. The manager
-   tool controls are implemented in Slice 1; direct per-child UI controls and
-   their protocol surface remain here.
-5. Make project stop/archive behavior visible and apply the documented
-   descendant policy.
+2. **Implemented:** show direct-child task summaries and live session state in
+   the project tree. Blocker and result messages are highlighted in the
+   activity timeline.
+3. **Implemented:** selecting a child opens its existing transcript/output
+   view; the child context menu provides pause, resume, interrupt, failed-step
+   retry, and cancel actions using existing `gpui-kit` menu controls.
+4. **Implemented:** show manager-child messages in the project activity
+   timeline, visually distinct from user conversation and tool activity.
+   Read the durable inbox for each direct project member with an independent
+   per-recipient cursor, merge messages by project sequence, and use the
+   workspace event feed cursor to refresh after reconnect or new activity.
+5. **Implemented:** pausing or interrupting the manager leaves child runs
+   independent. Project archive is rejected while any child task is queued,
+   blocked, or running; after tasks are terminal, archive the descendant
+   sessions with the root.
 
 **Exit:** users can inspect, message through the manager, and control each
 child independently; project state reconstructs after reconnect.

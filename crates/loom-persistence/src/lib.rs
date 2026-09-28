@@ -2232,7 +2232,13 @@ impl FilePersistence {
             return Ok(None);
         }
         let connection = self.connection()?;
-        let mut statement = connection
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin project snapshot read: {error}"),
+                true,
+            )
+        })?;
+        let mut statement = transaction
             .prepare(
                 "SELECT hierarchy.session_id, hierarchy.parent_session_id, hierarchy.depth,
                         session.state, session.updated_at, task.intent
@@ -2291,6 +2297,42 @@ impl FilePersistence {
         if agents.is_empty() {
             return Ok(None);
         }
+        drop(statement);
+        let mut task_statement = transaction
+            .prepare("SELECT task_id FROM delegated_tasks WHERE project_id=?1 ORDER BY created_at, task_id")
+            .map_err(|error| {
+                persistence_error(format!("could not prepare project task snapshot: {error}"), true)
+            })?;
+        let task_ids = task_statement
+            .query_map([project_id.as_uuid().as_bytes().as_slice()], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read project task snapshot: {error}"),
+                    true,
+                )
+            })?
+            .map(|row| {
+                row.map_err(|error| {
+                    persistence_error(format!("could not read project task ID: {error}"), true)
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(task_statement);
+        let tasks = task_ids
+            .iter()
+            .map(|bytes| {
+                let id = decode_uuid(bytes, "delegated task ID")?;
+                load_delegated_task(&transaction, &id)?.ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "project task index is inconsistent",
+                        false,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let root_session_id = AgentSessionId::from_uuid(*project_id.as_uuid());
         if !agents.iter().any(|agent| {
             agent.session_id == root_session_id
@@ -2303,10 +2345,18 @@ impl FilePersistence {
                 false,
             ));
         }
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not finish project snapshot read: {error}"),
+                true,
+            )
+        })?;
+        drop(connection);
         Ok(Some(ProjectSnapshot {
             project_id,
             root_session_id,
             agents,
+            tasks,
         }))
     }
 

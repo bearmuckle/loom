@@ -37,8 +37,9 @@ use gpui_kit::{
     transparent_black,
 };
 use loom_core::{
-    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
-    EventSequence, LoomError, RepositoryId, RunId, WorkspaceId, WorkspaceRecord,
+    ActivityId, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, AgentSessionState,
+    CapabilitySet, ErrorCode, EventSequence, LoomError, RepositoryId, RunId, WorkspaceId,
+    WorkspaceRecord,
 };
 use loom_model::{MessageRole, ModelId, ModelMessage, ProviderKind, ProviderSummary, ToolCall};
 #[cfg(target_family = "wasm")]
@@ -47,8 +48,9 @@ use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
     AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
     GitDiffLineKind, GitFileStatusKind, GitHubRepository, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
-    RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse, SessionDirectory,
-    SessionRepository, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
+    ProjectChildControlAction, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse,
+    SessionDirectory, SessionRepository, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus,
+    WorkspaceConfig, WorkspaceFeedEvent,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode};
@@ -612,6 +614,9 @@ fn session_id_for_request(
         | ClientRequest::SetSessionApprovalPolicy { session_id, .. }
         | ClientRequest::ForkAgentSession { session_id, .. }
         | ClientRequest::GetSessionUsage { session_id } => Some(*session_id),
+        ClientRequest::ControlProjectChild {
+            manager_session_id, ..
+        } => Some(*manager_session_id),
         ClientRequest::GetSessionEvents { session_id, .. } => {
             Some(session_id.unwrap_or(active_session_id))
         }
@@ -1384,6 +1389,14 @@ pub(crate) struct LoomView {
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
     project_snapshot: Option<loom_core::ProjectSnapshot>,
     project_snapshot_stale: bool,
+    project_messages: Vec<AgentMessageRecord>,
+    project_message_cursors: BTreeMap<AgentSessionId, u64>,
+    project_messages_stale: bool,
+    project_messages_loading: bool,
+    project_message_generation: u64,
+    project_feed_after_sequence: Option<EventSequence>,
+    project_feed_epoch: Option<String>,
+    project_poll_scheduled: bool,
     session_tree: Option<Entity<TreeState>>,
     session_tree_entries: Vec<(AgentSessionId, String)>,
     pub(crate) active_session: AgentSessionSnapshot,
@@ -1576,6 +1589,86 @@ fn project_session_list_projection(
     SessionListProjection {
         entries,
         selected_index,
+    }
+}
+
+fn workspace_feed_event_sequence(event: &WorkspaceFeedEvent) -> EventSequence {
+    match event {
+        WorkspaceFeedEvent::Session(event) => event.sequence,
+        WorkspaceFeedEvent::Workspace(event) => event.sequence,
+    }
+}
+
+fn is_project_workspace_event(
+    event: &WorkspaceFeedEvent,
+    project_id: loom_core::ProjectId,
+    member_ids: &BTreeSet<AgentSessionId>,
+) -> bool {
+    let WorkspaceFeedEvent::Session(event) = event else {
+        return false;
+    };
+    match &event.event {
+        ServerEvent::ProjectTaskUpdated { task } => task.project_id == project_id,
+        ServerEvent::ProjectAgentMessageAccepted { message } => message.project_id == project_id,
+        ServerEvent::ProjectAgentCreated { agent } | ServerEvent::ProjectAgentUpdated { agent } => {
+            agent.project_id == project_id
+        }
+        ServerEvent::AgentSessionCreated { .. }
+        | ServerEvent::AgentSessionStateChanged { .. }
+        | ServerEvent::AgentSessionRenamed { .. }
+        | ServerEvent::AgentSessionArchived { .. } => member_ids.contains(&event.session_id),
+        _ => false,
+    }
+}
+
+fn project_child_control_actions(
+    state: AgentSessionState,
+    status: loom_core::DelegatedTaskStatus,
+) -> Vec<ProjectChildControlAction> {
+    use loom_core::DelegatedTaskStatus as TaskStatus;
+    match status {
+        TaskStatus::Queued => vec![
+            ProjectChildControlAction::Continue,
+            ProjectChildControlAction::Cancel,
+        ],
+        TaskStatus::Running => match state {
+            AgentSessionState::Planning
+            | AgentSessionState::Executing
+            | AgentSessionState::AwaitingApproval
+            | AgentSessionState::Evaluating => vec![
+                ProjectChildControlAction::Pause,
+                ProjectChildControlAction::Interrupt,
+                ProjectChildControlAction::Cancel,
+            ],
+            AgentSessionState::Paused => vec![
+                ProjectChildControlAction::Continue,
+                ProjectChildControlAction::Cancel,
+            ],
+            AgentSessionState::Failed => vec![ProjectChildControlAction::RetryFailedStep],
+            _ => vec![ProjectChildControlAction::Cancel],
+        },
+        TaskStatus::Blocked => {
+            if state == AgentSessionState::Paused {
+                vec![
+                    ProjectChildControlAction::Continue,
+                    ProjectChildControlAction::Cancel,
+                ]
+            } else {
+                vec![ProjectChildControlAction::Cancel]
+            }
+        }
+        TaskStatus::Failed => vec![ProjectChildControlAction::RetryFailedStep],
+        TaskStatus::Completed | TaskStatus::Cancelled => Vec::new(),
+    }
+}
+
+fn project_child_control_label(action: ProjectChildControlAction) -> &'static str {
+    match action {
+        ProjectChildControlAction::Continue => "Resume child",
+        ProjectChildControlAction::RetryFailedStep => "Retry failed step",
+        ProjectChildControlAction::Pause => "Pause child",
+        ProjectChildControlAction::Interrupt => "Interrupt child",
+        ProjectChildControlAction::Cancel => "Cancel child task",
     }
 }
 
@@ -1832,6 +1925,14 @@ impl LoomView {
             sessions: Vec::new(),
             project_snapshot: None,
             project_snapshot_stale: false,
+            project_messages: Vec::new(),
+            project_message_cursors: BTreeMap::new(),
+            project_messages_stale: false,
+            project_messages_loading: false,
+            project_message_generation: 0,
+            project_feed_after_sequence: None,
+            project_feed_epoch: None,
+            project_poll_scheduled: false,
             session_tree: None,
             session_tree_entries: Vec::new(),
             active_session: active_session.clone(),
@@ -2218,6 +2319,14 @@ impl LoomView {
             },
             project_snapshot: None,
             project_snapshot_stale: false,
+            project_messages: Vec::new(),
+            project_message_cursors: BTreeMap::new(),
+            project_messages_stale: false,
+            project_messages_loading: false,
+            project_message_generation: 0,
+            project_feed_after_sequence: None,
+            project_feed_epoch: None,
+            project_poll_scheduled: false,
             session_tree: None,
             session_tree_entries: Vec::new(),
             active_session: session.clone(),
@@ -2376,6 +2485,14 @@ impl LoomView {
             },
             project_snapshot: None,
             project_snapshot_stale: false,
+            project_messages: Vec::new(),
+            project_message_cursors: BTreeMap::new(),
+            project_messages_stale: false,
+            project_messages_loading: false,
+            project_message_generation: 0,
+            project_feed_after_sequence: None,
+            project_feed_epoch: None,
+            project_poll_scheduled: false,
             session_tree: None,
             session_tree_entries: Vec::new(),
             active_session,
@@ -2619,6 +2736,14 @@ impl LoomView {
             },
             project_snapshot: None,
             project_snapshot_stale: false,
+            project_messages: Vec::new(),
+            project_message_cursors: BTreeMap::new(),
+            project_messages_stale: false,
+            project_messages_loading: false,
+            project_message_generation: 0,
+            project_feed_after_sequence: None,
+            project_feed_epoch: None,
+            project_poll_scheduled: false,
             session_tree: None,
             session_tree_entries: Vec::new(),
             active_session: session.clone(),
@@ -3133,6 +3258,24 @@ impl LoomView {
         self.context_inspection = None;
         self.run_state = None;
         self.after_sequence = None;
+        self.rebuild_project_message_timeline();
+    }
+
+    fn rebuild_project_message_timeline(&mut self) {
+        self.timeline
+            .retain(|item| !matches!(item, TimelineItem::ProjectMessage(_)));
+        if self
+            .project_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.root_session_id == self.active_session.id)
+        {
+            self.timeline.extend(
+                self.project_messages
+                    .iter()
+                    .cloned()
+                    .map(TimelineItem::ProjectMessage),
+            );
+        }
     }
 
     fn enable_activity_projection(&mut self) {
@@ -3153,9 +3296,20 @@ impl LoomView {
     }
 
     pub(crate) fn activate_session(&mut self, session: AgentSessionSnapshot) {
+        let workspace_changed = self.active_session.workspace_id != session.workspace_id;
         self.active_session = session;
         self.project_snapshot = None;
         self.project_snapshot_stale = false;
+        self.project_messages.clear();
+        self.project_message_cursors.clear();
+        self.project_messages_stale = false;
+        self.project_messages_loading = false;
+        self.project_message_generation = self.project_message_generation.wrapping_add(1);
+        if workspace_changed {
+            self.project_feed_after_sequence = None;
+            self.project_feed_epoch = None;
+            self.project_poll_scheduled = false;
+        }
         self.session_repositories.clear();
         self.session_directories.clear();
         self.selected_repository_id = None;
@@ -3209,9 +3363,13 @@ impl LoomView {
                 match response.result {
                     Ok(ServerResponse::ProjectSnapshot(snapshot)) => {
                         view.project_snapshot = Some(snapshot);
+                        view.project_messages_stale = true;
                     }
                     Err(error) if error.code == ErrorCode::NotFound => {
                         view.project_snapshot = None;
+                        view.project_messages.clear();
+                        view.project_message_cursors.clear();
+                        view.rebuild_project_message_timeline();
                     }
                     Err(error) => {
                         view.record_backend_error("load project snapshot", error);
@@ -3221,11 +3379,329 @@ impl LoomView {
                         unexpected_response("project snapshot", response),
                     ),
                 }
+                view.refresh_project_messages(cx);
+                view.schedule_project_poll(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn refresh_project_messages(&mut self, cx: &mut Context<Self>) {
+        if self.project_messages_loading || !self.project_messages_stale {
+            return;
+        }
+        let Some(project) = self
+            .project_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.root_session_id == self.active_session.id)
+        else {
+            return;
+        };
+        let project_id = project.project_id;
+        let mut recipients = project
+            .agents
+            .iter()
+            .filter(|agent| {
+                agent.session_id == project.root_session_id
+                    || agent.parent_session_id == Some(project.root_session_id)
+            })
+            .map(|agent| agent.session_id)
+            .collect::<Vec<_>>();
+        recipients.sort();
+        recipients.dedup();
+        if recipients.len() <= 1 {
+            self.project_messages.clear();
+            self.project_message_cursors.clear();
+            self.project_messages_stale = false;
+            self.rebuild_project_message_timeline();
+            return;
+        }
+        let backend = match self.backend_for_session(self.active_session.id) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.record_backend_error("load project messages", error);
+                return;
+            }
+        };
+        let mut cursors = self.project_message_cursors.clone();
+        let generation = self.project_message_generation;
+        self.project_messages_stale = false;
+        self.project_messages_loading = true;
+        cx.spawn(async move |view, cx| {
+            let mut messages = Vec::new();
+            let mut failure = None;
+            for session_id in recipients {
+                let mut cursor = cursors.get(&session_id).copied();
+                loop {
+                    let request = backend.submit(RequestEnvelope::new(
+                        ClientRequest::ListProjectAgentMessages {
+                            project_id,
+                            session_id,
+                            after_project_sequence: cursor,
+                            limit: 512,
+                        },
+                    ));
+                    let response = cx
+                        .background_spawn(async move { request.wait().await })
+                        .await;
+                    match response.result {
+                        Ok(ServerResponse::ProjectAgentMessages {
+                            messages: page,
+                            next_after_project_sequence,
+                        }) => {
+                            if let Some(last) = page.last() {
+                                cursor = Some(last.project_sequence);
+                                cursors.insert(session_id, last.project_sequence);
+                            }
+                            messages.extend(page);
+                            if let Some(next) = next_after_project_sequence {
+                                cursor = Some(next);
+                                cursors.insert(session_id, next);
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                        Ok(response) => {
+                            failure = Some(unexpected_response("project messages", response));
+                            break;
+                        }
+                    }
+                }
+                if failure.is_some() {
+                    break;
+                }
+            }
+            view.update(cx, |view, cx| {
+                if view.project_message_generation != generation
+                    || !view
+                        .project_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| view.active_session.id == snapshot.root_session_id)
+                {
+                    return;
+                }
+                let succeeded = failure.is_none();
+                view.project_messages_loading = false;
+                if let Some(error) = failure {
+                    view.project_messages_stale = true;
+                    view.record_backend_error("load project messages", error);
+                } else {
+                    view.project_message_cursors = cursors;
+                    for message in messages {
+                        if !view
+                            .project_messages
+                            .iter()
+                            .any(|existing| existing.message_id == message.message_id)
+                        {
+                            view.project_messages.push(message);
+                        }
+                    }
+                    view.project_messages
+                        .sort_by_key(|message| message.project_sequence);
+                    view.rebuild_project_message_timeline();
+                }
+                if succeeded && view.project_messages_stale {
+                    view.refresh_project_messages(cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn project_root_is_active(&self) -> bool {
+        self.project_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.root_session_id == self.active_session.id)
+    }
+
+    fn project_has_live_children(&self) -> bool {
+        let Some(project) = self.project_snapshot.as_ref() else {
+            return false;
+        };
+        let has_live_task = project.tasks.iter().any(|task| {
+            !matches!(
+                task.status,
+                loom_core::DelegatedTaskStatus::Completed
+                    | loom_core::DelegatedTaskStatus::Failed
+                    | loom_core::DelegatedTaskStatus::Cancelled
+            )
+        });
+        let has_live_session = project.agents.iter().any(|agent| {
+            agent.session_id != project.root_session_id
+                && matches!(
+                    agent.state,
+                    AgentSessionState::Queued
+                        | AgentSessionState::Planning
+                        | AgentSessionState::AwaitingApproval
+                        | AgentSessionState::Paused
+                        | AgentSessionState::Executing
+                        | AgentSessionState::Evaluating
+                        | AgentSessionState::NeedsInput
+                )
+        });
+        has_live_task || has_live_session
+    }
+
+    fn control_project_child_from_ui(
+        &mut self,
+        manager_session_id: AgentSessionId,
+        project_id: loom_core::ProjectId,
+        task_id: loom_core::TaskId,
+        action: ProjectChildControlAction,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(
+            cx,
+            ClientRequest::ControlProjectChild {
+                project_id,
+                manager_session_id,
+                task_id,
+                action,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::ProjectChildControlled { task, .. }) => {
+                    view.record_status(format!("{} · {:?}", task.child_name, task.status));
+                    view.project_snapshot_stale = true;
+                    view.refresh_active_project_snapshot(cx);
+                }
+                Err(error) => view.record_backend_error("control project child", error),
+                Ok(response) => view.record_backend_error(
+                    "control project child",
+                    unexpected_response("project child control", response),
+                ),
+            },
+        );
+    }
+
+    fn schedule_project_poll(&mut self, cx: &mut Context<Self>) {
+        if self.project_poll_scheduled
+            || !self.project_root_is_active()
+            || !self.project_has_live_children()
+        {
+            return;
+        }
+        self.project_poll_scheduled = true;
+        cx.spawn(async move |view, cx| {
+            #[cfg(target_family = "wasm")]
+            {
+                let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window
+                            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 1000);
+                    }
+                });
+                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+            }
+            #[cfg(not(target_family = "wasm"))]
+            cx.background_spawn(async {
+                std::thread::sleep(Duration::from_secs(1));
+            })
+            .await;
+            view.update(cx, |view, cx| {
+                if view.project_root_is_active() {
+                    view.poll_project_once(cx);
+                } else {
+                    view.project_poll_scheduled = false;
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn poll_project_once(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project_snapshot.as_ref() else {
+            self.project_poll_scheduled = false;
+            return;
+        };
+        let project_id = project.project_id;
+        let root_session_id = project.root_session_id;
+        let workspace_id = self.active_session.workspace_id;
+        let member_ids = project
+            .agents
+            .iter()
+            .map(|agent| agent.session_id)
+            .collect::<BTreeSet<_>>();
+        let after_sequence = self.project_feed_after_sequence;
+        let stream_epoch = self.project_feed_epoch.clone();
+        self.dispatch(
+            cx,
+            ClientRequest::GetSessionEvents {
+                session_id: None,
+                workspace_id: Some(workspace_id),
+                after_sequence,
+                stream_epoch,
+            },
+            move |view, response, cx| {
+                if view.active_session.id != root_session_id
+                    || view.active_session.workspace_id != workspace_id
+                {
+                    view.project_poll_scheduled = false;
+                    return;
+                }
+                view.project_poll_scheduled = false;
+                match response.result {
+                    Ok(ServerResponse::WorkspaceEvents {
+                        workspace_id: response_workspace,
+                        events,
+                        stream_epoch,
+                    }) if response_workspace == workspace_id => {
+                        view.project_feed_epoch = stream_epoch;
+                        if let Some(latest) = events.iter().map(workspace_feed_event_sequence).max()
+                        {
+                            view.project_feed_after_sequence = Some(
+                                view.project_feed_after_sequence
+                                    .map_or(latest, |current| current.max(latest)),
+                            );
+                        }
+                        if events
+                            .iter()
+                            .any(|event| is_project_workspace_event(event, project_id, &member_ids))
+                        {
+                            view.project_snapshot_stale = true;
+                            view.project_messages_stale = true;
+                        }
+                    }
+                    Ok(ServerResponse::WorkspaceEventsSnapshot {
+                        workspace_id: response_workspace,
+                        events,
+                        latest_sequence,
+                        stream_epoch,
+                        ..
+                    }) if response_workspace == workspace_id => {
+                        view.project_feed_epoch = stream_epoch;
+                        view.project_feed_after_sequence = Some(latest_sequence);
+                        view.project_snapshot_stale = true;
+                        view.project_messages_stale = true;
+                        if events
+                            .iter()
+                            .any(|event| is_project_workspace_event(event, project_id, &member_ids))
+                        {
+                            view.project_snapshot_stale = true;
+                        }
+                    }
+                    Err(error) => view.record_backend_error("project event stream", error),
+                    Ok(response) => view.record_backend_error(
+                        "project event stream",
+                        unexpected_response("project event stream", response),
+                    ),
+                }
+                if view.project_snapshot_stale {
+                    view.refresh_active_project_snapshot(cx);
+                } else if view.project_messages_stale {
+                    view.refresh_project_messages(cx);
+                }
+                view.schedule_project_poll(cx);
+            },
+        );
     }
 
     /// Loads a session synchronously.
@@ -3349,6 +3825,7 @@ impl LoomView {
             .result
         {
             self.project_snapshot = Some(snapshot);
+            self.project_messages_stale = true;
         }
     }
 
@@ -3499,6 +3976,9 @@ impl LoomView {
                 if view.project_snapshot_stale {
                     view.refresh_active_project_snapshot(cx);
                 }
+                if view.project_messages_stale {
+                    view.refresh_project_messages(cx);
+                }
                 view.run_poll_scheduled = false;
                 view.schedule_run_poll(cx);
             },
@@ -3570,10 +4050,12 @@ impl LoomView {
     pub(crate) fn consume_event(&mut self, event: &ServerEvent) {
         match event {
             ServerEvent::ProjectTaskUpdated { .. }
-            | ServerEvent::ProjectAgentMessageAccepted { .. }
             | ServerEvent::ProjectAgentCreated { .. }
             | ServerEvent::ProjectAgentUpdated { .. } => {
                 self.project_snapshot_stale = true;
+            }
+            ServerEvent::ProjectAgentMessageAccepted { .. } => {
+                self.project_messages_stale = true;
             }
             ServerEvent::AgentSessionCreated { snapshot } => {
                 self.active_session = snapshot.clone();
@@ -7282,6 +7764,7 @@ impl LoomView {
         let menu_sessions = sessions.clone();
         let menu_entries = entries.clone();
         let menu_view = view.clone();
+        let menu_project = self.project_snapshot.clone();
         KitTree::new(&tree, move |index, _, selected, _, app| {
             let Some((session_id, label)) = entries.get(index).cloned() else {
                 return ListItem::new(("session-tree-root", index));
@@ -7341,18 +7824,54 @@ impl LoomView {
             let rename_view = menu_view.clone();
             let archive_view = menu_view.clone();
             let rename_session = session.clone();
-            menu.item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
-                let rename_session = rename_session.clone();
-                rename_view.update(cx, |view, cx| {
-                    view.begin_session_rename(rename_session, window, cx);
-                });
-            }))
-            .item(PopupMenuItem::new("Archive").on_click(move |_, _, cx| {
-                archive_view.update(cx, |view, cx| {
-                    view.select_session(session.clone(), cx);
-                    view.archive_active(cx);
-                });
-            }))
+            let archive_session = session.clone();
+            let archive_label = menu_project
+                .as_ref()
+                .filter(|project| project.root_session_id == session.id)
+                .map_or("Archive", |_| "Archive project");
+            let mut menu = menu
+                .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                    let rename_session = rename_session.clone();
+                    rename_view.update(cx, |view, cx| {
+                        view.begin_session_rename(rename_session, window, cx);
+                    });
+                }))
+                .item(PopupMenuItem::new(archive_label).on_click(move |_, _, cx| {
+                    archive_view.update(cx, |view, cx| {
+                        view.select_session(archive_session.clone(), cx);
+                        view.archive_active(cx);
+                    });
+                }));
+            if let Some(project) = menu_project.as_ref()
+                && let Some(child) = project.agents.iter().find(|agent| {
+                    agent.session_id == session.id
+                        && agent.parent_session_id == Some(project.root_session_id)
+                })
+                && let Some(task) = project
+                    .tasks
+                    .iter()
+                    .find(|task| task.target_session_id == child.session_id)
+            {
+                let manager_session_id = project.root_session_id;
+                let project_id = project.project_id;
+                for action in project_child_control_actions(child.state, task.status) {
+                    let control_view = menu_view.clone();
+                    let task_id = task.task_id;
+                    let action_label = project_child_control_label(action);
+                    menu = menu.item(PopupMenuItem::new(action_label).on_click(move |_, _, cx| {
+                        control_view.update(cx, |view, cx| {
+                            view.control_project_child_from_ui(
+                                manager_session_id,
+                                project_id,
+                                task_id,
+                                action,
+                                cx,
+                            );
+                        });
+                    }));
+                }
+            }
+            menu
         })
         .size_full()
     }
@@ -7739,6 +8258,51 @@ impl LoomView {
                 .into_any(),
             TimelineItem::ActivitySection { activities } => {
                 self.render_activity_section(activities, index, parent)
+            }
+            TimelineItem::ProjectMessage(message) => {
+                let kind = match message.kind {
+                    loom_core::AgentMessageKind::Progress => "Progress",
+                    loom_core::AgentMessageKind::Result => "Result",
+                    loom_core::AgentMessageKind::Question => "Question",
+                    loom_core::AgentMessageKind::Blocker => "Blocker",
+                    loom_core::AgentMessageKind::Direction => "Direction",
+                    loom_core::AgentMessageKind::Answer => "Answer",
+                };
+                let participant = |session_id: AgentSessionId| {
+                    self.sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| session.name.clone())
+                        .unwrap_or_else(|| session_id.to_string())
+                };
+                let accent = if message.kind == loom_core::AgentMessageKind::Blocker {
+                    rgb(0xfbbf24)
+                } else if message.kind == loom_core::AgentMessageKind::Result {
+                    rgb(0x86efac)
+                } else {
+                    rgb(0x93c5fd)
+                };
+                div()
+                    .mx_3()
+                    .my_1()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(rgb(0x172033))
+                    .border_1()
+                    .border_color(rgb(0x334155))
+                    .text_color(rgb(0xe2e8f0))
+                    .child(div().text_xs().text_color(accent).child(format!(
+                        "Project {kind} · {} → {} · #{}",
+                        participant(message.sender_session_id),
+                        participant(message.target_session_id),
+                        message.project_sequence
+                    )))
+                    .child(render_timeline_text(
+                        format!("project-message-{}", message.message_id),
+                        message.body.clone(),
+                        0xe2e8f0,
+                    ))
+                    .into_any()
             }
             TimelineItem::Plan {
                 steps,
@@ -10327,6 +10891,10 @@ impl Render for LoomView {
         self.sync_model_select_states(window, cx);
         self.sync_agent_mode_select_state(window, cx);
         self.schedule_run_poll(cx);
+        if self.project_messages_stale {
+            self.refresh_project_messages(cx);
+        }
+        self.schedule_project_poll(cx);
         let view = cx.entity();
         let layout = responsive_layout(window.bounds().size.width);
         let review_panel_visible = review_panel_is_visible(
@@ -13639,10 +14207,10 @@ mod worker_node_tests {
         connection_placeholder, format_percentage, format_session_resource_percentages,
         format_worker_node_resources, initial_worker_nodes, local_source_available,
         mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
-        order_session_nodes, project_session_list_projection, remove_worker_node_entry,
-        safe_worker_url_label, session_id_for_request, session_list_projection,
-        session_node_indicator_state, session_node_pulse, session_owner_status,
-        source_choice_is_allowed, source_dialog_initial_state,
+        order_session_nodes, project_child_control_actions, project_session_list_projection,
+        remove_worker_node_entry, safe_worker_url_label, session_id_for_request,
+        session_list_projection, session_node_indicator_state, session_node_pulse,
+        session_owner_status, source_choice_is_allowed, source_dialog_initial_state,
         transition_worker_connection_to_connecting, update_worker_node_status,
         validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
         worker_node_name_for_id, worker_url_embeds_credential,
@@ -13653,7 +14221,9 @@ mod worker_node_tests {
     };
     use loom_core::{ErrorCode, LoomError};
     use loom_model::ModelId;
-    use loom_protocol::{ClientRequest, WorkerNodeResources, WorkerNodeStatus};
+    use loom_protocol::{
+        ClientRequest, ProjectChildControlAction, WorkerNodeResources, WorkerNodeStatus,
+    };
     use std::collections::BTreeMap;
 
     fn node(id: u64, is_local: bool) -> WorkerNodeEntry {
@@ -14008,6 +14578,7 @@ mod worker_node_tests {
                     updated_at: Timestamp::from_unix_millis(2),
                 },
             ],
+            tasks: vec![],
         };
 
         let projection = project_session_list_projection(&sessions, child_id, Some(&project));
@@ -14024,6 +14595,34 @@ mod worker_node_tests {
             ]
         );
         assert_eq!(projection.selected_index, Some(1));
+    }
+
+    #[test]
+    fn project_child_controls_follow_run_and_task_state() {
+        use AgentSessionState as SessionState;
+        use ProjectChildControlAction as Action;
+        use loom_core::DelegatedTaskStatus as TaskStatus;
+
+        assert_eq!(
+            project_child_control_actions(SessionState::Executing, TaskStatus::Running),
+            vec![Action::Pause, Action::Interrupt, Action::Cancel]
+        );
+        assert_eq!(
+            project_child_control_actions(SessionState::Paused, TaskStatus::Blocked),
+            vec![Action::Continue, Action::Cancel]
+        );
+        assert_eq!(
+            project_child_control_actions(SessionState::Queued, TaskStatus::Queued),
+            vec![Action::Continue, Action::Cancel]
+        );
+        assert_eq!(
+            project_child_control_actions(SessionState::Failed, TaskStatus::Failed),
+            vec![Action::RetryFailedStep]
+        );
+        assert!(
+            project_child_control_actions(SessionState::Completed, TaskStatus::Completed)
+                .is_empty()
+        );
     }
 
     #[test]
