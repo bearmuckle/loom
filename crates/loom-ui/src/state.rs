@@ -253,18 +253,6 @@ impl ToolPartStatus {
             Self::Cancelled => "cancelled",
         }
     }
-
-    pub(crate) const fn marker(self) -> &'static str {
-        match self {
-            Self::Queued => "○",
-            Self::Running => "›",
-            Self::AwaitingApproval => "!",
-            Self::AwaitingInput => "?",
-            Self::Completed => "✓",
-            Self::Failed => "×",
-            Self::Cancelled => "–",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -652,17 +640,17 @@ mod tests {
     }
 
     #[test]
-    fn tool_part_status_markers_cover_every_state() {
-        for (status, marker) in [
-            (ToolPartStatus::Queued, "○"),
-            (ToolPartStatus::Running, "›"),
-            (ToolPartStatus::AwaitingApproval, "!"),
-            (ToolPartStatus::AwaitingInput, "?"),
-            (ToolPartStatus::Completed, "✓"),
-            (ToolPartStatus::Failed, "×"),
-            (ToolPartStatus::Cancelled, "–"),
+    fn tool_part_status_labels_cover_every_state() {
+        for (status, label) in [
+            (ToolPartStatus::Queued, "queued"),
+            (ToolPartStatus::Running, "running"),
+            (ToolPartStatus::AwaitingApproval, "approval required"),
+            (ToolPartStatus::AwaitingInput, "waiting for input"),
+            (ToolPartStatus::Completed, "done"),
+            (ToolPartStatus::Failed, "failed"),
+            (ToolPartStatus::Cancelled, "cancelled"),
         ] {
-            assert_eq!(status.marker(), marker);
+            assert_eq!(status.label(), label);
         }
     }
 }

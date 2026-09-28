@@ -14,6 +14,7 @@ mod connection;
 #[cfg(not(target_family = "wasm"))]
 mod platform;
 mod state;
+mod syntax;
 mod theme;
 mod view;
 

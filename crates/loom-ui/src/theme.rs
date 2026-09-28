@@ -3,7 +3,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
-use gpui_kit::{App, Rgba, WindowAppearance};
+use gpui_kit::{App, Rgba, SharedString, WindowAppearance};
 
 pub(crate) const ERROR_CARD_SURFACE: u32 = 0x171c25;
 pub(crate) const ERROR_CARD_FOREGROUND: u32 = 0xe5e7eb;
@@ -368,12 +368,31 @@ fn latte_theme() -> Rc<ThemeConfig> {
 
 thread_local! {
     static ACTIVE_THEME: RefCell<Option<ThemePalette>> = const { RefCell::new(None) };
+    static MONO_FONT: RefCell<Option<SharedString>> = const { RefCell::new(None) };
+    static MONO_SIZE: std::cell::Cell<f32> = const { std::cell::Cell::new(13.) };
 }
 
 /// Synchronizes the app-local color helper with gpui-component's active theme.
 pub(crate) fn sync_palette(cx: &App) {
-    let palette = ThemePalette::from_theme(Theme::global(cx));
+    let theme = Theme::global(cx);
+    let palette = ThemePalette::from_theme(theme);
     ACTIVE_THEME.with(|active| *active.borrow_mut() = Some(palette));
+    MONO_FONT.with(|font| *font.borrow_mut() = Some(theme.mono_font_family.clone()));
+    MONO_SIZE.with(|size| size.set(f32::from(theme.mono_font_size)));
+}
+
+/// The active theme's monospace family, used for code, diffs, and commands.
+pub(crate) fn mono_font() -> SharedString {
+    MONO_FONT.with(|font| {
+        font.borrow()
+            .clone()
+            .unwrap_or_else(|| SharedString::from("monospace"))
+    })
+}
+
+/// The active theme's monospace size in pixels.
+pub(crate) fn mono_size() -> f32 {
+    MONO_SIZE.with(std::cell::Cell::get)
 }
 
 /// Resolves a legacy color role through the active component theme.
@@ -480,29 +499,31 @@ mod tests {
 
     #[test]
     fn every_legacy_color_literal_used_by_the_view_is_mapped() {
-        let source = include_str!("view.rs");
-        let mut unmapped = Vec::new();
-        let mut rest = source;
-        while let Some(index) = rest.find("rgb(0x") {
-            let after = &rest[index + "rgb(0x".len()..];
-            let digits = after
-                .chars()
-                .take_while(|character| character.is_ascii_hexdigit())
-                .take(6)
-                .collect::<String>();
-            if let Ok(value) = u32::from_str_radix(&digits, 16)
-                && legacy_color_role(value).is_none()
-            {
-                unmapped.push(value);
+        let sources = [include_str!("view.rs"), include_str!("syntax.rs")];
+        for source in sources {
+            let mut unmapped = Vec::new();
+            let mut rest = source;
+            while let Some(index) = rest.find("rgb(0x") {
+                let after = &rest[index + "rgb(0x".len()..];
+                let digits = after
+                    .chars()
+                    .take_while(|character| character.is_ascii_hexdigit())
+                    .take(6)
+                    .collect::<String>();
+                if let Ok(value) = u32::from_str_radix(&digits, 16)
+                    && legacy_color_role(value).is_none()
+                {
+                    unmapped.push(value);
+                }
+                rest = after;
             }
-            rest = after;
+            unmapped.sort_unstable();
+            unmapped.dedup();
+            assert!(
+                unmapped.is_empty(),
+                "ui source uses colors that are not mapped to a theme role: {unmapped:06x?}"
+            );
         }
-        unmapped.sort_unstable();
-        unmapped.dedup();
-        assert!(
-            unmapped.is_empty(),
-            "view.rs uses colors that are not mapped to a theme role: {unmapped:06x?}"
-        );
     }
 
     #[test]
