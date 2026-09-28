@@ -58,14 +58,12 @@ The target domain model separates organization from execution:
 The protocol exposes workspace lifecycle/list operations,
 workspace-scoped session listing/creation, and session-scoped repository
 attachment and filesystem operations. Workspace IDs are independent of paths
-and repository IDs. Protocol version 2 is the clean break for this ownership
-model; version 1 clients are rejected rather than adapted.
-
-Protocol version 2 includes `DiscoverCapabilities`,
+and repository IDs. The contract includes `DiscoverCapabilities`,
 `ClientFrame`/`ServerFrame` codec types, and `SessionEventsSnapshot`.
 Version compatibility is major-version based: a client may negotiate a newer
 minor version within the same major, while an incompatible major returns the
-existing `unsupported_protocol` error.
+existing `unsupported_protocol` error. Deployments must ensure or force clients
+to upgrade; old-client forward compatibility is not supported.
 
 Approval policies are scoped to an agent session. Session snapshots
 include the effective approval policy and the session's `auto_approve_actions`
@@ -96,11 +94,11 @@ revision changes carry a workspace ID directly and never use a synthetic
 session ID. The workspace sequence is shared with session events so clients can
 resume one ordered workspace feed.
 
-The server retains a bounded global journal (4096 events by default). If a
-session-specific cursor is older than the retained range,
-`GetSessionEvents` returns `SessionEventsSnapshot` with the current session
-projection, retained events, the oldest available sequence, and the latest
-global sequence. The client must replace its projection and resume from the
+The server retains a bounded event journal per session and per workspace (4096
+events each by default). If a session-specific cursor is older than the
+retained range, `GetSessionEvents` returns `SessionEventsSnapshot` with the
+current session projection, retained events, the oldest available sequence, and
+the latest sequence. The client must replace its projection and resume from the
 latest sequence in the response. Requests with a stable `RequestId` are
 idempotent for retryable mutations; the bounded idempotency cache is persisted
 with durable backend state.

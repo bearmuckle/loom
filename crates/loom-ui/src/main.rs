@@ -70,6 +70,10 @@ fn main() {
         },
         options.model.as_str()
     );
+    if let Err(error) = crate::platform::prepare_backend_state(&options) {
+        error!("{error}");
+        std::process::exit(1);
+    }
     gpui_kit::platform::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx: &mut App| {
@@ -111,7 +115,14 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     ..Default::default()
                 },
-                |_, cx| cx.new(|_| view),
+                // The component `Root` hosts the per-window `WindowState` that
+                // dialogs and inputs require. gpui-component's `window_border` is
+                // solely responsible for client-side window chrome, so Loom does
+                // not draw its own window frame.
+                |window, cx| {
+                    let view = cx.new(|_| view);
+                    cx.new(|cx| gpui_kit::component::Root::new(view, window, cx))
+                },
             ) {
                 Ok(window) => window,
                 Err(error) => {
@@ -121,11 +132,18 @@ fn main() {
                 }
             };
             info!("Loom window opened");
-            if let Err(error) = window.update(cx, |view, window, cx| {
-                view.reconnect_configured_worker_nodes(cx);
-                view.observe_system_appearance(window, cx);
-                view.select_theme(crate::state::ThemeChoice::System, window, cx);
-                view.composer_focus_handle.focus(window, cx);
+            if let Err(error) = window.update(cx, |root, window, cx| {
+                let view = root
+                    .view()
+                    .clone()
+                    .downcast::<LoomView>()
+                    .expect("Loom window root should contain LoomView");
+                view.update(cx, |view, cx| {
+                    view.reconnect_configured_worker_nodes(cx);
+                    view.observe_system_appearance(window, cx);
+                    view.select_theme(crate::state::ThemeChoice::System, window, cx);
+                    view.composer_focus_handle.focus(window, cx);
+                });
                 cx.activate(true);
             }) {
                 error!("failed to focus Loom composer: {error}");

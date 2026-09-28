@@ -30,11 +30,9 @@ use gpui_kit::component::{
     tree::{Tree as KitTree, TreeItem, TreeState},
 };
 use gpui_kit::{
-    Animation, AnimationExt, App, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle,
-    Decorations, Element, Entity, FocusHandle, Focusable, HighlightStyle, HitboxBehavior,
-    ListAlignment, ListState, MouseButton, Pixels, Render, ResizeEdge, Subscription, Tiling,
-    Window, WindowAppearance, WindowControlArea, canvas, div, list, point, prelude::*, px,
-    transparent_black,
+    Animation, AnimationExt, App, ClickEvent, ClipboardItem, Context, Element, Entity, FocusHandle,
+    Focusable, HighlightStyle, ListAlignment, ListState, MouseButton, Pixels, Render, Subscription,
+    Window, WindowAppearance, WindowControlArea, div, list, prelude::*, px,
 };
 use loom_core::{
     ActivityId, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, AgentSessionState,
@@ -67,10 +65,7 @@ use crate::{
         ThemeChoice, TimelineItem, activity_status_label, bounded, bounded_to,
         session_state_for_run, session_title_from_task, upsert_activity,
     },
-    theme::{
-        CLIENT_DECORATION_SHADOW, ClientCorners, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
-        ERROR_CARD_SURFACE, change_color, resize_edge, rgb,
-    },
+    theme::{ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND, ERROR_CARD_SURFACE, change_color, rgb},
 };
 
 #[cfg(not(target_family = "wasm"))]
@@ -11647,24 +11642,6 @@ impl Render for LoomView {
             self.providers_open,
             self.github_login.is_some(),
         );
-        let decorations = window.window_decorations();
-        let client_decorated = matches!(decorations, Decorations::Client { .. });
-        let shadow_size = CLIENT_DECORATION_SHADOW;
-        let mut tiling = match decorations {
-            Decorations::Client { tiling } => tiling,
-            Decorations::Server => Tiling::default(),
-        };
-        if window.is_maximized() || window.is_fullscreen() {
-            tiling = Tiling::tiled();
-        }
-        let decoration_inset = if tiling.is_tiled() {
-            px(0.)
-        } else {
-            shadow_size
-        };
-        if client_decorated {
-            window.set_client_inset(shadow_size);
-        }
         let panel_layout = h_resizable("loom-workspace-panels")
             .with_handle_appearance(Rc::new(|handle, _, _| {
                 let active = handle.is_active();
@@ -11981,7 +11958,6 @@ impl Render for LoomView {
                     .bg(rgb(0x1b1d24))
                     .border_b_1()
                     .border_color(rgb(0x30343f))
-                    .rounded_client_top(client_decorated, tiling)
                     .when(cfg!(target_os = "macos"), |element| element.pl(px(72.)))
                     .child(
                         div()
@@ -12098,7 +12074,6 @@ impl Render for LoomView {
                     .bg(rgb(0x1b1d24))
                     .border_t_1()
                     .border_color(rgb(0x30343f))
-                    .rounded_client_bottom(client_decorated, tiling)
                     .text_xs()
                     .text_color(rgb(0x8f98a6))
                     .child(format!(
@@ -12112,82 +12087,7 @@ impl Render for LoomView {
                         if self.demo_workspace { "Demo" } else { "Local" }
                     )),
             );
-        let content = content.rounded_client_corners(client_decorated, tiling);
-        match decorations {
-            Decorations::Server => div().size_full().child(content),
-            Decorations::Client { .. } => div()
-                .size_full()
-                .bg(transparent_black())
-                .when(!tiling.top, |element| element.pt(shadow_size))
-                .when(!tiling.bottom, |element| element.pb(shadow_size))
-                .when(!tiling.left, |element| element.pl(shadow_size))
-                .when(!tiling.right, |element| element.pr(shadow_size))
-                .child(
-                    div()
-                        .size_full()
-                        .rounded_client_corners(true, tiling)
-                        .when(!tiling.is_tiled(), |element| {
-                            element.border_1().border_color(rgb(0x30343f)).shadow(vec![
-                                gpui_kit::BoxShadow {
-                                    color: gpui_kit::hsla(0., 0., 0., 0.4),
-                                    blur_radius: shadow_size / 2.,
-                                    spread_radius: px(0.),
-                                    offset: point(px(0.), px(0.)),
-                                    inset: false,
-                                },
-                            ])
-                        })
-                        .child(content),
-                )
-                .child(
-                    canvas(
-                        |_bounds, window, _cx| {
-                            window.insert_hitbox(
-                                Bounds::new(
-                                    point(px(0.), px(0.)),
-                                    window.window_bounds().get_bounds().size,
-                                ),
-                                HitboxBehavior::Normal,
-                            )
-                        },
-                        move |_bounds, hitbox, window, _cx| {
-                            let size = window.window_bounds().get_bounds().size;
-                            let Some(edge) =
-                                resize_edge(window.mouse_position(), decoration_inset, size)
-                            else {
-                                return;
-                            };
-                            window.set_cursor_style(
-                                match edge {
-                                    ResizeEdge::Top | ResizeEdge::Bottom => {
-                                        CursorStyle::ResizeUpDown
-                                    }
-                                    ResizeEdge::Left | ResizeEdge::Right => {
-                                        CursorStyle::ResizeLeftRight
-                                    }
-                                    ResizeEdge::TopLeft | ResizeEdge::BottomRight => {
-                                        CursorStyle::ResizeUpLeftDownRight
-                                    }
-                                    ResizeEdge::TopRight | ResizeEdge::BottomLeft => {
-                                        CursorStyle::ResizeUpRightDownLeft
-                                    }
-                                },
-                                &hitbox,
-                            );
-                        },
-                    )
-                    .size_full()
-                    .absolute(),
-                )
-                .on_mouse_move(|_, window, _| window.refresh())
-                .on_mouse_down(MouseButton::Left, move |event, window, _| {
-                    let size = window.window_bounds().get_bounds().size;
-                    if let Some(edge) = resize_edge(event.position, decoration_inset, size) {
-                        window.start_window_resize(edge);
-                    }
-                }),
-        }
-        .into_any()
+        content.into_any()
     }
 }
 
@@ -12878,6 +12778,7 @@ mod loom_view_render_tests {
                 api_key: None,
                 remote: Some(remote.to_owned()),
                 token: token.map(str::to_owned),
+                reset_state: false,
             };
             let error = match LoomView::try_new(
                 &options("ws://user:secret@worker.example", Some("token")),
@@ -12915,6 +12816,7 @@ mod loom_view_render_tests {
                 api_key: None,
                 remote: None,
                 token: None,
+                reset_state: false,
             };
             let error = match LoomView::try_new(&local_options, cx.focus_handle()) {
                 Err(error) => error,
@@ -12942,6 +12844,7 @@ mod loom_view_render_tests {
                 api_key: None,
                 remote: None,
                 token: None,
+                reset_state: false,
             };
             let workspace_root =
                 std::env::temp_dir().join(format!("loom-ui-bootstrap-{}", uuid::Uuid::new_v4()));

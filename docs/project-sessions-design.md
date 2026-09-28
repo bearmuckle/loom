@@ -1,58 +1,50 @@
 # Project sessions and coordinated sub-agents
 
+> **Storage baseline note.** Loom now uses a single SQLite baseline schema
+> (version 1) with no migration ladder and no legacy import; an incompatible
+> database is rejected and must be wiped. Per-run project-agent grants are one
+> versioned JSON payload (`run_runtime_config.project_grants`) and delegated-task
+> grants are `delegated_tasks.permissions`. See [durable storage](storage.md).
+
 ## Status and scope
 
 This document turns [GitHub issue #17](https://github.com/bearmuckle/loom/issues/17),
 “Project sessions and coordinated sub-agents,” into an implementation design.
 It is the design and sequencing plan for the feature. The issue is XL-sized, so
-delivery is split into reviewable slices. Slices 0–3 provide direct-child
-coordination, child controls, and reviewed worktrees; that contract uses
-protocol 7.0 and SQLite schema v47. The current draft extends it through
-protocol 8.0/schema v48 for independent delegated-task grants, explicitly
-authorized branch messaging, and durable manager wait/join state. Since that
-milestone is already on the draft branch, the independent persisted review-run
-grant now uses protocol 9.0 and schema v49, with a forward v48-to-v49 migration.
-The current draft advances to protocol 10.0 to make child creation manager-only:
-clients cannot create children directly; the server-bound manager tool checks
-the executing run's persisted delegation grants. This protocol change does not
-add a storage migration. Separately, interruption-safe cancellation recovery
-adds the forward v49-to-v50 storage migration without changing protocol 10.0.
-The current draft advances to protocol 11.0 and schema v51 for deterministic
-conversation/activity ordering. Every run-wide message and activity receives
-one monotonic ordinal when created; persisted transcript pages and activity
-records carry it, and restored UI entries merge by that value. Loading older
-pages is idempotent by transcript message ordinal. Schema v50 did not store a
-cross-stream order, so its migration assigns a stable legacy order; the exact
-historical interleaving of those old rows is unrecoverable.
-The draft also parks a manager at a safe checkpoint, releases its workspace
+delivery is split into reviewable slices. Direct-child coordination, child
+controls, and reviewed worktrees shipped first; independent delegated-task
+grants, explicitly authorized branch messaging, and durable manager wait/join
+state followed. Child creation is now available only through the run-granted
+manager tool: clients cannot create children directly, and the server-bound
+tool checks the executing run's persisted grants. Every run-wide message and
+activity receives one monotonic ordinal when created, so restored UI entries
+merge deterministically and older-page loading is idempotent by transcript
+message ordinal. The manager parks at a safe checkpoint, releases its workspace
 slot, resumes the original tool continuation once selected children are ready,
-blocks premature manager completion, and admits queued work under a workspace-wide
-concurrency limit. Failed or cancelled prerequisites now leave dependent tasks
-blocked with their dependency IDs available for inspection; terminal manager
-waits are abandoned during recovery, and code completion requires a reviewed
-result and integration when changes exist. Descendant cascade cancellation,
-nested permission checks, parent-relative worktree integration, owner-edge
-controls, recursive project-tree rendering, descendant inbox display, and
-oldest-first admission across ready joins and queued tasks are implemented in
-the current worktree. Focused server E2Es validate parked-wait recovery across
-restart with exactly-once replay, cap-one and oldest-first admission, deepest-
-first cancellation with terminal state persistence, both nested worktree
-integration edges, and explicitly granted non-adjacent branch messaging.
-Failed-run prerequisite wakeup and recovery from interruption during a cascade
-are also covered. Cascade intent and its ordered subtree snapshot are persisted
-in schema v50 and replayed after runtime restoration but before queued-work
-reconciliation. Depth-three delegation is enabled after these recovery paths
-were validated.
-Deployments must ensure or force clients to upgrade:
-the backend rejects clients that do not negotiate protocol 11.0 before serving
-the new contract. Old-client forward compatibility and backend/schema
-downgrades are unsupported.
+blocks premature manager completion, and admits queued work under a
+workspace-wide concurrency limit. Failed or cancelled prerequisites leave
+dependent tasks blocked with their dependency IDs available for inspection;
+terminal manager waits are abandoned during recovery; and code completion
+requires a reviewed result and integration when changes exist. Descendant
+cascade cancellation, nested permission checks, parent-relative worktree
+integration, owner-edge controls, recursive project-tree rendering, descendant
+inbox display, and oldest-first admission across ready joins and queued tasks
+are implemented. Focused server E2Es validate parked-wait recovery across
+restart with exactly-once replay, cap-one and oldest-first admission,
+deepest-first cancellation with terminal state persistence, both nested
+worktree integration edges, explicitly granted non-adjacent branch messaging,
+failed-run prerequisite wakeup, and recovery from interruption during a
+cascade. Cascade intent and its ordered subtree snapshot are persisted and
+replayed after runtime restoration but before queued-work reconciliation.
+Depth-three delegation is enabled after these recovery paths were validated.
+Deployments must ensure or force clients to upgrade: the backend rejects
+clients that do not negotiate a compatible protocol major before serving the
+new contract, and old-client forward compatibility is unsupported.
 
-The existing implementation also includes forward v41-to-v51 SQLite
-migrations, durable child/task creation, persisted child model selection,
-restart scheduling for queued children, dependency gating, task-state
-reconciliation, and durable parent-child message delivery at safe model-turn
-boundaries. Project agents can inspect direct-child task and session status;
+The implementation also includes durable child/task creation, persisted child
+model selection, restart scheduling for queued children, dependency gating,
+task-state reconciliation, and durable parent-child message delivery at safe
+model-turn boundaries. Project agents can inspect direct-child task and session status;
 managers can continue a paused child, retry its failed tool step, or cancel it.
 The workspace navigator groups each project root with its direct children and
 shows child task summaries and live state; loading from a child resolves the
@@ -106,8 +98,8 @@ project's authority and cannot become a root project implicitly.
 
 Agent status, messages, task intent, permissions, worktree state, integration,
 and lifecycle are backend-authoritative. Clients render snapshots and ordered
-events; they do not own coordination state. Existing persisted sessions must
-be represented as project roots with no children when the model is introduced.
+events; they do not own coordination state. A session with no parent is its
+project's root and has no children until it delegates.
 
 ## Coordination and lifecycle behavior
 
@@ -217,53 +209,6 @@ pre-feature version/error envelope must remain sufficient to deliver this
 rejection; do not add a new error enum value that an old client would need to
 decode.
 
-Protocol 6.0 also carries the workspace-level project-agent concurrency
-setting. Because this protocol version is part of the coordinated project
-release, clients are upgraded or rejected at negotiation before using the new
-field. The persisted workspace-config JSON uses a serde default of four when
-the field is absent, so existing stored settings do not need a separate SQLite
-schema migration.
-
-The child-worktree and integration contract advances the protocol to 7.0 and
-the SQLite schema to v47. Protocol 6.x request envelopes are rejected before
-dispatch, including capability discovery; `Negotiate` also checks its embedded
-client version. No v7 worktree request, response, or event is sent to those
-clients; deployments must ensure or force the client upgrade. The implemented
-v46-to-v47 migration adds durable worktree ownership, base/result, integration,
-conflict, and cleanup state, plus default-disabled per-run code-worktree and
-integration grants. A backend that only supports v46 cannot open a database
-after migration to v47. Backend and schema downgrades remain unsupported;
-recover by restoring a pre-upgrade backup or moving forward with a fix.
-
-Slices 0–3 initially required protocol 7.0 for child worktrees and integration.
-M7.4 used protocol 9.0 for the independent review-run grant and protocol 10.0
-for manager-only child creation; it now requires protocol 11.0 for shared
-timeline ordering. Keep the existing session request surface for root-session
-operations where practical, but admitted clients treat roots as
-projects. The server rejects unsupported clients with `UnsupportedProtocol`
-before serving protocol-specific variants or project schemas. Backend
-downgrades to pre-project protocol/storage versions are unsupported, including
-when no child agents have been created.
-
-The M7.4 contract adds independently persisted delegation, branch messaging,
-child-control, review, and integration grants to delegated-task intent, plus
-durable state for managers waiting on their descendants. Protocol 8.0 and
-schema v48 introduced branch messaging and durable manager waits. The review
-run grant was added after that milestone reached the draft branch, so protocol
-9.0 used schema v49. Protocol 10.0/schema v50 made child creation manager-only.
-The current contract is protocol 11.0/schema v51; protocol 10.x and older
-clients must upgrade before negotiation succeeds, and request envelopes must
-use the supported protocol major before any dispatch, including capability
-discovery.
-Protocol 10 removes the client child-creation request. Protocol 11 adds the
-shared timeline order. Deployments must ensure or force protocol-11 clients.
-Backends that only support schema v50 must reject schema v51 databases. The
-v47-to-v48, v48-to-v49, v49-to-v50, and v50-to-v51 migrations are forward-only,
-with every newly introduced grant disabled for existing tasks and runs. Do not
-infer branch messaging from the existing direct-message grant. Agent-attributed
-messages must be submitted by the server-bound agent tool; a client-supplied
-sender session ID is not an agent identity.
-
 Persist normalized queryable records for project membership/parentage,
 delegated task intent and dependencies, message envelope/body and ordering,
 and worktree/integration state. Use foreign keys and transactions so child
@@ -274,28 +219,9 @@ Enforce one root per project, same-project parentage, no cycles, and
 maximum depth three in the backend domain service and persistence boundary.
 Do not place growing messages or child lists inside session JSON blobs.
 
-The project foundation migrated forward from schema version 41 through version
-47. The v41-to-v42 migration adds normalized project,
-membership/parentage, delegated-task, and addressed-message structures, then
-backfills each existing session as the root of a project while preserving its
-session ID, workspace, transcript, events, runs, approvals, and filesystem
-references. The v46-to-v47 migration adds worktree/integration state and
-separate code-worktree and integration grants. Existing session IDs
-remain stable; if project IDs are separate, assign them once and persist the
-mapping. Set `user_version` to 42 only after the backfill and invariants pass.
-The v42-to-v43 migration adds the per-run project-message cursor used to
-checkpoint inbox delivery atomically with the agent transcript. The v43-to-v44
-migration adds the per-run project-delegation grant. The v44-to-v45 migration
-adds separate per-run messaging and inspection grants, both defaulting off for
-existing runs. The v45-to-v46 migration adds the per-run child-control grant,
-also defaulting off. A recovered run retains only the project tool
-authorization captured when it started; delegation, messaging, inspection, and
-control grants do not imply one another. Each migration commits its resulting
-schema version with its schema change and can be retried safely after
-interruption. This is a forward-only transition: a backend release that
-supports schemas only through v45 cannot open the database after it has
-migrated to v46, and no schema downgrade is provided. If an upgrade must
-be rolled back, restore a pre-upgrade backup or move forward with a fix.
+Branch messaging is never inferred from the direct-message grant.
+Agent-attributed messages must be submitted by the server-bound agent tool; a
+client-supplied sender session ID is not an agent identity.
 
 Child creation is idempotent and commits its session, task, project link, and
 initial event before execution is scheduled. A crash after commit but before
@@ -318,13 +244,13 @@ and its decision.
 1. **Implemented:** add project/agent hierarchy IDs, depth, delegated-task
    intent/status, message envelope/type, and worktree integration state to
    shared domain types; enforce the core hierarchy invariants.
-2. **Implemented:** add the forward v41-to-v46 migrations and represent
-   existing sessions as project roots.
-3. **Implemented:** advance to protocol 6.0 and reject request envelopes with
-   an unsupported protocol major before dispatch. `Negotiate` also rejects an
-   incompatible embedded client version before returning project-aware
-   schemas. Deployments must ensure or force client upgrades; old-client
-   forward compatibility is not supported.
+2. **Implemented:** represent root sessions as projects with a durable hierarchy
+   record.
+3. **Implemented:** reject request envelopes with an incompatible protocol
+   major before dispatch. `Negotiate` also rejects an incompatible embedded
+   client version before returning project-aware schemas. Deployments must
+   ensure or force client upgrades; old-client forward compatibility is not
+   supported.
 4. **Implemented:** recover committed-but-not-launched queued children,
    reconcile delegated-task status from persisted child runs, and schedule
    tasks when dependencies complete. Existing run recovery keeps interrupted
@@ -332,15 +258,14 @@ and its decision.
 5. **Implemented:** configure delegated-agent parallelism per workspace. The
    default is four simultaneous running tasks, bounded from one to sixteen;
    durable queued tasks start when a slot becomes available. The pending queue
-   is bounded at fifty tasks. Older stored workspace settings default to four
-   without a SQLite schema migration.
+   is bounded at fifty tasks. Older stored workspace settings default to
+   four.
 
-**Exit:** v41 data migrates through v46 with existing sessions represented as
-projects; unsupported clients are directed to upgrade before using the new
-contract; hierarchy invariants are backend-enforced; snapshots and durable
-records survive restart and reconnect. Backend downgrade is unsupported and
-documented. Event replay is rebuilt from authoritative records where a crash
-occurs after record commit but before notification persistence.
+**Exit:** root sessions are represented as projects; unsupported clients are
+directed to upgrade before using the new contract; hierarchy invariants are
+backend-enforced; snapshots and durable records survive restart and reconnect.
+Event replay is rebuilt from authoritative records where a crash occurs after
+record commit but before notification persistence.
 
 ### Slice 1: direct-child non-code coordination
 
@@ -376,8 +301,7 @@ restart. Existing run-recovery behavior remains covered by its restart tests.
 ### Slice 2: project and child control UI
 
 1. **Implemented:** label root sessions as projects in workspace navigation
-   and group their direct children under the root; the root migration preserves
-   existing sessions.
+   and group their direct children under the root.
 2. **Implemented:** show direct-child task summaries and live session state in
    the project tree. Blocker and result messages are highlighted in the
    activity timeline.
@@ -433,9 +357,7 @@ later design step.
 
 ### Slice 4: deeper hierarchy and branch communication
 
-**Implementation status:** protocol 11.0, forward v47-to-v48 grant and
-wait-state migration, v48-to-v49 review-run grant migration, and v49-to-v50
-cancellation-recovery migration, sender
+**Implementation status:** sender
 binding, recipient discovery, explicitly granted branch-message routes,
 durable manager wait/join, workspace-wide admission, manager completion guards,
 descendant cascade cancellation, nested permission and parent-relative
@@ -486,7 +408,7 @@ cancellation. Depth-three delegation is enabled.
    Cancelling a child now cancels or interrupts its descendants deepest-first;
    pausing or interrupting a manager run remains local. Recursive branch rows
    now show durable task status separately from the child session/run state.
-   Owner-edge controls are implemented. A durable v50 cascade marker stores
+   Owner-edge controls are implemented. A durable cascade marker stores
    the captured post-order task/session list before any member changes. Startup
    replays each member idempotently before admission; scheduling and new child
    creation are fenced while an intent is pending. An interruption E2E verifies
@@ -519,7 +441,7 @@ non-adjacent branch messaging are validated.
 
 ## Verification and rollout
 
-Each slice should add domain transition tests, SQLite migration/restart tests,
+Each slice should add domain transition tests, storage/restart tests,
 protocol contract tests, and a deterministic end-to-end fixture at its
 boundary. Exercise duplicate child-creation/message requests, inactive
 recipients, ordering across reconnect, unauthorized cross-project access,
@@ -527,18 +449,16 @@ parallelism limits, cancellation, process restart, depth overflow, and partial
 worktree/merge failures. UI work should verify empty, active, blocked, failed,
 completed, and stale/reconnecting child states.
 
-The implemented rollout requires protocol 11.0 clients before serving the
-current contract. Protocol 10.x and older clients are rejected; deployments
-must ensure or force client upgrades. The SQLite v41-to-v51 path is
-forward-only. Backend and schema downgrades, and old-client forward
-compatibility, are unsupported. Child creation is manager-only through a
-server-bound tool granted by the executing run; the server validates the
-persisted grant before creating a child.
+The backend rejects clients that negotiate an incompatible protocol major
+before serving the current contract, so deployments must ensure or force client
+upgrades; old-client forward compatibility is unsupported. Child creation is
+manager-only through a server-bound tool granted by the executing run, and the
+server validates the persisted grant before creating a child.
 
 ## Settled choices and deferred scope
 
 - A project's ID is its root session ID. The hierarchy record is durable, and
-  the v41 migration backfills each existing session as its own project root.
+  a session with no parent is its own project root.
 - Queued child launch and parked-manager continuation use durable task/wait
   state with an atomic wait claim and serialized, oldest-first workspace
   admission. Recovery runs before queued work is admitted.

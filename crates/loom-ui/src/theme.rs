@@ -3,10 +3,8 @@
 use std::{cell::RefCell, rc::Rc};
 
 use gpui_kit::component::{Theme, ThemeConfig, ThemeConfigColors, ThemeMode};
-use gpui_kit::{App, Pixels, Point, ResizeEdge, Rgba, Styled, Tiling, WindowAppearance, px};
+use gpui_kit::{App, Rgba, WindowAppearance};
 
-pub(crate) const CLIENT_DECORATION_ROUNDING: Pixels = px(10.);
-pub(crate) const CLIENT_DECORATION_SHADOW: Pixels = px(10.);
 pub(crate) const ERROR_CARD_SURFACE: u32 = 0x171c25;
 pub(crate) const ERROR_CARD_FOREGROUND: u32 = 0xe5e7eb;
 pub(crate) const ERROR_CARD_ACCENT: u32 = 0xfca5a5;
@@ -18,38 +16,6 @@ const SUCCESS_SURFACE_LATTE: u32 = 0xdcebd8;
 const DANGER_SURFACE_LATTE: u32 = 0xf5dce1;
 const WARNING_SURFACE_LATTE: u32 = 0xf6e8ce;
 const INFO_SURFACE_LATTE: u32 = 0xe9defa;
-
-/// GPUI content masks are axis-aligned rectangles, so a rounded parent cannot clip a
-/// square child. Every element that paints a background into a window corner therefore
-/// has to carry the corner radius itself.
-pub(crate) trait ClientCorners: Styled + Sized {
-    fn rounded_client_top(mut self, decorated: bool, tiling: Tiling) -> Self {
-        if decorated && !tiling.top && !tiling.left {
-            self = self.rounded_tl(CLIENT_DECORATION_ROUNDING);
-        }
-        if decorated && !tiling.top && !tiling.right {
-            self = self.rounded_tr(CLIENT_DECORATION_ROUNDING);
-        }
-        self
-    }
-
-    fn rounded_client_bottom(mut self, decorated: bool, tiling: Tiling) -> Self {
-        if decorated && !tiling.bottom && !tiling.left {
-            self = self.rounded_bl(CLIENT_DECORATION_ROUNDING);
-        }
-        if decorated && !tiling.bottom && !tiling.right {
-            self = self.rounded_br(CLIENT_DECORATION_ROUNDING);
-        }
-        self
-    }
-
-    fn rounded_client_corners(self, decorated: bool, tiling: Tiling) -> Self {
-        self.rounded_client_top(decorated, tiling)
-            .rounded_client_bottom(decorated, tiling)
-    }
-}
-
-impl<T: Styled + Sized> ClientCorners for T {}
 
 #[derive(Clone, Copy)]
 struct ThemePalette {
@@ -386,42 +352,14 @@ pub(crate) fn change_color(kind: loom_workspace::WorkspaceChangeKind) -> Rgba {
     }
 }
 
-pub(crate) fn resize_edge(
-    position: Point<Pixels>,
-    inset: Pixels,
-    size: gpui_kit::Size<Pixels>,
-) -> Option<ResizeEdge> {
-    let edge = if position.y < inset && position.x < inset {
-        ResizeEdge::TopLeft
-    } else if position.y < inset && position.x > size.width - inset {
-        ResizeEdge::TopRight
-    } else if position.y < inset {
-        ResizeEdge::Top
-    } else if position.y > size.height - inset && position.x < inset {
-        ResizeEdge::BottomLeft
-    } else if position.y > size.height - inset && position.x > size.width - inset {
-        ResizeEdge::BottomRight
-    } else if position.y > size.height - inset {
-        ResizeEdge::Bottom
-    } else if position.x < inset {
-        ResizeEdge::Left
-    } else if position.x > size.width - inset {
-        ResizeEdge::Right
-    } else {
-        return None;
-    };
-    Some(edge)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         DANGER_SURFACE, DANGER_SURFACE_LATTE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
         ERROR_CARD_SURFACE, INFO_SURFACE, INFO_SURFACE_LATTE, SUCCESS_SURFACE,
         SUCCESS_SURFACE_LATTE, WARNING_SURFACE, WARNING_SURFACE_LATTE, change_color, latte_theme,
-        mocha_theme, resize_edge,
+        mocha_theme,
     };
-    use gpui_kit::{ResizeEdge, point, px, size};
 
     fn luminance(value: f32) -> f32 {
         if value <= 0.04045 {
@@ -479,26 +417,6 @@ mod tests {
         assert_eq!(latte.colors.primary.as_deref(), Some("#1e66f5"));
         assert_eq!(mocha.colors.success.as_deref(), Some("#a6e3a1"));
         assert_eq!(latte.colors.success.as_deref(), Some("#2c7025"));
-    }
-
-    #[test]
-    fn resize_edges_cover_corners_sides_and_interior() {
-        let inset = px(10.);
-        let bounds = size(px(100.), px(80.));
-        let points = [
-            (point(px(1.), px(1.)), Some(ResizeEdge::TopLeft)),
-            (point(px(99.), px(1.)), Some(ResizeEdge::TopRight)),
-            (point(px(50.), px(1.)), Some(ResizeEdge::Top)),
-            (point(px(1.), px(79.)), Some(ResizeEdge::BottomLeft)),
-            (point(px(99.), px(79.)), Some(ResizeEdge::BottomRight)),
-            (point(px(50.), px(79.)), Some(ResizeEdge::Bottom)),
-            (point(px(1.), px(40.)), Some(ResizeEdge::Left)),
-            (point(px(99.), px(40.)), Some(ResizeEdge::Right)),
-            (point(px(50.), px(40.)), None),
-        ];
-        for (position, expected) in points {
-            assert_eq!(resize_edge(position, inset, bounds), expected);
-        }
     }
 
     #[test]

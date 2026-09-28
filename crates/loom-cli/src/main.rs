@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -31,6 +31,47 @@ const EVENT_POLL_INTERVAL_MS: u64 = 20;
 /// stalled.
 const MAX_IDLE_EVENT_POLLS: u32 = 1_500;
 
+/// Ensures the state database can be opened by this build. An incompatible
+/// database is wiped only when the operator asked for it (`--reset-state`) or
+/// explicitly confirms the interactive prompt; otherwise the error is returned.
+fn ensure_state_database(path: &Path, reset_requested: bool) -> Result<(), LoomError> {
+    let status = loom_persistence::FilePersistence::schema_status(path)?;
+    if status.is_compatible() {
+        return Ok(());
+    }
+    let wipe = reset_requested || confirm_state_wipe(path, status)?;
+    if !wipe {
+        return Err(loom_persistence::incompatible_database_error(path, status));
+    }
+    loom_persistence::FilePersistence::reset_database(path)
+}
+
+fn confirm_state_wipe(
+    path: &Path,
+    status: loom_persistence::SchemaStatus,
+) -> Result<bool, LoomError> {
+    if !io::stdin().is_terminal() {
+        return Ok(false);
+    }
+    eprintln!(
+        "Loom state database '{}' uses {} and cannot be opened by this build.",
+        path.display(),
+        status.description()
+    );
+    eprint!("Wipe it and start with an empty database? [y/N] ");
+    io::stderr()
+        .flush()
+        .map_err(|error| LoomError::new(ErrorCode::Internal, format!("{error}"), true))?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| LoomError::new(ErrorCode::Internal, format!("{error}"), true))?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 fn main() -> Result<(), LoomError> {
     let Some(options) = parse_args(env::args().skip(1))? else {
         return Ok(());
@@ -51,6 +92,9 @@ fn main() -> Result<(), LoomError> {
             .m3_demo
             .then(|| env::temp_dir().join(format!("loom-m3-demo-{}.db", AgentSessionId::new())))
     });
+    if let Some(path) = persistence_path.as_deref() {
+        ensure_state_database(path, options.reset_state)?;
+    }
     let backend = match persistence_path.as_deref() {
         Some(path) if options.model.as_str() != "deterministic/demo" => {
             InProcessBackend::new_persistent_with_github_copilot(path)?
@@ -115,6 +159,7 @@ struct CliOptions {
     bind: SocketAddr,
     token: Option<String>,
     login_provider: Option<String>,
+    reset_state: bool,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOptions>, LoomError> {
@@ -134,6 +179,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             .expect("valid default bind address"),
         token: None,
         login_provider: None,
+        reset_state: false,
     };
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -146,6 +192,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
             "--m3-demo" => options.m3_demo = true,
             "--serve" => options.serve = true,
             "--m4-demo" => options.m4_demo = true,
+            "--reset-state" => options.reset_state = true,
             "--bind" => {
                 options.bind = required_value(&mut args, "--bind")?
                     .parse()
@@ -167,7 +214,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                 println!(
                     "Usage: loom [--name <name>] [--task <task>] [--model <id>] \
                      [--root <path>] [--manual-approval] [--m3-demo] \
-                     [--persistence <path>] [--serve --bind <addr> --token <token>] \
+                     [--persistence <path>] [--reset-state] \
+                     [--serve --bind <addr> --token <token>] \
                      [--m4-demo] [--login github-copilot]"
                 );
                 println!("Add --m2-demo to exercise workspace, terminal, and task APIs.");
@@ -184,6 +232,10 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<CliOption
                 );
                 println!("Use --m4-demo to exercise a second reconnecting remote client.");
                 println!("Use --login github-copilot to authenticate GitHub Copilot.");
+                println!(
+                    "Use --reset-state to wipe an incompatible state database instead of \
+                     being prompted."
+                );
                 return Ok(None);
             }
             value if value.starts_with("--name=") => {
@@ -269,6 +321,9 @@ fn run_server(options: CliOptions) -> Result<(), LoomError> {
         .filter(|token| !token.trim().is_empty())
         .ok_or_else(|| LoomError::invalid_request("--serve requires a non-empty --token"))?;
     let persistence_path = options.persistence;
+    if let Some(path) = persistence_path.as_deref() {
+        ensure_state_database(path, options.reset_state)?;
+    }
     let backend = match persistence_path {
         Some(path) => InProcessBackend::new_persistent_with_github_copilot(path)?,
         None => InProcessBackend::new_with_github_copilot()?,
@@ -1324,9 +1379,10 @@ const fn run_state_name(state: AgentRunState) -> &'static str {
 mod tests {
     use super::{
         CliOptions, create_session, create_workspace, demonstrate_m2_services,
-        demonstrate_m3_recovery, negotiate, parse_args, run_m4_demo, start_run, stream_run,
+        demonstrate_m3_recovery, ensure_state_database, negotiate, parse_args, run_m4_demo,
+        start_run, stream_run,
     };
-    use loom_core::AgentSessionState;
+    use loom_core::{AgentSessionState, RunId};
     use loom_model::ModelId;
     use loom_server::InProcessBackend;
     use std::net::SocketAddr;
@@ -1444,6 +1500,7 @@ mod tests {
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             token: None,
             login_provider: None,
+            reset_state: false,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();
@@ -1470,6 +1527,7 @@ mod tests {
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             token: None,
             login_provider: None,
+            reset_state: false,
         };
 
         let result = run_m4_demo(options);
@@ -1499,11 +1557,31 @@ mod tests {
             bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
             token: None,
             login_provider: None,
+            reset_state: false,
         };
         let run_id = start_run(&connection, session.id, &options).unwrap();
         stream_run(&connection, session.id, run_id, false).unwrap();
 
         demonstrate_m3_recovery(backend, connection, &path, true, session.id, run_id).unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn cli_state_reset_is_opt_in_and_wipes_only_when_requested() {
+        let path = std::env::temp_dir().join(format!("loom-cli-state-{}.db", RunId::new()));
+        // A file that looks like SQLite but declares an older schema version.
+        let mut header = [0u8; 100];
+        header[..16].copy_from_slice(b"SQLite format 3\0");
+        header[60..64].copy_from_slice(&40u32.to_be_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        // Without an explicit reset the incompatible database is preserved.
+        assert!(ensure_state_database(&path, false).is_err());
+        assert!(path.exists());
+
+        // An explicit reset wipes it so a fresh baseline can be created.
+        ensure_state_database(&path, true).unwrap();
+        assert!(!path.exists());
+        std::fs::remove_file(&path).ok();
     }
 }

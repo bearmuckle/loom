@@ -4255,6 +4255,7 @@ dependencies = [
  "loom-agent",
  "loom-core",
  "loom-model",
+ "loom-persistence",
  "loom-process",
  "loom-protocol",
  "loom-providers",
