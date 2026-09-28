@@ -187,6 +187,39 @@ streaming cursor, composer send/stop, actionable evidence, single-run plans,
 de-emphasized project messages, and a collapsed reasoning disclosure. Syntax
 highlighting and inline patch previews remain open.
 
+## Presentation polish
+
+A follow-up pass (see `crates/loom-ui/src/syntax.rs` and `view.rs`) closes most
+of the remaining gap with terminal agent harnesses:
+
+- **Code legibility.** Tool results render in the theme's monospace family with
+  lightweight syntax highlighting for the common transcript languages.
+  Unified diffs are detected and rendered with added/removed/hunk colors inline
+  in the tool block, and the review panel's diff lines are monospace.
+- **Progress feedback.** A single status line above the composer carries an
+  animated spinner, the run state, elapsed time, and the `esc to interrupt`
+  hint. Run state is no longer repeated in the session header.
+- **Composer.** The input auto-grows with its content and offers inline `/`
+  command and `@` file completions, `↵ send`/`⇧↵ newline` hints, and a
+  command-palette affordance.
+- **Command palette.** `⌘K`/`Ctrl+K` opens a filterable palette over the same
+  command set as the slash menu.
+- **Transcript.** Assistant turns carry a neutral `Agent` gutter marker (user
+  turns use `You`); tool blocks carry a type icon, monospace title, patch
+  summary, copy control, and a language label. Consecutive same-kind tool calls
+  collapse into one expandable summary row. The transcript scrolls through
+  gpui-kit's `MessageScroller`, which keeps the live edge pinned and provides
+  the scrollbar, bottom fade, and jump-to-latest control.
+- **Navigation.** Session rows show relative update times and an activity dot
+  for running background sessions, with a filter field above the tree.
+- **Empty states.** The no-project and empty-transcript states describe the
+  available commands and primary action.
+
+Remaining gaps: a tree-sitter-backed highlighter, per-tool timestamps, and
+shell-mode (`!`) execution are not implemented. The `@` completion lists
+changed files and attached sources rather than a full workspace file index.
+
+
 ## Verification
 
 - Unit-test the projection: text, reasoning, and tool deltas produce one
