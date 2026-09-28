@@ -381,6 +381,14 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::ControlSessionTask,
         Capability::ReadSessionTaskEvidence,
         Capability::ReadWorkerNodeStatus,
+        Capability::ReadProject,
+        Capability::SendProjectBranchMessage,
+        Capability::ReadProjectAgentMessages,
+        Capability::ControlProjectChild,
+        Capability::CreateProjectWorktree,
+        Capability::ReadProjectChildReview,
+        Capability::IntegrateProjectChild,
+        Capability::CleanupProjectChildWorktree,
         Capability::JsonProtocol,
     ])
 }
@@ -431,6 +439,14 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::ControlSessionTask,
         Capability::ReadSessionTaskEvidence,
         Capability::ReadWorkerNodeStatus,
+        Capability::ReadProject,
+        Capability::SendProjectBranchMessage,
+        Capability::ReadProjectAgentMessages,
+        Capability::ControlProjectChild,
+        Capability::CreateProjectWorktree,
+        Capability::ReadProjectChildReview,
+        Capability::IntegrateProjectChild,
+        Capability::CleanupProjectChildWorktree,
         Capability::JsonProtocol,
     ])
 }

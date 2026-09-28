@@ -161,6 +161,92 @@ session-centric product model.
 **Exit condition:** the browser client can complete the M1-M5 agent workflows
 against a remote backend using supported browsers.
 
+### M7 - Project sessions and coordinated sub-agents
+
+The detailed domain, protocol, recovery, worktree, and rollout design is in
+[project sessions and coordinated sub-agents](project-sessions-design.md).
+This XL feature is delivered as independently reviewable slices rather than
+one large orchestration change:
+
+- **M7.0 complete:** migrate SQLite v41 through v46 and represent every existing root session
+  as a project; add durable parentage, delegated task, and message records;
+  advance the protocol contract; require clients to meet the minimum
+  supported version before serving project-aware messages; recover committed
+  child launches.
+- **M7.1 complete:** enable direct-child non-code delegation with bounded concurrency,
+  durable parent-child messaging, blocker/result reporting, manager status
+  inspection, restart recovery, and manager-directed continue/cancel/failed-tool
+  retry controls.
+- **M7.2 complete:** present projects in workspace navigation and expose child
+  status, transcript output, durable message history, and individual controls.
+  Project archive waits for terminal child tasks, then archives the project tree.
+- **M7.3 complete for direct children:** add isolated child worktrees,
+  reviewable diffs, exact-revision review, parent-owned fast-forward
+  integration, and recoverable cleanup. Stale or diverged work remains
+  reviewable; automatic merge and conflict resolution are deferred.
+- **M7.4 implementation complete:** enable level-three agents and
+  policy-checked branch-to-branch messaging after nested integration works
+  reliably. Protocol 10.0 makes child creation manager-only; schema v50 adds
+  durable cancellation recovery. Protocol 11.0/schema v51 persist a shared
+  message/activity order for deterministic restore and deduplicated paging.
+  The remaining validation item is a full UI click-through for child controls,
+  review, and integration.
+
+M7.4 implementation includes protocol 8.0 and the forward v47-to-v48
+migration carry independently persisted, default-off agent grants and durable
+manager wait/join records. Since protocol 8/schema v48 is already on the draft
+branch, the independent per-run review grant advances the contract to protocol
+9.0 and schema v49 through a forward v48-to-v49 migration. Protocol 10.0
+removes the raw client child-creation request so only the run-granted manager
+tool can create children. Schema v50 adds durable cancellation-cascade
+recovery through a forward v49-to-v50 migration. Protocol 9.x and 8.x
+clients must upgrade. The server-bound tool path supports explicitly
+granted branch messages and rejects client-supplied agent identities. The
+draft also parks and resumes manager continuations, blocks premature manager
+completion, abandons waits for terminal managers, blocks dependents whose
+prerequisites fail or are cancelled, and applies admission limits
+workspace-wide. Descendant cascade cancellation, nested permissions and
+parent-relative worktree integration, owner-edge controls, recursive
+project-tree rendering, and descendant inbox display are implemented in the
+current worktree. Focused end-to-end tests validate parked-wait recovery across
+restart, cap-one wait/join, deepest-first cancellation with persisted terminal
+state, oldest-first admission across joins and queued tasks, nested worktree
+integration across both parent edges, and explicitly granted non-adjacent
+branch messaging, failed-run prerequisite wakeup, and restart recovery after
+an interrupted cancellation cascade. Startup replays the durable ordered
+cascade intent before admission. Depth-three delegation is enabled. A headless
+GPUI interaction test renders the three-level project tree and selects a
+depth-three session; the full child-control and review/integration menu
+click-through remains pending.
+
+The backend rejects delegation beyond three levels from the beginning, even
+while the first client only exposes direct children. Non-code delegation ships
+before code worktrees; no fixed plan-to-issues-to-build pipeline is required.
+Each slice's exit conditions and verification cases are defined in the design
+document.
+
+The v41-to-v51 database transition is forward-only. Backend downgrades are
+unsupported.
+Old-client forward compatibility is not supported: deployments must ensure
+or force clients to upgrade, and the backend rejects clients outside the
+supported protocol version during negotiation with the existing
+`UnsupportedProtocol` response before sending project schemas. Slices 0–3
+initially used protocol 7.0/schema v47 for child worktrees; protocol 10.0/schema
+v50 made child creation manager-only, and the current M7.4 contract requires
+protocol 11.0/schema v51 for deterministic transcript/activity ordering.
+
+M7.4 uses protocol 8.0/schema v48 for separately authorized branch messaging
+and durable manager wait state, then protocol 9.0/schema v49 for the independent
+review-run grant. Protocol 10.0 makes child creation available only through
+the run-granted manager tool. Schema v50 stores recoverable cancellation
+cascades. Protocol 11.0 adds shared run timeline order; schema v51 stores it on
+transcript messages and activities. Protocol 10.x and older clients must
+upgrade before the backend serves the current contract. The v47-to-v48,
+v48-to-v49, v49-to-v50, and v50-to-v51 migrations are forward-only; v50-only
+backends cannot open the upgraded database, and backend downgrades are
+unsupported. Deployments may ensure or force client upgrades;
+old-client forward compatibility is not supported.
+
 ## Quality bar
 
 ### Workspace/session model transition

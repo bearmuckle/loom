@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -7,7 +8,7 @@ use std::{
 };
 
 use globset::Glob;
-use loom_core::{ActionKind, AgentSessionId, ApprovalPolicy, Result};
+use loom_core::{ActionKind, AgentSessionId, ApprovalPolicy, PolicyEvaluation, Result};
 use loom_model::{ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
 use loom_workspace::{Workspace, WorkspaceEdit};
@@ -15,6 +16,30 @@ use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
 use url::Url;
+
+/// A server-owned set of tools attached to one agent session. Extensions can
+/// expose bounded operations without giving the agent arbitrary backend access.
+pub trait ToolExtension: Send + Sync {
+    fn definitions(&self) -> Vec<ToolDefinition>;
+    fn action_kind(&self, call: &ToolCall) -> Option<ActionKind>;
+    fn execute(&self, call: &ToolCall) -> ToolResult;
+
+    /// Identifies a tool call that must be parked by the agent runtime instead
+    /// of executed synchronously. The returned key is persisted as part of the
+    /// runtime continuation and can be completed by the owning server later.
+    /// Implementations must keep this check side-effect free; durable state is
+    /// written with the run checkpoint after the runtime parks the call.
+    fn prepare_deferred(&self, _call: &ToolCall) -> Option<String> {
+        None
+    }
+
+    /// Explains why this agent cannot report completion yet. Project-aware
+    /// extensions use this to keep a manager active while children or reviewed
+    /// code results still need attention.
+    fn completion_blocker(&self) -> Option<String> {
+        None
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolKind {
@@ -238,6 +263,7 @@ pub struct ToolExecutor {
     workspace: Workspace,
     web_search_provider: Option<Arc<dyn WebSearchProvider>>,
     github_token: Option<String>,
+    extension: Option<Arc<dyn ToolExtension>>,
 }
 
 impl ToolExecutor {
@@ -254,6 +280,7 @@ impl ToolExecutor {
             workspace,
             web_search_provider: None,
             github_token: None,
+            extension: None,
         }
     }
 
@@ -267,6 +294,58 @@ impl ToolExecutor {
         self
     }
 
+    pub fn with_extension(mut self, extension: Arc<dyn ToolExtension>) -> Self {
+        self.extension = Some(extension);
+        self
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        let mut definitions = tool_definitions();
+        if let Some(extension) = &self.extension {
+            let mut names = definitions
+                .iter()
+                .map(|definition| definition.name.clone())
+                .collect::<BTreeSet<_>>();
+            definitions.extend(
+                extension
+                    .definitions()
+                    .into_iter()
+                    .filter(|definition| names.insert(definition.name.clone())),
+            );
+        }
+        definitions
+    }
+
+    pub fn action_kind(&self, call: &ToolCall) -> Option<ActionKind> {
+        ToolKind::from_name(&call.name)
+            .map(ToolKind::action_kind)
+            .or_else(|| {
+                self.extension
+                    .as_ref()
+                    .and_then(|extension| extension.action_kind(call))
+            })
+    }
+
+    /// Returns the stable continuation key for an extension tool that must
+    /// suspend the current agent run. Built-in tools are always synchronous.
+    pub fn prepare_deferred(&self, call: &ToolCall) -> Option<String> {
+        if ToolKind::from_name(&call.name).is_some() {
+            return None;
+        }
+        self.extension
+            .as_ref()
+            .filter(|extension| extension.action_kind(call).is_some())
+            .and_then(|extension| extension.prepare_deferred(call))
+    }
+
+    /// Returns a server-owned completion blocker supplied by the active tool
+    /// extension, if any.
+    pub fn completion_blocker(&self) -> Option<String> {
+        self.extension
+            .as_ref()
+            .and_then(|extension| extension.completion_blocker())
+    }
+
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
     }
@@ -276,9 +355,8 @@ impl ToolExecutor {
         call: &ToolCall,
         policy: &ApprovalPolicy,
     ) -> Option<loom_core::PolicyEvaluation> {
-        ToolKind::from_name(&call.name).map(|kind| {
-            loom_core::PolicyEvaluation::evaluate(policy, kind.action_kind(), &call.name)
-        })
+        self.action_kind(call)
+            .map(|action| PolicyEvaluation::evaluate(policy, action, &call.name))
     }
 
     pub fn root(&self) -> &Path {
@@ -291,7 +369,14 @@ impl ToolExecutor {
 
     pub fn execute(&self, call: &ToolCall) -> ToolResult {
         let Some(kind) = ToolKind::from_name(&call.name) else {
-            return ToolResult::failure(call, format!("unknown tool '{}'", call.name));
+            return self
+                .extension
+                .as_ref()
+                .filter(|extension| extension.action_kind(call).is_some())
+                .map_or_else(
+                    || ToolResult::failure(call, format!("unknown tool '{}'", call.name)),
+                    |extension| extension.execute(call),
+                );
         };
 
         match kind {

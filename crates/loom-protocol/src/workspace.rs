@@ -15,6 +15,17 @@ pub struct WorkspaceConfig {
     /// CPU usage above which session-card node indicators begin pulsing.
     #[serde(default = "default_cpu_pulse_threshold_percent")]
     pub cpu_pulse_threshold_percent: u8,
+    /// Maximum number of delegated project agents running at once in this
+    /// workspace. Queued tasks start as an active child finishes.
+    #[serde(default = "default_project_agent_concurrency")]
+    pub project_agent_concurrency: u8,
+}
+
+pub const MIN_PROJECT_AGENT_CONCURRENCY: u8 = 1;
+pub const MAX_PROJECT_AGENT_CONCURRENCY: u8 = 16;
+
+const fn default_project_agent_concurrency() -> u8 {
+    4
 }
 
 const fn default_cpu_pulse_threshold_percent() -> u8 {
@@ -27,6 +38,7 @@ impl Default for WorkspaceConfig {
             revision: 0,
             worker_nodes: Vec::new(),
             cpu_pulse_threshold_percent: default_cpu_pulse_threshold_percent(),
+            project_agent_concurrency: default_project_agent_concurrency(),
         }
     }
 }
@@ -175,4 +187,21 @@ pub struct ContextFileReference {
     pub kind: ContextFileKind,
     pub content: String,
     pub reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspaceConfig;
+
+    #[test]
+    fn older_workspace_config_defaults_project_agent_concurrency() {
+        let config: WorkspaceConfig = serde_json::from_str(
+            r#"{"revision":3,"worker_nodes":[],"cpu_pulse_threshold_percent":15}"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.revision, 3);
+        assert_eq!(config.cpu_pulse_threshold_percent, 15);
+        assert_eq!(config.project_agent_concurrency, 4);
+    }
 }

@@ -119,6 +119,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input_cost_micros_per_1k: 1,
                 output_cost_micros_per_1k: 3,
                 context_inspection: None,
+                project_delegation_enabled: false,
+                project_messaging_enabled: false,
+                project_inspection_enabled: false,
+                project_child_control_enabled: false,
+                project_worktree_enabled: false,
+                project_review_enabled: false,
+                project_integration_enabled: false,
+                project_branch_messaging_enabled: false,
             },
         );
         run_activities.insert(
@@ -126,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             vec![AgentActivityRecord {
                 id: ActivityId::new(),
                 run_id,
+                timeline_ordinal: 0,
                 parent_id: None,
                 step_id: None,
                 kind: AgentActivityKind::ModelTurn,
@@ -149,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_id,
             vec![
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::User,
                     content: format!(
                         "Inspect workspace item {index}, make a focused change, and run its tests."
@@ -158,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::Assistant,
                     content: format!(
                         "I updated the relevant files for item {index} and am checking the result."
@@ -167,6 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::Tool,
                     content: tool_output,
                     name: Some("run_tests".to_owned()),
@@ -174,6 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::Assistant,
                     content: format!(
                         "Validation completed for item {index}. {}",

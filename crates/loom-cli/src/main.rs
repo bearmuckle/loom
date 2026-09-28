@@ -1119,6 +1119,33 @@ fn prompt_for_approval(tool_name: &str) -> Result<bool, LoomError> {
 fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
     print!("#{:<3} ", envelope.sequence);
     match &envelope.event {
+        ServerEvent::ProjectTaskUpdated { task } => println!(
+            "project task {} [{:?}]: {}",
+            task.task_id, task.status, task.child_name
+        ),
+        ServerEvent::ProjectChildWorktreeUpdated { worktree } => println!(
+            "project child worktree {} [{:?}]: {}",
+            worktree.task_id, worktree.status, worktree.branch_name
+        ),
+        ServerEvent::ProjectAgentMessageAccepted { message } => println!(
+            "project message {:?} {} -> {}: {}",
+            message.kind,
+            message.sender_session_id,
+            message.target_session_id,
+            message.body.lines().next().unwrap_or_default()
+        ),
+        ServerEvent::ProjectAgentCreated { agent } => println!(
+            "project agent created: {} [depth {}, {}]",
+            agent.session_id,
+            agent.depth,
+            session_state_name(agent.state)
+        ),
+        ServerEvent::ProjectAgentUpdated { agent } => println!(
+            "project agent updated: {} [depth {}, {}]",
+            agent.session_id,
+            agent.depth,
+            session_state_name(agent.state)
+        ),
         ServerEvent::AgentSessionCreated { snapshot } => println!(
             "session created: {} [{}]",
             snapshot.id,

@@ -1,7 +1,9 @@
 use loom_core::{
-    AgentSessionId, AgentSessionSnapshot, Capability, CapabilitySet, EventSequence, LoomError,
-    ProtocolVersion, RepositoryId, RequestId, RunId, SessionEvent, SessionEventRecord,
-    SessionLimits, ToolCallId, UsageSnapshot, WorkspaceId,
+    AgentMessageDraft, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, Capability,
+    CapabilitySet, DelegatedTaskRecord, EventSequence, LoomError, ProjectAgentRecord, ProjectId,
+    ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProtocolVersion,
+    RepositoryId, RequestId, RunId, SessionEvent, SessionEventRecord, SessionLimits, ToolCallId,
+    UsageSnapshot, WorkspaceId,
 };
 use loom_model::{
     ModelDescriptor, ModelId, ModelMessage, ProviderHealth, ProviderId, ProviderSummary,
@@ -26,7 +28,7 @@ pub use agent::{
     AgentEvent, AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
     AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
-    ApprovalDecision,
+    ApprovalDecision, ProjectJoinContinuation,
 };
 pub use context::{
     ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
@@ -44,17 +46,27 @@ pub use vcs::{
 };
 pub use workspace::{
     Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, GitHubRepository,
-    RevertResult, SessionDirectory, SessionFilesystemChange, SessionFilesystemFile,
-    SessionFilesystemSnapshot, SessionRepository, UndoResult, WorkerNodeConfig,
-    WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceEdit, WorkspaceEditResult,
-    WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
+    MAX_PROJECT_AGENT_CONCURRENCY, MIN_PROJECT_AGENT_CONCURRENCY, RevertResult, SessionDirectory,
+    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
+    UndoResult, WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
+    WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(4, 1);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(11, 0);
 pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
 pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
 pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
 pub const MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES: u32 = 32 * 1024;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectChildControlAction {
+    Continue,
+    RetryFailedStep,
+    Pause,
+    Interrupt,
+    Cancel,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkerNodeResources {
@@ -105,11 +117,15 @@ pub struct AgentRunSnapshotProjection {
     pub usage: UsageSnapshot,
     #[serde(default)]
     pub activities: Vec<AgentActivityRecord>,
+    /// Run-wide positions aligned with `messages`.
+    #[serde(default)]
+    pub message_timeline_ordinals: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentRunMessageHeader {
     pub ordinal: u64,
+    pub timeline_ordinal: u64,
     pub role: loom_model::MessageRole,
     pub content_bytes: u64,
     pub name: Option<String>,
@@ -120,6 +136,7 @@ pub struct AgentRunMessageHeader {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentRunTranscriptMessage {
     pub ordinal: u64,
+    pub timeline_ordinal: u64,
     pub message: ModelMessage,
     pub content_truncated: bool,
 }
@@ -380,6 +397,44 @@ pub enum ClientRequest {
     GetAgentSessionInitialState {
         session_id: AgentSessionId,
     },
+    GetProjectSnapshot {
+        project_id: ProjectId,
+    },
+    GetProjectSnapshotForSession {
+        session_id: AgentSessionId,
+    },
+    SendProjectAgentMessage {
+        message: AgentMessageDraft,
+    },
+    ListProjectAgentMessages {
+        project_id: ProjectId,
+        session_id: AgentSessionId,
+        after_project_sequence: Option<u64>,
+        limit: u32,
+    },
+    ControlProjectChild {
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+        action: ProjectChildControlAction,
+    },
+    GetProjectChildReview {
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+    },
+    IntegrateProjectChild {
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+        expected_parent_revision: String,
+    },
+    CleanupProjectChildWorktree {
+        project_id: ProjectId,
+        manager_session_id: AgentSessionId,
+        task_id: loom_core::TaskId,
+        disposition: ProjectWorktreeCleanupDisposition,
+    },
     RenameAgentSession {
         session_id: AgentSessionId,
         name: String,
@@ -557,6 +612,17 @@ impl ClientRequest {
             | Self::GetAgentSessionSnapshot { .. }
             | Self::GetAgentSessionSnapshotMetadata { .. }
             | Self::GetAgentSessionInitialState { .. } => Some(Capability::ReadAgentSession),
+            Self::GetProjectSnapshot { .. } | Self::GetProjectSnapshotForSession { .. } => {
+                Some(Capability::ReadProject)
+            }
+            Self::SendProjectAgentMessage { .. } => Some(Capability::SendProjectAgentMessage),
+            Self::ListProjectAgentMessages { .. } => Some(Capability::ReadProjectAgentMessages),
+            Self::ControlProjectChild { .. } => Some(Capability::ControlProjectChild),
+            Self::GetProjectChildReview { .. } => Some(Capability::ReadProjectChildReview),
+            Self::IntegrateProjectChild { .. } => Some(Capability::IntegrateProjectChild),
+            Self::CleanupProjectChildWorktree { .. } => {
+                Some(Capability::CleanupProjectChildWorktree)
+            }
             Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
                 Some(Capability::ControlAgentSession)
             }
@@ -603,6 +669,9 @@ impl ClientRequest {
                 | Self::RegisterWorkspace { .. }
                 | Self::RenameWorkspace { .. }
                 | Self::CreateAgentSessionInWorkspace { .. }
+                | Self::ControlProjectChild { .. }
+                | Self::IntegrateProjectChild { .. }
+                | Self::CleanupProjectChildWorktree { .. }
                 | Self::SetWorkspaceConfigForWorkspace { .. }
                 | Self::AttachSessionRepository { .. }
                 | Self::DetachSessionRepository { .. }
@@ -627,6 +696,7 @@ impl ClientRequest {
                 | Self::ApproveAgentAction { .. }
                 | Self::RejectAgentAction { .. }
                 | Self::SendAgentMessage { .. }
+                | Self::SendProjectAgentMessage { .. }
                 | Self::InterruptAgentRun { .. }
                 | Self::RetryAgentStep { .. }
                 | Self::PauseAgentRun { .. }
@@ -703,6 +773,26 @@ pub enum ServerResponse {
     AgentSession(AgentSessionSnapshot),
     AgentSessionSnapshot(AgentSessionSnapshotProjection),
     AgentSessionInitialState(AgentSessionInitialState),
+    ProjectSnapshot(ProjectSnapshot),
+    ProjectChildCreated {
+        task: DelegatedTaskRecord,
+        child: ProjectAgentRecord,
+    },
+    ProjectAgentMessageAccepted(AgentMessageRecord),
+    ProjectAgentMessages {
+        messages: Vec<AgentMessageRecord>,
+        next_after_project_sequence: Option<u64>,
+    },
+    ProjectChildControlled {
+        task: DelegatedTaskRecord,
+        run: Option<AgentRunSnapshot>,
+    },
+    ProjectChildReview {
+        worktree: ProjectWorktreeRecord,
+        status: GitRepositoryStatus,
+        diff: GitDiff,
+    },
+    ProjectChildWorktreeUpdated(ProjectWorktreeRecord),
     AgentSessionRenamed(AgentSessionSnapshot),
     AgentSessionArchived(AgentSessionSnapshot),
     AgentRunStarted(AgentRunSnapshot),
@@ -893,6 +983,21 @@ pub enum WorkspaceFeedEvent {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
 pub enum ServerEvent {
+    ProjectChildWorktreeUpdated {
+        worktree: ProjectWorktreeRecord,
+    },
+    ProjectTaskUpdated {
+        task: DelegatedTaskRecord,
+    },
+    ProjectAgentMessageAccepted {
+        message: AgentMessageRecord,
+    },
+    ProjectAgentCreated {
+        agent: ProjectAgentRecord,
+    },
+    ProjectAgentUpdated {
+        agent: ProjectAgentRecord,
+    },
     AgentSessionCreated {
         snapshot: AgentSessionSnapshot,
     },
@@ -1045,6 +1150,207 @@ mod run_message_protocol_tests {
     use super::*;
 
     #[test]
+    fn project_snapshot_request_uses_project_capability_and_round_trips() {
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 0));
+        let project_id = ProjectId::new();
+        let request = ClientRequest::GetProjectSnapshot { project_id };
+        assert_eq!(request.required_capability(), Some(Capability::ReadProject));
+        let encoded = encode_request(&RequestEnvelope::new(request)).unwrap();
+        assert_eq!(
+            decode_request(&encoded).unwrap().protocol_version,
+            CURRENT_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            decode_request(&encoded).unwrap().request,
+            ClientRequest::GetProjectSnapshot { project_id }
+        );
+
+        let child_session_id = AgentSessionId::new();
+        let session_request = ClientRequest::GetProjectSnapshotForSession {
+            session_id: child_session_id,
+        };
+        assert_eq!(
+            session_request.required_capability(),
+            Some(Capability::ReadProject)
+        );
+        assert_eq!(
+            decode_request(
+                &encode_request(&RequestEnvelope::new(session_request.clone())).unwrap()
+            )
+            .unwrap()
+            .request,
+            session_request
+        );
+
+        let root_session_id = AgentSessionId::new();
+        let snapshot = ProjectSnapshot {
+            project_id,
+            root_session_id,
+            agents: vec![ProjectAgentRecord {
+                session_id: root_session_id,
+                project_id,
+                parent_session_id: None,
+                depth: 1,
+                state: loom_core::AgentSessionState::Idle,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: loom_core::Timestamp::from_unix_millis(1),
+            }],
+            tasks: vec![],
+            worktrees: vec![],
+        };
+        let response = ServerResponse::ProjectSnapshot(snapshot);
+        let encoded = encode_response(&ResponseEnvelope::success(
+            RequestId::new(),
+            response.clone(),
+        ))
+        .unwrap();
+        assert_eq!(decode_response(&encoded).unwrap().result.unwrap(), response);
+    }
+
+    #[test]
+    fn addressed_project_message_protocol_round_trip() {
+        let parent = AgentSessionId::new();
+        let project_id = ProjectId::new();
+        let draft = AgentMessageDraft {
+            project_id,
+            task_id: Some(loom_core::TaskId::new()),
+            sender_session_id: parent,
+            target_session_id: AgentSessionId::new(),
+            kind: loom_core::AgentMessageKind::Progress,
+            body: "Status update".into(),
+        };
+        let send_request = ClientRequest::SendProjectAgentMessage {
+            message: draft.clone(),
+        };
+        assert_eq!(
+            send_request.required_capability(),
+            Some(Capability::SendProjectAgentMessage)
+        );
+        assert!(send_request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(send_request.clone())).unwrap())
+                .unwrap()
+                .request,
+            send_request
+        );
+
+        let list_request = ClientRequest::ListProjectAgentMessages {
+            project_id,
+            session_id: parent,
+            after_project_sequence: Some(4),
+            limit: 20,
+        };
+        assert_eq!(
+            list_request.required_capability(),
+            Some(Capability::ReadProjectAgentMessages)
+        );
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(list_request.clone())).unwrap())
+                .unwrap()
+                .request,
+            list_request
+        );
+
+        let control_request = ClientRequest::ControlProjectChild {
+            project_id,
+            manager_session_id: parent,
+            task_id: loom_core::TaskId::new(),
+            action: ProjectChildControlAction::Pause,
+        };
+        assert_eq!(
+            control_request.required_capability(),
+            Some(Capability::ControlProjectChild)
+        );
+        assert!(control_request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(
+                &encode_request(&RequestEnvelope::new(control_request.clone())).unwrap()
+            )
+            .unwrap()
+            .request,
+            control_request
+        );
+
+        let review_request = ClientRequest::GetProjectChildReview {
+            project_id,
+            manager_session_id: parent,
+            task_id: loom_core::TaskId::new(),
+        };
+        assert_eq!(
+            review_request.required_capability(),
+            Some(Capability::ReadProjectChildReview)
+        );
+        assert_eq!(
+            decode_request(&encode_request(&RequestEnvelope::new(review_request.clone())).unwrap())
+                .unwrap()
+                .request,
+            review_request
+        );
+
+        let integrate_request = ClientRequest::IntegrateProjectChild {
+            project_id,
+            manager_session_id: parent,
+            task_id: loom_core::TaskId::new(),
+            expected_parent_revision: "a1b2c3".into(),
+        };
+        assert_eq!(
+            integrate_request.required_capability(),
+            Some(Capability::IntegrateProjectChild)
+        );
+        assert!(integrate_request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(
+                &encode_request(&RequestEnvelope::new(integrate_request.clone())).unwrap()
+            )
+            .unwrap()
+            .request,
+            integrate_request
+        );
+
+        let cleanup_request = ClientRequest::CleanupProjectChildWorktree {
+            project_id,
+            manager_session_id: parent,
+            task_id: loom_core::TaskId::new(),
+            disposition: ProjectWorktreeCleanupDisposition::Retain,
+        };
+        assert_eq!(
+            cleanup_request.required_capability(),
+            Some(Capability::CleanupProjectChildWorktree)
+        );
+        assert!(cleanup_request.is_retryable_mutation());
+        assert_eq!(
+            decode_request(
+                &encode_request(&RequestEnvelope::new(cleanup_request.clone())).unwrap()
+            )
+            .unwrap()
+            .request,
+            cleanup_request
+        );
+
+        let message = AgentMessageRecord {
+            message_id: loom_core::AgentMessageId::new(),
+            project_id,
+            task_id: draft.task_id,
+            sender_session_id: draft.sender_session_id,
+            target_session_id: draft.target_session_id,
+            kind: draft.kind,
+            project_sequence: 1,
+            accepted_at: loom_core::Timestamp::from_unix_millis(10),
+            body: draft.body,
+        };
+        let event = ServerEventEnvelope {
+            protocol_version: CURRENT_PROTOCOL_VERSION,
+            sequence: EventSequence::new(1),
+            session_id: parent,
+            event: ServerEvent::ProjectAgentMessageAccepted {
+                message: message.clone(),
+            },
+        };
+        assert_eq!(decode_event(&encode_event(&event).unwrap()).unwrap(), event);
+    }
+
+    #[test]
     fn stream_epoch_fields_default_for_sequence_only_peers() {
         let request = RequestEnvelope::new(ClientRequest::GetSessionEvents {
             session_id: Some(AgentSessionId::new()),
@@ -1084,6 +1390,19 @@ mod run_message_protocol_tests {
                 stream_epoch: None,
             }
         );
+    }
+
+    #[test]
+    fn child_creation_is_not_a_client_protocol_request() {
+        let raw_request = serde_json::json!({
+            "protocol_version": CURRENT_PROTOCOL_VERSION,
+            "request_id": RequestId::new(),
+            "request": {
+                "type": "create_project_child",
+                "data": {}
+            }
+        });
+        assert!(decode_request(raw_request.to_string().as_bytes()).is_err());
     }
 
     #[test]
@@ -1190,6 +1509,7 @@ mod run_message_protocol_tests {
                 run_id,
                 messages: vec![AgentRunMessageHeader {
                     ordinal: 11,
+                    timeline_ordinal: 17,
                     role: loom_model::MessageRole::Assistant,
                     content_bytes: 18,
                     name: None,
@@ -1209,6 +1529,7 @@ mod run_message_protocol_tests {
                 run_id,
                 messages: vec![AgentRunTranscriptMessage {
                     ordinal: 11,
+                    timeline_ordinal: 17,
                     message: ModelMessage::new(loom_model::MessageRole::Assistant, "answer"),
                     content_truncated: false,
                 }],

@@ -8,9 +8,9 @@ use std::{
 
 use loom_context::{ContextAssembler, ContextAssemblyOptions, ContextInput, ContextInspection};
 use loom_core::{
-    ActivityId, AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink, InteractionId, LimitKind,
-    LimitStatus, LoomError, PolicyEvaluation, Result, RunId, SessionLimits, StepId, Timestamp,
-    UsageSnapshot,
+    ActivityId, AgentMessageRecord, AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink,
+    InteractionId, LimitKind, LimitStatus, LoomError, PolicyEvaluation, Result, RunId,
+    SessionLimits, StepId, Timestamp, UsageSnapshot,
 };
 use loom_model::{
     CancellationToken, CompletionOptions, MessageRole, ModelId, ModelMessage, ModelProvider,
@@ -19,9 +19,9 @@ use loom_model::{
 pub use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
     AgentInteractionRecord, AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState,
-    ApprovalDecision, FileActivityOperation,
+    ApprovalDecision, FileActivityOperation, ProjectJoinContinuation,
 };
-use loom_tools::{ToolExecutor, ToolKind, ToolResult, tool_definitions};
+use loom_tools::{ToolExecutor, ToolKind, ToolResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -43,6 +43,30 @@ pub struct AgentRuntimeOptions {
     pub checkpoint_id: Option<loom_core::CheckpointId>,
     pub input_cost_micros_per_1k: u64,
     pub output_cost_micros_per_1k: u64,
+    /// Persisted grant for server-provided project delegation tools.
+    #[serde(default)]
+    pub project_delegation_enabled: bool,
+    /// Persisted grant for direct parent-child message tools.
+    #[serde(default)]
+    pub project_messaging_enabled: bool,
+    /// Persisted grant for direct-child project status inspection.
+    #[serde(default)]
+    pub project_inspection_enabled: bool,
+    /// Persisted grant for direct-child lifecycle controls.
+    #[serde(default)]
+    pub project_child_control_enabled: bool,
+    /// Persisted grant for creating isolated project code-task worktrees.
+    #[serde(default)]
+    pub project_worktree_enabled: bool,
+    /// Persisted grant for reviewing direct-child project worktrees.
+    #[serde(default)]
+    pub project_review_enabled: bool,
+    /// Persisted grant for integrating reviewed child worktree commits.
+    #[serde(default)]
+    pub project_integration_enabled: bool,
+    /// Persisted grant for explicitly authorized non-adjacent project messages.
+    #[serde(default)]
+    pub project_branch_messaging_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -52,11 +76,19 @@ pub struct AgentRuntimeState {
     pub run: AgentRunSnapshot,
     pub plan: AgentPlan,
     pub messages: Vec<ModelMessage>,
+    /// Run-wide order aligned with `messages` for deterministic transcript/activity replay.
+    #[serde(default)]
+    pub message_timeline_ordinals: Vec<u64>,
+    #[serde(default)]
+    pub last_project_message_sequence: u64,
     #[serde(default)]
     pub attempts: Vec<loom_protocol::AgentRunAttemptRecord>,
     pub pending_approval: Option<ToolCall>,
     #[serde(default)]
     pub pending_tool_execution: Option<ToolCall>,
+    /// A tool call waiting for a durable project join to finish.
+    #[serde(default)]
+    pub pending_project_join: Option<ProjectJoinContinuation>,
     #[serde(default)]
     pub pending_input: Option<String>,
     pub last_failed_call: Option<ToolCall>,
@@ -210,6 +242,7 @@ struct StepContext {
     published: usize,
     saw_tool_call: bool,
     completed: bool,
+    completion_guarded: bool,
     finished: bool,
     activity_id: ActivityId,
 }
@@ -223,6 +256,7 @@ impl StepContext {
             published: 0,
             saw_tool_call: false,
             completed: false,
+            completion_guarded: false,
             finished: false,
             activity_id,
         }
@@ -238,8 +272,12 @@ pub struct AgentRuntime {
     provider: Option<Box<dyn ModelProvider>>,
     tools: ToolExecutor,
     messages: Vec<ModelMessage>,
+    message_timeline_ordinals: Vec<u64>,
+    next_timeline_ordinal: u64,
+    last_project_message_sequence: u64,
     pending_approval: Option<PendingApproval>,
     pending_tool_execution: Option<ToolCall>,
+    pending_project_join: Option<ProjectJoinContinuation>,
     pending_input: Option<String>,
     last_failed_call: Option<ToolCall>,
     next_message_id: u64,
@@ -311,6 +349,11 @@ impl AgentRuntime {
         }];
         let plan = AgentPlan { steps: Vec::new() };
         let messages = initial_messages(&task);
+        let message_timeline_ordinals = (0..messages.len())
+            .map(|ordinal| u64::try_from(ordinal).expect("initial message count fits in u64"))
+            .collect::<Vec<_>>();
+        let next_timeline_ordinal =
+            u64::try_from(messages.len()).expect("initial message count fits in u64");
         Self {
             session_id,
             task,
@@ -320,8 +363,12 @@ impl AgentRuntime {
             provider: Some(provider),
             tools,
             messages,
+            message_timeline_ordinals,
+            next_timeline_ordinal,
+            last_project_message_sequence: 0,
             pending_approval: None,
             pending_tool_execution: None,
+            pending_project_join: None,
             pending_input: None,
             last_failed_call: None,
             next_message_id: 0,
@@ -518,8 +565,229 @@ impl AgentRuntime {
         self.pending_input.clone()
     }
 
+    pub fn pending_project_join(&self) -> Option<ProjectJoinContinuation> {
+        self.pending_project_join.clone()
+    }
+
     pub fn messages(&self) -> Vec<ModelMessage> {
         self.messages.clone()
+    }
+
+    pub fn last_project_message_sequence(&self) -> u64 {
+        self.last_project_message_sequence
+    }
+
+    /// Sets the durable inbox cursor before a new run begins in this session.
+    pub fn set_project_message_cursor(&mut self, sequence: u64) {
+        self.last_project_message_sequence = self.last_project_message_sequence.max(sequence);
+    }
+
+    /// Injects one durable project message at a safe model-turn boundary.
+    /// Returns false when it was already delivered or the runtime is blocked.
+    pub fn append_project_message(&mut self, message: &AgentMessageRecord) -> Result<bool> {
+        if message.project_sequence <= self.last_project_message_sequence {
+            return Ok(false);
+        }
+        if self.pending_tool_execution.is_some()
+            || self.pending_project_join.is_some()
+            || self.pending_approval.is_some()
+            || self.pending_input.is_some()
+            || !matches!(
+                self.run.state,
+                AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+            )
+        {
+            return Ok(false);
+        }
+        let kind = match message.kind {
+            loom_core::AgentMessageKind::Progress => "progress",
+            loom_core::AgentMessageKind::Result => "result",
+            loom_core::AgentMessageKind::Question => "question",
+            loom_core::AgentMessageKind::Blocker => "blocker",
+            loom_core::AgentMessageKind::Direction => "direction",
+            loom_core::AgentMessageKind::Answer => "answer",
+        };
+        let task = message
+            .task_id
+            .map(|task_id| format!("; task {task_id}"))
+            .unwrap_or_default();
+        let mut model_message = ModelMessage::new(
+            MessageRole::User,
+            format!(
+                "[Project message {} from agent {} ({kind}{task})]\n{}",
+                message.project_sequence, message.sender_session_id, message.body
+            ),
+        );
+        model_message.name = Some("loom_project_message".to_owned());
+        self.push_message(model_message);
+        self.last_project_message_sequence = message.project_sequence;
+        Ok(true)
+    }
+
+    /// Parks the exact pending tool call as a durable project-join continuation.
+    ///
+    /// The operation is idempotent for the same wait id and call. A different
+    /// continuation cannot replace an already parked call, and the call must
+    /// still be the runtime's pending execution.
+    pub fn park_pending_project_join(
+        &mut self,
+        wait_id: impl Into<String>,
+        original_call: ToolCall,
+    ) -> Result<Vec<AgentEvent>> {
+        let result = self.park_pending_project_join_inner(wait_id.into(), original_call);
+        self.publish(result)
+    }
+
+    fn park_pending_project_join_inner(
+        &mut self,
+        wait_id: String,
+        original_call: ToolCall,
+    ) -> Result<Vec<AgentEvent>> {
+        if wait_id.trim().is_empty() || wait_id.len() > 256 {
+            return Err(LoomError::invalid_request(
+                "project join wait id must contain 1 to 256 bytes",
+            ));
+        }
+        if let Some(existing) = &self.pending_project_join {
+            if existing.wait_id == wait_id && existing.call == original_call {
+                return Ok(Vec::new());
+            }
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "a different project join continuation is already parked",
+                false,
+            ));
+        }
+        if self.pending_tool_execution.as_ref() != Some(&original_call) {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "project join call is not the pending tool execution",
+                false,
+            ));
+        }
+        if self.pending_approval.is_some() || self.pending_input.is_some() {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "agent runtime has another pending interaction",
+                false,
+            ));
+        }
+        if !matches!(
+            self.run.state,
+            AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+        ) {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "agent run is not active while parking a project join",
+                false,
+            ));
+        }
+
+        self.pending_tool_execution = None;
+        self.pending_project_join = Some(ProjectJoinContinuation {
+            wait_id,
+            call: original_call.clone(),
+        });
+        let mut events = vec![AgentEvent::ToolCallStarted {
+            run_id: self.run.id,
+            call: original_call,
+        }];
+        events.extend(self.set_state(AgentRunState::Paused));
+        Ok(events)
+    }
+
+    /// Completes a previously parked project join exactly once.
+    ///
+    /// Both the durable wait id and the original model tool-call id/name must
+    /// match the parked continuation. The resulting Tool message is appended
+    /// to conversation history so the next model step can continue normally.
+    pub fn complete_project_join(
+        &mut self,
+        wait_id: &str,
+        result: ToolResult,
+    ) -> Result<RunProgress> {
+        let result = self.complete_project_join_inner(wait_id, result);
+        self.publish_progress(result)
+    }
+
+    fn complete_project_join_inner(
+        &mut self,
+        wait_id: &str,
+        result: ToolResult,
+    ) -> Result<RunProgress> {
+        let Some(continuation) = self.pending_project_join.as_ref() else {
+            let already_completed = self.messages.iter().any(|message| {
+                message.role == MessageRole::Tool
+                    && message.tool_call_id == Some(result.tool_call_id)
+                    && message.name.as_deref() == Some(result.name.as_str())
+                    && message.content == result.output
+            });
+            if already_completed {
+                return Ok(RunProgress::blocked(Vec::new()));
+            }
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "there is no pending project join continuation",
+                false,
+            ));
+        };
+        if continuation.wait_id != wait_id {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "project join wait id does not match the pending continuation",
+                false,
+            ));
+        }
+        if result.tool_call_id != continuation.call.id || result.name != continuation.call.name {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "project join result does not match the original tool call",
+                false,
+            ));
+        }
+
+        let continuation = self
+            .pending_project_join
+            .take()
+            .expect("the validated project join continuation must still be present");
+        let mut events = Vec::new();
+        if !result.output.is_empty() {
+            events.push(AgentEvent::ToolOutputChunk {
+                run_id: self.run.id,
+                tool_call_id: continuation.call.id,
+                chunk: result.output.clone(),
+            });
+        }
+        events.push(AgentEvent::ToolCallCompleted {
+            run_id: self.run.id,
+            result: result.clone(),
+        });
+        events.push(self.complete_tool_activity(
+            &result,
+            if result.success {
+                AgentActivityStatus::Completed
+            } else {
+                AgentActivityStatus::Failed
+            },
+        ));
+        self.push_message(ModelMessage {
+            role: MessageRole::Tool,
+            content: result.output,
+            name: Some(result.name),
+            tool_call_id: Some(result.tool_call_id),
+            tool_calls: Vec::new(),
+        });
+        self.last_failed_call = None;
+        let continues = matches!(
+            self.run.state,
+            AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+        );
+        let progress = if continues {
+            RunProgress::running(events)
+        } else {
+            RunProgress::blocked(events)
+        };
+        Ok(progress)
     }
 
     pub fn checkpoint_id(&self) -> Option<loom_core::CheckpointId> {
@@ -537,12 +805,15 @@ impl AgentRuntime {
             run: self.run.clone(),
             plan: self.plan.clone(),
             messages: self.messages.clone(),
+            message_timeline_ordinals: self.message_timeline_ordinals.clone(),
+            last_project_message_sequence: self.last_project_message_sequence,
             attempts: self.attempts.clone(),
             pending_approval: self
                 .pending_approval
                 .as_ref()
                 .map(|pending| pending.call.clone()),
             pending_tool_execution: self.pending_tool_execution.clone(),
+            pending_project_join: self.pending_project_join.clone(),
             pending_input: self.pending_input.clone(),
             last_failed_call: self.last_failed_call.clone(),
             next_message_id: self.next_message_id,
@@ -587,6 +858,13 @@ impl AgentRuntime {
             )
         {
             state.pending_input = None;
+        }
+        if state.pending_tool_execution.is_some() && state.pending_project_join.is_some() {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "agent runtime state has both a pending tool and a project join continuation",
+                false,
+            ));
         }
         let resolved_at = Timestamp::now();
         for interaction in &mut state.interactions {
@@ -642,6 +920,85 @@ impl AgentRuntime {
                 false,
             ));
         }
+        let mut activities = state.activities;
+        let mut message_timeline_ordinals = state.message_timeline_ordinals;
+        if message_timeline_ordinals.len() > state.messages.len() {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "agent runtime state has more timeline ordinals than transcript messages",
+                false,
+            ));
+        }
+        let has_timeline_metadata = !message_timeline_ordinals.is_empty()
+            || activities
+                .iter()
+                .any(|activity| activity.timeline_ordinal != 0);
+        let next_timeline_ordinal = if !has_timeline_metadata
+            && (!state.messages.is_empty() || !activities.is_empty())
+        {
+            let mut next_timeline_ordinal = 0;
+            for _ in &state.messages {
+                message_timeline_ordinals.push(next_timeline_ordinal);
+                next_timeline_ordinal = next_timeline_ordinal.checked_add(1).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "legacy run timeline ordinal space is exhausted",
+                        false,
+                    )
+                })?;
+            }
+            for activity in &mut activities {
+                activity.timeline_ordinal = next_timeline_ordinal;
+                next_timeline_ordinal = next_timeline_ordinal.checked_add(1).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "legacy run timeline ordinal space is exhausted",
+                        false,
+                    )
+                })?;
+            }
+            next_timeline_ordinal
+        } else {
+            let maximum = message_timeline_ordinals
+                .iter()
+                .copied()
+                .chain(activities.iter().map(|activity| activity.timeline_ordinal))
+                .max();
+            let mut next = match maximum {
+                Some(maximum) => maximum.checked_add(1).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "run timeline ordinal space is exhausted",
+                        false,
+                    )
+                })?,
+                None => 0,
+            };
+            while message_timeline_ordinals.len() < state.messages.len() {
+                message_timeline_ordinals.push(next);
+                next = next.checked_add(1).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "run timeline ordinal space is exhausted",
+                        false,
+                    )
+                })?;
+            }
+            next
+        };
+        let mut seen_timeline_ordinals = BTreeSet::new();
+        if message_timeline_ordinals
+            .iter()
+            .copied()
+            .chain(activities.iter().map(|activity| activity.timeline_ordinal))
+            .any(|ordinal| !seen_timeline_ordinals.insert(ordinal))
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "agent runtime state contains duplicate timeline ordinals",
+                false,
+            ));
+        }
         Ok(Self {
             session_id: state.session_id,
             task: state.task,
@@ -651,8 +1008,12 @@ impl AgentRuntime {
             provider: Some(provider),
             tools,
             messages: state.messages,
+            message_timeline_ordinals,
+            next_timeline_ordinal,
+            last_project_message_sequence: state.last_project_message_sequence,
             pending_approval: state.pending_approval.map(|call| PendingApproval { call }),
             pending_tool_execution: state.pending_tool_execution,
+            pending_project_join: state.pending_project_join,
             pending_input: state.pending_input,
             last_failed_call: state.last_failed_call,
             next_message_id: state.next_message_id,
@@ -665,7 +1026,7 @@ impl AgentRuntime {
             provider_cursor: state.provider_cursor,
             step_id: state.step_id,
             step_index: state.step_index,
-            activities: state.activities,
+            activities,
             interactions: state.interactions,
             control: RunControl::new(),
             observer: None,
@@ -937,6 +1298,13 @@ impl AgentRuntime {
                 false,
             ));
         }
+        if self.pending_project_join.is_some() {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "project join is still pending",
+                false,
+            ));
+        }
         let events = if self.pending_approval.is_some() {
             self.set_state(AgentRunState::AwaitingApproval)
         } else if self.pending_input.is_some() {
@@ -1003,6 +1371,11 @@ impl AgentRuntime {
                 "resolve the pending tool approval before sending a message",
             ));
         }
+        if self.pending_project_join.is_some() {
+            return Err(LoomError::invalid_state(
+                "wait for the pending project join before sending a message",
+            ));
+        }
         if matches!(
             self.run.state,
             AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
@@ -1029,8 +1402,7 @@ impl AgentRuntime {
                 None,
             )?;
         }
-        self.messages
-            .push(ModelMessage::new(MessageRole::User, message.clone()));
+        self.push_message(ModelMessage::new(MessageRole::User, message.clone()));
         self.pending_input = None;
         self.run.control_revision = control_revision;
         self.active_message_id = None;
@@ -1063,6 +1435,11 @@ impl AgentRuntime {
         if self.pending_approval.is_some() {
             return Err(LoomError::invalid_state(
                 "resolve the pending tool approval before requesting input",
+            ));
+        }
+        if self.pending_project_join.is_some() {
+            return Err(LoomError::invalid_state(
+                "wait for the pending project join before requesting input",
             ));
         }
         if matches!(
@@ -1112,6 +1489,17 @@ impl AgentRuntime {
 
     pub fn recover_after_restart(&mut self) -> Result<Vec<AgentEvent>> {
         let mut events = Vec::new();
+        // A parked join has a durable wait record and must remain pending so
+        // its eventual audit result can complete the original model call.
+        if self.pending_project_join.is_some() {
+            if matches!(
+                self.run.state,
+                AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+            ) {
+                events.extend(self.set_state(AgentRunState::Paused));
+            }
+            return self.publish(Ok(events));
+        }
         if let Some(call) = self.pending_tool_execution.take() {
             self.last_failed_call = Some(call);
             events.push(AgentEvent::RecoveryRequired {
@@ -1198,6 +1586,13 @@ impl AgentRuntime {
     }
 
     fn checkpoint_retry_entry_inner(&mut self) -> Result<RunProgress> {
+        if self.pending_project_join.is_some() {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "a pending project join must complete before retrying from a checkpoint",
+                false,
+            ));
+        }
         if matches!(
             self.run.state,
             AgentRunState::Planning
@@ -1247,8 +1642,14 @@ impl AgentRuntime {
             completed_at: None,
         });
         self.messages = initial_messages(&self.task);
+        self.message_timeline_ordinals.clear();
+        for _ in 0..self.messages.len() {
+            let ordinal = self.allocate_timeline_ordinal();
+            self.message_timeline_ordinals.push(ordinal);
+        }
         self.pending_approval = None;
         self.pending_tool_execution = None;
+        self.pending_project_join = None;
         self.pending_input = None;
         self.last_failed_call = None;
         self.next_message_id = 0;
@@ -1304,7 +1705,15 @@ impl AgentRuntime {
             events.extend(control_events);
             return Ok(StepOutcome::Blocked);
         }
-        if let Some(call) = self.pending_tool_execution.take() {
+        if self.pending_project_join.is_some() {
+            return Ok(StepOutcome::Blocked);
+        }
+        if let Some(call) = self.pending_tool_execution.clone() {
+            if let Some(wait_id) = self.tools.prepare_deferred(&call) {
+                events.extend(self.park_pending_project_join_inner(wait_id, call)?);
+                return Ok(StepOutcome::Blocked);
+            }
+            self.pending_tool_execution = None;
             let (tool_events, _result) = self.execute_tool(&call);
             events.extend(tool_events);
             self.last_failed_call = None;
@@ -1377,6 +1786,7 @@ impl AgentRuntime {
         events.push(self.start_activity(AgentActivityRecord {
             id: model_activity_id,
             run_id: self.run.id,
+            timeline_ordinal: 0,
             parent_id: None,
             step_id: Some(step_id),
             kind: AgentActivityKind::ModelTurn,
@@ -1403,6 +1813,7 @@ impl AgentRuntime {
             published,
             saw_tool_call,
             completed,
+            completion_guarded,
             finished,
             ..
         } = ctx;
@@ -1444,6 +1855,9 @@ impl AgentRuntime {
             return Ok(StepOutcome::Blocked);
         }
         if completed && !saw_tool_call {
+            if completion_guarded {
+                return Ok(StepOutcome::Continue);
+            }
             return Ok(StepOutcome::Blocked);
         }
         Ok(StepOutcome::Continue)
@@ -1512,7 +1926,8 @@ impl AgentRuntime {
                     run_id: self.run.id,
                     call: call.clone(),
                 });
-                let Some(kind) = ToolKind::from_name(&call.name) else {
+                let kind = ToolKind::from_name(&call.name);
+                let Some(action_kind) = self.tools.action_kind(&call) else {
                     let output = format!("unknown tool '{}'", call.name);
                     let result = ToolResult {
                         tool_call_id: call.id,
@@ -1526,7 +1941,7 @@ impl AgentRuntime {
                     });
                     ctx.events
                         .push(self.complete_tool_activity(&result, AgentActivityStatus::Failed));
-                    self.messages.push(ModelMessage {
+                    self.push_message(ModelMessage {
                         role: MessageRole::Tool,
                         content: output.clone(),
                         name: Some(result.name.clone()),
@@ -1546,11 +1961,7 @@ impl AgentRuntime {
                     .tools
                     .policy_evaluation(&call, &self.approval_policy)
                     .unwrap_or_else(|| {
-                        PolicyEvaluation::evaluate(
-                            &self.approval_policy,
-                            kind.action_kind(),
-                            &call.name,
-                        )
+                        PolicyEvaluation::evaluate(&self.approval_policy, action_kind, &call.name)
                     });
                 ctx.events.push(AgentEvent::ToolPolicyEvaluated {
                     run_id: self.run.id,
@@ -1577,7 +1988,7 @@ impl AgentRuntime {
                         step_id: ctx.step_id,
                         index: ctx.step_index,
                     });
-                    self.messages.push(ModelMessage {
+                    self.push_message(ModelMessage {
                         role: MessageRole::Tool,
                         content: result.output,
                         name: Some(result.name),
@@ -1621,7 +2032,7 @@ impl AgentRuntime {
                     ctx.finished = true;
                     return Ok(StreamFlow::Stop);
                 }
-                if kind == ToolKind::ProposePlan {
+                if kind == Some(ToolKind::ProposePlan) {
                     let steps = call
                         .arguments
                         .get("steps")
@@ -1663,7 +2074,7 @@ impl AgentRuntime {
                             step_id: ctx.step_id,
                             index: ctx.step_index,
                         });
-                        self.messages.push(ModelMessage {
+                        self.push_message(ModelMessage {
                             role: MessageRole::Tool,
                             content: output,
                             name: Some(call.name.clone()),
@@ -1686,7 +2097,7 @@ impl AgentRuntime {
                     });
                     ctx.events
                         .push(self.complete_tool_activity(&result, AgentActivityStatus::Completed));
-                    self.messages.push(ModelMessage {
+                    self.push_message(ModelMessage {
                         role: MessageRole::Tool,
                         content: result.output.clone(),
                         name: Some(result.name.clone()),
@@ -1702,7 +2113,7 @@ impl AgentRuntime {
                     });
                     return Ok(StreamFlow::Stop);
                 }
-                if kind == ToolKind::AskUser {
+                if kind == Some(ToolKind::AskUser) {
                     let Some(prompt) = call
                         .arguments
                         .get("prompt")
@@ -1735,7 +2146,7 @@ impl AgentRuntime {
                             step_id: ctx.step_id,
                             index: ctx.step_index,
                         });
-                        self.messages.push(ModelMessage {
+                        self.push_message(ModelMessage {
                             role: MessageRole::Tool,
                             content: output,
                             name: Some(call.name.clone()),
@@ -1753,7 +2164,7 @@ impl AgentRuntime {
                     );
                     self.pending_input = Some(prompt.to_owned());
                     self.run.control_revision = control_revision;
-                    self.messages.push(ModelMessage {
+                    self.push_message(ModelMessage {
                         role: MessageRole::Tool,
                         content: format!("Waiting for user input: {prompt}"),
                         name: Some(call.name.clone()),
@@ -1839,7 +2250,19 @@ impl AgentRuntime {
                 });
                 if !ctx.saw_tool_call {
                     if matches!(reason, loom_model::FinishReason::Stop) {
-                        ctx.events.extend(self.finish_completed());
+                        if let Some(blocker) = self.tools.completion_blocker() {
+                            self.active_message_id = None;
+                            self.push_message(ModelMessage {
+                                role: MessageRole::User,
+                                content: format!("Project completion is blocked: {blocker}"),
+                                name: Some("loom_project_completion_guard".to_owned()),
+                                tool_call_id: None,
+                                tool_calls: Vec::new(),
+                            });
+                            ctx.completion_guarded = true;
+                        } else {
+                            ctx.events.extend(self.finish_completed());
+                        }
                     } else if matches!(reason, loom_model::FinishReason::Cancelled) {
                         ctx.events.extend(self.finish_cancelled());
                     } else if let loom_model::FinishReason::ErrorWithMessage { message } = reason {
@@ -1899,7 +2322,7 @@ impl AgentRuntime {
                 AgentActivityStatus::Failed
             },
         ));
-        self.messages.push(ModelMessage {
+        self.push_message(ModelMessage {
             role: MessageRole::Tool,
             content: result.output.clone(),
             name: Some(result.name.clone()),
@@ -1909,10 +2332,25 @@ impl AgentRuntime {
         (events, result)
     }
 
-    fn start_activity(&mut self, activity: AgentActivityRecord) -> AgentEvent {
+    fn start_activity(&mut self, mut activity: AgentActivityRecord) -> AgentEvent {
+        activity.timeline_ordinal = self.allocate_timeline_ordinal();
         let run_id = activity.run_id;
         self.activities.push(activity.clone());
         AgentEvent::ActivityRecorded { run_id, activity }
+    }
+
+    fn allocate_timeline_ordinal(&mut self) -> u64 {
+        let ordinal = self.next_timeline_ordinal;
+        self.next_timeline_ordinal = ordinal
+            .checked_add(1)
+            .expect("run timeline ordinal space is exhausted");
+        ordinal
+    }
+
+    fn push_message(&mut self, message: ModelMessage) {
+        let ordinal = self.allocate_timeline_ordinal();
+        self.message_timeline_ordinals.push(ordinal);
+        self.messages.push(message);
     }
 
     fn start_tool_activity(
@@ -1924,6 +2362,7 @@ impl AgentRuntime {
         self.start_activity(AgentActivityRecord {
             id: ActivityId::new(),
             run_id: self.run.id,
+            timeline_ordinal: 0,
             parent_id,
             step_id: self.step_id,
             kind,
@@ -1967,6 +2406,7 @@ impl AgentRuntime {
             return self.start_activity(AgentActivityRecord {
                 id: ActivityId::new(),
                 run_id: self.run.id,
+                timeline_ordinal: 0,
                 parent_id: None,
                 step_id: self.step_id,
                 kind: AgentActivityKind::ToolCall,
@@ -2229,7 +2669,7 @@ impl AgentRuntime {
             reserve,
         )?;
         let tools = if provider.descriptor().capabilities.tool_calling {
-            tool_definitions()
+            self.tools.definitions()
         } else {
             Vec::new()
         };
@@ -2338,8 +2778,7 @@ impl AgentRuntime {
             last.content.push_str(text);
             return;
         }
-        self.messages
-            .push(ModelMessage::new(MessageRole::Assistant, text));
+        self.push_message(ModelMessage::new(MessageRole::Assistant, text));
     }
 
     fn append_assistant_tool_call(&mut self, call: ToolCall) {
@@ -2349,7 +2788,7 @@ impl AgentRuntime {
             last.tool_calls.push(call);
             return;
         }
-        self.messages.push(ModelMessage {
+        self.push_message(ModelMessage {
             role: MessageRole::Assistant,
             content: String::new(),
             name: None,
@@ -2687,6 +3126,7 @@ mod tests {
 
     use loom_core::{AgentSessionId, LimitKind, SessionLimits};
     use loom_providers::DeterministicProvider;
+    use loom_tools::ToolExtension;
 
     use super::*;
 
@@ -2858,6 +3298,91 @@ mod tests {
 
         fn reset(&mut self) {
             self.cursor = 0;
+        }
+    }
+
+    struct ExtensionToolProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+        saw_extension_tool: Arc<AtomicBool>,
+    }
+
+    impl ModelProvider for ExtensionToolProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                self.saw_extension_tool.store(
+                    request
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == "agent_extension_tool"),
+                    Ordering::SeqCst,
+                );
+                vec![ModelStreamEvent::ToolCallDelta {
+                    call: ToolCall {
+                        id: loom_core::ToolCallId::new(),
+                        name: "agent_extension_tool".to_owned(),
+                        arguments: serde_json::json!({}),
+                    },
+                }]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "The extension ran.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
+    struct TestToolExtension {
+        called: Arc<AtomicBool>,
+    }
+
+    impl ToolExtension for TestToolExtension {
+        fn definitions(&self) -> Vec<loom_model::ToolDefinition> {
+            vec![loom_model::ToolDefinition {
+                name: "agent_extension_tool".to_owned(),
+                description: "Test-only server extension.".to_owned(),
+                input_schema: serde_json::json!({"type": "object", "additionalProperties": false}),
+            }]
+        }
+
+        fn action_kind(&self, call: &ToolCall) -> Option<loom_core::ActionKind> {
+            (call.name == "agent_extension_tool").then_some(loom_core::ActionKind::Read)
+        }
+
+        fn execute(&self, call: &ToolCall) -> ToolResult {
+            self.called.store(true, Ordering::SeqCst);
+            ToolResult {
+                tool_call_id: call.id,
+                name: call.name.clone(),
+                success: true,
+                output: "extension completed".to_owned(),
+            }
         }
     }
 
@@ -3062,7 +3587,18 @@ mod tests {
             fs::read_to_string(root.join("loom-m1-demo.txt")).unwrap(),
             "Loom M1 deterministic demo\n"
         );
-        let activities = runtime.export_state().activities;
+        let state = runtime.export_state();
+        assert_eq!(state.message_timeline_ordinals.len(), state.messages.len());
+        let mut timeline_ordinals = state.message_timeline_ordinals.clone();
+        timeline_ordinals.extend(
+            state
+                .activities
+                .iter()
+                .map(|activity| activity.timeline_ordinal),
+        );
+        timeline_ordinals.sort_unstable();
+        assert!(timeline_ordinals.windows(2).all(|pair| pair[0] < pair[1]));
+        let activities = state.activities;
         assert!(activities.iter().any(|activity| {
             activity.kind == AgentActivityKind::ModelTurn
                 && activity.status == AgentActivityStatus::Completed
@@ -3086,6 +3622,48 @@ mod tests {
                 .filter(|activity| activity.kind == AgentActivityKind::ToolCall)
                 .all(|activity| activity.parent_id.is_some())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_messages_append_once_and_advance_the_inbox_cursor() {
+        let root = workspace();
+        let session_id = AgentSessionId::new();
+        let task =
+            AgentTask::new("coordinate the project", ModelId::new("deterministic/demo")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            session_id,
+            task,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        let message = AgentMessageRecord {
+            message_id: loom_core::AgentMessageId::new(),
+            project_id: loom_core::ProjectId::from_uuid(*session_id.as_uuid()),
+            task_id: None,
+            sender_session_id: AgentSessionId::new(),
+            target_session_id: session_id,
+            kind: loom_core::AgentMessageKind::Direction,
+            project_sequence: 3,
+            accepted_at: Timestamp::now(),
+            body: "Please prioritize the compatibility review".to_owned(),
+        };
+
+        runtime.pending_tool_execution = Some(ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "write_file".to_owned(),
+            arguments: serde_json::json!({"path": "result.txt"}),
+        });
+        assert!(!runtime.append_project_message(&message).unwrap());
+        assert_eq!(runtime.last_project_message_sequence(), 0);
+        runtime.pending_tool_execution = None;
+        assert!(runtime.append_project_message(&message).unwrap());
+        assert!(!runtime.append_project_message(&message).unwrap());
+        assert_eq!(runtime.last_project_message_sequence(), 3);
+        let delivered = runtime.messages().pop().unwrap();
+        assert_eq!(delivered.role, MessageRole::User);
+        assert_eq!(delivered.name.as_deref(), Some("loom_project_message"));
+        assert!(delivered.content.contains("compatibility review"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3176,6 +3754,43 @@ mod tests {
                 .any(|message| message.role == MessageRole::Tool
                     && message.content == "plan proposed")
         );
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_runtime_exposes_and_executes_server_tool_extensions() {
+        let root = workspace();
+        let tool_called = Arc::new(AtomicBool::new(false));
+        let schema_exposed = Arc::new(AtomicBool::new(false));
+        let mut descriptor = loom_providers::deterministic_descriptor();
+        descriptor.id = ModelId::new("deterministic/extension");
+        let provider = ExtensionToolProvider {
+            descriptor,
+            cursor: 0,
+            saw_extension_tool: Arc::clone(&schema_exposed),
+        };
+        let tools = ToolExecutor::new(&root)
+            .unwrap()
+            .with_extension(Arc::new(TestToolExtension {
+                called: Arc::clone(&tool_called),
+            }));
+        let task = AgentTask::new(
+            "run the server extension",
+            ModelId::new("deterministic/extension"),
+        )
+        .unwrap();
+        let mut runtime = AgentRuntime::new(AgentSessionId::new(), task, Box::new(provider), tools);
+
+        let events = runtime.start().unwrap();
+
+        assert!(schema_exposed.load(Ordering::SeqCst));
+        assert!(tool_called.load(Ordering::SeqCst));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallCompleted { result, .. }
+                if result.name == "agent_extension_tool" && result.success
+        )));
         assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
         fs::remove_dir_all(root).unwrap();
     }
@@ -3753,6 +4368,31 @@ mod tests {
         runtime.context_checkpoint = inspection.summary.clone();
         runtime.context_inspection = Some(inspection);
         let state = runtime.export_state();
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("message_timeline_ordinals");
+        let restored_legacy = AgentRuntime::from_state(
+            serde_json::from_value(legacy).unwrap(),
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap()
+        .export_state();
+        assert_eq!(
+            restored_legacy.message_timeline_ordinals.len(),
+            restored_legacy.messages.len()
+        );
+        let mut restored_ordinals = restored_legacy.message_timeline_ordinals.clone();
+        restored_ordinals.extend(
+            restored_legacy
+                .activities
+                .iter()
+                .map(|activity| activity.timeline_ordinal),
+        );
+        restored_ordinals.sort_unstable();
+        assert!(restored_ordinals.windows(2).all(|pair| pair[0] < pair[1]));
         let serialized = serde_json::to_string(&state).unwrap();
         let mut restored = AgentRuntime::from_state(
             serde_json::from_str(&serialized).unwrap(),

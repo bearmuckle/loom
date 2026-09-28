@@ -42,6 +42,20 @@ pub enum Capability {
     BrowseGitHubRepositories,
     ReadSessionFilesystem,
     WriteSessionFilesystem,
+    ReadProject,
+    /// Allows a project run to receive the server-bound delegation tool when
+    /// its persisted run grant also permits delegation.
+    CreateProjectChild,
+    /// Enables depth-two managers to create depth-three agents after rollout validation.
+    CreateNestedProjectChild,
+    CreateProjectWorktree,
+    ControlProjectChild,
+    SendProjectAgentMessage,
+    SendProjectBranchMessage,
+    ReadProjectAgentMessages,
+    ReadProjectChildReview,
+    IntegrateProjectChild,
+    CleanupProjectChildWorktree,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

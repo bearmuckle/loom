@@ -57,6 +57,8 @@ macro_rules! uuid_id {
 }
 
 uuid_id!(AgentSessionId);
+uuid_id!(ProjectId);
+uuid_id!(AgentMessageId);
 uuid_id!(ActivityId);
 uuid_id!(CheckpointId);
 uuid_id!(InteractionId);
@@ -69,6 +71,7 @@ uuid_id!(TerminalId);
 uuid_id!(TaskId);
 uuid_id!(WorkspaceId);
 uuid_id!(RepositoryId);
+uuid_id!(ProjectManagerWaitId);
 
 impl RequestId {
     /// Returns the immutable Unix-millisecond issue time for UUIDv7 request IDs.

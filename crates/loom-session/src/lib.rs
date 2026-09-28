@@ -6,8 +6,12 @@ use loom_core::{
 };
 use serde::{Deserialize, Serialize};
 
+mod project;
 mod workspace;
 
+pub use project::{
+    AgentMembership, MAX_AGENT_DEPTH, ProjectManager, ProjectManagerState, ProjectRecord,
+};
 pub use workspace::{WorkspaceManager, WorkspaceManagerState};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

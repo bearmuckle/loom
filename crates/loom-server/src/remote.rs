@@ -834,10 +834,10 @@ mod unit_tests {
         http::{HeaderMap, HeaderValue, header::AUTHORIZATION},
         response::IntoResponse,
     };
-    use loom_core::{ErrorCode, RequestId};
+    use loom_core::{ErrorCode, ProtocolVersion, RequestId};
     use loom_protocol::{
-        ClientFrame, ClientRequest, RequestEnvelope, ResponseEnvelope, decode_response,
-        encode_client_frame, encode_request,
+        ClientFrame, ClientRequest, RequestEnvelope, ResponseEnvelope, ServerResponse,
+        decode_response, encode_client_frame, encode_request,
     };
     use std::{
         collections::HashMap,
@@ -848,7 +848,58 @@ mod unit_tests {
     use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::Error as TungsteniteError;
 
+    use super::super::AuthorizationScope;
     use super::{AuthTokenStore, InProcessBackend};
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{Error as TungsteniteClientError, http::StatusCode},
+    };
+
+    #[tokio::test]
+    async fn remote_websocket_rejects_unauthenticated_upgrade_and_protocol_9() {
+        let backend = InProcessBackend::new();
+        let auth = std::sync::Arc::new(AuthTokenStore::new());
+        let token = auth.issue(AuthorizationScope::all()).unwrap();
+        let server = RemoteServer::new(backend, auth, RemoteServerConfig::local_ephemeral())
+            .bind()
+            .await
+            .unwrap();
+
+        match connect_async(server.websocket_url()).await {
+            Err(TungsteniteClientError::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+            result => panic!("unauthenticated WebSocket upgrade was not rejected: {result:?}"),
+        }
+
+        let mut connection = WebSocketTransport::new(server.websocket_url(), token.token)
+            .connect()
+            .await
+            .unwrap();
+        let protocol_9 = connection
+            .request(RequestEnvelope::with_version(
+                ProtocolVersion::new(9, 0),
+                ClientRequest::DiscoverCapabilities,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            protocol_9.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
+
+        let protocol_10 = connection
+            .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+            .await
+            .unwrap();
+        assert!(matches!(
+            protocol_10.result,
+            Ok(ServerResponse::Capabilities(_))
+        ));
+
+        drop(connection);
+        server.stop().await.unwrap();
+    }
 
     #[test]
     fn request_auth_prefers_a_valid_bearer_header_and_falls_back_to_query() {
