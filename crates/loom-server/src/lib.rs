@@ -13185,6 +13185,28 @@ mod tests {
         panic!("agent run did not settle: {last_snapshot:?}; failure: {failure:?}");
     }
 
+    fn await_project_manager_wait_status(
+        persistence: &FilePersistence,
+        wait_id: loom_core::ProjectManagerWaitId,
+        expected_status: loom_core::ProjectManagerWaitStatus,
+    ) -> loom_core::ProjectManagerWaitRecord {
+        let mut last_status = None;
+        for _ in 0..400 {
+            let wait = persistence
+                .load_project_manager_wait(wait_id)
+                .unwrap()
+                .expect("project manager wait should remain durable");
+            last_status = Some(wait.status);
+            if wait.status == expected_status {
+                return wait;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "project manager wait {wait_id} did not reach {expected_status:?}; last status: {last_status:?}"
+        );
+    }
+
     fn workspace() -> PathBuf {
         let root = std::env::temp_dir().join(format!("loom-server-{}", AgentSessionId::new()));
         fs::create_dir(&root).unwrap();
@@ -18771,11 +18793,12 @@ mod tests {
             AgentRunState::Completed
         );
         assert_eq!(
-            persistence
-                .load_project_manager_wait(wait.wait_id)
-                .unwrap()
-                .unwrap()
-                .status,
+            await_project_manager_wait_status(
+                persistence,
+                wait.wait_id,
+                loom_core::ProjectManagerWaitStatus::Consumed,
+            )
+            .status,
             loom_core::ProjectManagerWaitStatus::Consumed
         );
         let manager_join_results = persistence
@@ -19257,11 +19280,12 @@ mod tests {
             AgentRunState::Completed
         );
         assert_eq!(
-            reopened_persistence
-                .load_project_manager_wait(wait.wait_id)
-                .unwrap()
-                .unwrap()
-                .status,
+            await_project_manager_wait_status(
+                reopened_persistence,
+                wait.wait_id,
+                loom_core::ProjectManagerWaitStatus::Consumed,
+            )
+            .status,
             loom_core::ProjectManagerWaitStatus::Consumed
         );
         let durable_wait_results = reopened_persistence
