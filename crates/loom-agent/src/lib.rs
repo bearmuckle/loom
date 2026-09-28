@@ -292,6 +292,9 @@ pub struct AgentRuntime {
     step_index: u32,
     activities: Vec<AgentActivityRecord>,
     interactions: Vec<AgentInteractionRecord>,
+    /// Signatures of tool calls the user rejected this run. Re-requesting one is
+    /// answered without prompting again so a rejection cannot loop.
+    denied_tool_calls: BTreeSet<String>,
     control: RunControl,
     observer: Option<AgentEventObserver>,
     flush_offset: usize,
@@ -383,6 +386,7 @@ impl AgentRuntime {
             step_index: 0,
             activities: Vec::new(),
             interactions: Vec::new(),
+            denied_tool_calls: BTreeSet::new(),
             control: RunControl::new(),
             observer: None,
             flush_offset: 0,
@@ -1028,6 +1032,7 @@ impl AgentRuntime {
             step_index: state.step_index,
             activities,
             interactions: state.interactions,
+            denied_tool_calls: BTreeSet::new(),
             control: RunControl::new(),
             observer: None,
             flush_offset: 0,
@@ -1215,7 +1220,7 @@ impl AgentRuntime {
         let output = reason.unwrap_or_else(|| "tool call rejected by the user".to_owned());
         let result = ToolResult {
             tool_call_id,
-            name: pending.call.name,
+            name: pending.call.name.clone(),
             success: false,
             output: output.clone(),
         };
@@ -1224,8 +1229,20 @@ impl AgentRuntime {
             result: result.clone(),
         });
         events.push(self.complete_tool_activity(&result, AgentActivityStatus::Failed));
-        events.extend(self.finish_failed(output));
-        Ok(RunProgress::blocked(events))
+        // A rejection is a tool error the model can react to, not a fatal run
+        // error. Remember the denied call so an identical retry is refused
+        // without prompting the user again.
+        self.denied_tool_calls
+            .insert(tool_call_signature(&pending.call));
+        self.push_message(ModelMessage {
+            role: MessageRole::Tool,
+            content: output,
+            name: Some(result.name.clone()),
+            tool_call_id: Some(tool_call_id),
+            tool_calls: Vec::new(),
+        });
+        events.extend(self.set_state(AgentRunState::Executing));
+        Ok(RunProgress::running(events))
     }
 
     pub fn interrupt(&mut self) -> Result<Vec<AgentEvent>> {
@@ -1513,6 +1530,25 @@ impl AgentRuntime {
             );
             return self.publish(Ok(events));
         }
+        // A tool call with no recorded result means the step was interrupted
+        // while the tool was running. Replaying it is unsafe, so surface it.
+        if !matches!(
+            self.run.state,
+            AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+        ) && self.pending_approval.is_none()
+            && self.pending_input.is_none()
+            && let Some(call) = self.next_unanswered_tool_call()
+        {
+            self.last_failed_call = Some(call);
+            events.push(AgentEvent::RecoveryRequired {
+                run_id: self.run.id,
+                reason: "a tool execution was interrupted; its external outcome is unknown and it was not replayed".to_owned(),
+            });
+            events.extend(
+                self.finish_failed("tool execution was interrupted with an unknown outcome"),
+            );
+            return self.publish(Ok(events));
+        }
         if matches!(
             self.run.state,
             AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
@@ -1652,6 +1688,7 @@ impl AgentRuntime {
         self.pending_project_join = None;
         self.pending_input = None;
         self.last_failed_call = None;
+        self.denied_tool_calls.clear();
         self.next_message_id = 0;
         self.active_message_id = None;
         self.usage = UsageSnapshot::default();
@@ -1894,6 +1931,19 @@ impl AgentRuntime {
                     });
                 }
             }
+            ModelStreamEvent::ReasoningDelta { text } => {
+                if !text.is_empty() {
+                    // Reasoning is surfaced to clients but never stored in the
+                    // provider transcript, so it cannot become a protocol
+                    // requirement for providers that do not emit it.
+                    let message_id = self.assistant_message_id();
+                    ctx.events.push(AgentEvent::ReasoningDelta {
+                        run_id: self.run.id,
+                        message_id,
+                        text,
+                    });
+                }
+            }
             ModelStreamEvent::ToolCallDelta { call } => {
                 self.active_message_id = None;
                 if self
@@ -2001,6 +2051,29 @@ impl AgentRuntime {
                     evaluation.decision,
                     loom_core::PolicyDecision::RequireApproval
                 ) {
+                    if self.denied_tool_calls.contains(&tool_call_signature(&call)) {
+                        let result = ToolResult {
+                            tool_call_id: call.id,
+                            name: call.name.clone(),
+                            success: false,
+                            output: "this action was rejected earlier in the run; choose a different approach".to_owned(),
+                        };
+                        ctx.events.push(AgentEvent::ToolCallCompleted {
+                            run_id: self.run.id,
+                            result: result.clone(),
+                        });
+                        ctx.events.push(
+                            self.complete_tool_activity(&result, AgentActivityStatus::Failed),
+                        );
+                        self.push_message(ModelMessage {
+                            role: MessageRole::Tool,
+                            content: result.output,
+                            name: Some(result.name),
+                            tool_call_id: Some(call.id),
+                            tool_calls: Vec::new(),
+                        });
+                        return Ok(StreamFlow::Continue);
+                    }
                     let control_revision = self.next_control_revision()?;
                     self.pending_approval = Some(PendingApproval { call: call.clone() });
                     self.run.control_revision = control_revision;
@@ -2192,15 +2265,28 @@ impl AgentRuntime {
                     ctx.finished = true;
                     return Ok(StreamFlow::Stop);
                 }
-                self.pending_tool_execution = Some(call.clone());
-                self.step_id = None;
-                self.step_index = self.step_index.saturating_add(1);
-                ctx.events.push(AgentEvent::StepCompleted {
-                    run_id: self.run.id,
-                    step_id: ctx.step_id,
-                    index: ctx.step_index,
-                });
-                return Ok(StreamFlow::Stop);
+                // Deferred tools (project joins) need the step boundary so the
+                // run can park durably; queue them for the run driver like the
+                // previous single-tool path.
+                if self.tools.prepare_deferred(&call).is_some() {
+                    self.pending_tool_execution = Some(call.clone());
+                    self.step_id = None;
+                    self.step_index = self.step_index.saturating_add(1);
+                    ctx.events.push(AgentEvent::StepCompleted {
+                        run_id: self.run.id,
+                        step_id: ctx.step_id,
+                        index: ctx.step_index,
+                    });
+                    return Ok(StreamFlow::Stop);
+                }
+                // Every remaining policy decision allows execution, so the call
+                // can run as soon as it arrives. The provider emits all tool
+                // calls for a completion before `Completed`, so a single model
+                // turn can run several tools instead of one per turn.
+                let (tool_events, _result) = self.execute_tool(&call);
+                self.last_failed_call = None;
+                ctx.events.extend(tool_events);
+                return Ok(StreamFlow::Continue);
             }
             ModelStreamEvent::Usage { usage } => {
                 self.usage.add_tokens(
@@ -2351,6 +2437,23 @@ impl AgentRuntime {
         let ordinal = self.allocate_timeline_ordinal();
         self.message_timeline_ordinals.push(ordinal);
         self.messages.push(message);
+    }
+
+    /// The first tool call the model requested that has no matching tool result.
+    /// An unanswered call means a step was interrupted between the model
+    /// response and the tool result being recorded.
+    fn next_unanswered_tool_call(&self) -> Option<ToolCall> {
+        let answered = self
+            .messages
+            .iter()
+            .filter_map(|message| message.tool_call_id)
+            .collect::<BTreeSet<_>>();
+        self.messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .flat_map(|message| message.tool_calls.iter())
+            .find(|call| !answered.contains(&call.id))
+            .cloned()
     }
 
     fn start_tool_activity(
@@ -2873,6 +2976,14 @@ impl AgentRuntime {
         });
         events
     }
+}
+
+fn tool_call_signature(call: &ToolCall) -> String {
+    format!(
+        "{}:{}",
+        call.name,
+        serde_json::to_string(&call.arguments).unwrap_or_default()
+    )
 }
 
 fn activity_data_for_call(
@@ -3437,6 +3548,130 @@ mod tests {
         }
     }
 
+    /// Emits two executable (read) tool calls in one completion, then finishes.
+    struct TwoToolsThenCompleteProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+    }
+
+    impl ModelProvider for TwoToolsThenCompleteProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "Checking two paths.".to_owned(),
+                    },
+                    ModelStreamEvent::ToolCallDelta {
+                        call: ToolCall {
+                            id: loom_core::ToolCallId::new(),
+                            name: "list_files".to_owned(),
+                            arguments: serde_json::json!({"path": "."}),
+                        },
+                    },
+                    ModelStreamEvent::ToolCallDelta {
+                        call: ToolCall {
+                            id: loom_core::ToolCallId::new(),
+                            name: "list_files".to_owned(),
+                            arguments: serde_json::json!({"path": "."}),
+                        },
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::ToolCall,
+                    },
+                ]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "Both paths checked.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
+    /// Requests one approval-gated change, then acknowledges the rejection.
+    struct RejectThenCompleteProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+    }
+
+    impl ModelProvider for RejectThenCompleteProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                vec![
+                    ModelStreamEvent::ToolCallDelta {
+                        call: ToolCall {
+                            id: loom_core::ToolCallId::new(),
+                            name: "apply_patch".to_owned(),
+                            arguments: serde_json::json!({
+                                "path": "rejected.txt",
+                                "old_text": "",
+                                "new_text": "nope\n"
+                            }),
+                        },
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::ToolCall,
+                    },
+                ]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "Understood, I will not change that file.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
     fn blocking_runtime(entered: Arc<AtomicBool>, released: Arc<AtomicBool>) -> AgentRuntime {
         let root = workspace();
         let tools = ToolExecutor::new(&root).unwrap();
@@ -3522,6 +3757,127 @@ mod tests {
         let runtime = worker.join().unwrap();
         assert_eq!(runtime.snapshot().state, AgentRunState::Paused);
         assert!(!control.is_stopping());
+    }
+
+    #[test]
+    fn a_single_completion_runs_all_of_its_executable_tool_calls() {
+        let root = workspace();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task = AgentTask::new("list twice", ModelId::new("two-tools/demo")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(TwoToolsThenCompleteProvider {
+                descriptor: loom_model::ModelDescriptor {
+                    id: ModelId::new("two-tools/demo"),
+                    provider: loom_model::ProviderId::new("two-tools"),
+                    display_name: "Two tool test provider".to_owned(),
+                    context_window: Some(8_192),
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    capabilities: loom_model::ModelCapabilities {
+                        streaming: true,
+                        tool_calling: true,
+                        vision: false,
+                        json_mode: false,
+                    },
+                },
+                cursor: 0,
+            }),
+            tools,
+        );
+
+        let events = runtime.start().unwrap();
+        let completed = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolCallCompleted { .. }))
+            .count();
+        assert_eq!(completed, 2);
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        assert_eq!(
+            runtime
+                .messages()
+                .iter()
+                .filter(|message| message.role == MessageRole::Tool)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn rejecting_a_tool_call_lets_the_run_continue() {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task = AgentTask::new("edit a file", ModelId::new("reject/demo")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(RejectThenCompleteProvider {
+                descriptor: loom_model::ModelDescriptor {
+                    id: ModelId::new("reject/demo"),
+                    provider: loom_model::ProviderId::new("reject"),
+                    display_name: "Reject test provider".to_owned(),
+                    context_window: Some(8_192),
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    capabilities: loom_model::ModelCapabilities {
+                        streaming: true,
+                        tool_calling: true,
+                        vision: false,
+                        json_mode: false,
+                    },
+                },
+                cursor: 0,
+            }),
+            tools,
+        );
+
+        let first = runtime.start().unwrap();
+        let (call_id, attempt_id, revision) = first
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolApprovalRequired {
+                    call,
+                    attempt_id,
+                    control_revision,
+                    ..
+                } => Some((call.id, *attempt_id, *control_revision)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::AwaitingApproval);
+
+        let progress = runtime
+            .reject_entry(
+                call_id,
+                Some("not this time".to_owned()),
+                attempt_id,
+                revision,
+            )
+            .unwrap();
+        assert!(progress.continues);
+        assert_eq!(runtime.snapshot().state, AgentRunState::Executing);
+        assert!(!root.join("rejected.txt").exists());
+        assert!(progress.events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallCompleted { result, .. } if !result.success
+        )));
+
+        let second = runtime.advance().unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        assert!(second.iter().any(|event| matches!(
+            event,
+            AgentEvent::AssistantMessageDelta { text, .. }
+                if text.contains("will not change that file")
+        )));
+        assert!(
+            runtime
+                .messages()
+                .iter()
+                .any(|message| message.role == MessageRole::Tool
+                    && message.content == "not this time")
+        );
     }
 
     #[test]

@@ -20,9 +20,7 @@ use gpui_kit::component::input::{
 use gpui_kit::component::list::ListItem;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{
-    Icon, IconName, IndexPath, Sizable,
-    collapsible::Collapsible,
-    h_resizable,
+    Icon, IconName, IndexPath, Sizable, h_resizable,
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     resizable_panel,
     select::{SearchableVec, Select, SelectEvent, SelectState},
@@ -36,8 +34,8 @@ use gpui_kit::{
 };
 use loom_core::{
     ActivityId, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, AgentSessionState,
-    CapabilitySet, ErrorCode, EventSequence, LoomError, RepositoryId, RunId, WorkspaceId,
-    WorkspaceRecord,
+    CapabilitySet, ErrorCode, EventSequence, LoomError, RepositoryId, RunId, ToolCallId,
+    WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{MessageRole, ModelId, ModelMessage, ProviderKind, ProviderSummary, ToolCall};
 #[cfg(target_family = "wasm")]
@@ -61,9 +59,11 @@ use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
-        AgentMode, GitHubLoginState, RenameDialogState, ReviewPanel, ReviewRow, ReviewState,
-        ThemeChoice, TimelineItem, activity_status_label, bounded, bounded_to,
-        session_state_for_run, session_title_from_task, upsert_activity,
+        AgentMode, AssistantPart, AssistantTurn, EvidenceText, GitHubLoginState, RenameDialogState,
+        ReviewPanel, ReviewRow, ReviewState, SystemNote, SystemTone, ThemeChoice, TimelineItem,
+        ToolPart, ToolPartStatus, bounded, bounded_to, finish_assistant_turn,
+        push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
+        session_state_for_run, session_title_from_task, upsert_tool_part,
     },
     theme::{ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND, ERROR_CARD_SURFACE, change_color, rgb},
 };
@@ -155,6 +155,7 @@ fn review_panel_is_visible(
         && !github_login_open
 }
 
+#[cfg(test)]
 fn session_header_title() -> gpui_kit::Div {
     div().flex().flex_1().min_w(px(0.)).items_center().gap_2()
 }
@@ -475,7 +476,6 @@ fn load_transcript_page_sync(
 fn timeline_items_from_messages(
     messages: Vec<TranscriptMessage>,
     mut activities: Vec<AgentActivityRecord>,
-    has_activity_records: bool,
 ) -> Vec<TimelineItem> {
     enum Entry {
         Message(ModelMessage),
@@ -502,31 +502,48 @@ fn timeline_items_from_messages(
                 }
                 MessageRole::User => timeline.push(TimelineItem::User(message.content)),
                 MessageRole::Assistant => {
-                    if message.content.is_empty() {
-                        continue;
-                    }
-                    if let Some(TimelineItem::Assistant(previous)) = timeline.last_mut() {
-                        if !previous.is_empty() {
-                            previous.push_str("\n\n");
+                    if !message.content.is_empty() {
+                        let appended = match timeline.last_mut() {
+                            Some(TimelineItem::Assistant(turn)) => match turn.parts.last_mut() {
+                                Some(AssistantPart::Text(existing)) => {
+                                    if !existing.is_empty() {
+                                        existing.push_str("\n\n");
+                                    }
+                                    existing.push_str(&message.content);
+                                    true
+                                }
+                                _ => false,
+                            },
+                            _ => false,
+                        };
+                        if !appended {
+                            timeline.push(TimelineItem::Assistant(AssistantTurn::text(
+                                message.content.clone(),
+                            )));
                         }
-                        previous.push_str(&message.content);
-                    } else {
-                        timeline.push(TimelineItem::Assistant(message.content));
+                    }
+                    for call in &message.tool_calls {
+                        upsert_tool_part(
+                            &mut timeline,
+                            tool_part_from_call(call, ToolPartStatus::Queued),
+                        );
                     }
                 }
-                MessageRole::Tool if !has_activity_records => {
-                    timeline.push(TimelineItem::ToolOutput(bounded(&message.content)))
+                MessageRole::Tool => {
+                    let call = loom_model::ToolCall {
+                        id: message.tool_call_id.unwrap_or_default(),
+                        name: message.name.clone().unwrap_or_else(|| "tool".to_owned()),
+                        arguments: serde_json::Value::Null,
+                    };
+                    let mut part = tool_part_from_call(&call, ToolPartStatus::Completed);
+                    part.output = Some(bounded(&message.content));
+                    upsert_tool_part(&mut timeline, part);
                 }
-                MessageRole::Tool | MessageRole::System => {}
+                MessageRole::System => {}
             },
             Entry::Activity(activity) => {
-                let activity = *activity;
-                if let Some(TimelineItem::ActivitySection { activities }) = timeline.last_mut() {
-                    activities.push(activity);
-                } else {
-                    timeline.push(TimelineItem::ActivitySection {
-                        activities: vec![activity],
-                    });
+                if let Some(part) = tool_part_from_activity(&activity) {
+                    upsert_tool_part(&mut timeline, part);
                 }
             }
         }
@@ -823,15 +840,42 @@ fn belongs_to_repository(path: &str, repositories: &[SessionRepository]) -> bool
     })
 }
 
-fn activity_marker(status: AgentActivityStatus) -> &'static str {
-    match status {
-        AgentActivityStatus::Started => "›",
-        AgentActivityStatus::Completed => "✓",
-        AgentActivityStatus::Failed => "×",
-        AgentActivityStatus::AwaitingApproval => "!",
-        AgentActivityStatus::AwaitingInput => "?",
-        AgentActivityStatus::Cancelled => "–",
+fn tool_element_id(index: usize, part_index: usize) -> u64 {
+    ((index as u64) << 32) | part_index as u64
+}
+
+fn reasoning_preview(text: &str) -> String {
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = normalized.chars().take(96).collect::<String>();
+    if normalized.chars().count() > 96 {
+        preview.push('…');
     }
+    preview
+}
+
+fn streaming_caret(index: usize) -> gpui_kit::AnyElement {
+    div()
+        .w(px(9.))
+        .h(px(16.))
+        .rounded_sm()
+        .bg(rgb(0x93c5fd))
+        .with_animation(
+            ("assistant-streaming", index),
+            Animation::new(Duration::from_millis(900))
+                .repeat_synced()
+                .with_max_fps(12.),
+            |element, progress| element.opacity(0.2 + 0.8 * (1. - progress)),
+        )
+        .into_any()
+}
+
+fn assistant_turn_matches(
+    timeline: &[TimelineItem],
+    predicate: impl Fn(&AssistantPart) -> bool,
+) -> bool {
+    timeline.iter().any(
+        |item| matches!(item, TimelineItem::Assistant(turn) if turn.parts.iter().any(&predicate)),
+    )
 }
 
 fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyElement {
@@ -881,59 +925,144 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
     }
 }
 
-fn activity_label(activity: &AgentActivityRecord) -> (String, Option<String>) {
-    let compact_arguments = |call: &loom_model::ToolCall| {
-        bounded_to(
-            &serde_json::to_string(&call.arguments).unwrap_or_default(),
-            180,
-        )
-    };
-    match &activity.data {
-        AgentActivityData::ModelTurn { model } => {
-            (format!("Agent turn · {}", model.as_str()), None)
-        }
-        AgentActivityData::ToolCall { call, .. } => {
-            (call.name.clone(), Some(compact_arguments(call)))
-        }
-        AgentActivityData::File {
-            call,
-            operation,
-            path,
-            ..
-        } => {
-            let operation = match operation {
-                FileActivityOperation::List => "List files",
-                FileActivityOperation::Read => "Read file",
-                FileActivityOperation::Write => "Write file",
-            };
-            (
-                operation.to_owned(),
-                Some(format!(
-                    "{} · {}",
-                    path.as_deref().unwrap_or("."),
-                    compact_arguments(call)
-                )),
-            )
-        }
-        AgentActivityData::Search {
-            call, query, path, ..
-        } => (
-            "Search".to_owned(),
-            Some(format!(
-                "\"{}\"{} · {}",
-                bounded_to(query, 120),
-                path.as_deref()
-                    .map_or_else(String::new, |path| format!(" in {path}")),
-                compact_arguments(call)
-            )),
+fn compact_arguments(call: &loom_model::ToolCall) -> String {
+    bounded_to(
+        &serde_json::to_string(&call.arguments).unwrap_or_default(),
+        180,
+    )
+}
+
+fn string_argument(arguments: &serde_json::Value, key: &str) -> Option<String> {
+    arguments
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// A short human intent for a tool call, used as the tool block title.
+fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
+    let path = || string_argument(arguments, "path");
+    match name {
+        "read_file" => path().map_or_else(|| "Read file".to_owned(), |p| format!("Read {p}")),
+        "write_file" => path().map_or_else(|| "Edit file".to_owned(), |p| format!("Edit {p}")),
+        "list_files" => path().map_or_else(|| "List files".to_owned(), |p| format!("List {p}")),
+        "search_text" => string_argument(arguments, "query").map_or_else(
+            || "Search text".to_owned(),
+            |query| format!("Search \"{}\"", compact_activity_text(&query, 40)),
         ),
+        "web_search" => string_argument(arguments, "query").map_or_else(
+            || "Web search".to_owned(),
+            |query| format!("Web search \"{}\"", compact_activity_text(&query, 40)),
+        ),
+        "apply_patch" => path().map_or_else(|| "Apply patch".to_owned(), |p| format!("Edit {p}")),
+        "run_command" => {
+            let Some(command) = string_argument(arguments, "command") else {
+                return "Run command".to_owned();
+            };
+            let args = arguments
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            command_purpose(&command, &args)
+        }
+        "propose_plan" => "Propose a plan".to_owned(),
+        "ask_user" => "Ask the user".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn tool_title_for_activity(activity: &AgentActivityRecord) -> String {
+    match &activity.data {
+        AgentActivityData::ModelTurn { .. } => String::new(),
+        AgentActivityData::ToolCall { call, .. } => tool_title(&call.name, &call.arguments),
+        AgentActivityData::File {
+            operation, path, ..
+        } => match operation {
+            FileActivityOperation::List => path
+                .clone()
+                .map_or_else(|| "List files".to_owned(), |path| format!("List {path}")),
+            FileActivityOperation::Read => path
+                .clone()
+                .map_or_else(|| "Read file".to_owned(), |path| format!("Read {path}")),
+            FileActivityOperation::Write => path
+                .clone()
+                .map_or_else(|| "Edit file".to_owned(), |path| format!("Edit {path}")),
+        },
+        AgentActivityData::Search { query, path, .. } => {
+            let suffix = path
+                .as_deref()
+                .map_or_else(String::new, |path| format!(" in {path}"));
+            format!("Search \"{}\"{suffix}", compact_activity_text(query, 40))
+        }
+        AgentActivityData::Command { command, args, .. } => command_purpose(command, args),
+    }
+}
+
+fn tool_status(status: AgentActivityStatus) -> ToolPartStatus {
+    match status {
+        AgentActivityStatus::Started => ToolPartStatus::Running,
+        AgentActivityStatus::Completed => ToolPartStatus::Completed,
+        AgentActivityStatus::Failed => ToolPartStatus::Failed,
+        AgentActivityStatus::AwaitingApproval => ToolPartStatus::AwaitingApproval,
+        AgentActivityStatus::AwaitingInput => ToolPartStatus::AwaitingInput,
+        AgentActivityStatus::Cancelled => ToolPartStatus::Cancelled,
+    }
+}
+
+fn tool_part_from_call(call: &loom_model::ToolCall, status: ToolPartStatus) -> ToolPart {
+    ToolPart {
+        id: call.id,
+        name: call.name.clone(),
+        title: tool_title(&call.name, &call.arguments),
+        status,
+        detail: Some(compact_arguments(call)),
+        output: None,
+        elapsed_ms: None,
+        approval_pending: status == ToolPartStatus::AwaitingApproval,
+    }
+}
+
+fn tool_part_from_activity(activity: &AgentActivityRecord) -> Option<ToolPart> {
+    let call = match &activity.data {
+        AgentActivityData::ModelTurn { .. } => return None,
+        AgentActivityData::ToolCall { call, .. }
+        | AgentActivityData::File { call, .. }
+        | AgentActivityData::Search { call, .. }
+        | AgentActivityData::Command { call, .. } => call,
+    };
+    let detail = match &activity.data {
+        AgentActivityData::ToolCall { .. } => Some(compact_arguments(call)),
+        AgentActivityData::File { path, .. } => {
+            Some(path.clone().unwrap_or_else(|| ".".to_owned()))
+        }
+        AgentActivityData::Search { query, .. } => Some(format!("\"{}\"", bounded_to(query, 120))),
         AgentActivityData::Command {
             command, args, cwd, ..
-        } => (
-            compact_activity_text(&command_line(command, args), 180),
-            cwd.as_ref().map(|cwd| format!("Directory: {cwd}")),
-        ),
-    }
+        } => {
+            let mut detail = command_line(command, args);
+            if let Some(cwd) = cwd {
+                detail.push_str(&format!("\nDirectory: {cwd}"));
+            }
+            Some(detail)
+        }
+        AgentActivityData::ModelTurn { .. } => None,
+    };
+    Some(ToolPart {
+        id: call.id,
+        name: call.name.clone(),
+        title: tool_title_for_activity(activity),
+        status: tool_status(activity.status),
+        detail,
+        output: activity_output(activity).map(bounded),
+        elapsed_ms: activity.elapsed_ms,
+        approval_pending: activity.status == AgentActivityStatus::AwaitingApproval,
+    })
 }
 
 fn activity_output(activity: &AgentActivityRecord) -> Option<&str> {
@@ -946,45 +1075,6 @@ fn activity_output(activity: &AgentActivityRecord) -> Option<&str> {
             .as_ref()
             .map(|result| result.output.as_str())
             .filter(|output| !output.is_empty()),
-    }
-}
-
-fn activity_turn_title(activities: &[AgentActivityRecord]) -> String {
-    if activities.iter().any(|activity| {
-        matches!(
-            &activity.data,
-            AgentActivityData::File {
-                operation: FileActivityOperation::Write,
-                ..
-            }
-        ) || matches!(
-            &activity.data,
-            AgentActivityData::ToolCall { call, .. } if call.name == "apply_patch"
-        )
-    }) {
-        "Making changes".to_owned()
-    } else if activities
-        .iter()
-        .any(|activity| matches!(&activity.data, AgentActivityData::Command { .. }))
-    {
-        command_group_title(activities)
-    } else if activities
-        .iter()
-        .any(|activity| matches!(&activity.data, AgentActivityData::Search { .. }))
-    {
-        "Searching the codebase".to_owned()
-    } else if activities
-        .iter()
-        .any(|activity| matches!(&activity.data, AgentActivityData::File { .. }))
-    {
-        "Inspecting the workspace".to_owned()
-    } else if activities
-        .iter()
-        .any(|activity| matches!(&activity.data, AgentActivityData::ToolCall { .. }))
-    {
-        "Using tools".to_owned()
-    } else {
-        "Working on the task".to_owned()
     }
 }
 
@@ -1058,66 +1148,6 @@ fn command_purpose(command: &str, args: &[String]) -> String {
             )
         }
     }
-}
-
-fn command_group_title(activities: &[AgentActivityRecord]) -> String {
-    let mut purposes = Vec::new();
-    for activity in activities {
-        if let AgentActivityData::Command { command, args, .. } = &activity.data {
-            let purpose = command_purpose(command, args);
-            if !purposes.contains(&purpose) {
-                purposes.push(purpose);
-            }
-        }
-    }
-    let title = match purposes.as_slice() {
-        [] => "Inspect the workspace".to_owned(),
-        [purpose] => purpose.clone(),
-        [first, second] => format!("{first} · {second}"),
-        [first, second, ..] => format!("{first} · {second} · More work"),
-    };
-    compact_activity_text(&title, 72)
-}
-
-fn activity_group_status(activities: &[AgentActivityRecord]) -> AgentActivityStatus {
-    // Actionable and active work stays visible even after another activity fails.
-    for status in [
-        AgentActivityStatus::AwaitingApproval,
-        AgentActivityStatus::AwaitingInput,
-        AgentActivityStatus::Started,
-        AgentActivityStatus::Failed,
-        AgentActivityStatus::Cancelled,
-    ] {
-        if activities.iter().any(|activity| activity.status == status) {
-            return status;
-        }
-    }
-    AgentActivityStatus::Completed
-}
-
-fn command_output_summary(output: &str) -> String {
-    let lines = output.lines().collect::<Vec<_>>();
-    if lines.len() <= 8 && output.len() <= 420 {
-        return output.trim().to_owned();
-    }
-    let head = lines.iter().take(3).copied().collect::<Vec<_>>().join("\n");
-    let tail = lines
-        .iter()
-        .skip(lines.len().saturating_sub(4))
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n");
-    // Keep the end, where build/test summaries and failure messages usually live.
-    let tail_start = tail
-        .char_indices()
-        .map(|(index, _)| index)
-        .find(|index| tail.len() - index <= 240)
-        .unwrap_or(tail.len());
-    format!(
-        "{}\n… output abbreviated …\n{}",
-        bounded_to(&head, 140),
-        &tail[tail_start..]
-    )
 }
 
 fn is_redundant_completion_summary(summary: &str) -> bool {
@@ -1516,9 +1546,9 @@ pub(crate) struct LoomView {
     transcript_loading: bool,
     transcript_generation: u64,
     timeline_view: Option<Entity<TimelineView>>,
-    pub(crate) activity_records_seen: bool,
-    pub(crate) expanded_activities: BTreeSet<ActivityId>,
-    expanded_activity_groups: BTreeSet<ActivityId>,
+    pub(crate) activity_records: BTreeMap<ActivityId, AgentActivityRecord>,
+    pub(crate) expanded_tools: BTreeSet<ToolCallId>,
+    pub(crate) expanded_reasoning: BTreeSet<u64>,
     pub(crate) approval_request_in_flight: bool,
     approval_settings_request_in_flight: bool,
     pub(crate) archive_request_in_flight: bool,
@@ -1772,13 +1802,7 @@ fn project_session_list_projection_for_project(
             .as_deref()
             .map(|summary| format!(" — {summary}"))
             .unwrap_or_default();
-        format!(
-            "↳ {} · task {} · run {}{}",
-            session.name,
-            task_state,
-            session_state_label(agent.state),
-            task_summary
-        )
+        format!("↳ {} · {task_state}{task_summary}", session.name)
     }
 
     fn project_task_status_label(status: loom_core::DelegatedTaskStatus) -> &'static str {
@@ -2300,9 +2324,9 @@ impl LoomView {
             transcript_loading: false,
             transcript_generation: 0,
             timeline_view: None,
-            activity_records_seen: false,
-            expanded_activities: BTreeSet::new(),
-            expanded_activity_groups: BTreeSet::new(),
+            activity_records: BTreeMap::new(),
+            expanded_tools: BTreeSet::new(),
+            expanded_reasoning: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -2701,9 +2725,9 @@ impl LoomView {
             transcript_loading: false,
             transcript_generation: 0,
             timeline_view: None,
-            activity_records_seen: false,
-            expanded_activities: BTreeSet::new(),
-            expanded_activity_groups: BTreeSet::new(),
+            activity_records: BTreeMap::new(),
+            expanded_tools: BTreeSet::new(),
+            expanded_reasoning: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -2879,7 +2903,9 @@ impl LoomView {
             timeline: if demo_mode {
                 vec![
                     TimelineItem::User("What can Loom do?".to_owned()),
-                    TimelineItem::Assistant("Loom gives you a workspace for steering coding agents. Connect a backend to work with a real repository, run tools, and keep sessions available across clients. This browser demo is a static preview.".to_owned()),
+                    TimelineItem::Assistant(AssistantTurn::text(
+                        "Loom gives you a workspace for steering coding agents. Connect a backend to work with a real repository, run tools, and keep sessions available across clients. This browser demo is a static preview.",
+                    )),
                 ]
             } else {
                 Vec::new()
@@ -2891,9 +2917,9 @@ impl LoomView {
             transcript_loading: false,
             transcript_generation: 0,
             timeline_view: None,
-            activity_records_seen: false,
-            expanded_activities: BTreeSet::new(),
-            expanded_activity_groups: BTreeSet::new(),
+            activity_records: BTreeMap::new(),
+            expanded_tools: BTreeSet::new(),
+            expanded_reasoning: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -3126,9 +3152,9 @@ impl LoomView {
             transcript_loading: false,
             transcript_generation: 0,
             timeline_view: None,
-            activity_records_seen: false,
-            expanded_activities: BTreeSet::new(),
-            expanded_activity_groups: BTreeSet::new(),
+            activity_records: BTreeMap::new(),
+            expanded_tools: BTreeSet::new(),
+            expanded_reasoning: BTreeSet::new(),
             approval_request_in_flight: false,
             approval_settings_request_in_flight: false,
             archive_request_in_flight: false,
@@ -3261,14 +3287,17 @@ impl LoomView {
     }
 
     pub(crate) fn record_status(&mut self, status: impl Into<String>) {
-        self.timeline.push(TimelineItem::Status(status.into()));
+        self.timeline
+            .push(TimelineItem::System(SystemNote::status(status.into())));
     }
 
     pub(crate) fn record_backend_error(&mut self, operation: &str, error: LoomError) {
-        self.timeline.push(TimelineItem::Error {
-            operation: operation.to_owned(),
-            error,
-        });
+        self.timeline.push(TimelineItem::System(SystemNote {
+            tone: SystemTone::Error,
+            heading: Some(format!("{operation} · {}", error.code)),
+            text: error.message.clone(),
+            retryable: error.retryable,
+        }));
     }
 
     /// Refreshes the model list. The synchronous variant is only used during
@@ -3577,9 +3606,9 @@ impl LoomView {
         self.transcript_messages.clear();
         self.transcript_has_older = false;
         self.transcript_loading = false;
-        self.activity_records_seen = false;
-        self.expanded_activities.clear();
-        self.expanded_activity_groups.clear();
+        self.activity_records.clear();
+        self.expanded_tools.clear();
+        self.expanded_reasoning.clear();
         self.approval_request_in_flight = false;
         self.pending_approval = None;
         self.pending_input = None;
@@ -3607,23 +3636,6 @@ impl LoomView {
                     .map(TimelineItem::ProjectMessage),
             );
         }
-    }
-
-    fn enable_activity_projection(&mut self) {
-        if self.activity_records_seen {
-            return;
-        }
-        self.activity_records_seen = true;
-        self.timeline.retain(|item| {
-            !matches!(
-                item,
-                TimelineItem::ToolRequested { .. }
-                    | TimelineItem::ToolStarted(_)
-                    | TimelineItem::ToolOutput(_)
-                    | TimelineItem::ToolCompleted { .. }
-                    | TimelineItem::Approval { .. }
-            )
-        });
     }
 
     pub(crate) fn activate_session(&mut self, session: AgentSessionSnapshot) {
@@ -4629,21 +4641,40 @@ impl LoomView {
                     self.transcript_messages.clear();
                     self.transcript_has_older = false;
                     self.transcript_loading = false;
+                    self.activity_records.clear();
                 }
                 self.context_inspection = None;
                 self.active_run = Some(snapshot.clone());
                 self.active_run_id = Some(snapshot.id);
                 self.run_state = Some(snapshot.state);
             }
-            AgentEvent::PlanProposed { plan, .. } => self.timeline.push(TimelineItem::Plan {
-                steps: plan
+            AgentEvent::PlanProposed { plan, .. } => {
+                let steps = plan
                     .steps
                     .iter()
                     .map(|step| step.description.clone())
-                    .collect(),
-                completed: BTreeSet::new(),
-                active: None,
-            }),
+                    .collect::<Vec<_>>();
+                if let Some(TimelineItem::Plan {
+                    steps: existing,
+                    completed,
+                    active,
+                }) = self
+                    .timeline
+                    .iter_mut()
+                    .rev()
+                    .find(|item| matches!(item, TimelineItem::Plan { .. }))
+                {
+                    *existing = steps;
+                    completed.clear();
+                    *active = None;
+                } else {
+                    self.timeline.push(TimelineItem::Plan {
+                        steps,
+                        completed: BTreeSet::new(),
+                        active: None,
+                    });
+                }
+            }
             AgentEvent::UserMessage {
                 run_id,
                 attempt_id,
@@ -4663,14 +4694,10 @@ impl LoomView {
                 }
             }
             AgentEvent::AssistantMessageDelta { text, .. } => {
-                if text.is_empty() {
-                    return;
-                }
-                if let Some(TimelineItem::Assistant(message)) = self.timeline.last_mut() {
-                    message.push_str(text);
-                } else {
-                    self.timeline.push(TimelineItem::Assistant(text.clone()));
-                }
+                push_assistant_text(&mut self.timeline, text);
+            }
+            AgentEvent::ReasoningDelta { text, .. } => {
+                push_assistant_reasoning(&mut self.timeline, text);
             }
             AgentEvent::StepStarted { index, .. } => {
                 if let Some(TimelineItem::Plan { active, .. }) = self
@@ -4704,20 +4731,18 @@ impl LoomView {
                 self.context_inspection = Some(inspection.clone());
             }
             AgentEvent::ProviderError { error, .. } | AgentEvent::ContextError { error, .. } => {
-                self.timeline.push(TimelineItem::Error {
-                    operation: "agent".to_owned(),
-                    error: error.clone(),
-                });
+                self.timeline.push(TimelineItem::System(SystemNote {
+                    tone: SystemTone::Error,
+                    heading: Some(format!("agent · {}", error.code)),
+                    text: error.message.clone(),
+                    retryable: error.retryable,
+                }));
             }
             AgentEvent::ToolCallRequested { call, .. } => {
-                if !self.activity_records_seen {
-                    self.timeline.push(TimelineItem::ToolRequested {
-                        name: call.name.clone(),
-                        arguments: bounded(
-                            &serde_json::to_string(&call.arguments).unwrap_or_default(),
-                        ),
-                    });
-                }
+                upsert_tool_part(
+                    &mut self.timeline,
+                    tool_part_from_call(call, ToolPartStatus::Queued),
+                );
             }
             AgentEvent::ToolApprovalRequired {
                 run_id,
@@ -4727,62 +4752,88 @@ impl LoomView {
                 ..
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
-                for item in &mut self.timeline {
-                    if let TimelineItem::Approval { active, .. } = item {
-                        *active = false;
-                    }
-                }
                 self.pending_approval = Some(call.clone());
-                if !self.activity_records_seen {
-                    self.timeline.push(TimelineItem::Approval {
-                        name: call.name.clone(),
-                        active: true,
-                    });
-                }
+                upsert_tool_part(
+                    &mut self.timeline,
+                    tool_part_from_call(call, ToolPartStatus::AwaitingApproval),
+                );
             }
             AgentEvent::ToolPolicyEvaluated { .. } => {}
             AgentEvent::ToolApprovalDecided {
                 run_id,
                 attempt_id,
                 control_revision,
+                tool_call_id,
+                decision,
                 ..
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 self.pending_approval = None;
                 self.approval_request_in_flight = false;
-                for item in &mut self.timeline {
-                    if let TimelineItem::Approval { active, .. } = item {
-                        *active = false;
-                    }
-                }
+                let status = if *decision == loom_protocol::ApprovalDecision::Approved {
+                    ToolPartStatus::Running
+                } else {
+                    ToolPartStatus::Failed
+                };
+                upsert_tool_part(
+                    &mut self.timeline,
+                    ToolPart {
+                        id: *tool_call_id,
+                        name: String::new(),
+                        title: String::new(),
+                        status,
+                        detail: None,
+                        output: None,
+                        elapsed_ms: None,
+                        approval_pending: false,
+                    },
+                );
             }
             AgentEvent::ToolCallStarted { call, .. } => {
-                if !self.activity_records_seen {
-                    self.timeline
-                        .push(TimelineItem::ToolStarted(call.name.clone()));
-                }
+                upsert_tool_part(
+                    &mut self.timeline,
+                    tool_part_from_call(call, ToolPartStatus::Running),
+                );
             }
-            AgentEvent::ToolOutputChunk { chunk, .. } => {
-                if !self.activity_records_seen {
-                    if let Some(TimelineItem::ToolOutput(output)) = self.timeline.last_mut() {
-                        output.push_str(chunk);
-                        *output = bounded(output);
-                    } else {
-                        self.timeline.push(TimelineItem::ToolOutput(bounded(chunk)));
-                    }
-                }
+            AgentEvent::ToolOutputChunk {
+                tool_call_id,
+                chunk,
+                ..
+            } => {
+                upsert_tool_part(
+                    &mut self.timeline,
+                    ToolPart {
+                        id: *tool_call_id,
+                        name: String::new(),
+                        title: String::new(),
+                        status: ToolPartStatus::Running,
+                        detail: None,
+                        output: Some(bounded(chunk)),
+                        elapsed_ms: None,
+                        approval_pending: false,
+                    },
+                );
             }
             AgentEvent::ToolCallCompleted { result, .. } => {
-                if !self.activity_records_seen {
-                    self.timeline.push(TimelineItem::ToolCompleted {
-                        name: result.name.clone(),
-                        success: result.success,
-                    });
-                }
+                let status = if result.success {
+                    ToolPartStatus::Completed
+                } else {
+                    ToolPartStatus::Failed
+                };
+                let call = loom_model::ToolCall {
+                    id: result.tool_call_id,
+                    name: result.name.clone(),
+                    arguments: serde_json::Value::Null,
+                };
+                let mut part = tool_part_from_call(&call, status);
+                part.output = (!result.output.is_empty()).then(|| bounded(&result.output));
+                upsert_tool_part(&mut self.timeline, part);
             }
             AgentEvent::ActivityRecorded { activity, .. } => {
-                self.enable_activity_projection();
-                upsert_activity(&mut self.timeline, activity.clone());
+                self.activity_records.insert(activity.id, activity.clone());
+                if let Some(part) = tool_part_from_activity(activity) {
+                    upsert_tool_part(&mut self.timeline, part);
+                }
             }
             AgentEvent::NeedsInput {
                 run_id,
@@ -4793,7 +4844,12 @@ impl LoomView {
             } => {
                 self.update_active_run_control(*run_id, *attempt_id, *control_revision);
                 self.pending_input = Some(prompt.clone());
-                self.timeline.push(TimelineItem::NeedsInput(prompt.clone()));
+                self.timeline.push(TimelineItem::System(SystemNote {
+                    tone: SystemTone::Input,
+                    heading: Some("Agent needs input".to_owned()),
+                    text: prompt.clone(),
+                    retryable: false,
+                }));
             }
             AgentEvent::RunUsage { .. } | AgentEvent::RunUsageUpdated { .. } => {}
             AgentEvent::RunLimitReached { status, .. } => {
@@ -4807,6 +4863,12 @@ impl LoomView {
                 self.session_state = session_state_for_run(*state);
                 self.active_session.state = self.session_state;
                 self.update_session_list();
+                if matches!(
+                    state,
+                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                ) {
+                    finish_assistant_turn(&mut self.timeline);
+                }
             }
             AgentEvent::RunCompleted { snapshot } => {
                 self.active_run = Some(snapshot.clone());
@@ -4815,17 +4877,34 @@ impl LoomView {
                 self.session_state = session_state_for_run(snapshot.state);
                 self.active_session.state = self.session_state;
                 self.update_session_list();
+                // The run is over, so stop the streaming cursor even when no
+                // completion summary is rendered.
+                finish_assistant_turn(&mut self.timeline);
                 if let Some(summary) = &snapshot.summary
                     && !is_redundant_completion_summary(summary)
+                    && !summary.trim().is_empty()
+                    && !assistant_turn_matches(
+                        &self.timeline,
+                        |part| matches!(part, AssistantPart::Text(text) if text == summary),
+                    )
                 {
-                    self.timeline.push(TimelineItem::Summary {
-                        text: summary.clone(),
-                        evidence: snapshot
+                    push_assistant_text(&mut self.timeline, summary);
+                    finish_assistant_turn(&mut self.timeline);
+                }
+                if !assistant_turn_matches(&self.timeline, |part| {
+                    matches!(part, AssistantPart::Evidence(_))
+                }) {
+                    push_assistant_evidence(
+                        &mut self.timeline,
+                        snapshot
                             .evidence
                             .iter()
-                            .map(|link| format!("{} ({})", link.label, link.uri))
+                            .map(|link| EvidenceText {
+                                label: link.label.clone(),
+                                uri: link.uri.clone(),
+                            })
                             .collect(),
-                    });
+                    );
                 }
             }
         }
@@ -4850,8 +4929,8 @@ impl LoomView {
         self.pending_approval = projection.pending_approval;
         self.pending_input = projection.pending_input;
         let activity_records = projection.activities;
-        if !activity_records.is_empty() {
-            self.enable_activity_projection();
+        for activity in &activity_records {
+            self.activity_records.insert(activity.id, activity.clone());
         }
         let message_timeline_ordinals = projection.message_timeline_ordinals;
         self.transcript_messages.clear();
@@ -4880,11 +4959,7 @@ impl LoomView {
             })
             .collect::<Vec<_>>();
         if self.timeline.is_empty() {
-            let mut timeline = timeline_items_from_messages(
-                messages,
-                activity_records.clone(),
-                !activity_records.is_empty(),
-            );
+            let mut timeline = timeline_items_from_messages(messages, activity_records.clone());
             if !projection.plan.is_empty() {
                 timeline.insert(
                     0,
@@ -4901,26 +4976,39 @@ impl LoomView {
             }
             self.timeline = timeline;
         } else {
-            for activity in activity_records {
-                upsert_activity(&mut self.timeline, activity);
+            for activity in &activity_records {
+                if let Some(part) = tool_part_from_activity(activity) {
+                    upsert_tool_part(&mut self.timeline, part);
+                }
             }
         }
-        if let Some(summary) = &projection.run.summary
+        let has_summary = assistant_turn_matches(&self.timeline, |part| {
+            matches!(part, AssistantPart::Evidence(_))
+        }) || projection.run.summary.as_deref().is_some_and(|summary| {
+            assistant_turn_matches(
+                &self.timeline,
+                |part| matches!(part, AssistantPart::Text(text) if text == summary),
+            )
+        });
+        if !has_summary
+            && let Some(summary) = &projection.run.summary
             && !is_redundant_completion_summary(summary)
-            && !self
-                .timeline
-                .iter()
-                .any(|item| matches!(item, TimelineItem::Summary { .. }))
+            && !summary.trim().is_empty()
         {
-            self.timeline.push(TimelineItem::Summary {
-                text: summary.clone(),
-                evidence: projection
+            push_assistant_text(&mut self.timeline, summary);
+            finish_assistant_turn(&mut self.timeline);
+            push_assistant_evidence(
+                &mut self.timeline,
+                projection
                     .run
                     .evidence
                     .iter()
-                    .map(|link| format!("{} ({})", link.label, link.uri))
+                    .map(|link| EvidenceText {
+                        label: link.label.clone(),
+                        uri: link.uri.clone(),
+                    })
                     .collect(),
-            });
+            );
         }
     }
 
@@ -5126,10 +5214,10 @@ impl LoomView {
         #[cfg(target_family = "wasm")]
         if self.browser_demo_mode {
             self.timeline.push(TimelineItem::User(message));
-            self.timeline.push(TimelineItem::Assistant(
-                "This is demo mode. The browser client needs to connect to a backend to work."
-                    .to_owned(),
-            ));
+            self.timeline
+                .push(TimelineItem::Assistant(AssistantTurn::text(
+                    "This is demo mode. The browser client needs to connect to a backend to work.",
+                )));
             cx.notify();
             return;
         }
@@ -5373,6 +5461,43 @@ impl LoomView {
             }
         }
         cx.notify();
+    }
+
+    /// Whether the active run can still be interrupted.
+    fn run_can_interrupt(&self) -> bool {
+        self.active_run_id.is_some()
+            && !matches!(
+                self.run_state,
+                Some(AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled)
+            )
+    }
+
+    fn interrupt_active_run(&mut self, cx: &mut Context<Self>) {
+        let Some(run_id) = self.active_run_id else {
+            return;
+        };
+        self.dispatch(
+            cx,
+            ClientRequest::InterruptAgentRun { run_id },
+            |view, response, cx| {
+                match response.result {
+                    Ok(ServerResponse::AgentRun(run))
+                    | Ok(ServerResponse::AgentRunStarted(run)) => {
+                        view.active_run_id = Some(run.id);
+                        view.active_run = Some(run.clone());
+                        view.run_state = Some(run.state);
+                        view.session_state = session_state_for_run(run.state);
+                        view.active_session.state = view.session_state;
+                    }
+                    Err(error) => view.record_backend_error("interrupt run", error),
+                    Ok(response) => view.record_backend_error(
+                        "interrupt run",
+                        unexpected_response("interrupt run", response),
+                    ),
+                }
+                cx.notify();
+            },
+        );
     }
 
     pub(crate) fn submit_composer(&mut self, cx: &mut Context<Self>) {
@@ -5701,21 +5826,12 @@ impl LoomView {
             self.transcript_messages
                 .insert(ordinal, (timeline_ordinal, message));
         }
-        let mut activities_by_id = BTreeMap::new();
-        for activity in self.timeline.iter().flat_map(|item| match item {
-            TimelineItem::ActivitySection { activities } => activities.as_slice(),
-            _ => &[],
-        }) {
-            activities_by_id.insert(activity.id, activity.clone());
-        }
         self.timeline.retain(|item| {
             !matches!(
                 item,
                 TimelineItem::User(_)
                     | TimelineItem::Assistant(_)
-                    | TimelineItem::ToolOutput(_)
                     | TimelineItem::ProjectMessageContext(_)
-                    | TimelineItem::ActivitySection { .. }
             )
         });
         let ordered_items = timeline_items_from_messages(
@@ -5725,8 +5841,7 @@ impl LoomView {
                     (*ordinal, *timeline_ordinal, message.clone())
                 })
                 .collect(),
-            activities_by_id.into_values().collect(),
-            self.activity_records_seen,
+            self.activity_records.values().cloned().collect(),
         );
         let insertion_index = self.transcript_insertion_index();
         self.timeline
@@ -8679,232 +8794,310 @@ impl LoomView {
         picker
     }
 
-    fn render_activity_section(
+    fn render_assistant_turn(
         &self,
-        activities: &[AgentActivityRecord],
+        turn: &AssistantTurn,
         index: usize,
         parent: &Entity<LoomView>,
     ) -> gpui_kit::AnyElement {
-        let mut rows = div().flex().flex_col().gap_1();
-        for (activity_index, activity) in activities.iter().enumerate() {
-            if !matches!(activity.data, AgentActivityData::ModelTurn { .. }) {
-                rows =
-                    rows.child(self.render_activity_row(activity, index, activity_index, parent));
+        let mut body = div().px_3().py_2().flex().flex_col().gap_1();
+        for (part_index, part) in turn.parts.iter().enumerate() {
+            match part {
+                AssistantPart::Reasoning(text) => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let key = tool_element_id(index, part_index);
+                    let expanded = self.expanded_reasoning.contains(&key);
+                    let parent_for_toggle = parent.clone();
+                    let mut block = div()
+                        .id(("reasoning", key))
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .pl_2()
+                        .border_l_2()
+                        .border_color(rgb(0x3b4555))
+                        .child(
+                            Button::new(("reasoning-header", key))
+                                .ghost()
+                                .small()
+                                .w_full()
+                                .accessibility_label("Reasoning")
+                                .on_click(move |_, _, cx| {
+                                    parent_for_toggle
+                                        .update(cx, |this, cx| this.toggle_reasoning(key, cx));
+                                })
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .text_xs()
+                                        .child(div().text_color(rgb(0x64748b)).child(if expanded {
+                                            "⌄"
+                                        } else {
+                                            "›"
+                                        }))
+                                        .child(div().text_color(rgb(0x94a3b8)).child("Reasoning"))
+                                        .when(!expanded, |element| {
+                                            element.child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w(px(0.))
+                                                    .truncate()
+                                                    .text_color(rgb(0x64748b))
+                                                    .child(reasoning_preview(text)),
+                                            )
+                                        }),
+                                ),
+                        );
+                    if expanded {
+                        block = block.child(div().mt_1().child(render_timeline_text(
+                            format!("transcript-reasoning-{index}-{part_index}"),
+                            text.clone(),
+                            0x94a3b8,
+                        )));
+                    }
+                    body = body.child(block);
+                }
+                AssistantPart::Text(text) => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let mut display = text.clone();
+                    if turn.streaming && part_index + 1 == turn.parts.len() {
+                        display.push('▍');
+                    }
+                    body = body.child(render_timeline_text(
+                        format!("transcript-assistant-{index}-{part_index}"),
+                        display,
+                        0xf3f4f6,
+                    ));
+                }
+                AssistantPart::Tool(part) => {
+                    body = body.child(self.render_tool_part(part, index, part_index, parent));
+                }
+                AssistantPart::Evidence(links) => {
+                    body = body.child(Self::render_evidence(links, index, part_index));
+                }
             }
         }
-        let group_id = activities[0].id;
-        let status = activity_group_status(activities);
-        let expanded = self.expanded_activity_groups.contains(&group_id)
-            || matches!(
-                status,
-                AgentActivityStatus::AwaitingApproval | AgentActivityStatus::AwaitingInput
-            );
-        let count = activities
-            .iter()
-            .filter(|activity| !matches!(activity.data, AgentActivityData::ModelTurn { .. }))
-            .count();
-        let count_label = match count {
-            0 => String::new(),
-            1 => " · 1 activity".to_owned(),
-            count => format!(" · {count} activities"),
-        };
-        let title = activity_turn_title(activities);
-        let header_color = rgb(0xf3f4f6).opacity(0.72);
-        let parent_for_toggle = parent.clone();
-        // The first activity gives the group a stable identity as more records arrive.
-        div()
-            .id(("activity-section", index))
-            .w_full()
-            .min_w_0()
-            .mx_2()
-            .my_1()
-            .pl_3()
-            .border_l_1()
-            .border_color(rgb(0x3b4555))
-            .child(
-                Collapsible::new()
-                    .open(expanded)
-                    .child(
-                        Button::new(("activity-group", index))
-                            .w_full()
-                            .ghost()
-                            .small()
-                            .text_color(header_color)
-                            .child(
-                                div()
-                                    .w_full()
-                                    .text_left()
-                                    .text_size(gpui_kit::rems(0.75))
-                                    .text_color(header_color)
-                                    .child(format!(
-                                        "{} {title}{count_label} · {}",
-                                        if expanded { "⌄" } else { "›" },
-                                        activity_status_label(status)
-                                    )),
-                            )
-                            .on_click(move |_, _, cx| {
-                                parent_for_toggle.update(cx, |this, cx| {
-                                    if !this.expanded_activity_groups.remove(&group_id) {
-                                        this.expanded_activity_groups.insert(group_id);
-                                    }
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .content(rows),
-            )
-            .into_any()
+        let last_is_text = matches!(
+            turn.parts.last(),
+            Some(AssistantPart::Text(text)) if !text.trim().is_empty()
+        );
+        if turn.streaming && !last_is_text {
+            body = body.child(streaming_caret(index));
+        }
+        body.into_any()
     }
 
-    fn render_activity_row(
-        &self,
-        activity: &AgentActivityRecord,
+    fn render_evidence(
+        links: &[EvidenceText],
         index: usize,
-        activity_index: usize,
+        part_index: usize,
+    ) -> gpui_kit::AnyElement {
+        let mut list = div().flex().flex_col().gap_1().pt_1();
+        for (link_index, link) in links.iter().enumerate() {
+            let uri = link.uri.clone();
+            let label = if link.label.trim().is_empty() {
+                link.uri.clone()
+            } else {
+                link.label.clone()
+            };
+            list = list.child(
+                Button::new((
+                    "evidence",
+                    ((index as u64) << 32) | ((part_index as u64) << 16) | link_index as u64,
+                ))
+                .ghost()
+                .small()
+                .accessibility_label(format!("Open evidence: {label}"))
+                .on_click(move |_, _, _| {
+                    let _ = open_external_url(&uri);
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x93c5fd))
+                        .child(format!("↗ {label}")),
+                ),
+            );
+        }
+        list.into_any()
+    }
+
+    fn render_tool_part(
+        &self,
+        part: &ToolPart,
+        index: usize,
+        part_index: usize,
         parent: &Entity<LoomView>,
     ) -> gpui_kit::AnyElement {
-        let (label, detail) = activity_label(activity);
-        let duration = activity.elapsed_ms.map(format_duration);
-        let output = activity_output(activity);
-        let is_command = matches!(activity.data, AgentActivityData::Command { .. });
-        let expanded = is_command || self.expanded_activities.contains(&activity.id);
-        let status_color = match activity.status {
-            AgentActivityStatus::Failed => rgb(0xfca5a5),
-            AgentActivityStatus::Completed => rgb(0x9ad7bd),
-            AgentActivityStatus::AwaitingApproval | AgentActivityStatus::AwaitingInput => {
-                rgb(0xfef3c7)
-            }
-            AgentActivityStatus::Started => rgb(0x93c5fd),
-            AgentActivityStatus::Cancelled => rgb(0x94a3b8),
+        let status_color = match part.status {
+            ToolPartStatus::Failed => rgb(0xfca5a5),
+            ToolPartStatus::Completed => rgb(0x9ad7bd),
+            ToolPartStatus::AwaitingApproval | ToolPartStatus::AwaitingInput => rgb(0xfef3c7),
+            ToolPartStatus::Running => rgb(0x93c5fd),
+            ToolPartStatus::Queued | ToolPartStatus::Cancelled => rgb(0x94a3b8),
         };
-        let activity_id = activity.id;
+        let duration = part.elapsed_ms.map(format_duration);
+        // Active, failed, and approval-gated work stays open; finished successes
+        // collapse so the transcript stays scannable.
+        let expanded = self.expanded_tools.contains(&part.id)
+            || matches!(
+                part.status,
+                ToolPartStatus::Running
+                    | ToolPartStatus::AwaitingApproval
+                    | ToolPartStatus::AwaitingInput
+                    | ToolPartStatus::Failed
+            );
+        let call_id = part.id;
         let parent_for_toggle = parent.clone();
-        let mut row = div()
-            .id(("activity", ((index as u64) << 32) | activity_index as u64))
+        let awaiting = part.status == ToolPartStatus::AwaitingApproval
+            && self
+                .pending_approval
+                .as_ref()
+                .is_some_and(|call| call.id == part.id);
+        let mut block = div()
+            .id(("tool", tool_element_id(index, part_index)))
             .test_support()
+            .w_full()
+            .pl_2()
+            .border_l_2()
+            .border_color(status_color.opacity(0.4))
             .flex()
             .flex_col()
-            .text_xs()
-            .text_color(rgb(0xcbd5e1))
-            .when(!is_command, |row| {
-                row.cursor_pointer().on_click(move |_, _, cx| {
-                    parent_for_toggle.update(cx, |this, cx| this.toggle_activity(activity_id, cx));
-                })
-            })
             .child(
-                session_header_title()
-                    .child(
-                        div()
-                            .w(px(12.))
-                            .text_color(status_color)
-                            .child(activity_marker(activity.status)),
-                    )
-                    .when(!is_command, |header| {
-                        header.child(if expanded { "⌄" } else { "›" })
+                Button::new(("tool-header", tool_element_id(index, part_index)))
+                    .ghost()
+                    .small()
+                    .w_full()
+                    .accessibility_label(format!("{}: {}", part.title, part.status.label()))
+                    .on_click(move |_, _, cx| {
+                        parent_for_toggle.update(cx, |this, cx| this.toggle_tool(call_id, cx));
                     })
-                    .child(label)
-                    .flex_1()
                     .child(
                         div()
-                            .text_color(status_color)
-                            .child(activity_status_label(activity.status)),
-                    )
-                    .when_some(duration, |element, duration| {
-                        element
-                            .text_color(rgb(0x64748b))
-                            .child(format!(" · {duration}"))
-                    }),
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .w(px(12.))
+                                    .text_color(status_color)
+                                    .child(part.status.marker()),
+                            )
+                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
+                                "⌄"
+                            } else {
+                                "›"
+                            }))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_color(rgb(0xdbeafe))
+                                    .child(part.title.clone()),
+                            )
+                            .child(div().text_color(status_color).child(part.status.label()))
+                            .when_some(duration, |element, duration| {
+                                element.child(div().text_color(rgb(0x64748b)).child(duration))
+                            }),
+                    ),
             );
         if expanded {
-            if let Some(detail) = detail {
-                row = row.child(
+            if let Some(detail) = &part.detail {
+                block = block.child(
                     div()
-                        .ml(px(26.))
-                        .max_w(px(560.))
+                        .ml(px(20.))
+                        .pt_1()
+                        .text_xs()
                         .text_color(rgb(0x94a3b8))
                         .child(render_timeline_text(
-                            format!("activity-detail-{index}-{activity_index}"),
-                            detail,
+                            format!("tool-detail-{index}-{part_index}"),
+                            detail.clone(),
                             0x94a3b8,
                         )),
                 );
             }
-            if let Some(output) = output {
-                row = row.child(
+            if let Some(output) = &part.output {
+                block = block.child(
                     div()
-                        .ml(px(26.))
-                        .max_w(px(560.))
+                        .ml(px(20.))
+                        .mt_1()
+                        .max_w(px(640.))
                         .border_l_1()
                         .border_color(rgb(0x30343f))
                         .pl_2()
+                        .text_xs()
                         .text_color(rgb(0x8f98a6))
                         .child(render_timeline_text(
-                            format!("activity-output-{index}-{activity_index}"),
-                            if matches!(activity.data, AgentActivityData::Command { .. }) {
-                                command_output_summary(output)
-                            } else {
-                                bounded_to(output, 420)
-                            },
+                            format!("tool-output-{index}-{part_index}"),
+                            output.clone(),
                             0x8f98a6,
                         )),
                 );
             }
         }
-        if activity.status == AgentActivityStatus::AwaitingApproval
-            && self.pending_approval.is_some()
-            && !self.approval_request_in_flight
-        {
+        if awaiting && !self.approval_request_in_flight {
             let parent_for_approve = parent.clone();
             let parent_for_reject = parent.clone();
-            row = row.child(
+            block = block.child(
                 div()
-                    .ml(px(26.))
+                    .ml(px(20.))
                     .mt_1()
                     .flex()
                     .gap_2()
                     .child(
-                        Button::new((
-                            "approve-activity",
-                            ((index as u64) << 32) | activity_index as u64,
-                        ))
-                        .label("Approve")
-                        .success()
-                        .small()
-                        .on_click(move |_, _, cx| {
-                            parent_for_approve
-                                .update(cx, |this, cx| this.approve_pending_action(cx));
-                        }),
+                        Button::new(("approve-tool", tool_element_id(index, part_index)))
+                            .label("Approve")
+                            .success()
+                            .small()
+                            .on_click(move |_, _, cx| {
+                                parent_for_approve
+                                    .update(cx, |this, cx| this.approve_pending_action(cx));
+                            }),
                     )
                     .child(
-                        Button::new((
-                            "reject-activity",
-                            ((index as u64) << 32) | activity_index as u64,
-                        ))
-                        .label("Reject")
-                        .danger()
-                        .small()
-                        .on_click(move |_, _, cx| {
-                            parent_for_reject.update(cx, |this, cx| this.reject_pending_action(cx));
-                        }),
+                        Button::new(("reject-tool", tool_element_id(index, part_index)))
+                            .label("Reject")
+                            .danger()
+                            .small()
+                            .on_click(move |_, _, cx| {
+                                parent_for_reject
+                                    .update(cx, |this, cx| this.reject_pending_action(cx));
+                            }),
                     ),
             );
-        } else if activity.status == AgentActivityStatus::AwaitingApproval
-            && self.approval_request_in_flight
-        {
-            row = row.child(
+        } else if awaiting && self.approval_request_in_flight {
+            block = block.child(
                 div()
-                    .ml(px(26.))
+                    .ml(px(20.))
                     .mt_1()
+                    .text_xs()
                     .text_color(rgb(0x94a3b8))
                     .child("Submitting approval..."),
             );
         }
-        row.into_any()
+        block.into_any()
     }
 
-    fn toggle_activity(&mut self, activity_id: ActivityId, cx: &mut Context<Self>) {
-        if !self.expanded_activities.remove(&activity_id) {
-            self.expanded_activities.insert(activity_id);
+    fn toggle_tool(&mut self, tool_id: ToolCallId, cx: &mut Context<Self>) {
+        if !self.expanded_tools.remove(&tool_id) {
+            self.expanded_tools.insert(tool_id);
+        }
+        cx.notify();
+    }
+
+    fn toggle_reasoning(&mut self, key: u64, cx: &mut Context<Self>) {
+        if !self.expanded_reasoning.remove(&key) {
+            self.expanded_reasoning.insert(key);
         }
         cx.notify();
     }
@@ -8925,12 +9118,11 @@ impl LoomView {
                 .child(
                     div()
                         .w_full()
-                        .max_w(px(520.))
+                        .max_w(px(560.))
                         .p_3()
                         .rounded_lg()
                         .bg(user_background)
                         .text_color(user_foreground)
-                        .child(div().text_xs().text_color(user_foreground).child("You"))
                         .child(render_timeline_text(
                             format!("transcript-user-{index}"),
                             text.clone(),
@@ -8938,33 +9130,55 @@ impl LoomView {
                         )),
                 )
                 .into_any(),
-            TimelineItem::Assistant(text) => div()
-                .px_3()
-                .py_2()
-                .text_color(rgb(0xf3f4f6))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8f98a6))
-                        .child("GitHub Copilot"),
-                )
-                .child(render_timeline_text(
-                    format!("transcript-assistant-{index}"),
-                    text.clone(),
-                    0xf3f4f6,
-                ))
-                .into_any(),
+            TimelineItem::Assistant(turn) => self.render_assistant_turn(turn, index, parent),
+            TimelineItem::System(note) => {
+                let (surface, accent) = match note.tone {
+                    SystemTone::Error => (rgb(ERROR_CARD_SURFACE), rgb(ERROR_CARD_ACCENT)),
+                    SystemTone::Input => (rgb(0x241f3b), rgb(0xc4b5fd)),
+                    SystemTone::Neutral => (rgb(0x191c22), rgb(0x64748b)),
+                };
+                let text_color = match note.tone {
+                    SystemTone::Error => ERROR_CARD_FOREGROUND,
+                    SystemTone::Input => 0xe9d5ff,
+                    SystemTone::Neutral => 0x94a3b8,
+                };
+                let mut card = div()
+                    .px_3()
+                    .py_2()
+                    .rounded_sm()
+                    .bg(surface)
+                    .text_color(rgb(text_color));
+                if let Some(heading) = &note.heading {
+                    card = card.child(div().text_xs().text_color(accent).child(heading.clone()));
+                }
+                card = card.child(render_timeline_text(
+                    format!("timeline-system-{index}"),
+                    note.text.clone(),
+                    text_color,
+                ));
+                if note.retryable {
+                    card = card.child(
+                        div()
+                            .mt_1()
+                            .text_xs()
+                            .text_color(accent)
+                            .child("This operation can be retried."),
+                    );
+                }
+                card.into_any()
+            }
             TimelineItem::ProjectMessageContext(text) => div()
                 .mx_3()
                 .my_1()
-                .p_3()
-                .rounded_lg()
-                .bg(rgb(0x1c2733))
+                .px_3()
+                .py_2()
+                .border_l_2()
+                .border_color(rgb(0x3b4555))
                 .text_color(rgb(0xcbd5e1))
                 .child(
                     div()
                         .text_xs()
-                        .text_color(rgb(0x93c5fd))
+                        .text_color(rgb(0x8f98a6))
                         .child("Project agent context"),
                 )
                 .child(render_timeline_text(
@@ -8973,9 +9187,6 @@ impl LoomView {
                     0xcbd5e1,
                 ))
                 .into_any(),
-            TimelineItem::ActivitySection { activities } => {
-                self.render_activity_section(activities, index, parent)
-            }
             TimelineItem::ProjectMessage(message) => {
                 let kind = match message.kind {
                     loom_core::AgentMessageKind::Progress => "Progress",
@@ -8999,27 +9210,28 @@ impl LoomView {
                 } else {
                     rgb(0x93c5fd)
                 };
-                div()
+                let mut card = div()
                     .mx_3()
                     .my_1()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(0x172033))
-                    .border_1()
-                    .border_color(rgb(0x334155))
-                    .text_color(rgb(0xe2e8f0))
-                    .child(div().text_xs().text_color(accent).child(format!(
-                        "Project {kind} · {} → {} · #{}",
+                    .px_3()
+                    .py_1()
+                    .border_l_2()
+                    .border_color(accent.opacity(0.45))
+                    .text_color(rgb(0xb7c0d0))
+                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child(format!(
+                        "{kind} · {} → {} · #{}",
                         participant(message.sender_session_id),
                         participant(message.target_session_id),
                         message.project_sequence
-                    )))
-                    .child(render_timeline_text(
+                    )));
+                if !message.body.trim().is_empty() {
+                    card = card.child(render_timeline_text(
                         format!("project-message-{}", message.message_id),
                         message.body.clone(),
-                        0xe2e8f0,
-                    ))
-                    .into_any()
+                        0xb7c0d0,
+                    ));
+                }
+                card.into_any()
             }
             TimelineItem::Plan {
                 steps,
@@ -9049,172 +9261,6 @@ impl LoomView {
                                 rgb(0xb7c0d0)
                             })
                             .child(format!("{marker} {}", step)),
-                    );
-                }
-                card.into_any()
-            }
-            TimelineItem::ToolRequested { name, arguments } => div()
-                .px_3()
-                .py_1()
-                .text_color(rgb(0xcbd5e1))
-                .child(format!(">_  {name}"))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x8f98a6))
-                        .child(arguments.clone()),
-                )
-                .into_any(),
-            TimelineItem::Approval { name, active } => {
-                let mut row = div()
-                    .px_3()
-                    .py_1()
-                    .text_color(if *active {
-                        rgb(0xfef3c7)
-                    } else {
-                        rgb(0x94a3b8)
-                    })
-                    .child(if *active {
-                        format!("Approval required  >_ {name}")
-                    } else {
-                        format!("Approval resolved  >_ {name}")
-                    });
-                if *active && self.pending_approval.is_some() && !self.approval_request_in_flight {
-                    let parent_for_approve = parent.clone();
-                    let parent_for_reject = parent.clone();
-                    row = row.child(
-                        div()
-                            .mt_1()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                Button::new(("approve-legacy", index))
-                                    .label("Approve")
-                                    .success()
-                                    .small()
-                                    .on_click(move |_, _, cx| {
-                                        parent_for_approve
-                                            .update(cx, |this, cx| this.approve_pending_action(cx));
-                                    }),
-                            )
-                            .child(
-                                Button::new(("reject-legacy", index))
-                                    .label("Reject")
-                                    .danger()
-                                    .small()
-                                    .on_click(move |_, _, cx| {
-                                        parent_for_reject
-                                            .update(cx, |this, cx| this.reject_pending_action(cx));
-                                    }),
-                            ),
-                    );
-                } else if *active && self.approval_request_in_flight {
-                    row = row.child(
-                        div()
-                            .mt_1()
-                            .text_color(rgb(0x94a3b8))
-                            .child("Submitting approval..."),
-                    );
-                }
-                row.into_any()
-            }
-            TimelineItem::ToolStarted(name) => div()
-                .px_3()
-                .py_1()
-                .text_xs()
-                .text_color(rgb(0xcbd5e1))
-                .child(format!(">_  {name}"))
-                .into_any(),
-            TimelineItem::ToolOutput(output) => div()
-                .mx_3()
-                .px_2()
-                .py_1()
-                .border_l_1()
-                .border_color(rgb(0x30343f))
-                .text_xs()
-                .text_color(rgb(0x94a3b8))
-                .child(output.clone())
-                .into_any(),
-            TimelineItem::ToolCompleted { name, success } => div()
-                .px_3()
-                .py_1()
-                .text_xs()
-                .text_color(if *success {
-                    rgb(0x9ad7bd)
-                } else {
-                    rgb(0xfca5a5)
-                })
-                .child(format!(
-                    ">_  {name} [{}]",
-                    if *success { "ok" } else { "failed" }
-                ))
-                .into_any(),
-            TimelineItem::Status(status) => div()
-                .px_3()
-                .py_1()
-                .text_xs()
-                .text_color(rgb(0x94a3b8))
-                .child(status.clone())
-                .into_any(),
-            TimelineItem::Error { operation, error } => div()
-                .p_2()
-                .rounded_lg()
-                .bg(rgb(ERROR_CARD_SURFACE))
-                .border_1()
-                .border_color(rgb(ERROR_CARD_ACCENT))
-                .text_sm()
-                .text_color(rgb(ERROR_CARD_FOREGROUND))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(ERROR_CARD_ACCENT))
-                        .child(format!("{} · {}", operation, error.code)),
-                )
-                .child(div().mt_1().child(render_timeline_text(
-                    format!("timeline-error-{index}"),
-                    error.message.clone(),
-                    ERROR_CARD_FOREGROUND,
-                )))
-                .when(error.retryable, |element| {
-                    element.child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(rgb(ERROR_CARD_ACCENT))
-                            .child("This operation can be retried."),
-                    )
-                })
-                .into_any(),
-            TimelineItem::NeedsInput(prompt) => div()
-                .p_2()
-                .rounded_sm()
-                .bg(rgb(0x3b2f66))
-                .text_color(rgb(0xe9d5ff))
-                .child(div().text_xs().child("Agent needs input"))
-                .child(render_timeline_text(
-                    format!("timeline-input-{index}"),
-                    prompt.clone(),
-                    0xe9d5ff,
-                ))
-                .into_any(),
-            TimelineItem::Summary { text, evidence } => {
-                let mut card = div()
-                    .px_3()
-                    .py_2()
-                    .text_color(rgb(0xf3f4f6))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x8f98a6))
-                            .child("GitHub Copilot"),
-                    )
-                    .child(text.clone());
-                for link in evidence {
-                    card = card.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x9ad7bd))
-                            .child(format!("Evidence: {link}")),
                     );
                 }
                 card.into_any()
@@ -9763,7 +9809,7 @@ impl LoomView {
                     .mt_2()
                     .flex()
                     .flex_wrap()
-                    .gap_1()
+                    .gap_2()
                     .items_center()
                     .justify_between()
                     .child(
@@ -9779,6 +9825,30 @@ impl LoomView {
                                     div().text_xs().text_color(rgb(0x64748b)).child("Working…"),
                                 )
                             }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(self.run_can_interrupt(), |element| {
+                                element.child(
+                                    Button::new("interrupt-run").label("Stop").small().on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.interrupt_active_run(cx);
+                                        }),
+                                    ),
+                                )
+                            })
+                            .child(
+                                Button::new("send-message")
+                                    .label("Send")
+                                    .primary()
+                                    .small()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.submit_composer(cx);
+                                    })),
+                            ),
                     ),
             )
     }
@@ -11236,6 +11306,7 @@ impl LoomView {
                             .icon(Icon::new(IconName::User))
                             .ghost()
                             .small()
+                            .accessibility_label("Account")
                             .dropdown_menu({
                                 let view = view.clone();
                                 move |menu, _, _| {
@@ -11265,6 +11336,7 @@ impl LoomView {
                             .icon(Icon::new(IconName::Settings))
                             .ghost()
                             .small()
+                            .accessibility_label("Settings")
                             .on_click({
                                 let view = view.clone();
                                 move |_, _, cx| {
@@ -11760,6 +11832,7 @@ impl Render for LoomView {
                             .icon(Icon::new(AssetIconName::ListTree))
                             .ghost()
                             .small()
+                            .accessibility_label("Session sources")
                             .dropdown_menu({
                                 let view = view.clone();
                                 let repositories = self.session_repositories.clone();
@@ -11870,6 +11943,7 @@ impl Render for LoomView {
                             }))
                             .ghost()
                             .small()
+                            .accessibility_label("Toggle side panel")
                             .when(self.review.open, |button| button.secondary())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_review_pane(cx);
@@ -11975,13 +12049,18 @@ impl Render for LoomView {
                                     window.start_window_move();
                                 }
                             })
-                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
-                                if self.sessions.is_empty() {
-                                    "No session".to_owned()
-                                } else {
-                                    self.active_session.name.clone()
-                                },
-                            )),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Loom"))
+                                    .child(
+                                        div().text_xs().text_color(rgb(0x64748b)).child(
+                                            if self.demo_workspace { "Demo" } else { "Local" },
+                                        ),
+                                    ),
+                            ),
                     )
                     .when(!cfg!(target_family = "wasm"), |element| {
                         element.child(
@@ -12063,29 +12142,6 @@ impl Render for LoomView {
                             && self.github_login.is_none(),
                         |element| element.child(self.render_review(window, cx)),
                     ),
-            )
-            .child(
-                div()
-                    .h(px(24.))
-                    .w_full()
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .bg(rgb(0x1b1d24))
-                    .border_t_1()
-                    .border_color(rgb(0x30343f))
-                    .text_xs()
-                    .text_color(rgb(0x8f98a6))
-                    .child(format!(
-                        "{}  ·  {} updates  ·  {}",
-                        if self.sessions.is_empty() {
-                            "No session"
-                        } else {
-                            session_state_label(self.session_state)
-                        },
-                        self.timeline.len(),
-                        if self.demo_workspace { "Demo" } else { "Local" }
-                    )),
             );
         content.into_any()
     }
@@ -12178,10 +12234,10 @@ mod session_name_tests {
 mod display_helper_tests {
     use super::{
         AgentActivityData, AgentActivityRecord, AgentActivityStatus, FileActivityOperation,
-        activity_group_status, activity_label, activity_marker, activity_output,
-        activity_turn_title, change_kind_label, command_group_title, command_line,
-        command_output_summary, command_purpose, format_bytes, format_duration, format_percentage,
-        is_redundant_completion_summary, run_state_label, session_state_label,
+        ToolPartStatus, activity_output, change_kind_label, command_line, command_purpose,
+        format_bytes, format_duration, format_percentage, is_redundant_completion_summary,
+        run_state_label, session_state_label, tool_part_from_activity, tool_status, tool_title,
+        tool_title_for_activity,
     };
     use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
     use loom_model::{ModelId, ToolCall};
@@ -12227,31 +12283,9 @@ mod display_helper_tests {
     }
 
     #[test]
-    fn command_groups_describe_work_and_preserve_result_summaries() {
-        let command = |program: &str, args: &[&str]| {
-            activity(AgentActivityData::Command {
-                call: call("run_command"),
-                command: program.to_owned(),
-                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-                cwd: None,
-                result: None,
-            })
-        };
-        let test = command("cargo", &["test"]);
-        let fmt = command("cargo", &["fmt", "--all", "--", "--check"]);
-        assert_eq!(
-            command_group_title(&[fmt, test.clone()]),
-            "Check formatting · Run tests"
-        );
-        assert_eq!(
-            command_group_title(&[test.clone(), test.clone()]),
-            "Run tests"
-        );
-        assert_eq!(
-            command_group_title(&[command("/usr/bin/bash", &["-lc", "cargo test --workspace"])]),
-            "Run tests"
-        );
+    fn command_titles_describe_the_work() {
         for (program, args, expected) in [
+            ("cargo", vec!["test"], "Run tests"),
             ("cargo", vec!["clippy"], "Check code quality"),
             ("cargo", vec!["fmt"], "Format code"),
             ("cargo", vec!["check"], "Check the build"),
@@ -12269,63 +12303,23 @@ mod display_helper_tests {
             );
         }
         assert_eq!(
+            command_purpose(
+                "/usr/bin/bash",
+                &["-lc".to_owned(), "cargo test --workspace".to_owned()]
+            ),
+            "Run tests"
+        );
+        assert_eq!(
             command_line(
                 "echo",
                 &["two words".to_owned(), "it's".to_owned(), "".to_owned()]
             ),
             "echo 'two words' 'it'\\''s' ''"
         );
-        assert_eq!(command_output_summary("test result: ok"), "test result: ok");
-        let output = format!(
-            "Starting checks\n{}\nerror: test failed",
-            "Compiling dependency\n".repeat(100)
-        );
-        let summary = command_output_summary(&output);
-        assert!(summary.starts_with("Starting checks"));
-        assert!(summary.ends_with("error: test failed"));
-        assert!(summary.contains("output abbreviated"));
-        assert!(summary.len() < 450);
-        let unicode = format!("{}final result", "界".repeat(1000));
-        assert!(command_output_summary(&unicode).ends_with("final result"));
-        assert_eq!(
-            activity_group_status(std::slice::from_ref(&test)),
-            AgentActivityStatus::Completed
-        );
-        let failed = AgentActivityRecord {
-            status: AgentActivityStatus::Failed,
-            ..test.clone()
-        };
-        assert_eq!(
-            activity_group_status(&[test.clone(), failed.clone()]),
-            AgentActivityStatus::Failed
-        );
-        for status in [
-            AgentActivityStatus::AwaitingApproval,
-            AgentActivityStatus::AwaitingInput,
-            AgentActivityStatus::Started,
-        ] {
-            assert_eq!(
-                activity_group_status(&[
-                    failed.clone(),
-                    AgentActivityRecord {
-                        status,
-                        ..test.clone()
-                    }
-                ]),
-                status
-            );
-        }
-        assert_eq!(
-            activity_group_status(&[AgentActivityRecord {
-                status: AgentActivityStatus::Cancelled,
-                ..test
-            }]),
-            AgentActivityStatus::Cancelled
-        );
     }
 
     #[test]
-    fn state_and_activity_labels_cover_every_status_and_activity_kind() {
+    fn state_labels_and_tool_projections_cover_every_variant() {
         let session_states = [
             (AgentSessionState::Idle, "Ready"),
             (AgentSessionState::Queued, "Queued"),
@@ -12364,35 +12358,30 @@ mod display_helper_tests {
         ] {
             assert_eq!(change_kind_label(kind), label);
         }
-        for (status, marker) in [
-            (AgentActivityStatus::Started, "›"),
-            (AgentActivityStatus::Completed, "✓"),
-            (AgentActivityStatus::Failed, "×"),
-            (AgentActivityStatus::AwaitingApproval, "!"),
-            (AgentActivityStatus::AwaitingInput, "?"),
-            (AgentActivityStatus::Cancelled, "–"),
+        for (status, expected) in [
+            (AgentActivityStatus::Started, ToolPartStatus::Running),
+            (AgentActivityStatus::Completed, ToolPartStatus::Completed),
+            (AgentActivityStatus::Failed, ToolPartStatus::Failed),
+            (
+                AgentActivityStatus::AwaitingApproval,
+                ToolPartStatus::AwaitingApproval,
+            ),
+            (
+                AgentActivityStatus::AwaitingInput,
+                ToolPartStatus::AwaitingInput,
+            ),
+            (AgentActivityStatus::Cancelled, ToolPartStatus::Cancelled),
         ] {
-            assert_eq!(activity_marker(status), marker);
+            assert_eq!(tool_status(status), expected);
         }
 
         let model = activity(AgentActivityData::ModelTurn {
             model: ModelId::new("test-model"),
         });
-        assert_eq!(
-            activity_label(&model),
-            ("Agent turn · test-model".to_owned(), None)
-        );
+        assert!(tool_part_from_activity(&model).is_none());
         assert_eq!(activity_output(&model), None);
 
-        let tool = activity(AgentActivityData::ToolCall {
-            call: call("apply_patch"),
-            result: None,
-        });
-        assert_eq!(activity_label(&tool).0, "apply_patch");
-        assert_eq!(
-            activity_turn_title(std::slice::from_ref(&tool)),
-            "Making changes".to_owned()
-        );
+        assert_eq!(tool_title("apply_patch", &json!({})), "Apply patch");
 
         let file = activity(AgentActivityData::File {
             call: call("read_file"),
@@ -12400,7 +12389,7 @@ mod display_helper_tests {
             path: None,
             result: None,
         });
-        assert_eq!(activity_label(&file).0, "Read file");
+        assert_eq!(tool_title_for_activity(&file), "Read file");
         let listed = activity(AgentActivityData::File {
             call: call("list_files"),
             operation: FileActivityOperation::List,
@@ -12410,25 +12399,13 @@ mod display_helper_tests {
                 "src/lib.rs".to_owned(),
             )),
         });
-        assert_eq!(activity_label(&listed).0, "List files");
+        assert_eq!(tool_title_for_activity(&listed), "List files");
         assert_eq!(activity_output(&listed), Some("src/lib.rs"));
         let empty_result = activity(AgentActivityData::ToolCall {
             call: call("inspect"),
             result: Some(ToolResult::success(&call("inspect"), String::new())),
         });
         assert_eq!(activity_output(&empty_result), None);
-        let tool_only = activity(AgentActivityData::ToolCall {
-            call: call("inspect"),
-            result: None,
-        });
-        assert_eq!(
-            activity_turn_title(std::slice::from_ref(&tool_only)),
-            "Using tools".to_owned()
-        );
-        assert_eq!(
-            activity_turn_title(std::slice::from_ref(&file)),
-            "Inspecting the workspace".to_owned()
-        );
 
         let write = activity(AgentActivityData::File {
             call: call("write_file"),
@@ -12437,8 +12414,8 @@ mod display_helper_tests {
             result: None,
         });
         assert_eq!(
-            activity_turn_title(std::slice::from_ref(&write)),
-            "Making changes".to_owned()
+            tool_part_from_activity(&write).unwrap().title,
+            "Edit src/main.rs"
         );
 
         let search = activity(AgentActivityData::Search {
@@ -12447,11 +12424,7 @@ mod display_helper_tests {
             path: Some("src".to_owned()),
             result: None,
         });
-        assert!(activity_label(&search).1.unwrap().contains("in src"));
-        assert_eq!(
-            activity_turn_title(std::slice::from_ref(&search)),
-            "Searching the codebase".to_owned()
-        );
+        assert_eq!(tool_title_for_activity(&search), "Search \"needle\" in src");
 
         let command = activity(AgentActivityData::Command {
             call: call("run"),
@@ -12460,12 +12433,12 @@ mod display_helper_tests {
             cwd: Some("repo".to_owned()),
             result: None,
         });
-        assert_eq!(activity_label(&command).0, "cargo test");
+        assert_eq!(tool_title_for_activity(&command), "Run tests");
+        let command_part = tool_part_from_activity(&command).unwrap();
         assert_eq!(
-            activity_turn_title(std::slice::from_ref(&command)),
-            "Run tests"
+            command_part.detail.as_deref(),
+            Some("cargo test\nDirectory: repo")
         );
-        assert_eq!(activity_turn_title(&[]), "Working on the task");
         for data in [
             AgentActivityData::File {
                 call: call("read_file"),
@@ -12592,6 +12565,10 @@ mod loom_view_render_tests {
     use crate::state::ReviewRow;
     use crate::state::ThemeChoice;
     use crate::state::TimelineItem;
+    use crate::state::{
+        AssistantPart, AssistantTurn, EvidenceText, SystemNote, SystemTone, ToolPart,
+        ToolPartStatus,
+    };
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, TestAppContext, px, size};
     use loom_core::CapabilitySet;
@@ -12970,8 +12947,9 @@ mod loom_view_render_tests {
         cx.run_until_parked();
         cx.update_window(control_window, |_, _, cx| {
             assert!(control_view.read(cx).timeline.iter().any(|item| {
-                matches!(item, TimelineItem::Error { operation, .. }
-                    if operation == "control project child")
+                matches!(item, TimelineItem::System(note)
+                    if note.tone == SystemTone::Error
+                        && note.heading.as_deref().is_some_and(|heading| heading.starts_with("control project child")))
             }));
         })
         .unwrap();
@@ -12996,8 +12974,9 @@ mod loom_view_render_tests {
         cx.run_until_parked();
         cx.update_window(review_window, |_, _, cx| {
             assert!(review_view.read(cx).timeline.iter().any(|item| {
-                matches!(item, TimelineItem::Error { operation, .. }
-                    if operation == "review project child")
+                matches!(item, TimelineItem::System(note)
+                    if note.tone == SystemTone::Error
+                        && note.heading.as_deref().is_some_and(|heading| heading.starts_with("review project child")))
             }));
         })
         .unwrap();
@@ -13011,8 +12990,9 @@ mod loom_view_render_tests {
         cx.run_until_parked();
         cx.update_window(integration_window, |_, _, cx| {
             assert!(integration_view.read(cx).timeline.iter().any(|item| {
-                matches!(item, TimelineItem::Error { operation, .. }
-                    if operation == "check child review before integration")
+                matches!(item, TimelineItem::System(note)
+                    if note.tone == SystemTone::Error
+                        && note.heading.as_deref().is_some_and(|heading| heading.starts_with("check child review before integration")))
             }));
         })
         .unwrap();
@@ -13101,7 +13081,9 @@ mod loom_view_render_tests {
         cx.update(gpui_kit::init);
         render_scenario(cx, |view| {
             view.sessions = vec![view.active_session.clone()];
-            view.timeline = vec![TimelineItem::Assistant("existing transcript".to_owned())];
+            view.timeline = vec![TimelineItem::Assistant(AssistantTurn::text(
+                "existing transcript",
+            ))];
             view.apply_run_projection(loom_protocol::AgentRunSnapshotProjection {
                 run: loom_protocol::AgentRunSnapshot {
                     id: RunId::new(),
@@ -13143,7 +13125,7 @@ mod loom_view_render_tests {
             view.session_models.insert(session_id, model.clone());
             view.session_auto_approve_actions.insert(session_id, false);
             view.timeline
-                .push(TimelineItem::Status("old status".to_owned()));
+                .push(TimelineItem::System(SystemNote::status("old status")));
             view.pending_input = Some("old prompt".to_owned());
             view.active_run_id = Some(RunId::new());
             view.review.selected_path = Some("old.rs".to_owned());
@@ -13306,7 +13288,7 @@ mod loom_view_render_tests {
                 assert!(
                     view.timeline
                         .iter()
-                        .any(|item| matches!(item, TimelineItem::Status(_)))
+                        .any(|item| matches!(item, TimelineItem::System(_)))
                 );
 
                 view.choose_source(SessionSourceChoice::GitHub, cx);
@@ -13501,9 +13483,8 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
-    fn command_groups_expand_keep_new_results_and_show_approvals(cx: &mut TestAppContext) {
+    fn tool_blocks_toggle_and_show_inline_approvals(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        let group_id = ActivityId::new();
         let run_id = RunId::new();
         let call = ToolCall {
             id: ToolCallId::new(),
@@ -13511,7 +13492,7 @@ mod loom_view_render_tests {
             arguments: serde_json::json!({"command": "cargo", "args": ["test"]}),
         };
         let record = AgentActivityRecord {
-            id: group_id,
+            id: ActivityId::new(),
             run_id,
             timeline_ordinal: 0,
             parent_id: None,
@@ -13532,36 +13513,21 @@ mod loom_view_render_tests {
         let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
             view.sessions = vec![view.active_session.clone()];
-            view.timeline = vec![TimelineItem::ActivitySection {
-                activities: vec![record.clone()],
-            }];
+            view.active_run_id = Some(run_id);
+            view.consume_agent_event(&loom_protocol::AgentEvent::ActivityRecorded {
+                run_id,
+                activity: record.clone(),
+            });
             view
         });
         cx.update_window(handle.into(), |view, window, cx| {
             let view = view.downcast::<LoomView>().unwrap();
             window.render_frame(cx);
-            assert!(window.try_find(("activity", 0u64)).is_none());
-            window.click(("activity-group", 0usize), cx);
+            window.click(("tool-header", 0u64), cx);
             window.render_frame(cx);
-            assert!(window.try_find(("activity", 0u64)).is_some());
             view.update(cx, |view, _| {
-                assert!(view.expanded_activity_groups.contains(&group_id));
-                view.consume_agent_event(&loom_protocol::AgentEvent::ActivityRecorded {
-                    run_id,
-                    activity: AgentActivityRecord {
-                        id: ActivityId::new(),
-                        ..record.clone()
-                    },
-                });
-            });
-            window.render_frame(cx);
-            assert!(window.try_find(("activity", 1u64)).is_some());
-            window.click(("activity-group", 0usize), cx);
-            window.render_frame(cx);
-            assert!(window.try_find(("activity", 0u64)).is_none());
-            view.update(cx, |view, cx| {
-                view.pending_approval = Some(call.clone());
-                view.active_run_id = Some(run_id);
+                assert!(view.expanded_tools.contains(&call.id));
+                // Late activity updates keep the block in place and reveal approval.
                 view.consume_agent_event(&loom_protocol::AgentEvent::ActivityRecorded {
                     run_id,
                     activity: AgentActivityRecord {
@@ -13569,60 +13535,12 @@ mod loom_view_render_tests {
                         ..record.clone()
                     },
                 });
-                cx.notify();
+                view.pending_approval = Some(call.clone());
             });
             window.render_frame(cx);
-            assert!(window.try_find(("approve-activity", 0u64)).is_some());
-            assert!(window.try_find(("reject-activity", 0u64)).is_some());
-            window.click(("approve-activity", 0u64), cx);
-            window.render_frame(cx);
-        })
-        .unwrap();
-    }
-
-    #[gpui_kit::test]
-    fn activity_rows_toggle_details_and_offer_approval_actions(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
-        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
-            let mut view = LoomView::new_for_test(cx.focus_handle());
-            view.sessions = vec![view.active_session.clone()];
-            let call = ToolCall {
-                id: ToolCallId::new(),
-                name: "write_file".to_owned(),
-                arguments: serde_json::json!({"path": "src/lib.rs"}),
-            };
-            let record = AgentActivityRecord {
-                id: ActivityId::new(),
-                run_id: RunId::new(),
-                timeline_ordinal: 0,
-                parent_id: None,
-                step_id: None,
-                kind: AgentActivityKind::File,
-                status: AgentActivityStatus::AwaitingApproval,
-                started_at: Timestamp::from_unix_millis(1),
-                completed_at: None,
-                elapsed_ms: None,
-                data: AgentActivityData::File {
-                    call: call.clone(),
-                    operation: FileActivityOperation::Write,
-                    path: Some("src/lib.rs".to_owned()),
-                    result: None,
-                },
-            };
-            view.timeline = vec![TimelineItem::ActivitySection {
-                activities: vec![record],
-            }];
-            view.active_run_id = Some(RunId::new());
-            view.pending_approval = Some(call);
-            view
-        });
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            window
-                .within(("activity-section", 0usize))
-                .click(("activity", 0u64), cx);
-            window.render_frame(cx);
-            window.click(("approve-activity", 0u64), cx);
+            assert!(window.try_find(("approve-tool", 0u64)).is_some());
+            assert!(window.try_find(("reject-tool", 0u64)).is_some());
+            window.click(("approve-tool", 0u64), cx);
             window.render_frame(cx);
         })
         .unwrap();
@@ -13646,7 +13564,7 @@ mod loom_view_render_tests {
             inspection.omitted_tokens = 120;
             inspection.included_tokens = 80;
             view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected { run_id, inspection: inspection.clone() });
-            assert!(matches!(view.timeline.last(), Some(TimelineItem::Status(text)) if text.contains("Context compacted") && text.contains("lossy excerpts")));
+            assert!(matches!(view.timeline.last(), Some(TimelineItem::System(note)) if note.text.contains("Context compacted") && note.text.contains("lossy excerpts")));
             let count = view.timeline.len();
             inspection.compacted = false;
             view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected { run_id, inspection });
@@ -13654,6 +13572,32 @@ mod loom_view_render_tests {
             assert_eq!(view.context_inspection.as_ref().unwrap().included_tokens, 80);
             view.reset_projection();
             assert!(view.context_inspection.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn completing_a_run_stops_the_streaming_cursor(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let run_id = RunId::new();
+            view.active_run_id = Some(run_id);
+            view.consume_agent_event(&loom_protocol::AgentEvent::AssistantMessageDelta {
+                run_id,
+                message_id: 1,
+                text: "working".to_owned(),
+            });
+            let streaming = |view: &LoomView| {
+                view.timeline
+                    .iter()
+                    .any(|item| matches!(item, TimelineItem::Assistant(turn) if turn.streaming))
+            };
+            assert!(streaming(&view));
+            view.consume_agent_event(&loom_protocol::AgentEvent::RunStateChanged {
+                run_id,
+                state: loom_protocol::AgentRunState::Completed,
+            });
+            assert!(!streaming(&view));
         });
     }
 
@@ -13834,13 +13778,11 @@ mod loom_view_render_tests {
             );
             assert!(view.pending_approval.is_none());
             assert_eq!(view.pending_input.as_deref(), Some("Which branch?"));
-            assert!(
-                view.timeline
-                    .iter()
-                    .any(|item| matches!(item, TimelineItem::Summary { .. }))
-            );
+            assert!(view.timeline.iter().any(|item| matches!(
+                item,
+                TimelineItem::Assistant(turn) if turn.parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text == "Finished the app update"))
+            )));
 
-            view.activity_records_seen = true;
             view.consume_agent_event(&loom_protocol::AgentEvent::ToolCallRequested {
                 run_id,
                 call: call.clone(),
@@ -13976,9 +13918,10 @@ mod loom_view_render_tests {
             );
             assert_eq!(view.active_run_id, Some(run.id));
             assert!(!view.auto_approve_actions);
-            assert!(view.timeline.iter().any(
-                |item| matches!(item, TimelineItem::Summary { text, .. } if text == "Recovered run")
-            ));
+            assert!(view.timeline.iter().any(|item| matches!(
+                item,
+                TimelineItem::Assistant(turn) if turn.parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text == "Recovered run"))
+            )));
 
             let old_timeline_len = view.timeline.len();
             view.finish_async_session_load(
@@ -14023,8 +13966,10 @@ mod loom_view_render_tests {
             view.send_message("uncached model task".to_owned(), cx);
             assert!(view.timeline.iter().any(|item| matches!(
                 item,
-                TimelineItem::Error { operation, error }
-                    if operation == "start run" && error.message.contains("has not been refreshed")
+                TimelineItem::System(note)
+                    if note.tone == SystemTone::Error
+                        && note.heading.as_deref().is_some_and(|heading| heading.starts_with("start run"))
+                        && note.text.contains("has not been refreshed")
             )));
 
             view.model = ModelId::new("deterministic/demo");
@@ -14121,7 +14066,7 @@ mod loom_view_render_tests {
             assert!(
                 view.timeline
                     .iter()
-                    .any(|item| matches!(item, TimelineItem::Status(_)))
+                    .any(|item| matches!(item, TimelineItem::System(_)))
             );
             view
         });
@@ -14701,7 +14646,7 @@ mod loom_view_render_tests {
                             assert!(view.source_dialog.is_some());
                             assert!(view.timeline.iter().any(|item| matches!(
                         item,
-                        TimelineItem::Status(status) if status == "Choose a GitHub repository"
+                        TimelineItem::System(note) if note.text == "Choose a GitHub repository"
                     )));
                         });
                 });
@@ -14976,47 +14921,49 @@ mod loom_view_render_tests {
             },
         };
         render_scenario(cx, |view| {
-            view.activity_records_seen = true;
-            view.expanded_activities.insert(activity.id);
+            view.expanded_tools.insert(call.id);
+            view.activity_records.insert(activity.id, activity);
             view.timeline = vec![
                 TimelineItem::User("Please update the file".to_owned()),
-                TimelineItem::Assistant("# Done\nThe file is updated.".to_owned()),
-                TimelineItem::ActivitySection {
-                    activities: vec![activity],
-                },
+                TimelineItem::Assistant(AssistantTurn {
+                    parts: vec![
+                        AssistantPart::Reasoning("The file needs a small edit.".to_owned()),
+                        AssistantPart::Text("# Done\nThe file is updated.".to_owned()),
+                        AssistantPart::Tool(Box::new(ToolPart {
+                            id: call.id,
+                            name: "write_file".to_owned(),
+                            title: "Edit src/lib.rs".to_owned(),
+                            status: ToolPartStatus::Completed,
+                            detail: Some("src/lib.rs".to_owned()),
+                            output: Some("updated file".to_owned()),
+                            elapsed_ms: Some(1500),
+                            approval_pending: false,
+                        })),
+                        AssistantPart::Evidence(vec![EvidenceText {
+                            label: "src/lib.rs".to_owned(),
+                            uri: "https://example.com/diff".to_owned(),
+                        }]),
+                    ],
+                    streaming: true,
+                }),
                 TimelineItem::Plan {
                     steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
                     completed: BTreeSet::from([0]),
                     active: Some(1),
                 },
-                TimelineItem::ToolRequested {
-                    name: "write_file".to_owned(),
-                    arguments: "{\"path\":\"src/lib.rs\"}".to_owned(),
-                },
-                TimelineItem::Approval {
-                    name: "write_file".to_owned(),
-                    active: true,
-                },
-                TimelineItem::ToolStarted("write_file".to_owned()),
-                TimelineItem::ToolOutput("updated file".to_owned()),
-                TimelineItem::ToolCompleted {
-                    name: "write_file".to_owned(),
-                    success: true,
-                },
-                TimelineItem::ToolCompleted {
-                    name: "run_tests".to_owned(),
-                    success: false,
-                },
-                TimelineItem::Status("Working".to_owned()),
-                TimelineItem::Error {
-                    operation: "save".to_owned(),
-                    error: loom_core::LoomError::new(ErrorCode::Persistence, "write failed", true),
-                },
-                TimelineItem::NeedsInput("Which branch should I use?".to_owned()),
-                TimelineItem::Summary {
-                    text: "Completed task: updated the file".to_owned(),
-                    evidence: vec!["src/lib.rs".to_owned()],
-                },
+                TimelineItem::System(SystemNote::status("Working".to_owned())),
+                TimelineItem::System(SystemNote {
+                    tone: SystemTone::Error,
+                    heading: Some("save · persistence".to_owned()),
+                    text: "write failed".to_owned(),
+                    retryable: true,
+                }),
+                TimelineItem::System(SystemNote {
+                    tone: SystemTone::Input,
+                    heading: Some("Agent needs input".to_owned()),
+                    text: "Which branch should I use?".to_owned(),
+                    retryable: false,
+                }),
             ];
             view.pending_input = Some("Which branch should I use?".to_owned());
             view.pending_approval = Some(call);
@@ -15548,12 +15495,11 @@ mod worker_node_tests {
                 (root_id, "Project".to_owned()),
                 (
                     child_id,
-                    "↳ Researcher · task blocked · run Working — Review protocol changes"
-                        .to_owned()
+                    "↳ Researcher · blocked — Review protocol changes".to_owned()
                 ),
                 (
                     grandchild_id,
-                    "↳ Analyst · task queued · run Queued — Check one detail".to_owned()
+                    "↳ Analyst · queued — Check one detail".to_owned()
                 ),
                 (other_id, "Other session".to_owned()),
             ]
@@ -16344,6 +16290,7 @@ mod transcript_paging_tests {
         remove_project_message_context_duplicates, timeline_items_from_messages,
         unseen_transcript_messages,
     };
+    use crate::state::AssistantPart;
     use loom_core::{
         ActivityId, AgentMessageId, AgentMessageKind, AgentMessageRecord, ProjectId, RunId,
         Timestamp,
@@ -16354,7 +16301,7 @@ mod transcript_paging_tests {
     };
     use std::collections::BTreeSet;
     #[test]
-    fn transcript_pages_keep_message_order_and_project_tool_output_only_without_activities() {
+    fn transcript_pages_merge_assistant_text_and_attach_tool_output() {
         let messages = vec![
             (0, 0, ModelMessage::new(MessageRole::User, "task")),
             (1, 1, ModelMessage::new(MessageRole::Assistant, "first")),
@@ -16364,24 +16311,21 @@ mod transcript_paging_tests {
             (5, 5, ModelMessage::new(MessageRole::User, "follow-up")),
         ];
 
+        let timeline = timeline_items_from_messages(messages, Vec::new());
+        assert_eq!(timeline.len(), 3);
+        assert!(matches!(&timeline[0], TimelineItem::User(task) if task == "task"));
+        let TimelineItem::Assistant(turn) = &timeline[1] else {
+            panic!("expected assistant turn");
+        };
+        assert_eq!(
+            turn.parts[0],
+            AssistantPart::Text("first\n\nsecond".to_owned())
+        );
         assert!(matches!(
-            timeline_items_from_messages(messages.clone(), Vec::new(), true).as_slice(),
-            [
-                TimelineItem::User(task),
-                TimelineItem::Assistant(answer),
-                TimelineItem::User(follow_up)
-            ] if task == "task" && answer == "first\n\nsecond" && follow_up == "follow-up"
+            &turn.parts[1],
+            AssistantPart::Tool(part) if part.output.as_deref() == Some("tool output")
         ));
-        assert!(matches!(
-            timeline_items_from_messages(messages, Vec::new(), false).as_slice(),
-            [
-                TimelineItem::User(task),
-                TimelineItem::Assistant(answer),
-                TimelineItem::ToolOutput(tool),
-                TimelineItem::User(follow_up)
-            ] if task == "task" && answer == "first\n\nsecond"
-                && tool.contains("tool output") && follow_up == "follow-up"
-        ));
+        assert!(matches!(&timeline[2], TimelineItem::User(follow_up) if follow_up == "follow-up"));
     }
 
     #[test]
@@ -16401,8 +16345,7 @@ mod transcript_paging_tests {
         let exact_context = project_message_transcript_content(&record);
         let mut project_message = ModelMessage::new(MessageRole::User, exact_context.clone());
         project_message.name = Some("loom_project_message".to_owned());
-        let mut timeline =
-            timeline_items_from_messages(vec![(0, 0, project_message)], Vec::new(), true);
+        let mut timeline = timeline_items_from_messages(vec![(0, 0, project_message)], Vec::new());
         assert!(matches!(
             timeline.as_slice(),
             [TimelineItem::ProjectMessageContext(content)] if content == &exact_context
@@ -16450,22 +16393,29 @@ mod transcript_paging_tests {
                 },
             })
             .collect();
-        let timeline = timeline_items_from_messages(messages, activities, true);
+        let timeline = timeline_items_from_messages(messages, activities);
 
-        assert!(matches!(
-            timeline.as_slice(),
-            [
-                TimelineItem::User(task),
-                TimelineItem::Assistant(commentary),
-                TimelineItem::ActivitySection { .. },
-                TimelineItem::User(follow_up),
-                TimelineItem::ActivitySection { .. },
-                TimelineItem::Assistant(answer)
-            ] if task == "task"
-                && commentary == "I found the relevant files."
-                && follow_up == "Check one more thing"
-                && answer == "The answer is complete."
-        ));
+        assert_eq!(timeline.len(), 4);
+        assert!(matches!(&timeline[0], TimelineItem::User(task) if task == "task"));
+        let TimelineItem::Assistant(turn) = &timeline[1] else {
+            panic!("expected assistant turn");
+        };
+        assert_eq!(
+            turn.parts,
+            vec![AssistantPart::Text(
+                "I found the relevant files.".to_owned()
+            )]
+        );
+        assert!(
+            matches!(&timeline[2], TimelineItem::User(follow_up) if follow_up == "Check one more thing")
+        );
+        let TimelineItem::Assistant(turn) = &timeline[3] else {
+            panic!("expected assistant turn");
+        };
+        assert_eq!(
+            turn.parts,
+            vec![AssistantPart::Text("The answer is complete.".to_owned())]
+        );
     }
 
     #[test]

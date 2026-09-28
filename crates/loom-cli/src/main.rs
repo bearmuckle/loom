@@ -1257,6 +1257,9 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
             AgentEvent::AssistantMessageDelta { text, .. } => {
                 println!("Assistant: {}", text.trim_end());
             }
+            AgentEvent::ReasoningDelta { text, .. } => {
+                println!("Reasoning: {}", text.trim_end());
+            }
             AgentEvent::UserMessage { text, .. } => {
                 println!("User: {}", text.trim_end());
             }

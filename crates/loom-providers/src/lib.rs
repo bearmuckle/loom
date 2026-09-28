@@ -2583,6 +2583,22 @@ impl StreamDecoder {
                 }
             }
         }
+        if let Some(text) = delta
+            .get("reasoning_content")
+            .and_then(serde_json::Value::as_str)
+            && !text.is_empty()
+        {
+            return sink.emit(ModelStreamEvent::ReasoningDelta {
+                text: text.to_owned(),
+            });
+        }
+        if let Some(text) = delta.get("reasoning").and_then(serde_json::Value::as_str)
+            && !text.is_empty()
+        {
+            return sink.emit(ModelStreamEvent::ReasoningDelta {
+                text: text.to_owned(),
+            });
+        }
         if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str)
             && !text.is_empty()
         {
@@ -2607,6 +2623,18 @@ impl StreamDecoder {
                     .unwrap_or_default();
                 if !text.is_empty() {
                     return sink.emit(ModelStreamEvent::TextDelta {
+                        text: text.to_owned(),
+                    });
+                }
+                Ok(StreamFlow::Continue)
+            }
+            Some("response.reasoning_summary_text.delta" | "response.reasoning_text.delta") => {
+                let text = chunk
+                    .get("delta")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    return sink.emit(ModelStreamEvent::ReasoningDelta {
                         text: text.to_owned(),
                     });
                 }
@@ -3618,6 +3646,42 @@ mod tests {
             ..StreamDecoder::chat_completions("fixture".to_owned())
         };
         assert!(missing_name.finish(&mut CollectingSink::default()).is_err());
+    }
+
+    #[test]
+    fn stream_decoders_surface_provider_reasoning_deltas() {
+        for field in ["reasoning_content", "reasoning"] {
+            let mut decoder = StreamDecoder::chat_completions("fixture".to_owned());
+            let mut sink = CollectingSink::default();
+            decoder
+                .accept(
+                    &serde_json::json!({"choices":[{"delta":{field:"thinking..."}}]}),
+                    &mut BTreeMap::new(),
+                    &mut sink,
+                )
+                .unwrap();
+            assert!(sink.events.iter().any(|event| matches!(
+                event,
+                ModelStreamEvent::ReasoningDelta { text } if text == "thinking..."
+            )));
+        }
+
+        let mut decoder = StreamDecoder::responses("fixture".to_owned());
+        let mut sink = CollectingSink::default();
+        decoder
+            .accept(
+                &serde_json::json!({
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": "weighing options",
+                }),
+                &mut BTreeMap::new(),
+                &mut sink,
+            )
+            .unwrap();
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ReasoningDelta { text } if text == "weighing options"
+        )));
     }
 
     #[test]

@@ -181,10 +181,24 @@ pub struct TokenUsage {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ModelStreamEvent {
-    TextDelta { text: String },
-    ToolCallDelta { call: ToolCall },
-    Usage { usage: TokenUsage },
-    Completed { reason: FinishReason },
+    TextDelta {
+        text: String,
+    },
+    /// Provider-reported reasoning/thinking summary. Optional and never
+    /// required by the agent runtime; providers that do not expose it simply
+    /// never emit this variant.
+    ReasoningDelta {
+        text: String,
+    },
+    ToolCallDelta {
+        call: ToolCall,
+    },
+    Usage {
+        usage: TokenUsage,
+    },
+    Completed {
+        reason: FinishReason,
+    },
 }
 
 #[cfg(test)]
