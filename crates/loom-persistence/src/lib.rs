@@ -35,7 +35,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const DATABASE_SCHEMA_VERSION: u32 = 42;
+const DATABASE_SCHEMA_VERSION: u32 = 43;
+const PROJECT_SCHEMA_VERSION: u32 = 42;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;
@@ -229,6 +230,7 @@ CREATE TABLE IF NOT EXISTS run_execution_state (
     provider_cursor INTEGER NOT NULL CHECK(provider_cursor >= 0),
     next_message_id INTEGER NOT NULL CHECK(next_message_id >= 0),
     active_message_id INTEGER CHECK(active_message_id IS NULL OR active_message_id >= 0),
+    last_project_message_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_project_message_sequence >= 0),
     pending_tool_execution TEXT CHECK(
         pending_tool_execution IS NULL OR length(pending_tool_execution) <= 1048576
     ),
@@ -3340,6 +3342,7 @@ impl FilePersistence {
             .query_row(
                 "SELECT session_id, attempt_id, control_revision, state, step_id, step_index,
                         provider_cursor, next_message_id, active_message_id,
+                        last_project_message_sequence,
                         pending_tool_execution, pending_approval, pending_input, last_failed_call
                  FROM run_execution_state WHERE run_id=?1",
                 [run_id.as_uuid().as_bytes().as_slice()],
@@ -3354,10 +3357,11 @@ impl FilePersistence {
                         row.get::<_, i64>(6)?,
                         row.get::<_, i64>(7)?,
                         row.get::<_, Option<i64>>(8)?,
-                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, i64>(9)?,
                         row.get::<_, Option<String>>(10)?,
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
                     ))
                 },
             )
@@ -3375,6 +3379,7 @@ impl FilePersistence {
             provider_cursor,
             next_message_id,
             active_message_id,
+            last_project_message_sequence,
             pending_tool_execution,
             pending_approval,
             pending_input,
@@ -3449,6 +3454,15 @@ impl FilePersistence {
                         false,
                     )
                 })?,
+            last_project_message_sequence: u64::try_from(last_project_message_sequence).map_err(
+                |_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted project message cursor is negative",
+                        false,
+                    )
+                },
+            )?,
             pending_tool_execution: decode_tool_call(pending_tool_execution)?,
             pending_approval: decode_tool_call(pending_approval)?,
             pending_input,
@@ -5779,7 +5793,11 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         return Ok(());
     }
     if database_version == 41 {
-        return migrate_v41_to_v42(connection);
+        migrate_v41_to_v42(connection)?;
+        return migrate_v42_to_v43(connection);
+    }
+    if database_version == PROJECT_SCHEMA_VERSION {
+        return migrate_v42_to_v43(connection);
     }
     if database_version != 0 {
         return Err(LoomError::new(
@@ -5942,7 +5960,7 @@ fn migrate_v41_to_v42(connection: &Connection) -> Result<()> {
             persistence_error(format!("could not backfill project roots: {error}"), true)
         })?;
     transaction
-        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .pragma_update(None, "user_version", PROJECT_SCHEMA_VERSION)
         .map_err(|error| {
             persistence_error(
                 format!("could not record persistence schema version: {error}"),
@@ -5952,6 +5970,42 @@ fn migrate_v41_to_v42(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(|error| {
         persistence_error(
             format!("could not commit persistence migration: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
+fn migrate_v42_to_v43(connection: &Connection) -> Result<()> {
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not begin project inbox migration: {error}"),
+            true,
+        )
+    })?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE run_execution_state
+                ADD COLUMN last_project_message_sequence INTEGER NOT NULL DEFAULT 0
+                CHECK(last_project_message_sequence >= 0);",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not add durable project inbox cursor: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record project inbox schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit project inbox migration: {error}"),
             true,
         )
     })?;
@@ -8639,14 +8693,23 @@ fn save_run_execution_state_rows(
                     false,
                 )
             })?;
+        let last_project_message_sequence = i64::try_from(execution.last_project_message_sequence)
+            .map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "project message cursor is out of range",
+                    false,
+                )
+            })?;
         let step_id = execution.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
         transaction
             .execute(
                 "INSERT INTO run_execution_state(
                     run_id, session_id, attempt_id, control_revision, state, step_id, step_index,
-                    provider_cursor, next_message_id, active_message_id, pending_tool_execution,
-                    pending_approval, pending_input, last_failed_call
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    provider_cursor, next_message_id, active_message_id,
+                    last_project_message_sequence, pending_tool_execution, pending_approval,
+                    pending_input, last_failed_call
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                  ON CONFLICT(run_id) DO UPDATE SET
                     session_id=excluded.session_id,
                     attempt_id=excluded.attempt_id,
@@ -8657,6 +8720,7 @@ fn save_run_execution_state_rows(
                     provider_cursor=excluded.provider_cursor,
                     next_message_id=excluded.next_message_id,
                     active_message_id=excluded.active_message_id,
+                    last_project_message_sequence=excluded.last_project_message_sequence,
                     pending_tool_execution=excluded.pending_tool_execution,
                     pending_approval=excluded.pending_approval,
                     pending_input=excluded.pending_input,
@@ -8670,6 +8734,7 @@ fn save_run_execution_state_rows(
                     OR run_execution_state.provider_cursor IS NOT excluded.provider_cursor
                     OR run_execution_state.next_message_id IS NOT excluded.next_message_id
                     OR run_execution_state.active_message_id IS NOT excluded.active_message_id
+                    OR run_execution_state.last_project_message_sequence IS NOT excluded.last_project_message_sequence
                     OR run_execution_state.pending_tool_execution IS NOT excluded.pending_tool_execution
                     OR run_execution_state.pending_approval IS NOT excluded.pending_approval
                     OR run_execution_state.pending_input IS NOT excluded.pending_input
@@ -8685,6 +8750,7 @@ fn save_run_execution_state_rows(
                     provider_cursor,
                     next_message_id,
                     active_message_id,
+                    last_project_message_sequence,
                     pending_tool_execution,
                     pending_approval,
                     execution.pending_input,
@@ -12275,6 +12341,46 @@ mod tests {
     }
 
     #[test]
+    fn v42_upgrade_adds_durable_project_message_cursor() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
+                 PRAGMA user_version=42;",
+            )
+            .unwrap();
+
+        initialize_schema(&connection).unwrap();
+
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let has_cursor: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('run_execution_state')
+                    WHERE name='last_project_message_sequence'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute("INSERT INTO run_execution_state(run_id) VALUES (x'01')", [])
+            .unwrap();
+        let cursor: i64 = connection
+            .query_row(
+                "SELECT last_project_message_sequence FROM run_execution_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 43);
+        assert!(has_cursor);
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
     fn v41_upgrade_preserves_sessions_as_project_roots() {
         type PersistedHierarchyRow = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, i64);
 
@@ -12290,6 +12396,7 @@ mod tests {
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL
                  ) WITHOUT ROWID, STRICT;
+                 CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
                  PRAGMA user_version=41;",
             )
             .unwrap();
@@ -12329,7 +12436,7 @@ mod tests {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 42);
+        assert_eq!(version, 43);
         for table in [
             "delegated_tasks",
             "delegated_task_context_references",
@@ -12365,6 +12472,7 @@ mod tests {
                     updated_at INTEGER NOT NULL
                  ) WITHOUT ROWID, STRICT;
                  CREATE TABLE sessions_hierarchy(unexpected TEXT);
+                 CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
                  PRAGMA user_version=41;",
             )
             .unwrap();
@@ -12404,7 +12512,7 @@ mod tests {
         let version: u32 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 42);
+        assert_eq!(version, 43);
         drop(connection);
         fs::remove_file(path).unwrap();
     }
@@ -12705,6 +12813,16 @@ mod tests {
                 .unwrap()
                 .status,
             DelegatedTaskStatus::Running
+        );
+        assert!(
+            !persistence
+                .update_delegated_task_status_if_queued(
+                    task.task_id,
+                    DelegatedTaskStatus::Blocked,
+                    Timestamp::now(),
+                )
+                .unwrap(),
+            "a scheduler claim must not overwrite a status advanced by runtime recovery"
         );
 
         let draft = AgentMessageDraft {
@@ -14391,6 +14509,7 @@ mod tests {
             provider_cursor: 0,
             next_message_id: 2,
             active_message_id: None,
+            last_project_message_sequence: 7,
             pending_tool_execution: None,
             pending_approval: None,
             pending_input: Some(prompt.clone()),
@@ -14822,6 +14941,7 @@ mod tests {
                 provider_cursor: 0,
                 next_message_id: 0,
                 active_message_id: None,
+                last_project_message_sequence: 0,
                 pending_tool_execution: Some(queued_call.clone()),
                 pending_approval: None,
                 pending_input: None,

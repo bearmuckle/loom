@@ -1042,6 +1042,31 @@ fn sync_cached_run_attempt(state: &mut AgentRuntimeState) {
     };
 }
 
+fn deliver_project_agent_messages(
+    persistence: &FilePersistence,
+    runtime: &mut AgentRuntime,
+) -> Result<bool> {
+    let session_id = runtime.session_id();
+    let project_id = persistence
+        .load_delegated_task_for_target(session_id)?
+        .map(|task| task.project_id)
+        .unwrap_or_else(|| ProjectId::from_uuid(*session_id.as_uuid()));
+    let messages = persistence.list_agent_messages(
+        project_id,
+        session_id,
+        runtime.last_project_message_sequence(),
+        32,
+    )?;
+    let mut delivered = false;
+    for message in messages {
+        if !runtime.append_project_message(&message)? {
+            break;
+        }
+        delivered = true;
+    }
+    Ok(delivered)
+}
+
 fn execution_state_from_runtime(state: &AgentRuntimeState) -> Result<AgentExecutionStateRecord> {
     Ok(AgentExecutionStateRecord {
         run_id: state.run.id,
@@ -1060,6 +1085,7 @@ fn execution_state_from_runtime(state: &AgentRuntimeState) -> Result<AgentExecut
         })?,
         next_message_id: state.next_message_id,
         active_message_id: state.active_message_id,
+        last_project_message_sequence: state.last_project_message_sequence,
         pending_tool_execution: state.pending_tool_execution.clone(),
         pending_approval: state.pending_approval.clone(),
         pending_input: state.pending_input.clone(),
@@ -1089,6 +1115,7 @@ fn runtime_state_from_durable_config(
         run: summary.snapshot.clone(),
         plan: loom_agent::AgentPlan { steps: Vec::new() },
         messages: Vec::new(),
+        last_project_message_sequence: 0,
         attempts: Vec::new(),
         pending_approval: None,
         pending_tool_execution: None,
@@ -1136,6 +1163,7 @@ fn hydrate_runtime_execution_state(
     })?;
     state.next_message_id = execution.next_message_id;
     state.active_message_id = execution.active_message_id;
+    state.last_project_message_sequence = execution.last_project_message_sequence;
     state.pending_tool_execution = execution.pending_tool_execution;
     state.pending_approval = execution.pending_approval;
     state.pending_input = execution.pending_input;
@@ -2954,7 +2982,7 @@ impl InProcessBackend {
             persistence.save_recovery_updates(&recovery_updates, &feed)?;
             journal.pending_events.clear();
         }
-        self.resume_queued_project_tasks()?;
+        self.reconcile_project_tasks_and_resume_queued(true)?;
         let lazy_filesystem_count = self.persisted_session_filesystems()?.len();
         log::info!(
             "indexed {} resumable runs, restored {} runtimes, deferred {} runtimes, and left {} filesystem services lazy in {} ms total",
@@ -2967,7 +2995,10 @@ impl InProcessBackend {
         Ok(())
     }
 
-    fn resume_queued_project_tasks(self: &Arc<Self>) -> Result<()> {
+    fn reconcile_project_tasks_and_resume_queued(
+        self: &Arc<Self>,
+        reconcile_persisted_runs: bool,
+    ) -> Result<()> {
         let Some(persistence) = self.persistence.as_ref() else {
             return Ok(());
         };
@@ -2987,6 +3018,38 @@ impl InProcessBackend {
         let connection = self.connect();
         for project_id in project_ids {
             for mut task in persistence.list_project_tasks(project_id)? {
+                if reconcile_persisted_runs {
+                    let latest_run =
+                        persistence.load_latest_run_summary_for_session(task.target_session_id)?;
+                    let recovered_status = latest_run
+                        .as_ref()
+                        .map(|summary| delegated_task_status_for_run_state(summary.snapshot.state))
+                        .or_else(|| {
+                            (task.status == loom_core::DelegatedTaskStatus::Running)
+                                .then_some(loom_core::DelegatedTaskStatus::Queued)
+                        });
+                    if let Some(status) = recovered_status
+                        && status != task.status
+                        && persistence.update_delegated_task_status(
+                            task.task_id,
+                            status,
+                            Timestamp::now(),
+                        )?
+                    {
+                        let Some(updated_task) = persistence.load_delegated_task(task.task_id)?
+                        else {
+                            return Err(LoomError::not_found("delegated task", task.task_id));
+                        };
+                        task = updated_task;
+                        let sequence = self.journal()?.next();
+                        self.journal()?.append_event(ServerEventEnvelope {
+                            protocol_version: CURRENT_PROTOCOL_VERSION,
+                            sequence,
+                            session_id: task.requester_session_id,
+                            event: ServerEvent::ProjectTaskUpdated { task: task.clone() },
+                        });
+                    }
+                }
                 if task.status == loom_core::DelegatedTaskStatus::Queued {
                     connection.schedule_project_task_if_ready(&mut task)?;
                 }
@@ -3626,7 +3689,7 @@ impl InProcessBackend {
                         | AgentSessionState::Failed
                         | AgentSessionState::Cancelled
                 ) {
-                    self.resume_queued_project_tasks()?;
+                    self.reconcile_project_tasks_and_resume_queued(false)?;
                 }
             }
         }
@@ -3703,7 +3766,7 @@ impl InProcessBackend {
                     | AgentSessionState::Failed
                     | AgentSessionState::Cancelled
             ) {
-                self.resume_queued_project_tasks()?;
+                self.reconcile_project_tasks_and_resume_queued(false)?;
             }
         }
         Ok(())
@@ -3809,6 +3872,33 @@ impl InProcessBackend {
                     })
                 });
                 loop {
+                    let delivered = if let Some(persistence) = backend.persistence.as_ref() {
+                        let mut runtime = handle
+                            .runtime
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        match deliver_project_agent_messages(persistence, &mut runtime) {
+                            Ok(delivered) => {
+                                if delivered {
+                                    handle.refresh(&runtime);
+                                }
+                                delivered
+                            }
+                            Err(error) => {
+                                handle.record_failure(error);
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if handle.failure().is_some() {
+                        break;
+                    }
+                    if delivered && let Err(error) = backend.persist_run_checkpoint(&handle) {
+                        handle.record_failure(error);
+                        break;
+                    }
                     let progress = {
                         let mut runtime = handle
                             .runtime
@@ -6627,16 +6717,18 @@ impl InProcessConnection {
         let nonterminal_direct_children = project
             .agents
             .iter()
+            .filter(|agent| agent.depth == 2 && agent.parent_session_id == Some(parent_session_id))
+            .map(|agent| self.backend.sessions()?.get(agent.session_id))
+            .collect::<Result<Vec<_>>>()?
+            .iter()
             .filter(|agent| {
-                agent.depth == 2
-                    && agent.parent_session_id == Some(parent_session_id)
-                    && !matches!(
-                        agent.state,
-                        AgentSessionState::Completed
-                            | AgentSessionState::Failed
-                            | AgentSessionState::Cancelled
-                            | AgentSessionState::Archived
-                    )
+                !matches!(
+                    agent.state,
+                    AgentSessionState::Completed
+                        | AgentSessionState::Failed
+                        | AgentSessionState::Cancelled
+                        | AgentSessionState::Archived
+                )
             })
             .count();
         if nonterminal_direct_children >= 4 {
@@ -7521,6 +7613,19 @@ impl InProcessConnection {
                 input.repository_instructions = Some(instructions);
             }
         }
+        if let Some(persistence) = self.backend.persistence.as_ref()
+            && let Some(project) =
+                persistence.load_project_snapshot(ProjectId::from_uuid(*session.id.as_uuid()))?
+            && project.root_session_id == session.id
+        {
+            let manager_instructions = "You are the project manager for this project. You own the user's overall goal, delegate bounded tasks, monitor child status and messages, synthesize results, escalate blockers or decisions to the user, and remain responsible for the final outcome. Project messages are authoritative coordination input; review and respond to them before continuing the overall goal.";
+            input.system_instructions = Some(match input.system_instructions.take() {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{existing}\n\n{manager_instructions}")
+                }
+                _ => manager_instructions.to_owned(),
+            });
+        }
         let checkpoint = workspace.create_checkpoint("before agent run")?;
         input.options.checkpoint_id = Some(checkpoint.id);
         let tools = ToolExecutor::new_with_workspace(workspace)
@@ -7529,7 +7634,7 @@ impl InProcessConnection {
         let mut agent_task = AgentTask::new(input.task, input.model)?;
         agent_task.system_instructions = input.system_instructions;
         agent_task.repository_instructions = input.repository_instructions;
-        let runtime = AgentRuntime::new_with_policy_and_options(
+        let mut runtime = AgentRuntime::new_with_policy_and_options(
             input.session_id,
             agent_task,
             provider,
@@ -7537,6 +7642,13 @@ impl InProcessConnection {
             policy,
             input.options,
         );
+        if let Some(persistence) = self.backend.persistence.as_ref()
+            && let Some(summary) =
+                persistence.load_latest_run_summary_for_session(input.session_id)?
+            && let Some(execution) = summary.execution_state
+        {
+            runtime.set_project_message_cursor(execution.last_project_message_sequence);
+        }
         let run_id = runtime.run_id();
         // The run is registered, and its events observable, before any model
         // work starts, so a second client can control it immediately.
@@ -7726,6 +7838,21 @@ fn delegated_task_status_for_session_state(
             return None;
         }
     })
+}
+
+fn delegated_task_status_for_run_state(state: AgentRunState) -> loom_core::DelegatedTaskStatus {
+    use loom_core::DelegatedTaskStatus as Status;
+    match state {
+        AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating => {
+            Status::Running
+        }
+        AgentRunState::AwaitingApproval | AgentRunState::Paused | AgentRunState::NeedsInput => {
+            Status::Blocked
+        }
+        AgentRunState::Completed => Status::Completed,
+        AgentRunState::Failed => Status::Failed,
+        AgentRunState::Cancelled => Status::Cancelled,
+    }
 }
 
 fn bounded_review_text(value: &str, limit: usize) -> String {
@@ -10407,10 +10534,9 @@ mod tests {
             backend.flush().unwrap();
             let persisted = FilePersistence::open(&persistence).unwrap();
             let runtime_config = persisted.load_run_runtime_config(run_id).unwrap().unwrap();
-            assert_eq!(
-                runtime_config.system_instructions.as_deref(),
-                Some("Be concise.")
-            );
+            let system_instructions = runtime_config.system_instructions.unwrap();
+            assert!(system_instructions.starts_with("Be concise."));
+            assert!(system_instructions.contains("project manager for this project"));
             assert_eq!(
                 runtime_config.repository_instructions.as_deref(),
                 Some("Keep changes focused.")
@@ -10496,10 +10622,9 @@ mod tests {
         assert_eq!(snapshot.attempt_id, approval.1);
         assert_eq!(snapshot.control_revision, approval.2);
         let reconstructed_state = connection.run_handle(run_id).unwrap().state();
-        assert_eq!(
-            reconstructed_state.task.system_instructions.as_deref(),
-            Some("Be concise.")
-        );
+        let system_instructions = reconstructed_state.task.system_instructions.unwrap();
+        assert!(system_instructions.starts_with("Be concise."));
+        assert!(system_instructions.contains("project manager for this project"));
         assert_eq!(
             reconstructed_state.options.context.context_window,
             Some(8_192)
@@ -12072,13 +12197,26 @@ mod tests {
         let over_capacity = connection.request(over_capacity_request.clone());
         match over_capacity.result {
             Err(error) if error.code == ErrorCode::Conflict => {
-                let (_, terminal_event) = backend
-                    .sessions()
-                    .unwrap()
-                    .transition(child.session_id, AgentSessionState::Completed)
-                    .unwrap();
-                backend.journal().unwrap().append_session(terminal_event);
-                backend.persist_state().unwrap();
+                if !matches!(
+                    backend
+                        .sessions()
+                        .unwrap()
+                        .get(child.session_id)
+                        .unwrap()
+                        .state,
+                    AgentSessionState::Completed
+                        | AgentSessionState::Failed
+                        | AgentSessionState::Cancelled
+                        | AgentSessionState::Archived
+                ) {
+                    let (_, terminal_event) = backend
+                        .sessions()
+                        .unwrap()
+                        .transition(child.session_id, AgentSessionState::Completed)
+                        .unwrap();
+                    backend.journal().unwrap().append_session(terminal_event);
+                    backend.persist_state().unwrap();
+                }
                 assert!(matches!(
                     connection.request(over_capacity_request).result,
                     Ok(ServerResponse::ProjectChildCreated { .. })

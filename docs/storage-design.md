@@ -4,19 +4,22 @@
 
 The current SQLite database format is version 41. Incompatible databases are
 rejected without modification; Loom does not import or migrate older state.
-The project-session rollout adds a forward-only migration from v41 to v42,
-which backfills existing sessions as project roots. Older formats remain
-unsupported. A pre-v42 backend cannot open a v42 database; backend downgrades
-and schema downgrade migrations are unsupported. If an upgrade must be rolled
-back, restore a pre-upgrade backup or move forward with a fix.
+The project-session rollout upgrades forward through v42 and v43: v42 backfills
+existing sessions as project roots, and v43 adds the durable project-message
+delivery cursor to run execution state. Older formats remain unsupported. A
+pre-v43 backend cannot open a v43 database; backend downgrades and schema
+downgrade migrations are unsupported. If an upgrade must be rolled back,
+restore a pre-upgrade backup or move forward with a fix.
 
 The v41-to-v42 migration must add project hierarchy, delegated-task, addressed
 message, and worktree/integration records and backfill one root project per
 existing session without changing session IDs or deleting existing history.
 Run the schema changes and backfill atomically, validate parent/root and
 workspace ownership invariants before updating `PRAGMA user_version`, and leave
-the database unchanged if migration fails. The migration should be tested for
-successful upgrade, rollback on failure, and safe retry after interruption.
+the database unchanged if migration fails. The v42-to-v43 migration adds the
+per-run project-message cursor used to checkpoint inbox delivery with the
+transcript. Each migration should be tested for successful upgrade, rollback
+on failure, and safe retry after interruption.
 
 ## Data model
 

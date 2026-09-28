@@ -8,9 +8,9 @@ use std::{
 
 use loom_context::{ContextAssembler, ContextAssemblyOptions, ContextInput, ContextInspection};
 use loom_core::{
-    ActivityId, AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink, InteractionId, LimitKind,
-    LimitStatus, LoomError, PolicyEvaluation, Result, RunId, SessionLimits, StepId, Timestamp,
-    UsageSnapshot,
+    ActivityId, AgentMessageRecord, AgentSessionId, ApprovalPolicy, ErrorCode, EvidenceLink,
+    InteractionId, LimitKind, LimitStatus, LoomError, PolicyEvaluation, Result, RunId,
+    SessionLimits, StepId, Timestamp, UsageSnapshot,
 };
 use loom_model::{
     CancellationToken, CompletionOptions, MessageRole, ModelId, ModelMessage, ModelProvider,
@@ -52,6 +52,8 @@ pub struct AgentRuntimeState {
     pub run: AgentRunSnapshot,
     pub plan: AgentPlan,
     pub messages: Vec<ModelMessage>,
+    #[serde(default)]
+    pub last_project_message_sequence: u64,
     #[serde(default)]
     pub attempts: Vec<loom_protocol::AgentRunAttemptRecord>,
     pub pending_approval: Option<ToolCall>,
@@ -238,6 +240,7 @@ pub struct AgentRuntime {
     provider: Option<Box<dyn ModelProvider>>,
     tools: ToolExecutor,
     messages: Vec<ModelMessage>,
+    last_project_message_sequence: u64,
     pending_approval: Option<PendingApproval>,
     pending_tool_execution: Option<ToolCall>,
     pending_input: Option<String>,
@@ -320,6 +323,7 @@ impl AgentRuntime {
             provider: Some(provider),
             tools,
             messages,
+            last_project_message_sequence: 0,
             pending_approval: None,
             pending_tool_execution: None,
             pending_input: None,
@@ -522,6 +526,56 @@ impl AgentRuntime {
         self.messages.clone()
     }
 
+    pub fn last_project_message_sequence(&self) -> u64 {
+        self.last_project_message_sequence
+    }
+
+    /// Sets the durable inbox cursor before a new run begins in this session.
+    pub fn set_project_message_cursor(&mut self, sequence: u64) {
+        self.last_project_message_sequence = self.last_project_message_sequence.max(sequence);
+    }
+
+    /// Injects one durable project message at a safe model-turn boundary.
+    /// Returns false when it was already delivered or the runtime is blocked.
+    pub fn append_project_message(&mut self, message: &AgentMessageRecord) -> Result<bool> {
+        if message.project_sequence <= self.last_project_message_sequence {
+            return Ok(false);
+        }
+        if self.pending_tool_execution.is_some()
+            || self.pending_approval.is_some()
+            || self.pending_input.is_some()
+            || !matches!(
+                self.run.state,
+                AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+            )
+        {
+            return Ok(false);
+        }
+        let kind = match message.kind {
+            loom_core::AgentMessageKind::Progress => "progress",
+            loom_core::AgentMessageKind::Result => "result",
+            loom_core::AgentMessageKind::Question => "question",
+            loom_core::AgentMessageKind::Blocker => "blocker",
+            loom_core::AgentMessageKind::Direction => "direction",
+            loom_core::AgentMessageKind::Answer => "answer",
+        };
+        let task = message
+            .task_id
+            .map(|task_id| format!("; task {task_id}"))
+            .unwrap_or_default();
+        let mut model_message = ModelMessage::new(
+            MessageRole::User,
+            format!(
+                "[Project message {} from agent {} ({kind}{task})]\n{}",
+                message.project_sequence, message.sender_session_id, message.body
+            ),
+        );
+        model_message.name = Some("loom_project_message".to_owned());
+        self.messages.push(model_message);
+        self.last_project_message_sequence = message.project_sequence;
+        Ok(true)
+    }
+
     pub fn checkpoint_id(&self) -> Option<loom_core::CheckpointId> {
         self.options.checkpoint_id
     }
@@ -537,6 +591,7 @@ impl AgentRuntime {
             run: self.run.clone(),
             plan: self.plan.clone(),
             messages: self.messages.clone(),
+            last_project_message_sequence: self.last_project_message_sequence,
             attempts: self.attempts.clone(),
             pending_approval: self
                 .pending_approval
@@ -651,6 +706,7 @@ impl AgentRuntime {
             provider: Some(provider),
             tools,
             messages: state.messages,
+            last_project_message_sequence: state.last_project_message_sequence,
             pending_approval: state.pending_approval.map(|call| PendingApproval { call }),
             pending_tool_execution: state.pending_tool_execution,
             pending_input: state.pending_input,
@@ -3028,6 +3084,48 @@ mod tests {
                 .filter(|activity| activity.kind == AgentActivityKind::ToolCall)
                 .all(|activity| activity.parent_id.is_some())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_messages_append_once_and_advance_the_inbox_cursor() {
+        let root = workspace();
+        let session_id = AgentSessionId::new();
+        let task =
+            AgentTask::new("coordinate the project", ModelId::new("deterministic/demo")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            session_id,
+            task,
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        let message = AgentMessageRecord {
+            message_id: loom_core::AgentMessageId::new(),
+            project_id: loom_core::ProjectId::from_uuid(*session_id.as_uuid()),
+            task_id: None,
+            sender_session_id: AgentSessionId::new(),
+            target_session_id: session_id,
+            kind: loom_core::AgentMessageKind::Direction,
+            project_sequence: 3,
+            accepted_at: Timestamp::now(),
+            body: "Please prioritize the compatibility review".to_owned(),
+        };
+
+        runtime.pending_tool_execution = Some(ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "write_file".to_owned(),
+            arguments: serde_json::json!({"path": "result.txt"}),
+        });
+        assert!(!runtime.append_project_message(&message).unwrap());
+        assert_eq!(runtime.last_project_message_sequence(), 0);
+        runtime.pending_tool_execution = None;
+        assert!(runtime.append_project_message(&message).unwrap());
+        assert!(!runtime.append_project_message(&message).unwrap());
+        assert_eq!(runtime.last_project_message_sequence(), 3);
+        let delivered = runtime.messages().pop().unwrap();
+        assert_eq!(delivered.role, MessageRole::User);
+        assert_eq!(delivered.name.as_deref(), Some("loom_project_message"));
+        assert!(delivered.content.contains("compatibility review"));
         fs::remove_dir_all(root).unwrap();
     }
 

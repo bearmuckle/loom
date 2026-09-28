@@ -62,6 +62,8 @@ pub struct AgentExecutionStateRecord {
     pub provider_cursor: u64,
     pub next_message_id: u64,
     pub active_message_id: Option<u64>,
+    #[serde(default)]
+    pub last_project_message_sequence: u64,
     pub pending_tool_execution: Option<ToolCall>,
     pub pending_approval: Option<ToolCall>,
     pub pending_input: Option<String>,

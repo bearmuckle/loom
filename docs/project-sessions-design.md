@@ -6,11 +6,12 @@ This document turns [GitHub issue #17](https://github.com/bearmuckle/loom/issues
 “Project sessions and coordinated sub-agents,” into an implementation design.
 It is the design and sequencing plan for the feature. The issue is XL-sized, so
 delivery is split into reviewable slices. The current draft implementation has
-landed the project hierarchy, protocol 5.0 contract, forward v41-to-v42 SQLite
-migration, durable child/task creation, persisted child model selection,
-restart scheduling for queued children, dependency gating, and basic durable
-parent-child message storage. Active runtime mailbox delivery, worktree-backed
-code tasks, controls, UI, and integration remain future slices.
+landed the project hierarchy, protocol 5.0 contract, forward v41-to-v43 SQLite
+migrations, durable child/task creation, persisted child model selection,
+restart scheduling for queued children, dependency gating, reconciliation of
+task status from persisted runs, and durable parent-child message delivery at
+safe model-turn boundaries. Worktree-backed code tasks, controls, UI, and
+integration remain future slices.
 
 The feature makes a root agent session a **project**: the durable owner of a
 user goal and the root of an agent hierarchy. A project manager may delegate
@@ -73,12 +74,15 @@ worktrees; shutdown or disconnect must not erase coordination state.
 
 Message acceptance means the addressed message has committed durably. Messages
 are ordered per project and retain sender, recipient, type, timestamps, and
-task association. Delivery may be asynchronous: an inactive recipient sees the
-message on resume, while an active recipient is woken after the durable write.
-Retryable send commands use request IDs so reconnects do not duplicate
-messages. The first slice supports parent-child exchange; routing between
-branches is added after direct-child coordination is reliable. Membership and
-policy are checked on every send and read.
+task association. Active run workers read the durable inbox between model
+turns; a message never interrupts an in-flight provider request or pending
+tool/approval action. The inbox cursor and injected transcript entry are saved
+in the same run checkpoint. A blocked or inactive recipient keeps messages in
+the durable inbox until its normal resume/next run. Retryable send commands use
+request IDs so reconnects do not duplicate messages. The first slice supports
+parent-child exchange; routing between branches is added after direct-child
+coordination is reliable. Membership and policy are checked on every send and
+read.
 
 Human review remains available at consequential decisions, particularly code
 integration and policy-sensitive actions. Projects are flexible coordinators,
@@ -159,19 +163,21 @@ Enforce one root per project, same-project parentage, no cycles, and
 maximum depth three in the backend domain service and persistence boundary.
 Do not place growing messages or child lists inside session JSON blobs.
 
-The project foundation requires a forward SQLite migration from the current
-schema version 41 to version 42. In one migration transaction, add the
+The project foundation requires forward SQLite migrations from schema version
+41 through version 43. The v41-to-v42 migration adds the
 normalized project, membership/parentage, delegated-task, addressed-message,
 and worktree/integration structures, then backfill each existing session as
 the root of a project while preserving its session ID, workspace, transcript,
 events, runs, approvals, and filesystem references. Existing session IDs
 remain stable; if project IDs are separate, assign them once and persist the
 mapping. Set `user_version` to 42 only after the backfill and invariants pass.
-Failure must roll back the migration so reopening can retry safely. Older
-schema versions remain unsupported according to the existing storage policy.
-This is a forward-only transition: a pre-v42 backend cannot open the migrated
-database, and no schema downgrade is provided. If an upgrade must be rolled
-back, restore a pre-upgrade backup or move forward with a fix.
+The v42-to-v43 migration adds the per-run project-message cursor used to
+checkpoint inbox delivery atomically with the agent transcript. Each migration
+rolls back independently and can be retried safely. Older schema versions
+remain unsupported according to the existing storage policy. This is a
+forward-only transition: a pre-v43 backend cannot open the migrated database,
+and no schema downgrade is provided. If an upgrade must be rolled back, restore
+a pre-upgrade backup or move forward with a fix.
 
 Child creation is idempotent and commits its session, task, project link, and
 initial event before execution is scheduled. A crash after commit but before
@@ -194,15 +200,16 @@ and its decision.
 1. **Implemented:** add project/agent hierarchy IDs, depth, delegated-task
    intent/status, message envelope/type, and worktree integration state to
    shared domain types; enforce the core hierarchy invariants.
-2. **Implemented:** add the forward v41-to-v42 migration and represent existing
-   sessions as project roots.
+2. **Implemented:** add the forward v41-to-v43 migrations and represent
+   existing sessions as project roots.
 3. **Implemented:** advance to protocol 5.0 and reject older clients during
    negotiation before serving project-aware schemas.
-4. **Partial:** recover committed-but-not-launched queued children and schedule
-   tasks when dependencies complete. Interrupted child runs still need full
-   reconciliation into a resumable/unknown state.
+4. **Implemented:** recover committed-but-not-launched queued children,
+   reconcile delegated-task status from persisted child runs, and schedule
+   tasks when dependencies complete. Existing run recovery keeps interrupted
+   work paused or blocked rather than starting a duplicate child run.
 
-**Exit:** v41 data migrates to v42 with existing sessions represented as
+**Exit:** v41 data migrates through v43 with existing sessions represented as
 projects; unsupported clients are directed to upgrade before using the new
 contract; hierarchy invariants are backend-enforced; snapshots and durable
 records survive restart and reconnect. Backend downgrade is unsupported and
@@ -215,10 +222,9 @@ occurs after record commit but before notification persistence.
    selected relevant context, limits, and explicit code-change intent.
 2. Enforce configurable bounded parallelism and project membership; create
    the child durably before scheduling its independent agent runtime.
-3. Implement parent-child durable messaging with accepted/ordered semantics,
-   active runtime wakeup, and queued delivery after resume. The current slice
-   stores messages and publishes a notification, but does not yet wake an
-   already-running recipient or replay missed notifications automatically.
+3. **Implemented:** deliver parent-child messages from the durable inbox at
+   model-turn boundaries, checkpoint the inbox cursor with the transcript,
+   and retain messages for blocked or inactive recipients until resume.
 4. Return progress, completion, questions, and blockers to the manager and
    allow it to answer, redirect, continue, retry, or cancel.
 5. Add a deterministic end-to-end scenario for investigation/planning that
