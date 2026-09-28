@@ -1,0 +1,6 @@
+# The GPUI/wgpu UI binary is very large and linking it dominates incremental
+# build/test cycles with the default system linker. Use mold (a drop-in, much
+# faster linker) via clang on Linux. Requires `clang` and `mold` installed.
+[target.'cfg(target_os = "linux")']
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
