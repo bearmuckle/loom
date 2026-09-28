@@ -14,8 +14,11 @@ safe model-turn boundaries. Root managers can create bounded non-code child
 tasks through a write-approved agent tool; separate delegation, messaging, and
 inspection grants survive run recovery. Project agents can send durable
 direct-parent/direct-child messages and inspect direct-child task and session
-status. The project hierarchy navigator, child lifecycle controls,
-worktree-backed code tasks, and integration remain future slices. Workspace
+status. The workspace navigator now groups a project root with its direct
+children and shows child task summaries and live state; loading the navigator
+from a child session resolves the containing project. The project message
+timeline, manager-directed child lifecycle controls, worktree-backed code
+tasks, and integration remain future slices. Workspace
 settings configure the maximum number of delegated agents running in parallel
 (default four, range one to sixteen); additional tasks remain durable and
 queued. A project can have up to fifty queued or active delegated tasks.
@@ -124,7 +127,8 @@ are handled; a child must never inherit a mutable attachment accidentally.
 Add versioned protocol operations and projections for project snapshots,
 children, delegated tasks, addressed messages, agent controls, and worktree
 integration. Proposed operation families are `CreateChildAgent`,
-`GetProjectSnapshot`, `SendAgentMessage`, `ListAgentMessages`, and
+`GetProjectSnapshot` (including lookup from any member session),
+`SendAgentMessage`, `ListAgentMessages`, and
 `ControlChildAgent` (pause/resume/interrupt/cancel); names are provisional and
 must follow existing request conventions. Events cover child creation and
 status transitions, task updates, messages, blockers, worktree changes,
@@ -256,22 +260,29 @@ occurs after record commit but before notification persistence.
    identifies a child by its delegated task ID. Terminal recipients are
    rejected because they have no current resume path.
 5. Return progress, completion, questions, and blockers to the manager and
-   allow it to answer, redirect, continue, retry, or cancel.
-6. Add a deterministic end-to-end scenario for investigation/planning that
-   completes without worktrees or a fixed document pipeline.
+   allow it to answer, redirect, continue, retry, or cancel. Message-based
+   answers and directions work; explicit continue, retry, and cancel controls
+   remain to be implemented.
+6. **Implemented:** add a deterministic end-to-end investigation scenario that
+   delegates a non-code task, exchanges progress/questions/directions/results,
+   completes both runs, and verifies project state, messages, transcripts,
+   inbox cursors, and run grants after reopening the backend.
 
 **Exit:** a manager creates a bounded non-code child, exchanges messages while
-both agents run, handles a blocker and completion, and resumes after restart.
+both agents run, handles a blocker and completion, and project state survives
+restart. Existing run-recovery behavior remains covered by its restart tests.
 
 ### Slice 2: project and child control UI
 
-1. Present root sessions as projects in workspace navigation and language;
-   preserve existing sessions through the root migration.
-2. Add a project agent list/tree with depth, task summary, live status,
-   blocker, and latest result. The initial workflow exposes direct children.
-3. Add focused child transcript/output inspection and per-child
-   pause/resume/interrupt/cancel controls using existing `gpui-kit` components
-   where suitable.
+1. **Implemented:** label root sessions as projects in workspace navigation
+   and group their direct children under the root; the root migration preserves
+   existing sessions.
+2. **Partially implemented:** show direct-child task summaries and live
+   session state in the project tree. Show blocker and latest-result details
+   in the timeline in step 4.
+3. Selecting a child opens its existing transcript/output view. Add explicit
+   per-child pause/resume/interrupt/cancel controls using existing `gpui-kit`
+   components where suitable.
 4. Show manager-child messages in the project activity timeline, visually
    distinct from user conversation and tool activity. Expose reconnect cursors
    and stale-state refresh through existing protocol projections.

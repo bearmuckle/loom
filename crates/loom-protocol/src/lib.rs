@@ -384,6 +384,9 @@ pub enum ClientRequest {
     GetProjectSnapshot {
         project_id: ProjectId,
     },
+    GetProjectSnapshotForSession {
+        session_id: AgentSessionId,
+    },
     CreateProjectChild {
         parent_session_id: AgentSessionId,
         child_name: String,
@@ -575,7 +578,9 @@ impl ClientRequest {
             | Self::GetAgentSessionSnapshot { .. }
             | Self::GetAgentSessionSnapshotMetadata { .. }
             | Self::GetAgentSessionInitialState { .. } => Some(Capability::ReadAgentSession),
-            Self::GetProjectSnapshot { .. } => Some(Capability::ReadProject),
+            Self::GetProjectSnapshot { .. } | Self::GetProjectSnapshotForSession { .. } => {
+                Some(Capability::ReadProject)
+            }
             Self::CreateProjectChild { .. } => Some(Capability::CreateProjectChild),
             Self::SendProjectAgentMessage { .. } => Some(Capability::SendProjectAgentMessage),
             Self::ListProjectAgentMessages { .. } => Some(Capability::ReadProjectAgentMessages),
@@ -1104,6 +1109,23 @@ mod run_message_protocol_tests {
         assert_eq!(
             decode_request(&encoded).unwrap().request,
             ClientRequest::GetProjectSnapshot { project_id }
+        );
+
+        let child_session_id = AgentSessionId::new();
+        let session_request = ClientRequest::GetProjectSnapshotForSession {
+            session_id: child_session_id,
+        };
+        assert_eq!(
+            session_request.required_capability(),
+            Some(Capability::ReadProject)
+        );
+        assert_eq!(
+            decode_request(
+                &encode_request(&RequestEnvelope::new(session_request.clone())).unwrap()
+            )
+            .unwrap()
+            .request,
+            session_request
         );
 
         let root_session_id = AgentSessionId::new();

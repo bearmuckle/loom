@@ -1382,6 +1382,8 @@ pub(crate) struct LoomView {
     workspaces: Vec<WorkspaceRecord>,
     local_directory_sources_available: bool,
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
+    project_snapshot: Option<loom_core::ProjectSnapshot>,
+    project_snapshot_stale: bool,
     session_tree: Option<Entity<TreeState>>,
     session_tree_entries: Vec<(AgentSessionId, String)>,
     pub(crate) active_session: AgentSessionSnapshot,
@@ -1513,6 +1515,67 @@ fn session_list_projection(
         selected_index: sessions
             .iter()
             .position(|session| session.id == active_session_id),
+    }
+}
+
+fn project_session_list_projection(
+    sessions: &[AgentSessionSnapshot],
+    active_session_id: AgentSessionId,
+    project: Option<&loom_core::ProjectSnapshot>,
+) -> SessionListProjection {
+    let Some(project) = project else {
+        return session_list_projection(sessions, active_session_id);
+    };
+    let child_agents = project
+        .agents
+        .iter()
+        .filter(|agent| agent.parent_session_id == Some(project.root_session_id))
+        .collect::<Vec<_>>();
+    let child_ids = child_agents
+        .iter()
+        .map(|agent| agent.session_id)
+        .collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+    for session in sessions {
+        if child_ids.contains(&session.id) {
+            continue;
+        }
+        let label = if session.id == project.root_session_id {
+            format!("Project · {}", session.name)
+        } else {
+            session.name.clone()
+        };
+        entries.push((session.id, label));
+        if session.id == project.root_session_id {
+            for agent in &child_agents {
+                if let Some(child) = sessions
+                    .iter()
+                    .find(|session| session.id == agent.session_id)
+                {
+                    let task_summary = agent
+                        .task_summary
+                        .as_deref()
+                        .map(|summary| format!(" — {summary}"))
+                        .unwrap_or_default();
+                    entries.push((
+                        child.id,
+                        format!(
+                            "↳ {} · {}{}",
+                            child.name,
+                            session_state_label(agent.state),
+                            task_summary
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    let selected_index = entries
+        .iter()
+        .position(|(session_id, _)| *session_id == active_session_id);
+    SessionListProjection {
+        entries,
+        selected_index,
     }
 }
 
@@ -1767,6 +1830,8 @@ impl LoomView {
             workspaces: Vec::new(),
             local_directory_sources_available: true,
             sessions: Vec::new(),
+            project_snapshot: None,
+            project_snapshot_stale: false,
             session_tree: None,
             session_tree_entries: Vec::new(),
             active_session: active_session.clone(),
@@ -2151,6 +2216,8 @@ impl LoomView {
             } else {
                 Vec::new()
             },
+            project_snapshot: None,
+            project_snapshot_stale: false,
             session_tree: None,
             session_tree_entries: Vec::new(),
             active_session: session.clone(),
@@ -2307,6 +2374,8 @@ impl LoomView {
             } else {
                 Vec::new()
             },
+            project_snapshot: None,
+            project_snapshot_stale: false,
             session_tree: None,
             session_tree_entries: Vec::new(),
             active_session,
@@ -2548,6 +2617,8 @@ impl LoomView {
             } else {
                 Vec::new()
             },
+            project_snapshot: None,
+            project_snapshot_stale: false,
             session_tree: None,
             session_tree_entries: Vec::new(),
             active_session: session.clone(),
@@ -3083,6 +3154,8 @@ impl LoomView {
 
     pub(crate) fn activate_session(&mut self, session: AgentSessionSnapshot) {
         self.active_session = session;
+        self.project_snapshot = None;
+        self.project_snapshot_stale = false;
         self.session_repositories.clear();
         self.session_directories.clear();
         self.selected_repository_id = None;
@@ -3110,6 +3183,49 @@ impl LoomView {
         self.review.changes.clear();
         self.review.vcs = None;
         self.review.repositories_loaded = false;
+    }
+
+    fn refresh_active_project_snapshot(&mut self, cx: &mut Context<Self>) {
+        let session_id = self.active_session.id;
+        let backend = match self.backend_for_session(session_id) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.record_backend_error("load project snapshot", error);
+                return;
+            }
+        };
+        self.project_snapshot_stale = false;
+        let request = backend.submit(RequestEnvelope::new(
+            ClientRequest::GetProjectSnapshotForSession { session_id },
+        ));
+        cx.spawn(async move |view, cx| {
+            let response = cx
+                .background_spawn(async move { request.wait().await })
+                .await;
+            view.update(cx, |view, cx| {
+                if view.active_session.id != session_id {
+                    return;
+                }
+                match response.result {
+                    Ok(ServerResponse::ProjectSnapshot(snapshot)) => {
+                        view.project_snapshot = Some(snapshot);
+                    }
+                    Err(error) if error.code == ErrorCode::NotFound => {
+                        view.project_snapshot = None;
+                    }
+                    Err(error) => {
+                        view.record_backend_error("load project snapshot", error);
+                    }
+                    Ok(response) => view.record_backend_error(
+                        "load project snapshot",
+                        unexpected_response("project snapshot", response),
+                    ),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Loads a session synchronously.
@@ -3222,6 +3338,17 @@ impl LoomView {
             .result
         {
             self.session_directories = directories;
+        }
+        if let Ok(ServerResponse::ProjectSnapshot(snapshot)) = self
+            .connection
+            .request(RequestEnvelope::new(
+                ClientRequest::GetProjectSnapshotForSession {
+                    session_id: self.active_session.id,
+                },
+            ))
+            .result
+        {
+            self.project_snapshot = Some(snapshot);
         }
     }
 
@@ -3369,6 +3496,9 @@ impl LoomView {
                         unexpected_response("session event stream", response),
                     ),
                 }
+                if view.project_snapshot_stale {
+                    view.refresh_active_project_snapshot(cx);
+                }
                 view.run_poll_scheduled = false;
                 view.schedule_run_poll(cx);
             },
@@ -3442,7 +3572,9 @@ impl LoomView {
             ServerEvent::ProjectTaskUpdated { .. }
             | ServerEvent::ProjectAgentMessageAccepted { .. }
             | ServerEvent::ProjectAgentCreated { .. }
-            | ServerEvent::ProjectAgentUpdated { .. } => {}
+            | ServerEvent::ProjectAgentUpdated { .. } => {
+                self.project_snapshot_stale = true;
+            }
             ServerEvent::AgentSessionCreated { snapshot } => {
                 self.active_session = snapshot.clone();
                 self.session_state = snapshot.state;
@@ -4274,7 +4406,14 @@ impl LoomView {
         self.providers_open = false;
         self.about_open = false;
         self.review.open = false;
+        let project_context = self.project_snapshot.clone().filter(|snapshot| {
+            snapshot
+                .agents
+                .iter()
+                .any(|agent| agent.session_id == session.id)
+        });
         self.activate_session(session.clone());
+        self.project_snapshot = project_context;
         if let Some(node_id) = self.session_node_ids.get(&session.id).cloned()
             && self.model_catalog_node_id.as_deref() != Some(node_id.as_str())
         {
@@ -4467,6 +4606,7 @@ impl LoomView {
             self.begin_transcript_page(None, cx);
         }
         self.refresh_review(cx);
+        self.refresh_active_project_snapshot(cx);
         cx.notify();
     }
 
@@ -7107,7 +7247,11 @@ impl LoomView {
     }
 
     pub(crate) fn render_session_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let projection = session_list_projection(&self.sessions, self.active_session.id);
+        let projection = project_session_list_projection(
+            &self.sessions,
+            self.active_session.id,
+            self.project_snapshot.as_ref(),
+        );
         let entries = projection.entries;
         let tree_items = entries
             .iter()
@@ -7136,9 +7280,17 @@ impl LoomView {
         let sessions = self.sessions.clone();
         let view = cx.entity();
         let menu_sessions = sessions.clone();
+        let menu_entries = entries.clone();
         let menu_view = view.clone();
         KitTree::new(&tree, move |index, _, selected, _, app| {
-            let Some(session) = sessions.get(index).cloned() else {
+            let Some((session_id, label)) = entries.get(index).cloned() else {
+                return ListItem::new(("session-tree-root", index));
+            };
+            let Some(session) = sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .cloned()
+            else {
                 return ListItem::new(("session-tree-root", index));
             };
             let node_indicator = view
@@ -7166,13 +7318,7 @@ impl LoomView {
                                     rgb(0x8f98a6)
                                 }),
                         )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .truncate()
-                                .child(session.name.clone()),
-                        )
+                        .child(div().flex_1().min_w(px(0.)).truncate().child(label))
                         .child(node_indicator),
                 )
                 .on_click(move |_, _, cx| {
@@ -7182,7 +7328,14 @@ impl LoomView {
                 })
         })
         .context_menu(move |index, _, menu, _window, _cx| {
-            let Some(session) = menu_sessions.get(index).cloned() else {
+            let Some((session_id, _)) = menu_entries.get(index) else {
+                return menu;
+            };
+            let Some(session) = menu_sessions
+                .iter()
+                .find(|session| session.id == *session_id)
+                .cloned()
+            else {
                 return menu;
             };
             let rename_view = menu_view.clone();
@@ -13486,16 +13639,17 @@ mod worker_node_tests {
         connection_placeholder, format_percentage, format_session_resource_percentages,
         format_worker_node_resources, initial_worker_nodes, local_source_available,
         mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
-        order_session_nodes, remove_worker_node_entry, safe_worker_url_label,
-        session_id_for_request, session_list_projection, session_node_indicator_state,
-        session_node_pulse, session_owner_status, source_choice_is_allowed,
-        source_dialog_initial_state, transition_worker_connection_to_connecting,
-        update_worker_node_status, validate_model_for_node, worker_connection_failure_detail,
-        worker_node_display_name, worker_node_name_for_id, worker_url_embeds_credential,
+        order_session_nodes, project_session_list_projection, remove_worker_node_entry,
+        safe_worker_url_label, session_id_for_request, session_list_projection,
+        session_node_indicator_state, session_node_pulse, session_owner_status,
+        source_choice_is_allowed, source_dialog_initial_state,
+        transition_worker_connection_to_connecting, update_worker_node_status,
+        validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
+        worker_node_name_for_id, worker_url_embeds_credential,
     };
     use loom_core::{
-        AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, RunId, Timestamp,
-        WorkspaceId,
+        AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, EventSequence,
+        RunId, Timestamp, WorkspaceId,
     };
     use loom_core::{ErrorCode, LoomError};
     use loom_model::ModelId;
@@ -13816,6 +13970,60 @@ mod worker_node_tests {
         let projection = session_list_projection(&sessions, AgentSessionId::new());
 
         assert_eq!(projection.selected_index, None);
+    }
+
+    #[test]
+    fn project_session_list_groups_direct_children_and_selects_them() {
+        let root_id = AgentSessionId::new();
+        let child_id = AgentSessionId::new();
+        let other_id = AgentSessionId::new();
+        let sessions = vec![
+            session(root_id, "Project"),
+            session(child_id, "Researcher"),
+            session(other_id, "Other session"),
+        ];
+        let project_id = loom_core::ProjectId::from_uuid(*root_id.as_uuid());
+        let project = loom_core::ProjectSnapshot {
+            project_id,
+            root_session_id: root_id,
+            agents: vec![
+                loom_core::ProjectAgentRecord {
+                    session_id: root_id,
+                    project_id,
+                    parent_session_id: None,
+                    depth: 1,
+                    state: AgentSessionState::Idle,
+                    task_summary: None,
+                    output_cursor: EventSequence::default(),
+                    updated_at: Timestamp::from_unix_millis(1),
+                },
+                loom_core::ProjectAgentRecord {
+                    session_id: child_id,
+                    project_id,
+                    parent_session_id: Some(root_id),
+                    depth: 2,
+                    state: AgentSessionState::Executing,
+                    task_summary: Some("Review protocol changes".to_owned()),
+                    output_cursor: EventSequence::default(),
+                    updated_at: Timestamp::from_unix_millis(2),
+                },
+            ],
+        };
+
+        let projection = project_session_list_projection(&sessions, child_id, Some(&project));
+
+        assert_eq!(
+            projection.entries,
+            vec![
+                (root_id, "Project · Project".to_owned()),
+                (
+                    child_id,
+                    "↳ Researcher · Working — Review protocol changes".to_owned()
+                ),
+                (other_id, "Other session".to_owned()),
+            ]
+        );
+        assert_eq!(projection.selected_index, Some(1));
     }
 
     #[test]

@@ -6189,6 +6189,11 @@ impl InProcessConnection {
             ClientRequest::GetProjectSnapshot { project_id } => Ok(
                 ServerResponse::ProjectSnapshot(self.load_project_snapshot(project_id)?),
             ),
+            ClientRequest::GetProjectSnapshotForSession { session_id } => {
+                Ok(ServerResponse::ProjectSnapshot(
+                    self.load_project_snapshot_for_session(session_id)?,
+                ))
+            }
             ClientRequest::CreateProjectChild {
                 parent_session_id,
                 child_name,
@@ -7694,6 +7699,43 @@ impl InProcessConnection {
         })
     }
 
+    fn load_project_snapshot_for_session(
+        &self,
+        session_id: AgentSessionId,
+    ) -> Result<ProjectSnapshot> {
+        if let Some(snapshot) = self
+            .backend
+            .persistence
+            .as_ref()
+            .map(|persistence| persistence.load_project_snapshot_for_session(session_id))
+            .transpose()?
+            .flatten()
+        {
+            return Ok(snapshot);
+        }
+
+        let root = self
+            .backend
+            .sessions()?
+            .get(session_id)
+            .map_err(|_| LoomError::not_found("project agent", session_id))?;
+        let project_id = ProjectId::from_uuid(*session_id.as_uuid());
+        Ok(ProjectSnapshot {
+            project_id,
+            root_session_id: root.id,
+            agents: vec![ProjectAgentRecord {
+                session_id: root.id,
+                project_id,
+                parent_session_id: None,
+                depth: 1,
+                state: root.state,
+                task_summary: None,
+                output_cursor: EventSequence::default(),
+                updated_at: root.updated_at,
+            }],
+        })
+    }
+
     fn authorize_project_snapshot(
         &self,
         auth: &AuthSession,
@@ -7831,6 +7873,21 @@ impl InProcessConnection {
                     ));
                 }
                 let snapshot = self.load_project_snapshot(*project_id)?;
+                self.authorize_project_snapshot(auth, &snapshot)?;
+            }
+            ClientRequest::GetProjectSnapshotForSession { session_id } => {
+                if !auth.scope().allows_session(*session_id) {
+                    return Err(unauthorized_session(*session_id));
+                }
+                let session = self.backend.sessions()?.get(*session_id)?;
+                if !auth.scope().allows_workspace(session.workspace_id) {
+                    return Err(LoomError::new(
+                        ErrorCode::AuthorizationDenied,
+                        "token is not authorized for the project's workspace",
+                        false,
+                    ));
+                }
+                let snapshot = self.load_project_snapshot_for_session(*session_id)?;
                 self.authorize_project_snapshot(auth, &snapshot)?;
             }
             ClientRequest::RegisterWorkspace { workspace } => {
@@ -8774,6 +8831,7 @@ impl InProcessConnection {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         fs,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
@@ -12864,6 +12922,18 @@ mod tests {
         assert_eq!(task.requester_session_id, root);
         assert_eq!(task.target_session_id, child.session_id);
         assert_eq!(child.depth, 2);
+        let child_project_snapshot = connection.request(RequestEnvelope::new(
+            ClientRequest::GetProjectSnapshotForSession {
+                session_id: child.session_id,
+            },
+        ));
+        assert!(matches!(
+            child_project_snapshot.result,
+            Ok(ServerResponse::ProjectSnapshot(snapshot))
+                if snapshot.project_id == task.project_id
+                    && snapshot.root_session_id == root
+                    && snapshot.agents.len() == 2
+        ));
         assert_eq!(
             backend
                 .connect()
@@ -13457,6 +13527,490 @@ mod tests {
     }
 
     #[test]
+    fn project_coordination_exchange_and_transcripts_survive_restart() {
+        let temp = std::env::temp_dir().join(format!(
+            "loom-project-coordination-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let persistence_path = temp.join("state.sqlite");
+        let mut model = ScriptedOpenAiEndpoint::start();
+        let model_endpoint = model.endpoint.clone();
+        let model_id = ModelId::new("fixture/project-coordination");
+        let provider_registry =
+            || scripted_project_provider_registry(&model_endpoint, model_id.clone());
+        let backend = InProcessBackend::with_provider_registry_persistent(
+            provider_registry(),
+            &persistence_path,
+        )
+        .unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Project coordination e2e".to_owned(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Manager".to_owned(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        let started =
+            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Coordinate a short investigation with a child agent.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            }));
+        let root_run_id = match started.result.unwrap() {
+            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            response => panic!("unexpected run response: {response:?}"),
+        };
+
+        // The model is driven by this test. Hold the manager's first follow-up
+        // request while the child reports, so the next manager turn is forced
+        // to cross an inbox boundary after both messages are durable.
+        let manager_delegate = model.next_for_manager();
+        assert!(request_has_tool(
+            &manager_delegate.request,
+            "delegate_project_task"
+        ));
+        model.respond_with_tool(
+            manager_delegate,
+            "delegate_project_task",
+            serde_json::json!({
+                "child_name": "investigator",
+                "intent": "Investigate the question and report an initial finding and any uncertainty.",
+                "model_id": model_id,
+                "context_references": [],
+                "dependencies": []
+            }),
+        );
+
+        let child_progress_turn = model.next_for_child();
+        assert!(request_has_tool(
+            &child_progress_turn.request,
+            "send_project_agent_message"
+        ));
+        let task = backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .list_project_tasks(ProjectId::from_uuid(*root.as_uuid()))
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("delegated task was committed before child scheduling");
+        model.respond_with_tool(
+            child_progress_turn,
+            "send_project_agent_message",
+            serde_json::json!({
+                "kind": "progress",
+                "body": "I have started the investigation and am checking the key assumption."
+            }),
+        );
+
+        let child_question_turn = model.next_for_child();
+        model.respond_with_tool(
+            child_question_turn,
+            "send_project_agent_message",
+            serde_json::json!({
+                "kind": "question",
+                "body": "Should I prioritize the launch timeline or the reliability tradeoff?"
+            }),
+        );
+
+        // A request after the question tool call proves the child message has
+        // been accepted. Keep that child turn open until the manager's answer
+        // and direction are recorded; it will need another turn to consume them.
+        let child_waiting_for_manager = model.next_for_child();
+        assert!(!request_has_project_message(
+            &child_waiting_for_manager.request,
+            "progress"
+        ));
+        assert!(!request_has_project_message(
+            &child_waiting_for_manager.request,
+            "question"
+        ));
+
+        let manager_poll = model.next_for_manager();
+        assert!(!request_has_project_message(
+            &manager_poll.request,
+            "question"
+        ));
+        model.respond_with_tool(manager_poll, "list_project_children", serde_json::json!({}));
+
+        let manager_with_child_messages = model.next_for_manager();
+        assert!(request_has_project_message(
+            &manager_with_child_messages.request,
+            "progress"
+        ));
+        assert!(request_has_project_message(
+            &manager_with_child_messages.request,
+            "question"
+        ));
+        model.respond_with_tool(
+            manager_with_child_messages,
+            "send_project_agent_message",
+            serde_json::json!({
+                "task_id": task.task_id,
+                "kind": "answer",
+                "body": "Prioritize reliability first; include the launch timeline as a secondary consideration."
+            }),
+        );
+
+        let manager_direction_turn = model.next_for_manager();
+        model.respond_with_tool(
+            manager_direction_turn,
+            "send_project_agent_message",
+            serde_json::json!({
+                "task_id": task.task_id,
+                "kind": "direction",
+                "body": "Redirect the investigation toward the reliability tradeoff and state one practical next step."
+            }),
+        );
+
+        // Keep the manager's next call open until the child has consumed both
+        // messages and sent its result. The list call below advances the
+        // manager to a boundary where the durable result can be delivered.
+        let manager_waiting_for_result = model.next_for_manager();
+        assert!(!request_has_project_message(
+            &manager_waiting_for_result.request,
+            "result"
+        ));
+
+        model.respond_with_tool(
+            child_waiting_for_manager,
+            "list_files",
+            serde_json::json!({ "path": "." }),
+        );
+        let child_with_manager_messages = model.next_for_child();
+        assert!(request_has_project_message(
+            &child_with_manager_messages.request,
+            "answer"
+        ));
+        assert!(request_has_project_message(
+            &child_with_manager_messages.request,
+            "direction"
+        ));
+        model.respond_with_tool(
+            child_with_manager_messages,
+            "send_project_agent_message",
+            serde_json::json!({
+                "kind": "result",
+                "body": "Reliability is the priority; the next step is to validate the failure-recovery path before setting the launch date."
+            }),
+        );
+        let child_final_turn = model.next_for_child();
+        model.respond_with_text(
+            child_final_turn,
+            "Investigation complete. Reliability should be validated before setting the launch date.",
+        );
+
+        model.respond_with_tool(
+            manager_waiting_for_result,
+            "list_project_children",
+            serde_json::json!({}),
+        );
+        let manager_with_result = model.next_for_manager();
+        assert!(request_has_project_message(
+            &manager_with_result.request,
+            "result"
+        ));
+        model.respond_with_text(
+            manager_with_result,
+            "The child completed the investigation: validate reliability recovery first, then set the launch date.",
+        );
+
+        assert_eq!(
+            await_settled_run(&connection, root_run_id).state,
+            AgentRunState::Completed
+        );
+        let child = backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_project_snapshot(ProjectId::from_uuid(*root.as_uuid()))
+            .unwrap()
+            .unwrap()
+            .agents
+            .into_iter()
+            .find(|agent| agent.session_id != root)
+            .expect("child agent was created");
+        let child_run_id = backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_latest_run_summary_for_session(child.session_id)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .id;
+        assert_eq!(
+            await_settled_run(&connection, child_run_id).state,
+            AgentRunState::Completed
+        );
+
+        let project_id = ProjectId::from_uuid(*root.as_uuid());
+        let durable = backend.persistence.as_ref().unwrap();
+        let task = durable.load_delegated_task(task.task_id).unwrap().unwrap();
+        assert_eq!(task.status, loom_core::DelegatedTaskStatus::Completed);
+        let parent_inbox = durable
+            .list_agent_messages(project_id, root, 0, 10)
+            .unwrap();
+        let child_inbox = durable
+            .list_agent_messages(project_id, child.session_id, 0, 10)
+            .unwrap();
+        assert_eq!(
+            parent_inbox
+                .iter()
+                .map(|message| message.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                loom_core::AgentMessageKind::Progress,
+                loom_core::AgentMessageKind::Question,
+                loom_core::AgentMessageKind::Result,
+            ]
+        );
+        assert_eq!(
+            child_inbox
+                .iter()
+                .map(|message| message.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                loom_core::AgentMessageKind::Answer,
+                loom_core::AgentMessageKind::Direction,
+            ]
+        );
+        assert!(parent_inbox.iter().all(|message| {
+            message.project_id == project_id
+                && message.task_id == Some(task.task_id)
+                && message.sender_session_id == child.session_id
+                && message.target_session_id == root
+        }));
+        assert!(child_inbox.iter().all(|message| {
+            message.project_id == project_id
+                && message.task_id == Some(task.task_id)
+                && message.sender_session_id == root
+                && message.target_session_id == child.session_id
+        }));
+        let child_cursor = durable
+            .load_run_execution_state(child_run_id)
+            .unwrap()
+            .unwrap()
+            .last_project_message_sequence;
+        let manager_cursor = durable
+            .load_run_execution_state(root_run_id)
+            .unwrap()
+            .unwrap()
+            .last_project_message_sequence;
+        assert_eq!(child_cursor, child_inbox.last().unwrap().project_sequence);
+        assert_eq!(
+            manager_cursor,
+            parent_inbox.last().unwrap().project_sequence
+        );
+        let child_transcript = durable.load_run_messages(child_run_id).unwrap();
+        assert!(child_transcript.iter().any(|message| {
+            message.name.as_deref() == Some("loom_project_message")
+                && message.content.contains("Prioritize reliability first")
+        }));
+        assert!(child_transcript.iter().any(|message| {
+            message.name.as_deref() == Some("loom_project_message")
+                && message.content.contains("Redirect the investigation")
+        }));
+        let manager_transcript = durable.load_run_messages(root_run_id).unwrap();
+        assert!(manager_transcript.iter().any(|message| {
+            message.name.as_deref() == Some("loom_project_message")
+                && message.content.contains("checking the key assumption")
+        }));
+        assert!(manager_transcript.iter().any(|message| {
+            message.name.as_deref() == Some("loom_project_message")
+                && message
+                    .content
+                    .contains("Should I prioritize the launch timeline")
+        }));
+        assert!(manager_transcript.iter().any(|message| {
+            message.name.as_deref() == Some("loom_project_message")
+                && message.content.contains("failure-recovery path")
+        }));
+        let root_runtime_config = durable
+            .load_run_runtime_config(root_run_id)
+            .unwrap()
+            .unwrap();
+        assert!(root_runtime_config.project_delegation_enabled);
+        assert!(root_runtime_config.project_messaging_enabled);
+        assert!(root_runtime_config.project_inspection_enabled);
+        let child_runtime_config = durable
+            .load_run_runtime_config(child_run_id)
+            .unwrap()
+            .unwrap();
+        assert!(child_runtime_config.project_messaging_enabled);
+
+        drop(connection);
+        backend.shutdown().unwrap();
+        drop(backend);
+
+        let reopened = InProcessBackend::with_provider_registry_persistent(
+            provider_registry(),
+            &persistence_path,
+        )
+        .unwrap();
+        let reopened_connection = reopened.connect();
+        negotiate(&reopened_connection);
+        let project =
+            reopened_connection.request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
+                project_id,
+            }));
+        let ServerResponse::ProjectSnapshot(project) = project.result.unwrap() else {
+            panic!("unexpected recovered project response");
+        };
+        assert_eq!(project.agents.len(), 2);
+        assert!(
+            project
+                .agents
+                .iter()
+                .all(|agent| agent.state == AgentSessionState::Completed)
+        );
+        assert!(project.agents.iter().any(|agent| {
+            agent.session_id == child.session_id
+                && agent.parent_session_id == Some(root)
+                && agent.depth == 2
+        }));
+        assert_eq!(
+            reopened
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_delegated_task(task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Completed
+        );
+        let recovered_parent_messages = reopened
+            .persistence
+            .as_ref()
+            .unwrap()
+            .list_agent_messages(project_id, root, 0, 10)
+            .unwrap();
+        let recovered_child_messages = reopened
+            .persistence
+            .as_ref()
+            .unwrap()
+            .list_agent_messages(project_id, child.session_id, 0, 10)
+            .unwrap();
+        assert_eq!(recovered_parent_messages, parent_inbox);
+        assert_eq!(recovered_child_messages, child_inbox);
+        assert_eq!(
+            reopened
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_execution_state(child_run_id)
+                .unwrap()
+                .unwrap()
+                .last_project_message_sequence,
+            child_cursor
+        );
+        assert_eq!(
+            reopened
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_execution_state(root_run_id)
+                .unwrap()
+                .unwrap()
+                .last_project_message_sequence,
+            manager_cursor
+        );
+        assert_eq!(
+            reopened
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_messages(child_run_id)
+                .unwrap(),
+            child_transcript
+        );
+        assert_eq!(
+            reopened
+                .persistence
+                .as_ref()
+                .unwrap()
+                .load_run_messages(root_run_id)
+                .unwrap(),
+            manager_transcript
+        );
+        let recovered_root_runtime_config = reopened
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_runtime_config(root_run_id)
+            .unwrap()
+            .unwrap();
+        assert!(recovered_root_runtime_config.project_delegation_enabled);
+        assert!(recovered_root_runtime_config.project_messaging_enabled);
+        assert!(recovered_root_runtime_config.project_inspection_enabled);
+        let recovered_child_runtime_config = reopened
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_runtime_config(child_run_id)
+            .unwrap()
+            .unwrap();
+        assert!(recovered_child_runtime_config.project_messaging_enabled);
+        let child_detail =
+            reopened_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+                run_id: child_run_id,
+            }));
+        let ServerResponse::AgentRunSnapshot(child_detail) = child_detail.result.unwrap() else {
+            panic!("unexpected recovered child run response");
+        };
+        assert_eq!(child_detail.run.state, AgentRunState::Completed);
+        assert!(child_detail.messages.iter().any(|message| {
+            message.name.as_deref() == Some("loom_project_message")
+                && message.content.contains("Prioritize reliability first")
+        }));
+        assert!(child_detail.messages.iter().any(|message| {
+            message.name.as_deref() == Some("loom_project_message")
+                && message.content.contains("Redirect the investigation")
+        }));
+        let root_detail =
+            reopened_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+                run_id: root_run_id,
+            }));
+        let ServerResponse::AgentRunSnapshot(root_detail) = root_detail.result.unwrap() else {
+            panic!("unexpected recovered manager run response");
+        };
+        assert_eq!(root_detail.run.state, AgentRunState::Completed);
+        assert!(root_detail.messages.iter().any(|message| {
+            message.name.as_deref() == Some("loom_project_message")
+                && message.content.contains("checking the key assumption")
+        }));
+
+        drop(reopened_connection);
+        reopened.shutdown().unwrap();
+        drop(reopened);
+        drop(model);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn delegated_children_require_durable_storage_on_ephemeral_backends() {
         let backend = InProcessBackend::new();
         let connection = backend.connect();
@@ -13619,6 +14173,249 @@ mod tests {
             second_receiver,
             finish_gate_sender,
         )
+    }
+
+    struct ScriptedModelRequest {
+        request: serde_json::Value,
+        stream: TcpStream,
+    }
+
+    struct ScriptedOpenAiEndpoint {
+        endpoint: String,
+        address: std::net::SocketAddr,
+        requests: std::sync::mpsc::Receiver<ScriptedModelRequest>,
+        pending: VecDeque<ScriptedModelRequest>,
+        stopped: Arc<AtomicBool>,
+        accept_worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ScriptedOpenAiEndpoint {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let (sender, requests) = std::sync::mpsc::channel();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let worker_stopped = Arc::clone(&stopped);
+            let accept_worker = thread::spawn(move || {
+                while !worker_stopped.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let sender = sender.clone();
+                            thread::spawn(move || {
+                                let Ok(body) = read_scripted_http_request_body(&mut stream) else {
+                                    return;
+                                };
+                                let Ok(request) = serde_json::from_slice(&body) else {
+                                    return;
+                                };
+                                let _ = sender.send(ScriptedModelRequest { request, stream });
+                            });
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                endpoint: format!("http://{address}/v1/chat/completions"),
+                address,
+                requests,
+                pending: VecDeque::new(),
+                stopped,
+                accept_worker: Some(accept_worker),
+            }
+        }
+
+        fn next_for_manager(&mut self) -> ScriptedModelRequest {
+            self.next_for_role(true)
+        }
+
+        fn next_for_child(&mut self) -> ScriptedModelRequest {
+            self.next_for_role(false)
+        }
+
+        fn next_for_role(&mut self, manager: bool) -> ScriptedModelRequest {
+            if let Some(index) = self
+                .pending
+                .iter()
+                .position(|request| scripted_request_is_manager(&request.request) == manager)
+            {
+                return self.pending.remove(index).unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(
+                    !remaining.is_zero(),
+                    "timed out waiting for scripted model request"
+                );
+                let request = self
+                    .requests
+                    .recv_timeout(remaining)
+                    .expect("scripted model request did not arrive");
+                if scripted_request_is_manager(&request.request) == manager {
+                    return request;
+                }
+                self.pending.push_back(request);
+            }
+        }
+
+        fn respond_with_tool(
+            &self,
+            request: ScriptedModelRequest,
+            name: &str,
+            arguments: serde_json::Value,
+        ) {
+            let response = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "fixture-call",
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": serde_json::to_string(&arguments).unwrap()
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            });
+            write_scripted_http_response(request.stream, response);
+        }
+
+        fn respond_with_text(&self, request: ScriptedModelRequest, content: &str) {
+            let response = serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"
+                }]
+            });
+            write_scripted_http_response(request.stream, response);
+        }
+    }
+
+    impl Drop for ScriptedOpenAiEndpoint {
+        fn drop(&mut self) {
+            self.stopped.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            if let Some(worker) = self.accept_worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    fn read_scripted_http_request_body(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+        let mut headers = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            stream.read_exact(&mut byte)?;
+            headers.push(byte[0]);
+            if headers.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            if headers.len() > 64 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "scripted model request headers were too large",
+                ));
+            }
+        }
+        let headers = String::from_utf8_lossy(&headers);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "scripted model request omitted content length",
+                )
+            })?;
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body)?;
+        Ok(body)
+    }
+
+    fn write_scripted_http_response(mut stream: TcpStream, body: serde_json::Value) {
+        let body = serde_json::to_vec(&body).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn scripted_project_provider_registry(endpoint: &str, model_id: ModelId) -> ProviderRegistry {
+        let provider_id = ProviderId::new("scripted-project");
+        let descriptor = ModelDescriptor {
+            id: model_id,
+            provider: provider_id.clone(),
+            display_name: "Scripted project coordination model".to_owned(),
+            context_window: Some(16_384),
+            capabilities: ModelCapabilities {
+                streaming: false,
+                tool_calling: true,
+                vision: false,
+                json_mode: false,
+            },
+        };
+        let providers = ProviderRegistry::new();
+        providers
+            .register(ProviderConfig::openai_compatible(
+                provider_id,
+                "Scripted project model",
+                endpoint,
+                descriptor,
+                None,
+            ))
+            .unwrap();
+        providers
+    }
+
+    fn scripted_request_is_manager(request: &serde_json::Value) -> bool {
+        request["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|message| message["role"] == "system")
+            .any(|message| {
+                message["content"].as_str().is_some_and(|content| {
+                    content.contains("You are the project manager for this project")
+                })
+            })
+    }
+
+    fn request_has_tool(request: &serde_json::Value, name: &str) -> bool {
+        request["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|tool| tool["function"]["name"] == name)
+    }
+
+    fn request_has_project_message(request: &serde_json::Value, kind: &str) -> bool {
+        request["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|message| {
+                message["name"] == "loom_project_message"
+                    && message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.contains(&format!("({kind}")))
+            })
     }
 
     #[test]
