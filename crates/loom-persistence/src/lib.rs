@@ -13,9 +13,11 @@ use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, CheckpointId,
     DelegatedTaskRecord, DelegatedTaskSpec, DelegatedTaskStatus, ErrorCode, EventSequence,
     InteractionId, LoomError, PolicyDecision, ProjectAgentPermissions, ProjectAgentRecord,
-    ProjectId, ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
+    ProjectId, ProjectManagerWaitId, ProjectManagerWaitRecord, ProjectManagerWaitStatus,
+    ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
     ProjectWorktreeStatus, RepositoryId, RequestId, Result, RunAttemptId, RunId, SessionLimits,
-    StepId, TaskContextReference, TaskId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    StepId, TaskContextReference, TaskId, Timestamp, ToolCallId, UsageSnapshot, WorkspaceId,
+    WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
@@ -61,6 +63,8 @@ const MAX_FILESYSTEM_CHANGE_HISTORY: usize = 2048;
 const MAX_FILESYSTEM_CHANGE_PAGE_SIZE: usize = 512;
 const MAX_IDEMPOTENCY_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_RUN_RUNTIME_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_PROJECT_MANAGER_WAIT_CHILDREN: usize = 50;
+const MAX_PROJECT_MANAGER_WAIT_RESULT_SUMMARY_BYTES: usize = 64 * 1024;
 
 const DATABASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS session_store_meta (
@@ -259,6 +263,9 @@ CREATE TABLE IF NOT EXISTS run_execution_state (
     ),
     pending_input TEXT CHECK(pending_input IS NULL OR length(pending_input) <= 65536),
     last_failed_call TEXT CHECK(last_failed_call IS NULL OR length(last_failed_call) <= 1048576),
+    pending_project_join TEXT CHECK(
+        pending_project_join IS NULL OR length(pending_project_join) <= 1048576
+    ),
     FOREIGN KEY(run_id, session_id)
         REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE,
     FOREIGN KEY(run_id, attempt_id)
@@ -891,6 +898,42 @@ CREATE TABLE IF NOT EXISTS project_worktree_conflict_paths (
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS project_worktree_conflicts_by_path
     ON project_worktree_conflict_paths(project_id, path, task_id);
+";
+
+const PROJECT_MANAGER_WAIT_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS project_manager_waits (
+    wait_id BLOB PRIMARY KEY NOT NULL CHECK(length(wait_id) = 16),
+    run_id BLOB NOT NULL CHECK(length(run_id) = 16),
+    attempt_id BLOB NOT NULL CHECK(length(attempt_id) = 16),
+    tool_call_id BLOB NOT NULL CHECK(length(tool_call_id) = 16),
+    manager_session_id BLOB NOT NULL CHECK(length(manager_session_id) = 16),
+    status TEXT NOT NULL CHECK(status IN ('waiting', 'ready', 'resuming', 'consumed', 'abandoned')),
+    result_summary TEXT CHECK(result_summary IS NULL OR length(CAST(result_summary AS BLOB)) <= 65536),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+    UNIQUE(run_id, attempt_id, tool_call_id),
+    FOREIGN KEY(run_id, manager_session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY(run_id, attempt_id)
+        REFERENCES run_attempts(run_id, attempt_id) ON DELETE CASCADE,
+    FOREIGN KEY(run_id, tool_call_id)
+        REFERENCES run_tool_calls(run_id, tool_call_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS project_manager_waits_by_status
+    ON project_manager_waits(status, updated_at, wait_id);
+CREATE INDEX IF NOT EXISTS project_manager_waits_by_manager
+    ON project_manager_waits(manager_session_id, status, updated_at, wait_id);
+CREATE TABLE IF NOT EXISTS project_manager_wait_children (
+    wait_id BLOB NOT NULL REFERENCES project_manager_waits(wait_id) ON DELETE CASCADE
+        CHECK(length(wait_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    child_task_id BLOB NOT NULL REFERENCES delegated_tasks(task_id) ON DELETE CASCADE
+        CHECK(length(child_task_id) = 16),
+    PRIMARY KEY(wait_id, ordinal),
+    UNIQUE(wait_id, child_task_id)
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS project_manager_wait_children_by_task
+    ON project_manager_wait_children(child_task_id, wait_id);
 ";
 
 fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> {
@@ -2043,6 +2086,256 @@ impl FilePersistence {
         }
         let connection = self.connection()?;
         load_project_worktree(&connection, task_id.as_uuid())
+    }
+
+    /// Creates a parked manager wait with its ordered child selection. Reusing
+    /// the same run/attempt/tool-call identity returns the existing wait after
+    /// verifying that the manager and selected children match.
+    pub fn create_project_manager_wait(
+        &self,
+        wait: &ProjectManagerWaitRecord,
+    ) -> Result<ProjectManagerWaitRecord> {
+        validate_project_manager_wait_create(wait)?;
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin project manager wait transaction: {error}"),
+                true,
+            )
+        })?;
+        let persisted = create_project_manager_wait_on(&transaction, wait)?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit project manager wait transaction: {error}"),
+                true,
+            )
+        })?;
+        Ok(persisted)
+    }
+
+    /// Finds a manager wait by the stable identity of its initiating tool call.
+    pub fn find_project_manager_wait(
+        &self,
+        run_id: RunId,
+        attempt_id: RunAttemptId,
+        tool_call_id: ToolCallId,
+    ) -> Result<Option<ProjectManagerWaitRecord>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        load_project_manager_wait_by_identity(&connection, run_id, attempt_id, tool_call_id)
+    }
+
+    /// Loads one manager wait by its durable ID.
+    pub fn load_project_manager_wait(
+        &self,
+        wait_id: ProjectManagerWaitId,
+    ) -> Result<Option<ProjectManagerWaitRecord>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        load_project_manager_wait(&connection, wait_id.as_uuid())
+    }
+
+    /// Lists unfinished waits that selected one child task, ordered by wait
+    /// creation. The server uses this after a child checkpoint to make joins
+    /// ready when all selected tasks can return.
+    pub fn list_project_manager_waits_by_child(
+        &self,
+        child_task_id: TaskId,
+    ) -> Result<Vec<ProjectManagerWaitRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT wait.wait_id FROM project_manager_waits AS wait
+                 JOIN project_manager_wait_children AS child USING(wait_id)
+                 WHERE child.child_task_id=?1 AND wait.status IN ('waiting', 'ready', 'resuming')
+                 ORDER BY wait.created_at, wait.wait_id",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare project manager waits by child: {error}"),
+                    true,
+                )
+            })?;
+        let ids = statement
+            .query_map([child_task_id.as_uuid().as_bytes().as_slice()], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read project manager waits by child: {error}"),
+                    true,
+                )
+            })?
+            .map(|row| {
+                row.map_err(|error| {
+                    persistence_error(
+                        format!("could not read project manager wait ID: {error}"),
+                        true,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|id| {
+                let uuid = decode_uuid(id, "project manager wait id")?;
+                load_project_manager_wait(&connection, &uuid)?.ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "project manager wait child index is inconsistent",
+                        false,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Lists waits that still require recovery or a completion transition.
+    pub fn list_unfinished_project_manager_waits(&self) -> Result<Vec<ProjectManagerWaitRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT wait_id FROM project_manager_waits
+                 WHERE status IN ('waiting', 'ready', 'resuming')
+                 ORDER BY created_at, wait_id",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare unfinished project manager waits: {error}"),
+                    true,
+                )
+            })?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read unfinished project manager waits: {error}"),
+                    true,
+                )
+            })?
+            .map(|row| {
+                row.map_err(|error| {
+                    persistence_error(
+                        format!("could not read project manager wait ID: {error}"),
+                        true,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ids.iter()
+            .map(|id| {
+                let uuid = decode_uuid(id, "project manager wait id")?;
+                load_project_manager_wait(&connection, &uuid)?.ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "unfinished project manager wait index is inconsistent",
+                        false,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Applies an expected-state transition using compare-and-swap semantics.
+    /// A supplied summary is persisted when the wait first becomes ready.
+    pub fn transition_project_manager_wait(
+        &self,
+        wait_id: ProjectManagerWaitId,
+        expected_status: ProjectManagerWaitStatus,
+        next_status: ProjectManagerWaitStatus,
+        result_summary: Option<&str>,
+        updated_at: Timestamp,
+    ) -> Result<bool> {
+        if !project_manager_wait_transition_allowed(expected_status, next_status) {
+            return Err(LoomError::invalid_request(
+                "project manager wait transition is not allowed",
+            ));
+        }
+        if result_summary.is_some() && next_status != ProjectManagerWaitStatus::Ready {
+            return Err(LoomError::invalid_request(
+                "project manager wait result summary can only be set when the wait becomes ready",
+            ));
+        }
+        validate_project_manager_wait_summary(result_summary)?;
+        let updated_at = encode_timestamp(updated_at)?;
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin project manager wait transition: {error}"),
+                true,
+            )
+        })?;
+        let changed = transaction
+            .execute(
+                "UPDATE project_manager_waits
+                 SET status=?3, result_summary=COALESCE(?4, result_summary), updated_at=?5
+                 WHERE wait_id=?1 AND status=?2 AND updated_at<=?5",
+                params![
+                    wait_id.as_uuid().as_bytes().as_slice(),
+                    project_manager_wait_status_name(expected_status),
+                    project_manager_wait_status_name(next_status),
+                    result_summary,
+                    updated_at,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not transition project manager wait: {error}"),
+                    true,
+                )
+            })?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit project manager wait transition: {error}"),
+                true,
+            )
+        })?;
+        Ok(changed > 0)
+    }
+
+    /// Claims a ready wait for exactly one continuation worker. The Ready to
+    /// Resuming transition is an atomic single-winner compare-and-swap.
+    pub fn claim_project_manager_wait(
+        &self,
+        wait_id: ProjectManagerWaitId,
+        updated_at: Timestamp,
+    ) -> Result<bool> {
+        let updated_at = encode_timestamp(updated_at)?;
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin project manager wait claim: {error}"),
+                true,
+            )
+        })?;
+        let changed = transaction
+            .execute(
+                "UPDATE project_manager_waits SET status='resuming', updated_at=?2
+                 WHERE wait_id=?1 AND status='ready' AND updated_at<=?2",
+                params![wait_id.as_uuid().as_bytes().as_slice(), updated_at],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not claim project manager wait: {error}"),
+                    true,
+                )
+            })?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit project manager wait claim: {error}"),
+                true,
+            )
+        })?;
+        Ok(changed > 0)
     }
 
     /// Reads a durable delegated task and its normalized context/dependency rows.
@@ -3830,7 +4123,8 @@ impl FilePersistence {
                 "SELECT session_id, attempt_id, control_revision, state, step_id, step_index,
                         provider_cursor, next_message_id, active_message_id,
                         last_project_message_sequence,
-                        pending_tool_execution, pending_approval, pending_input, last_failed_call
+                        pending_tool_execution, pending_approval, pending_input, last_failed_call,
+                        pending_project_join
                  FROM run_execution_state WHERE run_id=?1",
                 [run_id.as_uuid().as_bytes().as_slice()],
                 |row| {
@@ -3849,6 +4143,7 @@ impl FilePersistence {
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<String>>(14)?,
                     ))
                 },
             )
@@ -3871,6 +4166,7 @@ impl FilePersistence {
             pending_approval,
             pending_input,
             last_failed_call,
+            pending_project_join,
         )) = row
         else {
             return Ok(None);
@@ -3887,6 +4183,17 @@ impl FilePersistence {
             })
             .transpose()
         };
+        let pending_project_join = pending_project_join
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("persisted project join continuation is invalid: {error}"),
+                        false,
+                    )
+                })
+            })
+            .transpose()?;
         Ok(Some(AgentExecutionStateRecord {
             run_id,
             session_id: AgentSessionId::from_uuid(decode_uuid(
@@ -3951,6 +4258,7 @@ impl FilePersistence {
                 },
             )?,
             pending_tool_execution: decode_tool_call(pending_tool_execution)?,
+            pending_project_join,
             pending_approval: decode_tool_call(pending_approval)?,
             pending_input,
             last_failed_call: decode_tool_call(last_failed_call)?,
@@ -6086,6 +6394,52 @@ impl FilePersistence {
     /// Atomically checkpoints one worker run, its owner filesystem, and the
     /// captured event-feed state without enumerating or pruning other catalogs.
     pub fn save_run_checkpoint(&self, write: DurableRunCheckpointWrite<'_>) -> Result<()> {
+        self.save_run_checkpoint_inner(write, None)
+    }
+
+    /// Atomically checkpoints a parked manager run together with its initial
+    /// durable wait and ordered child selection.
+    pub fn save_run_checkpoint_with_project_manager_wait(
+        &self,
+        write: DurableRunCheckpointWrite<'_>,
+        wait: &ProjectManagerWaitRecord,
+    ) -> Result<()> {
+        validate_project_manager_wait_create(wait)?;
+        if write.summary.snapshot.id != wait.run_id
+            || write.summary.snapshot.attempt_id != wait.attempt_id
+            || write.summary.snapshot.session_id != wait.manager_session_id
+            || write.session.id != wait.manager_session_id
+        {
+            return Err(LoomError::invalid_request(
+                "project manager wait must match the checkpoint run, attempt, and session",
+            ));
+        }
+        let execution = write.summary.execution_state.as_ref().ok_or_else(|| {
+            LoomError::invalid_request(
+                "parked project manager wait requires a durable run execution state",
+            )
+        })?;
+        let continuation = execution.pending_project_join.as_ref().ok_or_else(|| {
+            LoomError::invalid_request(
+                "parked project manager wait requires a matching join continuation",
+            )
+        })?;
+        if continuation.wait_id != wait.wait_id.to_string()
+            || continuation.call.id != wait.tool_call_id
+            || execution.pending_tool_execution.is_some()
+        {
+            return Err(LoomError::invalid_request(
+                "project manager wait does not match the checkpoint join continuation",
+            ));
+        }
+        self.save_run_checkpoint_inner(write, Some(wait))
+    }
+
+    fn save_run_checkpoint_inner(
+        &self,
+        write: DurableRunCheckpointWrite<'_>,
+        project_manager_wait: Option<&ProjectManagerWaitRecord>,
+    ) -> Result<()> {
         let run_id = write.summary.snapshot.id;
         if write.session.id != write.summary.snapshot.session_id
             || write
@@ -6150,6 +6504,36 @@ impl FilePersistence {
         save_run_summary_rows(&transaction, &summaries)?;
         save_run_attempt_rows(&transaction, &summaries)?;
         save_run_execution_state_rows(&transaction, &summaries)?;
+        if write
+            .summary
+            .execution_state
+            .as_ref()
+            .is_some_and(|execution| execution.pending_project_join.is_none())
+        {
+            transaction
+                .execute(
+                    "UPDATE project_manager_waits
+                     SET status='consumed', updated_at=MAX(updated_at, ?3)
+                     WHERE run_id=?1 AND attempt_id=?2 AND status='resuming'",
+                    params![
+                        run_id.as_uuid().as_bytes().as_slice(),
+                        write
+                            .summary
+                            .snapshot
+                            .attempt_id
+                            .as_uuid()
+                            .as_bytes()
+                            .as_slice(),
+                        encode_timestamp(write.summary.snapshot.updated_at)?,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not consume completed project manager wait: {error}"),
+                        true,
+                    )
+                })?;
+        }
         save_run_runtime_config_rows(&transaction, &runtime_configs)?;
         save_run_context_checkpoint_rows(&transaction, &context_checkpoints)?;
         save_run_plan_rows(&transaction, &plans, Some(&summaries))?;
@@ -6158,6 +6542,9 @@ impl FilePersistence {
         } else {
             save_run_activity_rows(&transaction, &activities)?;
             save_run_tool_rows(&transaction, &activities, Some(&summaries))?;
+        }
+        if let Some(wait) = project_manager_wait {
+            create_project_manager_wait_on(&transaction, wait)?;
         }
         save_run_message_rows(
             &transaction,
@@ -6403,6 +6790,14 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
+        .execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project manager wait schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
         .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .map_err(|error| {
             persistence_error(
@@ -6565,6 +6960,41 @@ fn migrate_v47_to_v48(connection: &Connection) -> Result<()> {
         .map_err(|error| {
             persistence_error(
                 format!("could not add durable project-agent permissions: {error}"),
+                true,
+            )
+        })?;
+    let has_run_execution_state: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='run_execution_state')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not inspect run execution-state schema: {error}"),
+                true,
+            )
+        })?;
+    if has_run_execution_state {
+        transaction
+            .execute_batch(
+                "ALTER TABLE run_execution_state
+                    ADD COLUMN pending_project_join TEXT CHECK(
+                        pending_project_join IS NULL OR length(pending_project_join) <= 1048576
+                    );",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not add durable project join continuation: {error}"),
+                    true,
+                )
+            })?;
+    }
+    transaction
+        .execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project manager wait schema: {error}"),
                 true,
             )
         })?;
@@ -6969,6 +7399,314 @@ fn load_project_worktree(
         created_at: decode_timestamp(created_at)?,
         updated_at: decode_timestamp(updated_at)?,
     }))
+}
+
+fn validate_project_manager_wait_create(wait: &ProjectManagerWaitRecord) -> Result<()> {
+    if wait.status != ProjectManagerWaitStatus::Waiting || wait.result_summary.is_some() {
+        return Err(LoomError::invalid_request(
+            "a new project manager wait must start waiting without a result summary",
+        ));
+    }
+    if wait.child_task_ids.is_empty()
+        || wait.child_task_ids.len() > MAX_PROJECT_MANAGER_WAIT_CHILDREN
+    {
+        return Err(LoomError::invalid_request(format!(
+            "project manager wait must select between 1 and {MAX_PROJECT_MANAGER_WAIT_CHILDREN} child tasks"
+        )));
+    }
+    if wait
+        .child_task_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .len()
+        != wait.child_task_ids.len()
+    {
+        return Err(LoomError::invalid_request(
+            "project manager wait child selection contains duplicates",
+        ));
+    }
+    encode_timestamp(wait.created_at)?;
+    encode_timestamp(wait.updated_at)?;
+    validate_project_manager_wait_summary(wait.result_summary.as_deref())
+}
+
+fn validate_project_manager_wait_summary(summary: Option<&str>) -> Result<()> {
+    if summary.is_some_and(|summary| summary.len() > MAX_PROJECT_MANAGER_WAIT_RESULT_SUMMARY_BYTES)
+    {
+        return Err(LoomError::invalid_request(format!(
+            "project manager wait result summary exceeds {MAX_PROJECT_MANAGER_WAIT_RESULT_SUMMARY_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn create_project_manager_wait_on(
+    transaction: &Transaction<'_>,
+    wait: &ProjectManagerWaitRecord,
+) -> Result<ProjectManagerWaitRecord> {
+    validate_project_manager_wait_create(wait)?;
+    let inserted = transaction
+        .execute(
+            "INSERT INTO project_manager_waits(
+                wait_id, run_id, attempt_id, tool_call_id, manager_session_id,
+                status, result_summary, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'waiting', NULL, ?6, ?7)
+             ON CONFLICT(run_id, attempt_id, tool_call_id) DO NOTHING",
+            params![
+                wait.wait_id.as_uuid().as_bytes().as_slice(),
+                wait.run_id.as_uuid().as_bytes().as_slice(),
+                wait.attempt_id.as_uuid().as_bytes().as_slice(),
+                wait.tool_call_id.as_uuid().as_bytes().as_slice(),
+                wait.manager_session_id.as_uuid().as_bytes().as_slice(),
+                encode_timestamp(wait.created_at)?,
+                encode_timestamp(wait.updated_at)?,
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project manager wait: {error}"),
+                true,
+            )
+        })?;
+    if inserted > 0 {
+        for (ordinal, child_task_id) in wait.child_task_ids.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO project_manager_wait_children(wait_id, ordinal, child_task_id)
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        wait.wait_id.as_uuid().as_bytes().as_slice(),
+                        i64::try_from(ordinal).map_err(|_| {
+                            LoomError::invalid_request("too many project manager wait children")
+                        })?,
+                        child_task_id.as_uuid().as_bytes().as_slice(),
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save project manager wait child: {error}"),
+                        true,
+                    )
+                })?;
+        }
+    }
+    let persisted = load_project_manager_wait_by_identity(
+        transaction,
+        wait.run_id,
+        wait.attempt_id,
+        wait.tool_call_id,
+    )?
+    .ok_or_else(|| {
+        LoomError::new(
+            ErrorCode::Persistence,
+            "project manager wait identity is missing after creation",
+            false,
+        )
+    })?;
+    if persisted.manager_session_id != wait.manager_session_id
+        || persisted.child_task_ids != wait.child_task_ids
+    {
+        return Err(LoomError::invalid_request(
+            "project manager wait identity was already used for a different manager or child selection",
+        ));
+    }
+    Ok(persisted)
+}
+
+fn load_project_manager_wait_by_identity(
+    connection: &Connection,
+    run_id: RunId,
+    attempt_id: RunAttemptId,
+    tool_call_id: ToolCallId,
+) -> Result<Option<ProjectManagerWaitRecord>> {
+    let wait_id: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT wait_id FROM project_manager_waits
+             WHERE run_id=?1 AND attempt_id=?2 AND tool_call_id=?3",
+            params![
+                run_id.as_uuid().as_bytes().as_slice(),
+                attempt_id.as_uuid().as_bytes().as_slice(),
+                tool_call_id.as_uuid().as_bytes().as_slice(),
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(
+                format!("could not find project manager wait identity: {error}"),
+                true,
+            )
+        })?;
+    let Some(wait_id) = wait_id else {
+        return Ok(None);
+    };
+    let wait_id = decode_uuid(&wait_id, "project manager wait id")?;
+    load_project_manager_wait(connection, &wait_id)?
+        .map(Some)
+        .ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "project manager wait identity index is inconsistent",
+                false,
+            )
+        })
+}
+
+fn load_project_manager_wait(
+    connection: &Connection,
+    wait_id: &Uuid,
+) -> Result<Option<ProjectManagerWaitRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT run_id, attempt_id, tool_call_id, manager_session_id, status,
+                    result_summary, created_at, updated_at
+             FROM project_manager_waits WHERE wait_id=?1",
+            [wait_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(
+                format!("could not load project manager wait: {error}"),
+                true,
+            )
+        })?;
+    let Some((run_id, attempt_id, tool_call_id, manager_id, status, summary, created, updated)) =
+        row
+    else {
+        return Ok(None);
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT ordinal, child_task_id FROM project_manager_wait_children
+             WHERE wait_id=?1 ORDER BY ordinal",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prepare project manager wait children: {error}"),
+                true,
+            )
+        })?;
+    let children = statement
+        .query_map([wait_id.as_bytes().as_slice()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read project manager wait children: {error}"),
+                true,
+            )
+        })?;
+    let mut child_task_ids = Vec::new();
+    for (expected_ordinal, child) in children.enumerate() {
+        let (ordinal, child_id) = child.map_err(|error| {
+            persistence_error(
+                format!("could not read project manager wait child: {error}"),
+                true,
+            )
+        })?;
+        if usize::try_from(ordinal).ok() != Some(expected_ordinal) {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted project manager wait child order is invalid",
+                false,
+            ));
+        }
+        child_task_ids.push(TaskId::from_uuid(decode_uuid(
+            &child_id,
+            "project manager wait child task id",
+        )?));
+    }
+    if child_task_ids.is_empty() || child_task_ids.len() > MAX_PROJECT_MANAGER_WAIT_CHILDREN {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted project manager wait child count is invalid",
+            false,
+        ));
+    }
+    Ok(Some(ProjectManagerWaitRecord {
+        wait_id: ProjectManagerWaitId::from_uuid(*wait_id),
+        run_id: RunId::from_uuid(decode_uuid(&run_id, "project manager wait run id")?),
+        attempt_id: RunAttemptId::from_uuid(decode_uuid(
+            &attempt_id,
+            "project manager wait attempt id",
+        )?),
+        tool_call_id: ToolCallId::from_uuid(decode_uuid(
+            &tool_call_id,
+            "project manager wait tool call id",
+        )?),
+        manager_session_id: AgentSessionId::from_uuid(decode_uuid(
+            &manager_id,
+            "project manager wait manager session id",
+        )?),
+        child_task_ids,
+        status: parse_project_manager_wait_status(&status)?,
+        result_summary: summary,
+        created_at: decode_timestamp(created)?,
+        updated_at: decode_timestamp(updated)?,
+    }))
+}
+
+fn project_manager_wait_transition_allowed(
+    expected: ProjectManagerWaitStatus,
+    next: ProjectManagerWaitStatus,
+) -> bool {
+    matches!(
+        (expected, next),
+        (
+            ProjectManagerWaitStatus::Waiting,
+            ProjectManagerWaitStatus::Ready
+        ) | (
+            ProjectManagerWaitStatus::Waiting,
+            ProjectManagerWaitStatus::Abandoned
+        ) | (
+            ProjectManagerWaitStatus::Ready,
+            ProjectManagerWaitStatus::Abandoned
+        ) | (
+            ProjectManagerWaitStatus::Resuming,
+            ProjectManagerWaitStatus::Consumed
+        ) | (
+            ProjectManagerWaitStatus::Resuming,
+            ProjectManagerWaitStatus::Abandoned
+        )
+    )
+}
+
+fn project_manager_wait_status_name(status: ProjectManagerWaitStatus) -> &'static str {
+    match status {
+        ProjectManagerWaitStatus::Waiting => "waiting",
+        ProjectManagerWaitStatus::Ready => "ready",
+        ProjectManagerWaitStatus::Resuming => "resuming",
+        ProjectManagerWaitStatus::Consumed => "consumed",
+        ProjectManagerWaitStatus::Abandoned => "abandoned",
+    }
+}
+
+fn parse_project_manager_wait_status(status: &str) -> Result<ProjectManagerWaitStatus> {
+    match status {
+        "waiting" => Ok(ProjectManagerWaitStatus::Waiting),
+        "ready" => Ok(ProjectManagerWaitStatus::Ready),
+        "resuming" => Ok(ProjectManagerWaitStatus::Resuming),
+        "consumed" => Ok(ProjectManagerWaitStatus::Consumed),
+        "abandoned" => Ok(ProjectManagerWaitStatus::Abandoned),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted project manager wait status is invalid",
+            false,
+        )),
+    }
 }
 
 fn persist_initial_project_worktree(
@@ -9708,6 +10446,18 @@ fn save_run_execution_state_rows(
         let pending_tool_execution = encode_tool_call(&execution.pending_tool_execution)?;
         let pending_approval = encode_tool_call(&execution.pending_approval)?;
         let last_failed_call = encode_tool_call(&execution.last_failed_call)?;
+        let pending_project_join = execution
+            .pending_project_join
+            .as_ref()
+            .map(|continuation| {
+                serde_json::to_string(continuation).map_err(|error| {
+                    persistence_error(
+                        format!("could not encode project join continuation: {error}"),
+                        false,
+                    )
+                })
+            })
+            .transpose()?;
         if [
             pending_tool_execution.as_ref(),
             pending_approval.as_ref(),
@@ -9716,10 +10466,13 @@ fn save_run_execution_state_rows(
         .into_iter()
         .flatten()
         .any(|call| call.len() > 1_048_576)
+            || pending_project_join
+                .as_ref()
+                .is_some_and(|continuation| continuation.len() > 1_048_576)
         {
             return Err(LoomError::new(
                 ErrorCode::Persistence,
-                "execution tool call exceeds the maximum supported size",
+                "execution continuation exceeds the maximum supported size",
                 false,
             ));
         }
@@ -9771,8 +10524,8 @@ fn save_run_execution_state_rows(
                     run_id, session_id, attempt_id, control_revision, state, step_id, step_index,
                     provider_cursor, next_message_id, active_message_id,
                     last_project_message_sequence, pending_tool_execution, pending_approval,
-                    pending_input, last_failed_call
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                    pending_input, last_failed_call, pending_project_join
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(run_id) DO UPDATE SET
                     session_id=excluded.session_id,
                     attempt_id=excluded.attempt_id,
@@ -9787,7 +10540,8 @@ fn save_run_execution_state_rows(
                     pending_tool_execution=excluded.pending_tool_execution,
                     pending_approval=excluded.pending_approval,
                     pending_input=excluded.pending_input,
-                    last_failed_call=excluded.last_failed_call
+                    last_failed_call=excluded.last_failed_call,
+                    pending_project_join=excluded.pending_project_join
                  WHERE run_execution_state.session_id IS NOT excluded.session_id
                     OR run_execution_state.attempt_id IS NOT excluded.attempt_id
                     OR run_execution_state.control_revision IS NOT excluded.control_revision
@@ -9801,7 +10555,8 @@ fn save_run_execution_state_rows(
                     OR run_execution_state.pending_tool_execution IS NOT excluded.pending_tool_execution
                     OR run_execution_state.pending_approval IS NOT excluded.pending_approval
                     OR run_execution_state.pending_input IS NOT excluded.pending_input
-                    OR run_execution_state.last_failed_call IS NOT excluded.last_failed_call",
+                    OR run_execution_state.last_failed_call IS NOT excluded.last_failed_call
+                    OR run_execution_state.pending_project_join IS NOT excluded.pending_project_join",
                 params![
                     run_id.as_uuid().as_bytes().as_slice(),
                     execution.session_id.as_uuid().as_bytes().as_slice(),
@@ -9818,6 +10573,7 @@ fn save_run_execution_state_rows(
                     pending_approval,
                     execution.pending_input,
                     last_failed_call,
+                    pending_project_join,
                 ],
             )
             .map_err(|error| {
@@ -15848,6 +16604,7 @@ mod tests {
             active_message_id: None,
             last_project_message_sequence: 7,
             pending_tool_execution: None,
+            pending_project_join: None,
             pending_approval: None,
             pending_input: Some(prompt.clone()),
             last_failed_call: None,
@@ -16280,6 +17037,7 @@ mod tests {
                 active_message_id: None,
                 last_project_message_sequence: 0,
                 pending_tool_execution: Some(queued_call.clone()),
+                pending_project_join: None,
                 pending_approval: None,
                 pending_input: None,
                 last_failed_call: Some(unknown_call.clone()),

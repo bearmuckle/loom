@@ -2,7 +2,7 @@
 
 ## Status
 
-The project-session rollout upgrades forward through schema version 47. The
+The project-session rollout upgrades forward through schema version 48. The
 v41-to-v42 migration backfills existing sessions as project roots, v43 adds the
 durable project-message delivery cursor to run execution state, and v44 stores
 the per-run project-delegation grant. V45 adds separate per-run messaging and
@@ -38,17 +38,22 @@ receive neither grant. Each migration
 should be tested for successful upgrade, rollback on failure, and safe retry
 after interruption.
 
-M7.4 is planned to advance v47 to v48 for branch-messaging authorization and
-durable manager wait/join state. New per-run and delegated-task grants remain
+M7.4 advances v47 to v48 for branch-messaging authorization and durable
+manager wait/join state. New per-run and delegated-task grants remain
 independent and default off for existing records. The migration is forward
 only: a v47-only backend must reject the upgraded database, and no backend or
 schema downgrade is supported. Require protocol 8.0 clients before exposing
-the new wire contract; protocol 7.x clients must upgrade.
+the new wire contract; protocol 7.x clients must upgrade. Deployments must
+ensure or force that upgrade; old-client forward compatibility is not
+supported.
 
-The draft implementation currently adds the default-off delegated-task grants
-and branch-messaging runtime grant to v48. Durable manager wait/join records
-still need to be included in this migration before M7.4 is complete or
-released; level-three delegation remains unavailable in the meantime.
+The draft implementation includes the v48 grant and manager-wait schema,
+runtime wait continuation, workspace-wide admission, and recovery path. It
+abandons waits for terminal managers and moves dependents with failed or
+cancelled prerequisites into a blocked state. It still requires end-to-end
+restart and cap-one validation before deeper delegation is enabled. Level-three
+delegation remains unavailable until nested worktree integration, descendant
+cascade cancellation, and recursive UI support land.
 
 ## Data model
 

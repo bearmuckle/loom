@@ -23,6 +23,22 @@ pub trait ToolExtension: Send + Sync {
     fn definitions(&self) -> Vec<ToolDefinition>;
     fn action_kind(&self, call: &ToolCall) -> Option<ActionKind>;
     fn execute(&self, call: &ToolCall) -> ToolResult;
+
+    /// Identifies a tool call that must be parked by the agent runtime instead
+    /// of executed synchronously. The returned key is persisted as part of the
+    /// runtime continuation and can be completed by the owning server later.
+    /// Implementations must keep this check side-effect free; durable state is
+    /// written with the run checkpoint after the runtime parks the call.
+    fn prepare_deferred(&self, _call: &ToolCall) -> Option<String> {
+        None
+    }
+
+    /// Explains why this agent cannot report completion yet. Project-aware
+    /// extensions use this to keep a manager active while children or reviewed
+    /// code results still need attention.
+    fn completion_blocker(&self) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,6 +324,26 @@ impl ToolExecutor {
                     .as_ref()
                     .and_then(|extension| extension.action_kind(call))
             })
+    }
+
+    /// Returns the stable continuation key for an extension tool that must
+    /// suspend the current agent run. Built-in tools are always synchronous.
+    pub fn prepare_deferred(&self, call: &ToolCall) -> Option<String> {
+        if ToolKind::from_name(&call.name).is_some() {
+            return None;
+        }
+        self.extension
+            .as_ref()
+            .filter(|extension| extension.action_kind(call).is_some())
+            .and_then(|extension| extension.prepare_deferred(call))
+    }
+
+    /// Returns a server-owned completion blocker supplied by the active tool
+    /// extension, if any.
+    pub fn completion_blocker(&self) -> Option<String> {
+        self.extension
+            .as_ref()
+            .and_then(|extension| extension.completion_blocker())
     }
 
     pub fn workspace(&self) -> &Workspace {

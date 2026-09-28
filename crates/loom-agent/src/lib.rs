@@ -19,7 +19,7 @@ use loom_model::{
 pub use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
     AgentInteractionRecord, AgentPlan, AgentPlanStep, AgentRunSnapshot, AgentRunState,
-    ApprovalDecision, FileActivityOperation,
+    ApprovalDecision, FileActivityOperation, ProjectJoinContinuation,
 };
 use loom_tools::{ToolExecutor, ToolKind, ToolResult};
 use serde::{Deserialize, Serialize};
@@ -80,6 +80,9 @@ pub struct AgentRuntimeState {
     pub pending_approval: Option<ToolCall>,
     #[serde(default)]
     pub pending_tool_execution: Option<ToolCall>,
+    /// A tool call waiting for a durable project join to finish.
+    #[serde(default)]
+    pub pending_project_join: Option<ProjectJoinContinuation>,
     #[serde(default)]
     pub pending_input: Option<String>,
     pub last_failed_call: Option<ToolCall>,
@@ -233,6 +236,7 @@ struct StepContext {
     published: usize,
     saw_tool_call: bool,
     completed: bool,
+    completion_guarded: bool,
     finished: bool,
     activity_id: ActivityId,
 }
@@ -246,6 +250,7 @@ impl StepContext {
             published: 0,
             saw_tool_call: false,
             completed: false,
+            completion_guarded: false,
             finished: false,
             activity_id,
         }
@@ -264,6 +269,7 @@ pub struct AgentRuntime {
     last_project_message_sequence: u64,
     pending_approval: Option<PendingApproval>,
     pending_tool_execution: Option<ToolCall>,
+    pending_project_join: Option<ProjectJoinContinuation>,
     pending_input: Option<String>,
     last_failed_call: Option<ToolCall>,
     next_message_id: u64,
@@ -347,6 +353,7 @@ impl AgentRuntime {
             last_project_message_sequence: 0,
             pending_approval: None,
             pending_tool_execution: None,
+            pending_project_join: None,
             pending_input: None,
             last_failed_call: None,
             next_message_id: 0,
@@ -543,6 +550,10 @@ impl AgentRuntime {
         self.pending_input.clone()
     }
 
+    pub fn pending_project_join(&self) -> Option<ProjectJoinContinuation> {
+        self.pending_project_join.clone()
+    }
+
     pub fn messages(&self) -> Vec<ModelMessage> {
         self.messages.clone()
     }
@@ -563,6 +574,7 @@ impl AgentRuntime {
             return Ok(false);
         }
         if self.pending_tool_execution.is_some()
+            || self.pending_project_join.is_some()
             || self.pending_approval.is_some()
             || self.pending_input.is_some()
             || !matches!(
@@ -597,6 +609,172 @@ impl AgentRuntime {
         Ok(true)
     }
 
+    /// Parks the exact pending tool call as a durable project-join continuation.
+    ///
+    /// The operation is idempotent for the same wait id and call. A different
+    /// continuation cannot replace an already parked call, and the call must
+    /// still be the runtime's pending execution.
+    pub fn park_pending_project_join(
+        &mut self,
+        wait_id: impl Into<String>,
+        original_call: ToolCall,
+    ) -> Result<Vec<AgentEvent>> {
+        let result = self.park_pending_project_join_inner(wait_id.into(), original_call);
+        self.publish(result)
+    }
+
+    fn park_pending_project_join_inner(
+        &mut self,
+        wait_id: String,
+        original_call: ToolCall,
+    ) -> Result<Vec<AgentEvent>> {
+        if wait_id.trim().is_empty() || wait_id.len() > 256 {
+            return Err(LoomError::invalid_request(
+                "project join wait id must contain 1 to 256 bytes",
+            ));
+        }
+        if let Some(existing) = &self.pending_project_join {
+            if existing.wait_id == wait_id && existing.call == original_call {
+                return Ok(Vec::new());
+            }
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "a different project join continuation is already parked",
+                false,
+            ));
+        }
+        if self.pending_tool_execution.as_ref() != Some(&original_call) {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "project join call is not the pending tool execution",
+                false,
+            ));
+        }
+        if self.pending_approval.is_some() || self.pending_input.is_some() {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "agent runtime has another pending interaction",
+                false,
+            ));
+        }
+        if !matches!(
+            self.run.state,
+            AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+        ) {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "agent run is not active while parking a project join",
+                false,
+            ));
+        }
+
+        self.pending_tool_execution = None;
+        self.pending_project_join = Some(ProjectJoinContinuation {
+            wait_id,
+            call: original_call.clone(),
+        });
+        let mut events = vec![AgentEvent::ToolCallStarted {
+            run_id: self.run.id,
+            call: original_call,
+        }];
+        events.extend(self.set_state(AgentRunState::Paused));
+        Ok(events)
+    }
+
+    /// Completes a previously parked project join exactly once.
+    ///
+    /// Both the durable wait id and the original model tool-call id/name must
+    /// match the parked continuation. The resulting Tool message is appended
+    /// to conversation history so the next model step can continue normally.
+    pub fn complete_project_join(
+        &mut self,
+        wait_id: &str,
+        result: ToolResult,
+    ) -> Result<RunProgress> {
+        let result = self.complete_project_join_inner(wait_id, result);
+        self.publish_progress(result)
+    }
+
+    fn complete_project_join_inner(
+        &mut self,
+        wait_id: &str,
+        result: ToolResult,
+    ) -> Result<RunProgress> {
+        let Some(continuation) = self.pending_project_join.as_ref() else {
+            let already_completed = self.messages.iter().any(|message| {
+                message.role == MessageRole::Tool
+                    && message.tool_call_id == Some(result.tool_call_id)
+                    && message.name.as_deref() == Some(result.name.as_str())
+                    && message.content == result.output
+            });
+            if already_completed {
+                return Ok(RunProgress::blocked(Vec::new()));
+            }
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "there is no pending project join continuation",
+                false,
+            ));
+        };
+        if continuation.wait_id != wait_id {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "project join wait id does not match the pending continuation",
+                false,
+            ));
+        }
+        if result.tool_call_id != continuation.call.id || result.name != continuation.call.name {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "project join result does not match the original tool call",
+                false,
+            ));
+        }
+
+        let continuation = self
+            .pending_project_join
+            .take()
+            .expect("the validated project join continuation must still be present");
+        let mut events = Vec::new();
+        if !result.output.is_empty() {
+            events.push(AgentEvent::ToolOutputChunk {
+                run_id: self.run.id,
+                tool_call_id: continuation.call.id,
+                chunk: result.output.clone(),
+            });
+        }
+        events.push(AgentEvent::ToolCallCompleted {
+            run_id: self.run.id,
+            result: result.clone(),
+        });
+        events.push(self.complete_tool_activity(
+            &result,
+            if result.success {
+                AgentActivityStatus::Completed
+            } else {
+                AgentActivityStatus::Failed
+            },
+        ));
+        self.messages.push(ModelMessage {
+            role: MessageRole::Tool,
+            content: result.output,
+            name: Some(result.name),
+            tool_call_id: Some(result.tool_call_id),
+            tool_calls: Vec::new(),
+        });
+        self.last_failed_call = None;
+        let continues = matches!(
+            self.run.state,
+            AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+        );
+        let progress = if continues {
+            RunProgress::running(events)
+        } else {
+            RunProgress::blocked(events)
+        };
+        Ok(progress)
+    }
+
     pub fn checkpoint_id(&self) -> Option<loom_core::CheckpointId> {
         self.options.checkpoint_id
     }
@@ -619,6 +797,7 @@ impl AgentRuntime {
                 .as_ref()
                 .map(|pending| pending.call.clone()),
             pending_tool_execution: self.pending_tool_execution.clone(),
+            pending_project_join: self.pending_project_join.clone(),
             pending_input: self.pending_input.clone(),
             last_failed_call: self.last_failed_call.clone(),
             next_message_id: self.next_message_id,
@@ -663,6 +842,13 @@ impl AgentRuntime {
             )
         {
             state.pending_input = None;
+        }
+        if state.pending_tool_execution.is_some() && state.pending_project_join.is_some() {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "agent runtime state has both a pending tool and a project join continuation",
+                false,
+            ));
         }
         let resolved_at = Timestamp::now();
         for interaction in &mut state.interactions {
@@ -730,6 +916,7 @@ impl AgentRuntime {
             last_project_message_sequence: state.last_project_message_sequence,
             pending_approval: state.pending_approval.map(|call| PendingApproval { call }),
             pending_tool_execution: state.pending_tool_execution,
+            pending_project_join: state.pending_project_join,
             pending_input: state.pending_input,
             last_failed_call: state.last_failed_call,
             next_message_id: state.next_message_id,
@@ -1014,6 +1201,13 @@ impl AgentRuntime {
                 false,
             ));
         }
+        if self.pending_project_join.is_some() {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "project join is still pending",
+                false,
+            ));
+        }
         let events = if self.pending_approval.is_some() {
             self.set_state(AgentRunState::AwaitingApproval)
         } else if self.pending_input.is_some() {
@@ -1080,6 +1274,11 @@ impl AgentRuntime {
                 "resolve the pending tool approval before sending a message",
             ));
         }
+        if self.pending_project_join.is_some() {
+            return Err(LoomError::invalid_state(
+                "wait for the pending project join before sending a message",
+            ));
+        }
         if matches!(
             self.run.state,
             AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
@@ -1142,6 +1341,11 @@ impl AgentRuntime {
                 "resolve the pending tool approval before requesting input",
             ));
         }
+        if self.pending_project_join.is_some() {
+            return Err(LoomError::invalid_state(
+                "wait for the pending project join before requesting input",
+            ));
+        }
         if matches!(
             self.run.state,
             AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
@@ -1189,6 +1393,17 @@ impl AgentRuntime {
 
     pub fn recover_after_restart(&mut self) -> Result<Vec<AgentEvent>> {
         let mut events = Vec::new();
+        // A parked join has a durable wait record and must remain pending so
+        // its eventual audit result can complete the original model call.
+        if self.pending_project_join.is_some() {
+            if matches!(
+                self.run.state,
+                AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+            ) {
+                events.extend(self.set_state(AgentRunState::Paused));
+            }
+            return self.publish(Ok(events));
+        }
         if let Some(call) = self.pending_tool_execution.take() {
             self.last_failed_call = Some(call);
             events.push(AgentEvent::RecoveryRequired {
@@ -1275,6 +1490,13 @@ impl AgentRuntime {
     }
 
     fn checkpoint_retry_entry_inner(&mut self) -> Result<RunProgress> {
+        if self.pending_project_join.is_some() {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "a pending project join must complete before retrying from a checkpoint",
+                false,
+            ));
+        }
         if matches!(
             self.run.state,
             AgentRunState::Planning
@@ -1326,6 +1548,7 @@ impl AgentRuntime {
         self.messages = initial_messages(&self.task);
         self.pending_approval = None;
         self.pending_tool_execution = None;
+        self.pending_project_join = None;
         self.pending_input = None;
         self.last_failed_call = None;
         self.next_message_id = 0;
@@ -1381,7 +1604,15 @@ impl AgentRuntime {
             events.extend(control_events);
             return Ok(StepOutcome::Blocked);
         }
-        if let Some(call) = self.pending_tool_execution.take() {
+        if self.pending_project_join.is_some() {
+            return Ok(StepOutcome::Blocked);
+        }
+        if let Some(call) = self.pending_tool_execution.clone() {
+            if let Some(wait_id) = self.tools.prepare_deferred(&call) {
+                events.extend(self.park_pending_project_join_inner(wait_id, call)?);
+                return Ok(StepOutcome::Blocked);
+            }
+            self.pending_tool_execution = None;
             let (tool_events, _result) = self.execute_tool(&call);
             events.extend(tool_events);
             self.last_failed_call = None;
@@ -1480,6 +1711,7 @@ impl AgentRuntime {
             published,
             saw_tool_call,
             completed,
+            completion_guarded,
             finished,
             ..
         } = ctx;
@@ -1521,6 +1753,9 @@ impl AgentRuntime {
             return Ok(StepOutcome::Blocked);
         }
         if completed && !saw_tool_call {
+            if completion_guarded {
+                return Ok(StepOutcome::Continue);
+            }
             return Ok(StepOutcome::Blocked);
         }
         Ok(StepOutcome::Continue)
@@ -1913,7 +2148,19 @@ impl AgentRuntime {
                 });
                 if !ctx.saw_tool_call {
                     if matches!(reason, loom_model::FinishReason::Stop) {
-                        ctx.events.extend(self.finish_completed());
+                        if let Some(blocker) = self.tools.completion_blocker() {
+                            self.active_message_id = None;
+                            self.messages.push(ModelMessage {
+                                role: MessageRole::User,
+                                content: format!("Project completion is blocked: {blocker}"),
+                                name: Some("loom_project_completion_guard".to_owned()),
+                                tool_call_id: None,
+                                tool_calls: Vec::new(),
+                            });
+                            ctx.completion_guarded = true;
+                        } else {
+                            ctx.events.extend(self.finish_completed());
+                        }
                     } else if matches!(reason, loom_model::FinishReason::Cancelled) {
                         ctx.events.extend(self.finish_cancelled());
                     } else if let loom_model::FinishReason::ErrorWithMessage { message } = reason {

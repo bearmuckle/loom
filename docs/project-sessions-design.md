@@ -5,30 +5,43 @@
 This document turns [GitHub issue #17](https://github.com/bearmuckle/loom/issues/17),
 “Project sessions and coordinated sub-agents,” into an implementation design.
 It is the design and sequencing plan for the feature. The issue is XL-sized, so
-delivery is split into reviewable slices. The current draft implementation has
-landed the project hierarchy, protocol 6.0 contract, forward v41-to-v46 SQLite
+delivery is split into reviewable slices. Slices 0–3 provide direct-child
+coordination, child controls, and reviewed worktrees; that contract uses
+protocol 7.0 and SQLite schema v47. The current draft extends it to protocol
+8.0 and schema v48 with independent delegated-task grants, explicitly
+authorized branch messaging, and durable manager wait/join state. The draft
+also parks a manager at a safe checkpoint, releases its workspace slot, resumes
+the original tool continuation once selected children are ready, blocks
+premature manager completion, and admits queued work under a workspace-wide
+concurrency limit. Failed or cancelled prerequisites now leave dependent tasks
+blocked with their dependency IDs available for inspection; terminal manager
+waits are abandoned during recovery, and code completion requires a reviewed
+result and integration when changes exist. These M7.4 paths still need restart
+and cap-one end-to-end validation. Descendant cascade cancellation, nested
+worktree integration, recursive project UI, and cross-type fair scheduling are
+not implemented; depth-three delegation remains disabled until those features
+and the validation gate are complete. Deployments must ensure or force clients to
+upgrade: the backend rejects clients that do not negotiate the supported
+protocol before serving the new contract. Old-client forward compatibility
+and backend/schema downgrades are unsupported.
+
+The existing implementation also includes forward v41-to-v48 SQLite
 migrations, durable child/task creation, persisted child model selection,
-restart scheduling for queued children, dependency gating, reconciliation of
-task status from persisted runs, and durable parent-child message delivery at
-safe model-turn boundaries. Root managers can create bounded non-code child
-tasks through a write-approved agent tool; separate delegation, messaging,
-inspection, and child-control grants survive run recovery. Project agents can
-send durable direct-parent/direct-child messages and inspect direct-child task
-and session status. A manager tool can continue a paused child, retry its
-failed tool step, or cancel it. The workspace navigator now groups a project root with its direct
-children and shows child task summaries and live state; loading the navigator
-from a child session resolves the containing project. The project message
-timeline now displays durable parent-child messages with separate project
-activity styling. Child context menus provide pause/resume/interrupt/cancel
-controls, and project-root views refresh from workspace event cursors after
-reconnect. Project archive waits until child tasks are terminal, then archives
-the descendants with the root. Code-changing children now use isolated linked
-worktrees; project managers can review bounded diffs, fast-forward eligible
-commits, and retain or remove child checkouts with an explicit cleanup
-disposition. The worktree contract uses protocol 7.0 and SQLite schema v47.
-Workspace settings configure the maximum number of delegated agents running in
-parallel (default four, range one to sixteen); additional tasks remain durable
-and queued. A project can have up to fifty queued or active delegated tasks.
+restart scheduling for queued children, dependency gating, task-state
+reconciliation, and durable parent-child message delivery at safe model-turn
+boundaries. Project agents can inspect direct-child task and session status;
+managers can continue a paused child, retry its failed tool step, or cancel it.
+The workspace navigator groups each project root with its direct children and
+shows child task summaries and live state; loading from a child resolves the
+containing project. Project timelines display durable parent-child messages,
+and child context menus provide pause/resume/interrupt/cancel controls.
+Project archive waits until child tasks are terminal, then archives the
+descendants with the root. Code-changing children use isolated linked
+worktrees; managers can review bounded diffs, fast-forward eligible commits,
+and retain or remove child checkouts with an explicit cleanup disposition.
+Workspace settings bound delegated-agent parallelism from one to sixteen
+(default four); additional tasks remain durable and queued. A project can have
+up to fifty queued or active delegated tasks.
 
 The feature makes a root agent session a **project**: the durable owner of a
 user goal and the root of an agent hierarchy. A project manager may delegate
@@ -375,11 +388,14 @@ later design step.
 
 ### Slice 4: deeper hierarchy and branch communication
 
-**Implementation status:** protocol 8.0, the forward v47-to-v48 grant
-migration, sender binding, recipient discovery, and authorization for
-explicitly granted branch-message routes are in progress in the draft PR.
-Depth-three delegation remains disabled while durable wait/join, restart
-recovery, nested worktree integration, and recursive UI support are unfinished.
+**Implementation status:** protocol 8.0, the forward v47-to-v48 grants and
+wait-state migration, sender binding, recipient discovery, explicitly granted
+branch-message routes, durable manager wait/join, workspace-wide admission,
+and manager completion guards are implemented in the current worktree. The
+   wait/join path and failed-dependency handling still need restart and cap-one
+   end-to-end validation.
+Depth-three delegation remains disabled while descendant cancellation, nested
+worktree integration, and recursive UI support are unfinished.
 
 1. Persist an explicit, independent child permission set with each delegated
    task. A depth-two agent may create depth-three tasks only when its run has
@@ -393,19 +409,22 @@ recovery, nested worktree integration, and recursive UI support are unfinished.
    the executing run, keep task context separate from recipient selection,
    reject client-supplied agent identities, and retain per-recipient durable
    inbox ordering.
-3. Add a durable manager wait/join transition before enabling nested agents.
-   A synchronous blocking tool is unsafe because it can hold the only
-   concurrency slot while its child remains queued. Park a manager at a safe
-   run boundary, persist the wait and original continuation, release its
-   project slot, and resume it exactly once when its direct children are
-   return-ready. Recovery must reconcile parked managers and queued work
-   without replaying an uncertain external tool effect. A manager task must
-   not report completion while a child is still active or while its code
-   result still needs integration.
-4. Apply the configured concurrency limit across the workspace, serialize
-   admission at that scope, and restart queued projects fairly when a slot is
-   released. If a prerequisite fails or is cancelled, move its dependent task
-   to an actionable blocked state rather than leaving it queued forever.
+3. **Implemented; end-to-end validation pending:** add a durable manager
+   wait/join transition before enabling nested agents. A synchronous blocking
+   tool is unsafe because it can hold the only concurrency slot while its child
+   remains queued. Park a manager at a safe run boundary, persist the wait and
+   original continuation, release its workspace slot, and resume it exactly
+   once when its direct children are return-ready. Recovery reconciles parked
+   managers and queued work without replaying an uncertain external tool
+   effect. A manager is prevented from reporting completion while a child is
+   active or its code result still needs integration.
+4. **Partially implemented:** apply the configured concurrency limit across
+   the workspace, serialize admission at that scope, and restart queued tasks
+   when a slot is released. Queued tasks are ordered globally by creation time,
+   while ready joins currently receive priority. Cross-type fairness and
+   restart behavior need end-to-end validation. Failed or cancelled
+   prerequisites move dependents to blocked and make them return-ready to a
+   waiting manager; verify this failure path end-to-end.
 5. Let each manager control only its direct children. Cancelling a manager's
    child cancels or interrupts that child's descendants deepest-first; pausing
    or interrupting a manager run remains local. Derive branch progress from
@@ -422,8 +441,10 @@ recovery, nested worktree integration, and recursive UI support are unfinished.
 **Exit:** three-level projects coordinate safely, recover after restart, keep
 workspace concurrency bounded, preserve explicit grants, deliver branch
 messages only across authorized routes, and integrate code upward at every
-parent boundary. This slice remains planned until the durable wait/join,
-restart, and cap-one cases pass end-to-end.
+parent boundary. This slice remains incomplete until restart and cap-one
+wait/join cases pass end-to-end, descendant cancellation and nested worktree
+integration are implemented, and the project UI supports the hierarchy
+recursively.
 
 ## Verification and rollout
 

@@ -65,9 +65,18 @@ pub struct AgentExecutionStateRecord {
     #[serde(default)]
     pub last_project_message_sequence: u64,
     pub pending_tool_execution: Option<ToolCall>,
+    #[serde(default)]
+    pub pending_project_join: Option<ProjectJoinContinuation>,
     pub pending_approval: Option<ToolCall>,
     pub pending_input: Option<String>,
     pub last_failed_call: Option<ToolCall>,
+}
+
+/// Runtime continuation for a project join waiting on child agents.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectJoinContinuation {
+    pub wait_id: String,
+    pub call: ToolCall,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

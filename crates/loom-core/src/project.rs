@@ -1,5 +1,6 @@
 use crate::{
-    AgentMessageId, AgentSessionId, AgentSessionState, EventSequence, ProjectId, TaskId, Timestamp,
+    AgentMessageId, AgentSessionId, AgentSessionState, EventSequence, ProjectId,
+    ProjectManagerWaitId, RunAttemptId, RunId, TaskId, Timestamp, ToolCallId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +144,35 @@ pub struct ProjectWorktreeRecord {
     pub conflict_paths: Vec<String>,
     pub error: Option<String>,
     pub cleanup_disposition: Option<ProjectWorktreeCleanupDisposition>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+/// Lifecycle state for a manager parked while it waits for selected child tasks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectManagerWaitStatus {
+    Waiting,
+    Ready,
+    Resuming,
+    Consumed,
+    Abandoned,
+}
+
+/// Durable identity and ordered child set for one manager wait/join operation.
+/// The run, attempt, and tool-call tuple is the idempotency key used when a
+/// checkpoint is retried after a crash.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectManagerWaitRecord {
+    pub wait_id: ProjectManagerWaitId,
+    pub run_id: RunId,
+    pub attempt_id: RunAttemptId,
+    pub tool_call_id: ToolCallId,
+    pub manager_session_id: AgentSessionId,
+    pub child_task_ids: Vec<TaskId>,
+    pub status: ProjectManagerWaitStatus,
+    /// Optional bounded summary persisted when selected children are ready.
+    pub result_summary: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
