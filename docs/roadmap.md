@@ -184,10 +184,13 @@ one large orchestration change:
   reviewable diffs, exact-revision review, parent-owned fast-forward
   integration, and recoverable cleanup. Stale or diverged work remains
   reviewable; automatic merge and conflict resolution are deferred.
-- M7.4: enable level-three agents and policy-checked branch-to-branch
-  messaging after nested integration works reliably.
+- **M7.4 implementation complete:** enable level-three agents and
+  policy-checked branch-to-branch messaging after nested integration works
+  reliably. Protocol 10.0 makes child creation manager-only; schema v50 adds
+  durable cancellation recovery. The remaining validation item is a full UI
+  click-through for child controls, review, and integration.
 
-M7.4 implementation is in progress: protocol 8.0 and the forward v47-to-v48
+M7.4 implementation includes protocol 8.0 and the forward v47-to-v48
 migration carry independently persisted, default-off agent grants and durable
 manager wait/join records. Since protocol 8/schema v48 is already on the draft
 branch, the independent per-run review grant advances the contract to protocol
@@ -209,7 +212,10 @@ state, oldest-first admission across joins and queued tasks, nested worktree
 integration across both parent edges, and explicitly granted non-adjacent
 branch messaging, failed-run prerequisite wakeup, and restart recovery after
 an interrupted cancellation cascade. Startup replays the durable ordered
-cascade intent before admission. Depth-three delegation is enabled.
+cascade intent before admission. Depth-three delegation is enabled. A headless
+GPUI interaction test renders the three-level project tree and selects a
+depth-three session; the full child-control and review/integration menu
+click-through remains pending.
 
 The backend rejects delegation beyond three levels from the beginning, even
 while the first client only exposes direct children. Non-code delegation ships

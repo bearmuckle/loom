@@ -410,8 +410,8 @@ child independently; project state reconstructs after reconnect.
 6. **Validated in Slice 4:** nested worktree integration follows the owner edge
    at each level: the depth-two manager integrates the depth-three commit into
    its branch, then the project root reviews and integrates the manager's
-   branch. Capability rollout remains separately gated on the remaining
-   recovery cases.
+   branch. Depth-three delegation is enabled after the recovery cases listed
+   in Slice 4 passed their end-to-end tests.
 
 **Exit:** met for direct children. Siblings work in isolated worktrees and
 their parent can review and fast-forward integrate eligible child commits.
@@ -492,8 +492,10 @@ cancellation. Depth-three delegation is enabled.
    are gated by the owning parent's grants and target its direct child edge.
    Integration is offered after a review result exists. The root activity
    timeline merges successful descendant inbox reads even when another
-   recipient read fails. A full GPUI click-through smoke test remains the last
-   UI validation item.
+   recipient read fails. A headless GPUI interaction test renders the full
+   three-level tree and selects a depth-three session. A full UI click-through
+   for child controls, review, and integration remains the last validation
+   item.
 
 **Exit:** three-level projects coordinate safely, recover after restart, keep
 workspace concurrency bounded, preserve explicit grants, deliver branch
@@ -513,23 +515,34 @@ parallelism limits, cancellation, process restart, depth overflow, and partial
 worktree/merge failures. UI work should verify empty, active, blocked, failed,
 completed, and stale/reconnecting child states.
 
-Gate new client behavior on negotiated capabilities. Ship root-as-project
-compatibility before enabling child creation, then enable non-code direct
-children before code worktrees. This keeps the migration independently
-reviewable and makes each new authority boundary observable before it can
-modify repositories.
+The implemented rollout requires protocol 10.0 clients before serving the
+current contract. Protocol 9.x and older clients are rejected; deployments
+must ensure or force client upgrades. The SQLite v41-to-v50 path is
+forward-only. Backend and schema downgrades, and old-client forward
+compatibility, are unsupported. Child creation is manager-only through a
+server-bound tool granted by the executing run; the server validates the
+persisted grant before creating a child.
 
-## Open decisions
+## Settled choices and deferred scope
 
-- Whether project identity is a separate persisted ID or initially the root
-  session ID with a durable project record.
-- Exact continuation scheduling/claim mechanism for children committed but
-  not yet started.
-- Worktree creation and cleanup behavior for multi-repository tasks and native
-  local directory attachments; the initial slice rejects both.
-- Whether user messages can address a child directly or must pass through the
-  project manager in the first UI.
-- Descendant behavior for project stop, archive, and deletion, including
-  retention of unmerged child work.
-- Whether clean-but-unintegrated child commits should be retained indefinitely
-  by default after project completion.
+- A project's ID is its root session ID. The hierarchy record is durable, and
+  the v41 migration backfills each existing session as its own project root.
+- Queued child launch and parked-manager continuation use durable task/wait
+  state with an atomic wait claim and serialized, oldest-first workspace
+  admission. Recovery runs before queued work is admitted.
+- The first worktree implementation accepts one clean Git repository attached
+  to the parent session. Multi-repository tasks and native in-place directory
+  attachments are rejected until their isolation model is designed.
+- The first UI lets the user select any project session and message that agent
+  directly through its normal session composer. Manager-mediated user messages
+  are not required. Agent-to-agent branch messages remain separately
+  permission-checked.
+- Pausing or interrupting the project manager affects only that run. Cancelling
+  a delegated child cascades deepest-first through its descendants, while
+  archiving the root is rejected until child tasks are terminal; successful
+  archive then archives descendants deepest-first. A separate one-shot
+  project-wide cancel or project delete operation is not exposed; define its
+  lifecycle and worktree behavior before adding it.
+- Child worktrees are not automatically removed when a task or project
+  completes. The parent explicitly retains, removes a clean checkout, or
+  discards changes. Automatic retention expiry or cleanup is future scope.

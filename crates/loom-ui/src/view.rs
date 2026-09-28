@@ -12518,6 +12518,70 @@ mod loom_view_render_tests {
             .unwrap();
     }
 
+    fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomView {
+        use loom_core::{
+            AgentSessionSnapshot, AgentSessionState, ProjectAgentRecord, ProjectSnapshot,
+            WorkspaceId,
+        };
+
+        let workspace_id = WorkspaceId::new();
+        let root_id = AgentSessionId::new();
+        let manager_id = AgentSessionId::new();
+        let worker_id = AgentSessionId::new();
+        let project_id = loom_core::ProjectId::from_uuid(*root_id.as_uuid());
+        let timestamp = Timestamp::from_unix_millis(1);
+        let sessions = [
+            (root_id, "Project", AgentSessionState::Idle),
+            (manager_id, "Manager", AgentSessionState::Executing),
+            (worker_id, "Worker", AgentSessionState::Completed),
+        ];
+        let agents = sessions
+            .iter()
+            .enumerate()
+            .map(|(index, (session_id, _, state))| ProjectAgentRecord {
+                session_id: *session_id,
+                project_id,
+                parent_session_id: match index {
+                    0 => None,
+                    1 => Some(root_id),
+                    _ => Some(manager_id),
+                },
+                depth: index as u8 + 1,
+                state: *state,
+                task_summary: None,
+                output_cursor: Default::default(),
+                updated_at: timestamp,
+            })
+            .collect();
+        let session_snapshots = sessions
+            .iter()
+            .map(|(id, name, state)| AgentSessionSnapshot {
+                id: *id,
+                workspace_id,
+                name: (*name).to_owned(),
+                state: *state,
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .collect::<Vec<_>>();
+        let mut view = LoomView::new_for_test(focus_handle);
+        view.workspace_id = workspace_id;
+        view.active_session = session_snapshots[0].clone();
+        for session in &session_snapshots {
+            view.session_node_ids
+                .insert(session.id, view.default_backend_node_id.clone());
+        }
+        view.sessions = session_snapshots;
+        view.project_snapshot = Some(ProjectSnapshot {
+            project_id,
+            root_session_id: root_id,
+            agents,
+            tasks: Vec::new(),
+            worktrees: Vec::new(),
+        });
+        view
+    }
+
     #[gpui_kit::test]
     fn empty_session_view_renders_without_a_backend_round_trip(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
@@ -12678,6 +12742,28 @@ mod loom_view_render_tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.find(("session-tree-root", 0usize)).visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn nested_project_tree_selects_grandchild_session_by_click(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let rendered_view = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let rendered_view_for_window = rendered_view.clone();
+        let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
+            let view = cx.new(|cx| nested_project_view(cx.focus_handle()));
+            *rendered_view_for_window.borrow_mut() = Some(view.clone());
+            gpui_kit::component::Root::new(view, window, cx)
+        });
+        let view = rendered_view.borrow().as_ref().unwrap().clone();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            for index in 0usize..3 {
+                assert!(window.find(("session-tree-root", index)).visible());
+            }
+            window.click(("session-tree-root", 2usize), cx);
+            assert_eq!(view.read(cx).active_session.name, "Worker");
         })
         .unwrap();
     }
