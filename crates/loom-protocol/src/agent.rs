@@ -203,6 +203,13 @@ pub enum AgentEvent {
         message_id: u64,
         text: String,
     },
+    /// Optional provider reasoning/thinking summary for the active message.
+    /// Clients may render or ignore it; it is not part of the transcript.
+    ReasoningDelta {
+        run_id: RunId,
+        message_id: u64,
+        text: String,
+    },
     UserMessage {
         run_id: RunId,
         attempt_id: RunAttemptId,

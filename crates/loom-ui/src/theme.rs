@@ -41,6 +41,61 @@ struct ThemePalette {
     info_surface: Rgba,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColorRole {
+    Background,
+    Surface,
+    Control,
+    ControlHover,
+    Active,
+    Border,
+    BorderStrong,
+    Foreground,
+    AccentForeground,
+    MutedForeground,
+    Accent,
+    AccentHover,
+    Success,
+    SuccessSurface,
+    Danger,
+    DangerSurface,
+    Warning,
+    WarningSurface,
+    Info,
+    InfoSurface,
+}
+
+/// Maps a legacy dark-palette literal to the semantic role it represents.
+///
+/// A table rather than an inline match so a test can assert that every literal
+/// used by the view resolves to a role instead of falling through to a dark
+/// color that would break the light theme.
+const fn legacy_color_role(value: u32) -> Option<ColorRole> {
+    match value {
+        0x111318 | 0x10141b | 0x0f1115 => Some(ColorRole::Background),
+        0x14161a | 0x17191f | 0x171c25 => Some(ColorRole::Surface),
+        0x191c22 | 0x1b1d24 | 0x20242c => Some(ColorRole::Control),
+        0x202b3b | 0x25334a | 0x263b58 | 0x293244 => Some(ColorRole::Active),
+        0x293b56 => Some(ColorRole::ControlHover),
+        0x242833 | 0x30343f => Some(ColorRole::Border),
+        0x3b4555 | 0x3b5d85 => Some(ColorRole::BorderStrong),
+        0xe5e7eb | 0xf3f4f6 | 0xcbd5e1 | 0xdbeafe => Some(ColorRole::Foreground),
+        0xffffff => Some(ColorRole::AccentForeground),
+        0x64748b | 0x8f98a6 | 0x94a3b8 | 0xb7c0d0 => Some(ColorRole::MutedForeground),
+        0x93c5fd | 0xbfdbfe | 0x60a5fa | 0x2563eb => Some(ColorRole::Accent),
+        0x1d4ed8 => Some(ColorRole::AccentHover),
+        0x86efac | 0x9ad7bd | 0xd1fae5 | 0xbbf7d0 | 0x4ade80 => Some(ColorRole::Success),
+        0x064e3b | 0x24543d => Some(ColorRole::SuccessSurface),
+        0xef4444 | 0xfca5a5 | 0xfda4af | 0xfecaca | 0xfecdd3 => Some(ColorRole::Danger),
+        0x3a1f24 | 0x542936 | 0x7f1d1d => Some(ColorRole::DangerSurface),
+        0xfbbf24 | 0xfcd34d | 0xfef3c7 => Some(ColorRole::Warning),
+        0x493b1a => Some(ColorRole::WarningSurface),
+        0xc4b5fd | 0xcba6f7 | 0xe9d5ff => Some(ColorRole::Info),
+        0x241f3b | 0x3b2f66 => Some(ColorRole::InfoSurface),
+        _ => None,
+    }
+}
+
 impl ThemePalette {
     fn from_theme(theme: &Theme) -> Self {
         let colors = &theme.colors;
@@ -84,31 +139,35 @@ impl ThemePalette {
         }
     }
 
+    fn role(self, role: ColorRole) -> Rgba {
+        match role {
+            ColorRole::Background => self.background,
+            ColorRole::Surface => self.surface,
+            ColorRole::Control => self.control,
+            ColorRole::ControlHover => self.control_hover,
+            ColorRole::Active => self.active,
+            ColorRole::Border => self.border,
+            ColorRole::BorderStrong => self.border_strong,
+            ColorRole::Foreground => self.foreground,
+            ColorRole::AccentForeground => self.accent_foreground,
+            ColorRole::MutedForeground => self.muted_foreground,
+            ColorRole::Accent => self.accent,
+            ColorRole::AccentHover => self.accent_hover,
+            ColorRole::Success => self.success,
+            ColorRole::SuccessSurface => self.success_surface,
+            ColorRole::Danger => self.danger,
+            ColorRole::DangerSurface => self.danger_surface,
+            ColorRole::Warning => self.warning,
+            ColorRole::WarningSurface => self.warning_surface,
+            ColorRole::Info => self.info,
+            ColorRole::InfoSurface => self.info_surface,
+        }
+    }
+
     fn color(self, value: u32) -> Rgba {
-        match value {
-            0x111318 | 0x10141b | 0x0f1115 => self.background,
-            0x14161a | 0x17191f | 0x171c25 => self.surface,
-            0x1b1d24 | 0x20242c => self.control,
-            0x202b3b | 0x25334a | 0x293244 => self.active,
-            0x293b56 => self.control_hover,
-            0x242833 | 0x30343f => self.border,
-            0x3b4555 | 0x3b5d85 => self.border_strong,
-            0xe5e7eb | 0xf3f4f6 | 0xcbd5e1 | 0xdbeafe => self.foreground,
-            0xffffff => self.accent_foreground,
-            0x64748b | 0x8f98a6 | 0x94a3b8 | 0xb7c0d0 => self.muted_foreground,
-            0x93c5fd | 0xbfdbfe | 0x60a5fa | 0x2563eb => self.accent,
-            0x1d4ed8 => self.accent_hover,
-            0x9ad7bd | 0xd1fae5 | 0xbbf7d0 => self.success,
-            0x24543d | 0x064e3b => self.success_surface,
-            0x4ade80 => self.success,
-            0xfca5a5 | 0xfda4af | 0xfecaca | 0xfecdd3 => self.danger,
-            0xef4444 => self.danger,
-            0x3a1f24 | 0x542936 | 0x7f1d1d => self.danger_surface,
-            0xfef3c7 | 0xfcd34d => self.warning,
-            0x493b1a => self.warning_surface,
-            0xe9d5ff => self.info,
-            0x3b2f66 => self.info_surface,
-            _ => gpui_kit::rgb(value),
+        match legacy_color_role(value) {
+            Some(role) => self.role(role),
+            None => gpui_kit::rgb(value),
         }
     }
 }
@@ -358,7 +417,7 @@ mod tests {
         DANGER_SURFACE, DANGER_SURFACE_LATTE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
         ERROR_CARD_SURFACE, INFO_SURFACE, INFO_SURFACE_LATTE, SUCCESS_SURFACE,
         SUCCESS_SURFACE_LATTE, WARNING_SURFACE, WARNING_SURFACE_LATTE, change_color, latte_theme,
-        mocha_theme,
+        legacy_color_role, mocha_theme,
     };
 
     fn luminance(value: f32) -> f32 {
@@ -417,6 +476,33 @@ mod tests {
         assert_eq!(latte.colors.primary.as_deref(), Some("#1e66f5"));
         assert_eq!(mocha.colors.success.as_deref(), Some("#a6e3a1"));
         assert_eq!(latte.colors.success.as_deref(), Some("#2c7025"));
+    }
+
+    #[test]
+    fn every_legacy_color_literal_used_by_the_view_is_mapped() {
+        let source = include_str!("view.rs");
+        let mut unmapped = Vec::new();
+        let mut rest = source;
+        while let Some(index) = rest.find("rgb(0x") {
+            let after = &rest[index + "rgb(0x".len()..];
+            let digits = after
+                .chars()
+                .take_while(|character| character.is_ascii_hexdigit())
+                .take(6)
+                .collect::<String>();
+            if let Ok(value) = u32::from_str_radix(&digits, 16)
+                && legacy_color_role(value).is_none()
+            {
+                unmapped.push(value);
+            }
+            rest = after;
+        }
+        unmapped.sort_unstable();
+        unmapped.dedup();
+        assert!(
+            unmapped.is_empty(),
+            "view.rs uses colors that are not mapped to a theme role: {unmapped:06x?}"
+        );
     }
 
     #[test]

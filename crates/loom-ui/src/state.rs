@@ -7,11 +7,11 @@ use std::collections::BTreeSet;
 
 use gpui_kit::{ListAlignment, ListState, px};
 use loom_core::{
-    AgentMessageRecord, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, LoomError,
+    AgentMessageRecord, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ToolCallId,
 };
 use loom_protocol::{
-    AgentActivityRecord, AgentActivityStatus, AgentRunState, GitDiff, GitDiffLine,
-    GitRepositoryStatus, SessionFilesystemChange, SessionFilesystemFile,
+    AgentRunState, GitDiff, GitDiffLine, GitRepositoryStatus, SessionFilesystemChange,
+    SessionFilesystemFile,
 };
 
 use crate::MAX_TIMELINE_OUTPUT;
@@ -167,80 +167,250 @@ impl Default for ReviewState {
     }
 }
 
+/// Client-side transcript model. The backend's run/activity state is projected
+/// into a conversation: each assistant response is a turn made of ordered
+/// parts, and each tool call is exactly one part rather than a lifecycle of
+/// separate rows.
 #[derive(Clone, Debug)]
 pub(crate) enum TimelineItem {
     User(String),
-    Assistant(String),
-    ActivitySection {
-        activities: Vec<AgentActivityRecord>,
-    },
-    ProjectMessage(AgentMessageRecord),
+    Assistant(AssistantTurn),
+    System(SystemNote),
     Plan {
         steps: Vec<String>,
         completed: BTreeSet<u32>,
         active: Option<u32>,
     },
-    ToolRequested {
-        name: String,
-        arguments: String,
-    },
-    Approval {
-        name: String,
-        active: bool,
-    },
-    ToolStarted(String),
-    ToolOutput(String),
+    ProjectMessage(AgentMessageRecord),
     ProjectMessageContext(String),
-    ToolCompleted {
-        name: String,
-        success: bool,
-    },
-    Status(String),
-    Error {
-        operation: String,
-        error: LoomError,
-    },
-    NeedsInput(String),
-    Summary {
-        text: String,
-        evidence: Vec<String>,
-    },
 }
 
-/// Project consecutive activities from one run into one section. The live event
-/// stream supplies the insertion order; updates replace records in place.
-pub(crate) fn upsert_activity(timeline: &mut Vec<TimelineItem>, activity: AgentActivityRecord) {
-    for item in timeline.iter_mut() {
-        if let TimelineItem::ActivitySection { activities } = item
-            && let Some(existing) = activities.iter_mut().find(|item| item.id == activity.id)
-        {
-            *existing = activity;
-            return;
+/// One assistant response, rendered as an ordered list of parts. A response is
+/// usually text followed by one or more tool calls; the next response begins
+/// once the tool results return.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct AssistantTurn {
+    pub(crate) parts: Vec<AssistantPart>,
+    pub(crate) streaming: bool,
+}
+
+impl AssistantTurn {
+    pub(crate) fn text(text: impl Into<String>) -> Self {
+        Self {
+            parts: vec![AssistantPart::Text(text.into())],
+            streaming: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AssistantPart {
+    Reasoning(String),
+    Text(String),
+    Tool(Box<ToolPart>),
+    Evidence(Vec<EvidenceText>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EvidenceText {
+    pub(crate) label: String,
+    pub(crate) uri: String,
+}
+
+/// A single tool invocation presented as one collapsible block.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ToolPart {
+    pub(crate) id: ToolCallId,
+    pub(crate) name: String,
+    pub(crate) title: String,
+    pub(crate) status: ToolPartStatus,
+    pub(crate) detail: Option<String>,
+    pub(crate) output: Option<String>,
+    pub(crate) elapsed_ms: Option<u64>,
+    pub(crate) approval_pending: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolPartStatus {
+    Queued,
+    Running,
+    AwaitingApproval,
+    AwaitingInput,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl ToolPartStatus {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::AwaitingApproval => "approval required",
+            Self::AwaitingInput => "waiting for input",
+            Self::Completed => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 
-    if let Some(TimelineItem::ActivitySection { activities }) = timeline.last_mut() {
-        let same_run = activities.iter().all(|item| item.run_id == activity.run_id);
-        if same_run {
-            activities.push(activity);
-            return;
+    pub(crate) const fn marker(self) -> &'static str {
+        match self {
+            Self::Queued => "○",
+            Self::Running => "›",
+            Self::AwaitingApproval => "!",
+            Self::AwaitingInput => "?",
+            Self::Completed => "✓",
+            Self::Failed => "×",
+            Self::Cancelled => "–",
         }
     }
-    let section = TimelineItem::ActivitySection {
-        activities: vec![activity],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SystemTone {
+    Neutral,
+    Error,
+    Input,
+}
+
+/// A non-conversational note: status, an error, or a request for input.
+#[derive(Clone, Debug)]
+pub(crate) struct SystemNote {
+    pub(crate) tone: SystemTone,
+    pub(crate) heading: Option<String>,
+    pub(crate) text: String,
+    pub(crate) retryable: bool,
+}
+
+impl SystemNote {
+    pub(crate) fn status(text: impl Into<String>) -> Self {
+        Self {
+            tone: SystemTone::Neutral,
+            heading: None,
+            text: text.into(),
+            retryable: false,
+        }
+    }
+}
+
+/// Appends streamed assistant text. Once a turn has ended with a tool call,
+/// further text starts a fresh turn so each response reads as its own message.
+pub(crate) fn push_assistant_text(timeline: &mut Vec<TimelineItem>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let starts_new_turn = !matches!(
+        timeline.last(),
+        Some(TimelineItem::Assistant(turn))
+            if matches!(
+                turn.parts.last(),
+                None | Some(AssistantPart::Text(_)) | Some(AssistantPart::Reasoning(_))
+            )
+    );
+    if starts_new_turn {
+        timeline.push(TimelineItem::Assistant(AssistantTurn::default()));
+    }
+    let Some(TimelineItem::Assistant(turn)) = timeline.last_mut() else {
+        return;
     };
-    timeline.push(section);
+    turn.streaming = true;
+    match turn.parts.last_mut() {
+        Some(AssistantPart::Text(existing)) => existing.push_str(text),
+        _ => turn.parts.push(AssistantPart::Text(text.to_owned())),
+    }
 }
 
-pub(crate) fn activity_status_label(status: AgentActivityStatus) -> &'static str {
-    match status {
-        AgentActivityStatus::Started => "running",
-        AgentActivityStatus::Completed => "done",
-        AgentActivityStatus::Failed => "failed",
-        AgentActivityStatus::AwaitingApproval => "approval required",
-        AgentActivityStatus::AwaitingInput => "waiting for input",
-        AgentActivityStatus::Cancelled => "cancelled",
+/// Appends streamed reasoning text to the active assistant turn. Reasoning is
+/// presentation-only and never becomes part of the provider transcript.
+pub(crate) fn push_assistant_reasoning(timeline: &mut Vec<TimelineItem>, text: &str) {
+    if text.is_empty() {
+        return;
     }
+    let starts_new_turn = !matches!(
+        timeline.last(),
+        Some(TimelineItem::Assistant(turn))
+            if matches!(
+                turn.parts.last(),
+                None | Some(AssistantPart::Text(_)) | Some(AssistantPart::Reasoning(_))
+            )
+    );
+    if starts_new_turn {
+        timeline.push(TimelineItem::Assistant(AssistantTurn::default()));
+    }
+    let Some(TimelineItem::Assistant(turn)) = timeline.last_mut() else {
+        return;
+    };
+    turn.streaming = true;
+    match turn.parts.last_mut() {
+        Some(AssistantPart::Reasoning(existing)) => existing.push_str(text),
+        _ => turn.parts.push(AssistantPart::Reasoning(text.to_owned())),
+    }
+}
+
+pub(crate) fn finish_assistant_turn(timeline: &mut [TimelineItem]) {
+    if let Some(TimelineItem::Assistant(turn)) = timeline.last_mut() {
+        turn.streaming = false;
+    }
+}
+
+pub(crate) fn push_assistant_evidence(
+    timeline: &mut Vec<TimelineItem>,
+    evidence: Vec<EvidenceText>,
+) {
+    if evidence.is_empty() {
+        return;
+    }
+    if !matches!(timeline.last(), Some(TimelineItem::Assistant(_))) {
+        timeline.push(TimelineItem::Assistant(AssistantTurn::default()));
+    }
+    if let Some(TimelineItem::Assistant(turn)) = timeline.last_mut() {
+        turn.streaming = false;
+        turn.parts.push(AssistantPart::Evidence(evidence));
+    }
+}
+
+/// Inserts or updates a tool part, keyed by tool call ID. Updates find the
+/// existing block wherever it landed so late results stay in place.
+pub(crate) fn upsert_tool_part(timeline: &mut Vec<TimelineItem>, part: ToolPart) {
+    for item in timeline.iter_mut().rev() {
+        if let TimelineItem::Assistant(turn) = item
+            && let Some(AssistantPart::Tool(existing)) = turn.parts.iter_mut().find(
+                |candidate| matches!(candidate, AssistantPart::Tool(tool) if tool.id == part.id),
+            )
+        {
+            merge_tool_part(existing, part);
+            turn.streaming = false;
+            return;
+        }
+    }
+    if !matches!(timeline.last(), Some(TimelineItem::Assistant(_))) {
+        timeline.push(TimelineItem::Assistant(AssistantTurn::default()));
+    }
+    if let Some(TimelineItem::Assistant(turn)) = timeline.last_mut() {
+        turn.streaming = false;
+        turn.parts.push(AssistantPart::Tool(Box::new(part)));
+    }
+}
+
+fn merge_tool_part(target: &mut ToolPart, update: ToolPart) {
+    if !update.title.is_empty() {
+        target.title = update.title;
+    }
+    if !update.name.is_empty() {
+        target.name = update.name;
+    }
+    target.status = update.status;
+    if update.detail.is_some() {
+        target.detail = update.detail;
+    }
+    if update.output.is_some() {
+        target.output = update.output;
+    }
+    if update.elapsed_ms.is_some() {
+        target.elapsed_ms = update.elapsed_ms;
+    }
+    target.approval_pending = update.approval_pending;
 }
 
 pub(crate) fn bounded(value: &str) -> String {
@@ -293,11 +463,8 @@ pub(crate) fn session_state_for_run(state: AgentRunState) -> AgentSessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use loom_core::{ActivityId, RunId, Timestamp, ToolCallId};
-    use loom_model::{ModelId, ToolCall};
-    use loom_protocol::{
-        AgentActivityData, AgentActivityKind, AgentActivityStatus, GitDiffHunk, GitDiffLineKind,
-    };
+    use loom_core::ToolCallId;
+    use loom_protocol::{GitDiffHunk, GitDiffLineKind};
 
     #[test]
     fn review_hunks_map_to_virtual_rows() {
@@ -374,190 +541,128 @@ mod tests {
         );
     }
 
-    fn turn(run_id: RunId) -> AgentActivityRecord {
-        AgentActivityRecord {
-            id: ActivityId::new(),
-            run_id,
-            timeline_ordinal: 0,
-            parent_id: None,
-            step_id: None,
-            kind: AgentActivityKind::ModelTurn,
-            status: AgentActivityStatus::Completed,
-            started_at: Timestamp::from_unix_millis(1),
-            completed_at: None,
+    fn tool(id: ToolCallId, name: &str, status: ToolPartStatus) -> ToolPart {
+        ToolPart {
+            id,
+            name: name.to_owned(),
+            title: name.to_owned(),
+            status,
+            detail: None,
+            output: None,
             elapsed_ms: None,
-            data: AgentActivityData::ModelTurn {
-                model: ModelId::new("test/model"),
-            },
-        }
-    }
-
-    fn command(parent: &AgentActivityRecord) -> AgentActivityRecord {
-        AgentActivityRecord {
-            id: ActivityId::new(),
-            parent_id: Some(parent.id),
-            kind: AgentActivityKind::Command,
-            data: AgentActivityData::Command {
-                call: ToolCall {
-                    id: ToolCallId::new(),
-                    name: "run_command".to_owned(),
-                    arguments: serde_json::json!({}),
-                },
-                command: "cargo".to_owned(),
-                args: vec!["test".to_owned()],
-                cwd: None,
-                result: None,
-            },
-            ..parent.clone()
+            approval_pending: false,
         }
     }
 
     #[test]
-    fn consecutive_commands_span_turns_and_keep_late_results_in_place() {
-        let run_id = RunId::new();
-        let first_turn = turn(run_id);
-        let first = command(&first_turn);
-        let second_turn = turn(run_id);
-        let second = command(&second_turn);
-        let records = [first_turn, first.clone(), second_turn, second.clone()];
+    fn assistant_deltas_merge_and_restart_after_a_tool_part() {
         let mut timeline = Vec::new();
-        for record in &records {
-            upsert_activity(&mut timeline, record.clone());
-        }
+        push_assistant_text(&mut timeline, "Hello ");
+        push_assistant_text(&mut timeline, "world");
         assert_eq!(timeline.len(), 1);
-        timeline.push(TimelineItem::Assistant("Finished checks".to_owned()));
-        let mut finished = first.clone();
-        finished.status = AgentActivityStatus::Failed;
-        if let AgentActivityData::Command { call, result, .. } = &mut finished.data {
-            *result = Some(loom_protocol::ToolResult::failure(call, "test failed"));
-        }
-        upsert_activity(&mut timeline, finished.clone());
-        let TimelineItem::ActivitySection { activities } = &timeline[0] else {
-            panic!("expected group")
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected assistant turn");
+        };
+        assert!(turn.streaming);
+        assert_eq!(
+            turn.parts,
+            vec![AssistantPart::Text("Hello world".to_owned())]
+        );
+
+        upsert_tool_part(
+            &mut timeline,
+            tool(ToolCallId::new(), "read_file", ToolPartStatus::Queued),
+        );
+        push_assistant_text(&mut timeline, "Next response");
+        assert_eq!(timeline.len(), 2);
+        let TimelineItem::Assistant(second) = &timeline[1] else {
+            panic!("expected second assistant turn");
         };
         assert_eq!(
-            activities,
-            &[records[0].clone(), finished, records[2].clone(), second]
+            second.parts,
+            vec![AssistantPart::Text("Next response".to_owned())]
         );
-        assert_eq!(timeline.len(), 2);
-
-        // Snapshot replay takes the same path as streamed activity records.
-        let mut restored = Vec::new();
-        for record in records {
-            upsert_activity(&mut restored, record);
-        }
-        assert_eq!(restored.len(), 1);
     }
 
     #[test]
-    fn activities_do_not_cross_messages_or_run_boundaries() {
-        for separator in [
-            TimelineItem::Assistant("Checking another area".to_owned()),
-            TimelineItem::User("Next task".to_owned()),
-            TimelineItem::Status("Paused".to_owned()),
+    fn tool_updates_find_the_existing_part_across_interleaved_items() {
+        let id = ToolCallId::new();
+        let mut timeline = Vec::new();
+        upsert_tool_part(&mut timeline, tool(id, "read_file", ToolPartStatus::Queued));
+        push_assistant_text(&mut timeline, "Working on it");
+        let mut completed = tool(id, "read_file", ToolPartStatus::Completed);
+        completed.output = Some("file contents".to_owned());
+        completed.elapsed_ms = Some(12);
+        upsert_tool_part(&mut timeline, completed.clone());
+        assert_eq!(timeline.len(), 2);
+
+        let parts = timeline
+            .iter()
+            .flat_map(|item| match item {
+                TimelineItem::Assistant(turn) => turn.parts.as_slice(),
+                _ => &[],
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parts.len(), 2);
+        let AssistantPart::Tool(part) = parts[0] else {
+            panic!("expected tool part first");
+        };
+        assert_eq!(part.status, ToolPartStatus::Completed);
+        assert_eq!(part.output.as_deref(), Some("file contents"));
+        assert_eq!(part.elapsed_ms, Some(12));
+        assert!(!parts.iter().any(|_| false));
+    }
+
+    #[test]
+    fn reasoning_deltas_merge_into_one_part_before_text() {
+        let mut timeline = Vec::new();
+        push_assistant_reasoning(&mut timeline, "Considering ");
+        push_assistant_reasoning(&mut timeline, "options.");
+        push_assistant_text(&mut timeline, "Here is the answer.");
+        assert_eq!(timeline.len(), 1);
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected assistant turn");
+        };
+        assert_eq!(
+            turn.parts,
+            vec![
+                AssistantPart::Reasoning("Considering options.".to_owned()),
+                AssistantPart::Text("Here is the answer.".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn evidence_appends_to_the_last_assistant_turn() {
+        let mut timeline = Vec::new();
+        push_assistant_text(&mut timeline, "Done");
+        push_assistant_evidence(
+            &mut timeline,
+            vec![EvidenceText {
+                label: "PR".to_owned(),
+                uri: "https://example.com/pr/1".to_owned(),
+            }],
+        );
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected assistant turn");
+        };
+        assert!(!turn.streaming);
+        assert_eq!(turn.parts.len(), 2);
+        assert!(matches!(turn.parts[1], AssistantPart::Evidence(ref links) if links.len() == 1));
+    }
+
+    #[test]
+    fn tool_part_status_markers_cover_every_state() {
+        for (status, marker) in [
+            (ToolPartStatus::Queued, "○"),
+            (ToolPartStatus::Running, "›"),
+            (ToolPartStatus::AwaitingApproval, "!"),
+            (ToolPartStatus::AwaitingInput, "?"),
+            (ToolPartStatus::Completed, "✓"),
+            (ToolPartStatus::Failed, "×"),
+            (ToolPartStatus::Cancelled, "–"),
         ] {
-            let parent = turn(RunId::new());
-            let mut timeline = Vec::new();
-            upsert_activity(&mut timeline, parent.clone());
-            upsert_activity(&mut timeline, command(&parent));
-            timeline.push(separator);
-            upsert_activity(&mut timeline, command(&parent));
-            assert_eq!(timeline.len(), 3);
+            assert_eq!(status.marker(), marker);
         }
-        let parent = turn(RunId::new());
-        let mut timeline = Vec::new();
-        upsert_activity(&mut timeline, parent.clone());
-        upsert_activity(&mut timeline, command(&parent));
-        let other_tool = AgentActivityRecord {
-            id: ActivityId::new(),
-            parent_id: Some(parent.id),
-            kind: AgentActivityKind::ToolCall,
-            data: AgentActivityData::ToolCall {
-                call: ToolCall {
-                    id: ToolCallId::new(),
-                    name: "read_file".to_owned(),
-                    arguments: serde_json::json!({}),
-                },
-                result: None,
-            },
-            ..parent.clone()
-        };
-        upsert_activity(&mut timeline, other_tool.clone());
-        upsert_activity(&mut timeline, command(&parent));
-        assert_eq!(timeline.len(), 1);
-        let other_run = turn(RunId::new());
-        upsert_activity(&mut timeline, other_run.clone());
-        upsert_activity(&mut timeline, command(&other_run));
-        assert_eq!(timeline.len(), 2);
-        upsert_activity(&mut timeline, other_tool);
-        assert_eq!(timeline.len(), 2);
-    }
-
-    #[test]
-    fn activity_updates_are_grouped_by_parent_and_id() {
-        let run_id = RunId::new();
-        let turn_id = ActivityId::new();
-        let turn = AgentActivityRecord {
-            id: turn_id,
-            run_id,
-            timeline_ordinal: 0,
-            parent_id: None,
-            step_id: None,
-            kind: AgentActivityKind::ModelTurn,
-            status: AgentActivityStatus::Started,
-            started_at: Timestamp::from_unix_millis(1),
-            completed_at: None,
-            elapsed_ms: None,
-            data: AgentActivityData::ModelTurn {
-                model: ModelId::new("test/model"),
-            },
-        };
-        let mut timeline = Vec::new();
-        upsert_activity(&mut timeline, turn.clone());
-        upsert_activity(
-            &mut timeline,
-            AgentActivityRecord {
-                id: ActivityId::new(),
-                run_id,
-                timeline_ordinal: 0,
-                parent_id: Some(turn_id),
-                step_id: None,
-                kind: AgentActivityKind::ToolCall,
-                status: AgentActivityStatus::Completed,
-                started_at: Timestamp::from_unix_millis(2),
-                completed_at: Some(Timestamp::from_unix_millis(3)),
-                elapsed_ms: Some(1),
-                data: AgentActivityData::ToolCall {
-                    call: ToolCall {
-                        id: ToolCallId::new(),
-                        name: "read_file".to_owned(),
-                        arguments: serde_json::json!({"path": "README.md"}),
-                    },
-                    result: None,
-                },
-            },
-        );
-        upsert_activity(
-            &mut timeline,
-            AgentActivityRecord {
-                status: AgentActivityStatus::Completed,
-                completed_at: Some(Timestamp::from_unix_millis(4)),
-                elapsed_ms: Some(3),
-                ..turn
-            },
-        );
-
-        assert_eq!(
-            timeline
-                .iter()
-                .filter(|item| matches!(item, TimelineItem::ActivitySection { .. }))
-                .count(),
-            1
-        );
-        let TimelineItem::ActivitySection { activities } = &timeline[0] else {
-            panic!("expected activity section");
-        };
-        assert_eq!(activities.len(), 2);
-        assert_eq!(activities[0].status, AgentActivityStatus::Completed);
     }
 }

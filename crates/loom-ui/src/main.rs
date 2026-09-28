@@ -6,7 +6,7 @@
 //! projections (`state`), the GPUI view (`view`), window chrome (`theme`), and native platform adapters
 //! (`platform`).
 
-#[cfg(target_family = "wasm")]
+#[cfg(any(target_family = "wasm", test))]
 mod assets;
 #[cfg(target_family = "wasm")]
 mod browser;
