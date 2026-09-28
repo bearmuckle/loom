@@ -35,8 +35,8 @@ session only and the UI warns that it will not reconnect after restart. Linux
 uses Secret Service, which requires an available user session/keyring. Browser
 peer-token behavior is unchanged.
 
-The current database schema is version 49. Loom upgrades supported databases
-forward from v41 through v49; unknown formats and versions are rejected
+The current database schema is version 50. Loom upgrades supported databases
+forward from v41 through v50; unknown formats and versions are rejected
 without modifying the existing file. Backend and schema downgrades are
 unsupported, and there is no generic JSON section store retained for legacy
 compatibility.

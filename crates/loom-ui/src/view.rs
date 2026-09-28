@@ -8106,6 +8106,186 @@ impl LoomView {
         cx.notify();
     }
 
+    fn build_project_session_context_menu(
+        mut menu: PopupMenu,
+        session: AgentSessionSnapshot,
+        menu_project: Option<loom_core::ProjectSnapshot>,
+        menu_view: Entity<LoomView>,
+    ) -> PopupMenu {
+        let rename_view = menu_view.clone();
+        let archive_view = menu_view.clone();
+        let rename_session = session.clone();
+        let archive_session = session.clone();
+        let archive_label = menu_project
+            .as_ref()
+            .filter(|project| project.root_session_id == session.id)
+            .map_or("Archive", |_| "Archive project");
+        menu = menu
+            .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
+                let rename_session = rename_session.clone();
+                rename_view.update(cx, |view, cx| {
+                    view.begin_session_rename(rename_session, window, cx);
+                });
+            }))
+            .item(PopupMenuItem::new(archive_label).on_click(move |_, _, cx| {
+                archive_view.update(cx, |view, cx| {
+                    view.select_session(archive_session.clone(), cx);
+                    view.archive_active(cx);
+                });
+            }));
+        if let Some(project) = menu_project.as_ref()
+            && let Some(child) = project.agents.iter().find(|agent| {
+                agent.session_id == session.id
+                    && agent.parent_session_id.is_some_and(|parent_session_id| {
+                        parent_session_id == project.root_session_id
+                            || project
+                                .agents
+                                .iter()
+                                .any(|manager| manager.session_id == parent_session_id)
+                    })
+            })
+            && let Some(manager_session_id) = child.parent_session_id
+            && let Some(task) = project
+                .tasks
+                .iter()
+                .find(|task| task.target_session_id == child.session_id)
+        {
+            let project_id = project.project_id;
+            let manager_permissions = if manager_session_id == project.root_session_id {
+                Some((true, true, true))
+            } else {
+                project
+                    .tasks
+                    .iter()
+                    .find(|manager_task| manager_task.target_session_id == manager_session_id)
+                    .map(|manager_task| {
+                        (
+                            manager_task.permissions.child_control,
+                            manager_task.permissions.review,
+                            manager_task.permissions.integration,
+                        )
+                    })
+            };
+            let (can_control, can_review, can_integrate) = manager_permissions.unwrap_or_default();
+            if can_control {
+                for action in project_child_control_actions(child.state, task.status) {
+                    let control_view = menu_view.clone();
+                    let task_id = task.task_id;
+                    let action_label = if action == ProjectChildControlAction::Cancel
+                        && (child.state == AgentSessionState::Failed
+                            || task.status == loom_core::DelegatedTaskStatus::Failed)
+                    {
+                        "Cancel remaining descendants"
+                    } else {
+                        project_child_control_label(action)
+                    };
+                    menu = menu.item(PopupMenuItem::new(action_label).on_click(move |_, _, cx| {
+                        control_view.update(cx, |view, cx| {
+                            view.control_project_child_from_ui(
+                                manager_session_id,
+                                project_id,
+                                task_id,
+                                action,
+                                cx,
+                            );
+                        });
+                    }));
+                }
+            }
+            if task.code_change
+                && let Some(worktree) = project
+                    .worktrees
+                    .iter()
+                    .find(|worktree| worktree.task_id == task.task_id)
+            {
+                let task_id = task.task_id;
+                let terminal = matches!(
+                    task.status,
+                    loom_core::DelegatedTaskStatus::Completed
+                        | loom_core::DelegatedTaskStatus::Failed
+                        | loom_core::DelegatedTaskStatus::Cancelled
+                );
+                if can_review
+                    && !matches!(
+                        worktree.status,
+                        loom_core::ProjectWorktreeStatus::CleanupPending
+                            | loom_core::ProjectWorktreeStatus::Removed
+                    )
+                {
+                    let review_view = menu_view.clone();
+                    menu = menu.item(PopupMenuItem::new("Review child changes").on_click(
+                        move |_, _, cx| {
+                            review_view.update(cx, |view, cx| {
+                                view.review_project_child_from_ui(
+                                    manager_session_id,
+                                    project_id,
+                                    task_id,
+                                    cx,
+                                );
+                            });
+                        },
+                    ));
+                }
+                if can_integrate
+                    && terminal
+                    && task.status == loom_core::DelegatedTaskStatus::Completed
+                    && worktree.status == loom_core::ProjectWorktreeStatus::Ready
+                    && let Some(expected_child_revision) = worktree.result_revision.clone()
+                {
+                    let integrate_view = menu_view.clone();
+                    let expected_parent_revision = worktree.base_revision.clone();
+                    menu = menu.item(PopupMenuItem::new("Fast-forward child changes").on_click(
+                        move |_, _, cx| {
+                            integrate_view.update(cx, |view, cx| {
+                                view.integrate_project_child_from_ui(
+                                    manager_session_id,
+                                    project_id,
+                                    task_id,
+                                    expected_parent_revision.clone(),
+                                    expected_child_revision.clone(),
+                                    cx,
+                                );
+                            });
+                        },
+                    ));
+                }
+                if terminal && worktree.status != loom_core::ProjectWorktreeStatus::Removed {
+                    if worktree.status != loom_core::ProjectWorktreeStatus::Retained {
+                        let retain_view = menu_view.clone();
+                        menu = menu.item(PopupMenuItem::new("Keep child checkout").on_click(
+                            move |_, _, cx| {
+                                retain_view.update(cx, |view, cx| {
+                                    view.cleanup_project_child_from_ui(
+                                        manager_session_id,
+                                        project_id,
+                                        task_id,
+                                        loom_core::ProjectWorktreeCleanupDisposition::Retain,
+                                        cx,
+                                    );
+                                });
+                            },
+                        ));
+                    }
+                    let cleanup_view = menu_view.clone();
+                    menu = menu.item(PopupMenuItem::new("Remove clean child checkout").on_click(
+                        move |_, _, cx| {
+                            cleanup_view.update(cx, |view, cx| {
+                                view.cleanup_project_child_from_ui(
+                                    manager_session_id,
+                                    project_id,
+                                    task_id,
+                                    loom_core::ProjectWorktreeCleanupDisposition::RemoveClean,
+                                    cx,
+                                );
+                            });
+                        },
+                    ));
+                }
+            }
+        }
+        menu
+    }
+
     pub(crate) fn render_session_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let projection = project_session_list_projection(
             &self.sessions,
@@ -8208,183 +8388,12 @@ impl LoomView {
             else {
                 return menu;
             };
-            let rename_view = menu_view.clone();
-            let archive_view = menu_view.clone();
-            let rename_session = session.clone();
-            let archive_session = session.clone();
-            let archive_label = menu_project
-                .as_ref()
-                .filter(|project| project.root_session_id == session.id)
-                .map_or("Archive", |_| "Archive project");
-            let mut menu = menu
-                .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
-                    let rename_session = rename_session.clone();
-                    rename_view.update(cx, |view, cx| {
-                        view.begin_session_rename(rename_session, window, cx);
-                    });
-                }))
-                .item(PopupMenuItem::new(archive_label).on_click(move |_, _, cx| {
-                    archive_view.update(cx, |view, cx| {
-                        view.select_session(archive_session.clone(), cx);
-                        view.archive_active(cx);
-                    });
-                }));
-            if let Some(project) = menu_project.as_ref()
-                && let Some(child) = project.agents.iter().find(|agent| {
-                    agent.session_id == session.id
-                        && agent.parent_session_id.is_some_and(|parent_session_id| {
-                            parent_session_id == project.root_session_id
-                                || project
-                                    .agents
-                                    .iter()
-                                    .any(|manager| manager.session_id == parent_session_id)
-                        })
-                })
-                && let Some(manager_session_id) = child.parent_session_id
-                && let Some(task) = project
-                    .tasks
-                    .iter()
-                    .find(|task| task.target_session_id == child.session_id)
-            {
-                let project_id = project.project_id;
-                let manager_permissions = if manager_session_id == project.root_session_id {
-                    Some((true, true, true))
-                } else {
-                    project
-                        .tasks
-                        .iter()
-                        .find(|manager_task| manager_task.target_session_id == manager_session_id)
-                        .map(|manager_task| {
-                            (
-                                manager_task.permissions.child_control,
-                                manager_task.permissions.review,
-                                manager_task.permissions.integration,
-                            )
-                        })
-                };
-                let (can_control, can_review, can_integrate) =
-                    manager_permissions.unwrap_or_default();
-                if can_control {
-                    for action in project_child_control_actions(child.state, task.status) {
-                        let control_view = menu_view.clone();
-                        let task_id = task.task_id;
-                        let action_label = if action == ProjectChildControlAction::Cancel
-                            && (child.state == AgentSessionState::Failed
-                                || task.status == loom_core::DelegatedTaskStatus::Failed)
-                        {
-                            "Cancel remaining descendants"
-                        } else {
-                            project_child_control_label(action)
-                        };
-                        menu = menu.item(PopupMenuItem::new(action_label).on_click(
-                            move |_, _, cx| {
-                                control_view.update(cx, |view, cx| {
-                                    view.control_project_child_from_ui(
-                                        manager_session_id,
-                                        project_id,
-                                        task_id,
-                                        action,
-                                        cx,
-                                    );
-                                });
-                            },
-                        ));
-                    }
-                }
-                if task.code_change
-                    && let Some(worktree) = project
-                        .worktrees
-                        .iter()
-                        .find(|worktree| worktree.task_id == task.task_id)
-                {
-                    let task_id = task.task_id;
-                    let terminal = matches!(
-                        task.status,
-                        loom_core::DelegatedTaskStatus::Completed
-                            | loom_core::DelegatedTaskStatus::Failed
-                            | loom_core::DelegatedTaskStatus::Cancelled
-                    );
-                    if can_review
-                        && !matches!(
-                            worktree.status,
-                            loom_core::ProjectWorktreeStatus::CleanupPending
-                                | loom_core::ProjectWorktreeStatus::Removed
-                        )
-                    {
-                        let review_view = menu_view.clone();
-                        menu = menu.item(PopupMenuItem::new("Review child changes").on_click(
-                            move |_, _, cx| {
-                                review_view.update(cx, |view, cx| {
-                                    view.review_project_child_from_ui(
-                                        manager_session_id,
-                                        project_id,
-                                        task_id,
-                                        cx,
-                                    );
-                                });
-                            },
-                        ));
-                    }
-                    if can_integrate
-                        && terminal
-                        && task.status == loom_core::DelegatedTaskStatus::Completed
-                        && worktree.status == loom_core::ProjectWorktreeStatus::Ready
-                        && let Some(expected_child_revision) = worktree.result_revision.clone()
-                    {
-                        let integrate_view = menu_view.clone();
-                        let expected_parent_revision = worktree.base_revision.clone();
-                        menu =
-                            menu.item(PopupMenuItem::new("Fast-forward child changes").on_click(
-                                move |_, _, cx| {
-                                    integrate_view.update(cx, |view, cx| {
-                                        view.integrate_project_child_from_ui(
-                                            manager_session_id,
-                                            project_id,
-                                            task_id,
-                                            expected_parent_revision.clone(),
-                                            expected_child_revision.clone(),
-                                            cx,
-                                        );
-                                    });
-                                },
-                            ));
-                    }
-                    if terminal && worktree.status != loom_core::ProjectWorktreeStatus::Removed {
-                        if worktree.status != loom_core::ProjectWorktreeStatus::Retained {
-                            let retain_view = menu_view.clone();
-                            menu = menu.item(PopupMenuItem::new("Keep child checkout").on_click(
-                                move |_, _, cx| {
-                                    retain_view.update(cx, |view, cx| {
-                                        view.cleanup_project_child_from_ui(
-                                            manager_session_id,
-                                            project_id,
-                                            task_id,
-                                            loom_core::ProjectWorktreeCleanupDisposition::Retain,
-                                            cx,
-                                        );
-                                    });
-                                },
-                            ));
-                        }
-                        let cleanup_view = menu_view.clone();
-                        menu =
-                            menu.item(PopupMenuItem::new("Remove clean child checkout").on_click(
-                                move |_, _, cx| {
-                                    cleanup_view.update(cx, |view, cx| {
-                                        view.cleanup_project_child_from_ui(
-                                        manager_session_id,
-                                        project_id,
-                                        task_id,
-                                        loom_core::ProjectWorktreeCleanupDisposition::RemoveClean,
-                                        cx,
-                                    );
-                                    });
-                                },
-                            ));
-                    }
-                }
-            }
-            menu
+            Self::build_project_session_context_menu(
+                menu,
+                session,
+                menu_project.clone(),
+                menu_view.clone(),
+            )
         })
         .size_full()
     }
@@ -12520,8 +12529,9 @@ mod loom_view_render_tests {
 
     fn nested_project_view(focus_handle: gpui_kit::FocusHandle) -> LoomView {
         use loom_core::{
-            AgentSessionSnapshot, AgentSessionState, ProjectAgentRecord, ProjectSnapshot,
-            WorkspaceId,
+            AgentSessionSnapshot, AgentSessionState, DelegatedTaskRecord, DelegatedTaskStatus,
+            ProjectAgentPermissions, ProjectAgentRecord, ProjectSnapshot, ProjectWorktreeRecord,
+            ProjectWorktreeStatus, RepositoryId, TaskId, WorkspaceId,
         };
 
         let workspace_id = WorkspaceId::new();
@@ -12553,6 +12563,68 @@ mod loom_view_render_tests {
                 updated_at: timestamp,
             })
             .collect();
+        let manager_task_id = TaskId::new();
+        let worker_task_id = TaskId::new();
+        let manager_task = DelegatedTaskRecord {
+            task_id: manager_task_id,
+            project_id,
+            requester_session_id: root_id,
+            target_session_id: manager_id,
+            child_name: "Manager".to_owned(),
+            intent: "Coordinate the delegated work".to_owned(),
+            model_id: "deterministic/demo".to_owned(),
+            context_references: Vec::new(),
+            dependencies: Vec::new(),
+            code_change: false,
+            permissions: ProjectAgentPermissions {
+                delegation: true,
+                branch_messaging: true,
+                child_control: true,
+                inspection: true,
+                worktree_creation: true,
+                review: true,
+                integration: true,
+            },
+            status: DelegatedTaskStatus::Running,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let worker_task = DelegatedTaskRecord {
+            task_id: worker_task_id,
+            project_id,
+            requester_session_id: manager_id,
+            target_session_id: worker_id,
+            child_name: "Worker".to_owned(),
+            intent: "Implement the requested code change".to_owned(),
+            model_id: "deterministic/demo".to_owned(),
+            context_references: Vec::new(),
+            dependencies: Vec::new(),
+            code_change: true,
+            permissions: ProjectAgentPermissions::default(),
+            status: DelegatedTaskStatus::Completed,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let worker_worktree = ProjectWorktreeRecord {
+            project_id,
+            task_id: worker_task_id,
+            parent_session_id: manager_id,
+            child_session_id: worker_id,
+            parent_repository_id: RepositoryId::new(),
+            child_repository_id: RepositoryId::new(),
+            relative_path: "worktrees/worker".to_owned(),
+            worktree_name: "worker".to_owned(),
+            branch_name: "agent/worker".to_owned(),
+            base_revision: "parent-base".to_owned(),
+            result_revision: Some("child-result".to_owned()),
+            integrated_revision: None,
+            status: ProjectWorktreeStatus::Ready,
+            conflict_paths: Vec::new(),
+            error: None,
+            cleanup_disposition: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
         let session_snapshots = sessions
             .iter()
             .map(|(id, name, state)| AgentSessionSnapshot {
@@ -12576,8 +12648,8 @@ mod loom_view_render_tests {
             project_id,
             root_session_id: root_id,
             agents,
-            tasks: Vec::new(),
-            worktrees: Vec::new(),
+            tasks: vec![manager_task, worker_task],
+            worktrees: vec![worker_worktree],
         });
         view
     }
@@ -12766,6 +12838,108 @@ mod loom_view_render_tests {
             assert_eq!(view.read(cx).active_session.name, "Worker");
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn project_session_popup_menu_dispatches_child_control_review_and_integration(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let (control_window, control_view) = open_nested_project_menu(cx, 1);
+        cx.update_window(control_window, |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("popup-menu").visible());
+            let mut menu = window.within("popup-menu");
+            assert_eq!(menu.find(2usize).label(), Some("Pause child"));
+            assert_eq!(menu.find(3usize).label(), Some("Interrupt child"));
+            assert_eq!(
+                menu.find(4usize).label(),
+                Some("Cancel child and descendants")
+            );
+            menu.click(2usize, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(control_window, |_, _, cx| {
+            assert!(control_view.read(cx).timeline.iter().any(|item| {
+                matches!(item, TimelineItem::Error { operation, .. }
+                    if operation == "control project child")
+            }));
+        })
+        .unwrap();
+
+        let (review_window, review_view) = open_nested_project_menu(cx, 2);
+        cx.update_window(review_window, |_, window, cx| {
+            window.render_frame(cx);
+            let mut menu = window.within("popup-menu");
+            assert_eq!(menu.find(2usize).label(), Some("Review child changes"));
+            assert_eq!(
+                menu.find(3usize).label(),
+                Some("Fast-forward child changes")
+            );
+            assert_eq!(menu.find(4usize).label(), Some("Keep child checkout"));
+            assert_eq!(
+                menu.find(5usize).label(),
+                Some("Remove clean child checkout")
+            );
+            menu.click(2usize, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(review_window, |_, _, cx| {
+            assert!(review_view.read(cx).timeline.iter().any(|item| {
+                matches!(item, TimelineItem::Error { operation, .. }
+                    if operation == "review project child")
+            }));
+        })
+        .unwrap();
+
+        let (integration_window, integration_view) = open_nested_project_menu(cx, 2);
+        cx.update_window(integration_window, |_, window, cx| {
+            window.render_frame(cx);
+            window.within("popup-menu").click(3usize, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(integration_window, |_, _, cx| {
+            assert!(integration_view.read(cx).timeline.iter().any(|item| {
+                matches!(item, TimelineItem::Error { operation, .. }
+                    if operation == "check child review before integration")
+            }));
+        })
+        .unwrap();
+
+        drop(control_view);
+        drop(review_view);
+        drop(integration_view);
+        cx.quit();
+        cx.run_until_parked();
+    }
+
+    fn open_nested_project_menu(
+        cx: &mut TestAppContext,
+        session_index: usize,
+    ) -> (gpui_kit::AnyWindowHandle, gpui_kit::Entity<LoomView>) {
+        let rendered_view = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let rendered_view_for_window = rendered_view.clone();
+        let handle = cx.open_window(size(px(1280.), px(800.)), move |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = nested_project_view(cx.focus_handle());
+                view.project_poll_scheduled = true;
+                view
+            });
+            let session = view.read(cx).sessions[session_index].clone();
+            let project = view.read(cx).project_snapshot.clone();
+            let menu_view = view.clone();
+            let menu =
+                gpui_kit::component::menu::PopupMenu::build(window, cx, move |menu, _, _| {
+                    LoomView::build_project_session_context_menu(menu, session, project, menu_view)
+                });
+            *rendered_view_for_window.borrow_mut() = Some(view);
+            gpui_kit::component::Root::new(menu, window, cx)
+        });
+        let view = rendered_view.borrow_mut().take().unwrap();
+        (handle.into(), view)
     }
 
     #[gpui_kit::test]
