@@ -36,6 +36,12 @@ Large immutable values—including message bodies, tool output, checkpoint file 
 
 The generic JSON section store has been removed. JSON remains suitable for small bounded configuration or diagnostic payloads that are not used as query keys. Runtime objects, locks, provider clients, filesystem watchers, and UI caches are reconstructed and are not persisted.
 
+The workspace-config JSON stores `project_agent_concurrency` with a serde
+default of four (valid values are one through sixteen). Existing config blobs
+without the field remain readable, and the setting needs no separate SQLite
+schema migration; the delegated-task table already persists queued work. A
+project may have at most fifty queued or active delegated tasks.
+
 ## Transactions and incremental writes
 
 The backend uses one SQLite database with WAL journaling and `synchronous = FULL`. Persistent backend instances take an advisory owner lock, and graceful shutdown drains active run workers before final persistence and lock release.

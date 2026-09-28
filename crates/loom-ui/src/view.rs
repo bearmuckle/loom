@@ -368,6 +368,13 @@ fn adjusted_cpu_pulse_threshold(current: u8, delta: i8) -> u8 {
     (i16::from(current.min(100)) + i16::from(delta)).clamp(0, 100) as u8
 }
 
+fn adjusted_project_agent_concurrency(current: u8, delta: i8) -> u8 {
+    (i16::from(current) + i16::from(delta)).clamp(
+        i16::from(loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY),
+        i16::from(loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY),
+    ) as u8
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionNodeIndicatorState {
     Offline,
@@ -5443,6 +5450,20 @@ impl LoomView {
         cx.notify();
     }
 
+    fn adjust_project_agent_concurrency(&mut self, delta: i8, cx: &mut Context<Self>) {
+        let next = adjusted_project_agent_concurrency(
+            self.workspace_config.project_agent_concurrency,
+            delta,
+        );
+        if next == self.workspace_config.project_agent_concurrency {
+            return;
+        }
+        self.workspace_config.project_agent_concurrency = next;
+        self.workspace_config.revision = self.workspace_config.revision.saturating_add(1);
+        self.persist_and_distribute_workspace_config(None, cx);
+        cx.notify();
+    }
+
     fn set_font_scale_percent(
         &mut self,
         font_scale_percent: u16,
@@ -9040,6 +9061,57 @@ impl LoomView {
             )
             .child(
                 div()
+                    .mt_3()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex_1()
+                            .child("Parallel project agents")
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child("Maximum delegated agents running at once"),
+                            ),
+                    )
+                    .child(
+                        Button::new("project-agent-concurrency-decrease")
+                            .label("-")
+                            .small()
+                            .disabled(
+                                !self.is_connected()
+                                    || self.workspace_config.project_agent_concurrency
+                                        <= loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY,
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.adjust_project_agent_concurrency(-1, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .text_center()
+                            .text_sm()
+                            .child(self.workspace_config.project_agent_concurrency.to_string()),
+                    )
+                    .child(
+                        Button::new("project-agent-concurrency-increase")
+                            .label("+")
+                            .small()
+                            .disabled(
+                                !self.is_connected()
+                                    || self.workspace_config.project_agent_concurrency
+                                        >= loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY,
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.adjust_project_agent_concurrency(1, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
                     .mt_5()
                     .text_xs()
                     .text_color(rgb(0x93c5fd))
@@ -11552,6 +11624,12 @@ mod loom_view_render_tests {
                 .click("cpu-pulse-threshold-increase", cx);
             window
                 .within("settings-dialog")
+                .click("project-agent-concurrency-decrease", cx);
+            window
+                .within("settings-dialog")
+                .click("project-agent-concurrency-increase", cx);
+            window
+                .within("settings-dialog")
                 .click("session-auto-approve-toggle", cx);
             window.within("settings-dialog").click("close-settings", cx);
             window.render_frame(cx);
@@ -13404,16 +13482,16 @@ mod worker_node_tests {
     use super::{
         ACTIVE_BACKEND_NODE_ENTRY_ID, SessionNodeIndicatorState, SessionSourceChoice,
         SessionSourceDialogPurpose, WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry,
-        adjusted_cpu_pulse_threshold, assigned_node_id, connection_placeholder, format_percentage,
-        format_session_resource_percentages, format_worker_node_resources, initial_worker_nodes,
-        local_source_available, mark_worker_connection_failed, merge_node_sessions,
-        next_severe_load_streak, order_session_nodes, remove_worker_node_entry,
-        safe_worker_url_label, session_id_for_request, session_list_projection,
-        session_node_indicator_state, session_node_pulse, session_owner_status,
-        source_choice_is_allowed, source_dialog_initial_state,
-        transition_worker_connection_to_connecting, update_worker_node_status,
-        validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
-        worker_node_name_for_id, worker_url_embeds_credential,
+        adjusted_cpu_pulse_threshold, adjusted_project_agent_concurrency, assigned_node_id,
+        connection_placeholder, format_percentage, format_session_resource_percentages,
+        format_worker_node_resources, initial_worker_nodes, local_source_available,
+        mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
+        order_session_nodes, remove_worker_node_entry, safe_worker_url_label,
+        session_id_for_request, session_list_projection, session_node_indicator_state,
+        session_node_pulse, session_owner_status, source_choice_is_allowed,
+        source_dialog_initial_state, transition_worker_connection_to_connecting,
+        update_worker_node_status, validate_model_for_node, worker_connection_failure_detail,
+        worker_node_display_name, worker_node_name_for_id, worker_url_embeds_credential,
     };
     use loom_core::{
         AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, RunId, Timestamp,
@@ -14339,6 +14417,23 @@ mod worker_node_tests {
         assert_eq!(adjusted_cpu_pulse_threshold(100, 1), 100);
         assert_eq!(adjusted_cpu_pulse_threshold(99, 1), 100);
         assert_eq!(adjusted_cpu_pulse_threshold(255, 0), 100);
+    }
+
+    #[test]
+    fn project_agent_concurrency_adjustment_is_bounded() {
+        assert_eq!(
+            loom_protocol::WorkspaceConfig::default().project_agent_concurrency,
+            4
+        );
+        assert_eq!(adjusted_project_agent_concurrency(4, -1), 3);
+        assert_eq!(
+            adjusted_project_agent_concurrency(loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY, -1),
+            loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY
+        );
+        assert_eq!(
+            adjusted_project_agent_concurrency(loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY, 1),
+            loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY
+        );
     }
 
     #[test]

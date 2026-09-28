@@ -14,8 +14,11 @@ safe model-turn boundaries. Root managers can create bounded non-code child
 tasks through a write-approved agent tool; separate delegation, messaging, and
 inspection grants survive run recovery. Project agents can send durable
 direct-parent/direct-child messages and inspect direct-child task and session
-status. Worktree-backed code tasks, user controls, UI, and integration remain
-future slices.
+status. The project hierarchy navigator, child lifecycle controls,
+worktree-backed code tasks, and integration remain future slices. Workspace
+settings configure the maximum number of delegated agents running in parallel
+(default four, range one to sixteen); additional tasks remain durable and
+queued. A project can have up to fifty queued or active delegated tasks.
 
 The feature makes a root agent session a **project**: the durable owner of a
 user goal and the root of an agent hierarchy. A project manager may delegate
@@ -147,6 +150,13 @@ pre-feature version/error envelope must remain sufficient to deliver this
 rejection; do not add a new error enum value that an old client would need to
 decode.
 
+Protocol 5.0 also carries the workspace-level project-agent concurrency
+setting. Because this protocol version is part of the coordinated project
+release, clients are upgraded or rejected at negotiation before using the new
+field. The persisted workspace-config JSON uses a serde default of four when
+the field is absent, so existing stored settings do not need a separate SQLite
+schema migration.
+
 Advance the protocol version for the project contract. Prefer a major version
 change if the new required domain semantics or enum variants are not backward
 compatible; update all supported native/browser clients in the same release
@@ -215,6 +225,11 @@ and its decision.
    reconcile delegated-task status from persisted child runs, and schedule
    tasks when dependencies complete. Existing run recovery keeps interrupted
    work paused or blocked rather than starting a duplicate child run.
+5. **Implemented:** configure delegated-agent parallelism per workspace. The
+   default is four simultaneous running tasks, bounded from one to sixteen;
+   durable queued tasks start when a slot becomes available. The pending queue
+   is bounded at fifty tasks. Older stored workspace settings default to four
+   without a SQLite schema migration.
 
 **Exit:** v41 data migrates through v45 with existing sessions represented as
 projects; unsupported clients are directed to upgrade before using the new
@@ -230,8 +245,9 @@ occurs after record commit but before notification persistence.
    identity. Child creation remains behind the existing write approval policy.
    Persist its capability grant with the run so recovery restores the same
    tool surface without retaining backend or caller objects.
-2. Enforce configurable bounded parallelism and project membership; create
-   the child durably before scheduling its independent agent runtime.
+2. **Implemented:** enforce configurable bounded parallelism and project
+   membership; create each child durably before scheduling its independent
+   agent runtime.
 3. **Implemented:** deliver parent-child messages from the durable inbox at
    model-turn boundaries, checkpoint the inbox cursor with the transcript,
    and retain messages for blocked or inactive recipients until resume.
@@ -317,8 +333,6 @@ modify repositories.
 
 - Whether project identity is a separate persisted ID or initially the root
   session ID with a durable project record.
-- Whether concurrency is configured per workspace, backend, project, or a
-  combination, and what default limits apply.
 - Exact continuation scheduling/claim mechanism for children committed but
   not yet started.
 - Worktree creation and cleanup behavior for multi-repository tasks and native

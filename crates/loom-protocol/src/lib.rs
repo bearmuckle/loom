@@ -45,10 +45,10 @@ pub use vcs::{
 };
 pub use workspace::{
     Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, GitHubRepository,
-    RevertResult, SessionDirectory, SessionFilesystemChange, SessionFilesystemFile,
-    SessionFilesystemSnapshot, SessionRepository, UndoResult, WorkerNodeConfig,
-    WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceEdit, WorkspaceEditResult,
-    WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
+    MAX_PROJECT_AGENT_CONCURRENCY, MIN_PROJECT_AGENT_CONCURRENCY, RevertResult, SessionDirectory,
+    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
+    UndoResult, WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
+    WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
 pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(5, 0);

@@ -79,6 +79,7 @@ fn current_unix_millis() -> u64 {
 
 const FEED_PRUNE_AFTER_NEW_SEQUENCES: u64 = 64;
 const FEED_PRUNE_AFTER_NEW_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NONTERMINAL_PROJECT_TASKS: usize = 50;
 
 fn should_prune_worker_feed(
     next_sequence: u64,
@@ -1813,6 +1814,7 @@ impl RunHandle {
 
 struct StartRunInput {
     session_id: AgentSessionId,
+    project_task_id: Option<loom_core::TaskId>,
     task: String,
     model: ModelId,
     system_instructions: Option<String>,
@@ -1856,6 +1858,7 @@ pub struct InProcessBackend {
     idempotency: Mutex<BTreeMap<loom_core::RequestId, IdempotencyRecord>>,
     in_flight_requests: Mutex<BTreeMap<loom_core::RequestId, Arc<Mutex<()>>>>,
     session_admissions: Mutex<BTreeMap<AgentSessionId, Arc<Mutex<()>>>>,
+    project_admissions: Mutex<BTreeMap<ProjectId, Arc<Mutex<()>>>>,
     self_reference: Mutex<Weak<InProcessBackend>>,
     request_lifecycle: RwLock<u8>,
     persistence_failed: AtomicBool,
@@ -2612,6 +2615,7 @@ impl InProcessBackend {
             idempotency: Mutex::new(BTreeMap::new()),
             in_flight_requests: Mutex::new(BTreeMap::new()),
             session_admissions: Mutex::new(BTreeMap::new()),
+            project_admissions: Mutex::new(BTreeMap::new()),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),
             persistence_failed: AtomicBool::new(false),
@@ -2982,7 +2986,7 @@ impl InProcessBackend {
     }
 
     fn set_workspace_config(
-        &self,
+        self: &Arc<Self>,
         workspace_id: WorkspaceId,
         config: WorkspaceConfig,
     ) -> Result<()> {
@@ -2997,9 +3001,12 @@ impl InProcessBackend {
                 .worker_nodes
                 .iter()
                 .any(|node| node.url.trim() != node.url || !worker_node_url_is_safe(&node.url))
+            || !(loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY
+                ..=loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY)
+                .contains(&config.project_agent_concurrency)
         {
             return Err(LoomError::invalid_request(
-                "workspace worker-node configuration must contain at most 64 WebSocket URLs without access tokens",
+                "workspace configuration must contain at most 64 safe worker-node URLs and project agent concurrency between 1 and 16",
             ));
         }
         let current_revision = self
@@ -3009,6 +3016,12 @@ impl InProcessBackend {
         if current_revision.is_some_and(|revision| revision > config.revision) {
             return Ok(());
         }
+        let previous_concurrency = self
+            .workspace_configs()?
+            .get(&workspace_id)
+            .map(|config| config.project_agent_concurrency)
+            .unwrap_or_else(|| WorkspaceConfig::default().project_agent_concurrency);
+        let concurrency_changed = previous_concurrency != config.project_agent_concurrency;
         let revision = config.revision;
         let previous = self.workspace_configs()?.insert(workspace_id, config);
         let sequence = self
@@ -3023,6 +3036,9 @@ impl InProcessBackend {
             }
             self.journal()?.discard_pending_workspace(sequence);
             return Err(error);
+        }
+        if concurrency_changed {
+            self.reconcile_project_tasks_and_resume_queued(false)?;
         }
         Ok(())
     }
@@ -4078,12 +4094,7 @@ impl InProcessBackend {
                     self.journal()?.append_session(record);
                 }
                 self.update_project_task_for_session_state(session_id, state)?;
-                if matches!(
-                    state,
-                    AgentSessionState::Completed
-                        | AgentSessionState::Failed
-                        | AgentSessionState::Cancelled
-                ) {
+                if project_agent_slot_released(state) {
                     self.reconcile_project_tasks_and_resume_queued(false)?;
                 }
             }
@@ -4127,6 +4138,17 @@ impl InProcessBackend {
         Ok(Arc::clone(admissions.entry(session_id).or_default()))
     }
 
+    fn project_admission(&self, project_id: ProjectId) -> Result<Arc<Mutex<()>>> {
+        let mut admissions = self.project_admissions.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "project scheduling lock was poisoned",
+                true,
+            )
+        })?;
+        Ok(Arc::clone(admissions.entry(project_id).or_default()))
+    }
+
     fn release_request_slot(&self, request_id: loom_core::RequestId) {
         let mut in_flight = self
             .in_flight_requests
@@ -4155,12 +4177,7 @@ impl InProcessBackend {
                 self.journal()?.append_session(record);
             }
             self.update_project_task_for_session_state(session_id, state)?;
-            if matches!(
-                state,
-                AgentSessionState::Completed
-                    | AgentSessionState::Failed
-                    | AgentSessionState::Cancelled
-            ) {
+            if project_agent_slot_released(state) {
                 self.reconcile_project_tasks_and_resume_queued(false)?;
             }
         }
@@ -6387,6 +6404,7 @@ impl InProcessConnection {
                 repository_instructions,
             } => self.start_run_with_options(StartRunInput {
                 session_id,
+                project_task_id: None,
                 task,
                 model,
                 system_instructions,
@@ -6403,6 +6421,7 @@ impl InProcessConnection {
                 context,
             } => self.start_run_with_options(StartRunInput {
                 session_id,
+                project_task_id: None,
                 task,
                 model,
                 system_instructions,
@@ -6510,9 +6529,7 @@ impl InProcessConnection {
                 self.continue_run(run_id, AgentRuntime::retry_entry)
             }
             ClientRequest::PauseAgentRun { run_id } => self.stop_run(run_id, RunStop::Pause),
-            ClientRequest::ResumeAgentRun { run_id } => {
-                self.continue_run(run_id, AgentRuntime::resume_entry)
-            }
+            ClientRequest::ResumeAgentRun { run_id } => self.resume_agent_run(run_id),
             ClientRequest::RetryAgentFromCheckpoint {
                 run_id,
                 checkpoint_id,
@@ -7297,6 +7314,14 @@ impl InProcessConnection {
                 child,
             });
         }
+        let admission = self.backend.project_admission(project_id)?;
+        let admission_guard = admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "project scheduling lock was poisoned",
+                true,
+            )
+        })?;
         let current_tasks = persistence.list_project_tasks(project_id)?;
         if spec
             .dependencies
@@ -7307,29 +7332,22 @@ impl InProcessConnection {
                 "delegated task dependencies must reference tasks in the same project",
             ));
         }
-        let nonterminal_direct_children = project
-            .agents
+        let nonterminal_tasks = current_tasks
             .iter()
-            .filter(|agent| agent.depth == 2 && agent.parent_session_id == Some(parent_session_id))
-            .map(|agent| self.backend.sessions()?.get(agent.session_id))
-            .collect::<Result<Vec<_>>>()?
-            .iter()
-            .filter(|agent| {
+            .filter(|task| {
                 !matches!(
-                    agent.state,
-                    AgentSessionState::Completed
-                        | AgentSessionState::Failed
-                        | AgentSessionState::Cancelled
-                        | AgentSessionState::Archived
+                    task.status,
+                    loom_core::DelegatedTaskStatus::Completed
+                        | loom_core::DelegatedTaskStatus::Failed
+                        | loom_core::DelegatedTaskStatus::Cancelled
                 )
             })
             .count();
-        if nonterminal_direct_children >= 4 {
-            return Err(LoomError::conflict(
-                "project already has four nonterminal direct child agents",
-            ));
+        if nonterminal_tasks >= MAX_NONTERMINAL_PROJECT_TASKS {
+            return Err(LoomError::conflict(format!(
+                "project already has {MAX_NONTERMINAL_PROJECT_TASKS} queued or active tasks"
+            )));
         }
-
         let parent_snapshot = self.backend.sessions()?.get(parent_session_id)?;
         let child_session_id = AgentSessionId::new();
         let timestamp = loom_core::Timestamp::now();
@@ -7441,6 +7459,7 @@ impl InProcessConnection {
                 },
             });
         }
+        drop(admission_guard);
         self.schedule_project_task_if_ready(&mut persisted_task)?;
         Ok(ServerResponse::ProjectChildCreated {
             task: persisted_task,
@@ -7455,6 +7474,14 @@ impl InProcessConnection {
         if task.status != loom_core::DelegatedTaskStatus::Queued {
             return Ok(());
         }
+        let admission = self.backend.project_admission(task.project_id)?;
+        let _admission = admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "project scheduling lock was poisoned",
+                true,
+            )
+        })?;
         let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
             LoomError::new(
                 ErrorCode::UnsupportedCapability,
@@ -7469,6 +7496,20 @@ impl InProcessConnection {
                     && candidate.status == loom_core::DelegatedTaskStatus::Completed
             })
         }) {
+            return Ok(());
+        }
+        let target_session = self.backend.sessions()?.get(task.target_session_id)?;
+        let concurrency_limit = self
+            .backend
+            .workspace_configs()?
+            .get(&target_session.workspace_id)
+            .map(|config| config.project_agent_concurrency)
+            .unwrap_or_else(|| loom_protocol::WorkspaceConfig::default().project_agent_concurrency);
+        let running_tasks = tasks
+            .iter()
+            .filter(|candidate| candidate.status == loom_core::DelegatedTaskStatus::Running)
+            .count();
+        if !project_agent_capacity_available(running_tasks, concurrency_limit) {
             return Ok(());
         }
         if persistence
@@ -7501,6 +7542,7 @@ impl InProcessConnection {
         );
         let result = self.start_run_with_options(StartRunInput {
             session_id: task.target_session_id,
+            project_task_id: Some(task.task_id),
             task: task_prompt,
             model: ModelId::new(task.model_id.clone()),
             system_instructions: Some(system_instructions),
@@ -7527,6 +7569,9 @@ impl InProcessConnection {
             next_status,
             updated_at,
         )? {
+            *task = persistence
+                .load_delegated_task(task.task_id)?
+                .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
             return Ok(());
         }
         let Some(updated_task) = persistence.load_delegated_task(task.task_id)? else {
@@ -8180,6 +8225,30 @@ impl InProcessConnection {
             LoomError::conflict("another agent run is already being started for this session")
         })?;
         let session = self.backend.sessions()?.get(input.session_id)?;
+        if let Some(persistence) = self.backend.persistence.as_ref() {
+            let delegated_task = persistence.load_delegated_task_for_target(input.session_id)?;
+            match (delegated_task, input.project_task_id) {
+                (Some(task), Some(task_id)) if task.task_id == task_id => {}
+                (Some(_), None) => {
+                    return Err(LoomError::conflict(
+                        "delegated child runs are started by the project scheduler",
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(LoomError::new(
+                        ErrorCode::AuthorizationDenied,
+                        "project task does not own this child session",
+                        false,
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(LoomError::invalid_request(
+                        "project task run requires a delegated child session",
+                    ));
+                }
+                (None, None) => {}
+            }
+        }
         if session.state != AgentSessionState::Idle {
             return Err(LoomError::new(
                 ErrorCode::InvalidState,
@@ -8346,6 +8415,87 @@ impl InProcessConnection {
         Ok(ServerResponse::AgentRun(handle.snapshot()))
     }
 
+    fn resume_agent_run(&self, run_id: loom_core::RunId) -> Result<ServerResponse> {
+        let handle = self.run_handle(run_id)?;
+        let Some(persistence) = self.backend.persistence.as_ref() else {
+            return self.continue_run(run_id, AgentRuntime::resume_entry);
+        };
+        let Some(task) = persistence.load_delegated_task_for_target(handle.session_id)? else {
+            return self.continue_run(run_id, AgentRuntime::resume_entry);
+        };
+        let admission = self.backend.project_admission(task.project_id)?;
+        let _admission = admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "project scheduling lock was poisoned",
+                true,
+            )
+        })?;
+        let task = persistence
+            .load_delegated_task(task.task_id)?
+            .ok_or_else(|| LoomError::not_found("delegated task", task.task_id))?;
+        if task.status != loom_core::DelegatedTaskStatus::Running {
+            let running_tasks = persistence
+                .list_project_tasks(task.project_id)?
+                .iter()
+                .filter(|candidate| {
+                    candidate.task_id != task.task_id
+                        && candidate.status == loom_core::DelegatedTaskStatus::Running
+                })
+                .count();
+            let workspace_id = self
+                .backend
+                .sessions()?
+                .get(handle.session_id)?
+                .workspace_id;
+            let concurrency_limit = self
+                .backend
+                .workspace_configs()?
+                .get(&workspace_id)
+                .map(|config| config.project_agent_concurrency)
+                .unwrap_or_else(|| WorkspaceConfig::default().project_agent_concurrency);
+            if !project_agent_capacity_available(running_tasks, concurrency_limit) {
+                return Err(LoomError::conflict(
+                    "project agent concurrency limit reached; the child remains paused",
+                ));
+            }
+        }
+        let response = self.continue_run(run_id, AgentRuntime::resume_entry)?;
+        let resumed_is_active = matches!(
+            &response,
+            ServerResponse::AgentRun(snapshot)
+                if matches!(
+                    snapshot.state,
+                    AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+                )
+        );
+        if resumed_is_active
+            && let Some(current_task) = persistence.load_delegated_task(task.task_id)?
+            && current_task.status != loom_core::DelegatedTaskStatus::Running
+            && !matches!(
+                current_task.status,
+                loom_core::DelegatedTaskStatus::Completed
+                    | loom_core::DelegatedTaskStatus::Failed
+                    | loom_core::DelegatedTaskStatus::Cancelled
+            )
+            && persistence.update_delegated_task_status(
+                task.task_id,
+                loom_core::DelegatedTaskStatus::Running,
+                Timestamp::now(),
+            )?
+            && let Some(updated_task) = persistence.load_delegated_task(task.task_id)?
+        {
+            let sequence = self.backend.journal()?.next();
+            self.backend.journal()?.append_event(ServerEventEnvelope {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                sequence,
+                session_id: task.requester_session_id,
+                event: ServerEvent::ProjectTaskUpdated { task: updated_task },
+            });
+        }
+        Ok(response)
+    }
+
     /// Pauses or interrupts a run. The request only raises the control flag, so
     /// it is never queued behind the model call it is stopping.
     fn stop_run(&self, run_id: loom_core::RunId, stop: RunStop) -> Result<ServerResponse> {
@@ -8508,6 +8658,22 @@ fn delegated_task_status_for_run_state(state: AgentRunState) -> loom_core::Deleg
         AgentRunState::Failed => Status::Failed,
         AgentRunState::Cancelled => Status::Cancelled,
     }
+}
+
+fn project_agent_capacity_available(running_tasks: usize, limit: u8) -> bool {
+    running_tasks < usize::from(limit)
+}
+
+fn project_agent_slot_released(state: AgentSessionState) -> bool {
+    matches!(
+        state,
+        AgentSessionState::AwaitingApproval
+            | AgentSessionState::Paused
+            | AgentSessionState::NeedsInput
+            | AgentSessionState::Completed
+            | AgentSessionState::Failed
+            | AgentSessionState::Cancelled
+    )
 }
 
 fn bounded_review_text(value: &str, limit: usize) -> String {
@@ -9403,6 +9569,7 @@ mod tests {
         let config = WorkspaceConfig {
             revision: 1,
             cpu_pulse_threshold_percent: 37,
+            project_agent_concurrency: 2,
             worker_nodes: vec![WorkerNodeConfig {
                 url: "wss://worker.example/ws".to_owned(),
             }],
@@ -9449,6 +9616,7 @@ mod tests {
                     config: WorkspaceConfig {
                         revision: 0,
                         cpu_pulse_threshold_percent: 5,
+                        project_agent_concurrency: 4,
                         worker_nodes: vec![WorkerNodeConfig {
                             url: "wss://stale.example/ws".to_owned(),
                         }],
@@ -9476,6 +9644,7 @@ mod tests {
                         config: WorkspaceConfig {
                             revision: 2,
                             cpu_pulse_threshold_percent: 5,
+                            project_agent_concurrency: 4,
                             worker_nodes: vec![WorkerNodeConfig {
                                 url: url.to_owned(),
                             }],
@@ -9484,6 +9653,20 @@ mod tests {
                 ));
                 assert!(response.result.is_err());
             }
+            let invalid_concurrency = connection.request(RequestEnvelope::new(
+                ClientRequest::SetWorkspaceConfigForWorkspace {
+                    workspace_id,
+                    config: WorkspaceConfig {
+                        revision: 2,
+                        project_agent_concurrency: 0,
+                        ..WorkspaceConfig::default()
+                    },
+                },
+            ));
+            assert!(matches!(
+                invalid_concurrency.result,
+                Err(error) if error.code == ErrorCode::InvalidRequest
+            ));
             backend.shutdown().unwrap();
         }
         std::fs::remove_file(path).unwrap();
@@ -12849,37 +13032,14 @@ mod tests {
                 code_change: false,
             },
         });
-        let over_capacity = connection.request(over_capacity_request.clone());
-        match over_capacity.result {
-            Err(error) if error.code == ErrorCode::Conflict => {
-                if !matches!(
-                    backend
-                        .sessions()
-                        .unwrap()
-                        .get(child.session_id)
-                        .unwrap()
-                        .state,
-                    AgentSessionState::Completed
-                        | AgentSessionState::Failed
-                        | AgentSessionState::Cancelled
-                        | AgentSessionState::Archived
-                ) {
-                    let (_, terminal_event) = backend
-                        .sessions()
-                        .unwrap()
-                        .transition(child.session_id, AgentSessionState::Completed)
-                        .unwrap();
-                    backend.journal().unwrap().append_session(terminal_event);
-                    backend.persist_state().unwrap();
-                }
-                assert!(matches!(
-                    connection.request(over_capacity_request).result,
-                    Ok(ServerResponse::ProjectChildCreated { .. })
-                ));
-            }
-            Ok(ServerResponse::ProjectChildCreated { .. }) => {}
-            result => panic!("unexpected capacity response: {result:?}"),
-        }
+        let additional_child = connection.request(over_capacity_request).result;
+        assert!(
+            matches!(
+                additional_child,
+                Ok(ServerResponse::ProjectChildCreated { .. })
+            ),
+            "unexpected additional child response: {additional_child:?}"
+        );
         backend.idempotency().unwrap().remove(&request_id);
         assert!(matches!(
             connection
@@ -12909,6 +13069,112 @@ mod tests {
         drop(connection);
         drop(backend);
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn project_concurrency_limit_queues_additional_children() {
+        let (endpoint, request_seen) = slow_model_endpoint();
+        let path = std::env::temp_dir().join(format!(
+            "loom-project-concurrency-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let backend = InProcessBackend::with_openai_compatible_persistent(
+            endpoint,
+            "test-key",
+            ModelId::new("slow/model"),
+            &path,
+        )
+        .unwrap();
+        let connection = backend.connect();
+        negotiate(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+                name: "Project concurrency".into(),
+            }))
+            .result
+            .unwrap()
+        {
+            ServerResponse::WorkspaceCreated(workspace) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let root = match connection
+            .request(RequestEnvelope::new(
+                ClientRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Manager".into(),
+                },
+            ))
+            .result
+            .unwrap()
+        {
+            ServerResponse::AgentSessionCreated(session) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                        config: WorkspaceConfig {
+                            project_agent_concurrency: 1,
+                            ..WorkspaceConfig::default()
+                        },
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::WorkspaceConfigUpdated)
+        ));
+
+        let create_child = |child_name: &str| {
+            connection.request(RequestEnvelope::new(ClientRequest::CreateProjectChild {
+                parent_session_id: root,
+                child_name: child_name.to_owned(),
+                spec: loom_core::DelegatedTaskSpec {
+                    intent: format!("Review {child_name}"),
+                    model_id: "slow/model".into(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                },
+            }))
+        };
+
+        let first = match create_child("worker-1").result.unwrap() {
+            ServerResponse::ProjectChildCreated { task, child } => (task, child),
+            response => panic!("unexpected first child response: {response:?}"),
+        };
+        request_seen
+            .recv_timeout(Duration::from_secs(3))
+            .expect("first child should begin its provider request");
+        let second = match create_child("worker-2").result.unwrap() {
+            ServerResponse::ProjectChildCreated { task, child } => (task, child),
+            response => panic!("unexpected second child response: {response:?}"),
+        };
+        assert_eq!(first.0.status, loom_core::DelegatedTaskStatus::Running);
+        assert_eq!(second.0.status, loom_core::DelegatedTaskStatus::Queued);
+        assert_ne!(first.1.session_id, second.1.session_id);
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::StartSessionAgentRun {
+                        session_id: second.1.session_id,
+                        task: "Bypass the project queue".into(),
+                        model: ModelId::new("slow/model"),
+                        system_instructions: None,
+                        repository_instructions: None,
+                    },
+                ))
+                .result,
+            Err(error) if error.code == ErrorCode::Conflict
+        ));
+
+        backend.shutdown().unwrap();
+        drop(connection);
+        drop(backend);
+        let session_roots = path.with_extension("session-roots");
+        let _ = fs::remove_dir_all(session_roots);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("credentials.json"));
     }
 
     #[test]
