@@ -127,6 +127,7 @@ impl ReviewState {
 pub(crate) struct RenameDialogState {
     pub(crate) session: AgentSessionSnapshot,
     pub(crate) input: String,
+    pub(crate) is_project: bool,
 }
 
 #[derive(Clone, Debug)]

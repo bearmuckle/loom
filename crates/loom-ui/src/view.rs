@@ -1722,7 +1722,7 @@ fn project_session_list_projection(
     let mut visited = BTreeSet::new();
     let mut root_node = SessionTreeNode {
         session_id: project.root_session_id,
-        label: format!("Project · {}", root_session.name),
+        label: root_session.name.clone(),
         children: Vec::new(),
     };
     visited.insert(project.root_session_id);
@@ -7577,7 +7577,7 @@ impl LoomView {
         match dialog.purpose {
             SessionSourceDialogPurpose::StartSession => {
                 let name = source.as_ref().map_or_else(
-                    || format!("Session {}", self.sessions.len().saturating_add(1)),
+                    || format!("Project {}", self.sessions.len().saturating_add(1)),
                     session_name_for_source,
                 );
                 self.create_session_on_node_with_source(
@@ -7666,7 +7666,7 @@ impl LoomView {
             .icon(Icon::new(IconName::Plus))
             .ghost()
             .small()
-            .tooltip("Start a session")
+            .tooltip("New project")
             .on_click(cx.listener(Self::new_session))
             .into_any_element()
     }
@@ -7680,12 +7680,12 @@ impl LoomView {
     ) {
         let creation_status = match source.as_ref() {
             Some(SessionCreationSource::GitHub(repository)) => {
-                format!("Creating session and cloning {}…", repository.full_name)
+                format!("Creating project and cloning {}…", repository.full_name)
             }
             Some(SessionCreationSource::LocalDirectory(_)) => {
-                "Creating session and attaching directory…".to_owned()
+                "Creating project and attaching directory…".to_owned()
             }
-            None => "Creating session…".to_owned(),
+            None => "Creating project…".to_owned(),
         };
         self.record_status(creation_status);
         let Some(backend) = self.node_backends.get(&node_id).cloned() else {
@@ -7829,7 +7829,7 @@ impl LoomView {
             .await;
             view.update(cx, |view, cx| match result {
                 Ok(snapshot) => {
-                    view.record_status("Session created successfully");
+                    view.record_status("Project created successfully");
                     view.node_model_catalogs
                         .insert(node_id.clone(), models);
                     view.session_models.insert(snapshot.id, model);
@@ -7851,6 +7851,7 @@ impl LoomView {
     pub(crate) fn begin_session_rename(
         &mut self,
         session: AgentSessionSnapshot,
+        is_project: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -7858,6 +7859,7 @@ impl LoomView {
         self.rename_dialog = Some(RenameDialogState {
             session: self.active_session.clone(),
             input: self.active_session.name.clone(),
+            is_project,
         });
         self.rename_input_state = None;
     }
@@ -8115,6 +8117,9 @@ impl LoomView {
         let rename_view = menu_view.clone();
         let archive_view = menu_view.clone();
         let rename_session = session.clone();
+        let is_project = menu_project
+            .as_ref()
+            .is_none_or(|project| project.root_session_id == session.id);
         let archive_session = session.clone();
         let archive_label = menu_project
             .as_ref()
@@ -8124,7 +8129,7 @@ impl LoomView {
             .item(PopupMenuItem::new("Rename").on_click(move |_, window, cx| {
                 let rename_session = rename_session.clone();
                 rename_view.update(cx, |view, cx| {
-                    view.begin_session_rename(rename_session, window, cx);
+                    view.begin_session_rename(rename_session, is_project, window, cx);
                 });
             }))
             .item(PopupMenuItem::new(archive_label).on_click(move |_, _, cx| {
@@ -9609,7 +9614,11 @@ impl LoomView {
                 div()
                     .text_sm()
                     .text_color(rgb(0xf3f4f6))
-                    .child("Rename session"),
+                    .child(if dialog.is_project {
+                        "Rename project"
+                    } else {
+                        "Rename session"
+                    }),
             )
             .child(
                 div()
@@ -9850,7 +9859,7 @@ impl LoomView {
             dialog_body = dialog_body
                 .text_sm()
                 .text_color(rgb(0x8f98a6))
-                .child("Start a new session with no files or repositories.");
+                .child("Start a new project with no files or repositories.");
         }
         if let Some(error) = &dialog.error
             && dialog.choice != SessionSourceChoice::GitHub
@@ -9866,7 +9875,7 @@ impl LoomView {
 
         Dialog::new(cx)
             .title(if is_start {
-                "Start a session"
+                "New project"
             } else {
                 "Add to this session"
             })
@@ -9888,7 +9897,7 @@ impl LoomView {
                             .text_xs()
                             .text_color(rgb(0x8f98a6))
                             .child(if is_start {
-                                "Choose what the new session starts with."
+                                "Choose what the new project starts with."
                             } else {
                                 "Choose a repository or folder to add to the active session."
                             }),
@@ -9901,7 +9910,7 @@ impl LoomView {
                             .when(is_start, |row| {
                                 row.child(
                                     Button::new("source-empty")
-                                        .label("Empty session")
+                                        .label("Empty project")
                                         .small()
                                         .when(
                                             dialog.choice == SessionSourceChoice::Empty,
@@ -9960,7 +9969,7 @@ impl LoomView {
                             .child(
                                 Button::new("confirm-session-source")
                                     .label(if is_start {
-                                        "Start session"
+                                        "Create project"
                                     } else {
                                         "Add to session"
                                     })
@@ -11014,7 +11023,7 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Sessions"))
+                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Projects"))
                     .child(self.render_new_session_button(view, cx)),
             )
             .child(
@@ -11120,14 +11129,14 @@ impl LoomView {
                                 .border_r_1()
                                 .border_color(rgb(0x30343f))
                                 .child(div().flex().items_center().justify_between().child(
-                                    div().text_sm().text_color(rgb(0xf3f4f6)).child("Sessions"),
+                                    div().text_sm().text_color(rgb(0xf3f4f6)).child("Projects"),
                                 ))
                                 .child(
                                     div()
                                         .mt_1()
                                         .text_xs()
                                         .text_color(rgb(0x8f98a6))
-                                        .child("Sessions"),
+                                        .child("Projects"),
                                 )
                                 .child(
                                     div()
@@ -11139,7 +11148,7 @@ impl LoomView {
                                         .border_color(rgb(0x293244))
                                         .text_sm()
                                         .text_color(rgb(0x64748b))
-                                        .child("Connect a worker to load sessions."),
+                                        .child("Connect a worker to load projects."),
                                 )
                                 .child(
                                     div()
@@ -11212,7 +11221,7 @@ impl LoomView {
                                             .border_color(rgb(0x293244))
                                             .text_sm()
                                             .text_color(rgb(0x64748b))
-                                            .child("Connect a worker to start a session."),
+                                            .child("Connect a worker to create a project."),
                                     ),
                             )
                             .when(self.settings_open, |element| {
@@ -11537,7 +11546,7 @@ impl Render for LoomView {
                             .when(layout.phone, |element| {
                                 element.child(
                                     Button::new("open-session-drawer")
-                                        .label("Sessions")
+                                        .label("Projects")
                                         .small()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.session_drawer_open = true;
@@ -11718,10 +11727,10 @@ impl Render for LoomView {
                         .justify_center()
                         .gap_3()
                         .bg(rgb(0x111318))
-                        .child(div().text_base().child("No sessions"))
+                        .child(div().text_base().child("No projects"))
                         .child(
                             Button::new("start-first-session")
-                                .label("Start a session")
+                                .label("Create a project")
                                 .on_click(cx.listener(Self::new_session)),
                         ),
                 )
@@ -14603,6 +14612,7 @@ mod loom_view_render_tests {
             view.rename_dialog = Some(RenameDialogState {
                 session: view.active_session.clone(),
                 input: "Renamed session".to_owned(),
+                is_project: true,
             });
         });
         render_scenario(cx, |view| {
@@ -15422,7 +15432,7 @@ mod worker_node_tests {
         assert_eq!(
             projection.entries,
             vec![
-                (root_id, "Project · Project".to_owned()),
+                (root_id, "Project".to_owned()),
                 (
                     child_id,
                     "↳ Researcher · task blocked · run Working — Review protocol changes"
