@@ -616,6 +616,15 @@ fn session_id_for_request(
         | ClientRequest::GetSessionUsage { session_id } => Some(*session_id),
         ClientRequest::ControlProjectChild {
             manager_session_id, ..
+        }
+        | ClientRequest::GetProjectChildReview {
+            manager_session_id, ..
+        }
+        | ClientRequest::IntegrateProjectChild {
+            manager_session_id, ..
+        }
+        | ClientRequest::CleanupProjectChildWorktree {
+            manager_session_id, ..
         } => Some(*manager_session_id),
         ClientRequest::GetSessionEvents { session_id, .. } => {
             Some(session_id.unwrap_or(active_session_id))
@@ -1388,6 +1397,11 @@ pub(crate) struct LoomView {
     local_directory_sources_available: bool,
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
     project_snapshot: Option<loom_core::ProjectSnapshot>,
+    project_child_review: Option<(
+        loom_core::ProjectWorktreeRecord,
+        loom_protocol::GitRepositoryStatus,
+        loom_protocol::GitDiff,
+    )>,
     project_snapshot_stale: bool,
     project_messages: Vec<AgentMessageRecord>,
     project_message_cursors: BTreeMap<AgentSessionId, u64>,
@@ -1609,6 +1623,7 @@ fn is_project_workspace_event(
     };
     match &event.event {
         ServerEvent::ProjectTaskUpdated { task } => task.project_id == project_id,
+        ServerEvent::ProjectChildWorktreeUpdated { worktree } => worktree.project_id == project_id,
         ServerEvent::ProjectAgentMessageAccepted { message } => message.project_id == project_id,
         ServerEvent::ProjectAgentCreated { agent } | ServerEvent::ProjectAgentUpdated { agent } => {
             agent.project_id == project_id
@@ -1924,6 +1939,7 @@ impl LoomView {
             local_directory_sources_available: true,
             sessions: Vec::new(),
             project_snapshot: None,
+            project_child_review: None,
             project_snapshot_stale: false,
             project_messages: Vec::new(),
             project_message_cursors: BTreeMap::new(),
@@ -2318,6 +2334,7 @@ impl LoomView {
                 Vec::new()
             },
             project_snapshot: None,
+            project_child_review: None,
             project_snapshot_stale: false,
             project_messages: Vec::new(),
             project_message_cursors: BTreeMap::new(),
@@ -2484,6 +2501,7 @@ impl LoomView {
                 Vec::new()
             },
             project_snapshot: None,
+            project_child_review: None,
             project_snapshot_stale: false,
             project_messages: Vec::new(),
             project_message_cursors: BTreeMap::new(),
@@ -2735,6 +2753,7 @@ impl LoomView {
                 Vec::new()
             },
             project_snapshot: None,
+            project_child_review: None,
             project_snapshot_stale: false,
             project_messages: Vec::new(),
             project_message_cursors: BTreeMap::new(),
@@ -3581,6 +3600,129 @@ impl LoomView {
         );
     }
 
+    fn review_project_child_from_ui(
+        &mut self,
+        manager_session_id: AgentSessionId,
+        project_id: loom_core::ProjectId,
+        task_id: loom_core::TaskId,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(
+            cx,
+            ClientRequest::GetProjectChildReview {
+                project_id,
+                manager_session_id,
+                task_id,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::ProjectChildReview {
+                    worktree,
+                    status,
+                    diff,
+                }) => {
+                    view.project_child_review =
+                        Some((worktree.clone(), status.clone(), diff.clone()));
+                    view.project_snapshot_stale = true;
+                    view.review.open = true;
+                    view.review.panel = ReviewPanel::Changes;
+                    view.review.selected_file = None;
+                    view.review.selected_path = Some(format!(
+                        "{} · diff from {}",
+                        worktree.branch_name, worktree.base_revision
+                    ));
+                    view.review.selected_staged = false;
+                    view.review.selection_revision = view.review.selection_revision.wrapping_add(1);
+                    view.review.vcs = Some(status);
+                    view.review.show_diff(diff);
+                    view.refresh_active_project_snapshot(cx);
+                }
+                Err(error) => view.record_backend_error("review project child", error),
+                Ok(response) => view.record_backend_error(
+                    "review project child",
+                    unexpected_response("project child review", response),
+                ),
+            },
+        );
+    }
+
+    fn integrate_project_child_from_ui(
+        &mut self,
+        manager_session_id: AgentSessionId,
+        project_id: loom_core::ProjectId,
+        task_id: loom_core::TaskId,
+        expected_parent_revision: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(
+            cx,
+            ClientRequest::IntegrateProjectChild {
+                project_id,
+                manager_session_id,
+                task_id,
+                expected_parent_revision,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree)) => {
+                    view.project_child_review = None;
+                    view.project_snapshot_stale = true;
+                    view.record_status(format!(
+                        "Child changes integrated at {}",
+                        worktree
+                            .integrated_revision
+                            .as_deref()
+                            .unwrap_or("unknown revision")
+                    ));
+                    view.refresh_active_project_snapshot(cx);
+                    view.refresh_review(cx);
+                }
+                Err(error) => view.record_backend_error("integrate project child", error),
+                Ok(response) => view.record_backend_error(
+                    "integrate project child",
+                    unexpected_response("project child integration", response),
+                ),
+            },
+        );
+    }
+
+    fn cleanup_project_child_from_ui(
+        &mut self,
+        manager_session_id: AgentSessionId,
+        project_id: loom_core::ProjectId,
+        task_id: loom_core::TaskId,
+        disposition: loom_core::ProjectWorktreeCleanupDisposition,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(
+            cx,
+            ClientRequest::CleanupProjectChildWorktree {
+                project_id,
+                manager_session_id,
+                task_id,
+                disposition,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree)) => {
+                    view.project_snapshot_stale = true;
+                    view.record_status(format!("Child checkout is {:?}", worktree.status));
+                    if view
+                        .project_child_review
+                        .as_ref()
+                        .is_some_and(|(current, _, _)| current.task_id == worktree.task_id)
+                    {
+                        view.project_child_review = None;
+                        view.review.open = false;
+                    }
+                    view.refresh_active_project_snapshot(cx);
+                }
+                Err(error) => view.record_backend_error("clean up project child", error),
+                Ok(response) => view.record_backend_error(
+                    "clean up project child",
+                    unexpected_response("project child cleanup", response),
+                ),
+            },
+        );
+    }
+
     fn schedule_project_poll(&mut self, cx: &mut Context<Self>) {
         if self.project_poll_scheduled
             || !self.project_root_is_active()
@@ -4050,6 +4192,7 @@ impl LoomView {
     pub(crate) fn consume_event(&mut self, event: &ServerEvent) {
         match event {
             ServerEvent::ProjectTaskUpdated { .. }
+            | ServerEvent::ProjectChildWorktreeUpdated { .. }
             | ServerEvent::ProjectAgentCreated { .. }
             | ServerEvent::ProjectAgentUpdated { .. } => {
                 self.project_snapshot_stale = true;
@@ -4888,6 +5031,7 @@ impl LoomView {
         self.providers_open = false;
         self.about_open = false;
         self.review.open = false;
+        self.project_child_review = None;
         let project_context = self.project_snapshot.clone().filter(|snapshot| {
             snapshot
                 .agents
@@ -7599,11 +7743,13 @@ impl LoomView {
 
     pub(crate) fn close_review(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.review.open = false;
+        self.project_child_review = None;
         self.session_drawer_open = false;
         cx.notify();
     }
 
     pub(crate) fn open_review_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.project_child_review = None;
         self.review.selected_path = Some(path.clone());
         self.review.selection_revision += 1;
         let selection_revision = self.review.selection_revision;
@@ -7683,6 +7829,7 @@ impl LoomView {
         let Some(repository_id) = self.selected_repository_id else {
             return;
         };
+        self.project_child_review = None;
         self.review.selected_path = Some(path.clone());
         self.review.selection_revision += 1;
         let selection_revision = self.review.selection_revision;
@@ -7869,6 +8016,93 @@ impl LoomView {
                             );
                         });
                     }));
+                }
+                if task.code_change
+                    && let Some(worktree) = project
+                        .worktrees
+                        .iter()
+                        .find(|worktree| worktree.task_id == task.task_id)
+                {
+                    let task_id = task.task_id;
+                    let terminal = matches!(
+                        task.status,
+                        loom_core::DelegatedTaskStatus::Completed
+                            | loom_core::DelegatedTaskStatus::Failed
+                            | loom_core::DelegatedTaskStatus::Cancelled
+                    );
+                    if !matches!(
+                        worktree.status,
+                        loom_core::ProjectWorktreeStatus::CleanupPending
+                            | loom_core::ProjectWorktreeStatus::Removed
+                    ) {
+                        let review_view = menu_view.clone();
+                        menu = menu.item(PopupMenuItem::new("Review child changes").on_click(
+                            move |_, _, cx| {
+                                review_view.update(cx, |view, cx| {
+                                    view.review_project_child_from_ui(
+                                        manager_session_id,
+                                        project_id,
+                                        task_id,
+                                        cx,
+                                    );
+                                });
+                            },
+                        ));
+                    }
+                    if terminal
+                        && task.status == loom_core::DelegatedTaskStatus::Completed
+                        && worktree.status == loom_core::ProjectWorktreeStatus::Ready
+                    {
+                        let integrate_view = menu_view.clone();
+                        let expected_parent_revision = worktree.base_revision.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new("Fast-forward child changes").on_click(
+                                move |_, _, cx| {
+                                    integrate_view.update(cx, |view, cx| {
+                                        view.integrate_project_child_from_ui(
+                                            manager_session_id,
+                                            project_id,
+                                            task_id,
+                                            expected_parent_revision.clone(),
+                                            cx,
+                                        );
+                                    });
+                                },
+                            ));
+                    }
+                    if terminal && worktree.status != loom_core::ProjectWorktreeStatus::Removed {
+                        if worktree.status != loom_core::ProjectWorktreeStatus::Retained {
+                            let retain_view = menu_view.clone();
+                            menu = menu.item(PopupMenuItem::new("Keep child checkout").on_click(
+                                move |_, _, cx| {
+                                    retain_view.update(cx, |view, cx| {
+                                        view.cleanup_project_child_from_ui(
+                                            manager_session_id,
+                                            project_id,
+                                            task_id,
+                                            loom_core::ProjectWorktreeCleanupDisposition::Retain,
+                                            cx,
+                                        );
+                                    });
+                                },
+                            ));
+                        }
+                        let cleanup_view = menu_view.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new("Remove clean child checkout").on_click(
+                                move |_, _, cx| {
+                                    cleanup_view.update(cx, |view, cx| {
+                                        view.cleanup_project_child_from_ui(
+                                        manager_session_id,
+                                        project_id,
+                                        task_id,
+                                        loom_core::ProjectWorktreeCleanupDisposition::RemoveClean,
+                                        cx,
+                                    );
+                                    });
+                                },
+                            ));
+                    }
                 }
             }
             menu
@@ -8522,7 +8756,11 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let layout = responsive_layout(window.bounds().size.width);
-        let title = "Changes";
+        let title = if self.project_child_review.is_some() {
+            "Project child review"
+        } else {
+            "Changes"
+        };
         let mut body = div()
             .when(!layout.phone, |element| {
                 element
@@ -8546,7 +8784,7 @@ impl LoomView {
             .p_2();
         match self.review.panel {
             ReviewPanel::Changes => {
-                if self.session_repositories.len() > 1 {
+                if self.project_child_review.is_none() && self.session_repositories.len() > 1 {
                     body = body.child(
                         div()
                             .text_xs()
@@ -8578,15 +8816,16 @@ impl LoomView {
                     }
                 }
                 if let Some(status) = &self.review.vcs {
-                    body = body.child(
-                        div()
-                            .mt_2()
-                            .text_xs()
-                            .text_color(rgb(0x93c5fd))
-                            .child("REPOSITORY CHANGES"),
-                    );
+                    body = body.child(div().mt_2().text_xs().text_color(rgb(0x93c5fd)).child(
+                        if self.project_child_review.is_some() {
+                            "CHILD WORKTREE CHANGES"
+                        } else {
+                            "REPOSITORY CHANGES"
+                        },
+                    ));
                     for (index, file) in status.files.iter().enumerate() {
                         let path = file.path.clone();
+                        let project_child_review = self.project_child_review.is_some();
                         let staged = matches!(
                             file.worktree,
                             GitFileStatusKind::Unknown | GitFileStatusKind::Ignored
@@ -8614,11 +8853,14 @@ impl LoomView {
                                     deletions
                                 ))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_review_diff(path.clone(), staged, cx);
+                                    if !project_child_review {
+                                        this.open_review_diff(path.clone(), staged, cx);
+                                    }
                                 })),
                         );
                         if !staged && file.index != GitFileStatusKind::Unknown {
                             let path = file.path.clone();
+                            let project_child_review = self.project_child_review.is_some();
                             body = body.child(
                                 div()
                                     .id(("git-staged-file", index))
@@ -8632,22 +8874,27 @@ impl LoomView {
                                         file.index_additions, file.index_deletions
                                     ))
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.open_review_diff(path.clone(), true, cx);
+                                        if !project_child_review {
+                                            this.open_review_diff(path.clone(), true, cx);
+                                        }
                                     })),
                             );
                         }
                     }
                 }
-                let workspace_changes = self
-                    .review
-                    .changes
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, change)| {
-                        self.review.repositories_loaded
-                            && !belongs_to_repository(&change.path, &self.session_repositories)
-                    })
-                    .collect::<Vec<_>>();
+                let workspace_changes = if self.project_child_review.is_some() {
+                    Vec::new()
+                } else {
+                    self.review
+                        .changes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, change)| {
+                            self.review.repositories_loaded
+                                && !belongs_to_repository(&change.path, &self.session_repositories)
+                        })
+                        .collect::<Vec<_>>()
+                };
                 if !workspace_changes.is_empty() {
                     body = body.child(
                         div()
@@ -8676,7 +8923,7 @@ impl LoomView {
                             })),
                     );
                 }
-                if !self.review.repositories_loaded {
+                if self.project_child_review.is_none() && !self.review.repositories_loaded {
                     body = body.child(
                         div()
                             .text_sm()
@@ -8723,7 +8970,9 @@ impl LoomView {
                             .flex_col()
                             .child(div().text_sm().child(path.clone()))
                             .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
-                                if self.review.selected_file.is_some() {
+                                if self.project_child_review.is_some() {
+                                    "Project child checkout · read only"
+                                } else if self.review.selected_file.is_some() {
                                     "Current file · no repository diff"
                                 } else if self.review.selected_staged {
                                     "Staged changes · read only"
@@ -14579,6 +14828,7 @@ mod worker_node_tests {
                 },
             ],
             tasks: vec![],
+            worktrees: vec![],
         };
 
         let projection = project_session_list_projection(&sessions, child_id, Some(&project));
@@ -14623,6 +14873,49 @@ mod worker_node_tests {
             project_child_control_actions(SessionState::Completed, TaskStatus::Completed)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn project_worktree_updates_are_included_in_project_workspace_refreshes() {
+        let project_id = loom_core::ProjectId::new();
+        let root_session_id = AgentSessionId::new();
+        let worktree = loom_core::ProjectWorktreeRecord {
+            project_id,
+            task_id: loom_core::TaskId::new(),
+            parent_session_id: root_session_id,
+            child_session_id: AgentSessionId::new(),
+            parent_repository_id: loom_core::RepositoryId::new(),
+            child_repository_id: loom_core::RepositoryId::new(),
+            relative_path: "project-worktrees/example".to_owned(),
+            worktree_name: "loom-child-example".to_owned(),
+            branch_name: "loom/project-child-example".to_owned(),
+            base_revision: "base".to_owned(),
+            result_revision: None,
+            integrated_revision: None,
+            status: loom_core::ProjectWorktreeStatus::Ready,
+            conflict_paths: Vec::new(),
+            error: None,
+            cleanup_disposition: None,
+            created_at: loom_core::Timestamp::from_unix_millis(1),
+            updated_at: loom_core::Timestamp::from_unix_millis(1),
+        };
+        let event =
+            loom_protocol::WorkspaceFeedEvent::Session(loom_protocol::ServerEventEnvelope {
+                protocol_version: loom_protocol::CURRENT_PROTOCOL_VERSION,
+                sequence: EventSequence::new(3),
+                session_id: root_session_id,
+                event: loom_protocol::ServerEvent::ProjectChildWorktreeUpdated { worktree },
+            });
+        let members = std::collections::BTreeSet::from([root_session_id]);
+
+        assert!(super::is_project_workspace_event(
+            &event, project_id, &members
+        ));
+        assert!(!super::is_project_workspace_event(
+            &event,
+            loom_core::ProjectId::new(),
+            &members
+        ));
     }
 
     #[test]

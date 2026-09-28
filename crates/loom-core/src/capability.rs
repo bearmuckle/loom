@@ -44,9 +44,13 @@ pub enum Capability {
     WriteSessionFilesystem,
     ReadProject,
     CreateProjectChild,
+    CreateProjectWorktree,
     ControlProjectChild,
     SendProjectAgentMessage,
     ReadProjectAgentMessages,
+    ReadProjectChildReview,
+    IntegrateProjectChild,
+    CleanupProjectChildWorktree,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

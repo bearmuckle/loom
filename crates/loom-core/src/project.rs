@@ -31,6 +31,8 @@ pub struct ProjectSnapshot {
     /// Durable task intent and lifecycle state for delegated project agents.
     #[serde(default)]
     pub tasks: Vec<DelegatedTaskRecord>,
+    /// Durable checkout ownership, review, integration, and cleanup state.
+    pub worktrees: Vec<ProjectWorktreeRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -74,6 +76,53 @@ pub struct DelegatedTaskRecord {
     pub dependencies: Vec<TaskId>,
     pub code_change: bool,
     pub status: DelegatedTaskStatus,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectWorktreeStatus {
+    Creating,
+    Ready,
+    Stale,
+    Conflict,
+    Integrating,
+    Integrated,
+    RecoveryRequired,
+    CleanupPending,
+    Retained,
+    Removed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectWorktreeCleanupDisposition {
+    Retain,
+    RemoveClean,
+    DiscardChanges,
+}
+
+/// Durable identity and disposition of the isolated code checkout assigned to
+/// a delegated task. The path is relative to the child's session filesystem.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectWorktreeRecord {
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub parent_session_id: AgentSessionId,
+    pub child_session_id: AgentSessionId,
+    pub parent_repository_id: crate::RepositoryId,
+    pub child_repository_id: crate::RepositoryId,
+    pub relative_path: String,
+    pub worktree_name: String,
+    pub branch_name: String,
+    pub base_revision: String,
+    pub result_revision: Option<String>,
+    pub integrated_revision: Option<String>,
+    pub status: ProjectWorktreeStatus,
+    pub conflict_paths: Vec<String>,
+    pub error: Option<String>,
+    pub cleanup_disposition: Option<ProjectWorktreeCleanupDisposition>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -151,6 +200,7 @@ mod tests {
                 },
             ],
             tasks: vec![],
+            worktrees: vec![],
         };
         let json = serde_json::to_string(&snapshot).unwrap();
         let decoded: ProjectSnapshot = serde_json::from_str(&json).unwrap();

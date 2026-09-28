@@ -5,8 +5,9 @@ use std::{
 };
 
 use git2::{
-    BranchType, Cred, DiffFormat, DiffOptions, FetchOptions, RemoteCallbacks, Repository, Status,
-    StatusOptions, build::RepoBuilder,
+    BranchType, Cred, DiffFormat, DiffOptions, FetchOptions, Oid, RemoteCallbacks, Repository,
+    Status, StatusOptions, WorktreeAddOptions, WorktreeLockStatus, WorktreePruneOptions,
+    build::{CheckoutBuilder, RepoBuilder},
 };
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
 pub use loom_protocol::{
@@ -216,64 +217,37 @@ impl GitService {
                 .diff_index_to_workdir(None, Some(&mut options))
                 .map_err(|error| git_error("could not create Git diff", error))?
         };
-        let mut patch = Vec::new();
-        let mut hunks: Vec<GitDiffHunk> = Vec::new();
-        diff.print(DiffFormat::Patch, |_delta, hunk, line| {
-            if let Some(hunk) = hunk {
-                let new_hunk = hunks.last().is_none_or(|last| {
-                    last.old_start != hunk.old_start() || last.new_start != hunk.new_start()
-                });
-                if new_hunk {
-                    hunks.push(GitDiffHunk {
-                        old_start: hunk.old_start(),
-                        old_lines: hunk.old_lines(),
-                        new_start: hunk.new_start(),
-                        new_lines: hunk.new_lines(),
-                        lines: Vec::new(),
-                    });
-                }
-            }
-            if matches!(line.origin(), ' ' | '+' | '-') {
-                patch.push(line.origin() as u8);
-                if let Some(hunk) = hunks.last_mut() {
-                    let kind = match line.origin() {
-                        '+' => GitDiffLineKind::Added,
-                        '-' => GitDiffLineKind::Removed,
-                        _ => GitDiffLineKind::Context,
-                    };
-                    hunk.lines.push(GitDiffLine {
-                        kind,
-                        old_line: line.old_lineno(),
-                        new_line: line.new_lineno(),
-                        content: String::from_utf8_lossy(line.content())
-                            .trim_end_matches('\n')
-                            .trim_end_matches('\r')
-                            .to_owned(),
-                    });
-                }
-            }
-            patch.extend_from_slice(line.content());
-            true
-        })
-        .map_err(|error| git_error("could not render Git diff", error))?;
-        let binary = diff
-            .deltas()
-            .any(|delta| delta.old_file().is_binary() || delta.new_file().is_binary());
-        let patch = String::from_utf8(patch).map_err(|error| {
-            LoomError::new(
-                ErrorCode::Vcs,
-                format!("Git diff contained invalid UTF-8: {error}"),
-                false,
-            )
+        render_git_diff(diff, normalized, staged, None)
+    }
+
+    /// Compares a base commit with the current index and working tree.
+    ///
+    /// The output is a bounded prefix of the rendered patch and hunks. A line
+    /// that would exceed `max_bytes` is omitted whole and marks the result as
+    /// truncated. `staged` is false because the result combines staged and
+    /// unstaged changes relative to the requested base revision.
+    pub fn diff_from_revision(&self, base_revision: &str, max_bytes: usize) -> Result<GitDiff> {
+        let base_oid = Oid::from_str(base_revision).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid Git base revision '{base_revision}': {error}"
+            ))
         })?;
-        Ok(GitDiff {
-            path: normalized,
-            staged,
-            binary,
-            patch,
-            hunks,
-            truncated: false,
-        })
+        let repository = self.repository()?;
+        let base = repository
+            .find_commit(base_oid)
+            .map_err(|error| git_error("could not resolve Git diff base commit", error))?;
+        let tree = base
+            .tree()
+            .map_err(|error| git_error("could not read Git diff base tree", error))?;
+        let mut options = DiffOptions::new();
+        options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .show_untracked_content(true);
+        let diff = repository
+            .diff_tree_to_workdir_with_index(Some(&tree), Some(&mut options))
+            .map_err(|error| git_error("could not create Git diff from base revision", error))?;
+        render_git_diff(diff, None, false, Some(max_bytes))
     }
 
     pub fn branches(&self) -> Result<Vec<GitBranch>> {
@@ -315,6 +289,409 @@ impl GitService {
             .and_then(|head| head.shorthand().ok().map(str::to_owned)))
     }
 
+    /// Fast-forwards the currently checked-out local branch to `target_commit`.
+    ///
+    /// The parent checkout must be clean, attached to a local branch, and at
+    /// `expected_head`. The target must descend from that expected revision.
+    /// Checkout uses Git's safe strategy; if checkout or the ref update fails,
+    /// the resulting checkout state is preserved for inspection and recovery.
+    pub fn advance_clean_head(&self, expected_head: Oid, target_commit: Oid) -> Result<Oid> {
+        let repository = self.repository()?;
+        if repository.state() != git2::RepositoryState::Clean {
+            return Err(LoomError::invalid_state(
+                "cannot fast-forward while another Git operation is in progress",
+            ));
+        }
+
+        let head = repository
+            .head()
+            .map_err(|error| git_error("could not read parent Git HEAD", error))?;
+        if !head.is_branch() {
+            return Err(LoomError::invalid_state(
+                "cannot fast-forward a detached or non-local Git HEAD",
+            ));
+        }
+        let branch_refname = head
+            .name()
+            .map_err(|error| git_error("could not read the parent Git branch name", error))?;
+        let head_target = head.target().ok_or_else(|| {
+            LoomError::invalid_state("the checked-out Git branch does not point to a commit")
+        })?;
+        if head_target != expected_head {
+            return Err(LoomError::conflict(format!(
+                "parent Git HEAD changed: expected {expected_head}, found {head_target}"
+            )));
+        }
+
+        let mut status_options = StatusOptions::new();
+        status_options
+            .include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .include_ignored(true)
+            .recurse_ignored_dirs(true)
+            .include_unreadable(true)
+            .include_unreadable_as_untracked(true);
+        let statuses = repository
+            .statuses(Some(&mut status_options))
+            .map_err(|error| git_error("could not inspect parent Git checkout", error))?;
+        if !statuses.is_empty() {
+            return Err(LoomError::conflict(
+                "cannot fast-forward a parent Git checkout with staged, modified, untracked, ignored, or unreadable files",
+            ));
+        }
+
+        let target = repository
+            .find_commit(target_commit)
+            .map_err(|error| git_error("could not resolve fast-forward target commit", error))?;
+        if target_commit != expected_head
+            && !repository
+                .graph_descendant_of(target_commit, expected_head)
+                .map_err(|error| git_error("could not verify fast-forward ancestry", error))?
+        {
+            return Err(LoomError::conflict(format!(
+                "target commit {target_commit} is not a descendant of expected parent HEAD {expected_head}"
+            )));
+        }
+        if target_commit == expected_head {
+            return Ok(expected_head);
+        }
+
+        let mut transaction = repository
+            .transaction()
+            .map_err(|error| git_error("could not start parent branch update", error))?;
+        transaction
+            .lock_ref(branch_refname)
+            .map_err(|error| git_error("could not lock parent branch for fast-forward", error))?;
+        let locked_target = repository
+            .find_reference(branch_refname)
+            .map_err(|error| git_error("could not re-read locked parent branch", error))?
+            .target()
+            .ok_or_else(|| LoomError::invalid_state("locked parent branch has no target commit"))?;
+        if locked_target != expected_head {
+            return Err(LoomError::conflict(format!(
+                "parent Git branch changed before fast-forward: expected {expected_head}, found {locked_target}"
+            )));
+        }
+
+        let mut checkout = CheckoutBuilder::new();
+        checkout.safe().update_index(true);
+        if let Err(error) = repository.checkout_tree(target.as_object(), Some(&mut checkout)) {
+            return Err(git_error(
+                &format!(
+                    "safe checkout of fast-forward target {target_commit} failed; parent branch remains at {expected_head} and checkout state was preserved"
+                ),
+                error,
+            ));
+        }
+
+        let checked_out_branch_target = repository
+            .find_reference(branch_refname)
+            .map_err(|error| {
+                git_error(
+                    "could not verify parent branch after checkout; checkout state was preserved",
+                    error,
+                )
+            })?
+            .target()
+            .ok_or_else(|| {
+                LoomError::invalid_state(
+                    "parent branch lost its target after checkout; checkout state was preserved",
+                )
+            })?;
+        if checked_out_branch_target != expected_head {
+            return Err(LoomError::conflict(format!(
+                "parent branch changed during fast-forward checkout: expected {expected_head}, found {checked_out_branch_target}; checkout state was preserved"
+            )));
+        }
+
+        transaction
+            .set_target(
+                branch_refname,
+                target_commit,
+                None,
+                "loom: fast-forward parent worktree",
+            )
+            .map_err(|error| {
+                git_error(
+                    &format!(
+                        "could not update parent branch to {target_commit}; checkout state was preserved for recovery"
+                    ),
+                    error,
+                )
+            })?;
+        transaction.commit().map_err(|error| {
+            git_error(
+                &format!(
+                    "could not commit parent branch update to {target_commit}; checkout state was preserved for recovery"
+                ),
+                error,
+            )
+        })?;
+
+        Ok(target_commit)
+    }
+
+    /// String-based wrapper for callers that persist Git revisions as text.
+    pub fn advance_clean_head_revisions(
+        &self,
+        expected_head: &str,
+        target_commit: &str,
+    ) -> Result<String> {
+        let expected_head_oid = Oid::from_str(expected_head).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid expected parent Git revision '{expected_head}': {error}"
+            ))
+        })?;
+        let target_commit_oid = Oid::from_str(target_commit).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid target Git revision '{target_commit}': {error}"
+            ))
+        })?;
+        self.advance_clean_head(expected_head_oid, target_commit_oid)
+            .map(|revision| revision.to_string())
+    }
+
+    /// Creates a linked worktree at `path`, based on `base_commit`, and checks
+    /// out a newly created local branch in it.
+    ///
+    /// Worktree names and local branch names must be unused. The target path's
+    /// parent directory must already exist, and the target must not overlap
+    /// this repository's working tree.
+    pub fn create_linked_worktree(
+        &self,
+        worktree_name: &str,
+        branch_name: &str,
+        path: impl AsRef<Path>,
+        base_commit: Oid,
+    ) -> Result<Self> {
+        validate_worktree_name(worktree_name)?;
+        let path = self.validate_new_worktree_path(path.as_ref())?;
+        let repository = self.repository()?;
+
+        let worktrees = repository
+            .worktrees()
+            .map_err(|error| git_error("could not list Git worktrees", error))?;
+        let worktree_name_exists = worktrees.iter().try_fold(false, |found, name| {
+            let name =
+                name.map_err(|error| git_error("could not read Git worktree name", error))?;
+            Ok::<_, LoomError>(found || name == Some(worktree_name))
+        })?;
+        if worktree_name_exists {
+            return Err(LoomError::conflict(format!(
+                "Git worktree '{worktree_name}' already exists"
+            )));
+        }
+        if repository
+            .find_reference(&format!("refs/heads/{branch_name}"))
+            .is_ok()
+        {
+            return Err(LoomError::conflict(format!(
+                "local Git branch '{branch_name}' already exists"
+            )));
+        }
+
+        let commit = repository
+            .find_commit(base_commit)
+            .map_err(|error| git_error("could not resolve Git worktree base commit", error))?;
+
+        let branch = match repository.branch(branch_name, &commit, false) {
+            Ok(branch) => branch,
+            Err(error) => return Err(git_error("could not create Git worktree branch", error)),
+        };
+        let branch_reference = branch.into_reference();
+        let mut options = WorktreeAddOptions::new();
+        options.reference(Some(&branch_reference));
+        let worktree = match repository.worktree(worktree_name, &path, Some(&options)) {
+            Ok(worktree) => worktree,
+            Err(error) => {
+                let remove_unregistered_path = error.code() != git2::ErrorCode::Exists;
+                let original = git_error("could not create linked Git worktree", error);
+                drop(branch_reference);
+                let cleanup = cleanup_new_linked_worktree(
+                    &repository,
+                    worktree_name,
+                    branch_name,
+                    &path,
+                    remove_unregistered_path,
+                );
+                return Err(with_worktree_setup_cleanup(original, cleanup));
+            }
+        };
+        drop(worktree);
+        drop(branch_reference);
+
+        match Self::open(&path) {
+            Ok(worktree) => Ok(worktree),
+            Err(error) => {
+                let cleanup = cleanup_new_linked_worktree(
+                    &repository,
+                    worktree_name,
+                    branch_name,
+                    &path,
+                    true,
+                );
+                Err(with_worktree_setup_cleanup(error, cleanup))
+            }
+        }
+    }
+
+    /// Creates a linked worktree from a persisted commit OID string.
+    pub fn create_linked_worktree_at_revision(
+        &self,
+        worktree_name: &str,
+        branch_name: &str,
+        path: impl AsRef<Path>,
+        base_revision: &str,
+    ) -> Result<Self> {
+        let base_commit = Oid::from_str(base_revision).map_err(|error| {
+            LoomError::invalid_request(format!(
+                "invalid Git worktree base revision '{base_revision}': {error}"
+            ))
+        })?;
+        self.create_linked_worktree(worktree_name, branch_name, path, base_commit)
+    }
+
+    /// Opens a linked worktree only when its registered name and path match.
+    pub fn open_linked_worktree(
+        &self,
+        worktree_name: &str,
+        path: impl AsRef<Path>,
+    ) -> Result<Self> {
+        validate_worktree_name(worktree_name)?;
+        let repository = self.repository()?;
+        let worktree = repository.find_worktree(worktree_name).map_err(|error| {
+            if error.code() == git2::ErrorCode::NotFound {
+                LoomError::not_found("Git worktree", worktree_name)
+            } else {
+                git_error("could not find registered Git worktree", error)
+            }
+        })?;
+        let registered_path = worktree.path();
+        for candidate in [path.as_ref(), registered_path] {
+            match fs::symlink_metadata(candidate) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        format!(
+                            "refusing to open linked Git worktree '{worktree_name}' through symlink path '{}'",
+                            candidate.display()
+                        ),
+                        false,
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return Err(LoomError::new(
+                        ErrorCode::WorkspaceAccessDenied,
+                        format!(
+                            "could not inspect linked Git worktree path '{}': {error}",
+                            candidate.display()
+                        ),
+                        false,
+                    ));
+                }
+            }
+        }
+        worktree
+            .validate()
+            .map_err(|error| git_error("registered Git worktree is invalid", error))?;
+
+        let requested_path = fs::canonicalize(path.as_ref()).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not resolve requested Git worktree path: {error}"),
+                false,
+            )
+        })?;
+        let registered_path = fs::canonicalize(registered_path).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not resolve registered Git worktree path: {error}"),
+                false,
+            )
+        })?;
+        if requested_path != registered_path {
+            return Err(LoomError::conflict(format!(
+                "path '{}' does not match the registered path for Git worktree '{worktree_name}'",
+                path.as_ref().display()
+            )));
+        }
+        Self::open(registered_path)
+    }
+
+    /// Removes a named linked worktree and prunes its Git metadata.
+    ///
+    /// A worktree with tracked, untracked, ignored, or staged changes is kept
+    /// unless `force` is true. Its local branch is deliberately retained.
+    pub fn remove_linked_worktree(&self, worktree_name: &str, force: bool) -> Result<()> {
+        validate_worktree_name(worktree_name)?;
+        let repository = self.repository()?;
+        let worktree = repository.find_worktree(worktree_name).map_err(|error| {
+            if error.code() == git2::ErrorCode::NotFound {
+                LoomError::not_found("Git worktree", worktree_name)
+            } else {
+                git_error("could not open linked Git worktree", error)
+            }
+        })?;
+        let path = worktree.path().to_path_buf();
+
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!(
+                        "refusing to remove linked Git worktree '{worktree_name}' because its path is a symlink"
+                    ),
+                    false,
+                ));
+            }
+            Ok(_) => {
+                worktree.validate().map_err(|error| {
+                    git_error(
+                        "could not validate linked Git worktree before removal",
+                        error,
+                    )
+                })?;
+                let checkout = Repository::open(&path)
+                    .map_err(|error| git_error("could not inspect linked Git worktree", error))?;
+                let mut options = StatusOptions::new();
+                options
+                    .include_untracked(true)
+                    .recurse_untracked_dirs(true)
+                    .include_ignored(true)
+                    .recurse_ignored_dirs(true);
+                let statuses = checkout.statuses(Some(&mut options)).map_err(|error| {
+                    git_error("could not inspect linked Git worktree changes", error)
+                })?;
+                if !statuses.is_empty() && !force {
+                    return Err(LoomError::conflict(format!(
+                        "Git worktree '{worktree_name}' has changes; pass force only when its contents may be discarded"
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not inspect linked Git worktree path: {error}"),
+                    false,
+                ));
+            }
+        }
+
+        if matches!(worktree.is_locked(), Ok(WorktreeLockStatus::Locked(_))) && !force {
+            return Err(LoomError::conflict(format!(
+                "Git worktree '{worktree_name}' is locked; pass force only when its lock may be removed"
+            )));
+        }
+
+        let mut options = WorktreePruneOptions::new();
+        options.valid(true).locked(force).working_tree(true);
+        worktree
+            .prune(Some(&mut options))
+            .map_err(|error| git_error("could not remove linked Git worktree", error))
+    }
+
     pub fn conflicts(&self) -> Result<Vec<String>> {
         Ok(self.status()?.conflicts)
     }
@@ -336,10 +713,138 @@ impl GitService {
         Ok(candidate.to_string_lossy().replace('\\', "/"))
     }
 
+    fn validate_new_worktree_path(&self, path: &Path) -> Result<PathBuf> {
+        if !path.is_absolute()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(LoomError::invalid_request(
+                "Git worktree destination must be an absolute path without parent traversal",
+            ));
+        }
+        let parent = path.parent().ok_or_else(|| {
+            LoomError::invalid_request("Git worktree destination must have a parent directory")
+        })?;
+        let file_name = path.file_name().ok_or_else(|| {
+            LoomError::invalid_request("Git worktree destination must name a directory")
+        })?;
+        let parent = fs::canonicalize(parent).map_err(|error| {
+            LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                format!("could not resolve Git worktree destination parent: {error}"),
+                false,
+            )
+        })?;
+        let path = parent.join(file_name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(LoomError::conflict(format!(
+                    "Git worktree destination '{}' already exists",
+                    path.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(LoomError::new(
+                    ErrorCode::WorkspaceAccessDenied,
+                    format!("could not inspect Git worktree destination: {error}"),
+                    false,
+                ));
+            }
+        }
+        if path.starts_with(&self.root) || self.root.starts_with(&path) {
+            return Err(LoomError::invalid_request(
+                "Git worktree destination must not overlap the source working tree",
+            ));
+        }
+        Ok(path)
+    }
+
     fn repository(&self) -> Result<Repository> {
         Repository::open(&self.root)
             .map_err(|error| git_error("could not open Git repository", error))
     }
+}
+
+fn render_git_diff(
+    diff: git2::Diff<'_>,
+    path: Option<String>,
+    staged: bool,
+    max_bytes: Option<usize>,
+) -> Result<GitDiff> {
+    let mut patch = Vec::new();
+    let mut hunks: Vec<GitDiffHunk> = Vec::new();
+    let mut truncated = false;
+    let print_result = diff.print(DiffFormat::Patch, |_delta, hunk, line| {
+        let new_hunk = hunk.and_then(|hunk| {
+            let is_new = hunks.last().is_none_or(|last| {
+                last.old_start != hunk.old_start() || last.new_start != hunk.new_start()
+            });
+            is_new.then(|| GitDiffHunk {
+                old_start: hunk.old_start(),
+                old_lines: hunk.old_lines(),
+                new_start: hunk.new_start(),
+                new_lines: hunk.new_lines(),
+                lines: Vec::new(),
+            })
+        });
+        let origin = line.origin();
+        let contents = line.content();
+        let has_prefix = matches!(origin, ' ' | '+' | '-');
+        let output_line_len = contents.len() + usize::from(has_prefix);
+        if max_bytes.is_some_and(|limit| output_line_len > limit.saturating_sub(patch.len())) {
+            truncated = true;
+            return false;
+        }
+        if let Some(hunk) = new_hunk {
+            hunks.push(hunk);
+        }
+        if has_prefix {
+            patch.push(origin as u8);
+            if let Some(hunk) = hunks.last_mut() {
+                let kind = match origin {
+                    '+' => GitDiffLineKind::Added,
+                    '-' => GitDiffLineKind::Removed,
+                    _ => GitDiffLineKind::Context,
+                };
+                hunk.lines.push(GitDiffLine {
+                    kind,
+                    old_line: line.old_lineno(),
+                    new_line: line.new_lineno(),
+                    content: String::from_utf8_lossy(contents)
+                        .trim_end_matches('\n')
+                        .trim_end_matches('\r')
+                        .to_owned(),
+                });
+            }
+        }
+        patch.extend_from_slice(contents);
+        true
+    });
+    if let Err(error) = print_result
+        && (!truncated || error.code() != git2::ErrorCode::User)
+    {
+        return Err(git_error("could not render Git diff", error));
+    }
+    let binary = diff
+        .deltas()
+        .any(|delta| delta.old_file().is_binary() || delta.new_file().is_binary());
+    let patch = String::from_utf8(patch).map_err(|error| {
+        LoomError::new(
+            ErrorCode::Vcs,
+            format!("Git diff contained invalid UTF-8: {error}"),
+            false,
+        )
+    })?;
+    Ok(GitDiff {
+        path,
+        staged,
+        patch,
+        binary,
+        hunks,
+        truncated,
+    })
 }
 
 fn count_diff_lines(repository: &Repository, staged: bool) -> Result<BTreeMap<String, (u32, u32)>> {
@@ -409,6 +914,136 @@ fn status_kind(status: Status, index: bool) -> GitFileStatusKind {
     }
 }
 
+fn validate_worktree_name(name: &str) -> Result<()> {
+    if name.trim().is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(LoomError::invalid_request(
+            "Git worktree name must be a non-empty single path component",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_new_worktree_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path)
+        }
+        Ok(_) => {
+            return Err(LoomError::new(
+                ErrorCode::WorkspaceAccessDenied,
+                "refusing to remove a partially created Git worktree path that is not a directory",
+                false,
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(LoomError::new(
+                ErrorCode::Vcs,
+                format!("could not inspect failed Git worktree path: {error}"),
+                false,
+            ));
+        }
+    }
+    .map_err(|error| {
+        LoomError::new(
+            ErrorCode::Vcs,
+            format!("could not remove partially created Git worktree directory: {error}"),
+            false,
+        )
+    })
+}
+
+fn cleanup_new_linked_worktree(
+    repository: &Repository,
+    worktree_name: &str,
+    branch_name: &str,
+    path: &Path,
+    remove_unregistered_path: bool,
+) -> Result<()> {
+    let mut cleanup_errors = Vec::new();
+    let mut worktree_removed = false;
+    match repository.find_worktree(worktree_name) {
+        Ok(worktree) if worktree.path() == path && worktree_is_on_branch(path, branch_name) => {
+            let mut options = WorktreePruneOptions::new();
+            options.valid(true).locked(true).working_tree(true);
+            match worktree.prune(Some(&mut options)) {
+                Ok(()) => worktree_removed = true,
+                Err(error) => cleanup_errors.push(format!(
+                    "could not prune partially created worktree: {error}"
+                )),
+            }
+        }
+        // A same-named worktree may have been created concurrently after the
+        // preflight check. Leave it and its path alone; this call owns only its
+        // newly created branch.
+        Ok(_) => worktree_removed = true,
+        Err(error) if error.code() == git2::ErrorCode::NotFound && remove_unregistered_path => {
+            match remove_new_worktree_directory(path) {
+                Ok(()) => worktree_removed = true,
+                Err(error) => cleanup_errors.push(error.message),
+            }
+        }
+        Err(error) if error.code() == git2::ErrorCode::NotFound => worktree_removed = true,
+        Err(error) => cleanup_errors.push(format!(
+            "could not inspect worktree during setup cleanup: {error}"
+        )),
+    }
+
+    if worktree_removed {
+        match repository.find_branch(branch_name, BranchType::Local) {
+            Ok(mut branch) => {
+                if let Err(error) = branch.delete() {
+                    cleanup_errors.push(format!("could not delete new local branch: {error}"));
+                }
+            }
+            Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+            Err(error) => {
+                cleanup_errors.push(format!("could not look up new local branch: {error}"))
+            }
+        }
+    }
+
+    if cleanup_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(LoomError::new(
+            ErrorCode::Vcs,
+            cleanup_errors.join("; "),
+            false,
+        ))
+    }
+}
+
+fn worktree_is_on_branch(path: &Path, branch_name: &str) -> bool {
+    Repository::open(path).ok().is_some_and(|repository| {
+        repository
+            .head()
+            .ok()
+            .and_then(|head| head.shorthand().ok().map(|name| name == branch_name))
+            .unwrap_or(false)
+    })
+}
+
+fn with_worktree_setup_cleanup(original: LoomError, cleanup: Result<()>) -> LoomError {
+    match cleanup {
+        Ok(()) => original,
+        Err(cleanup) => LoomError::new(
+            original.code,
+            format!(
+                "{}; setup cleanup failed: {}",
+                original.message, cleanup.message
+            ),
+            false,
+        ),
+    }
+}
+
 fn git_error(operation: &str, error: git2::Error) -> LoomError {
     LoomError::new(ErrorCode::Vcs, format!("{operation}: {error}"), false)
 }
@@ -446,6 +1081,18 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    fn descendant_commit(git: &GitService, root: &Path) -> (Oid, String, String) {
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let child_branch = format!("codex/ff-{}", loom_core::RepositoryId::new());
+        run(root, &["checkout", "-qb", &child_branch]);
+        fs::write(root.join("README.md"), "after\n").unwrap();
+        run(root, &["add", "--", "README.md"]);
+        run(root, &["commit", "-qm", "child change"]);
+        let target = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(root, &["checkout", "-q", &parent_branch]);
+        (target, child_branch, parent_branch)
     }
 
     #[test]
@@ -491,6 +1138,28 @@ mod tests {
         assert_eq!(diff.hunks[0].lines[1].kind, GitDiffLineKind::Added);
         let untracked = git.diff(Some("new.txt"), false).unwrap();
         assert_eq!(untracked.hunks[0].lines[0].content, "new");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn revision_diff_includes_commits_and_unstaged_files_with_a_limit() {
+        let (git, root) = repository();
+        let base = git.repository().unwrap().head().unwrap().target().unwrap();
+        fs::write(root.join("committed.txt"), "committed content\n").unwrap();
+        run(&root, &["add", "--", "committed.txt"]);
+        run(&root, &["commit", "-qm", "commit after base"]);
+        fs::write(root.join("unstaged.txt"), "unstaged content\n").unwrap();
+
+        let diff = git.diff_from_revision(&base.to_string(), 4096).unwrap();
+        assert!(diff.patch.contains("committed.txt"));
+        assert!(diff.patch.contains("+committed content"));
+        assert!(diff.patch.contains("unstaged.txt"));
+        assert!(diff.patch.contains("+unstaged content"));
+        assert!(!diff.truncated);
+
+        let limited = git.diff_from_revision(&base.to_string(), 24).unwrap();
+        assert!(limited.truncated);
+        assert!(limited.patch.len() <= 24);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -542,6 +1211,346 @@ mod tests {
         let branch = git.current_branch().unwrap();
         assert!(branch.is_some());
         assert!(git.branches().unwrap().iter().any(|branch| branch.current));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_head_fast_forward_checks_out_and_advances_branch() {
+        let (git, root) = repository();
+        let expected = git.repository().unwrap().head().unwrap().target().unwrap();
+        let (target, _child_branch, parent_branch) = descendant_commit(&git, &root);
+
+        assert_eq!(git.advance_clean_head(expected, target).unwrap(), target);
+        let repository = git.repository().unwrap();
+        assert_eq!(repository.head().unwrap().target(), Some(target));
+        assert_eq!(
+            git.current_branch().unwrap().as_deref(),
+            Some(parent_branch.as_str())
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "after\n"
+        );
+        assert!(git.status().unwrap().clean);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_head_fast_forward_accepts_persisted_revision_strings() {
+        let (git, root) = repository();
+        let expected = git.repository().unwrap().head().unwrap().target().unwrap();
+        let (target, _, _) = descendant_commit(&git, &root);
+
+        assert_eq!(
+            git.advance_clean_head_revisions(&expected.to_string(), &target.to_string())
+                .unwrap(),
+            target.to_string()
+        );
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(target)
+        );
+        assert!(git.status().unwrap().clean);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_head_fast_forward_rejects_stale_expected_head() {
+        let (git, root) = repository();
+        let expected = git.repository().unwrap().head().unwrap().target().unwrap();
+        let (target, child_branch, _) = descendant_commit(&git, &root);
+        run(&root, &["checkout", "-q", &child_branch]);
+
+        assert_eq!(
+            git.advance_clean_head(expected, target).unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(target)
+        );
+        assert!(git.status().unwrap().clean);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_head_fast_forward_rejects_non_descendant_target() {
+        let (git, root) = repository();
+        let expected = git.repository().unwrap().head().unwrap().target().unwrap();
+        let parent_branch = git.current_branch().unwrap().unwrap();
+        let unrelated_branch = format!("codex/unrelated-{}", loom_core::RepositoryId::new());
+        run(&root, &["checkout", "-q", "--orphan", &unrelated_branch]);
+        fs::write(root.join("README.md"), "unrelated\n").unwrap();
+        run(&root, &["add", "--", "README.md"]);
+        run(&root, &["commit", "-qm", "unrelated change"]);
+        let unrelated = git.repository().unwrap().head().unwrap().target().unwrap();
+        run(&root, &["checkout", "-q", &parent_branch]);
+
+        assert_eq!(
+            git.advance_clean_head(expected, unrelated)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(expected)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "before\n"
+        );
+        assert!(git.status().unwrap().clean);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_head_fast_forward_rejects_detached_head() {
+        let (git, root) = repository();
+        let expected = git.repository().unwrap().head().unwrap().target().unwrap();
+        git.repository()
+            .unwrap()
+            .set_head_detached(expected)
+            .unwrap();
+
+        assert_eq!(
+            git.advance_clean_head(expected, expected).unwrap_err().code,
+            ErrorCode::InvalidState
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clean_head_fast_forward_rejects_dirty_parent_checkout() {
+        let (git, root) = repository();
+        let expected = git.repository().unwrap().head().unwrap().target().unwrap();
+        let (target, _, _) = descendant_commit(&git, &root);
+        fs::write(root.join("README.md"), "local change\n").unwrap();
+
+        assert_eq!(
+            git.advance_clean_head(expected, target).unwrap_err().code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            git.repository().unwrap().head().unwrap().target(),
+            Some(expected)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("README.md")).unwrap(),
+            "local change\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_worktree_uses_the_requested_commit_and_new_branch() {
+        let (git, root) = repository();
+        let base_commit = git.repository().unwrap().head().unwrap().target().unwrap();
+        let id = loom_core::RepositoryId::new();
+        let worktree_name = format!("child-{id}");
+        let branch_name = format!("codex/child-{id}");
+        let path = std::env::temp_dir().join(format!("loom-linked-{id}"));
+        let parent_branch = git.current_branch().unwrap();
+        let expected_commit = base_commit.to_string();
+
+        let child = git
+            .create_linked_worktree(&worktree_name, &branch_name, &path, base_commit)
+            .unwrap();
+
+        assert_eq!(
+            child.current_branch().unwrap().as_deref(),
+            Some(branch_name.as_str())
+        );
+        assert_eq!(
+            child.status().unwrap().head.as_deref(),
+            Some(expected_commit.as_str())
+        );
+        assert!(child.status().unwrap().clean);
+        assert_eq!(git.current_branch().unwrap(), parent_branch);
+        assert!(
+            git.branches()
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name == branch_name)
+        );
+
+        let colliding_path = std::env::temp_dir().join(format!("loom-linked-{id}-duplicate"));
+        let duplicate_branch = format!("codex/duplicate-{id}");
+        assert_eq!(
+            git.create_linked_worktree(
+                &worktree_name,
+                &duplicate_branch,
+                &colliding_path,
+                base_commit
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::Conflict
+        );
+        assert!(path.exists());
+        assert!(!colliding_path.exists());
+        assert!(
+            git.repository()
+                .unwrap()
+                .find_reference(&format!("refs/heads/{duplicate_branch}"))
+                .is_err()
+        );
+
+        git.remove_linked_worktree(&worktree_name, false).unwrap();
+        assert!(!path.exists());
+        assert!(
+            git.branches()
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name == branch_name)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_worktree_revision_wrapper_and_registered_open_are_validated() {
+        let (git, root) = repository();
+        let base_commit = git.repository().unwrap().head().unwrap().target().unwrap();
+        let id = loom_core::RepositoryId::new();
+        let worktree_name = format!("child-{id}");
+        let branch_name = format!("codex/child-{id}");
+        let path = std::env::temp_dir().join(format!("loom-linked-{id}"));
+
+        assert_eq!(
+            git.create_linked_worktree_at_revision(
+                &format!("invalid-{id}"),
+                &format!("codex/invalid-{id}"),
+                std::env::temp_dir().join(format!("loom-invalid-{id}")),
+                "not-an-oid"
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::InvalidRequest
+        );
+        git.create_linked_worktree_at_revision(
+            &worktree_name,
+            &branch_name,
+            &path,
+            &base_commit.to_string(),
+        )
+        .unwrap();
+
+        let opened = git.open_linked_worktree(&worktree_name, &path).unwrap();
+        assert_eq!(opened.root(), path.canonicalize().unwrap());
+        assert_eq!(
+            opened.current_branch().unwrap().as_deref(),
+            Some(branch_name.as_str())
+        );
+        assert_eq!(
+            git.open_linked_worktree(&worktree_name, &root)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        git.remove_linked_worktree(&worktree_name, false).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_worktree_creation_rejects_branch_and_path_collisions() {
+        let (git, root) = repository();
+        let base_commit = git.repository().unwrap().head().unwrap().target().unwrap();
+        let id = loom_core::RepositoryId::new();
+        let current_branch = git.current_branch().unwrap().unwrap();
+        let branch_collision_path = std::env::temp_dir().join(format!("loom-linked-{id}-branch"));
+        assert_eq!(
+            git.create_linked_worktree(
+                &format!("child-{id}-branch"),
+                &current_branch,
+                &branch_collision_path,
+                base_commit
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::Conflict
+        );
+        assert!(!branch_collision_path.exists());
+
+        let path_collision = std::env::temp_dir().join(format!("loom-linked-{id}-existing"));
+        fs::create_dir(&path_collision).unwrap();
+        let branch_name = format!("codex/child-{id}-existing");
+        assert_eq!(
+            git.create_linked_worktree(
+                &format!("child-{id}-existing"),
+                &branch_name,
+                &path_collision,
+                base_commit
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::Conflict
+        );
+        assert!(
+            git.repository()
+                .unwrap()
+                .find_reference(&format!("refs/heads/{branch_name}"))
+                .is_err()
+        );
+        fs::remove_dir_all(path_collision).unwrap();
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_worktree_removal_preserves_changes_without_force() {
+        let (git, root) = repository();
+        fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        run(&root, &["add", "--", ".gitignore"]);
+        run(&root, &["commit", "-qm", "ignore generated files"]);
+        let base_commit = git.repository().unwrap().head().unwrap().target().unwrap();
+        let id = loom_core::RepositoryId::new();
+        let worktree_name = format!("child-{id}");
+        let branch_name = format!("codex/child-{id}");
+        let path = std::env::temp_dir().join(format!("loom-linked-{id}"));
+        git.create_linked_worktree(&worktree_name, &branch_name, &path, base_commit)
+            .unwrap();
+        fs::write(path.join("ignored.txt"), "keep unless forced\n").unwrap();
+
+        assert_eq!(
+            git.remove_linked_worktree(&worktree_name, false)
+                .unwrap_err()
+                .code,
+            ErrorCode::Conflict
+        );
+        assert_eq!(
+            fs::read_to_string(path.join("ignored.txt")).unwrap(),
+            "keep unless forced\n"
+        );
+
+        git.remove_linked_worktree(&worktree_name, true).unwrap();
+        assert!(!path.exists());
+        assert!(
+            git.branches()
+                .unwrap()
+                .iter()
+                .any(|branch| branch.name == branch_name)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn invalid_branch_does_not_leave_a_worktree_path() {
+        let (git, root) = repository();
+        let base_commit = git.repository().unwrap().head().unwrap().target().unwrap();
+        let id = loom_core::RepositoryId::new();
+        let path = std::env::temp_dir().join(format!("loom-linked-{id}"));
+        assert_eq!(
+            git.create_linked_worktree(
+                &format!("child-{id}"),
+                "invalid..branch",
+                &path,
+                base_commit
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::Vcs
+        );
+        assert!(!path.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

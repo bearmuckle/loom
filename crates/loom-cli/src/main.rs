@@ -1123,6 +1123,10 @@ fn render_event(envelope: &loom_protocol::ServerEventEnvelope) {
             "project task {} [{:?}]: {}",
             task.task_id, task.status, task.child_name
         ),
+        ServerEvent::ProjectChildWorktreeUpdated { worktree } => println!(
+            "project child worktree {} [{:?}]: {}",
+            worktree.task_id, worktree.status, worktree.branch_name
+        ),
         ServerEvent::ProjectAgentMessageAccepted { message } => println!(
             "project message {:?} {} -> {}: {}",
             message.kind,

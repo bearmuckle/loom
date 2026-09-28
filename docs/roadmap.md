@@ -169,8 +169,8 @@ This XL feature is delivered as independently reviewable slices rather than
 one large orchestration change:
 
 - **M7.0 complete:** migrate SQLite v41 through v46 and represent every existing root session
-  as a project; add durable parentage, delegated task, message, and integration
-  records; advance the protocol contract; require clients to meet the minimum
+  as a project; add durable parentage, delegated task, and message records;
+  advance the protocol contract; require clients to meet the minimum
   supported version before serving project-aware messages; recover committed
   child launches.
 - **M7.1 complete:** enable direct-child non-code delegation with bounded concurrency,
@@ -180,8 +180,10 @@ one large orchestration change:
 - **M7.2 complete:** present projects in workspace navigation and expose child
   status, transcript output, durable message history, and individual controls.
   Project archive waits for terminal child tasks, then archives the project tree.
-- M7.3: add isolated child worktrees, reviewable diffs, explicit parent-owned
-  integration, conflict handling, and recoverable cleanup.
+- **M7.3 complete for direct children:** add isolated child worktrees,
+  reviewable diffs, exact-revision review, parent-owned fast-forward
+  integration, and recoverable cleanup. Stale or diverged work remains
+  reviewable; automatic merge and conflict resolution are deferred.
 - M7.4: enable level-three agents and policy-checked branch-to-branch
   messaging after nested integration works reliably.
 
@@ -191,12 +193,13 @@ before code worktrees; no fixed plan-to-issues-to-build pipeline is required.
 Each slice's exit conditions and verification cases are defined in the design
 document.
 
-The v41-to-v46 database transition is forward-only. Backend downgrades to a
-pre-project version are unsupported. Old-client forward compatibility is not
-supported: deployments must ensure or force clients to upgrade, and the
-backend rejects clients outside the supported protocol version during
-negotiation with the existing `UnsupportedProtocol` response before sending
-project schemas.
+The v41-to-v47 database transition is forward-only. Backend downgrades are
+unsupported.
+Old-client forward compatibility is not supported: deployments must ensure
+or force clients to upgrade, and the backend rejects clients outside the
+supported protocol version during negotiation with the existing
+`UnsupportedProtocol` response before sending project schemas. Protocol 7.0
+and schema v47 are required for child worktrees.
 
 ## Quality bar
 

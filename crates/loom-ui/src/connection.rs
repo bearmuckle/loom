@@ -384,6 +384,10 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::ReadProject,
         Capability::ReadProjectAgentMessages,
         Capability::ControlProjectChild,
+        Capability::CreateProjectWorktree,
+        Capability::ReadProjectChildReview,
+        Capability::IntegrateProjectChild,
+        Capability::CleanupProjectChildWorktree,
         Capability::JsonProtocol,
     ])
 }
@@ -437,6 +441,10 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::ReadProject,
         Capability::ReadProjectAgentMessages,
         Capability::ControlProjectChild,
+        Capability::CreateProjectWorktree,
+        Capability::ReadProjectChildReview,
+        Capability::IntegrateProjectChild,
+        Capability::CleanupProjectChildWorktree,
         Capability::JsonProtocol,
     ])
 }

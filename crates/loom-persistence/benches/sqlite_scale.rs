@@ -123,6 +123,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 project_messaging_enabled: false,
                 project_inspection_enabled: false,
                 project_child_control_enabled: false,
+                project_worktree_enabled: false,
+                project_integration_enabled: false,
             },
         );
         run_activities.insert(

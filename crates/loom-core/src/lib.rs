@@ -21,7 +21,8 @@ pub use policy::{ActionKind, ApprovalPolicy, PolicyDecision, PolicyEvaluation};
 pub use project::{
     AgentMessageDraft, AgentMessageKind, AgentMessageRecord, DelegatedTaskRecord,
     DelegatedTaskSpec, DelegatedTaskStatus, MAX_PROJECT_AGENT_DEPTH, ProjectAgentRecord,
-    ProjectSnapshot, TaskContextReference,
+    ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
+    ProjectWorktreeStatus, TaskContextReference,
 };
 pub use session::{AgentSessionSnapshot, AgentSessionState, SessionEvent, SessionEventRecord};
 pub use time::Timestamp;

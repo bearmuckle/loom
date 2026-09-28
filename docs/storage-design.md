@@ -2,7 +2,7 @@
 
 ## Status
 
-The project-session rollout upgrades forward through schema version 46. The
+The project-session rollout upgrades forward through schema version 47. The
 v41-to-v42 migration backfills existing sessions as project roots, v43 adds the
 durable project-message delivery cursor to run execution state, and v44 stores
 the per-run project-delegation grant. V45 adds separate per-run messaging and
@@ -10,14 +10,17 @@ inspection grants, defaulting them off for runs already in the database. V46
 adds a separate per-run child-control grant, also defaulting off for existing
 runs. Each migration records its own resulting version only after its schema
 change succeeds, so an interrupted multi-step upgrade can resume at the next
-missing migration.
-Incompatible databases are rejected
-without modification; backend downgrades and schema downgrade migrations are
-unsupported. If an upgrade must be rolled back, restore a pre-upgrade backup
-or move forward with a fix.
+missing migration. Incompatible databases are rejected without modification;
+backend downgrades and schema downgrade migrations are unsupported. The
+v46-to-v47 migration adds normalized project worktree records with ownership,
+base/result and integration revisions, conflict paths, lifecycle status, and
+cleanup disposition. Per-run code-worktree and integration grants default to
+disabled. After that migration, a v46-only backend cannot open a database. If
+an upgrade must be rolled back, restore a pre-upgrade backup or move forward
+with a fix.
 
-The v41-to-v42 migration must add project hierarchy, delegated-task, addressed
-message, and worktree/integration records and backfill one root project per
+The v41-to-v42 migration adds project hierarchy, delegated-task, and addressed
+message records and backfills one root project per
 existing session without changing session IDs or deleting existing history.
 Run the schema changes and backfill atomically, validate parent/root and
 workspace ownership invariants before updating `PRAGMA user_version`, and leave
@@ -29,7 +32,9 @@ run runtime configuration. The v44-to-v45 migration adds
 migration adds `project_child_control_enabled`. These grants remain separate,
 so existing runs do not acquire new capabilities during an upgrade. Existing
 runs default to disabled; new runs persist each project capability grant
-chosen at start so restart recovery exposes the same tool set. Each migration
+chosen at start so restart recovery exposes the same tool set. The v46-to-v47
+migration adds the independent worktree and integration grants; existing runs
+receive neither grant. Each migration
 should be tested for successful upgrade, rollback on failure, and safe retry
 after interruption.
 

@@ -22,11 +22,13 @@ timeline now displays durable parent-child messages with separate project
 activity styling. Child context menus provide pause/resume/interrupt/cancel
 controls, and project-root views refresh from workspace event cursors after
 reconnect. Project archive waits until child tasks are terminal, then archives
-the descendants with the root. Worktree-backed code tasks and integration
-remain future slices. Workspace
-settings configure the maximum number of delegated agents running in parallel
-(default four, range one to sixteen); additional tasks remain durable and
-queued. A project can have up to fifty queued or active delegated tasks.
+the descendants with the root. Code-changing children now use isolated linked
+worktrees; project managers can review bounded diffs, fast-forward eligible
+commits, and retain or remove child checkouts with an explicit cleanup
+disposition. The worktree contract uses protocol 7.0 and SQLite schema v47.
+Workspace settings configure the maximum number of delegated agents running in
+parallel (default four, range one to sixteen); additional tasks remain durable
+and queued. A project can have up to fifty queued or active delegated tasks.
 
 The feature makes a root agent session a **project**: the durable owner of a
 user goal and the root of an agent hierarchy. A project manager may delegate
@@ -109,20 +111,26 @@ not mandatory plan-document-to-issue-to-build pipelines.
 ## Code task isolation and integration
 
 Each code-changing agent receives its own Git worktree; non-code work gets no
-worktree. A child worktree is based on its parent's current project branch and
+worktree. The initial implementation accepts exactly one Git repository
+attached to the parent session and requires its checkout to be clean. Missing
+or multiple repositories and native in-place directory attachments are
+rejected. A child worktree is based on its parent's current project branch and
 revision. A level-three worktree is based on its level-two parent's branch and
 revision. Siblings never share a mutable checkout, and parentage grants no
 shared-filesystem access.
 
 The parent reviews a child's result and performs or directs integration into
-its own branch. A child never writes or merges into its parent's worktree. Each
+its own branch. A child never writes or merges into its parent's worktree. The
+initial integration mode is fast-forward only: require a clean parent at the
+expected base and review of the exact child `HEAD`; if that revision changes,
+review it again. Stale or diverged parent revisions remain reviewable and
+recoverable; automatic merge and conflict resolution are not supported. Each
 level integrates its descendants before returning its result upward; the
 project manager owns final integration into the project branch and the
 user-facing summary. Record base/result revisions, review and integration
-status, conflict state, and cleanup state. Stale bases and conflicts become
-visible coordination states with reviewable diffs and messages. Cleanup must
-preserve unmerged work or record an explicit disposition. Never silently
-overwrite parent or sibling changes.
+status, conflict state, and cleanup state. Cleanup preserves unmerged work or
+records an explicit disposition. Never silently overwrite parent or sibling
+changes.
 
 The first implementation should support repositories already represented by
 the session repository service. Before extending this to attached native
@@ -132,13 +140,14 @@ are handled; a child must never inherit a mutable attachment accidentally.
 
 ## Protocol and persistence design
 
-Add versioned protocol operations and projections for project snapshots,
-children, delegated tasks, addressed messages, agent controls, and worktree
-integration. The current contract includes `CreateProjectChild`,
-`GetProjectSnapshot` (including lookup from any member session),
-`SendProjectAgentMessage`, `ListProjectAgentMessages`, and
-`ControlProjectChild` (pause/resume/interrupt/cancel); future worktree
-operations remain provisional and must follow existing request conventions.
+The protocol includes versioned operations and projections for project
+snapshots, children, delegated tasks, addressed messages, agent controls, and
+worktree integration: `CreateProjectChild`, `GetProjectSnapshot` (including
+lookup from any member session), `SendProjectAgentMessage`,
+`ListProjectAgentMessages`, `ControlProjectChild` (pause/resume/interrupt/cancel),
+`GetProjectChildReview`, `IntegrateProjectChild`, and
+`CleanupProjectChildWorktree`. Worktree operations require their negotiated
+capabilities and project membership checks.
 `ProjectSnapshot` carries task IDs, intent, and lifecycle status so clients can
 address child controls without deriving identity from labels. The client
 control request is authorized against the project root and child membership;
@@ -173,15 +182,22 @@ field. The persisted workspace-config JSON uses a serde default of four when
 the field is absent, so existing stored settings do not need a separate SQLite
 schema migration.
 
-Advance the protocol version for the project contract. Prefer a major version
-change if the new required domain semantics or enum variants are not backward
-compatible; update all supported native/browser clients in the same release
-window. Keep the existing session request surface for root-session operations
-where practical, but clients admitted to the new protocol must treat roots as
-projects. Define the minimum client version and error/update path before
-enabling the backend feature. Backend downgrades to pre-project
-protocol/storage versions are unsupported, including when no child agents
-have been created.
+The child-worktree and integration contract advances the protocol to 7.0 and
+the SQLite schema to v47. Protocol 6.x clients are rejected during negotiation
+before capability discovery or any v7 worktree request, response, or event is
+sent; deployments must ensure or force the client upgrade. The implemented
+v46-to-v47 migration adds durable worktree ownership, base/result, integration,
+conflict, and cleanup state, plus default-disabled per-run code-worktree and
+integration grants. A backend that only supports v46 cannot open a database
+after migration to v47. Backend and schema downgrades remain unsupported;
+recover by restoring a pre-upgrade backup or moving forward with a fix.
+
+Protocol 7.0 is the minimum client contract for child worktrees and
+integration. Keep the existing session request surface for root-session
+operations where practical, but admitted clients treat roots as projects. The
+server rejects older clients with `UnsupportedProtocol` before sending v7
+variants. Backend downgrades to pre-project protocol/storage versions are
+unsupported, including when no child agents have been created.
 
 Persist normalized queryable records for project membership/parentage,
 delegated task intent and dependencies, message envelope/body and ordering,
@@ -193,12 +209,13 @@ Enforce one root per project, same-project parentage, no cycles, and
 maximum depth three in the backend domain service and persistence boundary.
 Do not place growing messages or child lists inside session JSON blobs.
 
-The project foundation requires forward SQLite migrations from schema version
-41 through version 46. The v41-to-v42 migration adds the
-normalized project, membership/parentage, delegated-task, addressed-message,
-and worktree/integration structures, then backfill each existing session as
-the root of a project while preserving its session ID, workspace, transcript,
-events, runs, approvals, and filesystem references. Existing session IDs
+The project foundation migrated forward from schema version 41 through version
+47. The v41-to-v42 migration adds normalized project,
+membership/parentage, delegated-task, and addressed-message structures, then
+backfills each existing session as the root of a project while preserving its
+session ID, workspace, transcript, events, runs, approvals, and filesystem
+references. The v46-to-v47 migration adds worktree/integration state and
+separate code-worktree and integration grants. Existing session IDs
 remain stable; if project IDs are separate, assign them once and persist the
 mapping. Set `user_version` to 42 only after the backfill and invariants pass.
 The v42-to-v43 migration adds the per-run project-message cursor used to
@@ -316,20 +333,34 @@ child independently; project state reconstructs after reconnect.
 
 ### Slice 3: code tasks and reviewed integration
 
-1. Add a backend worktree service that creates child worktrees from the
-   parent's recorded branch/revision, with ownership and cleanup records.
-2. Surface changed paths and bounded diffs for child output without granting
-   the parent implicit filesystem access.
-3. Add explicit parent review and integration commands. Integrate into the
-   parent's branch only after review; capture resulting revision or conflict.
-4. Handle stale bases, conflicts, retries, interruption, and failed cleanup
-   as durable statuses with recoverable work.
-5. Verify nested integration semantics at level two before enabling level
+1. **Implemented:** limit the first code-task implementation to one Git repository already
+   attached to the parent session. Reject missing or multiple repositories and
+   native in-place directory attachments. Require a clean parent checkout and
+   persist worktree intent before invoking Git.
+2. **Implemented:** create a task-derived local branch and linked worktree from the parent's
+   recorded `HEAD`; register that checkout only in the child session. Gate the
+   child run until its worktree is durably `Ready`.
+3. **Implemented:** surface changed paths and bounded diffs for child output without granting
+   the parent implicit filesystem access. Require the child result to be a
+   commit based on the recorded base before integration. Record the reviewed
+   child `HEAD`; if that revision changes, require another review.
+4. **Implemented:** add explicit parent review and integration commands. The first integration
+   mode is fast-forward only: require review of the exact child revision, a
+   clean parent checkout, and an exact expected `HEAD`; capture the resulting
+   revision. Surface stale or
+   diverged bases without replaying or rewriting commits, and retain the child
+   checkout for recovery.
+5. **Implemented:** persist creation/recovery and cleanup intent before filesystem mutations.
+   Reconcile interrupted setup/removal on restart; never recreate a missing
+   `Ready` checkout as an empty one or force-remove changed work implicitly.
+6. **Deferred:** verify nested integration semantics at level two before enabling level
    three in user workflows.
 
-**Exit:** siblings work in isolated worktrees and their parent can review,
-integrate, resolve conflicts, and report the resulting revision without
-discarding unmerged work.
+**Exit:** met for direct children. Siblings work in isolated worktrees and
+their parent can review and fast-forward integrate eligible child commits.
+Stale or diverged children remain reviewable and recoverable without
+discarding unmerged work; merge and conflict-resolution workflows remain a
+later design step.
 
 ### Slice 4: deeper hierarchy and branch communication
 
@@ -369,10 +400,10 @@ modify repositories.
 - Exact continuation scheduling/claim mechanism for children committed but
   not yet started.
 - Worktree creation and cleanup behavior for multi-repository tasks and native
-  local directory attachments.
+  local directory attachments; the initial slice rejects both.
 - Whether user messages can address a child directly or must pass through the
   project manager in the first UI.
 - Descendant behavior for project stop, archive, and deletion, including
   retention of unmerged child work.
-- Protocol compatibility window and database migration policy for existing
-  installations.
+- Whether clean-but-unintegrated child commits should be retained indefinitely
+  by default after project completion.

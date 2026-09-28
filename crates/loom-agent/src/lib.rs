@@ -55,6 +55,12 @@ pub struct AgentRuntimeOptions {
     /// Persisted grant for direct-child lifecycle controls.
     #[serde(default)]
     pub project_child_control_enabled: bool,
+    /// Persisted grant for creating isolated project code-task worktrees.
+    #[serde(default)]
+    pub project_worktree_enabled: bool,
+    /// Persisted grant for integrating reviewed child worktree commits.
+    #[serde(default)]
+    pub project_integration_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

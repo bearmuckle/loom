@@ -13,8 +13,9 @@ use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, CheckpointId,
     DelegatedTaskRecord, DelegatedTaskSpec, DelegatedTaskStatus, ErrorCode, EventSequence,
     InteractionId, LoomError, PolicyDecision, ProjectAgentRecord, ProjectId, ProjectSnapshot,
-    RepositoryId, RequestId, Result, RunAttemptId, RunId, SessionLimits, StepId,
-    TaskContextReference, TaskId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus, RepositoryId,
+    RequestId, Result, RunAttemptId, RunId, SessionLimits, StepId, TaskContextReference, TaskId,
+    Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
@@ -35,7 +36,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const DATABASE_SCHEMA_VERSION: u32 = 46;
+const DATABASE_SCHEMA_VERSION: u32 = 47;
+const PROJECT_CHILD_CONTROL_SCHEMA_VERSION: u32 = 46;
 const PROJECT_SCHEMA_VERSION: u32 = 42;
 const PROJECT_MESSAGE_SCHEMA_VERSION: u32 = 43;
 const PROJECT_DELEGATION_SCHEMA_VERSION: u32 = 44;
@@ -184,7 +186,11 @@ CREATE TABLE IF NOT EXISTS run_runtime_config (
     project_inspection_enabled INTEGER NOT NULL DEFAULT 0
         CHECK(project_inspection_enabled IN (0, 1)),
     project_child_control_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_child_control_enabled IN (0, 1))
+        CHECK(project_child_control_enabled IN (0, 1)),
+    project_worktree_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK(project_worktree_enabled IN (0, 1)),
+    project_integration_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK(project_integration_enabled IN (0, 1))
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS run_runtime_config_by_configuration
     ON run_runtime_config(configuration_hash);
@@ -809,6 +815,57 @@ CREATE INDEX IF NOT EXISTS project_agent_messages_by_sender
     ON project_agent_messages(project_id, sender_session_id, project_sequence);
 ";
 
+const PROJECT_WORKTREE_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS project_worktrees (
+    task_id BLOB PRIMARY KEY NOT NULL CHECK(length(task_id) = 16),
+    project_id BLOB NOT NULL CHECK(length(project_id) = 16),
+    parent_session_id BLOB NOT NULL CHECK(length(parent_session_id) = 16),
+    child_session_id BLOB NOT NULL CHECK(length(child_session_id) = 16),
+    parent_repository_id BLOB NOT NULL CHECK(length(parent_repository_id) = 16),
+    child_repository_id BLOB NOT NULL CHECK(length(child_repository_id) = 16),
+    relative_path TEXT NOT NULL CHECK(length(relative_path) > 0 AND length(relative_path) <= 4096
+        AND substr(relative_path, 1, 1) != '/' AND instr(relative_path, char(0)) = 0
+        AND instr(relative_path, char(92)) = 0 AND relative_path != '..'
+        AND relative_path NOT LIKE '../%' AND relative_path NOT LIKE '%/../%'
+        AND relative_path NOT LIKE '%/..'),
+    worktree_name TEXT NOT NULL CHECK(length(trim(worktree_name)) > 0 AND length(worktree_name) <= 256),
+    branch_name TEXT NOT NULL CHECK(length(trim(branch_name)) > 0 AND length(branch_name) <= 256),
+    base_revision TEXT NOT NULL CHECK(length(trim(base_revision)) > 0 AND length(base_revision) <= 256),
+    result_revision TEXT CHECK(result_revision IS NULL OR length(result_revision) <= 256),
+    integrated_revision TEXT CHECK(integrated_revision IS NULL OR length(integrated_revision) <= 256),
+    status TEXT NOT NULL CHECK(status IN (
+        'creating', 'ready', 'stale', 'conflict', 'integrating', 'integrated', 'recovery_required',
+        'cleanup_pending', 'retained', 'removed'
+    )),
+    error TEXT CHECK(error IS NULL OR length(error) <= 8192),
+    cleanup_disposition TEXT CHECK(cleanup_disposition IS NULL OR cleanup_disposition IN (
+        'retain', 'remove_clean', 'discard_changes'
+    )),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+    UNIQUE(project_id, task_id),
+    FOREIGN KEY(task_id) REFERENCES delegated_tasks(task_id) ON DELETE CASCADE,
+    FOREIGN KEY(project_id, parent_session_id)
+        REFERENCES sessions_hierarchy(project_id, session_id) ON DELETE CASCADE,
+    FOREIGN KEY(project_id, child_session_id)
+        REFERENCES sessions_hierarchy(project_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS project_worktrees_by_project_status
+    ON project_worktrees(project_id, status, updated_at, task_id);
+CREATE TABLE IF NOT EXISTS project_worktree_conflict_paths (
+    project_id BLOB NOT NULL CHECK(length(project_id) = 16),
+    task_id BLOB NOT NULL CHECK(length(task_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    path TEXT NOT NULL CHECK(length(path) > 0 AND length(path) <= 4096),
+    PRIMARY KEY(project_id, task_id, ordinal),
+    UNIQUE(project_id, task_id, path),
+    FOREIGN KEY(project_id, task_id)
+        REFERENCES project_worktrees(project_id, task_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE INDEX IF NOT EXISTS project_worktree_conflicts_by_path
+    ON project_worktree_conflict_paths(project_id, path, task_id);
+";
+
 fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> {
     let (raw_size, codec, payload): (i64, i64, Vec<u8>) = connection
         .query_row(
@@ -1135,6 +1192,8 @@ pub struct DurableRunRuntimeConfig {
     pub project_messaging_enabled: bool,
     pub project_inspection_enabled: bool,
     pub project_child_control_enabled: bool,
+    pub project_worktree_enabled: bool,
+    pub project_integration_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1552,6 +1611,71 @@ impl FilePersistence {
         session_next_sequence: EventSequence,
         task: &DelegatedTaskRecord,
     ) -> Result<DelegatedTaskRecord> {
+        self.create_project_child_inner(
+            request_id,
+            child_snapshot,
+            session_next_sequence,
+            task,
+            None,
+        )
+    }
+
+    /// Creates a code-changing child and records its initial worktree intent in
+    /// the same transaction as the session and delegated task.
+    pub fn create_project_child_with_worktree(
+        &self,
+        request_id: RequestId,
+        child_snapshot: &AgentSessionSnapshot,
+        session_next_sequence: EventSequence,
+        task: &DelegatedTaskRecord,
+        worktree: &ProjectWorktreeRecord,
+    ) -> Result<DelegatedTaskRecord> {
+        if !task.code_change || worktree.status != ProjectWorktreeStatus::Creating {
+            return Err(LoomError::invalid_request(
+                "atomic worktree creation requires a code task in creating state",
+            ));
+        }
+        if !worktree.conflict_paths.is_empty()
+            || worktree.error.is_some()
+            || worktree.result_revision.is_some()
+            || worktree.integrated_revision.is_some()
+            || worktree.cleanup_disposition.is_some()
+        {
+            return Err(LoomError::invalid_request(
+                "initial project worktree intent must not contain completion state",
+            ));
+        }
+        if worktree.project_id != task.project_id
+            || worktree.task_id != task.task_id
+            || worktree.parent_session_id != task.requester_session_id
+            || worktree.child_session_id != task.target_session_id
+        {
+            return Err(LoomError::invalid_request(
+                "project worktree must match its delegated task",
+            ));
+        }
+        self.create_project_child_inner(
+            request_id,
+            child_snapshot,
+            session_next_sequence,
+            task,
+            Some(worktree),
+        )
+    }
+
+    fn create_project_child_inner(
+        &self,
+        request_id: RequestId,
+        child_snapshot: &AgentSessionSnapshot,
+        session_next_sequence: EventSequence,
+        task: &DelegatedTaskRecord,
+        initial_worktree: Option<&ProjectWorktreeRecord>,
+    ) -> Result<DelegatedTaskRecord> {
+        if task.code_change && initial_worktree.is_none() {
+            return Err(LoomError::invalid_request(
+                "code-changing project tasks require an atomic worktree intent",
+            ));
+        }
         if task.target_session_id != child_snapshot.id {
             return Err(LoomError::invalid_request(
                 "delegated task target must match the child session",
@@ -1623,6 +1747,17 @@ impl FilePersistence {
                 return Err(LoomError::invalid_request(
                     "request ID was already used for a different delegated task",
                 ));
+            }
+            if let Some(initial_worktree) = initial_worktree {
+                let existing_worktree =
+                    load_project_worktree(&transaction, existing.task_id.as_uuid())?;
+                if !existing_worktree.as_ref().is_some_and(|existing| {
+                    same_project_worktree_identity(existing, initial_worktree)
+                }) {
+                    return Err(LoomError::invalid_request(
+                        "request ID was already used for a different project worktree",
+                    ));
+                }
             }
             transaction.commit().map_err(|error| {
                 persistence_error(
@@ -1728,6 +1863,9 @@ impl FilePersistence {
             )
             .map_err(|error| persistence_error(format!("could not update session sequence: {error}"), true))?;
         insert_delegated_task(&transaction, request_id, &request_fingerprint, task)?;
+        if let Some(initial_worktree) = initial_worktree {
+            persist_initial_project_worktree(&transaction, initial_worktree)?;
+        }
         transaction.commit().map_err(|error| {
             persistence_error(
                 format!("could not commit delegated task transaction: {error}"),
@@ -1735,6 +1873,148 @@ impl FilePersistence {
             )
         })?;
         Ok(task.clone())
+    }
+
+    /// Persists the owned checkout state for a delegated project task.
+    pub fn save_project_worktree(&self, worktree: &ProjectWorktreeRecord) -> Result<()> {
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin project worktree write: {error}"),
+                true,
+            )
+        })?;
+        let ownership_matches: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM delegated_tasks AS task
+                    JOIN sessions_hierarchy AS parent
+                      ON parent.project_id=task.project_id
+                     AND parent.session_id=task.requester_session_id
+                    JOIN sessions_hierarchy AS child
+                      ON child.project_id=task.project_id
+                     AND child.session_id=task.target_session_id
+                    WHERE task.task_id=?1 AND task.project_id=?2
+                      AND task.requester_session_id=?3 AND task.target_session_id=?4
+                 )",
+                params![
+                    worktree.task_id.as_uuid().as_bytes().as_slice(),
+                    worktree.project_id.as_uuid().as_bytes().as_slice(),
+                    worktree.parent_session_id.as_uuid().as_bytes().as_slice(),
+                    worktree.child_session_id.as_uuid().as_bytes().as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not verify project worktree ownership: {error}"),
+                    true,
+                )
+            })?;
+        if !ownership_matches {
+            return Err(LoomError::invalid_request(
+                "project worktree must match its delegated task and hierarchy members",
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO project_worktrees(
+                    task_id, project_id, parent_session_id, child_session_id,
+                    parent_repository_id, child_repository_id, relative_path,
+                    worktree_name, branch_name, base_revision, result_revision,
+                    integrated_revision, status, error, cleanup_disposition,
+                    created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT(task_id) DO UPDATE SET
+                    project_id=excluded.project_id,
+                    parent_session_id=excluded.parent_session_id,
+                    child_session_id=excluded.child_session_id,
+                    parent_repository_id=excluded.parent_repository_id,
+                    child_repository_id=excluded.child_repository_id,
+                    relative_path=excluded.relative_path,
+                    worktree_name=excluded.worktree_name,
+                    branch_name=excluded.branch_name,
+                    base_revision=excluded.base_revision,
+                    result_revision=excluded.result_revision,
+                    integrated_revision=excluded.integrated_revision,
+                    status=excluded.status,
+                    error=excluded.error,
+                    cleanup_disposition=excluded.cleanup_disposition,
+                    created_at=excluded.created_at,
+                    updated_at=excluded.updated_at",
+                params![
+                    worktree.task_id.as_uuid().as_bytes().as_slice(),
+                    worktree.project_id.as_uuid().as_bytes().as_slice(),
+                    worktree.parent_session_id.as_uuid().as_bytes().as_slice(),
+                    worktree.child_session_id.as_uuid().as_bytes().as_slice(),
+                    worktree.parent_repository_id.as_uuid().as_bytes().as_slice(),
+                    worktree.child_repository_id.as_uuid().as_bytes().as_slice(),
+                    worktree.relative_path,
+                    worktree.worktree_name,
+                    worktree.branch_name,
+                    worktree.base_revision,
+                    worktree.result_revision,
+                    worktree.integrated_revision,
+                    project_worktree_status_name(worktree.status),
+                    worktree.error,
+                    worktree.cleanup_disposition.map(project_worktree_cleanup_name),
+                    encode_timestamp(worktree.created_at)?,
+                    encode_timestamp(worktree.updated_at)?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save project worktree: {error}"), true)
+            })?;
+        transaction
+            .execute(
+                "DELETE FROM project_worktree_conflict_paths WHERE project_id=?1 AND task_id=?2",
+                params![
+                    worktree.project_id.as_uuid().as_bytes().as_slice(),
+                    worktree.task_id.as_uuid().as_bytes().as_slice(),
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not replace project worktree conflicts: {error}"),
+                    true,
+                )
+            })?;
+        for (ordinal, path) in worktree.conflict_paths.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO project_worktree_conflict_paths(project_id, task_id, ordinal, path)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        worktree.project_id.as_uuid().as_bytes().as_slice(),
+                        worktree.task_id.as_uuid().as_bytes().as_slice(),
+                        i64::try_from(ordinal).map_err(|_| {
+                            LoomError::invalid_request("too many project worktree conflict paths")
+                        })?,
+                        path,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not save project worktree conflict: {error}"), true)
+                })?;
+        }
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit project worktree write: {error}"),
+                true,
+            )
+        })
+    }
+
+    /// Loads the durable checkout assigned to one delegated task.
+    pub fn load_project_worktree_by_task(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<ProjectWorktreeRecord>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let connection = self.connection()?;
+        load_project_worktree(&connection, task_id.as_uuid())
     }
 
     /// Reads a durable delegated task and its normalized context/dependency rows.
@@ -2333,6 +2613,51 @@ impl FilePersistence {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let worktree_ids = {
+            let mut worktree_statement = transaction
+                .prepare(
+                    "SELECT task_id FROM project_worktrees
+                     WHERE project_id=?1 ORDER BY created_at, task_id",
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not prepare project worktree snapshot: {error}"),
+                        true,
+                    )
+                })?;
+            worktree_statement
+                .query_map([project_id.as_uuid().as_bytes().as_slice()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not read project worktree snapshot: {error}"),
+                        true,
+                    )
+                })?
+                .map(|row| {
+                    row.map_err(|error| {
+                        persistence_error(
+                            format!("could not read project worktree task ID: {error}"),
+                            true,
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let worktrees = worktree_ids
+            .iter()
+            .map(|bytes| {
+                let id = decode_uuid(bytes, "project worktree task ID")?;
+                load_project_worktree(&transaction, &id)?.ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "project worktree index is inconsistent",
+                        false,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         let root_session_id = AgentSessionId::from_uuid(*project_id.as_uuid());
         if !agents.iter().any(|agent| {
             agent.session_id == root_session_id
@@ -2357,6 +2682,7 @@ impl FilePersistence {
             root_session_id,
             agents,
             tasks,
+            worktrees,
         }))
     }
 
@@ -3109,7 +3435,8 @@ impl FilePersistence {
                         input_cost_micros_per_1k, output_cost_micros_per_1k,
                         context_inspection, project_delegation_enabled,
                         project_messaging_enabled, project_inspection_enabled,
-                        project_child_control_enabled
+                        project_child_control_enabled, project_worktree_enabled,
+                        project_integration_enabled
                  FROM run_runtime_config
                  JOIN runtime_configurations USING(configuration_hash)
                  WHERE run_id=?1",
@@ -3139,6 +3466,8 @@ impl FilePersistence {
                         row.get::<_, i64>(20)?,
                         row.get::<_, i64>(21)?,
                         row.get::<_, i64>(22)?,
+                        row.get::<_, i64>(23)?,
+                        row.get::<_, i64>(24)?,
                     ))
                 },
             )
@@ -3174,6 +3503,8 @@ impl FilePersistence {
                 project_messaging_enabled,
                 project_inspection_enabled,
                 project_child_control_enabled,
+                project_worktree_enabled,
+                project_integration_enabled,
             )| {
                 Ok(DurableRunRuntimeConfig {
                     system_instructions: system
@@ -3237,6 +3568,8 @@ impl FilePersistence {
                     project_messaging_enabled: project_messaging_enabled != 0,
                     project_inspection_enabled: project_inspection_enabled != 0,
                     project_child_control_enabled: project_child_control_enabled != 0,
+                    project_worktree_enabled: project_worktree_enabled != 0,
+                    project_integration_enabled: project_integration_enabled != 0,
                 })
             },
         )
@@ -5920,25 +6253,33 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         migrate_v42_to_v43(connection)?;
         migrate_v43_to_v44(connection)?;
         migrate_v44_to_v45(connection)?;
-        return migrate_v45_to_v46(connection);
+        migrate_v45_to_v46(connection)?;
+        return migrate_v46_to_v47(connection);
     }
     if database_version == PROJECT_SCHEMA_VERSION {
         migrate_v42_to_v43(connection)?;
         migrate_v43_to_v44(connection)?;
         migrate_v44_to_v45(connection)?;
-        return migrate_v45_to_v46(connection);
+        migrate_v45_to_v46(connection)?;
+        return migrate_v46_to_v47(connection);
     }
     if database_version == PROJECT_MESSAGE_SCHEMA_VERSION {
         migrate_v43_to_v44(connection)?;
         migrate_v44_to_v45(connection)?;
-        return migrate_v45_to_v46(connection);
+        migrate_v45_to_v46(connection)?;
+        return migrate_v46_to_v47(connection);
     }
     if database_version == PROJECT_DELEGATION_SCHEMA_VERSION {
         migrate_v44_to_v45(connection)?;
-        return migrate_v45_to_v46(connection);
+        migrate_v45_to_v46(connection)?;
+        return migrate_v46_to_v47(connection);
     }
     if database_version == PROJECT_COORDINATION_SCHEMA_VERSION {
-        return migrate_v45_to_v46(connection);
+        migrate_v45_to_v46(connection)?;
+        return migrate_v46_to_v47(connection);
+    }
+    if database_version == PROJECT_CHILD_CONTROL_SCHEMA_VERSION {
+        return migrate_v46_to_v47(connection);
     }
     if database_version != 0 {
         return Err(LoomError::new(
@@ -6002,6 +6343,14 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         .map_err(|error| {
             persistence_error(
                 format!("could not create project task schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(PROJECT_WORKTREE_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project worktree schema: {error}"),
                 true,
             )
         })?;
@@ -6081,7 +6430,7 @@ fn migrate_v45_to_v46(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
-        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .pragma_update(None, "user_version", PROJECT_CHILD_CONTROL_SCHEMA_VERSION)
         .map_err(|error| {
             persistence_error(
                 format!("could not record project child-control schema version: {error}"),
@@ -6091,6 +6440,53 @@ fn migrate_v45_to_v46(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(|error| {
         persistence_error(
             format!("could not commit project child-control grant migration: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
+fn migrate_v46_to_v47(connection: &Connection) -> Result<()> {
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not begin project worktree migration: {error}"),
+            true,
+        )
+    })?;
+    transaction
+        .execute_batch(PROJECT_WORKTREE_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project worktree schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE run_runtime_config
+                ADD COLUMN project_worktree_enabled INTEGER NOT NULL DEFAULT 0
+                CHECK(project_worktree_enabled IN (0, 1));
+             ALTER TABLE run_runtime_config
+                ADD COLUMN project_integration_enabled INTEGER NOT NULL DEFAULT 0
+                CHECK(project_integration_enabled IN (0, 1));",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not add durable project worktree grants: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record project worktree schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit project worktree migration: {error}"),
             true,
         )
     })?;
@@ -6342,6 +6738,249 @@ fn insert_delegated_task(
             })?;
     }
     Ok(())
+}
+
+fn load_project_worktree(
+    connection: &Connection,
+    task_id: &Uuid,
+) -> Result<Option<ProjectWorktreeRecord>> {
+    let row = connection
+        .query_row(
+            "SELECT project_id, task_id, parent_session_id, child_session_id,
+                    parent_repository_id, child_repository_id, relative_path,
+                    worktree_name, branch_name, base_revision, result_revision,
+                    integrated_revision, status, error, cleanup_disposition,
+                    created_at, updated_at
+             FROM project_worktrees WHERE task_id=?1",
+            [task_id.as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, i64>(16)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(format!("could not load project worktree: {error}"), true)
+        })?;
+    let Some((
+        project_id,
+        task_id,
+        parent_session_id,
+        child_session_id,
+        parent_repository_id,
+        child_repository_id,
+        relative_path,
+        worktree_name,
+        branch_name,
+        base_revision,
+        result_revision,
+        integrated_revision,
+        status,
+        error,
+        cleanup_disposition,
+        created_at,
+        updated_at,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let project_id = ProjectId::from_uuid(decode_uuid(&project_id, "project id")?);
+    let task_id = TaskId::from_uuid(decode_uuid(&task_id, "delegated task id")?);
+    let mut statement = connection
+        .prepare("SELECT path FROM project_worktree_conflict_paths WHERE project_id=?1 AND task_id=?2 ORDER BY ordinal")
+        .map_err(|error| {
+            persistence_error(format!("could not prepare project worktree conflicts: {error}"), true)
+        })?;
+    let conflict_paths = statement
+        .query_map(
+            params![
+                project_id.as_uuid().as_bytes().as_slice(),
+                task_id.as_uuid().as_bytes().as_slice()
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read project worktree conflicts: {error}"),
+                true,
+            )
+        })?
+        .map(|row| {
+            row.map_err(|error| {
+                persistence_error(
+                    format!("could not read project worktree conflict: {error}"),
+                    true,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(ProjectWorktreeRecord {
+        project_id,
+        task_id,
+        parent_session_id: AgentSessionId::from_uuid(decode_uuid(
+            &parent_session_id,
+            "project worktree parent session id",
+        )?),
+        child_session_id: AgentSessionId::from_uuid(decode_uuid(
+            &child_session_id,
+            "project worktree child session id",
+        )?),
+        parent_repository_id: RepositoryId::from_uuid(decode_uuid(
+            &parent_repository_id,
+            "project worktree parent repository id",
+        )?),
+        child_repository_id: RepositoryId::from_uuid(decode_uuid(
+            &child_repository_id,
+            "project worktree child repository id",
+        )?),
+        relative_path,
+        worktree_name,
+        branch_name,
+        base_revision,
+        result_revision,
+        integrated_revision,
+        status: parse_project_worktree_status(&status)?,
+        conflict_paths,
+        error,
+        cleanup_disposition: cleanup_disposition
+            .as_deref()
+            .map(parse_project_worktree_cleanup)
+            .transpose()?,
+        created_at: decode_timestamp(created_at)?,
+        updated_at: decode_timestamp(updated_at)?,
+    }))
+}
+
+fn persist_initial_project_worktree(
+    transaction: &Transaction<'_>,
+    worktree: &ProjectWorktreeRecord,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO project_worktrees(
+                task_id, project_id, parent_session_id, child_session_id,
+                parent_repository_id, child_repository_id, relative_path,
+                worktree_name, branch_name, base_revision, result_revision,
+                integrated_revision, status, error, cleanup_disposition,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL,
+                       'creating', NULL, NULL, ?11, ?12)",
+            params![
+                worktree.task_id.as_uuid().as_bytes().as_slice(),
+                worktree.project_id.as_uuid().as_bytes().as_slice(),
+                worktree.parent_session_id.as_uuid().as_bytes().as_slice(),
+                worktree.child_session_id.as_uuid().as_bytes().as_slice(),
+                worktree
+                    .parent_repository_id
+                    .as_uuid()
+                    .as_bytes()
+                    .as_slice(),
+                worktree.child_repository_id.as_uuid().as_bytes().as_slice(),
+                worktree.relative_path,
+                worktree.worktree_name,
+                worktree.branch_name,
+                worktree.base_revision,
+                encode_timestamp(worktree.created_at)?,
+                encode_timestamp(worktree.updated_at)?,
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record initial project worktree: {error}"),
+                true,
+            )
+        })?;
+    Ok(())
+}
+
+fn same_project_worktree_identity(
+    existing: &ProjectWorktreeRecord,
+    requested: &ProjectWorktreeRecord,
+) -> bool {
+    existing.project_id == requested.project_id
+        && existing.task_id == requested.task_id
+        && existing.parent_session_id == requested.parent_session_id
+        && existing.child_session_id == requested.child_session_id
+        && existing.parent_repository_id == requested.parent_repository_id
+        && existing.child_repository_id == requested.child_repository_id
+        && existing.relative_path == requested.relative_path
+        && existing.worktree_name == requested.worktree_name
+        && existing.branch_name == requested.branch_name
+        && existing.base_revision == requested.base_revision
+        && existing.created_at == requested.created_at
+}
+
+fn project_worktree_status_name(status: ProjectWorktreeStatus) -> &'static str {
+    match status {
+        ProjectWorktreeStatus::Creating => "creating",
+        ProjectWorktreeStatus::Ready => "ready",
+        ProjectWorktreeStatus::Stale => "stale",
+        ProjectWorktreeStatus::Conflict => "conflict",
+        ProjectWorktreeStatus::Integrating => "integrating",
+        ProjectWorktreeStatus::Integrated => "integrated",
+        ProjectWorktreeStatus::RecoveryRequired => "recovery_required",
+        ProjectWorktreeStatus::CleanupPending => "cleanup_pending",
+        ProjectWorktreeStatus::Retained => "retained",
+        ProjectWorktreeStatus::Removed => "removed",
+    }
+}
+
+fn parse_project_worktree_status(status: &str) -> Result<ProjectWorktreeStatus> {
+    match status {
+        "creating" => Ok(ProjectWorktreeStatus::Creating),
+        "ready" => Ok(ProjectWorktreeStatus::Ready),
+        "stale" => Ok(ProjectWorktreeStatus::Stale),
+        "conflict" => Ok(ProjectWorktreeStatus::Conflict),
+        "integrating" => Ok(ProjectWorktreeStatus::Integrating),
+        "integrated" => Ok(ProjectWorktreeStatus::Integrated),
+        "recovery_required" => Ok(ProjectWorktreeStatus::RecoveryRequired),
+        "cleanup_pending" => Ok(ProjectWorktreeStatus::CleanupPending),
+        "retained" => Ok(ProjectWorktreeStatus::Retained),
+        "removed" => Ok(ProjectWorktreeStatus::Removed),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted project worktree status is invalid",
+            false,
+        )),
+    }
+}
+
+fn project_worktree_cleanup_name(disposition: ProjectWorktreeCleanupDisposition) -> &'static str {
+    match disposition {
+        ProjectWorktreeCleanupDisposition::Retain => "retain",
+        ProjectWorktreeCleanupDisposition::RemoveClean => "remove_clean",
+        ProjectWorktreeCleanupDisposition::DiscardChanges => "discard_changes",
+    }
+}
+
+fn parse_project_worktree_cleanup(disposition: &str) -> Result<ProjectWorktreeCleanupDisposition> {
+    match disposition {
+        "retain" => Ok(ProjectWorktreeCleanupDisposition::Retain),
+        "remove_clean" => Ok(ProjectWorktreeCleanupDisposition::RemoveClean),
+        "discard_changes" => Ok(ProjectWorktreeCleanupDisposition::DiscardChanges),
+        _ => Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted project worktree cleanup disposition is invalid",
+            false,
+        )),
+    }
 }
 
 fn load_delegated_task(
@@ -8430,21 +9069,26 @@ fn save_run_runtime_config_rows(
                 "INSERT INTO run_runtime_config(
                     run_id, configuration_hash, context_inspection,
                     project_delegation_enabled, project_messaging_enabled,
-                    project_inspection_enabled, project_child_control_enabled
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    project_inspection_enabled, project_child_control_enabled,
+                    project_worktree_enabled, project_integration_enabled
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(run_id) DO UPDATE SET
                     configuration_hash=excluded.configuration_hash,
                     context_inspection=excluded.context_inspection,
                     project_delegation_enabled=excluded.project_delegation_enabled,
                     project_messaging_enabled=excluded.project_messaging_enabled,
                     project_inspection_enabled=excluded.project_inspection_enabled,
-                    project_child_control_enabled=excluded.project_child_control_enabled
+                    project_child_control_enabled=excluded.project_child_control_enabled,
+                    project_worktree_enabled=excluded.project_worktree_enabled,
+                    project_integration_enabled=excluded.project_integration_enabled
                  WHERE run_runtime_config.configuration_hash IS NOT excluded.configuration_hash
                     OR run_runtime_config.context_inspection IS NOT excluded.context_inspection
                     OR run_runtime_config.project_delegation_enabled IS NOT excluded.project_delegation_enabled
                     OR run_runtime_config.project_messaging_enabled IS NOT excluded.project_messaging_enabled
                     OR run_runtime_config.project_inspection_enabled IS NOT excluded.project_inspection_enabled
-                    OR run_runtime_config.project_child_control_enabled IS NOT excluded.project_child_control_enabled",
+                    OR run_runtime_config.project_child_control_enabled IS NOT excluded.project_child_control_enabled
+                    OR run_runtime_config.project_worktree_enabled IS NOT excluded.project_worktree_enabled
+                    OR run_runtime_config.project_integration_enabled IS NOT excluded.project_integration_enabled",
                 params![
                     run_id.as_uuid().as_bytes().as_slice(),
                     configuration_hash,
@@ -8453,6 +9097,8 @@ fn save_run_runtime_config_rows(
                     i64::from(config.project_messaging_enabled),
                     i64::from(config.project_inspection_enabled),
                     i64::from(config.project_child_control_enabled),
+                    i64::from(config.project_worktree_enabled),
+                    i64::from(config.project_integration_enabled),
                 ],
             )
             .map_err(|error| {
@@ -12022,6 +12668,8 @@ mod tests {
             project_messaging_enabled: false,
             project_inspection_enabled: false,
             project_child_control_enabled: false,
+            project_worktree_enabled: false,
+            project_integration_enabled: false,
         };
         let mut changed_session = session.clone();
         changed_session.state = AgentSessionState::Planning;
@@ -12749,6 +13397,65 @@ mod tests {
     }
 
     #[test]
+    fn v46_upgrade_adds_normalized_project_worktree_state() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE run_runtime_config(
+                    run_id BLOB PRIMARY KEY,
+                    project_delegation_enabled INTEGER NOT NULL DEFAULT 0,
+                    project_messaging_enabled INTEGER NOT NULL DEFAULT 0,
+                    project_inspection_enabled INTEGER NOT NULL DEFAULT 0,
+                    project_child_control_enabled INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO run_runtime_config(run_id) VALUES (x'01');
+                 PRAGMA user_version=46;",
+            )
+            .unwrap();
+
+        initialize_schema(&connection).unwrap();
+
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+                 AND name IN ('project_worktrees', 'project_worktree_conflict_paths')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let default_grants: (i64, i64) = connection
+            .query_row(
+                "SELECT project_worktree_enabled, project_integration_enabled
+                 FROM run_runtime_config WHERE run_id=x'01'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE run_runtime_config SET project_worktree_enabled=1,
+                 project_integration_enabled=0 WHERE run_id=x'01'",
+                [],
+            )
+            .unwrap();
+        let independent_grants: (i64, i64) = connection
+            .query_row(
+                "SELECT project_worktree_enabled, project_integration_enabled
+                 FROM run_runtime_config WHERE run_id=x'01'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        assert_eq!(table_count, 2);
+        assert_eq!(default_grants, (0, 0));
+        assert_eq!(independent_grants, (1, 0));
+    }
+
+    #[test]
     fn v41_upgrade_preserves_sessions_as_project_roots() {
         type PersistedHierarchyRow = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, i64);
 
@@ -13076,25 +13783,66 @@ mod tests {
                 uri: "docs/architecture.md".to_owned(),
             }],
             dependencies: Vec::new(),
-            code_change: false,
+            code_change: true,
             status: DelegatedTaskStatus::Queued,
+            created_at: child_snapshot.created_at,
+            updated_at: child_snapshot.updated_at,
+        };
+        let parent_repository_id = RepositoryId::new();
+        let child_repository_id = RepositoryId::new();
+        let initial_worktree = ProjectWorktreeRecord {
+            project_id: task.project_id,
+            task_id: task.task_id,
+            parent_session_id: root.id,
+            child_session_id: child_id,
+            parent_repository_id,
+            child_repository_id,
+            relative_path: "worktrees/task-a".to_owned(),
+            worktree_name: "task-a".to_owned(),
+            branch_name: "codex/task-a".to_owned(),
+            base_revision: "base-sha".to_owned(),
+            result_revision: None,
+            integrated_revision: None,
+            status: ProjectWorktreeStatus::Creating,
+            conflict_paths: Vec::new(),
+            error: None,
+            cleanup_disposition: None,
             created_at: child_snapshot.created_at,
             updated_at: child_snapshot.updated_at,
         };
         let request_id = RequestId::new();
         let created = persistence
-            .create_project_child(
+            .create_project_child_with_worktree(
                 request_id,
                 &child_snapshot,
                 manager.export_state().next_sequence,
                 &task,
+                &initial_worktree,
             )
             .unwrap();
         assert_eq!(created, task);
+        let worktree = ProjectWorktreeRecord {
+            result_revision: Some("result-sha".to_owned()),
+            integrated_revision: None,
+            status: ProjectWorktreeStatus::Conflict,
+            conflict_paths: vec!["src/main.rs".to_owned(), "docs/plan.md".to_owned()],
+            error: Some("integration found conflicts".to_owned()),
+            cleanup_disposition: Some(ProjectWorktreeCleanupDisposition::Retain),
+            updated_at: Timestamp::now(),
+            ..initial_worktree.clone()
+        };
+        persistence.save_project_worktree(&worktree).unwrap();
+        assert_eq!(
+            persistence
+                .load_project_worktree_by_task(task.task_id)
+                .unwrap(),
+            Some(worktree.clone())
+        );
         let project_snapshot = persistence
             .load_project_snapshot(task.project_id)
             .unwrap()
             .unwrap();
+        assert_eq!(project_snapshot.worktrees, vec![worktree]);
         let child_projection = project_snapshot
             .agents
             .iter()
@@ -13143,26 +13891,16 @@ mod tests {
                 .is_err()
         );
 
-        // A retried create request may re-generate its internal IDs, but the
-        // semantic task request is the same and must return the original child.
-        let retry_child = AgentSessionSnapshot {
-            id: AgentSessionId::new(),
-            ..child_snapshot.clone()
-        };
-        let retry_task = DelegatedTaskRecord {
-            task_id: TaskId::new(),
-            target_session_id: retry_child.id,
-            created_at: Timestamp::now(),
-            updated_at: Timestamp::now(),
-            ..task.clone()
-        };
+        // Retrying the atomic code-task creation must preserve its worktree
+        // intent identity even after the worktree has advanced to conflict.
         assert_eq!(
             persistence
-                .create_project_child(
+                .create_project_child_with_worktree(
                     request_id,
-                    &retry_child,
+                    &child_snapshot,
                     manager.export_state().next_sequence,
-                    &retry_task,
+                    &task,
+                    &initial_worktree,
                 )
                 .unwrap(),
             task
@@ -13497,6 +14235,8 @@ mod tests {
             project_messaging_enabled: true,
             project_inspection_enabled: true,
             project_child_control_enabled: true,
+            project_worktree_enabled: true,
+            project_integration_enabled: false,
         };
         let run_runtime_configs = BTreeMap::from([
             (run_id, run_runtime_config.clone()),
