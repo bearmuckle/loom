@@ -12,10 +12,10 @@ use loom_core::{
     ActivityId, AgentMessageDraft, AgentMessageId, AgentMessageKind, AgentMessageRecord,
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, CheckpointId,
     DelegatedTaskRecord, DelegatedTaskSpec, DelegatedTaskStatus, ErrorCode, EventSequence,
-    InteractionId, LoomError, PolicyDecision, ProjectAgentRecord, ProjectId, ProjectSnapshot,
-    ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus, RepositoryId,
-    RequestId, Result, RunAttemptId, RunId, SessionLimits, StepId, TaskContextReference, TaskId,
-    Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    InteractionId, LoomError, PolicyDecision, ProjectAgentPermissions, ProjectAgentRecord,
+    ProjectId, ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
+    ProjectWorktreeStatus, RepositoryId, RequestId, Result, RunAttemptId, RunId, SessionLimits,
+    StepId, TaskContextReference, TaskId, Timestamp, UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
 use loom_protocol::{
@@ -36,7 +36,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const DATABASE_SCHEMA_VERSION: u32 = 47;
+const DATABASE_SCHEMA_VERSION: u32 = 48;
+const PROJECT_WORKTREE_SCHEMA_VERSION: u32 = 47;
 const PROJECT_CHILD_CONTROL_SCHEMA_VERSION: u32 = 46;
 const PROJECT_SCHEMA_VERSION: u32 = 42;
 const PROJECT_MESSAGE_SCHEMA_VERSION: u32 = 43;
@@ -190,7 +191,9 @@ CREATE TABLE IF NOT EXISTS run_runtime_config (
     project_worktree_enabled INTEGER NOT NULL DEFAULT 0
         CHECK(project_worktree_enabled IN (0, 1)),
     project_integration_enabled INTEGER NOT NULL DEFAULT 0
-        CHECK(project_integration_enabled IN (0, 1))
+        CHECK(project_integration_enabled IN (0, 1)),
+    project_branch_messaging_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK(project_branch_messaging_enabled IN (0, 1))
 ) WITHOUT ROWID, STRICT;
 CREATE INDEX IF NOT EXISTS run_runtime_config_by_configuration
     ON run_runtime_config(configuration_hash);
@@ -815,6 +818,30 @@ CREATE INDEX IF NOT EXISTS project_agent_messages_by_sender
     ON project_agent_messages(project_id, sender_session_id, project_sequence);
 ";
 
+const PROJECT_TASK_PERMISSION_COLUMNS: &str = "
+ALTER TABLE delegated_tasks
+    ADD COLUMN permission_delegation INTEGER NOT NULL DEFAULT 0
+    CHECK(permission_delegation IN (0, 1));
+ALTER TABLE delegated_tasks
+    ADD COLUMN permission_branch_messaging INTEGER NOT NULL DEFAULT 0
+    CHECK(permission_branch_messaging IN (0, 1));
+ALTER TABLE delegated_tasks
+    ADD COLUMN permission_child_control INTEGER NOT NULL DEFAULT 0
+    CHECK(permission_child_control IN (0, 1));
+ALTER TABLE delegated_tasks
+    ADD COLUMN permission_inspection INTEGER NOT NULL DEFAULT 0
+    CHECK(permission_inspection IN (0, 1));
+ALTER TABLE delegated_tasks
+    ADD COLUMN permission_worktree_creation INTEGER NOT NULL DEFAULT 0
+    CHECK(permission_worktree_creation IN (0, 1));
+ALTER TABLE delegated_tasks
+    ADD COLUMN permission_review INTEGER NOT NULL DEFAULT 0
+    CHECK(permission_review IN (0, 1));
+ALTER TABLE delegated_tasks
+    ADD COLUMN permission_integration INTEGER NOT NULL DEFAULT 0
+    CHECK(permission_integration IN (0, 1));
+";
+
 const PROJECT_WORKTREE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS project_worktrees (
     task_id BLOB PRIMARY KEY NOT NULL CHECK(length(task_id) = 16),
@@ -1194,6 +1221,7 @@ pub struct DurableRunRuntimeConfig {
     pub project_child_control_enabled: bool,
     pub project_worktree_enabled: bool,
     pub project_integration_enabled: bool,
+    pub project_branch_messaging_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3436,7 +3464,7 @@ impl FilePersistence {
                         context_inspection, project_delegation_enabled,
                         project_messaging_enabled, project_inspection_enabled,
                         project_child_control_enabled, project_worktree_enabled,
-                        project_integration_enabled
+                        project_integration_enabled, project_branch_messaging_enabled
                  FROM run_runtime_config
                  JOIN runtime_configurations USING(configuration_hash)
                  WHERE run_id=?1",
@@ -3468,6 +3496,7 @@ impl FilePersistence {
                         row.get::<_, i64>(22)?,
                         row.get::<_, i64>(23)?,
                         row.get::<_, i64>(24)?,
+                        row.get::<_, i64>(25)?,
                     ))
                 },
             )
@@ -3505,6 +3534,7 @@ impl FilePersistence {
                 project_child_control_enabled,
                 project_worktree_enabled,
                 project_integration_enabled,
+                project_branch_messaging_enabled,
             )| {
                 Ok(DurableRunRuntimeConfig {
                     system_instructions: system
@@ -3570,6 +3600,7 @@ impl FilePersistence {
                     project_child_control_enabled: project_child_control_enabled != 0,
                     project_worktree_enabled: project_worktree_enabled != 0,
                     project_integration_enabled: project_integration_enabled != 0,
+                    project_branch_messaging_enabled: project_branch_messaging_enabled != 0,
                 })
             },
         )
@@ -6254,32 +6285,41 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         migrate_v43_to_v44(connection)?;
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
-        return migrate_v46_to_v47(connection);
+        migrate_v46_to_v47(connection)?;
+        return migrate_v47_to_v48(connection);
     }
     if database_version == PROJECT_SCHEMA_VERSION {
         migrate_v42_to_v43(connection)?;
         migrate_v43_to_v44(connection)?;
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
-        return migrate_v46_to_v47(connection);
+        migrate_v46_to_v47(connection)?;
+        return migrate_v47_to_v48(connection);
     }
     if database_version == PROJECT_MESSAGE_SCHEMA_VERSION {
         migrate_v43_to_v44(connection)?;
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
-        return migrate_v46_to_v47(connection);
+        migrate_v46_to_v47(connection)?;
+        return migrate_v47_to_v48(connection);
     }
     if database_version == PROJECT_DELEGATION_SCHEMA_VERSION {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
-        return migrate_v46_to_v47(connection);
+        migrate_v46_to_v47(connection)?;
+        return migrate_v47_to_v48(connection);
     }
     if database_version == PROJECT_COORDINATION_SCHEMA_VERSION {
         migrate_v45_to_v46(connection)?;
-        return migrate_v46_to_v47(connection);
+        migrate_v46_to_v47(connection)?;
+        return migrate_v47_to_v48(connection);
     }
     if database_version == PROJECT_CHILD_CONTROL_SCHEMA_VERSION {
-        return migrate_v46_to_v47(connection);
+        migrate_v46_to_v47(connection)?;
+        return migrate_v47_to_v48(connection);
+    }
+    if database_version == PROJECT_WORKTREE_SCHEMA_VERSION {
+        return migrate_v47_to_v48(connection);
     }
     if database_version != 0 {
         return Err(LoomError::new(
@@ -6343,6 +6383,14 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         .map_err(|error| {
             persistence_error(
                 format!("could not create project task schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(PROJECT_TASK_PERMISSION_COLUMNS)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project-agent permission columns: {error}"),
                 true,
             )
         })?;
@@ -6477,7 +6525,7 @@ fn migrate_v46_to_v47(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
-        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .pragma_update(None, "user_version", PROJECT_WORKTREE_SCHEMA_VERSION)
         .map_err(|error| {
             persistence_error(
                 format!("could not record project worktree schema version: {error}"),
@@ -6487,6 +6535,50 @@ fn migrate_v46_to_v47(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(|error| {
         persistence_error(
             format!("could not commit project worktree migration: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
+fn migrate_v47_to_v48(connection: &Connection) -> Result<()> {
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not begin project-agent permission migration: {error}"),
+            true,
+        )
+    })?;
+    transaction
+        .execute_batch(PROJECT_TASK_PERMISSION_COLUMNS)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not add durable delegated-task permissions: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE run_runtime_config
+                ADD COLUMN project_branch_messaging_enabled INTEGER NOT NULL DEFAULT 0
+                CHECK(project_branch_messaging_enabled IN (0, 1));",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not add durable project-agent permissions: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record project-agent permission schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit project-agent permission migration: {error}"),
             true,
         )
     })?;
@@ -6670,8 +6762,12 @@ fn insert_delegated_task(
         .execute(
             "INSERT INTO delegated_tasks(
                 task_id, request_id, request_fingerprint, project_id, requester_session_id, target_session_id,
-                child_name, intent, model_id, code_change, status, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                child_name, intent, model_id, code_change, permission_delegation,
+                permission_branch_messaging, permission_child_control, permission_inspection,
+                permission_worktree_creation, permission_review, permission_integration,
+                status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                       ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 task.task_id.as_uuid().as_bytes().as_slice(),
                 request_id.as_uuid().as_bytes().as_slice(),
@@ -6683,6 +6779,13 @@ fn insert_delegated_task(
                 task.intent,
                 task.model_id,
                 i64::from(task.code_change),
+                i64::from(task.permissions.delegation),
+                i64::from(task.permissions.branch_messaging),
+                i64::from(task.permissions.child_control),
+                i64::from(task.permissions.inspection),
+                i64::from(task.permissions.worktree_creation),
+                i64::from(task.permissions.review),
+                i64::from(task.permissions.integration),
                 delegated_task_status_name(task.status),
                 encode_timestamp(task.created_at)?,
                 encode_timestamp(task.updated_at)?,
@@ -6990,7 +7093,10 @@ fn load_delegated_task(
     let row = connection
         .query_row(
             "SELECT task_id, project_id, requester_session_id, target_session_id, child_name,
-                    intent, model_id, code_change, status, created_at, updated_at
+                    intent, model_id, code_change, status, created_at, updated_at,
+                    permission_delegation, permission_branch_messaging, permission_child_control,
+                    permission_inspection, permission_worktree_creation, permission_review,
+                    permission_integration
              FROM delegated_tasks WHERE task_id=?1",
             [task_id.as_bytes().as_slice()],
             |row| {
@@ -7006,6 +7112,13 @@ fn load_delegated_task(
                     row.get::<_, String>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                    row.get::<_, i64>(12)?,
+                    row.get::<_, i64>(13)?,
+                    row.get::<_, i64>(14)?,
+                    row.get::<_, i64>(15)?,
+                    row.get::<_, i64>(16)?,
+                    row.get::<_, i64>(17)?,
                 ))
             },
         )
@@ -7025,6 +7138,13 @@ fn load_delegated_task(
         status,
         created_at,
         updated_at,
+        permission_delegation,
+        permission_branch_messaging,
+        permission_child_control,
+        permission_inspection,
+        permission_worktree_creation,
+        permission_review,
+        permission_integration,
     )) = row
     else {
         return Ok(None);
@@ -7095,6 +7215,15 @@ fn load_delegated_task(
         context_references,
         dependencies,
         code_change: code_change != 0,
+        permissions: ProjectAgentPermissions {
+            delegation: permission_delegation != 0,
+            branch_messaging: permission_branch_messaging != 0,
+            child_control: permission_child_control != 0,
+            inspection: permission_inspection != 0,
+            worktree_creation: permission_worktree_creation != 0,
+            review: permission_review != 0,
+            integration: permission_integration != 0,
+        },
         status: parse_delegated_task_status(&status)?,
         created_at: decode_timestamp(created_at)?,
         updated_at: decode_timestamp(updated_at)?,
@@ -7112,6 +7241,7 @@ fn delegated_task_request_fingerprint(task: &DelegatedTaskRecord) -> Result<Vec<
             context_references: task.context_references.clone(),
             dependencies: task.dependencies.clone(),
             code_change: task.code_change,
+            permissions: task.permissions,
         },
     )
 }
@@ -7122,16 +7252,32 @@ fn delegated_task_spec_fingerprint(
     child_name: &str,
     spec: &DelegatedTaskSpec,
 ) -> Result<Vec<u8>> {
-    let payload = serde_json::to_vec(&(
-        project_id,
-        requester_session_id,
-        child_name,
-        &spec.intent,
-        &spec.model_id,
-        &spec.context_references,
-        &spec.dependencies,
-        spec.code_change,
-    ))
+    // Preserve the pre-v48 fingerprint for permission-free tasks so retries of
+    // requests created by older servers remain idempotent after migration.
+    let payload = if spec.permissions == ProjectAgentPermissions::default() {
+        serde_json::to_vec(&(
+            project_id,
+            requester_session_id,
+            child_name,
+            &spec.intent,
+            &spec.model_id,
+            &spec.context_references,
+            &spec.dependencies,
+            spec.code_change,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            project_id,
+            requester_session_id,
+            child_name,
+            &spec.intent,
+            &spec.model_id,
+            &spec.context_references,
+            &spec.dependencies,
+            spec.code_change,
+            spec.permissions,
+        ))
+    }
     .map_err(|error| {
         persistence_error(
             format!("could not encode delegated task request: {error}"),
@@ -9070,8 +9216,9 @@ fn save_run_runtime_config_rows(
                     run_id, configuration_hash, context_inspection,
                     project_delegation_enabled, project_messaging_enabled,
                     project_inspection_enabled, project_child_control_enabled,
-                    project_worktree_enabled, project_integration_enabled
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    project_worktree_enabled, project_integration_enabled,
+                    project_branch_messaging_enabled
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(run_id) DO UPDATE SET
                     configuration_hash=excluded.configuration_hash,
                     context_inspection=excluded.context_inspection,
@@ -9080,7 +9227,8 @@ fn save_run_runtime_config_rows(
                     project_inspection_enabled=excluded.project_inspection_enabled,
                     project_child_control_enabled=excluded.project_child_control_enabled,
                     project_worktree_enabled=excluded.project_worktree_enabled,
-                    project_integration_enabled=excluded.project_integration_enabled
+                    project_integration_enabled=excluded.project_integration_enabled,
+                    project_branch_messaging_enabled=excluded.project_branch_messaging_enabled
                  WHERE run_runtime_config.configuration_hash IS NOT excluded.configuration_hash
                     OR run_runtime_config.context_inspection IS NOT excluded.context_inspection
                     OR run_runtime_config.project_delegation_enabled IS NOT excluded.project_delegation_enabled
@@ -9088,7 +9236,8 @@ fn save_run_runtime_config_rows(
                     OR run_runtime_config.project_inspection_enabled IS NOT excluded.project_inspection_enabled
                     OR run_runtime_config.project_child_control_enabled IS NOT excluded.project_child_control_enabled
                     OR run_runtime_config.project_worktree_enabled IS NOT excluded.project_worktree_enabled
-                    OR run_runtime_config.project_integration_enabled IS NOT excluded.project_integration_enabled",
+                    OR run_runtime_config.project_integration_enabled IS NOT excluded.project_integration_enabled
+                    OR run_runtime_config.project_branch_messaging_enabled IS NOT excluded.project_branch_messaging_enabled",
                 params![
                     run_id.as_uuid().as_bytes().as_slice(),
                     configuration_hash,
@@ -9099,6 +9248,7 @@ fn save_run_runtime_config_rows(
                     i64::from(config.project_child_control_enabled),
                     i64::from(config.project_worktree_enabled),
                     i64::from(config.project_integration_enabled),
+                    i64::from(config.project_branch_messaging_enabled),
                 ],
             )
             .map_err(|error| {
@@ -12670,6 +12820,7 @@ mod tests {
             project_child_control_enabled: false,
             project_worktree_enabled: false,
             project_integration_enabled: false,
+            project_branch_messaging_enabled: false,
         };
         let mut changed_session = session.clone();
         changed_session.state = AgentSessionState::Planning;
@@ -13266,6 +13417,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
                  CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
+                 CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
                  PRAGMA user_version=42;",
             )
             .unwrap();
@@ -13331,6 +13483,7 @@ mod tests {
                 );
                  INSERT INTO run_runtime_config(run_id, project_delegation_enabled)
                     VALUES (x'01', 1);
+                 CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
                  PRAGMA user_version=44;",
             )
             .unwrap();
@@ -13374,6 +13527,7 @@ mod tests {
                     run_id, project_delegation_enabled, project_messaging_enabled,
                     project_inspection_enabled
                  ) VALUES (x'01', 1, 1, 1);
+                 CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
                  PRAGMA user_version=45;",
             )
             .unwrap();
@@ -13409,6 +13563,7 @@ mod tests {
                     project_child_control_enabled INTEGER NOT NULL DEFAULT 0
                  );
                  INSERT INTO run_runtime_config(run_id) VALUES (x'01');
+                 CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
                  PRAGMA user_version=46;",
             )
             .unwrap();
@@ -13453,6 +13608,62 @@ mod tests {
         assert_eq!(table_count, 2);
         assert_eq!(default_grants, (0, 0));
         assert_eq!(independent_grants, (1, 0));
+    }
+
+    #[test]
+    fn v47_upgrade_adds_default_disabled_task_and_branch_messaging_grants() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
+                 INSERT INTO delegated_tasks(task_id) VALUES (x'01');
+                 CREATE TABLE run_runtime_config(
+                    run_id BLOB PRIMARY KEY,
+                    project_messaging_enabled INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO run_runtime_config(run_id, project_messaging_enabled)
+                    VALUES (x'02', 1);
+                 PRAGMA user_version=47;",
+            )
+            .unwrap();
+
+        initialize_schema(&connection).unwrap();
+
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let task_permissions: (i64, i64, i64, i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT permission_delegation, permission_branch_messaging,
+                        permission_child_control, permission_inspection,
+                        permission_worktree_creation, permission_review, permission_integration
+                 FROM delegated_tasks WHERE task_id=x'01'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let (direct_messaging, branch_messaging): (i64, i64) = connection
+            .query_row(
+                "SELECT project_messaging_enabled, project_branch_messaging_enabled
+                 FROM run_runtime_config WHERE run_id=x'02'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        assert_eq!(task_permissions, (0, 0, 0, 0, 0, 0, 0));
+        assert_eq!((direct_messaging, branch_messaging), (1, 0));
     }
 
     #[test]
@@ -13784,6 +13995,15 @@ mod tests {
             }],
             dependencies: Vec::new(),
             code_change: true,
+            permissions: ProjectAgentPermissions {
+                delegation: false,
+                branch_messaging: true,
+                child_control: false,
+                inspection: true,
+                worktree_creation: true,
+                review: true,
+                integration: false,
+            },
             status: DelegatedTaskStatus::Queued,
             created_at: child_snapshot.created_at,
             updated_at: child_snapshot.updated_at,
@@ -13866,6 +14086,7 @@ mod tests {
             context_references: task.context_references.clone(),
             dependencies: task.dependencies.clone(),
             code_change: task.code_change,
+            permissions: task.permissions,
         };
         assert_eq!(
             persistence
@@ -14237,6 +14458,7 @@ mod tests {
             project_child_control_enabled: true,
             project_worktree_enabled: true,
             project_integration_enabled: false,
+            project_branch_messaging_enabled: true,
         };
         let run_runtime_configs = BTreeMap::from([
             (run_id, run_runtime_config.clone()),
@@ -14614,6 +14836,7 @@ mod tests {
         drop(connection);
         let mut changed_runtime_config = run_runtime_configs[&run_id].clone();
         changed_runtime_config.approval_policy.write = PolicyDecision::Allow;
+        changed_runtime_config.project_branch_messaging_enabled = false;
         let mut changed_configs = BTreeMap::from([(run_id, changed_runtime_config.clone())]);
         let mut connection = Connection::open(&path).unwrap();
         connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();

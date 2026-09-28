@@ -187,6 +187,13 @@ one large orchestration change:
 - M7.4: enable level-three agents and policy-checked branch-to-branch
   messaging after nested integration works reliably.
 
+M7.4 implementation is in progress: protocol 8.0 and the forward v47-to-v48
+migration now carry independently persisted, default-off agent grants. The
+server-bound tool path supports explicitly granted branch messages and rejects
+client-supplied agent identities. Durable manager wait/join, restart-safe
+scheduling, nested worktree integration, and recursive UI support remain
+required; depth-three delegation stays disabled until those paths are complete.
+
 The backend rejects delegation beyond three levels from the beginning, even
 while the first client only exposes direct children. Non-code delegation ships
 before code worktrees; no fixed plan-to-issues-to-build pipeline is required.

@@ -206,6 +206,7 @@ fn fixture(
         project_child_control_enabled: false,
         project_worktree_enabled: false,
         project_integration_enabled: false,
+        project_branch_messaging_enabled: false,
     };
     let messages = (0..rows)
         .map(|index| message(index, "representative persisted transcript row ".repeat(4)))

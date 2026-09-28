@@ -61,6 +61,9 @@ pub struct AgentRuntimeOptions {
     /// Persisted grant for integrating reviewed child worktree commits.
     #[serde(default)]
     pub project_integration_enabled: bool,
+    /// Persisted grant for explicitly authorized non-adjacent project messages.
+    #[serde(default)]
+    pub project_branch_messaging_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

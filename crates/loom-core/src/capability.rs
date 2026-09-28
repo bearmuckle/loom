@@ -47,6 +47,7 @@ pub enum Capability {
     CreateProjectWorktree,
     ControlProjectChild,
     SendProjectAgentMessage,
+    SendProjectBranchMessage,
     ReadProjectAgentMessages,
     ReadProjectChildReview,
     IntegrateProjectChild,

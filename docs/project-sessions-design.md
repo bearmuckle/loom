@@ -375,6 +375,12 @@ later design step.
 
 ### Slice 4: deeper hierarchy and branch communication
 
+**Implementation status:** protocol 8.0, the forward v47-to-v48 grant
+migration, sender binding, recipient discovery, and authorization for
+explicitly granted branch-message routes are in progress in the draft PR.
+Depth-three delegation remains disabled while durable wait/join, restart
+recovery, nested worktree integration, and recursive UI support are unfinished.
+
 1. Persist an explicit, independent child permission set with each delegated
    task. A depth-two agent may create depth-three tasks only when its run has
    the delegation grant; depth-three agents cannot delegate. Code-worktree

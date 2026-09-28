@@ -1072,6 +1072,30 @@ fn deliver_project_agent_messages(
     Ok(delivered)
 }
 
+fn project_member_branch_messaging_enabled(
+    persistence: &FilePersistence,
+    root_session_id: AgentSessionId,
+    member_session_id: AgentSessionId,
+) -> Result<bool> {
+    let task_grant = if member_session_id == root_session_id {
+        None
+    } else {
+        persistence
+            .load_delegated_task_for_target(member_session_id)?
+            .map(|task| task.permissions.branch_messaging)
+    };
+    if member_session_id != root_session_id && !task_grant.unwrap_or(false) {
+        return Ok(false);
+    }
+    let Some(summary) = persistence.load_latest_run_summary_for_session(member_session_id)? else {
+        return Ok(task_grant.unwrap_or(false));
+    };
+    let Some(config) = persistence.load_run_runtime_config(summary.snapshot.id)? else {
+        return Ok(false);
+    };
+    Ok(config.project_branch_messaging_enabled)
+}
+
 fn execution_state_from_runtime(state: &AgentRuntimeState) -> Result<AgentExecutionStateRecord> {
     Ok(AgentExecutionStateRecord {
         run_id: state.run.id,
@@ -1114,6 +1138,7 @@ fn runtime_state_from_durable_config(
         project_child_control_enabled: config.project_child_control_enabled,
         project_worktree_enabled: config.project_worktree_enabled,
         project_integration_enabled: config.project_integration_enabled,
+        project_branch_messaging_enabled: config.project_branch_messaging_enabled,
     };
     Ok(AgentRuntimeState {
         session_id: summary.snapshot.session_id,
@@ -1883,11 +1908,16 @@ struct DelegateProjectTaskArguments {
     context_references: Vec<TaskContextReference>,
     #[serde(default)]
     dependencies: Vec<loom_core::TaskId>,
+    #[serde(default)]
+    permissions: loom_core::ProjectAgentPermissions,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendProjectAgentMessageArguments {
+    #[serde(default)]
+    target_session_id: Option<AgentSessionId>,
+    /// Optional task context for this message; it does not select a recipient.
     #[serde(default)]
     task_id: Option<loom_core::TaskId>,
     kind: loom_core::AgentMessageKind,
@@ -1897,6 +1927,10 @@ struct SendProjectAgentMessageArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ListProjectChildrenArguments {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListProjectMessageRecipientsArguments {}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1922,6 +1956,7 @@ struct IntegrateProjectChildArguments {
 struct ProjectAgentToolGrants {
     delegation: bool,
     messaging: bool,
+    branch_messaging: bool,
     inspection: bool,
     child_control: bool,
     worktree: bool,
@@ -1937,6 +1972,7 @@ struct ProjectAgentTools {
     can_delegate: bool,
     can_delegate_code: bool,
     can_message: bool,
+    can_branch_message: bool,
     can_inspect_children: bool,
     can_control_children: bool,
     can_review_children: bool,
@@ -1973,6 +2009,19 @@ impl ToolExtension for ProjectAgentTools {
                             "type": "array",
                             "maxItems": 128,
                             "items": {"type": "string", "format": "uuid"}
+                        },
+                        "permissions": {
+                            "type": "object",
+                            "properties": {
+                                "delegation": {"type": "boolean"},
+                                "branch_messaging": {"type": "boolean"},
+                                "child_control": {"type": "boolean"},
+                                "inspection": {"type": "boolean"},
+                                "worktree_creation": {"type": "boolean"},
+                                "review": {"type": "boolean"},
+                                "integration": {"type": "boolean"}
+                            },
+                            "additionalProperties": false
                         }
                     },
                     "required": ["child_name", "intent"],
@@ -2007,6 +2056,19 @@ impl ToolExtension for ProjectAgentTools {
                             "type": "array",
                             "maxItems": 128,
                             "items": {"type": "string", "format": "uuid"}
+                        },
+                        "permissions": {
+                            "type": "object",
+                            "properties": {
+                                "delegation": {"type": "boolean"},
+                                "branch_messaging": {"type": "boolean"},
+                                "child_control": {"type": "boolean"},
+                                "inspection": {"type": "boolean"},
+                                "worktree_creation": {"type": "boolean"},
+                                "review": {"type": "boolean"},
+                                "integration": {"type": "boolean"}
+                            },
+                            "additionalProperties": false
                         }
                     },
                     "required": ["child_name", "intent"],
@@ -2014,18 +2076,30 @@ impl ToolExtension for ProjectAgentTools {
                 }),
             });
         }
-        if self.can_message {
+        if self.can_message || self.can_branch_message {
             definitions.push(ToolDefinition {
                 name: "send_project_agent_message".to_owned(),
-                description: "Send a durable message to your direct parent or one of your direct children. For a child, omit task_id to report to your parent; to message a child, provide that child's task_id. Use progress, result, question, blocker, direction, or answer for kind. Sender and project are bound to this agent session; messages cannot be routed to other projects or branches.".to_owned(),
+                description: "Send a durable message to an explicitly named project member. Direct parent-child routes use the direct messaging grant; non-adjacent routes require the sender and recipient to have independent branch-messaging grants. task_id supplies optional context and never selects the recipient. The sender is bound to this agent run.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
+                        "target_session_id": {"type": "string", "format": "uuid"},
                         "task_id": {"type": "string", "format": "uuid"},
                         "kind": {"type": "string", "enum": ["progress", "result", "question", "blocker", "direction", "answer"]},
                         "body": {"type": "string", "minLength": 1, "maxLength": 16384}
                     },
-                    "required": ["kind", "body"],
+                    "required": ["target_session_id", "kind", "body"],
+                    "additionalProperties": false
+                }),
+            });
+        }
+        if self.can_branch_message {
+            definitions.push(ToolDefinition {
+                name: "list_project_message_recipients".to_owned(),
+                description: "List only project members who have an explicit branch-messaging grant, so you can address an authorized non-adjacent recipient by session ID.".to_owned(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
                     "additionalProperties": false
                 }),
             });
@@ -2098,7 +2172,12 @@ impl ToolExtension for ProjectAgentTools {
             // uses the low-risk policy tier so routine reports do not require
             // per-message approval; routing is checked against live project
             // membership and direct parent-child relationships.
-            "send_project_agent_message" if self.can_message => Some(loom_core::ActionKind::Read),
+            "send_project_agent_message" if self.can_message || self.can_branch_message => {
+                Some(loom_core::ActionKind::Read)
+            }
+            "list_project_message_recipients" if self.can_branch_message => {
+                Some(loom_core::ActionKind::Read)
+            }
             "list_project_children" if self.can_inspect_children => {
                 Some(loom_core::ActionKind::Read)
             }
@@ -2119,7 +2198,12 @@ impl ToolExtension for ProjectAgentTools {
             "delegate_project_code_task" if self.can_delegate_code => {
                 self.execute_code_delegation(call)
             }
-            "send_project_agent_message" if self.can_message => self.execute_message(call),
+            "send_project_agent_message" if self.can_message || self.can_branch_message => {
+                self.execute_message(call)
+            }
+            "list_project_message_recipients" if self.can_branch_message => {
+                self.execute_list_message_recipients(call)
+            }
             "list_project_children" if self.can_inspect_children => {
                 self.execute_list_children(call)
             }
@@ -2163,6 +2247,12 @@ impl ProjectAgentTools {
                     );
                 }
             };
+        if arguments.permissions.branch_messaging && !self.can_branch_message {
+            return ToolResult::failure(
+                call,
+                "this agent run cannot grant branch messaging to a child",
+            );
+        }
         let Some(backend) = self.backend.upgrade() else {
             return ToolResult::failure(call, "project backend is no longer available");
         };
@@ -2192,6 +2282,7 @@ impl ProjectAgentTools {
             context_references: arguments.context_references,
             dependencies: arguments.dependencies,
             code_change,
+            permissions: arguments.permissions,
         };
         match connection.create_project_child(
             request_id,
@@ -2232,66 +2323,25 @@ impl ProjectAgentTools {
         if arguments.body.trim().is_empty() || arguments.body.len() > 16 * 1024 {
             return ToolResult::failure(call, "agent message body must contain 1 to 16384 bytes");
         }
+        let Some(target_session_id) = arguments.target_session_id else {
+            return ToolResult::failure(call, "target_session_id is required");
+        };
         let Some(backend) = self.backend.upgrade() else {
             return ToolResult::failure(call, "project backend is no longer available");
         };
-        let Some(persistence) = &backend.persistence else {
-            return ToolResult::failure(call, "project messaging requires durable storage");
-        };
-        let project = match persistence.load_project_snapshot(self.project_id) {
-            Ok(Some(project)) => project,
-            Ok(None) => return ToolResult::failure(call, "project no longer exists"),
-            Err(error) => return ToolResult::failure(call, error.message),
-        };
-        let Some(sender) = project
-            .agents
-            .iter()
-            .find(|agent| agent.session_id == self.session_id)
-        else {
-            return ToolResult::failure(call, "project messaging grant is no longer valid");
-        };
-        let (target_session_id, task_id) = if let Some(task_id) = arguments.task_id {
-            let task = match persistence.load_delegated_task(task_id) {
-                Ok(Some(task)) => task,
-                Ok(None) => return ToolResult::failure(call, "delegated task does not exist"),
-                Err(error) => return ToolResult::failure(call, error.message),
-            };
-            if task.project_id != self.project_id
-                || task.requester_session_id != self.session_id
-                || !project.agents.iter().any(|agent| {
-                    agent.session_id == task.target_session_id
-                        && agent.parent_session_id == Some(self.session_id)
-                })
-            {
-                return ToolResult::failure(
-                    call,
-                    "task_id must identify one of this agent's direct child tasks",
-                );
-            }
-            (task.target_session_id, Some(task_id))
-        } else if let Some(parent_session_id) = sender.parent_session_id {
-            let task_id = match persistence.load_delegated_task_for_target(self.session_id) {
-                Ok(task) => task.map(|task| task.task_id),
-                Err(error) => return ToolResult::failure(call, error.message),
-            };
-            (parent_session_id, task_id)
-        } else {
-            return ToolResult::failure(
-                call,
-                "a project manager must supply the task_id of the child to message",
-            );
-        };
         let draft = loom_core::AgentMessageDraft {
             project_id: self.project_id,
-            task_id,
+            task_id: arguments.task_id,
             sender_session_id: self.session_id,
             target_session_id,
             kind: arguments.kind,
             body: arguments.body,
         };
         match backend.accept_project_agent_message(
-            None,
             RequestId::from_uuid(*call.id.as_uuid()),
+            self.session_id,
+            self.can_message,
+            self.can_branch_message,
             draft,
         ) {
             Ok(ServerResponse::ProjectAgentMessageAccepted(message)) => ToolResult {
@@ -2310,6 +2360,70 @@ impl ProjectAgentTools {
                 }),
             },
             Ok(_) => ToolResult::failure(call, "project messaging returned an unexpected result"),
+            Err(error) => ToolResult::failure(call, error.message),
+        }
+    }
+
+    fn execute_list_message_recipients(&self, call: &ToolCall) -> ToolResult {
+        if let Err(error) =
+            serde_json::from_value::<ListProjectMessageRecipientsArguments>(call.arguments.clone())
+        {
+            return ToolResult::failure(
+                call,
+                format!("invalid project message-recipient query: {error}"),
+            );
+        }
+        let Some(backend) = self.backend.upgrade() else {
+            return ToolResult::failure(call, "project backend is no longer available");
+        };
+        let Some(persistence) = backend.persistence.as_ref() else {
+            return ToolResult::failure(call, "project messaging requires durable storage");
+        };
+        let project = match persistence.load_project_snapshot(self.project_id) {
+            Ok(Some(project)) => project,
+            Ok(None) => return ToolResult::failure(call, "project no longer exists"),
+            Err(error) => return ToolResult::failure(call, error.message),
+        };
+        let recipients = project
+            .agents
+            .iter()
+            .filter(|agent| agent.session_id != self.session_id)
+            .filter_map(|agent| {
+                let name = if agent.session_id == project.root_session_id {
+                    "project root".to_owned()
+                } else {
+                    project
+                        .tasks
+                        .iter()
+                        .find(|task| task.target_session_id == agent.session_id)
+                        .map(|task| task.child_name.clone())
+                        .or_else(|| agent.task_summary.clone())
+                        .unwrap_or_else(|| "project agent".to_owned())
+                };
+                match project_member_branch_messaging_enabled(
+                    persistence,
+                    project.root_session_id,
+                    agent.session_id,
+                ) {
+                    Ok(true) => Some(Ok(serde_json::json!({
+                        "session_id": agent.session_id,
+                        "name": name,
+                        "depth": agent.depth,
+                        "parent_session_id": agent.parent_session_id,
+                    }))),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect::<Result<Vec<_>>>();
+        match recipients {
+            Ok(recipients) => ToolResult {
+                tool_call_id: call.id,
+                name: call.name.clone(),
+                success: true,
+                output: serde_json::to_string(&recipients)
+                    .unwrap_or_else(|error| format!("could not encode recipients: {error}")),
+            },
             Err(error) => ToolResult::failure(call, error.message),
         }
     }
@@ -2849,6 +2963,7 @@ impl InProcessBackend {
                 Capability::CreateProjectChild,
                 Capability::ControlProjectChild,
                 Capability::SendProjectAgentMessage,
+                Capability::SendProjectBranchMessage,
                 Capability::ReadProjectAgentMessages,
                 Capability::CreateProjectWorktree,
                 Capability::ReadProjectChildReview,
@@ -3648,6 +3763,7 @@ impl InProcessBackend {
                 ProjectAgentToolGrants {
                     delegation: runtime_state.options.project_delegation_enabled,
                     messaging: runtime_state.options.project_messaging_enabled,
+                    branch_messaging: runtime_state.options.project_branch_messaging_enabled,
                     inspection: runtime_state.options.project_inspection_enabled,
                     child_control: runtime_state.options.project_child_control_enabled,
                     worktree: runtime_state.options.project_worktree_enabled,
@@ -3857,6 +3973,7 @@ impl InProcessBackend {
                 project_child_control_enabled: state.options.project_child_control_enabled,
                 project_worktree_enabled: state.options.project_worktree_enabled,
                 project_integration_enabled: state.options.project_integration_enabled,
+                project_branch_messaging_enabled: state.options.project_branch_messaging_enabled,
             };
             let context_checkpoint =
                 state
@@ -4172,6 +4289,9 @@ impl InProcessBackend {
                         project_child_control_enabled: state.options.project_child_control_enabled,
                         project_worktree_enabled: state.options.project_worktree_enabled,
                         project_integration_enabled: state.options.project_integration_enabled,
+                        project_branch_messaging_enabled: state
+                            .options
+                            .project_branch_messaging_enabled,
                     },
                 ))
             })
@@ -4764,6 +4884,10 @@ impl InProcessBackend {
             && self
                 .supported_capabilities
                 .contains(Capability::SendProjectAgentMessage);
+        let can_branch_message = grants.branch_messaging
+            && self
+                .supported_capabilities
+                .contains(Capability::SendProjectBranchMessage);
         let can_inspect_children = grants.inspection
             && self
                 .supported_capabilities
@@ -4786,6 +4910,7 @@ impl InProcessBackend {
         if !can_delegate
             && !can_delegate_code
             && !can_message
+            && !can_branch_message
             && !can_inspect_children
             && !can_control_children
             && !can_review_children
@@ -4819,6 +4944,7 @@ impl InProcessBackend {
             can_delegate,
             can_delegate_code,
             can_message,
+            can_branch_message,
             can_inspect_children,
             can_control_children,
             can_review_children,
@@ -4843,9 +4969,11 @@ impl InProcessBackend {
 
     fn accept_project_agent_message(
         &self,
-        auth: Option<&AuthSession>,
         request_id: RequestId,
-        draft: loom_core::AgentMessageDraft,
+        trusted_sender_session_id: AgentSessionId,
+        sender_can_message: bool,
+        sender_can_branch_message: bool,
+        mut draft: loom_core::AgentMessageDraft,
     ) -> Result<ServerResponse> {
         if draft.body.trim().is_empty() || draft.body.len() > 16 * 1024 {
             return Err(LoomError::invalid_request(
@@ -4862,56 +4990,52 @@ impl InProcessBackend {
         let project = persistence
             .load_project_snapshot(draft.project_id)?
             .ok_or_else(|| LoomError::not_found("project", draft.project_id))?;
+        draft.sender_session_id = trusted_sender_session_id;
         let sender = project
             .agents
             .iter()
-            .find(|agent| agent.session_id == draft.sender_session_id)
+            .find(|agent| agent.session_id == trusted_sender_session_id)
             .ok_or_else(|| LoomError::invalid_request("message sender is not a project member"))?;
         let target = project
             .agents
             .iter()
             .find(|agent| agent.session_id == draft.target_session_id)
             .ok_or_else(|| LoomError::invalid_request("message target is not a project member"))?;
-        if sender.parent_session_id != Some(target.session_id)
-            && target.parent_session_id != Some(sender.session_id)
-        {
-            return Err(LoomError::invalid_request(
-                "agent messages are limited to a parent and direct child",
-            ));
-        }
-        if let Some(auth) = auth {
-            for session_id in [draft.sender_session_id, draft.target_session_id] {
-                if !auth.scope().allows_session(session_id) {
-                    return Err(unauthorized_session(session_id));
-                }
-                let session = self.sessions()?.get(session_id)?;
-                if !auth.scope().allows_workspace(session.workspace_id) {
-                    return Err(LoomError::new(
-                        ErrorCode::AuthorizationDenied,
-                        "token is not authorized for a project member's workspace",
-                        false,
-                    ));
-                }
-            }
-        }
-        let target_task = if let Some(task_id) = draft.task_id {
-            let task = persistence
+        let is_direct_route = sender.parent_session_id == Some(target.session_id)
+            || target.parent_session_id == Some(sender.session_id);
+        if let Some(task_id) = draft.task_id {
+            let context_task = persistence
                 .load_delegated_task(task_id)?
                 .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
-            if task.project_id != draft.project_id
-                || ![task.requester_session_id, task.target_session_id]
-                    .contains(&draft.sender_session_id)
-                || ![task.requester_session_id, task.target_session_id]
-                    .contains(&draft.target_session_id)
-            {
+            if context_task.project_id != draft.project_id {
                 return Err(LoomError::invalid_request(
-                    "message task must belong to the sender and target",
+                    "message task context must belong to the sender's project",
                 ));
             }
-            Some(task)
-        } else {
-            persistence.load_delegated_task_for_target(draft.target_session_id)?
-        };
+        }
+        let target_task = persistence.load_delegated_task_for_target(draft.target_session_id)?;
+        let branch_route = !is_direct_route;
+        if is_direct_route && !sender_can_message {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "direct project messaging is not granted to this run",
+                false,
+            ));
+        }
+        if branch_route
+            && (!sender_can_branch_message
+                || !project_member_branch_messaging_enabled(
+                    persistence,
+                    project.root_session_id,
+                    target.session_id,
+                )?)
+        {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "branch messages require explicit sender and recipient grants",
+                false,
+            ));
+        }
         if persistence
             .load_agent_message_by_request(request_id)?
             .is_some()
@@ -4956,7 +5080,7 @@ impl InProcessBackend {
                 message: message.clone(),
             },
         });
-        if draft.target_session_id != project.root_session_id {
+        if !branch_route && draft.target_session_id != project.root_session_id {
             let sequence = self.journal()?.next();
             self.journal()?.append_event(ServerEventEnvelope {
                 protocol_version: CURRENT_PROTOCOL_VERSION,
@@ -5072,6 +5196,7 @@ impl InProcessConnection {
             ProjectAgentToolGrants {
                 delegation: state.options.project_delegation_enabled,
                 messaging: state.options.project_messaging_enabled,
+                branch_messaging: state.options.project_branch_messaging_enabled,
                 inspection: state.options.project_inspection_enabled,
                 child_control: state.options.project_child_control_enabled,
                 worktree: state.options.project_worktree_enabled,
@@ -7604,6 +7729,35 @@ impl InProcessConnection {
         child_name: String,
         spec: loom_core::DelegatedTaskSpec,
     ) -> Result<ServerResponse> {
+        let permissions = spec.permissions;
+        if permissions.delegation
+            || permissions.child_control
+            || permissions.inspection
+            || permissions.worktree_creation
+            || permissions.review
+            || permissions.integration
+        {
+            return Err(LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "nested-agent permissions require the durable manager wait and recovery flow",
+                false,
+            ));
+        }
+        if permissions.branch_messaging
+            && (!self
+                .backend
+                .supported_capabilities
+                .contains(Capability::SendProjectBranchMessage)
+                || !self
+                    .authorized_capabilities()
+                    .contains(Capability::SendProjectBranchMessage))
+        {
+            return Err(LoomError::new(
+                ErrorCode::AuthorizationDenied,
+                "branch-messaging permission is not authorized for this request",
+                false,
+            ));
+        }
         if spec.code_change
             && !self
                 .backend
@@ -7824,6 +7978,7 @@ impl InProcessConnection {
             context_references: spec.context_references,
             dependencies: spec.dependencies,
             code_change: spec.code_change,
+            permissions,
             status: loom_core::DelegatedTaskStatus::Queued,
             created_at: timestamp,
             updated_at: timestamp,
@@ -9228,11 +9383,14 @@ impl InProcessConnection {
 
     fn send_project_agent_message(
         &self,
-        request_id: RequestId,
-        draft: loom_core::AgentMessageDraft,
+        _request_id: RequestId,
+        _draft: loom_core::AgentMessageDraft,
     ) -> Result<ServerResponse> {
-        self.backend
-            .accept_project_agent_message(self.auth.as_ref(), request_id, draft)
+        Err(LoomError::new(
+            ErrorCode::AuthorizationDenied,
+            "agent messages may only be sent by a server-bound agent run",
+            false,
+        ))
     }
 
     fn list_project_agent_messages(
@@ -10007,6 +10165,7 @@ impl InProcessConnection {
         }
         input.options.project_delegation_enabled = false;
         input.options.project_messaging_enabled = false;
+        input.options.project_branch_messaging_enabled = false;
         input.options.project_inspection_enabled = false;
         input.options.project_child_control_enabled = false;
         input.options.project_worktree_enabled = false;
@@ -10027,6 +10186,22 @@ impl InProcessConnection {
                     session.id,
                     Capability::SendProjectAgentMessage,
                 )?;
+            let delegated_permissions = persistence
+                .load_delegated_task_for_target(session.id)?
+                .map(|task| task.permissions);
+            input.options.project_branch_messaging_enabled = supports_tools
+                && if project.root_session_id == session.id {
+                    self.project_capability_enabled_for_session(
+                        session.id,
+                        Capability::SendProjectBranchMessage,
+                    )?
+                } else {
+                    delegated_permissions.is_some_and(|permissions| permissions.branch_messaging)
+                        && self.project_capability_enabled_for_session(
+                            session.id,
+                            Capability::SendProjectBranchMessage,
+                        )?
+                };
             input.options.project_inspection_enabled = supports_tools
                 && self
                     .project_capability_enabled_for_session(session.id, Capability::ReadProject)?;
@@ -10061,7 +10236,10 @@ impl InProcessConnection {
                     instructions.push_str(" Use `integrate_project_child` only after reviewing the completed child and confirming its exact base revision; integration fast-forwards the clean parent checkout and cannot merge divergent branches.");
                 }
                 if input.options.project_messaging_enabled {
-                    instructions.push_str(" Use `send_project_agent_message` to direct a child by its task_id and reply to questions or blockers; message delivery is durable and may wait until the child reaches a safe model-turn boundary.");
+                    instructions.push_str(" Use `send_project_agent_message` with `target_session_id` to direct a child or reply to questions and blockers; `task_id` is optional context only. Message delivery is durable and may wait until the child reaches a safe model-turn boundary.");
+                }
+                if input.options.project_branch_messaging_enabled {
+                    instructions.push_str(" Non-adjacent messages require explicit branch-messaging grants on both agents. Use `list_project_message_recipients` to find eligible session IDs and never infer permission from direct messaging.");
                 }
                 if input.options.project_inspection_enabled {
                     instructions.push_str(" Use `list_project_children` to check direct-child state and task status before deciding whether to redirect, retry, or report completion.");
@@ -10094,9 +10272,12 @@ impl InProcessConnection {
                         .unwrap_or_else(|| "unavailable".to_owned()),
                 );
                 if input.options.project_messaging_enabled {
-                    instructions.push_str(" Report progress, questions, blockers, and the final result using `send_project_agent_message`; omit task_id to address your parent. Message delivery is durable and does not interrupt an in-flight provider request or pending approval.");
+                    instructions.push_str(" Report progress, questions, blockers, and the final result using `send_project_agent_message` with your parent's `target_session_id`; `task_id` is optional context only. Message delivery is durable and does not interrupt an in-flight provider request or pending approval.");
                 } else {
                     instructions.push_str(" Include progress and your final result in the run response because project messaging is not enabled for this run.");
+                }
+                if input.options.project_branch_messaging_enabled {
+                    instructions.push_str(" You also have an explicit branch-messaging grant. Use `list_project_message_recipients` to find non-adjacent project members who also have that grant; direct-message permission alone does not authorize branch routes.");
                 }
                 if let Some(task_id) = task_id {
                     instructions.push_str(&format!(" Your delegated task_id is {task_id}."));
@@ -10121,6 +10302,7 @@ impl InProcessConnection {
             ProjectAgentToolGrants {
                 delegation: input.options.project_delegation_enabled,
                 messaging: input.options.project_messaging_enabled,
+                branch_messaging: input.options.project_branch_messaging_enabled,
                 inspection: input.options.project_inspection_enabled,
                 child_control: input.options.project_child_control_enabled,
                 worktree: input.options.project_worktree_enabled,
@@ -13456,6 +13638,18 @@ mod tests {
             protocol_6_negotiation.result.unwrap_err().code,
             ErrorCode::UnsupportedProtocol
         );
+        let protocol_7_connection = backend.connect();
+        let protocol_7_negotiation = protocol_7_connection.request(RequestEnvelope::with_version(
+            ProtocolVersion::new(7, 0),
+            ClientRequest::Negotiate {
+                client_version: ProtocolVersion::new(7, 0),
+                capabilities: backend.supported_capabilities.clone(),
+            },
+        ));
+        assert_eq!(
+            protocol_7_negotiation.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
 
         let capability_limited_connection = backend.connect();
         let capability_limited = CapabilitySet::new(
@@ -14721,6 +14915,7 @@ mod tests {
             context_references: vec![],
             dependencies: vec![],
             code_change: false,
+            permissions: loom_core::ProjectAgentPermissions::default(),
             status: loom_core::DelegatedTaskStatus::Queued,
             created_at,
             updated_at: created_at,
@@ -14830,6 +15025,7 @@ mod tests {
                 context_references: vec![],
                 dependencies: vec![],
                 code_change: false,
+                permissions: loom_core::ProjectAgentPermissions::default(),
             },
         };
         let request_id = RequestId::new();
@@ -14921,16 +15117,26 @@ mod tests {
             kind: loom_core::AgentMessageKind::Direction,
             body: "Please report findings.".into(),
         };
-        assert!(matches!(
-            connection
-                .request(RequestEnvelope::new(
-                    ClientRequest::SendProjectAgentMessage {
-                        message: message.clone(),
-                    }
-                ))
-                .result,
-            Ok(ServerResponse::ProjectAgentMessageAccepted(_))
-        ));
+        for untrusted_message in [
+            message.clone(),
+            loom_core::AgentMessageDraft {
+                sender_session_id: child.session_id,
+                ..message.clone()
+            },
+        ] {
+            assert_eq!(
+                connection
+                    .request(RequestEnvelope::new(
+                        ClientRequest::SendProjectAgentMessage {
+                            message: untrusted_message,
+                        }
+                    ))
+                    .result
+                    .unwrap_err()
+                    .code,
+                ErrorCode::AuthorizationDenied
+            );
+        }
         let root_events =
             connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
                 session_id: Some(root),
@@ -14941,11 +15147,10 @@ mod tests {
         assert!(matches!(
             root_events.result,
             Ok(ServerResponse::SessionEvents { events, .. })
-                if events.iter().any(|event| matches!(
+                if events.iter().all(|event| !matches!(
                     &event.event,
                     ServerEvent::ProjectAgentMessageAccepted { message: accepted }
                         if accepted.project_id == message.project_id
-                            && accepted.target_session_id == child.session_id
                 ))
         ));
         let messages = connection.request(RequestEnvelope::new(
@@ -14956,9 +15161,10 @@ mod tests {
                 limit: 10,
             },
         ));
-        assert!(
-            matches!(messages.result, Ok(ServerResponse::ProjectAgentMessages { messages, .. }) if messages.len() == 1 && messages[0].kind == loom_core::AgentMessageKind::Direction)
-        );
+        assert!(matches!(
+            messages.result,
+            Ok(ServerResponse::ProjectAgentMessages { messages, .. }) if messages.is_empty()
+        ));
         let tokens = AuthTokenStore::new();
         let scoped_token = tokens
             .issue(AuthorizationScope::for_sessions(
@@ -14971,6 +15177,21 @@ mod tests {
         negotiate(&scoped);
         assert_eq!(
             scoped
+                .request(RequestEnvelope::new(
+                    ClientRequest::SendProjectAgentMessage {
+                        message: message.clone(),
+                    }
+                ))
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::AuthorizationDenied
+        );
+        let broad_token = tokens.issue(AuthorizationScope::all()).unwrap();
+        let broad = backend.connect_authenticated(tokens.authenticate(&broad_token.token).unwrap());
+        negotiate(&broad);
+        assert_eq!(
+            broad
                 .request(RequestEnvelope::new(
                     ClientRequest::SendProjectAgentMessage {
                         message: message.clone(),
@@ -15006,7 +15227,7 @@ mod tests {
         ));
         assert!(matches!(
             wrong_direction.result,
-            Err(error) if error.code == ErrorCode::InvalidRequest
+            Err(error) if error.code == ErrorCode::AuthorizationDenied
         ));
         let code_change =
             connection.request(RequestEnvelope::new(ClientRequest::CreateProjectChild {
@@ -15018,6 +15239,7 @@ mod tests {
                     context_references: vec![],
                     dependencies: vec![],
                     code_change: true,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
                 },
             }));
         assert!(matches!(
@@ -15038,6 +15260,7 @@ mod tests {
                         context_references: vec![],
                         dependencies: vec![],
                         code_change: false,
+                        permissions: loom_core::ProjectAgentPermissions::default(),
                     },
                 }));
             assert!(matches!(
@@ -15054,6 +15277,7 @@ mod tests {
                 context_references: vec![],
                 dependencies: vec![],
                 code_change: false,
+                permissions: loom_core::ProjectAgentPermissions::default(),
             },
         });
         let additional_child = connection.request(over_capacity_request).result;
@@ -15081,6 +15305,7 @@ mod tests {
                 context_references: vec![],
                 dependencies: vec![],
                 code_change: false,
+                permissions: loom_core::ProjectAgentPermissions::default(),
             },
         };
         backend.idempotency().unwrap().remove(&request_id);
@@ -15168,6 +15393,7 @@ mod tests {
             context_references: Vec::new(),
             dependencies: Vec::new(),
             code_change: true,
+            permissions: loom_core::ProjectAgentPermissions::default(),
             status: loom_core::DelegatedTaskStatus::Queued,
             created_at,
             updated_at: created_at,
@@ -15395,6 +15621,7 @@ mod tests {
                     context_references: vec![],
                     dependencies: vec![],
                     code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
                 },
             }))
         };
@@ -15554,6 +15781,7 @@ mod tests {
                 ProjectAgentToolGrants {
                     delegation: true,
                     messaging: true,
+                    branch_messaging: true,
                     inspection: true,
                     child_control: true,
                     worktree: false,
@@ -15572,7 +15800,8 @@ mod tests {
                 "child_name": "protocol reviewer",
                 "intent": "Review the protocol compatibility design",
                 "context_references": [{"label": "Design", "uri": "docs/project-sessions-design.md"}],
-                "dependencies": []
+                "dependencies": [],
+                "permissions": {"branch_messaging": true}
             }),
         };
 
@@ -15641,6 +15870,23 @@ mod tests {
         assert_eq!(task.model_id, "deterministic/demo");
         assert!(!task.code_change);
 
+        let ungranted_peer = tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "delegate_project_task".to_owned(),
+            arguments: serde_json::json!({
+                "child_name": "ungranted peer",
+                "intent": "Remain available for a bounded follow-up",
+            }),
+        });
+        assert!(ungranted_peer.success, "{}", ungranted_peer.output);
+        let ungranted_peer: serde_json::Value =
+            serde_json::from_str(&ungranted_peer.output).unwrap();
+        let ungranted_peer_id = ungranted_peer["child_session_id"]
+            .as_str()
+            .unwrap()
+            .parse::<AgentSessionId>()
+            .unwrap();
+
         // Keep a second child idle so the manager-to-child tool path does not
         // race the deterministic child runner finishing its first task.
         let idle_child_id = AgentSessionId::new();
@@ -15664,6 +15910,10 @@ mod tests {
             context_references: vec![],
             dependencies: vec![],
             code_change: false,
+            permissions: loom_core::ProjectAgentPermissions {
+                branch_messaging: true,
+                ..loom_core::ProjectAgentPermissions::default()
+            },
             status: loom_core::DelegatedTaskStatus::Queued,
             created_at,
             updated_at: created_at,
@@ -15698,6 +15948,7 @@ mod tests {
             id: ToolCallId::new(),
             name: "send_project_agent_message".to_owned(),
             arguments: serde_json::json!({
+                "target_session_id": idle_child_id,
                 "task_id": idle_task.task_id,
                 "kind": "direction",
                 "body": "Review the current protocol gate and report back."
@@ -15710,6 +15961,71 @@ mod tests {
             .unwrap();
         assert_eq!(child_inbox.len(), 1);
         assert_eq!(child_inbox[0].sender_session_id, root);
+
+        let branch_extension = backend
+            .project_agent_tools(
+                child_session_id,
+                ModelId::new("deterministic/demo"),
+                ProjectAgentToolGrants {
+                    delegation: false,
+                    messaging: true,
+                    branch_messaging: true,
+                    inspection: false,
+                    child_control: false,
+                    worktree: false,
+                    review: false,
+                    integration: false,
+                },
+            )
+            .unwrap()
+            .expect("branch-messaging project tools");
+        let branch_tools = ToolExecutor::new_with_workspace(
+            connection.session_filesystem(child_session_id).unwrap(),
+        )
+        .with_extension(branch_extension);
+        let recipients = branch_tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "list_project_message_recipients".to_owned(),
+            arguments: serde_json::json!({}),
+        });
+        assert!(recipients.success, "{}", recipients.output);
+        let recipients: serde_json::Value = serde_json::from_str(&recipients.output).unwrap();
+        assert_eq!(recipients.as_array().unwrap().len(), 1);
+        assert_eq!(
+            recipients[0]["session_id"].as_str(),
+            Some(idle_child_id.to_string().as_str())
+        );
+        let branch_message = branch_tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "send_project_agent_message".to_owned(),
+            arguments: serde_json::json!({
+                "target_session_id": idle_child_id,
+                "task_id": task.task_id,
+                "kind": "progress",
+                "body": "I found a related point that may help your review."
+            }),
+        });
+        assert!(branch_message.success, "{}", branch_message.output);
+        let denied_branch_message = branch_tools.execute(&ToolCall {
+            id: ToolCallId::new(),
+            name: "send_project_agent_message".to_owned(),
+            arguments: serde_json::json!({
+                "target_session_id": ungranted_peer_id,
+                "kind": "progress",
+                "body": "This recipient has no branch-messaging grant."
+            }),
+        });
+        assert!(!denied_branch_message.success);
+        let idle_inbox = persistence
+            .list_agent_messages(idle_task.project_id, idle_child_id, 0, 10)
+            .unwrap();
+        assert_eq!(idle_inbox.len(), 2);
+        assert_eq!(idle_inbox[1].sender_session_id, child_session_id);
+        assert_eq!(idle_inbox[1].target_session_id, idle_child_id);
+        let root_branch_inbox = persistence
+            .list_agent_messages(idle_task.project_id, root, 0, 10)
+            .unwrap();
+        assert!(root_branch_inbox.is_empty());
 
         let cancel_call = ToolCall {
             id: ToolCallId::new(),
@@ -15751,6 +16067,7 @@ mod tests {
             id: ToolCallId::new(),
             name: "send_project_agent_message".to_owned(),
             arguments: serde_json::json!({
+                "target_session_id": idle_child_id,
                 "task_id": idle_task.task_id,
                 "kind": "direction",
                 "body": "This new message must be rejected after cancellation."
@@ -15785,6 +16102,7 @@ mod tests {
                 ProjectAgentToolGrants {
                     delegation: false,
                     messaging: true,
+                    branch_messaging: false,
                     inspection: false,
                     child_control: false,
                     worktree: false,
@@ -15802,6 +16120,7 @@ mod tests {
             id: ToolCallId::new(),
             name: "send_project_agent_message".to_owned(),
             arguments: serde_json::json!({
+                "target_session_id": root,
                 "kind": "result",
                 "body": "Protocol review complete; the upgrade boundary is explicit."
             }),
@@ -15922,6 +16241,8 @@ mod tests {
             child_progress_turn,
             "send_project_agent_message",
             serde_json::json!({
+                "target_session_id": root,
+                "task_id": task.task_id,
                 "kind": "progress",
                 "body": "I have started the investigation and am checking the key assumption."
             }),
@@ -15932,6 +16253,8 @@ mod tests {
             child_question_turn,
             "send_project_agent_message",
             serde_json::json!({
+                "target_session_id": root,
+                "task_id": task.task_id,
                 "kind": "question",
                 "body": "Should I prioritize the launch timeline or the reliability tradeoff?"
             }),
@@ -15970,6 +16293,7 @@ mod tests {
             manager_with_child_messages,
             "send_project_agent_message",
             serde_json::json!({
+                "target_session_id": task.target_session_id,
                 "task_id": task.task_id,
                 "kind": "answer",
                 "body": "Prioritize reliability first; include the launch timeline as a secondary consideration."
@@ -15981,6 +16305,7 @@ mod tests {
             manager_direction_turn,
             "send_project_agent_message",
             serde_json::json!({
+                "target_session_id": task.target_session_id,
                 "task_id": task.task_id,
                 "kind": "direction",
                 "body": "Redirect the investigation toward the reliability tradeoff and state one practical next step."
@@ -16014,6 +16339,8 @@ mod tests {
             child_with_manager_messages,
             "send_project_agent_message",
             serde_json::json!({
+                "target_session_id": root,
+                "task_id": task.task_id,
                 "kind": "result",
                 "body": "Reliability is the priority; the next step is to validate the failure-recovery path before setting the launch date."
             }),
@@ -16364,6 +16691,7 @@ mod tests {
                     context_references: vec![],
                     dependencies: vec![],
                     code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
                 },
             }));
         assert!(

@@ -61,6 +61,23 @@ pub struct DelegatedTaskSpec {
     pub context_references: Vec<TaskContextReference>,
     pub dependencies: Vec<TaskId>,
     pub code_change: bool,
+    /// Independent project-agent capabilities granted to the child task.
+    #[serde(default)]
+    pub permissions: ProjectAgentPermissions,
+}
+
+/// Capabilities independently granted to one delegated project agent.
+/// Missing fields in older serialized task records default to disabled.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ProjectAgentPermissions {
+    pub delegation: bool,
+    pub branch_messaging: bool,
+    pub child_control: bool,
+    pub inspection: bool,
+    pub worktree_creation: bool,
+    pub review: bool,
+    pub integration: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -75,6 +92,9 @@ pub struct DelegatedTaskRecord {
     pub context_references: Vec<TaskContextReference>,
     pub dependencies: Vec<TaskId>,
     pub code_change: bool,
+    /// The child task's independent project-agent capability grants.
+    #[serde(default)]
+    pub permissions: ProjectAgentPermissions,
     pub status: DelegatedTaskStatus,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -214,7 +234,7 @@ mod tests {
     fn delegated_task_and_durable_message_contracts_round_trip() {
         use super::{
             AgentMessageDraft, AgentMessageKind, AgentMessageRecord, DelegatedTaskRecord,
-            DelegatedTaskSpec, DelegatedTaskStatus, TaskContextReference,
+            DelegatedTaskSpec, DelegatedTaskStatus, ProjectAgentPermissions, TaskContextReference,
         };
         use crate::{AgentMessageId, AgentSessionId, ProjectId, TaskId, Timestamp};
 
@@ -231,6 +251,15 @@ mod tests {
             }],
             dependencies: vec![],
             code_change: true,
+            permissions: ProjectAgentPermissions {
+                delegation: true,
+                branch_messaging: true,
+                child_control: false,
+                inspection: true,
+                worktree_creation: true,
+                review: true,
+                integration: false,
+            },
         };
         let task = DelegatedTaskRecord {
             task_id,
@@ -243,6 +272,7 @@ mod tests {
             context_references: spec.context_references.clone(),
             dependencies: spec.dependencies.clone(),
             code_change: spec.code_change,
+            permissions: spec.permissions,
             status: DelegatedTaskStatus::Queued,
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
@@ -274,5 +304,14 @@ mod tests {
         ] {
             assert!(value.is_object());
         }
+        let legacy_spec = serde_json::json!({
+            "intent": "Legacy task",
+            "model_id": "provider/review-model",
+            "context_references": [],
+            "dependencies": [],
+            "code_change": false
+        });
+        let legacy_spec: DelegatedTaskSpec = serde_json::from_value(legacy_spec).unwrap();
+        assert_eq!(legacy_spec.permissions, ProjectAgentPermissions::default());
     }
 }

@@ -45,6 +45,11 @@ only: a v47-only backend must reject the upgraded database, and no backend or
 schema downgrade is supported. Require protocol 8.0 clients before exposing
 the new wire contract; protocol 7.x clients must upgrade.
 
+The draft implementation currently adds the default-off delegated-task grants
+and branch-messaging runtime grant to v48. Durable manager wait/join records
+still need to be included in this migration before M7.4 is complete or
+released; level-three delegation remains unavailable in the meantime.
+
 ## Data model
 
 Typed, indexed tables are the source of truth for workspaces, sessions, runs, attempts, messages, activities, approvals and other interactions, provider state, usage, checkpoints, and filesystem history. Query and ownership fields are represented as columns and indexed for the operations that use them. Growing histories are stored as ordered child rows rather than arrays inside aggregate JSON documents.
