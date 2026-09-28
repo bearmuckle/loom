@@ -56,8 +56,11 @@ boundaries. Project agents can inspect direct-child task and session status;
 managers can continue a paused child, retry its failed tool step, or cancel it.
 The workspace navigator groups each project root with its direct children and
 shows child task summaries and live state; loading from a child resolves the
-containing project. Project timelines display durable parent-child messages,
-and child context menus provide pause/resume/interrupt/cancel controls.
+containing project. Project timelines display durable parent-child messages.
+Restored model-context copies of those messages retain project-agent
+attribution rather than appearing as user-authored; when the durable project
+message card is present, the transcript copy is suppressed. Child context menus
+provide pause/resume/interrupt/cancel controls.
 Project archive waits until child tasks are terminal, then archives the
 descendants with the root. Code-changing children use isolated linked
 worktrees; managers can review bounded diffs, fast-forward eligible commits,

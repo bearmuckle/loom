@@ -502,6 +502,9 @@ fn timeline_items_from_messages(
     for (_, entry) in entries {
         match entry {
             Entry::Message(message) => match message.role {
+                MessageRole::User if message.name.as_deref() == Some("loom_project_message") => {
+                    timeline.push(TimelineItem::ProjectMessageContext(message.content));
+                }
                 MessageRole::User => timeline.push(TimelineItem::User(message.content)),
                 MessageRole::Assistant => {
                     if message.content.is_empty() {
@@ -534,6 +537,39 @@ fn timeline_items_from_messages(
         }
     }
     timeline
+}
+
+fn project_message_transcript_content(message: &AgentMessageRecord) -> String {
+    let kind = match message.kind {
+        loom_core::AgentMessageKind::Progress => "progress",
+        loom_core::AgentMessageKind::Result => "result",
+        loom_core::AgentMessageKind::Question => "question",
+        loom_core::AgentMessageKind::Blocker => "blocker",
+        loom_core::AgentMessageKind::Direction => "direction",
+        loom_core::AgentMessageKind::Answer => "answer",
+    };
+    let task = message
+        .task_id
+        .map(|task_id| format!("; task {task_id}"))
+        .unwrap_or_default();
+    format!(
+        "[Project message {} from agent {} ({kind}{task})]\n{}",
+        message.project_sequence, message.sender_session_id, message.body
+    )
+}
+
+fn remove_project_message_context_duplicates(
+    timeline: &mut Vec<TimelineItem>,
+    project_messages: &[AgentMessageRecord],
+) {
+    let project_message_contexts = project_messages
+        .iter()
+        .map(project_message_transcript_content)
+        .collect::<BTreeSet<_>>();
+    timeline.retain(|item| {
+        !matches!(item, TimelineItem::ProjectMessageContext(content)
+            if project_message_contexts.contains(content))
+    });
 }
 
 fn unseen_transcript_messages(
@@ -3502,6 +3538,7 @@ impl LoomView {
             .as_ref()
             .is_some_and(|snapshot| snapshot.root_session_id == self.active_session.id)
         {
+            remove_project_message_context_duplicates(&mut self.timeline, &self.project_messages);
             self.timeline.extend(
                 self.project_messages
                     .iter()
@@ -5610,6 +5647,7 @@ impl LoomView {
                 TimelineItem::User(_)
                     | TimelineItem::Assistant(_)
                     | TimelineItem::ToolOutput(_)
+                    | TimelineItem::ProjectMessageContext(_)
                     | TimelineItem::ActivitySection { .. }
             )
         });
@@ -5626,6 +5664,7 @@ impl LoomView {
         let insertion_index = self.transcript_insertion_index();
         self.timeline
             .splice(insertion_index..insertion_index, ordered_items);
+        self.rebuild_project_message_timeline();
         self.transcript_before_ordinal = next_before;
         self.transcript_has_older = has_older;
         self.ensure_session_task_message(self.active_session.id);
@@ -8838,6 +8877,25 @@ impl LoomView {
                     format!("transcript-assistant-{index}"),
                     text.clone(),
                     0xf3f4f6,
+                ))
+                .into_any(),
+            TimelineItem::ProjectMessageContext(text) => div()
+                .mx_3()
+                .my_1()
+                .p_3()
+                .rounded_lg()
+                .bg(rgb(0x1c2733))
+                .text_color(rgb(0xcbd5e1))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x93c5fd))
+                        .child("Project agent context"),
+                )
+                .child(render_timeline_text(
+                    format!("transcript-project-context-{index}"),
+                    text.clone(),
+                    0xcbd5e1,
                 ))
                 .into_any(),
             TimelineItem::ActivitySection { activities } => {
@@ -16269,8 +16327,15 @@ mod worker_node_tests {
 
 #[cfg(test)]
 mod transcript_paging_tests {
-    use super::{TimelineItem, timeline_items_from_messages, unseen_transcript_messages};
-    use loom_core::{ActivityId, RunId, Timestamp};
+    use super::{
+        TimelineItem, project_message_transcript_content,
+        remove_project_message_context_duplicates, timeline_items_from_messages,
+        unseen_transcript_messages,
+    };
+    use loom_core::{
+        ActivityId, AgentMessageId, AgentMessageKind, AgentMessageRecord, ProjectId, RunId,
+        Timestamp,
+    };
     use loom_model::{MessageRole, ModelId, ModelMessage};
     use loom_protocol::{
         AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
@@ -16305,6 +16370,34 @@ mod transcript_paging_tests {
             ] if task == "task" && answer == "first\n\nsecond"
                 && tool.contains("tool output") && follow_up == "follow-up"
         ));
+    }
+
+    #[test]
+    fn restored_project_message_is_not_misattributed_to_the_user_or_duplicated() {
+        let sender_session_id = loom_core::AgentSessionId::new();
+        let record = AgentMessageRecord {
+            message_id: AgentMessageId::new(),
+            project_id: ProjectId::new(),
+            task_id: None,
+            sender_session_id,
+            target_session_id: loom_core::AgentSessionId::new(),
+            kind: AgentMessageKind::Result,
+            project_sequence: 1,
+            accepted_at: Timestamp::from_unix_millis(1),
+            body: "The child finished.".to_owned(),
+        };
+        let exact_context = project_message_transcript_content(&record);
+        let mut project_message = ModelMessage::new(MessageRole::User, exact_context.clone());
+        project_message.name = Some("loom_project_message".to_owned());
+        let mut timeline =
+            timeline_items_from_messages(vec![(0, 0, project_message)], Vec::new(), true);
+        assert!(matches!(
+            timeline.as_slice(),
+            [TimelineItem::ProjectMessageContext(content)] if content == &exact_context
+        ));
+
+        remove_project_message_context_duplicates(&mut timeline, &[record]);
+        assert!(timeline.is_empty());
     }
 
     #[test]

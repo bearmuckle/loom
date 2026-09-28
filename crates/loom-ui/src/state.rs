@@ -190,6 +190,7 @@ pub(crate) enum TimelineItem {
     },
     ToolStarted(String),
     ToolOutput(String),
+    ProjectMessageContext(String),
     ToolCompleted {
         name: String,
         success: bool,
