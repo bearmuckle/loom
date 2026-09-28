@@ -201,6 +201,12 @@ supported protocol version during negotiation with the existing
 `UnsupportedProtocol` response before sending project schemas. Protocol 7.0
 and schema v47 are required for child worktrees.
 
+M7.4 is planned as protocol 8.0 and schema v48 because it adds separately
+authorized branch messaging and durable manager wait state. Protocol 7.x
+clients must upgrade before the backend serves that contract. The v47-to-v48
+migration is forward-only; v47-only backends cannot open the upgraded
+database, and backend downgrades are unsupported.
+
 ## Quality bar
 
 ### Workspace/session model transition

@@ -38,6 +38,13 @@ receive neither grant. Each migration
 should be tested for successful upgrade, rollback on failure, and safe retry
 after interruption.
 
+M7.4 is planned to advance v47 to v48 for branch-messaging authorization and
+durable manager wait/join state. New per-run and delegated-task grants remain
+independent and default off for existing records. The migration is forward
+only: a v47-only backend must reject the upgraded database, and no backend or
+schema downgrade is supported. Require protocol 8.0 clients before exposing
+the new wire contract; protocol 7.x clients must upgrade.
+
 ## Data model
 
 Typed, indexed tables are the source of truth for workspaces, sessions, runs, attempts, messages, activities, approvals and other interactions, provider state, usage, checkpoints, and filesystem history. Query and ownership fields are represented as columns and indexed for the operations that use them. Growing histories are stored as ordered child rows rather than arrays inside aggregate JSON documents.

@@ -199,6 +199,17 @@ server rejects older clients with `UnsupportedProtocol` before sending v7
 variants. Backend downgrades to pre-project protocol/storage versions are
 unsupported, including when no child agents have been created.
 
+The planned M7.4 contract adds independently persisted delegation, branch
+messaging, child-control, review, and integration grants to delegated-task
+intent, plus durable state for managers waiting on their descendants. Roll it
+out as protocol 8.0 and SQLite schema v48: protocol 7.x clients must upgrade
+before negotiation succeeds, and v47-only backends must reject v48 databases.
+The v47-to-v48 migration is forward-only, with every newly introduced grant
+disabled for existing tasks and runs. Do not infer branch messaging from the
+existing direct-message grant. Agent-attributed messages must be submitted by
+the server-bound agent tool; a client-supplied sender session ID is not an
+agent identity.
+
 Persist normalized queryable records for project membership/parentage,
 delegated task intent and dependencies, message envelope/body and ordering,
 and worktree/integration state. Use foreign keys and transactions so child
@@ -364,18 +375,49 @@ later design step.
 
 ### Slice 4: deeper hierarchy and branch communication
 
-1. Enable level-two delegation with level-three agents; backend rejects any
-   request beyond three total levels.
-2. Add project-scoped branch-to-branch routing with policy and membership
-   checks, keeping direct manager/child messaging as the simpler default.
-3. Add hierarchy-wide dependency coordination, concurrency accounting,
-   cancellation semantics, and progress roll-up while the project manager
-   retains final accountability.
-4. Validate nested worktree ancestry and integrate each level upward before
-   project-branch integration.
+1. Persist an explicit, independent child permission set with each delegated
+   task. A depth-two agent may create depth-three tasks only when its run has
+   the delegation grant; depth-three agents cannot delegate. Code-worktree
+   creation, child control, review, integration, inspection, and branch
+   messaging remain separate grants. Reject requests that exceed the parent's
+   own grants or the maximum depth.
+2. Keep direct parent-child messages under the existing direct-message grant.
+   Permit non-adjacent branch messages only when both endpoints are project
+   members and have the explicit branch-messaging grant. Bind the sender to
+   the executing run, keep task context separate from recipient selection,
+   reject client-supplied agent identities, and retain per-recipient durable
+   inbox ordering.
+3. Add a durable manager wait/join transition before enabling nested agents.
+   A synchronous blocking tool is unsafe because it can hold the only
+   concurrency slot while its child remains queued. Park a manager at a safe
+   run boundary, persist the wait and original continuation, release its
+   project slot, and resume it exactly once when its direct children are
+   return-ready. Recovery must reconcile parked managers and queued work
+   without replaying an uncertain external tool effect. A manager task must
+   not report completion while a child is still active or while its code
+   result still needs integration.
+4. Apply the configured concurrency limit across the workspace, serialize
+   admission at that scope, and restart queued projects fairly when a slot is
+   released. If a prerequisite fails or is cancelled, move its dependent task
+   to an actionable blocked state rather than leaving it queued forever.
+5. Let each manager control only its direct children. Cancelling a manager's
+   child cancels or interrupts that child's descendants deepest-first; pausing
+   or interrupting a manager run remains local. Derive branch progress from
+   durable child task states, while keeping each run's own state distinct.
+6. Preserve upward code ownership: a depth-two agent reviews and integrates a
+   depth-three commit into its own branch before returning, then the project
+   root reviews and integrates that branch. Require a clean exact base and
+   review of the exact child `HEAD` at each edge; retain stale or diverged
+   work for explicit recovery.
+7. Extend the workspace project tree recursively, expose controls and review
+   actions for the owning parent-child edge, and include authorized descendant
+   inboxes in the root activity timeline.
 
-**Exit:** three-level projects coordinate safely, recover after restart, and
-preserve explicit ownership and review at each integration boundary.
+**Exit:** three-level projects coordinate safely, recover after restart, keep
+workspace concurrency bounded, preserve explicit grants, deliver branch
+messages only across authorized routes, and integrate code upward at every
+parent boundary. This slice remains planned until the durable wait/join,
+restart, and cap-one cases pass end-to-end.
 
 ## Verification and rollout
 
