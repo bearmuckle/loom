@@ -68,6 +68,10 @@ pub enum AgentActivityData {
 pub struct AgentActivityRecord {
     pub id: ActivityId,
     pub run_id: RunId,
+    /// Stable run-wide order assigned when this activity first starts.
+    /// Status updates keep the original value.
+    #[serde(default)]
+    pub timeline_ordinal: u64,
     pub parent_id: Option<ActivityId>,
     pub step_id: Option<StepId>,
     pub kind: AgentActivityKind,

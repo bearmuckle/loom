@@ -206,9 +206,8 @@ pub(crate) enum TimelineItem {
     },
 }
 
-/// Project consecutive activities from one run into one section. Transcript messages,
-/// status items, and run boundaries break a group. Updates replace records in place so
-/// late results never reorder the transcript.
+/// Project consecutive activities from one run into one section. The live event
+/// stream supplies the insertion order; updates replace records in place.
 pub(crate) fn upsert_activity(timeline: &mut Vec<TimelineItem>, activity: AgentActivityRecord) {
     for item in timeline.iter_mut() {
         if let TimelineItem::ActivitySection { activities } = item
@@ -229,15 +228,7 @@ pub(crate) fn upsert_activity(timeline: &mut Vec<TimelineItem>, activity: AgentA
     let section = TimelineItem::ActivitySection {
         activities: vec![activity],
     };
-    // Transcript restoration loads messages separately from activity records.
-    // If the transcript is already present, the current run's activity belongs
-    // before its final assistant response, not after it.
-    let insertion_index = if matches!(timeline.last(), Some(TimelineItem::Assistant(_))) {
-        timeline.len() - 1
-    } else {
-        timeline.len()
-    };
-    timeline.insert(insertion_index, section);
+    timeline.push(section);
 }
 
 pub(crate) fn activity_status_label(status: AgentActivityStatus) -> &'static str {
@@ -386,6 +377,7 @@ mod tests {
         AgentActivityRecord {
             id: ActivityId::new(),
             run_id,
+            timeline_ordinal: 0,
             parent_id: None,
             step_id: None,
             kind: AgentActivityKind::ModelTurn,
@@ -507,6 +499,7 @@ mod tests {
         let turn = AgentActivityRecord {
             id: turn_id,
             run_id,
+            timeline_ordinal: 0,
             parent_id: None,
             step_id: None,
             kind: AgentActivityKind::ModelTurn,
@@ -525,6 +518,7 @@ mod tests {
             AgentActivityRecord {
                 id: ActivityId::new(),
                 run_id,
+                timeline_ordinal: 0,
                 parent_id: Some(turn_id),
                 step_id: None,
                 kind: AgentActivityKind::ToolCall,

@@ -968,17 +968,29 @@ struct PersistedRunSummary {
     usage: UsageSnapshot,
 }
 
-fn durable_run_messages_from_runtime(messages: &[ModelMessage]) -> Vec<DurableRunMessage> {
-    messages
+fn durable_run_messages_from_runtime(
+    messages: &[ModelMessage],
+    timeline_ordinals: &[u64],
+) -> Result<Vec<DurableRunMessage>> {
+    if messages.len() != timeline_ordinals.len() {
+        return Err(LoomError::new(
+            ErrorCode::MalformedPayload,
+            "run transcript and timeline order are out of sync",
+            false,
+        ));
+    }
+    Ok(messages
         .iter()
-        .map(|message| DurableRunMessage {
+        .zip(timeline_ordinals.iter().copied())
+        .map(|(message, timeline_ordinal)| DurableRunMessage {
+            timeline_ordinal,
             role: message.role,
             content: message.content.clone(),
             name: message.name.clone(),
             tool_call_id: message.tool_call_id,
             tool_calls: message.tool_calls.clone(),
         })
-        .collect()
+        .collect())
 }
 
 fn persisted_run_messages(messages: Vec<DurableRunMessage>) -> Vec<ModelMessage> {
@@ -1154,6 +1166,7 @@ fn runtime_state_from_durable_config(
         run: summary.snapshot.clone(),
         plan: loom_agent::AgentPlan { steps: Vec::new() },
         messages: Vec::new(),
+        message_timeline_ordinals: Vec::new(),
         last_project_message_sequence: 0,
         attempts: Vec::new(),
         pending_approval: None,
@@ -1922,6 +1935,15 @@ struct DelegateProjectTaskArguments {
     permissions: loom_core::ProjectAgentPermissions,
 }
 
+fn delegated_child_model_id(requested: Option<String>, current_model: &ModelId) -> String {
+    match requested {
+        Some(requested) if !requested.trim().eq_ignore_ascii_case("current") => {
+            requested.trim().to_owned()
+        }
+        _ => current_model.as_str().to_owned(),
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendProjectAgentMessageArguments {
@@ -2040,13 +2062,13 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_delegate {
             definitions.push(ToolDefinition {
                 name: "delegate_project_task".to_owned(),
-                description: "Create a bounded non-code child agent task in this project. The child uses the current model unless model_id is supplied.".to_owned(),
+                description: "Create a bounded non-code child agent task in this project. Omit model_id or set it to `current` to reuse this agent's model; use a provider/model ID to choose another model.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
                         "child_name": {"type": "string", "minLength": 1, "maxLength": 128},
                         "intent": {"type": "string", "minLength": 1, "maxLength": 16384},
-                        "model_id": {"type": "string", "minLength": 1, "maxLength": 512},
+                        "model_id": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Optional provider/model ID. Omit this field or use `current` to reuse this agent's model."},
                         "context_references": {
                             "type": "array",
                             "maxItems": 128,
@@ -2093,7 +2115,7 @@ impl ToolExtension for ProjectAgentTools {
                     "properties": {
                         "child_name": {"type": "string", "minLength": 1, "maxLength": 128},
                         "intent": {"type": "string", "minLength": 1, "maxLength": 16384},
-                        "model_id": {"type": "string", "minLength": 1, "maxLength": 512},
+                        "model_id": {"type": "string", "minLength": 1, "maxLength": 512, "description": "Optional provider/model ID. Omit this field or use `current` to reuse this agent's model."},
                         "context_references": {
                             "type": "array",
                             "maxItems": 128,
@@ -2564,9 +2586,7 @@ impl ProjectAgentTools {
         let request_id = RequestId::from_uuid(*call.id.as_uuid());
         let spec = DelegatedTaskSpec {
             intent: arguments.intent,
-            model_id: arguments
-                .model_id
-                .unwrap_or_else(|| self.model_id.as_str().to_owned()),
+            model_id: delegated_child_model_id(arguments.model_id, &self.model_id),
             context_references: arguments.context_references,
             dependencies: arguments.dependencies,
             code_change,
@@ -4011,7 +4031,12 @@ impl InProcessBackend {
             })?;
             hydrate_runtime_execution_state(&mut runtime_state, execution_state)?;
             runtime_state.plan = persistence.load_run_plan(run_id)?;
-            runtime_state.messages = persisted_run_messages(persistence.load_run_messages(run_id)?);
+            let durable_messages = persistence.load_run_messages(run_id)?;
+            runtime_state.message_timeline_ordinals = durable_messages
+                .iter()
+                .map(|message| message.timeline_ordinal)
+                .collect();
+            runtime_state.messages = persisted_run_messages(durable_messages);
             hydrate_run_context_checkpoint(&persistence, run_id, &mut runtime_state)?;
             runtime_state.activities = persistence.load_run_activities(run_id)?;
             runtime_state.attempts = persistence.load_run_attempts(run_id)?;
@@ -4358,7 +4383,10 @@ impl InProcessBackend {
             let message_delta = DurableRunMessageDelta {
                 start_ordinal: start_ordinal as u64,
                 reset: reset_messages,
-                messages: durable_run_messages_from_runtime(&state.messages[start_index..]),
+                messages: durable_run_messages_from_runtime(
+                    &state.messages[start_index..],
+                    &state.message_timeline_ordinals[start_index..],
+                )?,
             };
             let project_manager_wait = state
                 .pending_project_join
@@ -4684,8 +4712,13 @@ impl InProcessBackend {
         let mut durable_run_messages = BTreeMap::new();
         let mut durable_run_activities = BTreeMap::new();
         for (run_id, state) in &mut runs {
-            durable_run_messages
-                .insert(*run_id, durable_run_messages_from_runtime(&state.messages));
+            durable_run_messages.insert(
+                *run_id,
+                durable_run_messages_from_runtime(
+                    &state.messages,
+                    &state.message_timeline_ordinals,
+                )?,
+            );
             durable_run_activities.insert(*run_id, std::mem::take(&mut state.activities));
         }
         let loaded_repositories = self.session_repositories()?.clone();
@@ -5653,6 +5686,7 @@ impl InProcessConnection {
                         .into_iter()
                         .map(|message| AgentRunMessageHeader {
                             ordinal: message.ordinal,
+                            timeline_ordinal: message.timeline_ordinal,
                             role: message.role,
                             content_bytes: message.content_bytes,
                             name: message.name,
@@ -5675,6 +5709,17 @@ impl InProcessConnection {
             .rev()
             .map(|(relative_ordinal, message)| {
                 let ordinal = start + relative_ordinal;
+                let timeline_ordinal = state
+                    .message_timeline_ordinals
+                    .get(ordinal)
+                    .copied()
+                    .ok_or_else(|| {
+                        LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            "run transcript has no timeline ordinal",
+                            false,
+                        )
+                    })?;
                 Ok(AgentRunMessageHeader {
                     ordinal: u64::try_from(ordinal).map_err(|_| {
                         LoomError::new(
@@ -5683,6 +5728,7 @@ impl InProcessConnection {
                             false,
                         )
                     })?,
+                    timeline_ordinal,
                     role: message.role,
                     content_bytes: u64::try_from(message.content.len()).map_err(|_| {
                         LoomError::new(
@@ -5736,6 +5782,7 @@ impl InProcessConnection {
                     bounded_transcript_content(&content, header.content_bytes);
                 Ok(AgentRunTranscriptMessage {
                     ordinal: header.ordinal,
+                    timeline_ordinal: header.timeline_ordinal,
                     message: ModelMessage {
                         role: header.role,
                         content,
@@ -5827,10 +5874,15 @@ impl InProcessConnection {
         hydrate_runtime_execution_state(&mut state, execution_state)?;
         state.plan = persistence.load_run_plan(summary.snapshot.id)?;
         if include_messages {
-            state.messages =
-                persisted_run_messages(persistence.load_run_messages(summary.snapshot.id)?);
+            let durable_messages = persistence.load_run_messages(summary.snapshot.id)?;
+            state.message_timeline_ordinals = durable_messages
+                .iter()
+                .map(|message| message.timeline_ordinal)
+                .collect();
+            state.messages = persisted_run_messages(durable_messages);
         } else {
             state.messages.clear();
+            state.message_timeline_ordinals.clear();
         }
         hydrate_run_context_checkpoint(persistence, summary.snapshot.id, &mut state)?;
         state.activities = persistence.load_run_activities(summary.snapshot.id)?;
@@ -12196,6 +12248,11 @@ fn run_snapshot_projection_with_messages(
         pending_input: state.pending_input.clone(),
         usage: state.usage.clone(),
         activities: state.activities.clone(),
+        message_timeline_ordinals: if include_messages {
+            state.message_timeline_ordinals.clone()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -12262,6 +12319,28 @@ mod tests {
     use loom_workspace::{WorkspaceControl, WorkspaceEdit};
 
     use super::*;
+
+    #[test]
+    fn delegated_child_current_model_alias_resolves_to_manager_model() {
+        let current_model = ModelId::new("provider/model");
+
+        assert_eq!(
+            delegated_child_model_id(None, &current_model),
+            "provider/model"
+        );
+        assert_eq!(
+            delegated_child_model_id(Some("current".to_owned()), &current_model),
+            "provider/model"
+        );
+        assert_eq!(
+            delegated_child_model_id(Some("  CURRENT  ".to_owned()), &current_model),
+            "provider/model"
+        );
+        assert_eq!(
+            delegated_child_model_id(Some("provider/other".to_owned()), &current_model),
+            "provider/other"
+        );
+    }
 
     #[test]
     fn api_key_provider_configuration_is_backend_scoped_and_recovers_without_persisting_the_secret_in_sqlite()

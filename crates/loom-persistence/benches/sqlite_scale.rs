@@ -134,6 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             vec![AgentActivityRecord {
                 id: ActivityId::new(),
                 run_id,
+                timeline_ordinal: 0,
                 parent_id: None,
                 step_id: None,
                 kind: AgentActivityKind::ModelTurn,
@@ -157,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_id,
             vec![
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::User,
                     content: format!(
                         "Inspect workspace item {index}, make a focused change, and run its tests."
@@ -166,6 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::Assistant,
                     content: format!(
                         "I updated the relevant files for item {index} and am checking the result."
@@ -175,6 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::Tool,
                     content: tool_output,
                     name: Some("run_tests".to_owned()),
@@ -182,6 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::Assistant,
                     content: format!(
                         "Validation completed for item {index}. {}",

@@ -38,7 +38,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const DATABASE_SCHEMA_VERSION: u32 = 50;
+const DATABASE_SCHEMA_VERSION: u32 = 51;
+const RUN_TIMELINE_PREVIOUS_SCHEMA_VERSION: u32 = 50;
 const PROJECT_WORKTREE_SCHEMA_VERSION: u32 = 47;
 const PROJECT_CHILD_CONTROL_SCHEMA_VERSION: u32 = 46;
 const PROJECT_MANAGER_WAIT_SCHEMA_VERSION: u32 = 48;
@@ -318,6 +319,7 @@ CREATE TABLE IF NOT EXISTS run_messages (
     session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
         CHECK(length(session_id) = 16),
     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    timeline_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(timeline_ordinal >= 0),
     role TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant', 'tool')),
     content_hash BLOB REFERENCES content_objects(hash) ON DELETE RESTRICT
         CHECK(content_hash IS NULL OR length(content_hash) = 32),
@@ -363,6 +365,7 @@ CREATE TABLE IF NOT EXISTS run_activities (
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
     activity_id BLOB NOT NULL CHECK(length(activity_id) = 16),
     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    timeline_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(timeline_ordinal >= 0),
     parent_activity_id BLOB CHECK(parent_activity_id IS NULL OR length(parent_activity_id) = 16),
     step_id BLOB CHECK(step_id IS NULL OR length(step_id) = 16),
     tool_call_id BLOB CHECK(tool_call_id IS NULL OR length(tool_call_id) = 16),
@@ -1330,6 +1333,7 @@ pub struct DurableSessionProjectionRead {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableRunMessage {
+    pub timeline_ordinal: u64,
     pub role: loom_model::MessageRole,
     pub content: String,
     pub name: Option<String>,
@@ -1349,6 +1353,7 @@ pub struct DurableRunMessageDelta {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DurableRunMessageHeader {
     pub ordinal: u64,
+    pub timeline_ordinal: u64,
     pub role: loom_model::MessageRole,
     pub content_bytes: u64,
     pub name: Option<String>,
@@ -4607,7 +4612,7 @@ impl FilePersistence {
         let tool_calls_by_message = load_run_message_tool_calls(&connection, run_id, None, None)?;
         let mut statement = connection
             .prepare(
-                "SELECT ordinal, role, content_hash, name, tool_call_id
+                "SELECT ordinal, timeline_ordinal, role, content_hash, name, tool_call_id
                       FROM run_messages WHERE run_id=?1 ORDER BY ordinal",
             )
             .map_err(|error| {
@@ -4617,24 +4622,33 @@ impl FilePersistence {
             .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<Vec<u8>>>(4)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                 ))
             })
             .map_err(|error| {
                 persistence_error(format!("could not read run messages: {error}"), true)
             })?;
         rows.map(|row| {
-            let (ordinal, role, content_hash, name, tool_call_id) = row.map_err(|error| {
-                persistence_error(format!("could not read run message: {error}"), true)
-            })?;
+            let (ordinal, timeline_ordinal, role, content_hash, name, tool_call_id) =
+                row.map_err(|error| {
+                    persistence_error(format!("could not read run message: {error}"), true)
+                })?;
             let role = parse_message_role(&role)?;
             let ordinal = u64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
                     "persisted message ordinal is negative",
+                    false,
+                )
+            })?;
+            let timeline_ordinal = u64::try_from(timeline_ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted message timeline ordinal is negative",
                     false,
                 )
             })?;
@@ -4667,6 +4681,7 @@ impl FilePersistence {
             }
             let tool_call_id = decode_optional_tool_call_id(tool_call_id)?;
             Ok(DurableRunMessage {
+                timeline_ordinal,
                 role,
                 content,
                 name,
@@ -4695,7 +4710,7 @@ impl FilePersistence {
     ) -> Result<Vec<AgentActivityRecord>> {
         let mut statement = connection
             .prepare(
-                "SELECT ordinal, activity_id, parent_activity_id, step_id, tool_call_id,
+                "SELECT ordinal, timeline_ordinal, activity_id, parent_activity_id, step_id, tool_call_id,
                         kind, status, started_at, completed_at, elapsed_ms, data_hash
                  FROM run_activities WHERE run_id=?1 ORDER BY ordinal",
             )
@@ -4706,16 +4721,17 @@ impl FilePersistence {
             .query_map([run_id.as_uuid().as_bytes().as_slice()], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
                     row.get::<_, Option<Vec<u8>>>(3)?,
                     row.get::<_, Option<Vec<u8>>>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                     row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
                     row.get::<_, Option<i64>>(9)?,
-                    row.get::<_, Vec<u8>>(10)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Vec<u8>>(11)?,
                 ))
             })
             .map_err(|error| {
@@ -4740,6 +4756,7 @@ impl FilePersistence {
             expected_ordinal,
             (
                 ordinal,
+                timeline_ordinal,
                 activity_id,
                 parent_activity_id,
                 step_id,
@@ -4793,10 +4810,18 @@ impl FilePersistence {
                 ));
             }
             let activity_id = ActivityId::from_uuid(decode_uuid(&activity_id, "activity id")?);
+            let timeline_ordinal = u64::try_from(timeline_ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted activity timeline ordinal is negative",
+                    false,
+                )
+            })?;
             let data = restore_activity_tool_data(data, activity_id, &calls, &attempts)?;
             activities.push(AgentActivityRecord {
                 id: activity_id,
                 run_id,
+                timeline_ordinal,
                 parent_id: decode_optional_activity_id(parent_activity_id)?,
                 step_id: decode_optional_step_id(step_id)?,
                 kind,
@@ -5023,7 +5048,7 @@ impl FilePersistence {
         let connection = self.connection()?;
         let mut statement = connection
             .prepare(
-                "SELECT m.ordinal, m.role,
+                "SELECT m.ordinal, m.timeline_ordinal, m.role,
                         MAX(
                             COALESCE(
                                 (SELECT raw_size FROM content_objects WHERE hash=m.content_hash),
@@ -5055,10 +5080,11 @@ impl FilePersistence {
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
                     ))
                 },
             )
@@ -5068,9 +5094,10 @@ impl FilePersistence {
         let tool_calls_by_message =
             load_run_message_tool_calls(&connection, run_id, before_ordinal, Some(limit as usize))?;
         rows.map(|row| {
-            let (ordinal, role, content_bytes, name, tool_call_id) = row.map_err(|error| {
-                persistence_error(format!("could not read run message header: {error}"), true)
-            })?;
+            let (ordinal, timeline_ordinal, role, content_bytes, name, tool_call_id) = row
+                .map_err(|error| {
+                    persistence_error(format!("could not read run message header: {error}"), true)
+                })?;
             let ordinal = u64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
                     ErrorCode::MalformedPayload,
@@ -5078,8 +5105,16 @@ impl FilePersistence {
                     false,
                 )
             })?;
+            let timeline_ordinal = u64::try_from(timeline_ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted message timeline ordinal is negative",
+                    false,
+                )
+            })?;
             Ok(DurableRunMessageHeader {
                 ordinal,
+                timeline_ordinal,
                 role: parse_message_role(&role)?,
                 content_bytes: u64::try_from(content_bytes).map_err(|_| {
                     LoomError::new(
@@ -6901,8 +6936,12 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     if database_version == DATABASE_SCHEMA_VERSION {
         return Ok(());
     }
+    if database_version == RUN_TIMELINE_PREVIOUS_SCHEMA_VERSION {
+        return migrate_v50_to_v51(connection);
+    }
     if database_version == PROJECT_CANCELLATION_CASCADE_SCHEMA_VERSION {
-        return migrate_v49_to_v50(connection);
+        migrate_v49_to_v50(connection)?;
+        return migrate_v50_to_v51(connection);
     }
     if database_version == 41 {
         migrate_v41_to_v42(connection)?;
@@ -6911,7 +6950,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v50(connection);
+        return migrate_v47_to_v51(connection);
     }
     if database_version == PROJECT_SCHEMA_VERSION {
         migrate_v42_to_v43(connection)?;
@@ -6919,36 +6958,37 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v50(connection);
+        return migrate_v47_to_v51(connection);
     }
     if database_version == PROJECT_MESSAGE_SCHEMA_VERSION {
         migrate_v43_to_v44(connection)?;
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v50(connection);
+        return migrate_v47_to_v51(connection);
     }
     if database_version == PROJECT_DELEGATION_SCHEMA_VERSION {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v50(connection);
+        return migrate_v47_to_v51(connection);
     }
     if database_version == PROJECT_COORDINATION_SCHEMA_VERSION {
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v50(connection);
+        return migrate_v47_to_v51(connection);
     }
     if database_version == PROJECT_CHILD_CONTROL_SCHEMA_VERSION {
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v50(connection);
+        return migrate_v47_to_v51(connection);
     }
     if database_version == PROJECT_WORKTREE_SCHEMA_VERSION {
-        return migrate_v47_to_v50(connection);
+        return migrate_v47_to_v51(connection);
     }
     if database_version == PROJECT_MANAGER_WAIT_SCHEMA_VERSION {
         migrate_v48_to_v49(connection)?;
-        return migrate_v49_to_v50(connection);
+        migrate_v49_to_v50(connection)?;
+        return migrate_v50_to_v51(connection);
     }
     if database_version != 0 {
         return Err(LoomError::new(
@@ -7070,6 +7110,56 @@ fn migrate_v47_to_v50(connection: &Connection) -> Result<()> {
     migrate_v49_to_v50(connection)
 }
 
+fn migrate_v47_to_v51(connection: &Connection) -> Result<()> {
+    migrate_v47_to_v50(connection)?;
+    migrate_v50_to_v51(connection)
+}
+
+fn migrate_v50_to_v51(connection: &Connection) -> Result<()> {
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not begin run timeline migration: {error}"),
+            true,
+        )
+    })?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE run_messages
+                ADD COLUMN timeline_ordinal INTEGER NOT NULL DEFAULT 0
+                CHECK(timeline_ordinal >= 0);
+             ALTER TABLE run_activities
+                ADD COLUMN timeline_ordinal INTEGER NOT NULL DEFAULT 0
+                CHECK(timeline_ordinal >= 0);
+             UPDATE run_messages
+                SET timeline_ordinal = ordinal;
+             UPDATE run_activities
+                SET timeline_ordinal = ordinal + COALESCE(
+                    (SELECT MAX(message.ordinal) + 1
+                     FROM run_messages message
+                     WHERE message.run_id = run_activities.run_id),
+                    0
+                );",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not add run timeline order: {error}"), true)
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record run timeline schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit run timeline migration: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
 fn migrate_v48_to_v49(connection: &Connection) -> Result<()> {
     let transaction = connection.unchecked_transaction().map_err(|error| {
         persistence_error(
@@ -7126,7 +7216,7 @@ fn migrate_v49_to_v50(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
-        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .pragma_update(None, "user_version", RUN_TIMELINE_PREVIOUS_SCHEMA_VERSION)
         .map_err(|error| {
             persistence_error(
                 format!("could not record project cancellation recovery schema version: {error}"),
@@ -9435,6 +9525,13 @@ fn save_run_message_rows(
                     false,
                 )
             })?;
+            let timeline_ordinal = i64::try_from(message.timeline_ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "run timeline ordinal exceeds SQLite's integer range",
+                    false,
+                )
+            })?;
             let fragments_match = run_message_fragments_match(
                 transaction,
                 *run_id,
@@ -9529,14 +9626,16 @@ fn save_run_message_rows(
             }
             transaction
                 .execute(
-                    "INSERT INTO run_messages(run_id, session_id, ordinal, role, content_hash,
-                    name, tool_call_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    "INSERT INTO run_messages(run_id, session_id, ordinal, timeline_ordinal,
+                    role, content_hash, name, tool_call_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(run_id, ordinal) DO UPDATE SET
-                    session_id=excluded.session_id, role=excluded.role,
+                    session_id=excluded.session_id,
+                    timeline_ordinal=excluded.timeline_ordinal, role=excluded.role,
                     content_hash=excluded.content_hash, name=excluded.name,
                     tool_call_id=excluded.tool_call_id
                  WHERE run_messages.session_id IS NOT excluded.session_id
+                    OR run_messages.timeline_ordinal IS NOT excluded.timeline_ordinal
                     OR run_messages.role IS NOT excluded.role
                     OR run_messages.content_hash IS NOT excluded.content_hash
                     OR run_messages.name IS NOT excluded.name
@@ -9545,6 +9644,7 @@ fn save_run_message_rows(
                         run_id_bytes.as_slice(),
                         session_id,
                         ordinal,
+                        timeline_ordinal,
                         message_role_name(message.role),
                         content_hash,
                         message.name,
@@ -11344,6 +11444,13 @@ fn save_run_activity_rows(
                     false,
                 )
             })?;
+            let timeline_ordinal = i64::try_from(activity.timeline_ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "activity timeline ordinal exceeds SQLite's integer range",
+                    false,
+                )
+            })?;
             let activity_id = activity.id.as_uuid().as_bytes().to_vec();
             let existing_ordinal: Option<i64> = transaction
                 .query_row(
@@ -11420,13 +11527,14 @@ fn save_run_activity_rows(
             transaction
                 .execute(
                     "INSERT INTO run_activities(
-                        run_id, session_id, activity_id, ordinal, parent_activity_id,
+                        run_id, session_id, activity_id, ordinal, timeline_ordinal, parent_activity_id,
                         step_id, tool_call_id, kind, status, started_at, completed_at,
                         elapsed_ms, data_hash
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                      ON CONFLICT(run_id, activity_id) DO UPDATE SET
                         session_id=excluded.session_id,
                         ordinal=excluded.ordinal,
+                        timeline_ordinal=excluded.timeline_ordinal,
                         parent_activity_id=excluded.parent_activity_id,
                         step_id=excluded.step_id,
                         tool_call_id=excluded.tool_call_id,
@@ -11438,6 +11546,7 @@ fn save_run_activity_rows(
                         data_hash=excluded.data_hash
                      WHERE run_activities.session_id IS NOT excluded.session_id
                         OR run_activities.ordinal IS NOT excluded.ordinal
+                        OR run_activities.timeline_ordinal IS NOT excluded.timeline_ordinal
                         OR run_activities.parent_activity_id IS NOT excluded.parent_activity_id
                         OR run_activities.step_id IS NOT excluded.step_id
                         OR run_activities.tool_call_id IS NOT excluded.tool_call_id
@@ -11452,6 +11561,7 @@ fn save_run_activity_rows(
                         session_id.as_slice(),
                         activity_id.as_slice(),
                         ordinal,
+                        timeline_ordinal,
                         parent_activity_id.as_deref(),
                         step_id.as_deref(),
                         tool_call_id.as_deref(),
@@ -11554,6 +11664,13 @@ fn save_run_activity_deltas(
                     )
                 })?
         };
+        let timeline_ordinal = i64::try_from(activity.timeline_ordinal).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "activity timeline ordinal exceeds SQLite's integer range",
+                false,
+            )
+        })?;
         let normalized_data = normalize_activity_tool_data(&activity.data);
         let data = serde_json::to_vec(&normalized_data).map_err(|error| {
             LoomError::new(
@@ -11587,10 +11704,10 @@ fn save_run_activity_deltas(
             .transpose()?;
         transaction.execute(
             "INSERT INTO run_activities(
-                run_id, session_id, activity_id, ordinal, parent_activity_id,
+                run_id, session_id, activity_id, ordinal, timeline_ordinal, parent_activity_id,
                 step_id, tool_call_id, kind, status, started_at, completed_at,
                 elapsed_ms, data_hash
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(run_id, activity_id) DO UPDATE SET
                 parent_activity_id=excluded.parent_activity_id, step_id=excluded.step_id,
                 tool_call_id=excluded.tool_call_id, kind=excluded.kind, status=excluded.status,
@@ -11605,6 +11722,7 @@ fn save_run_activity_deltas(
                 OR run_activities.elapsed_ms IS NOT excluded.elapsed_ms
                 OR run_activities.data_hash IS NOT excluded.data_hash",
             params![run_id_bytes.as_slice(), session_id.as_slice(), activity_id, ordinal,
+                timeline_ordinal,
                 parent_activity_id.as_deref(), step_id.as_deref(), tool_call_id.as_deref(),
                 activity_kind_name(activity.kind), activity_status_name(activity.status),
                 started_at, completed_at, elapsed_ms, data_hash],
@@ -13944,6 +14062,7 @@ mod tests {
         let initial_activity = AgentActivityRecord {
             id: ActivityId::new(),
             run_id,
+            timeline_ordinal: 1,
             parent_id: None,
             step_id: None,
             kind: AgentActivityKind::ToolCall,
@@ -13961,6 +14080,7 @@ mod tests {
             run_id,
             vec![
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::System,
                     content: "old system".to_owned(),
                     name: None,
@@ -13968,6 +14088,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 2,
                     role: loom_model::MessageRole::Assistant,
                     content: "stale streamed answer".to_owned(),
                     name: Some("old header".to_owned()),
@@ -14052,6 +14173,7 @@ mod tests {
         let second_activity = AgentActivityRecord {
             id: ActivityId::new(),
             run_id,
+            timeline_ordinal: 4,
             parent_id: None,
             step_id: None,
             kind: AgentActivityKind::ToolCall,
@@ -14067,6 +14189,7 @@ mod tests {
         let third_activity = AgentActivityRecord {
             id: ActivityId::new(),
             run_id,
+            timeline_ordinal: 5,
             parent_id: None,
             step_id: None,
             kind: AgentActivityKind::ModelTurn,
@@ -14088,6 +14211,7 @@ mod tests {
             reset: true,
             messages: vec![
                 DurableRunMessage {
+                    timeline_ordinal: 3,
                     role: loom_model::MessageRole::User,
                     content: "retry prompt".to_owned(),
                     name: None,
@@ -14095,6 +14219,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 6,
                     role: loom_model::MessageRole::Assistant,
                     content: "partial".to_owned(),
                     name: Some("streaming".to_owned()),
@@ -14193,6 +14318,7 @@ mod tests {
             start_ordinal: 1,
             reset: false,
             messages: vec![DurableRunMessage {
+                timeline_ordinal: 6,
                 role: loom_model::MessageRole::Assistant,
                 content: "partial final".to_owned(),
                 name: Some("new header".to_owned()),
@@ -14642,7 +14768,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE sentinel(value TEXT);
                  INSERT INTO sentinel(value) VALUES ('keep');
-                 PRAGMA user_version=51;",
+                 PRAGMA user_version=52;",
             )
             .unwrap();
         let original_journal_mode: String = connection
@@ -14673,7 +14799,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 51);
+        assert_eq!(version, 52);
         assert_eq!(journal_mode, original_journal_mode);
         assert_eq!(sentinel, "keep");
         assert!(!has_feed_meta);
@@ -14698,6 +14824,8 @@ mod tests {
                  INSERT INTO run_runtime_config(
                     run_id, project_delegation_enabled, project_branch_messaging_enabled
                  ) VALUES (x'01', 1, 1);
+                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
                  PRAGMA user_version=48;",
             )
             .unwrap();
@@ -14733,6 +14861,43 @@ mod tests {
     }
 
     #[test]
+    fn v50_upgrade_assigns_stable_legacy_run_timeline_order() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 INSERT INTO run_messages(run_id, ordinal) VALUES (x'01', 0), (x'01', 1);
+                 INSERT INTO run_activities(run_id, ordinal) VALUES (x'01', 0), (x'01', 1);
+                 PRAGMA user_version=50;",
+            )
+            .unwrap();
+
+        initialize_schema(&connection).unwrap();
+
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let messages: Vec<i64> = connection
+            .prepare("SELECT timeline_ordinal FROM run_messages ORDER BY ordinal")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        let activities: Vec<i64> = connection
+            .prepare("SELECT timeline_ordinal FROM run_activities ORDER BY ordinal")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        assert_eq!(messages, vec![0, 1]);
+        assert_eq!(activities, vec![2, 3]);
+    }
+
+    #[test]
     fn v42_upgrade_adds_durable_project_message_cursor() {
         let connection = Connection::open_in_memory().unwrap();
         connection
@@ -14740,6 +14905,8 @@ mod tests {
                 "CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
                  CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
                  CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
+                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
                  PRAGMA user_version=42;",
             )
             .unwrap();
@@ -14806,6 +14973,8 @@ mod tests {
                  INSERT INTO run_runtime_config(run_id, project_delegation_enabled)
                     VALUES (x'01', 1);
                  CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
+                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
                  PRAGMA user_version=44;",
             )
             .unwrap();
@@ -14850,6 +15019,8 @@ mod tests {
                     project_inspection_enabled
                  ) VALUES (x'01', 1, 1, 1);
                  CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
+                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
                  PRAGMA user_version=45;",
             )
             .unwrap();
@@ -14886,6 +15057,8 @@ mod tests {
                  );
                  INSERT INTO run_runtime_config(run_id) VALUES (x'01');
                  CREATE TABLE delegated_tasks(task_id BLOB PRIMARY KEY);
+                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
                  PRAGMA user_version=46;",
             )
             .unwrap();
@@ -14945,6 +15118,8 @@ mod tests {
                  );
                  INSERT INTO run_runtime_config(run_id, project_messaging_enabled)
                     VALUES (x'02', 1);
+                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
                  PRAGMA user_version=47;",
             )
             .unwrap();
@@ -15006,6 +15181,8 @@ mod tests {
                  ) WITHOUT ROWID, STRICT;
                  CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
                  CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
+                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
                  PRAGMA user_version=41;",
             )
             .unwrap();
@@ -15083,6 +15260,8 @@ mod tests {
                  CREATE TABLE sessions_hierarchy(unexpected TEXT);
                  CREATE TABLE run_execution_state(run_id BLOB PRIMARY KEY);
                  CREATE TABLE run_runtime_config(run_id BLOB PRIMARY KEY);
+                 CREATE TABLE run_messages(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
+                 CREATE TABLE run_activities(run_id BLOB NOT NULL, ordinal INTEGER NOT NULL);
                  PRAGMA user_version=41;",
             )
             .unwrap();
@@ -15923,6 +16102,7 @@ mod tests {
         let activity = AgentActivityRecord {
             id: ActivityId::new(),
             run_id,
+            timeline_ordinal: 0,
             parent_id: None,
             step_id: Some(StepId::new()),
             kind: AgentActivityKind::ToolCall,
@@ -15940,6 +16120,7 @@ mod tests {
             run_id,
             vec![
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::User,
                     content: "large transcript content ".repeat(500),
                     name: None,
@@ -15947,6 +16128,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::Assistant,
                     content: String::new(),
                     name: Some("assistant".to_owned()),
@@ -16759,6 +16941,7 @@ mod tests {
             run_id,
             vec![
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::User,
                     content: "question".to_owned(),
                     name: None,
@@ -16766,6 +16949,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::Assistant,
                     content: "seed".to_owned(),
                     name: None,
@@ -16773,6 +16957,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::Assistant,
                     content: String::new(),
                     name: None,
@@ -16780,6 +16965,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 DurableRunMessage {
+                    timeline_ordinal: 0,
                     role: loom_model::MessageRole::User,
                     content: large_content.clone(),
                     name: None,
@@ -17635,6 +17821,7 @@ mod tests {
             .map(|(ordinal, (call, status))| AgentActivityRecord {
                 id: ActivityId::new(),
                 run_id,
+                timeline_ordinal: 0,
                 parent_id: None,
                 step_id: None,
                 kind: AgentActivityKind::ToolCall,
@@ -17655,6 +17842,7 @@ mod tests {
         activities.push(AgentActivityRecord {
             id: ActivityId::new(),
             run_id,
+            timeline_ordinal: 0,
             parent_id: None,
             step_id: None,
             kind: AgentActivityKind::ToolCall,

@@ -262,6 +262,7 @@ fn seed(
 
 fn message(index: usize, content: impl Into<String>) -> DurableRunMessage {
     DurableRunMessage {
+        timeline_ordinal: 0,
         role: MessageRole::Assistant,
         content: format!("{index}: {}", content.into()),
         name: None,
@@ -275,6 +276,7 @@ fn activity(run_id: RunId, id: ActivityId, index: usize) -> AgentActivityRecord 
     AgentActivityRecord {
         id,
         run_id,
+        timeline_ordinal: 0,
         parent_id: None,
         step_id: None,
         kind: AgentActivityKind::ModelTurn,

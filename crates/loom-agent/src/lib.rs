@@ -76,6 +76,9 @@ pub struct AgentRuntimeState {
     pub run: AgentRunSnapshot,
     pub plan: AgentPlan,
     pub messages: Vec<ModelMessage>,
+    /// Run-wide order aligned with `messages` for deterministic transcript/activity replay.
+    #[serde(default)]
+    pub message_timeline_ordinals: Vec<u64>,
     #[serde(default)]
     pub last_project_message_sequence: u64,
     #[serde(default)]
@@ -269,6 +272,8 @@ pub struct AgentRuntime {
     provider: Option<Box<dyn ModelProvider>>,
     tools: ToolExecutor,
     messages: Vec<ModelMessage>,
+    message_timeline_ordinals: Vec<u64>,
+    next_timeline_ordinal: u64,
     last_project_message_sequence: u64,
     pending_approval: Option<PendingApproval>,
     pending_tool_execution: Option<ToolCall>,
@@ -344,6 +349,11 @@ impl AgentRuntime {
         }];
         let plan = AgentPlan { steps: Vec::new() };
         let messages = initial_messages(&task);
+        let message_timeline_ordinals = (0..messages.len())
+            .map(|ordinal| u64::try_from(ordinal).expect("initial message count fits in u64"))
+            .collect::<Vec<_>>();
+        let next_timeline_ordinal =
+            u64::try_from(messages.len()).expect("initial message count fits in u64");
         Self {
             session_id,
             task,
@@ -353,6 +363,8 @@ impl AgentRuntime {
             provider: Some(provider),
             tools,
             messages,
+            message_timeline_ordinals,
+            next_timeline_ordinal,
             last_project_message_sequence: 0,
             pending_approval: None,
             pending_tool_execution: None,
@@ -607,7 +619,7 @@ impl AgentRuntime {
             ),
         );
         model_message.name = Some("loom_project_message".to_owned());
-        self.messages.push(model_message);
+        self.push_message(model_message);
         self.last_project_message_sequence = message.project_sequence;
         Ok(true)
     }
@@ -758,7 +770,7 @@ impl AgentRuntime {
                 AgentActivityStatus::Failed
             },
         ));
-        self.messages.push(ModelMessage {
+        self.push_message(ModelMessage {
             role: MessageRole::Tool,
             content: result.output,
             name: Some(result.name),
@@ -793,6 +805,7 @@ impl AgentRuntime {
             run: self.run.clone(),
             plan: self.plan.clone(),
             messages: self.messages.clone(),
+            message_timeline_ordinals: self.message_timeline_ordinals.clone(),
             last_project_message_sequence: self.last_project_message_sequence,
             attempts: self.attempts.clone(),
             pending_approval: self
@@ -907,6 +920,85 @@ impl AgentRuntime {
                 false,
             ));
         }
+        let mut activities = state.activities;
+        let mut message_timeline_ordinals = state.message_timeline_ordinals;
+        if message_timeline_ordinals.len() > state.messages.len() {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "agent runtime state has more timeline ordinals than transcript messages",
+                false,
+            ));
+        }
+        let has_timeline_metadata = !message_timeline_ordinals.is_empty()
+            || activities
+                .iter()
+                .any(|activity| activity.timeline_ordinal != 0);
+        let next_timeline_ordinal = if !has_timeline_metadata
+            && (!state.messages.is_empty() || !activities.is_empty())
+        {
+            let mut next_timeline_ordinal = 0;
+            for _ in &state.messages {
+                message_timeline_ordinals.push(next_timeline_ordinal);
+                next_timeline_ordinal = next_timeline_ordinal.checked_add(1).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "legacy run timeline ordinal space is exhausted",
+                        false,
+                    )
+                })?;
+            }
+            for activity in &mut activities {
+                activity.timeline_ordinal = next_timeline_ordinal;
+                next_timeline_ordinal = next_timeline_ordinal.checked_add(1).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "legacy run timeline ordinal space is exhausted",
+                        false,
+                    )
+                })?;
+            }
+            next_timeline_ordinal
+        } else {
+            let maximum = message_timeline_ordinals
+                .iter()
+                .copied()
+                .chain(activities.iter().map(|activity| activity.timeline_ordinal))
+                .max();
+            let mut next = match maximum {
+                Some(maximum) => maximum.checked_add(1).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "run timeline ordinal space is exhausted",
+                        false,
+                    )
+                })?,
+                None => 0,
+            };
+            while message_timeline_ordinals.len() < state.messages.len() {
+                message_timeline_ordinals.push(next);
+                next = next.checked_add(1).ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "run timeline ordinal space is exhausted",
+                        false,
+                    )
+                })?;
+            }
+            next
+        };
+        let mut seen_timeline_ordinals = BTreeSet::new();
+        if message_timeline_ordinals
+            .iter()
+            .copied()
+            .chain(activities.iter().map(|activity| activity.timeline_ordinal))
+            .any(|ordinal| !seen_timeline_ordinals.insert(ordinal))
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "agent runtime state contains duplicate timeline ordinals",
+                false,
+            ));
+        }
         Ok(Self {
             session_id: state.session_id,
             task: state.task,
@@ -916,6 +1008,8 @@ impl AgentRuntime {
             provider: Some(provider),
             tools,
             messages: state.messages,
+            message_timeline_ordinals,
+            next_timeline_ordinal,
             last_project_message_sequence: state.last_project_message_sequence,
             pending_approval: state.pending_approval.map(|call| PendingApproval { call }),
             pending_tool_execution: state.pending_tool_execution,
@@ -932,7 +1026,7 @@ impl AgentRuntime {
             provider_cursor: state.provider_cursor,
             step_id: state.step_id,
             step_index: state.step_index,
-            activities: state.activities,
+            activities,
             interactions: state.interactions,
             control: RunControl::new(),
             observer: None,
@@ -1308,8 +1402,7 @@ impl AgentRuntime {
                 None,
             )?;
         }
-        self.messages
-            .push(ModelMessage::new(MessageRole::User, message.clone()));
+        self.push_message(ModelMessage::new(MessageRole::User, message.clone()));
         self.pending_input = None;
         self.run.control_revision = control_revision;
         self.active_message_id = None;
@@ -1549,6 +1642,11 @@ impl AgentRuntime {
             completed_at: None,
         });
         self.messages = initial_messages(&self.task);
+        self.message_timeline_ordinals.clear();
+        for _ in 0..self.messages.len() {
+            let ordinal = self.allocate_timeline_ordinal();
+            self.message_timeline_ordinals.push(ordinal);
+        }
         self.pending_approval = None;
         self.pending_tool_execution = None;
         self.pending_project_join = None;
@@ -1688,6 +1786,7 @@ impl AgentRuntime {
         events.push(self.start_activity(AgentActivityRecord {
             id: model_activity_id,
             run_id: self.run.id,
+            timeline_ordinal: 0,
             parent_id: None,
             step_id: Some(step_id),
             kind: AgentActivityKind::ModelTurn,
@@ -1842,7 +1941,7 @@ impl AgentRuntime {
                     });
                     ctx.events
                         .push(self.complete_tool_activity(&result, AgentActivityStatus::Failed));
-                    self.messages.push(ModelMessage {
+                    self.push_message(ModelMessage {
                         role: MessageRole::Tool,
                         content: output.clone(),
                         name: Some(result.name.clone()),
@@ -1889,7 +1988,7 @@ impl AgentRuntime {
                         step_id: ctx.step_id,
                         index: ctx.step_index,
                     });
-                    self.messages.push(ModelMessage {
+                    self.push_message(ModelMessage {
                         role: MessageRole::Tool,
                         content: result.output,
                         name: Some(result.name),
@@ -1975,7 +2074,7 @@ impl AgentRuntime {
                             step_id: ctx.step_id,
                             index: ctx.step_index,
                         });
-                        self.messages.push(ModelMessage {
+                        self.push_message(ModelMessage {
                             role: MessageRole::Tool,
                             content: output,
                             name: Some(call.name.clone()),
@@ -1998,7 +2097,7 @@ impl AgentRuntime {
                     });
                     ctx.events
                         .push(self.complete_tool_activity(&result, AgentActivityStatus::Completed));
-                    self.messages.push(ModelMessage {
+                    self.push_message(ModelMessage {
                         role: MessageRole::Tool,
                         content: result.output.clone(),
                         name: Some(result.name.clone()),
@@ -2047,7 +2146,7 @@ impl AgentRuntime {
                             step_id: ctx.step_id,
                             index: ctx.step_index,
                         });
-                        self.messages.push(ModelMessage {
+                        self.push_message(ModelMessage {
                             role: MessageRole::Tool,
                             content: output,
                             name: Some(call.name.clone()),
@@ -2065,7 +2164,7 @@ impl AgentRuntime {
                     );
                     self.pending_input = Some(prompt.to_owned());
                     self.run.control_revision = control_revision;
-                    self.messages.push(ModelMessage {
+                    self.push_message(ModelMessage {
                         role: MessageRole::Tool,
                         content: format!("Waiting for user input: {prompt}"),
                         name: Some(call.name.clone()),
@@ -2153,7 +2252,7 @@ impl AgentRuntime {
                     if matches!(reason, loom_model::FinishReason::Stop) {
                         if let Some(blocker) = self.tools.completion_blocker() {
                             self.active_message_id = None;
-                            self.messages.push(ModelMessage {
+                            self.push_message(ModelMessage {
                                 role: MessageRole::User,
                                 content: format!("Project completion is blocked: {blocker}"),
                                 name: Some("loom_project_completion_guard".to_owned()),
@@ -2223,7 +2322,7 @@ impl AgentRuntime {
                 AgentActivityStatus::Failed
             },
         ));
-        self.messages.push(ModelMessage {
+        self.push_message(ModelMessage {
             role: MessageRole::Tool,
             content: result.output.clone(),
             name: Some(result.name.clone()),
@@ -2233,10 +2332,25 @@ impl AgentRuntime {
         (events, result)
     }
 
-    fn start_activity(&mut self, activity: AgentActivityRecord) -> AgentEvent {
+    fn start_activity(&mut self, mut activity: AgentActivityRecord) -> AgentEvent {
+        activity.timeline_ordinal = self.allocate_timeline_ordinal();
         let run_id = activity.run_id;
         self.activities.push(activity.clone());
         AgentEvent::ActivityRecorded { run_id, activity }
+    }
+
+    fn allocate_timeline_ordinal(&mut self) -> u64 {
+        let ordinal = self.next_timeline_ordinal;
+        self.next_timeline_ordinal = ordinal
+            .checked_add(1)
+            .expect("run timeline ordinal space is exhausted");
+        ordinal
+    }
+
+    fn push_message(&mut self, message: ModelMessage) {
+        let ordinal = self.allocate_timeline_ordinal();
+        self.message_timeline_ordinals.push(ordinal);
+        self.messages.push(message);
     }
 
     fn start_tool_activity(
@@ -2248,6 +2362,7 @@ impl AgentRuntime {
         self.start_activity(AgentActivityRecord {
             id: ActivityId::new(),
             run_id: self.run.id,
+            timeline_ordinal: 0,
             parent_id,
             step_id: self.step_id,
             kind,
@@ -2291,6 +2406,7 @@ impl AgentRuntime {
             return self.start_activity(AgentActivityRecord {
                 id: ActivityId::new(),
                 run_id: self.run.id,
+                timeline_ordinal: 0,
                 parent_id: None,
                 step_id: self.step_id,
                 kind: AgentActivityKind::ToolCall,
@@ -2662,8 +2778,7 @@ impl AgentRuntime {
             last.content.push_str(text);
             return;
         }
-        self.messages
-            .push(ModelMessage::new(MessageRole::Assistant, text));
+        self.push_message(ModelMessage::new(MessageRole::Assistant, text));
     }
 
     fn append_assistant_tool_call(&mut self, call: ToolCall) {
@@ -2673,7 +2788,7 @@ impl AgentRuntime {
             last.tool_calls.push(call);
             return;
         }
-        self.messages.push(ModelMessage {
+        self.push_message(ModelMessage {
             role: MessageRole::Assistant,
             content: String::new(),
             name: None,
@@ -3472,7 +3587,18 @@ mod tests {
             fs::read_to_string(root.join("loom-m1-demo.txt")).unwrap(),
             "Loom M1 deterministic demo\n"
         );
-        let activities = runtime.export_state().activities;
+        let state = runtime.export_state();
+        assert_eq!(state.message_timeline_ordinals.len(), state.messages.len());
+        let mut timeline_ordinals = state.message_timeline_ordinals.clone();
+        timeline_ordinals.extend(
+            state
+                .activities
+                .iter()
+                .map(|activity| activity.timeline_ordinal),
+        );
+        timeline_ordinals.sort_unstable();
+        assert!(timeline_ordinals.windows(2).all(|pair| pair[0] < pair[1]));
+        let activities = state.activities;
         assert!(activities.iter().any(|activity| {
             activity.kind == AgentActivityKind::ModelTurn
                 && activity.status == AgentActivityStatus::Completed
@@ -4242,6 +4368,31 @@ mod tests {
         runtime.context_checkpoint = inspection.summary.clone();
         runtime.context_inspection = Some(inspection);
         let state = runtime.export_state();
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("message_timeline_ordinals");
+        let restored_legacy = AgentRuntime::from_state(
+            serde_json::from_value(legacy).unwrap(),
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        )
+        .unwrap()
+        .export_state();
+        assert_eq!(
+            restored_legacy.message_timeline_ordinals.len(),
+            restored_legacy.messages.len()
+        );
+        let mut restored_ordinals = restored_legacy.message_timeline_ordinals.clone();
+        restored_ordinals.extend(
+            restored_legacy
+                .activities
+                .iter()
+                .map(|activity| activity.timeline_ordinal),
+        );
+        restored_ordinals.sort_unstable();
+        assert!(restored_ordinals.windows(2).all(|pair| pair[0] < pair[1]));
         let serialized = serde_json::to_string(&state).unwrap();
         let mut restored = AgentRuntime::from_state(
             serde_json::from_str(&serialized).unwrap(),

@@ -187,8 +187,10 @@ one large orchestration change:
 - **M7.4 implementation complete:** enable level-three agents and
   policy-checked branch-to-branch messaging after nested integration works
   reliably. Protocol 10.0 makes child creation manager-only; schema v50 adds
-  durable cancellation recovery. The remaining validation item is a full UI
-  click-through for child controls, review, and integration.
+  durable cancellation recovery. Protocol 11.0/schema v51 persist a shared
+  message/activity order for deterministic restore and deduplicated paging.
+  The remaining validation item is a full UI click-through for child controls,
+  review, and integration.
 
 M7.4 implementation includes protocol 8.0 and the forward v47-to-v48
 migration carry independently persisted, default-off agent grants and durable
@@ -223,23 +225,26 @@ before code worktrees; no fixed plan-to-issues-to-build pipeline is required.
 Each slice's exit conditions and verification cases are defined in the design
 document.
 
-The v41-to-v50 database transition is forward-only. Backend downgrades are
+The v41-to-v51 database transition is forward-only. Backend downgrades are
 unsupported.
 Old-client forward compatibility is not supported: deployments must ensure
 or force clients to upgrade, and the backend rejects clients outside the
 supported protocol version during negotiation with the existing
 `UnsupportedProtocol` response before sending project schemas. Slices 0–3
-initially used protocol 7.0/schema v47 for child worktrees; the current M7.4
-contract requires protocol 10.0/schema v50.
+initially used protocol 7.0/schema v47 for child worktrees; protocol 10.0/schema
+v50 made child creation manager-only, and the current M7.4 contract requires
+protocol 11.0/schema v51 for deterministic transcript/activity ordering.
 
 M7.4 uses protocol 8.0/schema v48 for separately authorized branch messaging
 and durable manager wait state, then protocol 9.0/schema v49 for the independent
 review-run grant. Protocol 10.0 makes child creation available only through
 the run-granted manager tool. Schema v50 stores recoverable cancellation
-cascades. Protocol 9.x and older clients must upgrade before the backend serves
-the current contract. The v47-to-v48, v48-to-v49, and v49-to-v50 migrations are
-forward-only; v49-only backends cannot open the upgraded database, and backend
-downgrades are unsupported. Deployments may ensure or force client upgrades;
+cascades. Protocol 11.0 adds shared run timeline order; schema v51 stores it on
+transcript messages and activities. Protocol 10.x and older clients must
+upgrade before the backend serves the current contract. The v47-to-v48,
+v48-to-v49, v49-to-v50, and v50-to-v51 migrations are forward-only; v50-only
+backends cannot open the upgraded database, and backend downgrades are
+unsupported. Deployments may ensure or force client upgrades;
 old-client forward compatibility is not supported.
 
 ## Quality bar

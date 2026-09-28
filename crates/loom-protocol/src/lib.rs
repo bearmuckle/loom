@@ -52,7 +52,7 @@ pub use workspace::{
     WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(10, 0);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(11, 0);
 pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
 pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
 pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
@@ -117,11 +117,15 @@ pub struct AgentRunSnapshotProjection {
     pub usage: UsageSnapshot,
     #[serde(default)]
     pub activities: Vec<AgentActivityRecord>,
+    /// Run-wide positions aligned with `messages`.
+    #[serde(default)]
+    pub message_timeline_ordinals: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentRunMessageHeader {
     pub ordinal: u64,
+    pub timeline_ordinal: u64,
     pub role: loom_model::MessageRole,
     pub content_bytes: u64,
     pub name: Option<String>,
@@ -132,6 +136,7 @@ pub struct AgentRunMessageHeader {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentRunTranscriptMessage {
     pub ordinal: u64,
+    pub timeline_ordinal: u64,
     pub message: ModelMessage,
     pub content_truncated: bool,
 }
@@ -1146,7 +1151,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(10, 0));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 0));
         let project_id = ProjectId::new();
         let request = ClientRequest::GetProjectSnapshot { project_id };
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
@@ -1504,6 +1509,7 @@ mod run_message_protocol_tests {
                 run_id,
                 messages: vec![AgentRunMessageHeader {
                     ordinal: 11,
+                    timeline_ordinal: 17,
                     role: loom_model::MessageRole::Assistant,
                     content_bytes: 18,
                     name: None,
@@ -1523,6 +1529,7 @@ mod run_message_protocol_tests {
                 run_id,
                 messages: vec![AgentRunTranscriptMessage {
                     ordinal: 11,
+                    timeline_ordinal: 17,
                     message: ModelMessage::new(loom_model::MessageRole::Assistant, "answer"),
                     content_truncated: false,
                 }],

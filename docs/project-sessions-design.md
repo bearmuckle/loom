@@ -17,6 +17,13 @@ clients cannot create children directly; the server-bound manager tool checks
 the executing run's persisted delegation grants. This protocol change does not
 add a storage migration. Separately, interruption-safe cancellation recovery
 adds the forward v49-to-v50 storage migration without changing protocol 10.0.
+The current draft advances to protocol 11.0 and schema v51 for deterministic
+conversation/activity ordering. Every run-wide message and activity receives
+one monotonic ordinal when created; persisted transcript pages and activity
+records carry it, and restored UI entries merge by that value. Loading older
+pages is idempotent by transcript message ordinal. Schema v50 did not store a
+cross-stream order, so its migration assigns a stable legacy order; the exact
+historical interleaving of those old rows is unrecoverable.
 The draft also parks a manager at a safe checkpoint, releases its workspace
 slot, resumes the original tool continuation once selected children are ready,
 blocks premature manager completion, and admits queued work under a workspace-wide
@@ -37,11 +44,11 @@ in schema v50 and replayed after runtime restoration but before queued-work
 reconciliation. Depth-three delegation is enabled after these recovery paths
 were validated.
 Deployments must ensure or force clients to upgrade:
-the backend rejects clients that do not negotiate protocol 10.0 before serving
+the backend rejects clients that do not negotiate protocol 11.0 before serving
 the new contract. Old-client forward compatibility and backend/schema
 downgrades are unsupported.
 
-The existing implementation also includes forward v41-to-v50 SQLite
+The existing implementation also includes forward v41-to-v51 SQLite
 migrations, durable child/task creation, persisted child model selection,
 restart scheduling for queued children, dependency gating, task-state
 reconciliation, and durable parent-child message delivery at safe model-turn
@@ -225,10 +232,11 @@ integration grants. A backend that only supports v46 cannot open a database
 after migration to v47. Backend and schema downgrades remain unsupported;
 recover by restoring a pre-upgrade backup or moving forward with a fix.
 
-Slices 0–3 initially required protocol 7.0 for child worktrees and integration;
-M7.4 used protocol 9.0 for the independent review-run grant and now requires
-protocol 10.0 for manager-only child creation. Keep the existing session request surface for
-root-session operations where practical, but admitted clients treat roots as
+Slices 0–3 initially required protocol 7.0 for child worktrees and integration.
+M7.4 used protocol 9.0 for the independent review-run grant and protocol 10.0
+for manager-only child creation; it now requires protocol 11.0 for shared
+timeline ordering. Keep the existing session request surface for root-session
+operations where practical, but admitted clients treat roots as
 projects. The server rejects unsupported clients with `UnsupportedProtocol`
 before serving protocol-specific variants or project schemas. Backend
 downgrades to pre-project protocol/storage versions are unsupported, including
@@ -239,15 +247,16 @@ child-control, review, and integration grants to delegated-task intent, plus
 durable state for managers waiting on their descendants. Protocol 8.0 and
 schema v48 introduced branch messaging and durable manager waits. The review
 run grant was added after that milestone reached the draft branch, so protocol
-9.0 used schema v49. The current contract is protocol 10.0/schema v50;
-protocol 9.x and 8.x clients must
-upgrade before negotiation succeeds, and request envelopes must use the
-supported protocol major before any dispatch, including capability discovery.
-Protocol 10 removes the client child-creation request. Deployments must ensure
-or force protocol-10 clients after upgrading from protocol 9.
-Backends that only support schema v49 must reject schema v50 databases. The
-v47-to-v48, v48-to-v49, and v49-to-v50 migrations are forward-only, with
-every newly introduced grant disabled for existing tasks and runs. Do not
+9.0 used schema v49. Protocol 10.0/schema v50 made child creation manager-only.
+The current contract is protocol 11.0/schema v51; protocol 10.x and older
+clients must upgrade before negotiation succeeds, and request envelopes must
+use the supported protocol major before any dispatch, including capability
+discovery.
+Protocol 10 removes the client child-creation request. Protocol 11 adds the
+shared timeline order. Deployments must ensure or force protocol-11 clients.
+Backends that only support schema v50 must reject schema v51 databases. The
+v47-to-v48, v48-to-v49, v49-to-v50, and v50-to-v51 migrations are forward-only,
+with every newly introduced grant disabled for existing tasks and runs. Do not
 infer branch messaging from the existing direct-message grant. Agent-attributed
 messages must be submitted by the server-bound agent tool; a client-supplied
 sender session ID is not an agent identity.
@@ -421,7 +430,7 @@ later design step.
 
 ### Slice 4: deeper hierarchy and branch communication
 
-**Implementation status:** protocol 10.0, forward v47-to-v48 grant and
+**Implementation status:** protocol 11.0, forward v47-to-v48 grant and
 wait-state migration, v48-to-v49 review-run grant migration, and v49-to-v50
 cancellation-recovery migration, sender
 binding, recipient discovery, explicitly granted branch-message routes,
@@ -515,9 +524,9 @@ parallelism limits, cancellation, process restart, depth overflow, and partial
 worktree/merge failures. UI work should verify empty, active, blocked, failed,
 completed, and stale/reconnecting child states.
 
-The implemented rollout requires protocol 10.0 clients before serving the
-current contract. Protocol 9.x and older clients are rejected; deployments
-must ensure or force client upgrades. The SQLite v41-to-v50 path is
+The implemented rollout requires protocol 11.0 clients before serving the
+current contract. Protocol 10.x and older clients are rejected; deployments
+must ensure or force client upgrades. The SQLite v41-to-v51 path is
 forward-only. Backend and schema downgrades, and old-client forward
 compatibility, are unsupported. Child creation is manager-only through a
 server-bound tool granted by the executing run; the server validates the

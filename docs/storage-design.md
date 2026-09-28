@@ -2,7 +2,7 @@
 
 ## Status
 
-The project-session rollout upgrades forward through schema version 50. The
+The project-session rollout upgrades forward through schema version 51. The
 v41-to-v42 migration backfills existing sessions as project roots, v43 adds the
 durable project-message delivery cursor to run execution state, and v44 stores
 the per-run project-delegation grant. V45 adds separate per-run messaging and
@@ -18,6 +18,14 @@ cleanup disposition. Per-run code-worktree and integration grants default to
 disabled. After that migration, a v46-only backend cannot open a database. If
 an upgrade must be rolled back, restore a pre-upgrade backup or move forward
 with a fix.
+
+Schema v51 adds a run-wide `timeline_ordinal` to persisted transcript messages
+and activity records. The runtime assigns it as each item is created; activity
+status updates keep the original ordinal. Transcript pages and activity
+snapshots expose that same key so clients merge both streams by durable order.
+The v50-to-v51 migration is forward-only. Pre-v51 rows did not preserve a
+cross-stream order, so their migration assigns a stable legacy order; exact
+historical interleaving cannot be recovered from the old schema.
 
 The v41-to-v42 migration adds project hierarchy, delegated-task, and addressed
 message records and backfills one root project per
@@ -46,15 +54,21 @@ client child-creation request so only the run-granted manager tool can create
 children; this protocol-only boundary does not change schema. Schema v50 adds
 durable cancellation-cascade intent and the ordered subtree snapshot needed
 for recovery. New per-run and delegated-task grants remain independent and
-default off for existing records. The v47-to-v48, v48-to-v49, and v49-to-v50
-migrations are forward-only: a v49-only backend must reject the upgraded
-database, and no backend or schema downgrade is supported. Require
-protocol 10.0 clients before exposing the current contract; protocol 9.x and
+default off for existing records. The v47-to-v48, v48-to-v49, v49-to-v50, and
+v50-to-v51 migrations are forward-only: a v50-only backend must reject the
+upgraded database, and no backend or schema downgrade is supported. Require
+protocol 11.0 clients before exposing the current contract; protocol 10.x and
 older clients must upgrade. Deployments must ensure or force that upgrade;
 old-client forward compatibility is not supported.
 
+Protocol 11.0 carries the shared run timeline ordinal in activity records,
+message headers, transcript pages, and run snapshots. Protocol 10 clients must
+upgrade before the backend serves this contract; forward compatibility with
+old clients is unsupported.
+
 The implementation includes the v48 branch-message grant and manager-wait
-schema, the v49 review-grant column, and v50 cancellation-recovery tables.
+schema, the v49 review-grant column, v50 cancellation-recovery tables, and the
+v51 cross-stream timeline-order columns.
 Each active cascade stores its root task, requesting manager, and ordered
 task/session members before any task or run transition. Startup restores
 runtimes, replays pending cascades idempotently, persists resulting events, and

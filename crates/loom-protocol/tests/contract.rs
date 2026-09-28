@@ -276,6 +276,7 @@ fn activity_event_round_trip_preserves_typed_work_and_relationships() {
     let activity = AgentActivityRecord {
         id: ActivityId::new(),
         run_id,
+        timeline_ordinal: 0,
         parent_id: Some(ActivityId::new()),
         step_id: Some(step_id),
         kind: AgentActivityKind::File,
@@ -401,7 +402,8 @@ fn capability_discovery_accepts_current_major_and_rejects_old_major() {
     assert!(!ProtocolVersion::new(8, 0).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(9, 0).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(9, 99).is_compatible_with(CURRENT_PROTOCOL_VERSION));
-    assert!(ProtocolVersion::new(10, 99).is_compatible_with(CURRENT_PROTOCOL_VERSION));
+    assert!(!ProtocolVersion::new(10, 99).is_compatible_with(CURRENT_PROTOCOL_VERSION));
+    assert!(ProtocolVersion::new(11, 99).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(4, 1).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(3, 9).is_compatible_with(CURRENT_PROTOCOL_VERSION));
     assert!(!ProtocolVersion::new(2, 9).is_compatible_with(CURRENT_PROTOCOL_VERSION));
@@ -506,6 +508,7 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
             pending_input: None,
             usage: Default::default(),
             activities: Vec::new(),
+            message_timeline_ordinals: Vec::new(),
         }),
     );
     assert_eq!(

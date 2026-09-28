@@ -406,11 +406,14 @@ fn order_session_nodes(
     nodes
 }
 
+type TranscriptMessage = (u64, u64, ModelMessage);
+type TranscriptPage = (Vec<TranscriptMessage>, Option<u64>, bool);
+
 async fn load_transcript_page(
     backend: BackendWorker,
     run_id: RunId,
     before_ordinal: Option<u64>,
-) -> Result<(Vec<ModelMessage>, Option<u64>, bool), LoomError> {
+) -> Result<TranscriptPage, LoomError> {
     let response = backend
         .submit(RequestEnvelope::new(
             ClientRequest::GetAgentRunTranscriptPage {
@@ -435,7 +438,7 @@ async fn load_transcript_page(
     Ok((
         messages
             .into_iter()
-            .map(|message| message.message)
+            .map(|message| (message.ordinal, message.timeline_ordinal, message.message))
             .collect(),
         next_before,
         has_older,
@@ -447,7 +450,7 @@ fn load_transcript_page_sync(
     connection: &ClientConnection,
     run_id: RunId,
     before_ordinal: Option<u64>,
-) -> Result<(Vec<ModelMessage>, Option<u64>, bool), LoomError> {
+) -> Result<TranscriptPage, LoomError> {
     let response = connection.request(RequestEnvelope::new(
         ClientRequest::GetAgentRunTranscriptPage {
             run_id,
@@ -467,7 +470,7 @@ fn load_transcript_page_sync(
     Ok((
         messages
             .into_iter()
-            .map(|message| message.message)
+            .map(|message| (message.ordinal, message.timeline_ordinal, message.message))
             .collect(),
         next_before,
         has_older,
@@ -475,60 +478,76 @@ fn load_transcript_page_sync(
 }
 
 fn timeline_items_from_messages(
-    messages: Vec<ModelMessage>,
+    messages: Vec<TranscriptMessage>,
+    mut activities: Vec<AgentActivityRecord>,
     has_activity_records: bool,
 ) -> Vec<TimelineItem> {
+    enum Entry {
+        Message(ModelMessage),
+        Activity(Box<AgentActivityRecord>),
+    }
+    let mut entries = messages
+        .into_iter()
+        .map(|(_, timeline_ordinal, message)| (timeline_ordinal, Entry::Message(message)))
+        .chain(activities.drain(..).map(|activity| {
+            (
+                activity.timeline_ordinal,
+                Entry::Activity(Box::new(activity)),
+            )
+        }))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(timeline_ordinal, _)| *timeline_ordinal);
+
     let mut timeline = Vec::new();
-    for message in messages {
-        match message.role {
-            MessageRole::User => timeline.push(TimelineItem::User(message.content)),
-            MessageRole::Assistant => {
-                if message.content.is_empty() {
-                    continue;
-                }
-                if let Some(TimelineItem::Assistant(previous)) = timeline.last_mut() {
-                    if !previous.is_empty() {
-                        previous.push_str("\n\n");
+    for (_, entry) in entries {
+        match entry {
+            Entry::Message(message) => match message.role {
+                MessageRole::User => timeline.push(TimelineItem::User(message.content)),
+                MessageRole::Assistant => {
+                    if message.content.is_empty() {
+                        continue;
                     }
-                    previous.push_str(&message.content);
+                    if let Some(TimelineItem::Assistant(previous)) = timeline.last_mut() {
+                        if !previous.is_empty() {
+                            previous.push_str("\n\n");
+                        }
+                        previous.push_str(&message.content);
+                    } else {
+                        timeline.push(TimelineItem::Assistant(message.content));
+                    }
+                }
+                MessageRole::Tool if !has_activity_records => {
+                    timeline.push(TimelineItem::ToolOutput(bounded(&message.content)))
+                }
+                MessageRole::Tool | MessageRole::System => {}
+            },
+            Entry::Activity(activity) => {
+                let activity = *activity;
+                if let Some(TimelineItem::ActivitySection { activities }) = timeline.last_mut() {
+                    activities.push(activity);
                 } else {
-                    timeline.push(TimelineItem::Assistant(message.content));
+                    timeline.push(TimelineItem::ActivitySection {
+                        activities: vec![activity],
+                    });
                 }
             }
-            MessageRole::Tool if !has_activity_records => {
-                timeline.push(TimelineItem::ToolOutput(bounded(&message.content)))
-            }
-            MessageRole::Tool | MessageRole::System => {}
         }
     }
     timeline
 }
 
-fn prepend_timeline_page(
-    timeline: &mut Vec<TimelineItem>,
-    mut older_items: Vec<TimelineItem>,
-    insertion_index: usize,
-) {
-    let boundary_assistant = matches!(older_items.last(), Some(TimelineItem::Assistant(_)))
-        && matches!(
-            timeline.get(insertion_index),
-            Some(TimelineItem::Assistant(_))
-        );
-    if boundary_assistant {
-        let Some(TimelineItem::Assistant(older)) = older_items.pop() else {
-            unreachable!()
-        };
-        let Some(TimelineItem::Assistant(newer)) = timeline.get_mut(insertion_index) else {
-            unreachable!()
-        };
-        let separator = if older.is_empty() || newer.is_empty() {
-            ""
-        } else {
-            "\n\n"
-        };
-        *newer = format!("{older}{separator}{newer}");
-    }
-    timeline.splice(insertion_index..insertion_index, older_items);
+fn unseen_transcript_messages(
+    messages: Vec<TranscriptMessage>,
+    loaded_ordinals: &mut BTreeSet<u64>,
+) -> Vec<TranscriptMessage> {
+    messages
+        .into_iter()
+        .filter_map(|(ordinal, timeline_ordinal, message)| {
+            loaded_ordinals
+                .insert(ordinal)
+                .then_some((ordinal, timeline_ordinal, message))
+        })
+        .collect()
 }
 
 fn merge_node_sessions(
@@ -1458,6 +1477,8 @@ pub(crate) struct LoomView {
     event_stream_epoch: Option<String>,
     pub(crate) timeline: Vec<TimelineItem>,
     transcript_before_ordinal: Option<u64>,
+    transcript_loaded_ordinals: BTreeSet<u64>,
+    transcript_messages: BTreeMap<u64, (u64, ModelMessage)>,
     transcript_has_older: bool,
     transcript_loading: bool,
     transcript_generation: u64,
@@ -1770,6 +1791,17 @@ fn project_session_list_projection(
         }
     }
     session_list_projection_from_tree(tree, active_session_id)
+}
+
+fn project_snapshot_has_unloaded_agent_sessions(
+    project: &loom_core::ProjectSnapshot,
+    sessions: &[AgentSessionSnapshot],
+) -> bool {
+    project.agents.iter().any(|agent| {
+        !sessions
+            .iter()
+            .any(|session| session.id == agent.session_id)
+    })
 }
 
 fn workspace_feed_event_sequence(event: &WorkspaceFeedEvent) -> EventSequence {
@@ -2168,6 +2200,8 @@ impl LoomView {
             event_stream_epoch: None,
             timeline: Vec::new(),
             transcript_before_ordinal: None,
+            transcript_loaded_ordinals: BTreeSet::new(),
+            transcript_messages: BTreeMap::new(),
             transcript_has_older: false,
             transcript_loading: false,
             transcript_generation: 0,
@@ -2566,6 +2600,8 @@ impl LoomView {
             event_stream_epoch: None,
             timeline: Vec::new(),
             transcript_before_ordinal: None,
+            transcript_loaded_ordinals: BTreeSet::new(),
+            transcript_messages: BTreeMap::new(),
             transcript_has_older: false,
             transcript_loading: false,
             transcript_generation: 0,
@@ -2753,6 +2789,8 @@ impl LoomView {
                 Vec::new()
             },
             transcript_before_ordinal: None,
+            transcript_loaded_ordinals: BTreeSet::new(),
+            transcript_messages: BTreeMap::new(),
             transcript_has_older: false,
             transcript_loading: false,
             transcript_generation: 0,
@@ -2985,6 +3023,8 @@ impl LoomView {
             event_stream_epoch: None,
             timeline: Vec::new(),
             transcript_before_ordinal: None,
+            transcript_loaded_ordinals: BTreeSet::new(),
+            transcript_messages: BTreeMap::new(),
             transcript_has_older: false,
             transcript_loading: false,
             transcript_generation: 0,
@@ -3436,6 +3476,8 @@ impl LoomView {
         self.timeline.clear();
         self.transcript_generation = self.transcript_generation.wrapping_add(1);
         self.transcript_before_ordinal = None;
+        self.transcript_loaded_ordinals.clear();
+        self.transcript_messages.clear();
         self.transcript_has_older = false;
         self.transcript_loading = false;
         self.activity_records_seen = false;
@@ -3551,8 +3593,11 @@ impl LoomView {
                 if view.active_session.id != session_id {
                     return;
                 }
+                let mut reload_sessions = false;
                 match response.result {
                     Ok(ServerResponse::ProjectSnapshot(snapshot)) => {
+                        reload_sessions =
+                            project_snapshot_has_unloaded_agent_sessions(&snapshot, &view.sessions);
                         view.project_snapshot = Some(snapshot);
                         view.project_messages_stale = true;
                     }
@@ -3569,6 +3614,9 @@ impl LoomView {
                         "load project snapshot",
                         unexpected_response("project snapshot", response),
                     ),
+                }
+                if reload_sessions {
+                    view.reload_sessions(cx);
                 }
                 view.refresh_project_messages(cx);
                 view.schedule_project_poll(cx);
@@ -4470,6 +4518,14 @@ impl LoomView {
     pub(crate) fn consume_agent_event(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::RunStarted { snapshot } => {
+                if self.active_run_id != Some(snapshot.id) {
+                    self.transcript_generation = self.transcript_generation.wrapping_add(1);
+                    self.transcript_before_ordinal = None;
+                    self.transcript_loaded_ordinals.clear();
+                    self.transcript_messages.clear();
+                    self.transcript_has_older = false;
+                    self.transcript_loading = false;
+                }
                 self.context_inspection = None;
                 self.active_run = Some(snapshot.clone());
                 self.active_run_id = Some(snapshot.id);
@@ -4693,31 +4749,38 @@ impl LoomView {
         if !activity_records.is_empty() {
             self.enable_activity_projection();
         }
-        if self.timeline.is_empty() {
-            let mut timeline = Vec::new();
-            for message in projection.messages {
-                match message.role {
-                    MessageRole::User => timeline.push(TimelineItem::User(message.content)),
-                    MessageRole::Assistant => {
-                        if message.content.is_empty() {
-                            continue;
-                        }
-                        if let Some(TimelineItem::Assistant(previous)) = timeline.last_mut() {
-                            if !previous.is_empty() && !message.content.is_empty() {
-                                previous.push_str("\n\n");
-                            }
-                            previous.push_str(&message.content);
-                        } else {
-                            timeline.push(TimelineItem::Assistant(message.content));
-                        }
-                    }
-                    MessageRole::Tool if activity_records.is_empty() => {
-                        timeline.push(TimelineItem::ToolOutput(bounded(&message.content)))
-                    }
-                    MessageRole::Tool => {}
-                    MessageRole::System => {}
+        let message_timeline_ordinals = projection.message_timeline_ordinals;
+        self.transcript_messages.clear();
+        self.transcript_loaded_ordinals.clear();
+        let message_orders_match = message_timeline_ordinals.len() == projection.messages.len();
+        if !message_orders_match && !projection.messages.is_empty() {
+            log::warn!(
+                "run snapshot has {} messages but {} timeline ordinals; waiting for the transcript page",
+                projection.messages.len(),
+                message_timeline_ordinals.len()
+            );
+        }
+        let messages = projection
+            .messages
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, message)| {
+                if !message_orders_match {
+                    return None;
                 }
-            }
+                let ordinal = u64::try_from(index).ok()?;
+                let timeline_ordinal = *message_timeline_ordinals.get(index)?;
+                self.transcript_messages
+                    .insert(ordinal, (timeline_ordinal, message.clone()));
+                Some((ordinal, timeline_ordinal, message))
+            })
+            .collect::<Vec<_>>();
+        if self.timeline.is_empty() {
+            let mut timeline = timeline_items_from_messages(
+                messages,
+                activity_records.clone(),
+                !activity_records.is_empty(),
+            );
             if !projection.plan.is_empty() {
                 timeline.insert(
                     0,
@@ -4733,9 +4796,10 @@ impl LoomView {
                 );
             }
             self.timeline = timeline;
-        }
-        for activity in activity_records {
-            upsert_activity(&mut self.timeline, activity);
+        } else {
+            for activity in activity_records {
+                upsert_activity(&mut self.timeline, activity);
+            }
         }
         if let Some(summary) = &projection.run.summary
             && !is_redundant_completion_summary(summary)
@@ -5517,31 +5581,51 @@ impl LoomView {
         &mut self,
         run_id: RunId,
         before_ordinal: Option<u64>,
-        messages: Vec<ModelMessage>,
+        messages: Vec<(u64, u64, ModelMessage)>,
         next_before: Option<u64>,
         has_older: bool,
     ) {
         if self.active_run_id != Some(run_id) {
             return;
         }
-        let page_items = timeline_items_from_messages(messages, self.activity_records_seen);
         if before_ordinal.is_none() {
-            self.timeline.retain(|item| {
-                !matches!(
-                    item,
-                    TimelineItem::User(_)
-                        | TimelineItem::Assistant(_)
-                        | TimelineItem::ToolOutput(_)
-                )
-            });
-            let insertion_index = self.transcript_insertion_index();
-            self.timeline
-                .splice(insertion_index..insertion_index, page_items);
-            self.place_restored_activities_after_task();
-        } else {
-            let insertion_index = self.transcript_insertion_index();
-            prepend_timeline_page(&mut self.timeline, page_items, insertion_index);
+            self.transcript_loaded_ordinals.clear();
+            self.transcript_messages.clear();
         }
+        let messages = unseen_transcript_messages(messages, &mut self.transcript_loaded_ordinals);
+        for (ordinal, timeline_ordinal, message) in messages {
+            self.transcript_messages
+                .insert(ordinal, (timeline_ordinal, message));
+        }
+        let mut activities_by_id = BTreeMap::new();
+        for activity in self.timeline.iter().flat_map(|item| match item {
+            TimelineItem::ActivitySection { activities } => activities.as_slice(),
+            _ => &[],
+        }) {
+            activities_by_id.insert(activity.id, activity.clone());
+        }
+        self.timeline.retain(|item| {
+            !matches!(
+                item,
+                TimelineItem::User(_)
+                    | TimelineItem::Assistant(_)
+                    | TimelineItem::ToolOutput(_)
+                    | TimelineItem::ActivitySection { .. }
+            )
+        });
+        let ordered_items = timeline_items_from_messages(
+            self.transcript_messages
+                .iter()
+                .map(|(ordinal, (timeline_ordinal, message))| {
+                    (*ordinal, *timeline_ordinal, message.clone())
+                })
+                .collect(),
+            activities_by_id.into_values().collect(),
+            self.activity_records_seen,
+        );
+        let insertion_index = self.transcript_insertion_index();
+        self.timeline
+            .splice(insertion_index..insertion_index, ordered_items);
         self.transcript_before_ordinal = next_before;
         self.transcript_has_older = has_older;
         self.ensure_session_task_message(self.active_session.id);
@@ -5558,33 +5642,6 @@ impl LoomView {
             index += 1;
         }
         index
-    }
-
-    fn place_restored_activities_after_task(&mut self) {
-        if !self
-            .timeline
-            .iter()
-            .any(|item| matches!(item, TimelineItem::User(_)))
-        {
-            return;
-        }
-        let mut activities = Vec::new();
-        self.timeline.retain(|item| {
-            if matches!(item, TimelineItem::ActivitySection { .. }) {
-                activities.push(item.clone());
-                false
-            } else {
-                true
-            }
-        });
-        let insertion_index = self
-            .timeline
-            .iter()
-            .rposition(|item| matches!(item, TimelineItem::User(_)))
-            .expect("user message was checked above")
-            + 1;
-        self.timeline
-            .splice(insertion_index..insertion_index, activities);
     }
 
     pub(crate) fn ensure_session_task_message(&mut self, session_id: AgentSessionId) {
@@ -12097,6 +12154,7 @@ mod display_helper_tests {
         AgentActivityRecord {
             id: ActivityId::new(),
             run_id: RunId::new(),
+            timeline_ordinal: 0,
             parent_id: None,
             step_id: None,
             kind: AgentActivityKind::ToolCall,
@@ -12990,6 +13048,7 @@ mod loom_view_render_tests {
                 pending_input: None,
                 usage: Default::default(),
                 activities: Vec::new(),
+                message_timeline_ordinals: vec![0, 1, 2, 3, 4, 5],
             });
         });
     }
@@ -13026,6 +13085,7 @@ mod loom_view_render_tests {
                 pending_input: None,
                 usage: Default::default(),
                 activities: Vec::new(),
+                message_timeline_ordinals: vec![0],
             });
         });
     }
@@ -13412,6 +13472,7 @@ mod loom_view_render_tests {
         let record = AgentActivityRecord {
             id: group_id,
             run_id,
+            timeline_ordinal: 0,
             parent_id: None,
             step_id: None,
             kind: AgentActivityKind::Command,
@@ -13492,6 +13553,7 @@ mod loom_view_render_tests {
             let record = AgentActivityRecord {
                 id: ActivityId::new(),
                 run_id: RunId::new(),
+                timeline_ordinal: 0,
                 parent_id: None,
                 step_id: None,
                 kind: AgentActivityKind::File,
@@ -13847,6 +13909,7 @@ mod loom_view_render_tests {
                 pending_input: None,
                 usage: Default::default(),
                 activities: Vec::new(),
+                message_timeline_ordinals: vec![0],
             };
             let snapshot = loom_protocol::AgentSessionSnapshotProjection {
                 session: view.active_session.clone(),
@@ -14856,6 +14919,7 @@ mod loom_view_render_tests {
         let activity = AgentActivityRecord {
             id: ActivityId::new(),
             run_id: RunId::new(),
+            timeline_ordinal: 0,
             parent_id: None,
             step_id: None,
             kind: AgentActivityKind::File,
@@ -15008,9 +15072,10 @@ mod worker_node_tests {
         format_worker_node_resources, initial_worker_nodes, local_source_available,
         mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
         order_session_nodes, project_child_control_actions, project_session_list_projection,
-        remove_worker_node_entry, safe_worker_url_label, session_id_for_request,
-        session_list_projection, session_node_indicator_state, session_node_pulse,
-        session_owner_status, source_choice_is_allowed, source_dialog_initial_state,
+        project_snapshot_has_unloaded_agent_sessions, remove_worker_node_entry,
+        safe_worker_url_label, session_id_for_request, session_list_projection,
+        session_node_indicator_state, session_node_pulse, session_owner_status,
+        source_choice_is_allowed, source_dialog_initial_state,
         transition_worker_connection_to_connecting, update_worker_node_status,
         validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
         worker_node_name_for_id, worker_url_embeds_credential,
@@ -15427,6 +15492,13 @@ mod worker_node_tests {
             worktrees: vec![],
         };
 
+        assert!(project_snapshot_has_unloaded_agent_sessions(
+            &project,
+            &sessions[..1]
+        ));
+        assert!(!project_snapshot_has_unloaded_agent_sessions(
+            &project, &sessions
+        ));
         let projection = project_session_list_projection(&sessions, child_id, Some(&project));
 
         assert_eq!(
@@ -16197,23 +16269,26 @@ mod worker_node_tests {
 
 #[cfg(test)]
 mod transcript_paging_tests {
-    use super::{TimelineItem, prepend_timeline_page, timeline_items_from_messages};
-    use loom_model::{MessageRole, ModelMessage};
+    use super::{TimelineItem, timeline_items_from_messages, unseen_transcript_messages};
+    use loom_core::{ActivityId, RunId, Timestamp};
+    use loom_model::{MessageRole, ModelId, ModelMessage};
+    use loom_protocol::{
+        AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+    };
     use std::collections::BTreeSet;
-
     #[test]
     fn transcript_pages_keep_message_order_and_project_tool_output_only_without_activities() {
         let messages = vec![
-            ModelMessage::new(MessageRole::User, "task"),
-            ModelMessage::new(MessageRole::Assistant, "first"),
-            ModelMessage::new(MessageRole::Assistant, "second"),
-            ModelMessage::new(MessageRole::Tool, "tool output"),
-            ModelMessage::new(MessageRole::System, "hidden"),
-            ModelMessage::new(MessageRole::User, "follow-up"),
+            (0, 0, ModelMessage::new(MessageRole::User, "task")),
+            (1, 1, ModelMessage::new(MessageRole::Assistant, "first")),
+            (2, 2, ModelMessage::new(MessageRole::Assistant, "second")),
+            (3, 3, ModelMessage::new(MessageRole::Tool, "tool output")),
+            (4, 4, ModelMessage::new(MessageRole::System, "hidden")),
+            (5, 5, ModelMessage::new(MessageRole::User, "follow-up")),
         ];
 
         assert!(matches!(
-            timeline_items_from_messages(messages.clone(), true).as_slice(),
+            timeline_items_from_messages(messages.clone(), Vec::new(), true).as_slice(),
             [
                 TimelineItem::User(task),
                 TimelineItem::Assistant(answer),
@@ -16221,7 +16296,7 @@ mod transcript_paging_tests {
             ] if task == "task" && answer == "first\n\nsecond" && follow_up == "follow-up"
         ));
         assert!(matches!(
-            timeline_items_from_messages(messages, false).as_slice(),
+            timeline_items_from_messages(messages, Vec::new(), false).as_slice(),
             [
                 TimelineItem::User(task),
                 TimelineItem::Assistant(answer),
@@ -16233,34 +16308,91 @@ mod transcript_paging_tests {
     }
 
     #[test]
-    fn older_pages_prepend_and_join_assistant_messages_at_the_page_boundary() {
-        let mut timeline = vec![
-            TimelineItem::Plan {
-                steps: vec!["plan".to_owned()],
-                completed: BTreeSet::new(),
-                active: None,
-            },
-            TimelineItem::User("task".to_owned()),
-            TimelineItem::Assistant("newer answer".to_owned()),
+    fn restores_messages_and_activities_by_their_shared_order() {
+        let messages = vec![
+            (0, 0, ModelMessage::new(MessageRole::User, "task")),
+            (
+                1,
+                1,
+                ModelMessage::new(MessageRole::Assistant, "I found the relevant files."),
+            ),
+            (
+                2,
+                3,
+                ModelMessage::new(MessageRole::User, "Check one more thing"),
+            ),
+            (
+                3,
+                5,
+                ModelMessage::new(MessageRole::Assistant, "The answer is complete."),
+            ),
         ];
-        prepend_timeline_page(
-            &mut timeline,
-            vec![
-                TimelineItem::User("older question".to_owned()),
-                TimelineItem::Assistant("older answer".to_owned()),
-            ],
-            2,
-        );
+        let activities = [2, 4]
+            .into_iter()
+            .map(|timeline_ordinal| AgentActivityRecord {
+                id: ActivityId::new(),
+                run_id: RunId::new(),
+                timeline_ordinal,
+                parent_id: None,
+                step_id: None,
+                kind: AgentActivityKind::ModelTurn,
+                status: AgentActivityStatus::Completed,
+                started_at: Timestamp::from_unix_millis(timeline_ordinal),
+                completed_at: None,
+                elapsed_ms: None,
+                data: AgentActivityData::ModelTurn {
+                    model: ModelId::new("deterministic/demo"),
+                },
+            })
+            .collect();
+        let timeline = timeline_items_from_messages(messages, activities, true);
+
         assert!(matches!(
             timeline.as_slice(),
             [
-                TimelineItem::Plan { .. },
                 TimelineItem::User(task),
-                TimelineItem::User(question),
+                TimelineItem::Assistant(commentary),
+                TimelineItem::ActivitySection { .. },
+                TimelineItem::User(follow_up),
+                TimelineItem::ActivitySection { .. },
                 TimelineItem::Assistant(answer)
-            ] if task == "task" && question == "older question"
-                && answer == "older answer\n\nnewer answer"
+            ] if task == "task"
+                && commentary == "I found the relevant files."
+                && follow_up == "Check one more thing"
+                && answer == "The answer is complete."
         ));
+    }
+
+    #[test]
+    fn transcript_pages_ignore_ordinals_already_loaded() {
+        let mut loaded = BTreeSet::new();
+        let first_page = unseen_transcript_messages(
+            vec![
+                (
+                    3,
+                    8,
+                    ModelMessage::new(MessageRole::User, "current question"),
+                ),
+                (4, 9, ModelMessage::new(MessageRole::Assistant, "answer")),
+            ],
+            &mut loaded,
+        );
+        assert_eq!(first_page.len(), 2);
+
+        let overlapping_page = unseen_transcript_messages(
+            vec![
+                (2, 7, ModelMessage::new(MessageRole::User, "older question")),
+                (
+                    3,
+                    8,
+                    ModelMessage::new(MessageRole::User, "current question"),
+                ),
+                (4, 9, ModelMessage::new(MessageRole::Assistant, "answer")),
+            ],
+            &mut loaded,
+        );
+        assert_eq!(overlapping_page.len(), 1);
+        assert_eq!(overlapping_page[0].2.content, "older question");
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -16302,7 +16434,7 @@ mod transcript_paging_tests {
             .unwrap();
         assert_eq!(next_before, Some(0));
         assert!(!has_older);
-        assert!(messages.iter().any(|message| {
+        assert!(messages.iter().any(|(_, _, message)| {
             message.role == MessageRole::User && message.content == "load only a transcript page"
         }));
     }
