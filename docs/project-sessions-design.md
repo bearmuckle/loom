@@ -6,14 +6,16 @@ This document turns [GitHub issue #17](https://github.com/bearmuckle/loom/issues
 “Project sessions and coordinated sub-agents,” into an implementation design.
 It is the design and sequencing plan for the feature. The issue is XL-sized, so
 delivery is split into reviewable slices. The current draft implementation has
-landed the project hierarchy, protocol 5.0 contract, forward v41-to-v44 SQLite
+landed the project hierarchy, protocol 5.0 contract, forward v41-to-v45 SQLite
 migrations, durable child/task creation, persisted child model selection,
 restart scheduling for queued children, dependency gating, reconciliation of
 task status from persisted runs, and durable parent-child message delivery at
 safe model-turn boundaries. Root managers can create bounded non-code child
-tasks through a write-approved agent tool; its grant survives run recovery.
-Manager messaging tools, worktree-backed code tasks, controls, UI, and
-integration remain future slices.
+tasks through a write-approved agent tool; separate delegation, messaging, and
+inspection grants survive run recovery. Project agents can send durable
+direct-parent/direct-child messages and inspect direct-child task and session
+status. Worktree-backed code tasks, user controls, UI, and integration remain
+future slices.
 
 The feature makes a root agent session a **project**: the durable owner of a
 user goal and the root of an agent hierarchy. A project manager may delegate
@@ -166,7 +168,7 @@ maximum depth three in the backend domain service and persistence boundary.
 Do not place growing messages or child lists inside session JSON blobs.
 
 The project foundation requires forward SQLite migrations from schema version
-41 through version 44. The v41-to-v42 migration adds the
+41 through version 45. The v41-to-v42 migration adds the
 normalized project, membership/parentage, delegated-task, addressed-message,
 and worktree/integration structures, then backfill each existing session as
 the root of a project while preserving its session ID, workspace, transcript,
@@ -175,12 +177,14 @@ remain stable; if project IDs are separate, assign them once and persist the
 mapping. Set `user_version` to 42 only after the backfill and invariants pass.
 The v42-to-v43 migration adds the per-run project-message cursor used to
 checkpoint inbox delivery atomically with the agent transcript. The v43-to-v44
-migration adds the per-run project-delegation grant so a recovered manager
-retains only the project tool authorization captured when its run started.
-Each migration rolls back independently and can be retried safely. This is a
-forward-only transition: a pre-v44 backend cannot open the migrated database,
-and no schema downgrade is provided. If an upgrade must be rolled back, restore
-a pre-upgrade backup or move forward with a fix.
+migration adds the per-run project-delegation grant. The v44-to-v45 migration
+adds separate per-run messaging and inspection grants, both defaulting off for
+existing runs. A recovered run retains only the project tool authorization
+captured when it started; v44 delegation grants do not implicitly grant message
+or status access. Each migration rolls back independently and can be retried
+safely. This is a forward-only transition: a pre-v45 backend cannot open the
+migrated database, and no schema downgrade is provided. If an upgrade must be
+rolled back, restore a pre-upgrade backup or move forward with a fix.
 
 Child creation is idempotent and commits its session, task, project link, and
 initial event before execution is scheduled. A crash after commit but before
@@ -203,7 +207,7 @@ and its decision.
 1. **Implemented:** add project/agent hierarchy IDs, depth, delegated-task
    intent/status, message envelope/type, and worktree integration state to
    shared domain types; enforce the core hierarchy invariants.
-2. **Implemented:** add the forward v41-to-v44 migrations and represent
+2. **Implemented:** add the forward v41-to-v45 migrations and represent
    existing sessions as project roots.
 3. **Implemented:** advance to protocol 5.0 and reject older clients during
    negotiation before serving project-aware schemas.
@@ -212,7 +216,7 @@ and its decision.
    tasks when dependencies complete. Existing run recovery keeps interrupted
    work paused or blocked rather than starting a duplicate child run.
 
-**Exit:** v41 data migrates through v44 with existing sessions represented as
+**Exit:** v41 data migrates through v45 with existing sessions represented as
 projects; unsupported clients are directed to upgrade before using the new
 contract; hierarchy invariants are backend-enforced; snapshots and durable
 records survive restart and reconnect. Backend downgrade is unsupported and
@@ -231,9 +235,13 @@ occurs after record commit but before notification persistence.
 3. **Implemented:** deliver parent-child messages from the durable inbox at
    model-turn boundaries, checkpoint the inbox cursor with the transcript,
    and retain messages for blocked or inactive recipients until resume.
-4. Return progress, completion, questions, and blockers to the manager and
+4. **Implemented:** add run-granted `send_project_agent_message` and
+   `list_project_children` tools. A child reports to its parent; a parent
+   identifies a child by its delegated task ID. Terminal recipients are
+   rejected because they have no current resume path.
+5. Return progress, completion, questions, and blockers to the manager and
    allow it to answer, redirect, continue, retry, or cancel.
-5. Add a deterministic end-to-end scenario for investigation/planning that
+6. Add a deterministic end-to-end scenario for investigation/planning that
    completes without worktrees or a fixed document pipeline.
 
 **Exit:** a manager creates a bounded non-code child, exchanges messages while

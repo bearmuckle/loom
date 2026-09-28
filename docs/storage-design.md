@@ -2,10 +2,12 @@
 
 ## Status
 
-The project-session rollout upgrades forward through schema version 44. The
+The project-session rollout upgrades forward through schema version 45. The
 v41-to-v42 migration backfills existing sessions as project roots, v43 adds the
 durable project-message delivery cursor to run execution state, and v44 stores
-the per-run project-delegation grant. Incompatible databases are rejected
+the per-run project-delegation grant. V45 adds separate per-run messaging and
+inspection grants, defaulting them off for runs already in the database.
+Incompatible databases are rejected
 without modification; backend downgrades and schema downgrade migrations are
 unsupported. If an upgrade must be rolled back, restore a pre-upgrade backup
 or move forward with a fix.
@@ -18,9 +20,12 @@ workspace ownership invariants before updating `PRAGMA user_version`, and leave
 the database unchanged if migration fails. The v42-to-v43 migration adds the
 per-run project-message cursor used to checkpoint inbox delivery with the
 transcript. The v43-to-v44 migration adds `project_delegation_enabled` to each
-run runtime configuration. Existing runs default to disabled; new runs persist
-the project capability grant chosen at start so restart recovery exposes the
-same manager tool set. Each migration should be tested for successful upgrade,
+run runtime configuration. The v44-to-v45 migration adds
+`project_messaging_enabled` and `project_inspection_enabled`; these remain
+separate from delegation so existing v44 runs do not acquire new capabilities.
+Existing runs default to disabled; new runs persist each project capability
+grant chosen at start so restart recovery exposes the same tool set. Each
+migration should be tested for successful upgrade,
 rollback on failure, and safe retry after interruption.
 
 ## Data model

@@ -120,6 +120,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output_cost_micros_per_1k: 3,
                 context_inspection: None,
                 project_delegation_enabled: false,
+                project_messaging_enabled: false,
+                project_inspection_enabled: false,
             },
         );
         run_activities.insert(

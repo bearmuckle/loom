@@ -46,6 +46,12 @@ pub struct AgentRuntimeOptions {
     /// Persisted grant for server-provided project delegation tools.
     #[serde(default)]
     pub project_delegation_enabled: bool,
+    /// Persisted grant for direct parent-child message tools.
+    #[serde(default)]
+    pub project_messaging_enabled: bool,
+    /// Persisted grant for direct-child project status inspection.
+    #[serde(default)]
+    pub project_inspection_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
