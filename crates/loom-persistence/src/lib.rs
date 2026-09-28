@@ -38,9 +38,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const DATABASE_SCHEMA_VERSION: u32 = 48;
+const DATABASE_SCHEMA_VERSION: u32 = 49;
 const PROJECT_WORKTREE_SCHEMA_VERSION: u32 = 47;
 const PROJECT_CHILD_CONTROL_SCHEMA_VERSION: u32 = 46;
+const PROJECT_MANAGER_WAIT_SCHEMA_VERSION: u32 = 48;
 const PROJECT_SCHEMA_VERSION: u32 = 42;
 const PROJECT_MESSAGE_SCHEMA_VERSION: u32 = 43;
 const PROJECT_DELEGATION_SCHEMA_VERSION: u32 = 44;
@@ -194,6 +195,8 @@ CREATE TABLE IF NOT EXISTS run_runtime_config (
         CHECK(project_child_control_enabled IN (0, 1)),
     project_worktree_enabled INTEGER NOT NULL DEFAULT 0
         CHECK(project_worktree_enabled IN (0, 1)),
+    project_review_enabled INTEGER NOT NULL DEFAULT 0
+        CHECK(project_review_enabled IN (0, 1)),
     project_integration_enabled INTEGER NOT NULL DEFAULT 0
         CHECK(project_integration_enabled IN (0, 1)),
     project_branch_messaging_enabled INTEGER NOT NULL DEFAULT 0
@@ -1263,6 +1266,7 @@ pub struct DurableRunRuntimeConfig {
     pub project_inspection_enabled: bool,
     pub project_child_control_enabled: bool,
     pub project_worktree_enabled: bool,
+    pub project_review_enabled: bool,
     pub project_integration_enabled: bool,
     pub project_branch_messaging_enabled: bool,
 }
@@ -3757,7 +3761,8 @@ impl FilePersistence {
                         context_inspection, project_delegation_enabled,
                         project_messaging_enabled, project_inspection_enabled,
                         project_child_control_enabled, project_worktree_enabled,
-                        project_integration_enabled, project_branch_messaging_enabled
+                        project_review_enabled, project_integration_enabled,
+                        project_branch_messaging_enabled
                  FROM run_runtime_config
                  JOIN runtime_configurations USING(configuration_hash)
                  WHERE run_id=?1",
@@ -3790,6 +3795,7 @@ impl FilePersistence {
                         row.get::<_, i64>(23)?,
                         row.get::<_, i64>(24)?,
                         row.get::<_, i64>(25)?,
+                        row.get::<_, i64>(26)?,
                     ))
                 },
             )
@@ -3826,6 +3832,7 @@ impl FilePersistence {
                 project_inspection_enabled,
                 project_child_control_enabled,
                 project_worktree_enabled,
+                project_review_enabled,
                 project_integration_enabled,
                 project_branch_messaging_enabled,
             )| {
@@ -3892,6 +3899,7 @@ impl FilePersistence {
                     project_inspection_enabled: project_inspection_enabled != 0,
                     project_child_control_enabled: project_child_control_enabled != 0,
                     project_worktree_enabled: project_worktree_enabled != 0,
+                    project_review_enabled: project_review_enabled != 0,
                     project_integration_enabled: project_integration_enabled != 0,
                     project_branch_messaging_enabled: project_branch_messaging_enabled != 0,
                 })
@@ -6673,7 +6681,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v48(connection);
+        return migrate_v47_to_v49(connection);
     }
     if database_version == PROJECT_SCHEMA_VERSION {
         migrate_v42_to_v43(connection)?;
@@ -6681,32 +6689,35 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v48(connection);
+        return migrate_v47_to_v49(connection);
     }
     if database_version == PROJECT_MESSAGE_SCHEMA_VERSION {
         migrate_v43_to_v44(connection)?;
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v48(connection);
+        return migrate_v47_to_v49(connection);
     }
     if database_version == PROJECT_DELEGATION_SCHEMA_VERSION {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v48(connection);
+        return migrate_v47_to_v49(connection);
     }
     if database_version == PROJECT_COORDINATION_SCHEMA_VERSION {
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v48(connection);
+        return migrate_v47_to_v49(connection);
     }
     if database_version == PROJECT_CHILD_CONTROL_SCHEMA_VERSION {
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v48(connection);
+        return migrate_v47_to_v49(connection);
     }
     if database_version == PROJECT_WORKTREE_SCHEMA_VERSION {
-        return migrate_v47_to_v48(connection);
+        return migrate_v47_to_v49(connection);
+    }
+    if database_version == PROJECT_MANAGER_WAIT_SCHEMA_VERSION {
+        return migrate_v48_to_v49(connection);
     }
     if database_version != 0 {
         return Err(LoomError::new(
@@ -6808,6 +6819,47 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(|error| {
         persistence_error(
             format!("could not commit persistence schema: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
+fn migrate_v47_to_v49(connection: &Connection) -> Result<()> {
+    migrate_v47_to_v48(connection)?;
+    migrate_v48_to_v49(connection)
+}
+
+fn migrate_v48_to_v49(connection: &Connection) -> Result<()> {
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not begin project review-grant migration: {error}"),
+            true,
+        )
+    })?;
+    transaction
+        .execute_batch(
+            "ALTER TABLE run_runtime_config
+                ADD COLUMN project_review_enabled INTEGER NOT NULL DEFAULT 0
+                CHECK(project_review_enabled IN (0, 1));",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not add durable project review grant: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record project review-grant schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit project review-grant migration: {error}"),
             true,
         )
     })?;
@@ -6999,7 +7051,7 @@ fn migrate_v47_to_v48(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
-        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .pragma_update(None, "user_version", PROJECT_MANAGER_WAIT_SCHEMA_VERSION)
         .map_err(|error| {
             persistence_error(
                 format!("could not record project-agent permission schema version: {error}"),
@@ -9954,9 +10006,9 @@ fn save_run_runtime_config_rows(
                     run_id, configuration_hash, context_inspection,
                     project_delegation_enabled, project_messaging_enabled,
                     project_inspection_enabled, project_child_control_enabled,
-                    project_worktree_enabled, project_integration_enabled,
-                    project_branch_messaging_enabled
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                    project_worktree_enabled, project_review_enabled,
+                    project_integration_enabled, project_branch_messaging_enabled
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(run_id) DO UPDATE SET
                     configuration_hash=excluded.configuration_hash,
                     context_inspection=excluded.context_inspection,
@@ -9965,6 +10017,7 @@ fn save_run_runtime_config_rows(
                     project_inspection_enabled=excluded.project_inspection_enabled,
                     project_child_control_enabled=excluded.project_child_control_enabled,
                     project_worktree_enabled=excluded.project_worktree_enabled,
+                    project_review_enabled=excluded.project_review_enabled,
                     project_integration_enabled=excluded.project_integration_enabled,
                     project_branch_messaging_enabled=excluded.project_branch_messaging_enabled
                  WHERE run_runtime_config.configuration_hash IS NOT excluded.configuration_hash
@@ -9974,6 +10027,7 @@ fn save_run_runtime_config_rows(
                     OR run_runtime_config.project_inspection_enabled IS NOT excluded.project_inspection_enabled
                     OR run_runtime_config.project_child_control_enabled IS NOT excluded.project_child_control_enabled
                     OR run_runtime_config.project_worktree_enabled IS NOT excluded.project_worktree_enabled
+                    OR run_runtime_config.project_review_enabled IS NOT excluded.project_review_enabled
                     OR run_runtime_config.project_integration_enabled IS NOT excluded.project_integration_enabled
                     OR run_runtime_config.project_branch_messaging_enabled IS NOT excluded.project_branch_messaging_enabled",
                 params![
@@ -9985,6 +10039,7 @@ fn save_run_runtime_config_rows(
                     i64::from(config.project_inspection_enabled),
                     i64::from(config.project_child_control_enabled),
                     i64::from(config.project_worktree_enabled),
+                    i64::from(config.project_review_enabled),
                     i64::from(config.project_integration_enabled),
                     i64::from(config.project_branch_messaging_enabled),
                 ],
@@ -13575,6 +13630,7 @@ mod tests {
             project_inspection_enabled: false,
             project_child_control_enabled: false,
             project_worktree_enabled: false,
+            project_review_enabled: false,
             project_integration_enabled: false,
             project_branch_messaging_enabled: false,
         };
@@ -15213,6 +15269,7 @@ mod tests {
             project_inspection_enabled: true,
             project_child_control_enabled: true,
             project_worktree_enabled: true,
+            project_review_enabled: false,
             project_integration_enabled: false,
             project_branch_messaging_enabled: true,
         };

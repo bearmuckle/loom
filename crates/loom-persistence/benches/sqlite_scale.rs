@@ -124,6 +124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 project_inspection_enabled: false,
                 project_child_control_enabled: false,
                 project_worktree_enabled: false,
+                project_review_enabled: false,
                 project_integration_enabled: false,
                 project_branch_messaging_enabled: false,
             },

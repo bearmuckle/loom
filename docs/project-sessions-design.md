@@ -7,25 +7,31 @@ This document turns [GitHub issue #17](https://github.com/bearmuckle/loom/issues
 It is the design and sequencing plan for the feature. The issue is XL-sized, so
 delivery is split into reviewable slices. Slices 0–3 provide direct-child
 coordination, child controls, and reviewed worktrees; that contract uses
-protocol 7.0 and SQLite schema v47. The current draft extends it to protocol
-8.0 and schema v48 with independent delegated-task grants, explicitly
-authorized branch messaging, and durable manager wait/join state. The draft
-also parks a manager at a safe checkpoint, releases its workspace slot, resumes
-the original tool continuation once selected children are ready, blocks
-premature manager completion, and admits queued work under a workspace-wide
+protocol 7.0 and SQLite schema v47. The current draft extends it through
+protocol 8.0/schema v48 for independent delegated-task grants, explicitly
+authorized branch messaging, and durable manager wait/join state. Since that
+milestone is already on the draft branch, the independent persisted review-run
+grant now uses protocol 9.0 and schema v49, with a forward v48-to-v49 migration.
+The draft also parks a manager at a safe checkpoint, releases its workspace
+slot, resumes the original tool continuation once selected children are ready,
+blocks premature manager completion, and admits queued work under a workspace-wide
 concurrency limit. Failed or cancelled prerequisites now leave dependent tasks
 blocked with their dependency IDs available for inspection; terminal manager
 waits are abandoned during recovery, and code completion requires a reviewed
-result and integration when changes exist. These M7.4 paths still need restart
-and cap-one end-to-end validation. Descendant cascade cancellation, nested
-worktree integration, recursive project UI, and cross-type fair scheduling are
-not implemented; depth-three delegation remains disabled until those features
-and the validation gate are complete. Deployments must ensure or force clients to
-upgrade: the backend rejects clients that do not negotiate the supported
-protocol before serving the new contract. Old-client forward compatibility
-and backend/schema downgrades are unsupported.
+result and integration when changes exist. Descendant cascade cancellation,
+nested permission checks, parent-relative worktree integration, owner-edge
+controls, recursive project-tree rendering, descendant inbox display, and
+oldest-first admission across ready joins and queued tasks are implemented in
+the current worktree. Restart/cap-one, fair-admission, and cascade end-to-end
+validation remain.
+Depth-three delegation stays closed behind the unadvertised
+`CreateNestedProjectChild` server capability until those gates pass.
+Deployments must ensure or force clients to upgrade:
+the backend rejects clients that do not negotiate protocol 9.0 before serving
+the new contract. Old-client forward compatibility and backend/schema
+downgrades are unsupported.
 
-The existing implementation also includes forward v41-to-v48 SQLite
+The existing implementation also includes forward v41-to-v49 SQLite
 migrations, durable child/task creation, persisted child model selection,
 restart scheduling for queued children, dependency gating, task-state
 reconciliation, and durable parent-child message delivery at safe model-turn
@@ -205,23 +211,26 @@ integration grants. A backend that only supports v46 cannot open a database
 after migration to v47. Backend and schema downgrades remain unsupported;
 recover by restoring a pre-upgrade backup or moving forward with a fix.
 
-Protocol 7.0 is the minimum client contract for child worktrees and
-integration. Keep the existing session request surface for root-session
-operations where practical, but admitted clients treat roots as projects. The
-server rejects older clients with `UnsupportedProtocol` before sending v7
-variants. Backend downgrades to pre-project protocol/storage versions are
-unsupported, including when no child agents have been created.
+Slices 0–3 initially required protocol 7.0 for child worktrees and integration;
+M7.4 now requires protocol 9.0. Keep the existing session request surface for
+root-session operations where practical, but admitted clients treat roots as
+projects. The server rejects unsupported clients with `UnsupportedProtocol`
+before serving protocol-specific variants or project schemas. Backend
+downgrades to pre-project protocol/storage versions are unsupported, including
+when no child agents have been created.
 
-The planned M7.4 contract adds independently persisted delegation, branch
-messaging, child-control, review, and integration grants to delegated-task
-intent, plus durable state for managers waiting on their descendants. Roll it
-out as protocol 8.0 and SQLite schema v48: protocol 7.x clients must upgrade
-before negotiation succeeds, and v47-only backends must reject v48 databases.
-The v47-to-v48 migration is forward-only, with every newly introduced grant
-disabled for existing tasks and runs. Do not infer branch messaging from the
-existing direct-message grant. Agent-attributed messages must be submitted by
-the server-bound agent tool; a client-supplied sender session ID is not an
-agent identity.
+The M7.4 contract adds independently persisted delegation, branch messaging,
+child-control, review, and integration grants to delegated-task intent, plus
+durable state for managers waiting on their descendants. Protocol 8.0 and
+schema v48 introduced branch messaging and durable manager waits. The review
+run grant was added after that milestone reached the draft branch, so the
+current contract is protocol 9.0 and schema v49; protocol 8.x clients must
+upgrade before negotiation succeeds, and v48-only backends must reject v49
+databases. The v47-to-v48 and v48-to-v49 migrations are forward-only, with
+every newly introduced grant disabled for existing tasks and runs. Do not
+infer branch messaging from the existing direct-message grant. Agent-attributed
+messages must be submitted by the server-bound agent tool; a client-supplied
+sender session ID is not an agent identity.
 
 Persist normalized queryable records for project membership/parentage,
 delegated task intent and dependencies, message envelope/body and ordering,
@@ -388,14 +397,16 @@ later design step.
 
 ### Slice 4: deeper hierarchy and branch communication
 
-**Implementation status:** protocol 8.0, the forward v47-to-v48 grants and
-wait-state migration, sender binding, recipient discovery, explicitly granted
-branch-message routes, durable manager wait/join, workspace-wide admission,
-and manager completion guards are implemented in the current worktree. The
-   wait/join path and failed-dependency handling still need restart and cap-one
-   end-to-end validation.
-Depth-three delegation remains disabled while descendant cancellation, nested
-worktree integration, and recursive UI support are unfinished.
+**Implementation status:** protocol 9.0, forward v47-to-v48 grant and
+wait-state migration plus v48-to-v49 review-run grant migration, sender
+binding, recipient discovery, explicitly granted branch-message routes,
+durable manager wait/join, workspace-wide admission, manager completion guards,
+descendant cascade cancellation, nested permission and parent-relative
+worktree paths, owner-edge controls, recursive project-tree rendering,
+descendant inbox display, and oldest-first admission are implemented in the
+current worktree. Depth-three
+delegation remains closed behind `CreateNestedProjectChild` until restart/cap-one,
+cascade, and cross-type scheduling validation is complete.
 
 1. Persist an explicit, independent child permission set with each delegated
    task. A depth-two agent may create depth-three tasks only when its run has
@@ -420,31 +431,34 @@ worktree integration, and recursive UI support are unfinished.
    active or its code result still needs integration.
 4. **Partially implemented:** apply the configured concurrency limit across
    the workspace, serialize admission at that scope, and restart queued tasks
-   when a slot is released. Queued tasks are ordered globally by creation time,
-   while ready joins currently receive priority. Cross-type fairness and
-   restart behavior need end-to-end validation. Failed or cancelled
+   when a slot is released. Ready joins and queued tasks share an oldest-first
+   admission queue; restart, cap-one, and cross-type fairness need end-to-end
+   validation. Failed or cancelled
    prerequisites move dependents to blocked and make them return-ready to a
    waiting manager; verify this failure path end-to-end.
-5. Let each manager control only its direct children. Cancelling a manager's
-   child cancels or interrupts that child's descendants deepest-first; pausing
-   or interrupting a manager run remains local. Derive branch progress from
-   durable child task states, while keeping each run's own state distinct.
-6. Preserve upward code ownership: a depth-two agent reviews and integrates a
+5. **Partially implemented:** keep manager control scoped to direct children.
+   Cancelling a child now cancels or interrupts its descendants deepest-first;
+   pausing or interrupting a manager run remains local. Derive branch progress
+   from durable child task states while keeping each run's own state distinct.
+   Owner-edge controls are implemented; cascade recovery still needs validation.
+6. **Implemented, pending end-to-end validation:** preserve upward code
+   ownership: a depth-two agent reviews and integrates a
    depth-three commit into its own branch before returning, then the project
    root reviews and integrates that branch. Require a clean exact base and
    review of the exact child `HEAD` at each edge; retain stale or diverged
    work for explicit recovery.
-7. Extend the workspace project tree recursively, expose controls and review
-   actions for the owning parent-child edge, and include authorized descendant
-   inboxes in the root activity timeline.
+7. **Implemented, pending end-to-end validation:** project sessions render
+   recursively, nest under their persisted parent, and reveal their owner chain
+   when selected. Controls and review actions target the owning parent-child
+   edge, and the root activity timeline includes authorized descendant inboxes.
 
 **Exit:** three-level projects coordinate safely, recover after restart, keep
 workspace concurrency bounded, preserve explicit grants, deliver branch
 messages only across authorized routes, and integrate code upward at every
 parent boundary. This slice remains incomplete until restart and cap-one
-wait/join cases pass end-to-end, descendant cancellation and nested worktree
-integration are implemented, and the project UI supports the hierarchy
-recursively.
+wait/join cases, descendant cancellation, nested worktree integration,
+descendant message delivery, and oldest-first admission across ready joins and
+queued tasks pass end-to-end validation.
 
 ## Verification and rollout
 

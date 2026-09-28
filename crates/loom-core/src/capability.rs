@@ -44,6 +44,8 @@ pub enum Capability {
     WriteSessionFilesystem,
     ReadProject,
     CreateProjectChild,
+    /// Enables depth-two managers to create depth-three agents after rollout validation.
+    CreateNestedProjectChild,
     CreateProjectWorktree,
     ControlProjectChild,
     SendProjectAgentMessage,

@@ -58,6 +58,9 @@ pub struct AgentRuntimeOptions {
     /// Persisted grant for creating isolated project code-task worktrees.
     #[serde(default)]
     pub project_worktree_enabled: bool,
+    /// Persisted grant for reviewing direct-child project worktrees.
+    #[serde(default)]
+    pub project_review_enabled: bool,
     /// Persisted grant for integrating reviewed child worktree commits.
     #[serde(default)]
     pub project_integration_enabled: bool,

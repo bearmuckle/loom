@@ -52,7 +52,7 @@ pub use workspace::{
     WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
 
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(8, 0);
+pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(9, 0);
 pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
 pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
 pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
@@ -1157,7 +1157,7 @@ mod run_message_protocol_tests {
 
     #[test]
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
-        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(8, 0));
+        assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(9, 0));
         let project_id = ProjectId::new();
         let request = ClientRequest::GetProjectSnapshot { project_id };
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));

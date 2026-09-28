@@ -1412,7 +1412,7 @@ pub(crate) struct LoomView {
     project_feed_epoch: Option<String>,
     project_poll_scheduled: bool,
     session_tree: Option<Entity<TreeState>>,
-    session_tree_entries: Vec<(AgentSessionId, String)>,
+    session_tree_entries: Vec<SessionTreeNode>,
     pub(crate) active_session: AgentSessionSnapshot,
     pub(crate) active_run: Option<AgentRunSnapshot>,
     pub(crate) active_run_id: Option<RunId>,
@@ -1524,25 +1524,83 @@ enum SessionSourceChoice {
     GitHub,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SessionTreeNode {
+    session_id: AgentSessionId,
+    label: String,
+    children: Vec<SessionTreeNode>,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct SessionListProjection {
     entries: Vec<(AgentSessionId, String)>,
     selected_index: Option<usize>,
+    tree: Vec<SessionTreeNode>,
 }
 
 fn session_list_projection(
     sessions: &[AgentSessionSnapshot],
     active_session_id: AgentSessionId,
 ) -> SessionListProjection {
-    SessionListProjection {
-        entries: sessions
+    session_list_projection_from_tree(
+        sessions
             .iter()
-            .map(|session| (session.id, session.name.clone()))
+            .map(|session| SessionTreeNode {
+                session_id: session.id,
+                label: session.name.clone(),
+                children: Vec::new(),
+            })
             .collect(),
-        selected_index: sessions
-            .iter()
-            .position(|session| session.id == active_session_id),
+        active_session_id,
+    )
+}
+
+fn session_list_projection_from_tree(
+    tree: Vec<SessionTreeNode>,
+    active_session_id: AgentSessionId,
+) -> SessionListProjection {
+    fn flatten(node: &SessionTreeNode, entries: &mut Vec<(AgentSessionId, String)>) {
+        entries.push((node.session_id, node.label.clone()));
+        for child in &node.children {
+            flatten(child, entries);
+        }
     }
+
+    let mut entries = Vec::new();
+    for node in &tree {
+        flatten(node, &mut entries);
+    }
+    let selected_index = entries
+        .iter()
+        .position(|(session_id, _)| *session_id == active_session_id);
+    SessionListProjection {
+        entries,
+        selected_index,
+        tree,
+    }
+}
+
+fn session_tree_item(node: &SessionTreeNode) -> TreeItem {
+    let children = node
+        .children
+        .iter()
+        .map(session_tree_item)
+        .collect::<Vec<_>>();
+    TreeItem::new(node.session_id.to_string(), node.label.clone())
+        .children(children)
+        .expanded(!node.children.is_empty())
+}
+
+fn find_session_tree_item<'a>(items: &'a [TreeItem], session_id: &str) -> Option<&'a TreeItem> {
+    for item in items {
+        if item.id.as_ref() == session_id {
+            return Some(item);
+        }
+        if let Some(child) = find_session_tree_item(&item.children, session_id) {
+            return Some(child);
+        }
+    }
+    None
 }
 
 fn project_session_list_projection(
@@ -1553,57 +1611,138 @@ fn project_session_list_projection(
     let Some(project) = project else {
         return session_list_projection(sessions, active_session_id);
     };
-    let child_agents = project
+    let sessions_by_id = sessions
+        .iter()
+        .map(|session| (session.id, session))
+        .collect::<BTreeMap<_, _>>();
+    let agents_by_id = project
         .agents
         .iter()
-        .filter(|agent| agent.parent_session_id == Some(project.root_session_id))
-        .collect::<Vec<_>>();
-    let child_ids = child_agents
+        .filter(|agent| agent.session_id != project.root_session_id)
+        .map(|agent| (agent.session_id, agent))
+        .collect::<BTreeMap<_, _>>();
+    let mut agents_by_parent =
+        BTreeMap::<AgentSessionId, Vec<&loom_core::ProjectAgentRecord>>::new();
+    for agent in project
+        .agents
         .iter()
-        .map(|agent| agent.session_id)
-        .collect::<BTreeSet<_>>();
-    let mut entries = Vec::new();
+        .filter(|agent| agent.session_id != project.root_session_id)
+    {
+        let parent_id = agent
+            .parent_session_id
+            .filter(|parent_id| {
+                *parent_id == project.root_session_id
+                    || (agents_by_id.contains_key(parent_id)
+                        && sessions_by_id.contains_key(parent_id))
+            })
+            .unwrap_or(project.root_session_id);
+        agents_by_parent.entry(parent_id).or_default().push(agent);
+    }
+
+    fn agent_label(
+        session: &AgentSessionSnapshot,
+        agent: &loom_core::ProjectAgentRecord,
+    ) -> String {
+        let task_summary = agent
+            .task_summary
+            .as_deref()
+            .map(|summary| format!(" — {summary}"))
+            .unwrap_or_default();
+        format!(
+            "↳ {} · {}{}",
+            session.name,
+            session_state_label(agent.state),
+            task_summary
+        )
+    }
+
+    fn build_agent_node(
+        session_id: AgentSessionId,
+        sessions_by_id: &BTreeMap<AgentSessionId, &AgentSessionSnapshot>,
+        agents_by_id: &BTreeMap<AgentSessionId, &loom_core::ProjectAgentRecord>,
+        agents_by_parent: &BTreeMap<AgentSessionId, Vec<&loom_core::ProjectAgentRecord>>,
+        visited: &mut BTreeSet<AgentSessionId>,
+    ) -> Option<SessionTreeNode> {
+        if !visited.insert(session_id) {
+            return None;
+        }
+        let session = sessions_by_id.get(&session_id)?;
+        let label = agents_by_id
+            .get(&session_id)
+            .map_or_else(|| session.name.clone(), |agent| agent_label(session, agent));
+        let children = agents_by_parent
+            .get(&session_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|agent| {
+                build_agent_node(
+                    agent.session_id,
+                    sessions_by_id,
+                    agents_by_id,
+                    agents_by_parent,
+                    visited,
+                )
+            })
+            .collect();
+        Some(SessionTreeNode {
+            session_id,
+            label,
+            children,
+        })
+    }
+
+    let Some(root_session) = sessions_by_id.get(&project.root_session_id) else {
+        return session_list_projection(sessions, active_session_id);
+    };
+    let mut visited = BTreeSet::new();
+    let mut root_node = SessionTreeNode {
+        session_id: project.root_session_id,
+        label: format!("Project · {}", root_session.name),
+        children: Vec::new(),
+    };
+    visited.insert(project.root_session_id);
+    root_node.children = agents_by_parent
+        .get(&project.root_session_id)
+        .into_iter()
+        .flatten()
+        .filter_map(|agent| {
+            build_agent_node(
+                agent.session_id,
+                &sessions_by_id,
+                &agents_by_id,
+                &agents_by_parent,
+                &mut visited,
+            )
+        })
+        .collect();
+
+    // Keep agents with missing parents and parent cycles in the project group too.
+    for agent in agents_by_id.values() {
+        if let Some(node) = build_agent_node(
+            agent.session_id,
+            &sessions_by_id,
+            &agents_by_id,
+            &agents_by_parent,
+            &mut visited,
+        ) {
+            root_node.children.push(node);
+        }
+    }
+
+    let project_session_ids = agents_by_id.keys().copied().collect::<BTreeSet<_>>();
+    let mut tree = Vec::new();
     for session in sessions {
-        if child_ids.contains(&session.id) {
-            continue;
-        }
-        let label = if session.id == project.root_session_id {
-            format!("Project · {}", session.name)
-        } else {
-            session.name.clone()
-        };
-        entries.push((session.id, label));
         if session.id == project.root_session_id {
-            for agent in &child_agents {
-                if let Some(child) = sessions
-                    .iter()
-                    .find(|session| session.id == agent.session_id)
-                {
-                    let task_summary = agent
-                        .task_summary
-                        .as_deref()
-                        .map(|summary| format!(" — {summary}"))
-                        .unwrap_or_default();
-                    entries.push((
-                        child.id,
-                        format!(
-                            "↳ {} · {}{}",
-                            child.name,
-                            session_state_label(agent.state),
-                            task_summary
-                        ),
-                    ));
-                }
-            }
+            tree.push(root_node.clone());
+        } else if !project_session_ids.contains(&session.id) {
+            tree.push(SessionTreeNode {
+                session_id: session.id,
+                label: session.name.clone(),
+                children: Vec::new(),
+            });
         }
     }
-    let selected_index = entries
-        .iter()
-        .position(|(session_id, _)| *session_id == active_session_id);
-    SessionListProjection {
-        entries,
-        selected_index,
-    }
+    session_list_projection_from_tree(tree, active_session_id)
 }
 
 fn workspace_feed_event_sequence(event: &WorkspaceFeedEvent) -> EventSequence {
@@ -1659,7 +1798,10 @@ fn project_child_control_actions(
                 ProjectChildControlAction::Continue,
                 ProjectChildControlAction::Cancel,
             ],
-            AgentSessionState::Failed => vec![ProjectChildControlAction::RetryFailedStep],
+            AgentSessionState::Failed => vec![
+                ProjectChildControlAction::RetryFailedStep,
+                ProjectChildControlAction::Cancel,
+            ],
             _ => vec![ProjectChildControlAction::Cancel],
         },
         TaskStatus::Blocked => {
@@ -1672,7 +1814,10 @@ fn project_child_control_actions(
                 vec![ProjectChildControlAction::Cancel]
             }
         }
-        TaskStatus::Failed => vec![ProjectChildControlAction::RetryFailedStep],
+        TaskStatus::Failed => vec![
+            ProjectChildControlAction::RetryFailedStep,
+            ProjectChildControlAction::Cancel,
+        ],
         TaskStatus::Completed | TaskStatus::Cancelled => Vec::new(),
     }
 }
@@ -3422,12 +3567,9 @@ impl LoomView {
         let mut recipients = project
             .agents
             .iter()
-            .filter(|agent| {
-                agent.session_id == project.root_session_id
-                    || agent.parent_session_id == Some(project.root_session_id)
-            })
             .map(|agent| agent.session_id)
             .collect::<Vec<_>>();
+        recipients.push(project.root_session_id);
         recipients.sort();
         recipients.dedup();
         if recipients.len() <= 1 {
@@ -7881,27 +8023,27 @@ impl LoomView {
             self.active_session.id,
             self.project_snapshot.as_ref(),
         );
-        let entries = projection.entries;
-        let tree_items = entries
-            .iter()
-            .map(|(id, name)| TreeItem::new(id.to_string(), name.clone()))
-            .collect::<Vec<_>>();
-        let selected_index = projection.selected_index;
+        let tree_nodes = projection.tree;
+        let tree_items = tree_nodes.iter().map(session_tree_item).collect::<Vec<_>>();
+        let selected_session_id = self.active_session.id.to_string();
+        let selected_item = find_session_tree_item(&tree_items, &selected_session_id);
         let tree = if let Some(tree) = self.session_tree.clone() {
-            if self.session_tree_entries != entries {
-                tree.update(cx, |state, cx| state.set_items(tree_items, cx));
-                self.session_tree_entries = entries.clone();
+            if self.session_tree_entries != tree_nodes {
+                tree.update(cx, |state, cx| state.set_items(tree_items.clone(), cx));
+                self.session_tree_entries = tree_nodes.clone();
             }
-            if tree.read(cx).selected_index() != selected_index {
-                tree.update(cx, |state, cx| state.set_selected_index(selected_index, cx));
+            let current_selected_id = tree
+                .read(cx)
+                .selected_item()
+                .map(|item| item.id.to_string());
+            if current_selected_id.as_deref() != Some(selected_session_id.as_str()) {
+                tree.update(cx, |state, cx| state.set_selected_item(selected_item, cx));
             }
             tree
         } else {
-            self.session_tree_entries = entries.clone();
-            let tree = cx.new(|cx| TreeState::new(cx).items(tree_items));
-            if let Some(index) = selected_index {
-                tree.update(cx, |state, cx| state.set_selected_index(Some(index), cx));
-            }
+            self.session_tree_entries = tree_nodes;
+            let tree = cx.new(|cx| TreeState::new(cx).items(tree_items.clone()));
+            tree.update(cx, |state, cx| state.set_selected_item(selected_item, cx));
             self.session_tree = Some(tree.clone());
             tree
         };
@@ -7909,19 +8051,23 @@ impl LoomView {
         let sessions = self.sessions.clone();
         let view = cx.entity();
         let menu_sessions = sessions.clone();
-        let menu_entries = entries.clone();
         let menu_view = view.clone();
         let menu_project = self.project_snapshot.clone();
-        KitTree::new(&tree, move |index, _, selected, _, app| {
-            let Some((session_id, label)) = entries.get(index).cloned() else {
-                return ListItem::new(("session-tree-root", index));
-            };
+        KitTree::new(&tree, move |index, entry, selected, _, app| {
+            let session_id = entry.item().id.to_string();
             let Some(session) = sessions
                 .iter()
-                .find(|session| session.id == session_id)
+                .find(|session| session.id.to_string() == session_id)
                 .cloned()
             else {
                 return ListItem::new(("session-tree-root", index));
+            };
+            let label = entry.item().label.to_string();
+            let depth = entry.depth() as f32;
+            let tree_indicator = if entry.is_folder() {
+                if entry.is_expanded() { "⌄" } else { "›" }
+            } else {
+                " "
             };
             let node_indicator = view
                 .read(app)
@@ -7935,10 +8081,17 @@ impl LoomView {
                 .text_size(gpui_kit::rems(0.8125))
                 .child(
                     div()
+                        .pl(px(depth * 12.))
                         .w_full()
                         .flex()
                         .items_center()
                         .gap_2()
+                        .child(
+                            div()
+                                .w(px(10.))
+                                .text_color(rgb(0x8f98a6))
+                                .child(tree_indicator),
+                        )
                         .child(
                             Icon::new(AssetIconName::MessagesSquare)
                                 .size_4()
@@ -7957,13 +8110,11 @@ impl LoomView {
                     });
                 })
         })
-        .context_menu(move |index, _, menu, _window, _cx| {
-            let Some((session_id, _)) = menu_entries.get(index) else {
-                return menu;
-            };
+        .context_menu(move |_, entry, menu, _window, _cx| {
+            let session_id = entry.item().id.to_string();
             let Some(session) = menu_sessions
                 .iter()
-                .find(|session| session.id == *session_id)
+                .find(|session| session.id.to_string() == session_id)
                 .cloned()
             else {
                 return menu;
@@ -7992,19 +8143,32 @@ impl LoomView {
             if let Some(project) = menu_project.as_ref()
                 && let Some(child) = project.agents.iter().find(|agent| {
                     agent.session_id == session.id
-                        && agent.parent_session_id == Some(project.root_session_id)
+                        && agent.parent_session_id.is_some_and(|parent_session_id| {
+                            parent_session_id == project.root_session_id
+                                || project
+                                    .agents
+                                    .iter()
+                                    .any(|manager| manager.session_id == parent_session_id)
+                        })
                 })
+                && let Some(manager_session_id) = child.parent_session_id
                 && let Some(task) = project
                     .tasks
                     .iter()
                     .find(|task| task.target_session_id == child.session_id)
             {
-                let manager_session_id = project.root_session_id;
                 let project_id = project.project_id;
                 for action in project_child_control_actions(child.state, task.status) {
                     let control_view = menu_view.clone();
                     let task_id = task.task_id;
-                    let action_label = project_child_control_label(action);
+                    let action_label = if action == ProjectChildControlAction::Cancel
+                        && (child.state == AgentSessionState::Failed
+                            || task.status == loom_core::DelegatedTaskStatus::Failed)
+                    {
+                        "Cancel remaining descendants"
+                    } else {
+                        project_child_control_label(action)
+                    };
                     menu = menu.item(PopupMenuItem::new(action_label).on_click(move |_, _, cx| {
                         control_view.update(cx, |view, cx| {
                             view.control_project_child_from_ui(
@@ -14867,7 +15031,7 @@ mod worker_node_tests {
         );
         assert_eq!(
             project_child_control_actions(SessionState::Failed, TaskStatus::Failed),
-            vec![Action::RetryFailedStep]
+            vec![Action::RetryFailedStep, Action::Cancel]
         );
         assert!(
             project_child_control_actions(SessionState::Completed, TaskStatus::Completed)

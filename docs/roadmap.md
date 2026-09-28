@@ -189,16 +189,22 @@ one large orchestration change:
 
 M7.4 implementation is in progress: protocol 8.0 and the forward v47-to-v48
 migration carry independently persisted, default-off agent grants and durable
-manager wait/join records. The server-bound tool path supports explicitly
+manager wait/join records. Since protocol 8/schema v48 is already on the draft
+branch, the independent per-run review grant advances the contract to protocol
+9.0 and schema v49 through a forward v48-to-v49 migration. Protocol 8.x
+clients must upgrade. The server-bound tool path supports explicitly
 granted branch messages and rejects client-supplied agent identities. The
 draft also parks and resumes manager continuations, blocks premature manager
 completion, abandons waits for terminal managers, blocks dependents whose
 prerequisites fail or are cancelled, and applies admission limits
-workspace-wide. Restart and cap-one behavior still need end-to-end validation;
-nested worktree integration, descendant cascade cancellation, recursive UI,
-and fair admission across ready joins and queued tasks remain required.
-Depth-three delegation stays disabled until those paths and validations are
-complete.
+workspace-wide. Descendant cascade cancellation, nested permissions and
+parent-relative worktree integration, owner-edge controls, recursive
+project-tree rendering, and descendant inbox display are implemented in the
+current worktree. Oldest-first admission across joins and queued tasks is
+implemented. Restart/cap-one, cascade recovery, and fair admission still need
+end-to-end validation. Depth-three delegation is held behind the
+unadvertised `CreateNestedProjectChild` capability until all recovery and
+fairness gates pass.
 
 The backend rejects delegation beyond three levels from the beginning, even
 while the first client only exposes direct children. Non-code delegation ships
@@ -206,20 +212,22 @@ before code worktrees; no fixed plan-to-issues-to-build pipeline is required.
 Each slice's exit conditions and verification cases are defined in the design
 document.
 
-The v41-to-v48 database transition is forward-only. Backend downgrades are
+The v41-to-v49 database transition is forward-only. Backend downgrades are
 unsupported.
 Old-client forward compatibility is not supported: deployments must ensure
 or force clients to upgrade, and the backend rejects clients outside the
 supported protocol version during negotiation with the existing
-`UnsupportedProtocol` response before sending project schemas. Protocol 7.0
-and schema v47 are required for child worktrees.
+`UnsupportedProtocol` response before sending project schemas. Slices 0–3
+initially used protocol 7.0/schema v47 for child worktrees; the current M7.4
+contract requires protocol 9.0/schema v49.
 
-M7.4 uses protocol 8.0 and schema v48 for separately authorized branch
-messaging and durable manager wait state. Protocol 7.x clients must upgrade
-before the backend serves that contract. The v47-to-v48 migration is
-forward-only; v47-only backends cannot open the upgraded database, and backend
-downgrades are unsupported. Deployments may ensure or force client upgrades;
-old-client forward compatibility is not supported.
+M7.4 uses protocol 8.0/schema v48 for separately authorized branch messaging
+and durable manager wait state, then protocol 9.0/schema v49 for the independent
+review-run grant. Protocol 8.x clients must upgrade before the backend serves
+the current contract. The v47-to-v48 and v48-to-v49 migrations are forward-only;
+v48-only backends cannot open the upgraded database, and backend downgrades are
+unsupported. Deployments may ensure or force client upgrades; old-client
+forward compatibility is not supported.
 
 ## Quality bar
 

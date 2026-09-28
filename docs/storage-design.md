@@ -39,21 +39,26 @@ should be tested for successful upgrade, rollback on failure, and safe retry
 after interruption.
 
 M7.4 advances v47 to v48 for branch-messaging authorization and durable
-manager wait/join state. New per-run and delegated-task grants remain
-independent and default off for existing records. The migration is forward
-only: a v47-only backend must reject the upgraded database, and no backend or
-schema downgrade is supported. Require protocol 8.0 clients before exposing
-the new wire contract; protocol 7.x clients must upgrade. Deployments must
-ensure or force that upgrade; old-client forward compatibility is not
-supported.
+manager wait/join state. Because that milestone is already on the draft
+branch, a separately persisted review-run grant advances storage to v49 and
+the negotiated contract to protocol 9.0. New per-run and delegated-task grants
+remain independent and default off for existing records. The v47-to-v48 and
+v48-to-v49 migrations are forward-only: a v48-only backend must reject the
+upgraded database, and no backend or schema downgrade is supported. Require
+protocol 9.0 clients before exposing the current contract; protocol 8.x clients
+must upgrade. Deployments must ensure or force that upgrade; old-client forward
+compatibility is not supported.
 
-The draft implementation includes the v48 grant and manager-wait schema,
-runtime wait continuation, workspace-wide admission, and recovery path. It
-abandons waits for terminal managers and moves dependents with failed or
-cancelled prerequisites into a blocked state. It still requires end-to-end
-restart and cap-one validation before deeper delegation is enabled. Level-three
-delegation remains unavailable until nested worktree integration, descendant
-cascade cancellation, and recursive UI support land.
+The draft implementation includes the v48 grant and manager-wait schema, the
+v49 review-grant column, runtime wait continuation, workspace-wide admission,
+and recovery path. It abandons waits for terminal managers and moves dependents
+with failed or cancelled prerequisites into a blocked state. Descendant
+cascade cancellation and nested permission/worktree paths are implemented in
+the current worktree. Oldest-first admission across ready joins and queued
+tasks is implemented, pending end-to-end fairness validation. Level-three
+delegation stays unavailable behind the unadvertised
+`CreateNestedProjectChild` capability until restart/cap-one, cascade recovery,
+and fairness are validated.
 
 ## Data model
 
