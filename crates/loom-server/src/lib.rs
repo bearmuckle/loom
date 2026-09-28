@@ -2358,6 +2358,25 @@ impl ToolExtension for ProjectAgentTools {
                                 task.task_id, task.child_name
                             ));
                         };
+                        if worktree.status != ProjectWorktreeStatus::Removed {
+                            match project_child_worktree_status(&backend, &worktree) {
+                                Ok(status)
+                                    if status.clean
+                                        && status.head.as_deref() == Some(result_revision) => {}
+                                Ok(_) => {
+                                    return Some(format!(
+                                        "completed code child task {} ({}) changed after review or has uncommitted work; review its current checkout before reporting completion",
+                                        task.task_id, task.child_name
+                                    ));
+                                }
+                                Err(_) => {
+                                    return Some(format!(
+                                        "the live checkout for code child task {} ({}) could not be confirmed",
+                                        task.task_id, task.child_name
+                                    ));
+                                }
+                            }
+                        }
                         if result_revision != worktree.base_revision
                             && worktree.integrated_revision.as_deref() != Some(result_revision)
                         {
@@ -8967,10 +8986,11 @@ impl InProcessConnection {
                 }
                 drop(workspace_admission_guard);
 
-                // A stopped run may synchronously reconcile queued tasks and
-                // waits, so release the project admission lock before stopping
-                // any run in the subtree.
-                drop(admission_guard);
+                // Keep project admission locked until every run in the captured
+                // subtree has stopped. This prevents a manager from creating a
+                // new descendant after the subtree snapshot. The workspace
+                // admission lock was released above because stop_run reconciles
+                // queued tasks and waits synchronously.
 
                 for session_id in cancellation_order {
                     let is_selected_child = session_id == task.target_session_id;
@@ -11738,6 +11758,59 @@ fn project_manager_wait_result_summary(
         ));
     }
     Ok(Some(summary))
+}
+
+fn project_child_worktree_status(
+    backend: &InProcessBackend,
+    worktree: &ProjectWorktreeRecord,
+) -> Result<loom_vcs::GitRepositoryStatus> {
+    let filesystem = backend.restore_session_filesystem(worktree.child_session_id)?;
+    let relative_path = checked_session_relative_path(&worktree.relative_path)?;
+    let destination = filesystem.root().join(relative_path);
+    let metadata = fs::symlink_metadata(&destination).map_err(|error| {
+        LoomError::new(
+            ErrorCode::RecoveryRequired,
+            format!("project child worktree path is unavailable: {error}"),
+            true,
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            "refusing to inspect a project child worktree through a symlink",
+            false,
+        ));
+    }
+    let root = fs::canonicalize(filesystem.root()).map_err(|error| {
+        LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            format!("could not resolve child filesystem root: {error}"),
+            false,
+        )
+    })?;
+    let canonical_destination = fs::canonicalize(&destination).map_err(|error| {
+        LoomError::new(
+            ErrorCode::RecoveryRequired,
+            format!("could not resolve project child worktree path: {error}"),
+            true,
+        )
+    })?;
+    if !canonical_destination.starts_with(root) {
+        return Err(LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            "project worktree path escapes the child filesystem root",
+            false,
+        ));
+    }
+    let status = GitService::open(&destination)?.status()?;
+    if status.branch.as_deref() != Some(worktree.branch_name.as_str()) || status.head.is_none() {
+        return Err(LoomError::new(
+            ErrorCode::RecoveryRequired,
+            "linked project worktree does not match its durable branch identity",
+            true,
+        ));
+    }
+    Ok(status)
 }
 
 fn project_subtree_deepest_first(
@@ -14791,6 +14864,26 @@ mod tests {
             protocol_7_negotiation.result.unwrap_err().code,
             ErrorCode::UnsupportedProtocol
         );
+        let protocol_8_connection = backend.connect();
+        let protocol_8_discovery = protocol_8_connection.request(RequestEnvelope::with_version(
+            ProtocolVersion::new(8, 0),
+            ClientRequest::DiscoverCapabilities,
+        ));
+        assert_eq!(
+            protocol_8_discovery.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
+        let protocol_8_negotiation = protocol_8_connection.request(RequestEnvelope::with_version(
+            CURRENT_PROTOCOL_VERSION,
+            ClientRequest::Negotiate {
+                client_version: ProtocolVersion::new(8, 0),
+                capabilities: backend.supported_capabilities.clone(),
+            },
+        ));
+        assert_eq!(
+            protocol_8_negotiation.result.unwrap_err().code,
+            ErrorCode::UnsupportedProtocol
+        );
 
         let capability_limited_connection = backend.connect();
         let capability_limited = CapabilitySet::new(
@@ -16656,6 +16749,30 @@ mod tests {
         );
         assert!(diff.patch.contains("child result"));
 
+        let completion_guard = ProjectAgentTools {
+            backend: Arc::downgrade(&backend),
+            session_id: root.id,
+            project_id: task.project_id,
+            model_id: ModelId::new("deterministic/demo"),
+            can_delegate: false,
+            can_delegate_code: false,
+            can_message: false,
+            can_branch_message: false,
+            can_inspect_children: false,
+            can_wait_children: false,
+            can_control_children: false,
+            can_review_children: false,
+            can_integrate_children: false,
+        };
+        let unreviewed_path = child_checkout.join("unreviewed.txt");
+        fs::write(&unreviewed_path, "unreviewed change\n").unwrap();
+        assert!(
+            completion_guard
+                .completion_blocker()
+                .is_some_and(|blocker| blocker.contains("changed after review"))
+        );
+        fs::remove_file(unreviewed_path).unwrap();
+
         let integration =
             connection.request(RequestEnvelope::new(ClientRequest::IntegrateProjectChild {
                 project_id: task.project_id,
@@ -18139,6 +18256,8 @@ mod tests {
             provider: provider_id.clone(),
             display_name: "Scripted project coordination model".to_owned(),
             context_window: Some(16_384),
+            max_input_tokens: None,
+            max_output_tokens: None,
             capabilities: ModelCapabilities {
                 streaming: false,
                 tool_calling: true,

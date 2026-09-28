@@ -2,7 +2,7 @@
 
 ## Status
 
-The project-session rollout upgrades forward through schema version 48. The
+The project-session rollout upgrades forward through schema version 49. The
 v41-to-v42 migration backfills existing sessions as project roots, v43 adds the
 durable project-message delivery cursor to run execution state, and v44 stores
 the per-run project-delegation grant. V45 adds separate per-run messaging and
@@ -34,9 +34,9 @@ so existing runs do not acquire new capabilities during an upgrade. Existing
 runs default to disabled; new runs persist each project capability grant
 chosen at start so restart recovery exposes the same tool set. The v46-to-v47
 migration adds the independent worktree and integration grants; existing runs
-receive neither grant. Each migration
-should be tested for successful upgrade, rollback on failure, and safe retry
-after interruption.
+receive neither grant. The v48-to-v49 migration adds a separate review-run
+grant, defaulting it off for existing runs. Each migration should be tested for
+successful upgrade, rollback on failure, and safe retry after interruption.
 
 M7.4 advances v47 to v48 for branch-messaging authorization and durable
 manager wait/join state. Because that milestone is already on the draft
@@ -49,16 +49,22 @@ protocol 9.0 clients before exposing the current contract; protocol 8.x clients
 must upgrade. Deployments must ensure or force that upgrade; old-client forward
 compatibility is not supported.
 
-The draft implementation includes the v48 grant and manager-wait schema, the
-v49 review-grant column, runtime wait continuation, workspace-wide admission,
-and recovery path. It abandons waits for terminal managers and moves dependents
-with failed or cancelled prerequisites into a blocked state. Descendant
-cascade cancellation and nested permission/worktree paths are implemented in
-the current worktree. Oldest-first admission across ready joins and queued
-tasks is implemented, pending end-to-end fairness validation. Level-three
-delegation stays unavailable behind the unadvertised
+The implementation includes the v48 branch-message grant and manager-wait
+schema, the v49 review-grant column, runtime wait continuation, serialized
+workspace admission, and recovery path. It abandons waits for terminal managers
+and moves dependents with failed or cancelled prerequisites into a blocked
+state. Descendant cascade cancellation and nested permission/worktree paths
+are implemented in the current worktree. Oldest-first admission across ready
+joins and queued tasks is implemented, pending end-to-end fairness validation.
+Level-three delegation stays unavailable behind the unadvertised
 `CreateNestedProjectChild` capability until restart/cap-one, cascade recovery,
 and fairness are validated.
+
+Every request envelope is checked against the supported protocol major before
+dispatch, including capability discovery. `Negotiate` also checks its embedded
+client version. Clients may discover capabilities before explicit negotiation
+only after sending a supported protocol-9 envelope; protocol-8 and older
+clients are rejected before receiving protocol-9 schemas or capability values.
 
 ## Data model
 

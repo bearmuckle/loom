@@ -14223,6 +14223,92 @@ mod tests {
     }
 
     #[test]
+    fn future_database_version_is_rejected_without_schema_changes() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sentinel(value TEXT);
+                 INSERT INTO sentinel(value) VALUES ('keep');
+                 PRAGMA user_version=50;",
+            )
+            .unwrap();
+        let original_journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        drop(connection);
+
+        let store = FilePersistence::open(&path).unwrap();
+        assert_eq!(
+            store.load_feed_header().unwrap_err().code,
+            ErrorCode::MalformedPayload
+        );
+
+        let connection = Connection::open(&path).unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let journal_mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let sentinel: String = connection
+            .query_row("SELECT value FROM sentinel", [], |row| row.get(0))
+            .unwrap();
+        let has_feed_meta: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='feed_session_meta')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 50);
+        assert_eq!(journal_mode, original_journal_mode);
+        assert_eq!(sentinel, "keep");
+        assert!(!has_feed_meta);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn v48_upgrade_adds_review_grant_disabled_for_existing_runs() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE run_runtime_config(
+                    run_id BLOB PRIMARY KEY,
+                    project_delegation_enabled INTEGER NOT NULL DEFAULT 0,
+                    project_messaging_enabled INTEGER NOT NULL DEFAULT 0,
+                    project_branch_messaging_enabled INTEGER NOT NULL DEFAULT 0,
+                    project_inspection_enabled INTEGER NOT NULL DEFAULT 0,
+                    project_child_control_enabled INTEGER NOT NULL DEFAULT 0,
+                    project_worktree_enabled INTEGER NOT NULL DEFAULT 0,
+                    project_integration_enabled INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO run_runtime_config(
+                    run_id, project_delegation_enabled, project_branch_messaging_enabled
+                 ) VALUES (x'01', 1, 1);
+                 PRAGMA user_version=48;",
+            )
+            .unwrap();
+
+        initialize_schema(&connection).unwrap();
+
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let grants: (i64, i64, i64) = connection
+            .query_row(
+                "SELECT project_delegation_enabled, project_branch_messaging_enabled,
+                        project_review_enabled
+                 FROM run_runtime_config WHERE run_id=x'01'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        assert_eq!(grants, (1, 1, 0));
+    }
+
+    #[test]
     fn v42_upgrade_adds_durable_project_message_cursor() {
         let connection = Connection::open_in_memory().unwrap();
         connection

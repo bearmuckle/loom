@@ -202,9 +202,10 @@ the field is absent, so existing stored settings do not need a separate SQLite
 schema migration.
 
 The child-worktree and integration contract advances the protocol to 7.0 and
-the SQLite schema to v47. Protocol 6.x clients are rejected during negotiation
-before capability discovery or any v7 worktree request, response, or event is
-sent; deployments must ensure or force the client upgrade. The implemented
+the SQLite schema to v47. Protocol 6.x request envelopes are rejected before
+dispatch, including capability discovery; `Negotiate` also checks its embedded
+client version. No v7 worktree request, response, or event is sent to those
+clients; deployments must ensure or force the client upgrade. The implemented
 v46-to-v47 migration adds durable worktree ownership, base/result, integration,
 conflict, and cleanup state, plus default-disabled per-run code-worktree and
 integration grants. A backend that only supports v46 cannot open a database
@@ -225,8 +226,10 @@ durable state for managers waiting on their descendants. Protocol 8.0 and
 schema v48 introduced branch messaging and durable manager waits. The review
 run grant was added after that milestone reached the draft branch, so the
 current contract is protocol 9.0 and schema v49; protocol 8.x clients must
-upgrade before negotiation succeeds, and v48-only backends must reject v49
-databases. The v47-to-v48 and v48-to-v49 migrations are forward-only, with
+upgrade before negotiation succeeds, and request envelopes must use the
+supported protocol major before any dispatch, including capability discovery.
+V48-only backends must reject v49 databases. The v47-to-v48 and v48-to-v49
+migrations are forward-only, with
 every newly introduced grant disabled for existing tasks and runs. Do not
 infer branch messaging from the existing direct-message grant. Agent-attributed
 messages must be submitted by the server-bound agent tool; a client-supplied
@@ -288,10 +291,11 @@ and its decision.
    shared domain types; enforce the core hierarchy invariants.
 2. **Implemented:** add the forward v41-to-v46 migrations and represent
    existing sessions as project roots.
-3. **Implemented:** advance to protocol 6.0 and reject clients that do not
-   meet the supported protocol version during negotiation, before serving
-   project-aware schemas. Deployments must ensure or force client upgrades;
-   old-client forward compatibility is not supported.
+3. **Implemented:** advance to protocol 6.0 and reject request envelopes with
+   an unsupported protocol major before dispatch. `Negotiate` also rejects an
+   incompatible embedded client version before returning project-aware
+   schemas. Deployments must ensure or force client upgrades; old-client
+   forward compatibility is not supported.
 4. **Implemented:** recover committed-but-not-launched queued children,
    reconcile delegated-task status from persisted child runs, and schedule
    tasks when dependencies complete. Existing run recovery keeps interrupted

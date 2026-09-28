@@ -1855,7 +1855,7 @@ fn project_child_control_label(action: ProjectChildControlAction) -> &'static st
         ProjectChildControlAction::RetryFailedStep => "Retry failed step",
         ProjectChildControlAction::Pause => "Pause child",
         ProjectChildControlAction::Interrupt => "Interrupt child",
-        ProjectChildControlAction::Cancel => "Cancel child task",
+        ProjectChildControlAction::Cancel => "Cancel child and descendants",
     }
 }
 
@@ -3816,6 +3816,67 @@ impl LoomView {
     }
 
     fn integrate_project_child_from_ui(
+        &mut self,
+        manager_session_id: AgentSessionId,
+        project_id: loom_core::ProjectId,
+        task_id: loom_core::TaskId,
+        expected_parent_revision: String,
+        expected_child_revision: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.dispatch(
+            cx,
+            ClientRequest::GetProjectChildReview {
+                project_id,
+                manager_session_id,
+                task_id,
+            },
+            move |view, response, cx| match response.result {
+                Ok(ServerResponse::ProjectChildReview { status, .. }) if status.clean
+                    && status.head.as_deref() == Some(expected_child_revision.as_str()) =>
+                {
+                    view.submit_project_child_integration(
+                        manager_session_id,
+                        project_id,
+                        task_id,
+                        expected_parent_revision,
+                        cx,
+                    );
+                }
+                Ok(ServerResponse::ProjectChildReview {
+                    worktree,
+                    status,
+                    diff,
+                }) => {
+                    view.project_child_review =
+                        Some((worktree.clone(), status.clone(), diff.clone()));
+                    view.project_snapshot_stale = true;
+                    view.review.open = true;
+                    view.review.panel = ReviewPanel::Changes;
+                    view.review.selected_file = None;
+                    view.review.selected_path = Some(format!(
+                        "{} · diff from {}",
+                        worktree.branch_name, worktree.base_revision
+                    ));
+                    view.review.selected_staged = false;
+                    view.review.selection_revision = view.review.selection_revision.wrapping_add(1);
+                    view.review.vcs = Some(status);
+                    view.review.show_diff(diff);
+                    view.record_status(
+                        "Child checkout changed since review or has uncommitted edits. Review the current diff before integrating.",
+                    );
+                    view.refresh_active_project_snapshot(cx);
+                }
+                Err(error) => view.record_backend_error("check child review before integration", error),
+                Ok(response) => view.record_backend_error(
+                    "check child review before integration",
+                    unexpected_response("project child review", response),
+                ),
+            },
+        );
+    }
+
+    fn submit_project_child_integration(
         &mut self,
         manager_session_id: AgentSessionId,
         project_id: loom_core::ProjectId,
@@ -8268,7 +8329,7 @@ impl LoomView {
                         && terminal
                         && task.status == loom_core::DelegatedTaskStatus::Completed
                         && worktree.status == loom_core::ProjectWorktreeStatus::Ready
-                        && worktree.result_revision.is_some()
+                        && let Some(expected_child_revision) = worktree.result_revision.clone()
                     {
                         let integrate_view = menu_view.clone();
                         let expected_parent_revision = worktree.base_revision.clone();
@@ -8281,6 +8342,7 @@ impl LoomView {
                                             project_id,
                                             task_id,
                                             expected_parent_revision.clone(),
+                                            expected_child_revision.clone(),
                                             cx,
                                         );
                                     });
