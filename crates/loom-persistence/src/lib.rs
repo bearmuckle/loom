@@ -38,10 +38,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const DATABASE_SCHEMA_VERSION: u32 = 49;
+const DATABASE_SCHEMA_VERSION: u32 = 50;
 const PROJECT_WORKTREE_SCHEMA_VERSION: u32 = 47;
 const PROJECT_CHILD_CONTROL_SCHEMA_VERSION: u32 = 46;
 const PROJECT_MANAGER_WAIT_SCHEMA_VERSION: u32 = 48;
+const PROJECT_CANCELLATION_CASCADE_SCHEMA_VERSION: u32 = 49;
 const PROJECT_SCHEMA_VERSION: u32 = 42;
 const PROJECT_MESSAGE_SCHEMA_VERSION: u32 = 43;
 const PROJECT_DELEGATION_SCHEMA_VERSION: u32 = 44;
@@ -939,6 +940,28 @@ CREATE INDEX IF NOT EXISTS project_manager_wait_children_by_task
     ON project_manager_wait_children(child_task_id, wait_id);
 ";
 
+const PROJECT_CANCELLATION_CASCADE_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS project_cancellation_cascades (
+    project_id BLOB PRIMARY KEY NOT NULL CHECK(length(project_id) = 16),
+    root_task_id BLOB NOT NULL CHECK(length(root_task_id) = 16),
+    manager_session_id BLOB NOT NULL CHECK(length(manager_session_id) = 16),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    FOREIGN KEY(project_id) REFERENCES sessions(id) ON DELETE CASCADE,
+    FOREIGN KEY(root_task_id) REFERENCES delegated_tasks(task_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+CREATE TABLE IF NOT EXISTS project_cancellation_cascade_members (
+    project_id BLOB NOT NULL CHECK(length(project_id) = 16),
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    task_id BLOB NOT NULL CHECK(length(task_id) = 16),
+    target_session_id BLOB NOT NULL CHECK(length(target_session_id) = 16),
+    PRIMARY KEY(project_id, ordinal),
+    UNIQUE(project_id, task_id),
+    UNIQUE(project_id, target_session_id),
+    FOREIGN KEY(project_id) REFERENCES project_cancellation_cascades(project_id) ON DELETE CASCADE,
+    FOREIGN KEY(task_id) REFERENCES delegated_tasks(task_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
+";
+
 fn decode_content_blob(connection: &Connection, hash: &[u8]) -> Result<Vec<u8>> {
     let (raw_size, codec, payload): (i64, i64, Vec<u8>) = connection
         .query_row(
@@ -1275,6 +1298,18 @@ pub struct DurableRunRuntimeConfig {
 pub struct DurableRunContextCheckpoint {
     pub session_id: AgentSessionId,
     pub summary: ContextSummary,
+}
+
+/// Durable intent for an in-progress deepest-first project cancellation.
+/// `members` preserves the exact task/session snapshot captured before any
+/// member was changed so restart recovery can safely replay the operation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectCancellationCascadeRecord {
+    pub project_id: ProjectId,
+    pub root_task_id: TaskId,
+    pub manager_session_id: AgentSessionId,
+    pub members: Vec<(TaskId, AgentSessionId)>,
+    pub created_at: Timestamp,
 }
 
 /// Persisted inputs used to hydrate the latest run during a session bootstrap.
@@ -2090,6 +2125,198 @@ impl FilePersistence {
         }
         let connection = self.connection()?;
         load_project_worktree(&connection, task_id.as_uuid())
+    }
+
+    /// Persists an ordered cancellation snapshot before its run/task members
+    /// are changed. Repeating the same operation is idempotent.
+    pub fn begin_project_cancellation_cascade(
+        &self,
+        cascade: &ProjectCancellationCascadeRecord,
+    ) -> Result<ProjectCancellationCascadeRecord> {
+        validate_project_cancellation_cascade(cascade)?;
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin project cancellation cascade: {error}"),
+                true,
+            )
+        })?;
+        let existing = load_project_cancellation_cascade(&transaction, cascade.project_id)?;
+        if let Some(existing) = existing {
+            if existing.root_task_id != cascade.root_task_id
+                || existing.manager_session_id != cascade.manager_session_id
+                || existing.members != cascade.members
+            {
+                return Err(LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    "another project cancellation cascade is pending recovery",
+                    true,
+                ));
+            }
+            transaction.commit().map_err(|error| {
+                persistence_error(
+                    format!("could not finish project cancellation lookup: {error}"),
+                    true,
+                )
+            })?;
+            return Ok(existing);
+        }
+        transaction
+            .execute(
+                "INSERT INTO project_cancellation_cascades(
+                    project_id, root_task_id, manager_session_id, created_at
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    cascade.project_id.as_uuid().as_bytes().as_slice(),
+                    cascade.root_task_id.as_uuid().as_bytes().as_slice(),
+                    cascade.manager_session_id.as_uuid().as_bytes().as_slice(),
+                    encode_timestamp(cascade.created_at)?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not persist project cancellation intent: {error}"),
+                    true,
+                )
+            })?;
+        for (ordinal, (task_id, session_id)) in cascade.members.iter().enumerate() {
+            transaction
+                .execute(
+                    "INSERT INTO project_cancellation_cascade_members(
+                        project_id, ordinal, task_id, target_session_id
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        cascade.project_id.as_uuid().as_bytes().as_slice(),
+                        i64::try_from(ordinal).map_err(|_| {
+                            LoomError::invalid_request("too many cancellation cascade members")
+                        })?,
+                        task_id.as_uuid().as_bytes().as_slice(),
+                        session_id.as_uuid().as_bytes().as_slice(),
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not persist project cancellation member: {error}"),
+                        true,
+                    )
+                })?;
+        }
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit project cancellation intent: {error}"),
+                true,
+            )
+        })?;
+        Ok(cascade.clone())
+    }
+
+    /// Returns durable cascades which must finish before their project can
+    /// admit more work.
+    pub fn list_pending_project_cancellation_cascades(
+        &self,
+    ) -> Result<Vec<ProjectCancellationCascadeRecord>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT project_id FROM project_cancellation_cascades
+                 ORDER BY created_at, project_id",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare pending project cancellations: {error}"),
+                    true,
+                )
+            })?;
+        let project_ids = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not read pending project cancellations: {error}"),
+                    true,
+                )
+            })?
+            .map(|row| {
+                row.map_err(|error| {
+                    persistence_error(
+                        format!("could not read pending project cancellation ID: {error}"),
+                        true,
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        drop(statement);
+        project_ids
+            .iter()
+            .map(|bytes| {
+                let project_id = ProjectId::from_uuid(decode_uuid(bytes, "project ID")?);
+                load_project_cancellation_cascade(&connection, project_id)?.ok_or_else(|| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "pending project cancellation index is inconsistent",
+                        false,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub fn has_pending_project_cancellation_cascade(&self, project_id: ProjectId) -> Result<bool> {
+        if !self.path.exists() {
+            return Ok(false);
+        }
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM project_cancellation_cascades WHERE project_id=?1)",
+                [project_id.as_uuid().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect pending project cancellation: {error}"),
+                    true,
+                )
+            })
+    }
+
+    /// Removes a cascade marker only after every member has been reconciled.
+    pub fn complete_project_cancellation_cascade(
+        &self,
+        project_id: ProjectId,
+        root_task_id: TaskId,
+    ) -> Result<bool> {
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin project cancellation completion: {error}"),
+                true,
+            )
+        })?;
+        let changed = transaction
+            .execute(
+                "DELETE FROM project_cancellation_cascades
+                 WHERE project_id=?1 AND root_task_id=?2",
+                params![
+                    project_id.as_uuid().as_bytes().as_slice(),
+                    root_task_id.as_uuid().as_bytes().as_slice(),
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not complete project cancellation: {error}"),
+                    true,
+                )
+            })?;
+        transaction.commit().map_err(|error| {
+            persistence_error(
+                format!("could not commit project cancellation completion: {error}"),
+                true,
+            )
+        })?;
+        Ok(changed > 0)
     }
 
     /// Creates a parked manager wait with its ordered child selection. Reusing
@@ -6674,6 +6901,9 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     if database_version == DATABASE_SCHEMA_VERSION {
         return Ok(());
     }
+    if database_version == PROJECT_CANCELLATION_CASCADE_SCHEMA_VERSION {
+        return migrate_v49_to_v50(connection);
+    }
     if database_version == 41 {
         migrate_v41_to_v42(connection)?;
         migrate_v42_to_v43(connection)?;
@@ -6681,7 +6911,7 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v49(connection);
+        return migrate_v47_to_v50(connection);
     }
     if database_version == PROJECT_SCHEMA_VERSION {
         migrate_v42_to_v43(connection)?;
@@ -6689,35 +6919,36 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v49(connection);
+        return migrate_v47_to_v50(connection);
     }
     if database_version == PROJECT_MESSAGE_SCHEMA_VERSION {
         migrate_v43_to_v44(connection)?;
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v49(connection);
+        return migrate_v47_to_v50(connection);
     }
     if database_version == PROJECT_DELEGATION_SCHEMA_VERSION {
         migrate_v44_to_v45(connection)?;
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v49(connection);
+        return migrate_v47_to_v50(connection);
     }
     if database_version == PROJECT_COORDINATION_SCHEMA_VERSION {
         migrate_v45_to_v46(connection)?;
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v49(connection);
+        return migrate_v47_to_v50(connection);
     }
     if database_version == PROJECT_CHILD_CONTROL_SCHEMA_VERSION {
         migrate_v46_to_v47(connection)?;
-        return migrate_v47_to_v49(connection);
+        return migrate_v47_to_v50(connection);
     }
     if database_version == PROJECT_WORKTREE_SCHEMA_VERSION {
-        return migrate_v47_to_v49(connection);
+        return migrate_v47_to_v50(connection);
     }
     if database_version == PROJECT_MANAGER_WAIT_SCHEMA_VERSION {
-        return migrate_v48_to_v49(connection);
+        migrate_v48_to_v49(connection)?;
+        return migrate_v49_to_v50(connection);
     }
     if database_version != 0 {
         return Err(LoomError::new(
@@ -6809,6 +7040,14 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
+        .execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project cancellation recovery schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
         .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
         .map_err(|error| {
             persistence_error(
@@ -6825,9 +7064,10 @@ fn initialize_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate_v47_to_v49(connection: &Connection) -> Result<()> {
+fn migrate_v47_to_v50(connection: &Connection) -> Result<()> {
     migrate_v47_to_v48(connection)?;
-    migrate_v48_to_v49(connection)
+    migrate_v48_to_v49(connection)?;
+    migrate_v49_to_v50(connection)
 }
 
 fn migrate_v48_to_v49(connection: &Connection) -> Result<()> {
@@ -6850,7 +7090,11 @@ fn migrate_v48_to_v49(connection: &Connection) -> Result<()> {
             )
         })?;
     transaction
-        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .pragma_update(
+            None,
+            "user_version",
+            PROJECT_CANCELLATION_CASCADE_SCHEMA_VERSION,
+        )
         .map_err(|error| {
             persistence_error(
                 format!("could not record project review-grant schema version: {error}"),
@@ -6860,6 +7104,38 @@ fn migrate_v48_to_v49(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(|error| {
         persistence_error(
             format!("could not commit project review-grant migration: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
+fn migrate_v49_to_v50(connection: &Connection) -> Result<()> {
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not begin project cancellation recovery migration: {error}"),
+            true,
+        )
+    })?;
+    transaction
+        .execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project cancellation recovery schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record project cancellation recovery schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit project cancellation recovery migration: {error}"),
             true,
         )
     })?;
@@ -7451,6 +7727,108 @@ fn load_project_worktree(
         created_at: decode_timestamp(created_at)?,
         updated_at: decode_timestamp(updated_at)?,
     }))
+}
+
+fn validate_project_cancellation_cascade(cascade: &ProjectCancellationCascadeRecord) -> Result<()> {
+    let unique_tasks = cascade
+        .members
+        .iter()
+        .map(|(task_id, _)| *task_id)
+        .collect::<BTreeSet<_>>();
+    let unique_sessions = cascade
+        .members
+        .iter()
+        .map(|(_, session_id)| *session_id)
+        .collect::<BTreeSet<_>>();
+    if cascade.members.is_empty()
+        || cascade.members.len() > MAX_PROJECT_MANAGER_WAIT_CHILDREN
+        || unique_tasks.len() != cascade.members.len()
+        || unique_sessions.len() != cascade.members.len()
+        || cascade.members.last().map(|(task_id, _)| *task_id) != Some(cascade.root_task_id)
+    {
+        return Err(LoomError::invalid_request(
+            "project cancellation cascade must contain a unique ordered subtree ending with its root task",
+        ));
+    }
+    Ok(())
+}
+
+fn load_project_cancellation_cascade(
+    connection: &Connection,
+    project_id: ProjectId,
+) -> Result<Option<ProjectCancellationCascadeRecord>> {
+    let Some((root_task_id, manager_session_id, created_at)) = connection
+        .query_row(
+            "SELECT root_task_id, manager_session_id, created_at
+             FROM project_cancellation_cascades WHERE project_id=?1",
+            [project_id.as_uuid().as_bytes().as_slice()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read project cancellation intent: {error}"),
+                true,
+            )
+        })?
+    else {
+        return Ok(None);
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT task_id, target_session_id FROM project_cancellation_cascade_members
+             WHERE project_id=?1 ORDER BY ordinal",
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prepare project cancellation members: {error}"),
+                true,
+            )
+        })?;
+    let members = statement
+        .query_map([project_id.as_uuid().as_bytes().as_slice()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|error| {
+            persistence_error(
+                format!("could not read project cancellation members: {error}"),
+                true,
+            )
+        })?
+        .map(|row| {
+            let (task_id, session_id) = row.map_err(|error| {
+                persistence_error(
+                    format!("could not read project cancellation member: {error}"),
+                    true,
+                )
+            })?;
+            Ok((
+                TaskId::from_uuid(decode_uuid(&task_id, "cancellation task ID")?),
+                AgentSessionId::from_uuid(decode_uuid(
+                    &session_id,
+                    "cancellation target session ID",
+                )?),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let cascade = ProjectCancellationCascadeRecord {
+        project_id,
+        root_task_id: TaskId::from_uuid(decode_uuid(&root_task_id, "cancellation root task ID")?),
+        manager_session_id: AgentSessionId::from_uuid(decode_uuid(
+            &manager_session_id,
+            "cancellation manager session ID",
+        )?),
+        members,
+        created_at: decode_timestamp(created_at)?,
+    };
+    validate_project_cancellation_cascade(&cascade)?;
+    Ok(Some(cascade))
 }
 
 fn validate_project_manager_wait_create(wait: &ProjectManagerWaitRecord) -> Result<()> {
@@ -14264,7 +14642,7 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE sentinel(value TEXT);
                  INSERT INTO sentinel(value) VALUES ('keep');
-                 PRAGMA user_version=50;",
+                 PRAGMA user_version=51;",
             )
             .unwrap();
         let original_journal_mode: String = connection
@@ -14295,7 +14673,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
         assert_eq!(journal_mode, original_journal_mode);
         assert_eq!(sentinel, "keep");
         assert!(!has_feed_meta);
@@ -14338,8 +14716,20 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
+        let has_cascade_tables: bool = connection
+            .query_row(
+                "SELECT COUNT(*)=2 FROM sqlite_master
+                 WHERE type='table' AND name IN (
+                    'project_cancellation_cascades',
+                    'project_cancellation_cascade_members'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(version, DATABASE_SCHEMA_VERSION);
         assert_eq!(grants, (1, 1, 0));
+        assert!(has_cascade_tables);
     }
 
     #[test]
@@ -15133,6 +15523,114 @@ mod tests {
             persistence
                 .accept_agent_message(message_request, &mismatch)
                 .is_err()
+        );
+        drop(persistence);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn project_cancellation_cascade_intent_is_ordered_idempotent_and_removable() {
+        let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+        let persistence = FilePersistence::open(&path).unwrap();
+        let mut manager = SessionManager::default();
+        let (root, _) = manager
+            .create_in_workspace(WorkspaceId::new(), "Project manager")
+            .unwrap();
+        persistence
+            .save_state_with_sessions(&manager.export_state())
+            .unwrap();
+        let child_id = AgentSessionId::new();
+        let child_snapshot = AgentSessionSnapshot {
+            id: child_id,
+            workspace_id: root.workspace_id,
+            name: "Research agent".to_owned(),
+            state: AgentSessionState::Idle,
+            created_at: Timestamp::now(),
+            updated_at: Timestamp::now(),
+        };
+        let task = DelegatedTaskRecord {
+            task_id: TaskId::new(),
+            project_id: ProjectId::from_uuid(*root.id.as_uuid()),
+            requester_session_id: root.id,
+            target_session_id: child_id,
+            child_name: child_snapshot.name.clone(),
+            intent: "Inspect the relevant module".to_owned(),
+            model_id: "deterministic/demo".to_owned(),
+            context_references: Vec::new(),
+            dependencies: Vec::new(),
+            code_change: false,
+            permissions: ProjectAgentPermissions::default(),
+            status: DelegatedTaskStatus::Queued,
+            created_at: child_snapshot.created_at,
+            updated_at: child_snapshot.updated_at,
+        };
+        persistence
+            .create_project_child(
+                RequestId::new(),
+                &child_snapshot,
+                manager.export_state().next_sequence,
+                &task,
+            )
+            .unwrap();
+        let cascade = ProjectCancellationCascadeRecord {
+            project_id: task.project_id,
+            root_task_id: task.task_id,
+            manager_session_id: root.id,
+            members: vec![(task.task_id, child_id)],
+            created_at: Timestamp::now(),
+        };
+        assert_eq!(
+            persistence
+                .begin_project_cancellation_cascade(&cascade)
+                .unwrap(),
+            cascade
+        );
+        assert!(
+            persistence
+                .has_pending_project_cancellation_cascade(task.project_id)
+                .unwrap()
+        );
+        assert_eq!(
+            persistence
+                .list_pending_project_cancellation_cascades()
+                .unwrap(),
+            vec![cascade.clone()]
+        );
+        assert_eq!(
+            persistence
+                .begin_project_cancellation_cascade(&cascade)
+                .unwrap(),
+            cascade
+        );
+        let invalid = ProjectCancellationCascadeRecord {
+            members: Vec::new(),
+            ..cascade.clone()
+        };
+        assert!(
+            persistence
+                .begin_project_cancellation_cascade(&invalid)
+                .is_err()
+        );
+        assert!(
+            persistence
+                .complete_project_cancellation_cascade(task.project_id, task.task_id)
+                .unwrap()
+        );
+        assert!(
+            !persistence
+                .has_pending_project_cancellation_cascade(task.project_id)
+                .unwrap()
+        );
+        assert!(
+            persistence
+                .list_pending_project_cancellation_cascades()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !persistence
+                .complete_project_cancellation_cascade(task.project_id, task.task_id)
+                .unwrap()
         );
         drop(persistence);
         fs::remove_file(path).unwrap();

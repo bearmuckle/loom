@@ -193,7 +193,8 @@ manager wait/join records. Since protocol 8/schema v48 is already on the draft
 branch, the independent per-run review grant advances the contract to protocol
 9.0 and schema v49 through a forward v48-to-v49 migration. Protocol 10.0
 removes the raw client child-creation request so only the run-granted manager
-tool can create children; it uses the same schema v49. Protocol 9.x and 8.x
+tool can create children. Schema v50 adds durable cancellation-cascade
+recovery through a forward v49-to-v50 migration. Protocol 9.x and 8.x
 clients must upgrade. The server-bound tool path supports explicitly
 granted branch messages and rejects client-supplied agent identities. The
 draft also parks and resumes manager continuations, blocks premature manager
@@ -206,12 +207,9 @@ current worktree. Focused end-to-end tests validate parked-wait recovery across
 restart, cap-one wait/join, deepest-first cancellation with persisted terminal
 state, oldest-first admission across joins and queued tasks, nested worktree
 integration across both parent edges, and explicitly granted non-adjacent
-branch messaging. Failed-run prerequisite wakeup and interruption recovery
-during a cascade remain to be validated. A restart repairs committed run/task
-changes but does not resume a partially completed cascade; untouched queued
-descendants may be admitted. Depth-three delegation is held behind the
-unadvertised `CreateNestedProjectChild` capability until durable cascade
-recovery is addressed.
+branch messaging, failed-run prerequisite wakeup, and restart recovery after
+an interrupted cancellation cascade. Startup replays the durable ordered
+cascade intent before admission. Depth-three delegation is enabled.
 
 The backend rejects delegation beyond three levels from the beginning, even
 while the first client only exposes direct children. Non-code delegation ships
@@ -219,24 +217,24 @@ before code worktrees; no fixed plan-to-issues-to-build pipeline is required.
 Each slice's exit conditions and verification cases are defined in the design
 document.
 
-The v41-to-v49 database transition is forward-only. Backend downgrades are
+The v41-to-v50 database transition is forward-only. Backend downgrades are
 unsupported.
 Old-client forward compatibility is not supported: deployments must ensure
 or force clients to upgrade, and the backend rejects clients outside the
 supported protocol version during negotiation with the existing
 `UnsupportedProtocol` response before sending project schemas. Slices 0–3
 initially used protocol 7.0/schema v47 for child worktrees; the current M7.4
-contract requires protocol 10.0/schema v49.
+contract requires protocol 10.0/schema v50.
 
 M7.4 uses protocol 8.0/schema v48 for separately authorized branch messaging
 and durable manager wait state, then protocol 9.0/schema v49 for the independent
-review-run grant. The current protocol 10.0 contract makes child creation
-available only through the run-granted manager tool. Protocol 9.x and older
-clients must upgrade before the backend serves the current contract. The
-v47-to-v48 and v48-to-v49 migrations are forward-only;
-v48-only backends cannot open the upgraded database, and backend downgrades are
-unsupported. Deployments may ensure or force client upgrades; old-client
-forward compatibility is not supported.
+review-run grant. Protocol 10.0 makes child creation available only through
+the run-granted manager tool. Schema v50 stores recoverable cancellation
+cascades. Protocol 9.x and older clients must upgrade before the backend serves
+the current contract. The v47-to-v48, v48-to-v49, and v49-to-v50 migrations are
+forward-only; v49-only backends cannot open the upgraded database, and backend
+downgrades are unsupported. Deployments may ensure or force client upgrades;
+old-client forward compatibility is not supported.
 
 ## Quality bar
 

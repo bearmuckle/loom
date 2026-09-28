@@ -15,7 +15,8 @@ grant now uses protocol 9.0 and schema v49, with a forward v48-to-v49 migration.
 The current draft advances to protocol 10.0 to make child creation manager-only:
 clients cannot create children directly; the server-bound manager tool checks
 the executing run's persisted delegation grants. This protocol change does not
-add a storage migration.
+add a storage migration. Separately, interruption-safe cancellation recovery
+adds the forward v49-to-v50 storage migration without changing protocol 10.0.
 The draft also parks a manager at a safe checkpoint, releases its workspace
 slot, resumes the original tool continuation once selected children are ready,
 blocks premature manager completion, and admits queued work under a workspace-wide
@@ -31,17 +32,16 @@ restart with exactly-once replay, cap-one and oldest-first admission, deepest-
 first cancellation with terminal state persistence, both nested worktree
 integration edges, and explicitly granted non-adjacent branch messaging.
 Failed-run prerequisite wakeup and recovery from interruption during a cascade
-remain to be validated. A process restart repairs each committed run/task
-transition, but it does not automatically resume a partially completed
-cascade; queued descendants left untouched may be admitted. Depth-three
-delegation stays closed behind the unadvertised `CreateNestedProjectChild`
-server capability until durable interruption recovery is addressed.
+are also covered. Cascade intent and its ordered subtree snapshot are persisted
+in schema v50 and replayed after runtime restoration but before queued-work
+reconciliation. Depth-three delegation is enabled after these recovery paths
+were validated.
 Deployments must ensure or force clients to upgrade:
 the backend rejects clients that do not negotiate protocol 10.0 before serving
 the new contract. Old-client forward compatibility and backend/schema
 downgrades are unsupported.
 
-The existing implementation also includes forward v41-to-v49 SQLite
+The existing implementation also includes forward v41-to-v50 SQLite
 migrations, durable child/task creation, persisted child model selection,
 restart scheduling for queued children, dependency gating, task-state
 reconciliation, and durable parent-child message delivery at safe model-turn
@@ -239,14 +239,14 @@ child-control, review, and integration grants to delegated-task intent, plus
 durable state for managers waiting on their descendants. Protocol 8.0 and
 schema v48 introduced branch messaging and durable manager waits. The review
 run grant was added after that milestone reached the draft branch, so protocol
-9.0 used schema v49. The current contract is protocol 10.0/schema v49;
+9.0 used schema v49. The current contract is protocol 10.0/schema v50;
 protocol 9.x and 8.x clients must
 upgrade before negotiation succeeds, and request envelopes must use the
 supported protocol major before any dispatch, including capability discovery.
 Protocol 10 removes the client child-creation request. Deployments must ensure
 or force protocol-10 clients after upgrading from protocol 9.
-V48-only backends must reject v49 databases. The v47-to-v48 and v48-to-v49
-migrations are forward-only, with
+Backends that only support schema v49 must reject schema v50 databases. The
+v47-to-v48, v48-to-v49, and v49-to-v50 migrations are forward-only, with
 every newly introduced grant disabled for existing tasks and runs. Do not
 infer branch messaging from the existing direct-message grant. Agent-attributed
 messages must be submitted by the server-bound agent tool; a client-supplied
@@ -422,7 +422,8 @@ later design step.
 ### Slice 4: deeper hierarchy and branch communication
 
 **Implementation status:** protocol 10.0, forward v47-to-v48 grant and
-wait-state migration plus v48-to-v49 review-run grant migration, sender
+wait-state migration, v48-to-v49 review-run grant migration, and v49-to-v50
+cancellation-recovery migration, sender
 binding, recipient discovery, explicitly granted branch-message routes,
 durable manager wait/join, workspace-wide admission, manager completion guards,
 descendant cascade cancellation, nested permission and parent-relative
@@ -432,10 +433,9 @@ current worktree. Focused end-to-end tests now cover cap-one wait/join fairness,
 oldest-first admission across ready joins and queued tasks, parked-wait recovery
 across restart with exactly-once resumption, deepest-first descendant
 cancellation with terminal state persistence, parent-relative integration
-through both nested worktree edges, and explicitly granted non-adjacent branch
-messaging. Depth-three delegation remains closed behind
-`CreateNestedProjectChild` until failed-prerequisite wakeup and interruption
-recovery during cascade cancellation are validated.
+through both nested worktree edges, explicitly granted non-adjacent branch
+messaging, failed-prerequisite wakeup, and interruption recovery during cascade
+cancellation. Depth-three delegation is enabled.
 
 1. Persist an explicit, independent child permission set with each delegated
    task. A depth-two agent may create depth-three tasks only when its run has
@@ -467,20 +467,18 @@ recovery during cascade cancellation are validated.
    consuming capacity. A focused test verifies a ready older join is admitted
    before a newer queued root sibling at cap one. Failed or cancelled
    prerequisites move dependents to blocked and make them return-ready to a
-   waiting manager. A focused E2E validates the cancelled-prerequisite path;
-   separately validate a failed-run prerequisite.
+   waiting manager. Focused E2Es validate both cancelled- and failed-
+   prerequisite paths and exactly-once manager-wait resumption.
 5. **Implemented; deepest-first cancellation end-to-end validated:** keep
    manager control scoped to direct children.
    Cancelling a child now cancels or interrupts its descendants deepest-first;
    pausing or interrupting a manager run remains local. Recursive branch rows
    now show durable task status separately from the child session/run state.
-   Owner-edge controls are implemented. A cancellation E2E verifies deepest-first
-   events and terminal task/run state after backend reopen; interruption during
-   an in-progress cascade still needs validation. Cancellation is persisted
-   through separate run/task updates without a durable cascade marker, so a
-   restart can admit queued descendants left untouched by the interrupted
-   operation; do not enable nested delegation until restart handling is
-   addressed.
+   Owner-edge controls are implemented. A durable v50 cascade marker stores
+   the captured post-order task/session list before any member changes. Startup
+   replays each member idempotently before admission; scheduling and new child
+   creation are fenced while an intent is pending. An interruption E2E verifies
+   partial cancellation finishes after restart.
 6. **Implemented and end-to-end validated:** preserve upward code
    ownership: a depth-two agent reviews and integrates a
    depth-three commit into its own branch before returning, then the project
@@ -488,21 +486,22 @@ recovery during cascade cancellation are validated.
    review of the exact child `HEAD` at each edge; retain stale or diverged
    work for explicit recovery. The nested worktree E2E confirms each parent's
    `HEAD` advances to the same descendant commit only after review.
-7. **Implemented, pending end-to-end validation:** project sessions render
-   recursively, nest under their persisted parent, and reveal their owner chain
-   when selected. Controls, review, and integration actions are gated by the
-   owning parent's grants and target its direct child edge. Integration is
-   offered after a review result exists. The root activity timeline merges
-   successful descendant inbox reads even when another recipient read fails.
+7. **Implemented; nested projection and control-state tests added:** project
+   sessions render recursively, nest under their persisted parent, and reveal
+   their owner chain when selected. Controls, review, and integration actions
+   are gated by the owning parent's grants and target its direct child edge.
+   Integration is offered after a review result exists. The root activity
+   timeline merges successful descendant inbox reads even when another
+   recipient read fails. A full GPUI click-through smoke test remains the last
+   UI validation item.
 
 **Exit:** three-level projects coordinate safely, recover after restart, keep
 workspace concurrency bounded, preserve explicit grants, deliver branch
 messages only across authorized routes, and integrate code upward at every
 parent boundary. Restart and cap-one wait/join recovery, deepest-first
-cancellation, oldest-first admission, nested worktree integration, and
-explicitly granted non-adjacent branch messaging are validated. This slice
-remains incomplete until failed-run prerequisite wakeup and durable recovery
-from interruption during cascade cancellation pass end-to-end validation.
+cancellation and its interruption recovery, both prerequisite outcomes,
+oldest-first admission, nested worktree integration, and explicitly granted
+non-adjacent branch messaging are validated.
 
 ## Verification and rollout
 

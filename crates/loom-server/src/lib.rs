@@ -29,6 +29,7 @@ use loom_persistence::{
     DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
     DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
     DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
+    ProjectCancellationCascadeRecord,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -1902,6 +1903,8 @@ pub struct InProcessBackend {
     state_persist_gate: Mutex<()>,
     #[cfg(test)]
     fail_next_state_save: AtomicBool,
+    #[cfg(test)]
+    project_cancellation_failpoint: AtomicUsize,
 }
 
 #[derive(Deserialize)]
@@ -3256,6 +3259,7 @@ impl InProcessBackend {
                 Capability::ReadProjectChildReview,
                 Capability::IntegrateProjectChild,
                 Capability::CleanupProjectChildWorktree,
+                Capability::CreateNestedProjectChild,
             ]);
         }
         let backend = Arc::new(Self {
@@ -3297,6 +3301,8 @@ impl InProcessBackend {
             state_persist_gate: Mutex::new(()),
             #[cfg(test)]
             fail_next_state_save: AtomicBool::new(false),
+            #[cfg(test)]
+            project_cancellation_failpoint: AtomicUsize::new(0),
         });
         *backend
             .self_reference
@@ -4104,6 +4110,10 @@ impl InProcessBackend {
             persistence.save_recovery_updates(&recovery_updates, &feed)?;
             journal.pending_events.clear();
         }
+        // Finish durable cascade intents before the scheduler can reconcile or
+        // admit any queued project work after restart.
+        self.connect()
+            .recover_pending_project_cancellation_cascades()?;
         self.reconcile_project_tasks_and_resume_queued(true)?;
         let lazy_filesystem_count = self.persisted_session_filesystems()?.len();
         log::info!(
@@ -8357,6 +8367,13 @@ impl InProcessConnection {
                 true,
             )
         })?;
+        if persistence.has_pending_project_cancellation_cascade(project_id)? {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "project child creation is paused until its pending cancellation cascade is recovered",
+                true,
+            ));
+        }
         let parent_snapshot = self.backend.sessions()?.get(parent_session_id)?;
         let workspace_admission = self
             .backend
@@ -8943,6 +8960,41 @@ impl InProcessConnection {
                 // traversal also guards against malformed cycles and duplicates.
                 let cancellation_order =
                     project_subtree_deepest_first(&project, task.target_session_id);
+                let cascade = ProjectCancellationCascadeRecord {
+                    project_id,
+                    root_task_id: task.task_id,
+                    manager_session_id,
+                    members: cancellation_order
+                        .iter()
+                        .map(|session_id| {
+                            persistence
+                                .load_delegated_task_for_target(*session_id)?
+                                .map(|task| (task.task_id, *session_id))
+                                .ok_or_else(|| {
+                                    LoomError::new(
+                                        ErrorCode::RecoveryRequired,
+                                        "project cancellation member has no delegated task",
+                                        false,
+                                    )
+                                })
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                    created_at: Timestamp::now(),
+                };
+                let cascade = persistence.begin_project_cancellation_cascade(&cascade)?;
+                #[cfg(test)]
+                if self
+                    .backend
+                    .project_cancellation_failpoint
+                    .compare_exchange(usize::MAX, 0, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    return Err(LoomError::new(
+                        ErrorCode::RecoveryRequired,
+                        "test interruption after persisting project cancellation intent",
+                        true,
+                    ));
+                }
                 let workspace_id = self
                     .backend
                     .sessions()?
@@ -9055,14 +9107,13 @@ impl InProcessConnection {
                                 };
                                 descendant_run = Some(stopped);
                                 if let Some(descendant_task) = descendant_task.as_mut()
-                                    && descendant_run
-                                        .as_ref()
-                                        .is_some_and(|run| run.state == AgentRunState::Cancelled)
+                                    && let Some(run) = descendant_run.as_ref()
+                                    && is_terminal_agent_run_state(run.state)
                                 {
                                     self.set_project_task_status(
                                         persistence,
                                         descendant_task,
-                                        loom_core::DelegatedTaskStatus::Cancelled,
+                                        delegated_task_status_for_run_state(run.state),
                                     )?;
                                 }
                             }
@@ -9091,11 +9142,46 @@ impl InProcessConnection {
                             .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
                         run = descendant_run;
                     }
+
+                    #[cfg(test)]
+                    if self
+                        .backend
+                        .project_cancellation_failpoint
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                            if remaining > 0 {
+                                Some(remaining - 1)
+                            } else {
+                                None
+                            }
+                        })
+                        .is_ok_and(|remaining| remaining == 1)
+                    {
+                        return Err(LoomError::new(
+                            ErrorCode::RecoveryRequired,
+                            "test interruption after a durable project cancellation member update",
+                            true,
+                        ));
+                    }
                 }
 
                 // Queued direct children can become terminal without a run
                 // checkpoint, so reconcile joins and newly unblocked work once
                 // the complete subtree has been updated.
+                self.backend
+                    .reconcile_project_tasks_and_resume_queued(false)?;
+                self.backend.persist_state()?;
+                if !persistence.complete_project_cancellation_cascade(
+                    cascade.project_id,
+                    cascade.root_task_id,
+                )? {
+                    return Err(LoomError::new(
+                        ErrorCode::RecoveryRequired,
+                        "project cancellation intent disappeared before completion",
+                        true,
+                    ));
+                }
+                // The first reconciliation was fenced by the pending intent so
+                // callbacks could not admit work from this project mid-cascade.
                 self.backend
                     .reconcile_project_tasks_and_resume_queued(false)?;
             }
@@ -9104,6 +9190,166 @@ impl InProcessConnection {
             .load_delegated_task(task_id)?
             .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
         Ok((task, run))
+    }
+
+    fn recover_pending_project_cancellation_cascades(&self) -> Result<()> {
+        let Some(persistence) = self.backend.persistence.as_ref() else {
+            return Ok(());
+        };
+        for cascade in persistence.list_pending_project_cancellation_cascades()? {
+            self.apply_project_cancellation_cascade(&cascade)?;
+        }
+        Ok(())
+    }
+
+    fn apply_project_cancellation_cascade(
+        &self,
+        cascade: &ProjectCancellationCascadeRecord,
+    ) -> Result<(loom_core::DelegatedTaskRecord, Option<AgentRunSnapshot>)> {
+        let persistence = self.backend.persistence.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::UnsupportedCapability,
+                "project child cancellation requires durable storage",
+                false,
+            )
+        })?;
+        let project_admission = self.backend.project_admission(cascade.project_id)?;
+        let _project_admission_guard = project_admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "project scheduling lock was poisoned",
+                true,
+            )
+        })?;
+        let root_task = persistence
+            .load_delegated_task(cascade.root_task_id)?
+            .ok_or_else(|| LoomError::not_found("delegated task", cascade.root_task_id))?;
+        if root_task.project_id != cascade.project_id
+            || root_task.requester_session_id != cascade.manager_session_id
+        {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "persisted project cancellation identity no longer matches its task",
+                false,
+            ));
+        }
+        let workspace_id = self
+            .backend
+            .sessions()?
+            .get(root_task.target_session_id)?
+            .workspace_id;
+        let workspace_admission = self.backend.workspace_project_admission(workspace_id)?;
+        let workspace_admission_guard = workspace_admission.lock().map_err(|_| {
+            LoomError::new(
+                ErrorCode::Internal,
+                "workspace project scheduling lock was poisoned",
+                true,
+            )
+        })?;
+        let cancellation_sessions = cascade
+            .members
+            .iter()
+            .map(|(_, session_id)| *session_id)
+            .collect::<Vec<_>>();
+        self.abandon_project_manager_waits_owned_by(persistence, &cancellation_sessions)?;
+
+        // Terminalize members with no run before stopping active runs. Their
+        // checkpoint callbacks may synchronously drain workspace admissions.
+        for (task_id, session_id) in &cascade.members {
+            let Some(mut task) = persistence.load_delegated_task(*task_id)? else {
+                return Err(LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    "project cancellation member task is missing",
+                    false,
+                ));
+            };
+            if task.target_session_id != *session_id || task.project_id != cascade.project_id {
+                return Err(LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    "project cancellation member no longer matches its saved snapshot",
+                    false,
+                ));
+            }
+            if !matches!(
+                task.status,
+                loom_core::DelegatedTaskStatus::Completed
+                    | loom_core::DelegatedTaskStatus::Failed
+                    | loom_core::DelegatedTaskStatus::Cancelled
+            ) && persistence
+                .load_latest_run_summary_for_session(*session_id)?
+                .is_none()
+            {
+                self.set_project_task_status(
+                    persistence,
+                    &mut task,
+                    loom_core::DelegatedTaskStatus::Cancelled,
+                )?;
+            }
+        }
+        drop(workspace_admission_guard);
+
+        let mut root_run = None;
+        for (task_id, session_id) in &cascade.members {
+            let mut task = persistence
+                .load_delegated_task(*task_id)?
+                .ok_or_else(|| LoomError::not_found("delegated task", *task_id))?;
+            let latest_run = persistence.load_latest_run_summary_for_session(*session_id)?;
+            let mut run = latest_run
+                .as_ref()
+                .map(|summary| {
+                    self.run_summary(summary.snapshot.id)
+                        .map(|summary| summary.snapshot)
+                })
+                .transpose()?;
+            if let Some(snapshot) = run.clone() {
+                let terminal_status = match snapshot.state {
+                    AgentRunState::Completed => Some(loom_core::DelegatedTaskStatus::Completed),
+                    AgentRunState::Failed => Some(loom_core::DelegatedTaskStatus::Failed),
+                    AgentRunState::Cancelled => Some(loom_core::DelegatedTaskStatus::Cancelled),
+                    _ => None,
+                };
+                if let Some(status) = terminal_status {
+                    self.set_project_task_status(persistence, &mut task, status)?;
+                } else {
+                    let response = self.stop_run(snapshot.id, RunStop::Interrupt)?;
+                    let ServerResponse::AgentRun(stopped) = response else {
+                        return Err(LoomError::new(
+                            ErrorCode::Internal,
+                            "project child cancel returned an unexpected response",
+                            false,
+                        ));
+                    };
+                    run = Some(stopped);
+                    if run
+                        .as_ref()
+                        .is_some_and(|run| run.state == AgentRunState::Cancelled)
+                    {
+                        self.set_project_task_status(
+                            persistence,
+                            &mut task,
+                            loom_core::DelegatedTaskStatus::Cancelled,
+                        )?;
+                    }
+                }
+            }
+            if *task_id == cascade.root_task_id {
+                root_run = run;
+            }
+        }
+        self.backend.persist_state()?;
+        if !persistence
+            .complete_project_cancellation_cascade(cascade.project_id, cascade.root_task_id)?
+        {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "project cancellation intent disappeared before completion",
+                true,
+            ));
+        }
+        let root_task = persistence
+            .load_delegated_task(cascade.root_task_id)?
+            .ok_or_else(|| LoomError::not_found("delegated task", cascade.root_task_id))?;
+        Ok((root_task, root_run))
     }
 
     fn set_project_task_status(
@@ -9886,10 +10132,18 @@ impl InProcessConnection {
         let Some(persistence) = self.backend.persistence.as_ref() else {
             return Ok(());
         };
+        let pending_cancellation_projects = persistence
+            .list_pending_project_cancellation_cascades()?
+            .into_iter()
+            .map(|cascade| cascade.project_id)
+            .collect::<BTreeSet<_>>();
         let mut candidates = self
             .workspace_project_tasks(workspace_id)?
             .into_iter()
-            .filter(|task| task.status == loom_core::DelegatedTaskStatus::Queued)
+            .filter(|task| {
+                task.status == loom_core::DelegatedTaskStatus::Queued
+                    && !pending_cancellation_projects.contains(&task.project_id)
+            })
             .map(|task| {
                 (
                     task.created_at,
@@ -9905,6 +10159,12 @@ impl InProcessConnection {
                 .get(wait.manager_session_id)?
                 .workspace_id
                 != workspace_id
+            {
+                continue;
+            }
+            if persistence
+                .load_project_snapshot_for_session(wait.manager_session_id)?
+                .is_some_and(|project| pending_cancellation_projects.contains(&project.project_id))
             {
                 continue;
             }
@@ -16803,27 +17063,11 @@ mod tests {
         let mut model = ScriptedOpenAiEndpoint::start();
         let model_endpoint = model.endpoint.clone();
         let model_id = ModelId::new("fixture/nested-worktree-integration");
-        let mut backend = InProcessBackend::with_provider_registry_persistent(
+        let backend = InProcessBackend::with_provider_registry_persistent(
             scripted_project_provider_registry(&model_endpoint, model_id.clone()),
             &persistence_path,
         )
         .unwrap();
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
-        let supported_capabilities = backend
-            .supported_capabilities
-            .iter()
-            .copied()
-            .chain([Capability::CreateNestedProjectChild])
-            .collect::<Vec<_>>();
-        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
-            CapabilitySet::new(supported_capabilities);
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
 
         let connection = backend.connect();
         negotiate(&connection);
@@ -18252,27 +18496,11 @@ mod tests {
         let mut model = ScriptedOpenAiEndpoint::start();
         let model_endpoint = model.endpoint.clone();
         let model_id = ModelId::new("fixture/project-manager-wait");
-        let mut backend = InProcessBackend::with_provider_registry_persistent(
+        let backend = InProcessBackend::with_provider_registry_persistent(
             scripted_project_provider_registry(&model_endpoint, model_id.clone()),
             &persistence_path,
         )
         .unwrap();
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
-        let supported_capabilities = backend
-            .supported_capabilities
-            .iter()
-            .copied()
-            .chain([Capability::CreateNestedProjectChild])
-            .collect::<Vec<_>>();
-        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
-            CapabilitySet::new(supported_capabilities);
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
         let connection = backend.connect();
         negotiate(&connection);
         let workspace = match connection
@@ -18643,29 +18871,12 @@ mod tests {
         let model_id = ModelId::new("fixture/project-manager-wait-restart");
         let provider_registry =
             || scripted_project_provider_registry(&model_endpoint, model_id.clone());
-        let mut backend = InProcessBackend::with_provider_registry_persistent(
+        let backend = InProcessBackend::with_provider_registry_persistent(
             provider_registry(),
             &persistence_path,
         )
         .unwrap();
-        // The manager's persisted delegation grant is exercised only while
-        // building the depth-two hierarchy in this test backend.
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
-        let supported_capabilities = backend
-            .supported_capabilities
-            .iter()
-            .copied()
-            .chain([Capability::CreateNestedProjectChild])
-            .collect::<Vec<_>>();
-        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
-            CapabilitySet::new(supported_capabilities);
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
+        // This exercises the persisted nested-delegation grant at depth two.
 
         let connection = backend.connect();
         negotiate(&connection);
@@ -18909,7 +19120,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !reopened
+            reopened
                 .supported_capabilities
                 .contains(Capability::CreateNestedProjectChild)
         );
@@ -19082,6 +19293,15 @@ mod tests {
 
     #[test]
     fn cancelled_prerequisite_blocks_child_and_releases_manager_wait_once() {
+        dependency_failure_blocks_child_and_releases_manager_wait_once(false);
+    }
+
+    #[test]
+    fn failed_prerequisite_blocks_child_and_releases_manager_wait_once() {
+        dependency_failure_blocks_child_and_releases_manager_wait_once(true);
+    }
+
+    fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_fails: bool) {
         let temp = std::env::temp_dir().join(format!(
             "loom-project-manager-wait-cancelled-dependency-e2e-{}",
             uuid::Uuid::new_v4()
@@ -19093,30 +19313,11 @@ mod tests {
         let model_id = ModelId::new("fixture/project-manager-wait-cancelled-dependency");
         let provider_registry =
             || scripted_project_provider_registry(&model_endpoint, model_id.clone());
-        let mut backend = InProcessBackend::with_provider_registry_persistent(
+        let backend = InProcessBackend::with_provider_registry_persistent(
             provider_registry(),
             &persistence_path,
         )
         .unwrap();
-        // Nested delegation is enabled only for the test backend used to build
-        // the root -> manager -> dependent child hierarchy.
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
-        let supported_capabilities = backend
-            .supported_capabilities
-            .iter()
-            .copied()
-            .chain([Capability::CreateNestedProjectChild])
-            .collect::<Vec<_>>();
-        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
-            CapabilitySet::new(supported_capabilities);
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
-
         let connection = backend.connect();
         negotiate(&connection);
         let workspace = match connection
@@ -19345,27 +19546,58 @@ mod tests {
             &prerequisite_turn.request,
             "wait_for_project_children"
         ));
-        let prerequisite_stream = hold_scripted_model_stream_until_cancelled(prerequisite_turn);
-        let cancel = connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
-            project_id,
-            manager_session_id: root,
-            task_id: prerequisite_task.task_id,
-            action: loom_protocol::ProjectChildControlAction::Cancel,
-        }));
-        let ServerResponse::ProjectChildControlled {
-            task: cancelled_prerequisite,
-            run: cancelled_run,
-        } = cancel.result.unwrap()
-        else {
-            panic!("unexpected prerequisite cancellation response");
+        let prerequisite_stream = if prerequisite_fails {
+            model.respond_with_failure(prerequisite_turn, 500, "scripted prerequisite failure");
+            None
+        } else {
+            let stream = hold_scripted_model_stream_until_cancelled(prerequisite_turn);
+            let cancel =
+                connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+                    project_id,
+                    manager_session_id: root,
+                    task_id: prerequisite_task.task_id,
+                    action: loom_protocol::ProjectChildControlAction::Cancel,
+                }));
+            let ServerResponse::ProjectChildControlled {
+                task: cancelled_prerequisite,
+                run: cancelled_run,
+            } = cancel.result.unwrap()
+            else {
+                panic!("unexpected prerequisite cancellation response");
+            };
+            assert_eq!(
+                cancelled_prerequisite.status,
+                loom_core::DelegatedTaskStatus::Cancelled
+            );
+            assert!(matches!(cancelled_run, Some(run)
+                if run.state == AgentRunState::Cancelled));
+            Some(stream)
         };
-        assert_eq!(
-            cancelled_prerequisite.status,
+
+        let prerequisite_status = if prerequisite_fails {
+            loom_core::DelegatedTaskStatus::Failed
+        } else {
             loom_core::DelegatedTaskStatus::Cancelled
-        );
-        assert!(matches!(cancelled_run, Some(run)
-            if run.state == AgentRunState::Cancelled));
-        prerequisite_stream.join().unwrap();
+        };
+        let prerequisite_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = persistence
+                .load_delegated_task(prerequisite_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == prerequisite_status {
+                break;
+            }
+            assert!(
+                Instant::now() < prerequisite_deadline,
+                "prerequisite should become {prerequisite_status:?}, got {status:?}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(stream) = prerequisite_stream {
+            stream.join().unwrap();
+        }
 
         let resumed_manager_turn = model.next_for_child();
         let wait_call_id = wait.tool_call_id.to_string();
@@ -20003,29 +20235,11 @@ mod tests {
         let model_id = ModelId::new("fixture/project-cancel-cascade");
         let provider_registry =
             || scripted_project_provider_registry(&model_endpoint, model_id.clone());
-        let mut backend = InProcessBackend::with_provider_registry_persistent(
+        let backend = InProcessBackend::with_provider_registry_persistent(
             provider_registry(),
             &persistence_path,
         )
         .unwrap();
-        // Nested delegation stays disabled by default; this test enables it
-        // only on the backend instance it uses to build the three-level tree.
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Weak::new();
-        let supported_capabilities = backend
-            .supported_capabilities
-            .iter()
-            .copied()
-            .chain([Capability::CreateNestedProjectChild])
-            .collect::<Vec<_>>();
-        Arc::get_mut(&mut backend).unwrap().supported_capabilities =
-            CapabilitySet::new(supported_capabilities);
-        *backend
-            .self_reference
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(&backend);
 
         let connection = backend.connect();
         negotiate(&connection);
@@ -20052,6 +20266,20 @@ mod tests {
             ServerResponse::AgentSessionCreated(session) => session.id,
             response => panic!("unexpected session response: {response:?}"),
         };
+        assert!(matches!(
+            connection
+                .request(RequestEnvelope::new(
+                    ClientRequest::SetWorkspaceConfigForWorkspace {
+                        workspace_id: workspace.id,
+                        config: WorkspaceConfig {
+                            project_agent_concurrency: 2,
+                            ..WorkspaceConfig::default()
+                        },
+                    },
+                ))
+                .result,
+            Ok(ServerResponse::WorkspaceConfigUpdated)
+        ));
 
         let (manager_task, manager_session) = match connection
             .create_project_child(
@@ -20084,6 +20312,33 @@ mod tests {
             &manager_delegate.request,
             "delegate_project_task"
         ));
+        let sibling_task = match connection
+            .create_project_child(
+                RequestId::new(),
+                root,
+                "sibling".to_owned(),
+                loom_core::DelegatedTaskSpec {
+                    intent: "Hold one independent task while the manager delegates.".to_owned(),
+                    model_id: model_id.as_str().to_owned(),
+                    context_references: vec![],
+                    dependencies: vec![],
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
+                },
+            )
+            .unwrap()
+        {
+            ServerResponse::ProjectChildCreated { task, .. } => task,
+            response => panic!("unexpected sibling task response: {response:?}"),
+        };
+        assert_eq!(sibling_task.status, loom_core::DelegatedTaskStatus::Running);
+        let sibling_turn = model.next_for_child();
+        assert!(!request_has_tool(
+            &sibling_turn.request,
+            "delegate_project_task"
+        ));
+        let sibling_stream = hold_model_stream_until_cancelled(sibling_turn);
+
         model.respond_with_tool(
             manager_delegate,
             "delegate_project_task",
@@ -20097,30 +20352,14 @@ mod tests {
 
         let project_id = ProjectId::from_uuid(*root.as_uuid());
         let persistence = backend.persistence.as_ref().unwrap();
-        // Keep both active model calls open. The manager has delegation tools;
-        // the grandchild was given no delegation permission.
-        let mut manager_turn = None;
-        let mut grandchild_turn = None;
-        for _ in 0..2 {
-            let request = model.next_for_child();
-            if request_has_tool(&request.request, "delegate_project_task") {
-                assert!(manager_turn.replace(request).is_none());
-            } else {
-                assert!(grandchild_turn.replace(request).is_none());
-            }
-        }
-        assert!(
-            manager_turn.is_some(),
-            "manager should remain active after delegation"
-        );
-        assert!(
-            grandchild_turn.is_some(),
-            "grandchild run should have started"
-        );
-        let manager_turn = manager_turn.unwrap();
-        let grandchild_turn = grandchild_turn.unwrap();
+        // Both workspace slots are occupied, so the nested child remains
+        // queued while the manager is still active.
+        let manager_turn = model.next_for_child();
+        assert!(request_has_tool(
+            &manager_turn.request,
+            "delegate_project_task"
+        ));
         let manager_stream = hold_model_stream_until_cancelled(manager_turn);
-        let grandchild_stream = hold_model_stream_until_cancelled(grandchild_turn);
         let grandchild_task = persistence
             .list_project_tasks(project_id)
             .unwrap()
@@ -20146,18 +20385,25 @@ mod tests {
             .expect("manager run should be durable")
             .snapshot
             .id;
-        let grandchild_run_id = persistence
-            .load_latest_run_summary_for_session(grandchild_task.target_session_id)
-            .unwrap()
-            .expect("grandchild run should be durable")
-            .snapshot
-            .id;
         assert_eq!(
             grandchild_task.requester_session_id,
             manager_session.session_id
         );
+        assert_eq!(
+            grandchild_task.status,
+            loom_core::DelegatedTaskStatus::Queued
+        );
+        assert!(
+            persistence
+                .load_latest_run_summary_for_session(grandchild_task.target_session_id)
+                .unwrap()
+                .is_none()
+        );
 
         let sequence_before_cancel = backend.journal().unwrap().latest_sequence(None);
+        backend
+            .project_cancellation_failpoint
+            .store(usize::MAX, Ordering::SeqCst);
         let cancel_response =
             connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
                 project_id,
@@ -20165,13 +20411,17 @@ mod tests {
                 task_id: manager_task.task_id,
                 action: ProjectChildControlAction::Cancel,
             }));
-        let ServerResponse::ProjectChildControlled { task, run } = cancel_response.result.unwrap()
-        else {
-            panic!("unexpected cancellation response");
-        };
-        assert_eq!(task.status, loom_core::DelegatedTaskStatus::Cancelled);
-        assert!(matches!(run, Some(run)
-            if run.id == manager_run_id && run.state == AgentRunState::Cancelled));
+        assert_eq!(
+            cancel_response.result.unwrap_err().code,
+            ErrorCode::RecoveryRequired
+        );
+        assert_eq!(
+            persistence
+                .list_pending_project_cancellation_cascades()
+                .unwrap()
+                .len(),
+            1
+        );
 
         let updates = backend
             .journal()
@@ -20189,33 +20439,20 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            updates,
-            vec![grandchild_task.task_id, manager_task.task_id],
-            "subtree task cancellation events should be deepest-first"
-        );
+        assert!(updates.is_empty());
         assert_eq!(
             persistence
                 .load_delegated_task(grandchild_task.task_id)
                 .unwrap()
                 .unwrap()
                 .status,
-            loom_core::DelegatedTaskStatus::Cancelled
-        );
-        assert_eq!(
-            persistence
-                .load_latest_run_summary_for_session(grandchild_task.target_session_id)
-                .unwrap()
-                .unwrap()
-                .snapshot
-                .state,
-            AgentRunState::Cancelled
+            loom_core::DelegatedTaskStatus::Queued
         );
 
-        manager_stream.join().unwrap();
-        grandchild_stream.join().unwrap();
         drop(connection);
         backend.shutdown().unwrap();
+        manager_stream.join().unwrap();
+        sibling_stream.join().unwrap();
         drop(backend);
         drop(model);
 
@@ -20225,12 +20462,40 @@ mod tests {
         )
         .unwrap();
         let reopened_persistence = reopened.persistence.as_ref().unwrap();
+        assert!(
+            reopened_persistence
+                .list_pending_project_cancellation_cascades()
+                .unwrap()
+                .is_empty(),
+            "startup must finish the persisted cancellation before returning"
+        );
+        let recovered_cancel_updates = reopened
+            .journal()
+            .unwrap()
+            .events_since(None, sequence_before_cancel)
+            .into_iter()
+            .filter_map(|event| match event.event {
+                ServerEvent::ProjectTaskUpdated { task }
+                    if task.status == loom_core::DelegatedTaskStatus::Cancelled
+                        && (task.task_id == manager_task.task_id
+                            || task.task_id == grandchild_task.task_id) =>
+                {
+                    Some(task.task_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recovered_cancel_updates,
+            vec![grandchild_task.task_id, manager_task.task_id],
+            "startup should replay the captured cascade in deepest-first order"
+        );
         let recovered = reopened_persistence
             .load_project_snapshot(project_id)
             .unwrap()
             .unwrap();
-        assert_eq!(recovered.agents.len(), 3);
-        assert_eq!(recovered.tasks.len(), 2);
+        assert_eq!(recovered.agents.len(), 4);
+        assert_eq!(recovered.tasks.len(), 3);
         for task_id in [manager_task.task_id, grandchild_task.task_id] {
             assert_eq!(
                 reopened_persistence
@@ -20248,13 +20513,20 @@ mod tests {
             .snapshot;
         assert_eq!(recovered_manager_run.id, manager_run_id);
         assert_eq!(recovered_manager_run.state, AgentRunState::Cancelled);
-        let recovered_grandchild_run = reopened_persistence
-            .load_latest_run_summary_for_session(grandchild_task.target_session_id)
-            .unwrap()
-            .unwrap()
-            .snapshot;
-        assert_eq!(recovered_grandchild_run.id, grandchild_run_id);
-        assert_eq!(recovered_grandchild_run.state, AgentRunState::Cancelled);
+        assert!(
+            reopened_persistence
+                .load_latest_run_summary_for_session(grandchild_task.target_session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            reopened_persistence
+                .load_delegated_task(sibling_task.task_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            loom_core::DelegatedTaskStatus::Blocked
+        );
         drop(reopened);
         fs::remove_dir_all(temp).unwrap();
     }
@@ -20559,6 +20831,22 @@ mod tests {
                 }]
             });
             write_scripted_http_response(request.stream, response);
+        }
+
+        fn respond_with_failure(&self, request: ScriptedModelRequest, status: u16, message: &str) {
+            let body = serde_json::json!({"error": {"message": message}}).to_string();
+            let reason = match status {
+                500 => "Internal Server Error",
+                503 => "Service Unavailable",
+                _ => "Scripted Failure",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let mut stream = request.stream;
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
         }
     }
 

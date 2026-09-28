@@ -2,7 +2,7 @@
 
 ## Status
 
-The project-session rollout upgrades forward through schema version 49. The
+The project-session rollout upgrades forward through schema version 50. The
 v41-to-v42 migration backfills existing sessions as project roots, v43 adds the
 durable project-message delivery cursor to run execution state, and v44 stores
 the per-run project-delegation grant. V45 adds separate per-run messaging and
@@ -43,31 +43,34 @@ manager wait/join state. Because that milestone is already on the draft
 branch, a separately persisted review-run grant advances storage to v49 and
 the negotiated contract to protocol 9.0. Protocol 10.0 then removes the raw
 client child-creation request so only the run-granted manager tool can create
-children; this protocol-only boundary does not change schema v49. New per-run and delegated-task grants
-remain independent and default off for existing records. The v47-to-v48 and
-v48-to-v49 migrations are forward-only: a v48-only backend must reject the
-upgraded database, and no backend or schema downgrade is supported. Require
+children; this protocol-only boundary does not change schema. Schema v50 adds
+durable cancellation-cascade intent and the ordered subtree snapshot needed
+for recovery. New per-run and delegated-task grants remain independent and
+default off for existing records. The v47-to-v48, v48-to-v49, and v49-to-v50
+migrations are forward-only: a v49-only backend must reject the upgraded
+database, and no backend or schema downgrade is supported. Require
 protocol 10.0 clients before exposing the current contract; protocol 9.x and
 older clients must upgrade. Deployments must ensure or force that upgrade;
 old-client forward compatibility is not supported.
 
 The implementation includes the v48 branch-message grant and manager-wait
-schema, the v49 review-grant column, runtime wait continuation, serialized
-workspace admission, and recovery path. It abandons waits for terminal managers
-and moves dependents with failed or cancelled prerequisites into a blocked
-state. Descendant cascade cancellation and nested permission/worktree paths
-are implemented in the current worktree. Focused end-to-end tests validate
-deepest-first cancellation with terminal state persistence, cap-one wait/join,
-oldest-first admission across ready joins and queued tasks, and parked-wait
-recovery across restart with exactly-once resumption. Interruption during an
-in-progress cascade recovery and failed-run prerequisite wakeup still need
-end-to-end validation. A process restart repairs committed run/task changes,
-but does not resume an interrupted cascade; untouched queued descendants may
-be admitted. Nested worktree integration is validated across both parent
-edges, and explicitly granted non-adjacent branch messaging has end-to-end
-coverage. Level-three delegation stays unavailable behind the unadvertised
-`CreateNestedProjectChild` capability until durable cascade recovery is
-addressed.
+schema, the v49 review-grant column, and v50 cancellation-recovery tables.
+Each active cascade stores its root task, requesting manager, and ordered
+task/session members before any task or run transition. Startup restores
+runtimes, replays pending cascades idempotently, persists resulting events, and
+only then reconciles or admits queued work. The scheduler skips projects with
+pending intents, and child creation is fenced until recovery completes. The
+v49-to-v50 migration creates both normalized tables atomically without changing
+protocol or task/run statuses; no downgrade path exists.
+
+The implementation abandons waits for terminal managers and moves dependents
+with failed or cancelled prerequisites into a blocked state. Focused end-to-end
+tests validate deepest-first cancellation, terminal task/run state after an
+injected interruption and restart, both prerequisite outcomes, cap-one
+wait/join, oldest-first admission across ready joins and queued tasks, and
+parked-wait recovery with exactly-once resumption. Nested worktree integration
+is validated across both parent edges, and explicitly granted non-adjacent
+branch messaging has end-to-end coverage. Depth-three delegation is enabled.
 
 Every request envelope is checked against the supported protocol major before
 dispatch, including capability discovery. `Negotiate` also checks its embedded

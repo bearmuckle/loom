@@ -15073,13 +15073,15 @@ mod worker_node_tests {
     }
 
     #[test]
-    fn project_session_list_groups_direct_children_and_selects_them() {
+    fn project_session_list_projects_nested_children_and_selects_them() {
         let root_id = AgentSessionId::new();
         let child_id = AgentSessionId::new();
+        let grandchild_id = AgentSessionId::new();
         let other_id = AgentSessionId::new();
         let sessions = vec![
             session(root_id, "Project"),
             session(child_id, "Researcher"),
+            session(grandchild_id, "Analyst"),
             session(other_id, "Other session"),
         ];
         let project_id = loom_core::ProjectId::from_uuid(*root_id.as_uuid());
@@ -15107,23 +15109,51 @@ mod worker_node_tests {
                     output_cursor: EventSequence::default(),
                     updated_at: Timestamp::from_unix_millis(2),
                 },
+                loom_core::ProjectAgentRecord {
+                    session_id: grandchild_id,
+                    project_id,
+                    parent_session_id: Some(child_id),
+                    depth: 3,
+                    state: AgentSessionState::Queued,
+                    task_summary: Some("Check one detail".to_owned()),
+                    output_cursor: EventSequence::default(),
+                    updated_at: Timestamp::from_unix_millis(3),
+                },
             ],
-            tasks: vec![loom_core::DelegatedTaskRecord {
-                task_id: loom_core::TaskId::new(),
-                project_id,
-                requester_session_id: root_id,
-                target_session_id: child_id,
-                child_name: "Researcher".to_owned(),
-                intent: "Review protocol changes".to_owned(),
-                model_id: "test-model".to_owned(),
-                context_references: Vec::new(),
-                dependencies: Vec::new(),
-                code_change: false,
-                permissions: loom_core::ProjectAgentPermissions::default(),
-                status: loom_core::DelegatedTaskStatus::Blocked,
-                created_at: Timestamp::from_unix_millis(1),
-                updated_at: Timestamp::from_unix_millis(2),
-            }],
+            tasks: vec![
+                loom_core::DelegatedTaskRecord {
+                    task_id: loom_core::TaskId::new(),
+                    project_id,
+                    requester_session_id: root_id,
+                    target_session_id: child_id,
+                    child_name: "Researcher".to_owned(),
+                    intent: "Review protocol changes".to_owned(),
+                    model_id: "test-model".to_owned(),
+                    context_references: Vec::new(),
+                    dependencies: Vec::new(),
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
+                    status: loom_core::DelegatedTaskStatus::Blocked,
+                    created_at: Timestamp::from_unix_millis(1),
+                    updated_at: Timestamp::from_unix_millis(2),
+                },
+                loom_core::DelegatedTaskRecord {
+                    task_id: loom_core::TaskId::new(),
+                    project_id,
+                    requester_session_id: child_id,
+                    target_session_id: grandchild_id,
+                    child_name: "Analyst".to_owned(),
+                    intent: "Check one detail".to_owned(),
+                    model_id: "test-model".to_owned(),
+                    context_references: Vec::new(),
+                    dependencies: Vec::new(),
+                    code_change: false,
+                    permissions: loom_core::ProjectAgentPermissions::default(),
+                    status: loom_core::DelegatedTaskStatus::Queued,
+                    created_at: Timestamp::from_unix_millis(2),
+                    updated_at: Timestamp::from_unix_millis(3),
+                },
+            ],
             worktrees: vec![],
         };
 
@@ -15138,10 +15168,21 @@ mod worker_node_tests {
                     "↳ Researcher · task blocked · run Working — Review protocol changes"
                         .to_owned()
                 ),
+                (
+                    grandchild_id,
+                    "↳ Analyst · task queued · run Queued — Check one detail".to_owned()
+                ),
                 (other_id, "Other session".to_owned()),
             ]
         );
         assert_eq!(projection.selected_index, Some(1));
+        assert_eq!(
+            projection.tree[0].children[0].children[0].session_id,
+            grandchild_id
+        );
+        let grandchild_projection =
+            project_session_list_projection(&sessions, grandchild_id, Some(&project));
+        assert_eq!(grandchild_projection.selected_index, Some(2));
     }
 
     #[test]
