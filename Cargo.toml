@@ -68,19 +68,17 @@ axum = { version = "0.8.9", features = ["ws"] }
 futures-util = "0.3.34"
 sha2 = "0.11.0"
 flate2 = "1.1.9"
-tokio = { version = "1.53", features = ["full"] }
+tokio = { version = "1.53", features = ["rt", "rt-multi-thread", "time", "sync", "net", "signal", "macros"] }
 tokio-tungstenite = "0.30.0"
 wasm-bindgen = "0.2.128"
 wasm-bindgen-futures = "0.4.78"
 js-sys = "0.3.105"
 web-sys = { version = "0.3.105", features = [
-    "Location",
     "Storage",
     "Window",
     "WebSocket",
     "MessageEvent",
     "CloseEvent",
-    "ErrorEvent",
     "Event",
     "UrlSearchParams",
 ] }

@@ -9,6 +9,3 @@ rust-version.workspace = true
 [dependencies]
 loom-core.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
-loom-core.workspace = true
