@@ -971,6 +971,31 @@ pub(crate) fn tool_group_label(name: &str, count: usize) -> String {
     }
 }
 
+/// The aggregate status for a collapsed group of same-kind tool calls. A single
+/// failed or active call dominates; otherwise pending calls keep the group from
+/// reading as done until every call has settled.
+pub(crate) fn tool_group_status(tools: &[&ToolPart]) -> ToolPartStatus {
+    let has = |status| tools.iter().any(|tool| tool.status == status);
+    if has(ToolPartStatus::Failed) {
+        ToolPartStatus::Failed
+    } else if tools.iter().any(|tool| {
+        matches!(
+            tool.status,
+            ToolPartStatus::Running
+                | ToolPartStatus::AwaitingApproval
+                | ToolPartStatus::AwaitingInput
+        )
+    }) {
+        ToolPartStatus::Running
+    } else if has(ToolPartStatus::Queued) {
+        ToolPartStatus::Queued
+    } else if has(ToolPartStatus::Cancelled) {
+        ToolPartStatus::Cancelled
+    } else {
+        ToolPartStatus::Completed
+    }
+}
+
 /// Renders a tool result as a patch when it looks like one, otherwise as code.
 pub(crate) fn render_tool_output(
     id: impl Into<gpui_kit::ElementId>,

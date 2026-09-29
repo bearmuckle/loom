@@ -152,33 +152,19 @@ impl LoomView {
         let Some(first) = tools.first() else {
             return div().into_any();
         };
-        let failed = tools
-            .iter()
-            .any(|tool| tool.status == ToolPartStatus::Failed);
-        let running = tools.iter().any(|tool| {
-            matches!(
-                tool.status,
-                ToolPartStatus::Running
-                    | ToolPartStatus::AwaitingApproval
-                    | ToolPartStatus::AwaitingInput
-            )
-        });
-        let status_color = if failed {
-            rgb(0xfca5a5)
-        } else if running {
-            rgb(0x93c5fd)
-        } else {
-            rgb(0x9ad7bd)
+        let status = tool_group_status(&tools);
+        let status_color = match status {
+            ToolPartStatus::Failed => rgb(0xfca5a5),
+            ToolPartStatus::Running => rgb(0x93c5fd),
+            ToolPartStatus::Queued | ToolPartStatus::Cancelled => rgb(0x94a3b8),
+            ToolPartStatus::Completed
+            | ToolPartStatus::AwaitingApproval
+            | ToolPartStatus::AwaitingInput => rgb(0x9ad7bd),
         };
-        let status_label = if failed {
-            "failed"
-        } else if running {
-            "running"
-        } else {
-            "done"
-        };
+        let status_label = status.label();
         let key = tool_element_id(index, first_part_index);
-        let expanded = running || failed || self.expanded_tool_groups.contains(&key);
+        let expanded = matches!(status, ToolPartStatus::Failed | ToolPartStatus::Running)
+            || self.expanded_tool_groups.contains(&key);
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let label = tool_group_label(&first.name, tools.len());
