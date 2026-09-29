@@ -46,74 +46,38 @@ impl InProcessBackend {
     pub(crate) fn session_filesystems(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, Workspace>>> {
-        self.session_filesystems.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session filesystem manager lock was poisoned",
-                true,
-            )
-        })
+        self.session_filesystem_service.filesystems()
     }
 
     pub(crate) fn persisted_session_filesystems(
         &self,
     ) -> Result<MutexGuard<'_, BTreeSet<AgentSessionId>>> {
-        self.persisted_session_filesystems.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "persisted session filesystem manager lock was poisoned",
-                true,
-            )
-        })
+        self.session_filesystem_service.persisted()
     }
 
     pub(crate) fn session_repositories(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>>
     {
-        self.session_repositories.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session repository manager lock was poisoned",
-                true,
-            )
-        })
+        self.repository_service.records()
     }
 
     pub(crate) fn session_vcs(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<(AgentSessionId, RepositoryId), GitService>>> {
-        self.session_vcs.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session Git service manager lock was poisoned",
-                true,
-            )
-        })
+        self.repository_service.vcs()
     }
 
     pub(crate) fn session_task_supervisors(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, TaskSupervisor>>> {
-        self.session_task_supervisors.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session task supervisor lock was poisoned",
-                true,
-            )
-        })
+        self.process_service.task_supervisors()
     }
 
     pub(crate) fn session_terminals(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<loom_core::TerminalId, AgentSessionId>>> {
-        self.session_terminals.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session terminal lock was poisoned",
-                true,
-            )
-        })
+        self.process_service.session_terminals()
     }
 
     pub(crate) fn runs(

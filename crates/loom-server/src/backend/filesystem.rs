@@ -8,13 +8,7 @@ impl InProcessBackend {
         if let Some(filesystem) = self.session_filesystems()?.get(&session_id).cloned() {
             return Ok(filesystem);
         }
-        let _restore_guard = self.session_filesystem_restore.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session filesystem restore lock was poisoned",
-                true,
-            )
-        })?;
+        let _restore_guard = self.session_filesystem_service.restore_guard()?;
         if let Some(filesystem) = self.session_filesystems()?.get(&session_id).cloned() {
             return Ok(filesystem);
         }

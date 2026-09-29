@@ -65,7 +65,10 @@ use sysinfo::System;
 mod auth;
 mod backend;
 
-use backend::{RunService, SessionService, WorkspaceService};
+use backend::{
+    ProcessService, RepositoryService, RunService, SessionFilesystemService, SessionService,
+    WorkspaceService,
+};
 mod connection;
 mod dispatch;
 mod event_journal;
@@ -262,14 +265,9 @@ pub struct InProcessBackend {
     journal: Mutex<EventJournal>,
     last_feed_pruned_sequence: AtomicU64,
     feed_bytes_since_prune: AtomicUsize,
-    session_filesystems: Mutex<BTreeMap<AgentSessionId, Workspace>>,
-    persisted_session_filesystems: Mutex<BTreeSet<AgentSessionId>>,
-    session_filesystem_restore: Mutex<()>,
-    session_repositories:
-        Mutex<BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>,
-    session_vcs: Mutex<BTreeMap<(AgentSessionId, RepositoryId), GitService>>,
-    session_task_supervisors: Mutex<BTreeMap<AgentSessionId, TaskSupervisor>>,
-    session_terminals: Mutex<BTreeMap<loom_core::TerminalId, AgentSessionId>>,
+    session_filesystem_service: SessionFilesystemService,
+    repository_service: RepositoryService,
+    process_service: ProcessService,
     terminals: TerminalManager,
     resource_monitor: Mutex<ResourceMonitor>,
     supported_capabilities: CapabilitySet,
