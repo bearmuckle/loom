@@ -845,6 +845,8 @@ pub(crate) fn map_schema_version(version: u32) -> SchemaStatus {
         // A SQLite file that has not been initialized yet; `initialize_schema`
         // decides whether it is empty or an unrecognized layout.
         SchemaStatus::Absent
+    } else if version < DATABASE_SCHEMA_VERSION {
+        SchemaStatus::Migratable(version)
     } else {
         SchemaStatus::OtherVersion(version)
     }
@@ -906,11 +908,18 @@ struct Migration {
 
 /// The ordered schema migration ladder. New schema changes append a step with
 /// the next version instead of editing the baseline.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "baseline typed catalog, runs, filesystem, and feed schema",
-    apply: apply_baseline,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "baseline typed catalog, runs, filesystem, and feed schema",
+        apply: apply_baseline,
+    },
+    Migration {
+        version: 2,
+        description: "record applied schema migrations in schema_migrations",
+        apply: apply_schema_migrations,
+    },
+];
 
 fn apply_baseline(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
     transaction.execute_batch(DATABASE_SCHEMA)?;
@@ -918,6 +927,23 @@ fn apply_baseline(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
     transaction.execute_batch(PROJECT_WORKTREE_SCHEMA)?;
     transaction.execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)?;
     transaction.execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)?;
+    Ok(())
+}
+
+fn apply_schema_migrations(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at INTEGER NOT NULL
+        ) STRICT;",
+    )?;
+    let applied_at = Timestamp::now().as_unix_millis() as i64;
+    for version in 1..=2 {
+        transaction.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
+            params![version, applied_at],
+        )?;
+    }
     Ok(())
 }
 

@@ -70,7 +70,7 @@ pub use schema::*;
 /// fragments) in place; do not reintroduce incremental migrations or legacy
 /// import paths. New optional state should prefer a versioned JSON payload
 /// column over a new column that would need its own migration.
-const DATABASE_SCHEMA_VERSION: u32 = 1;
+const DATABASE_SCHEMA_VERSION: u32 = 2;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;
@@ -397,7 +397,9 @@ pub enum SchemaStatus {
     Absent,
     /// The database is at the current baseline schema version.
     Current,
-    /// The database was written at a different schema version.
+    /// The database is at an older known version that opening will migrate.
+    Migratable(u32),
+    /// The database was written at an unknown or newer schema version.
     OtherVersion(u32),
     /// The file exists but is not a recognizable SQLite database.
     Unrecognized,
@@ -406,7 +408,7 @@ pub enum SchemaStatus {
 impl SchemaStatus {
     /// Whether the database can be opened without wiping it.
     pub fn is_compatible(self) -> bool {
-        matches!(self, Self::Absent | Self::Current)
+        matches!(self, Self::Absent | Self::Current | Self::Migratable(_))
     }
 
     /// Short description used in prompts and error messages.
@@ -414,6 +416,9 @@ impl SchemaStatus {
         match self {
             Self::Absent => "no existing database".to_owned(),
             Self::Current => format!("schema version {DATABASE_SCHEMA_VERSION}"),
+            Self::Migratable(version) => {
+                format!("schema version {version}, migratable to {DATABASE_SCHEMA_VERSION}")
+            }
             Self::OtherVersion(version) => format!("schema version {version}"),
             Self::Unrecognized => "an unrecognized format".to_owned(),
         }

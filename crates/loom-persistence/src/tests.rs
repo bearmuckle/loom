@@ -4193,3 +4193,42 @@ fn in_memory_backend_shares_the_sqlite_code_path() {
     let loaded = store.load_sessions().unwrap();
     assert!(loaded.is_none_or(|state| state.sessions.is_empty()));
 }
+
+#[test]
+fn opening_an_older_database_applies_pending_migrations() {
+    let dir = std::env::temp_dir().join(format!("loom-migrate-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+
+    {
+        let connection = Connection::open(&path).unwrap();
+        initialize_schema(&connection).unwrap();
+        // Simulate a database written by the previous schema version.
+        connection
+            .pragma_update(None, "user_version", 1u32)
+            .unwrap();
+    }
+    assert_eq!(
+        FilePersistence::schema_status(&path).unwrap(),
+        SchemaStatus::Migratable(1)
+    );
+
+    let store = FilePersistence::open(&path).unwrap();
+    store
+        .save_state_with_sessions(&SessionManager::default().export_state())
+        .unwrap();
+    assert_eq!(
+        FilePersistence::schema_status(&path).unwrap(),
+        SchemaStatus::Current
+    );
+
+    let connection = Connection::open(&path).unwrap();
+    let recorded: i64 = connection
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(recorded, 2);
+
+    let _ = fs::remove_dir_all(&dir);
+}
