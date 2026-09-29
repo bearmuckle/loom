@@ -131,21 +131,13 @@ impl InProcessBackend {
     pub(crate) fn runs(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<loom_core::RunId, Arc<RunHandle>>>> {
-        self.runs
-            .lock()
-            .map_err(|_| LoomError::new(ErrorCode::Internal, "agent run lock was poisoned", true))
+        self.run_service.runs()
     }
 
     pub(crate) fn persisted_runs(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<loom_core::RunId, PersistedRunSummary>>> {
-        self.persisted_runs.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "persisted run summary lock was poisoned",
-                true,
-            )
-        })
+        self.run_service.persisted_runs()
     }
 
     pub(crate) fn journal(&self) -> Result<MutexGuard<'_, EventJournal>> {

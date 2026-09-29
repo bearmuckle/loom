@@ -64,6 +64,8 @@ use sysinfo::System;
 
 mod auth;
 mod backend;
+
+use backend::RunService;
 mod connection;
 mod dispatch;
 mod event_journal;
@@ -256,8 +258,7 @@ pub struct InProcessBackend {
     node_name: String,
     sessions: Mutex<SessionManager>,
     workspace_records: Mutex<loom_session::WorkspaceManager>,
-    runs: Mutex<BTreeMap<loom_core::RunId, Arc<RunHandle>>>,
-    persisted_runs: Mutex<BTreeMap<loom_core::RunId, PersistedRunSummary>>,
+    run_service: RunService,
     journal: Mutex<EventJournal>,
     last_feed_pruned_sequence: AtomicU64,
     feed_bytes_since_prune: AtomicUsize,
