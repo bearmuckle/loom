@@ -13,7 +13,7 @@ impl LoomView {
                     .child(
                         Select::new(state)
                             .id("session-model-select")
-                            .max_w(if phone { px(150.) } else { px(220.) })
+                            .max_w(if phone { px(140.) } else { px(220.) })
                             .menu_width(px(320.))
                             .small()
                             .appearance(false)
@@ -38,7 +38,7 @@ impl LoomView {
                     .child(
                         Select::new(state)
                             .id("agent-mode-select")
-                            .max_w(if phone { px(110.) } else { px(140.) })
+                            .max_w(if phone { px(100.) } else { px(140.) })
                             .small()
                             .appearance(false)
                             .accessibility_label("Agent mode")
@@ -191,7 +191,7 @@ impl LoomView {
                                     ),
                             )
                             .when(self.settings_open, |element| {
-                                element.child(self.render_settings_dialog(cx))
+                                element.child(self.render_settings_dialog(layout, cx))
                             }),
                     ),
             )

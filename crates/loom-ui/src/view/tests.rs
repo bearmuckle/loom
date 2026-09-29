@@ -475,9 +475,11 @@ mod display_helper_tests {
 
     #[test]
     fn composer_grows_with_lines_and_is_bounded() {
-        assert_eq!(composer_height(""), 28.);
-        assert_eq!(composer_height("one\ntwo"), 48.);
-        assert_eq!(composer_height(&"x\n".repeat(20)), 168.);
+        assert_eq!(composer_height("", false), 28.);
+        assert_eq!(composer_height("one\ntwo", false), 48.);
+        assert_eq!(composer_height(&"x\n".repeat(20), false), 168.);
+        assert_eq!(composer_height("", true), 44.);
+        assert_eq!(composer_height(&"x\n".repeat(20), true), 184.);
     }
 
     #[test]
@@ -2529,6 +2531,49 @@ mod loom_view_render_tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("toggle-review-sidebar-close").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn phone_composer_and_settings_render_at_mobile_width(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(390.), px(844.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("send-message").visible());
+            assert!(window.find("open-command-palette").visible());
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.settings_open = true;
+                    cx.notify();
+                });
+            window.render_frame(cx);
+            for index in 0..SETTINGS_SECTIONS.len() {
+                window
+                    .within("settings-dialog")
+                    .click(("settings-section", index), cx);
+                window.render_frame(cx);
+                assert!(
+                    window
+                        .within("settings-dialog")
+                        .find(("settings-section", index))
+                        .visible()
+                );
+                assert!(
+                    window
+                        .within("settings-dialog")
+                        .find("settings-content")
+                        .visible()
+                );
+            }
         })
         .unwrap();
     }

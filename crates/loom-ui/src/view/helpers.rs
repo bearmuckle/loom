@@ -107,10 +107,13 @@ pub(crate) fn relative_time(millis: u64, now: u64) -> String {
     }
 }
 
-/// A rough auto-grow height for the composer, in pixels.
-pub(crate) fn composer_height(value: &str) -> f32 {
+/// A rough auto-grow height for the composer, in pixels. Phone layouts use a
+/// taller minimum so the field stays a comfortable touch target without
+/// changing the line growth on larger screens.
+pub(crate) fn composer_height(value: &str, phone: bool) -> f32 {
     let lines = value.lines().count().clamp(1, 8);
-    28. + (lines as f32 - 1.) * 20.
+    let min_height = if phone { 44. } else { 28. };
+    min_height + (lines as f32 - 1.) * 20.
 }
 
 /// The accent color for a run state.
@@ -1678,8 +1681,11 @@ mod tests {
 
     #[test]
     fn sizing_and_formatting_helpers() {
-        assert_eq!(composer_height(""), 28.0);
-        assert_eq!(composer_height("a\nb"), 48.0);
+        assert_eq!(composer_height("", false), 28.0);
+        assert_eq!(composer_height("a\nb", false), 48.0);
+        assert_eq!(composer_height("", true), 44.0);
+        assert_eq!(composer_height("a\nb", true), 64.0);
+        assert_eq!(composer_height(&"x\n".repeat(20), true), 184.0);
         assert_eq!(format_bytes(None), "n/a");
         assert_eq!(format_bytes(Some(1024)), "1.0 KiB");
         assert_eq!(format_bytes(Some(1 << 20)), "1.0 MiB");

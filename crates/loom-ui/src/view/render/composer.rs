@@ -30,7 +30,7 @@ impl LoomView {
             // This is presentation state only; the text stays in InputState.
         }
         let value = composer.read(cx).value().to_string();
-        let height = composer_height(&value);
+        let height = composer_height(&value, layout.phone);
         let view = cx.entity();
         let completion_rows = match &self.composer_completion {
             Some(completion) if completion.kind == CompletionKind::Command => {
@@ -95,7 +95,7 @@ impl LoomView {
                         .id("composer-completions")
                         .test_support()
                         .w_full()
-                        .max_h(px(240.))
+                        .max_h(if layout.phone { px(180.) } else { px(240.) })
                         .overflow_y_scroll()
                         .rounded_lg()
                         .bg(rgb(0x10141b))
@@ -177,8 +177,11 @@ impl LoomView {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
                                     .gap_1()
+                                    .min_w(px(0.))
+                                    .when(layout.phone, |element| element.w_full())
                                     .child(self.render_agent_mode_picker(layout.phone))
                                     .child(self.render_model_picker(layout.phone))
                                     .child(
@@ -200,6 +203,7 @@ impl LoomView {
                                     .flex()
                                     .items_center()
                                     .gap_2()
+                                    .when(layout.phone, |element| element.w_full().justify_end())
                                     .when(self.run_can_interrupt(), |element| {
                                         element.child(
                                             Button::new("interrupt-run")

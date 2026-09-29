@@ -568,7 +568,7 @@ impl Render for LoomView {
                 element.child(self.render_rename_dialog(cx))
             })
             .when(self.settings_open, |element| {
-                element.child(self.render_settings_dialog(cx))
+                element.child(self.render_settings_dialog(layout, cx))
             })
             .when(self.github_login.is_some(), |element| {
                 element.child(self.render_github_login_dialog(cx))
