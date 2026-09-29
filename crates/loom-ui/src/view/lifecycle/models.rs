@@ -5,7 +5,7 @@ impl LoomView {
     /// the startup bootstrap, before the window exists.
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn refresh_models(&mut self) {
-        let provider_ids = match list_provider_ids(&self.connection) {
+        let provider_ids = match list_usable_provider_ids(&self.connection) {
             Ok(provider_ids) => provider_ids,
             Err(error) => {
                 self.record_status(format!(

@@ -230,6 +230,15 @@ pub enum ProviderKind {
     GitHubCopilot,
 }
 
+impl ProviderKind {
+    /// Official hosted APIs cannot serve requests without a stored credential.
+    /// Local runtimes, self-hosted gateways, and the deterministic demo do not
+    /// require one.
+    pub fn requires_credential(self) -> bool {
+        matches!(self, ProviderKind::OpenAi | ProviderKind::DeepSeek)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderHealth {
     pub state: ProviderHealthState,
@@ -270,6 +279,15 @@ pub struct ProviderSummary {
     #[serde(default)]
     pub api_key_configurable: bool,
     pub health: ProviderHealth,
+}
+
+impl ProviderSummary {
+    /// Whether this provider can currently serve model requests. Providers
+    /// that require a credential but have none are not usable, so their seeded
+    /// models must stay out of the catalog until a key is configured.
+    pub fn is_usable(&self) -> bool {
+        !self.kind.requires_credential() || self.credential_id.is_some()
+    }
 }
 
 pub type ProviderDescriptor = ProviderSummary;

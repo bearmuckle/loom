@@ -418,7 +418,7 @@ impl ProviderRegistry {
             .map_err(|_| internal_lock_error("provider configuration"))?;
         Ok(configurations
             .values()
-            .filter(|config| self.is_configured(config))
+            .filter(|config| self.is_usable(config))
             .flat_map(|config| config.models.iter().cloned())
             .collect())
     }
@@ -428,6 +428,14 @@ impl ProviderRegistry {
             .credential
             .as_ref()
             .is_none_or(|reference| self.resolve_credential(reference).is_ok())
+    }
+
+    /// Whether a provider can serve model requests. Official API providers
+    /// still appear in `list_providers` for setup, but their seeded models are
+    /// only catalogued once a credential is stored.
+    fn is_usable(&self, config: &ProviderConfig) -> bool {
+        self.is_configured(config)
+            && (!config.kind.requires_credential() || config.credential.is_some())
     }
 
     pub fn models(&self) -> Result<Vec<ModelDescriptor>> {
