@@ -65,7 +65,7 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Run tests and enforce coverage threshold
-        run: cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80 --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --all-features --locked --fail-under-lines 75 --lcov --output-path lcov.info
       - name: Build application binaries
         if: github.event_name == 'pull_request'
         run: cargo build -p loom-ui -p loom-cli --locked

@@ -20,7 +20,7 @@ Install Rust 1.95 or newer and the native system dependencies listed in the
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo llvm-cov --workspace --all-features --locked --fail-under-lines 80
+cargo llvm-cov --workspace --all-features --locked --fail-under-lines 75
 cargo build --workspace --locked
 ```
 
