@@ -60,6 +60,13 @@ use sysinfo::System;
 mod auth;
 mod dispatch;
 mod remote;
+mod services;
+
+#[cfg(test)]
+use services::idempotency::{
+    IDEMPOTENCY_RETENTION, LEGACY_IDEMPOTENCY_RETENTION, trim_idempotency_cache,
+};
+use services::idempotency::{IdempotencyRecord, IdempotencyStore};
 
 fn json_value<T: Serialize>(value: T) -> Result<Value> {
     serde_json::to_value(value).map_err(|error| {
@@ -92,51 +99,6 @@ fn should_prune_worker_feed(
 ) -> bool {
     next_sequence.saturating_sub(last_pruned_sequence) >= FEED_PRUNE_AFTER_NEW_SEQUENCES
         || accumulated_bytes.saturating_add(pending_bytes) >= FEED_PRUNE_AFTER_NEW_BYTES
-}
-
-fn validate_retry_horizon(request_id: RequestId, now_ms: u64) -> Result<()> {
-    let Some(issued_at_ms) = request_id.issued_at_unix_millis() else {
-        // UUIDv4 IDs were used by earlier protocol clients. Keep their bounded
-        // count-based cache behavior while new clients use timestamped UUIDv7.
-        return Ok(());
-    };
-    let future_skew_ms = REQUEST_ID_FUTURE_SKEW.as_millis() as u64;
-    if issued_at_ms > now_ms.saturating_add(future_skew_ms) {
-        return Err(LoomError::invalid_request(
-            "request id issue time is too far in the future",
-        ));
-    }
-    if now_ms.saturating_sub(issued_at_ms) > IDEMPOTENCY_RETENTION.as_millis() as u64 {
-        return Err(LoomError::new(
-            ErrorCode::DeadlineExceeded,
-            "retry horizon expired; submit the operation as a new request",
-            false,
-        ));
-    }
-    Ok(())
-}
-
-fn trim_idempotency_cache(cache: &mut BTreeMap<RequestId, IdempotencyRecord>) {
-    let now = current_unix_millis();
-    cache.retain(|request_id, record| {
-        record
-            .expires_at
-            .is_none_or(|expires_at| expires_at.as_unix_millis() > now)
-            || request_id.issued_at_unix_millis().is_none()
-    });
-
-    let mut legacy = cache
-        .iter()
-        .filter(|(request_id, _)| request_id.issued_at_unix_millis().is_none())
-        .map(|(request_id, record)| (*request_id, record.created_at))
-        .collect::<Vec<_>>();
-    if legacy.len() > LEGACY_IDEMPOTENCY_RETENTION {
-        let expired_count = legacy.len() - LEGACY_IDEMPOTENCY_RETENTION;
-        legacy.sort_by_key(|(_, created_at)| *created_at);
-        for (request_id, _) in legacy.into_iter().take(expired_count) {
-            cache.remove(&request_id);
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -393,9 +355,6 @@ pub use remote::{
 };
 
 const DEFAULT_EVENT_RETENTION: usize = 4096;
-const IDEMPOTENCY_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const LEGACY_IDEMPOTENCY_RETENTION: usize = 1024;
-const REQUEST_ID_FUTURE_SKEW: Duration = Duration::from_secs(5 * 60);
 const MAX_REVIEW_CHANGES: usize = 512;
 
 fn filesystem_history_pruned(
@@ -920,33 +879,6 @@ fn deduplicate_events(events: Vec<ServerEventEnvelope>) -> Vec<ServerEventEnvelo
         by_sequence.insert(event.sequence.value(), event);
     }
     by_sequence.into_values().collect()
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct IdempotencyRecord {
-    created_at: Timestamp,
-    expires_at: Option<Timestamp>,
-    request: ClientRequest,
-    response: ResponseEnvelope,
-}
-
-impl IdempotencyRecord {
-    fn new(
-        request_id: loom_core::RequestId,
-        request: ClientRequest,
-        response: ResponseEnvelope,
-    ) -> Self {
-        Self {
-            created_at: Timestamp::now(),
-            expires_at: request_id.issued_at_unix_millis().map(|issued_at| {
-                Timestamp::from_unix_millis(
-                    issued_at.saturating_add(IDEMPOTENCY_RETENTION.as_millis() as u64),
-                )
-            }),
-            request,
-            response,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1905,15 +1837,13 @@ pub struct InProcessBackend {
     github_copilot_logins: Mutex<BTreeMap<String, GitHubCopilotLoginRecord>>,
     persistence: Option<FilePersistence>,
     session_root_base: PathBuf,
-    idempotency: Mutex<BTreeMap<loom_core::RequestId, IdempotencyRecord>>,
-    in_flight_requests: Mutex<BTreeMap<loom_core::RequestId, Arc<Mutex<()>>>>,
+    idempotency_store: IdempotencyStore,
     session_admissions: Mutex<BTreeMap<AgentSessionId, Arc<Mutex<()>>>>,
     project_admissions: Mutex<BTreeMap<ProjectId, Arc<Mutex<()>>>>,
     workspace_project_admissions: Mutex<BTreeMap<WorkspaceId, Arc<Mutex<()>>>>,
     self_reference: Mutex<Weak<InProcessBackend>>,
     request_lifecycle: RwLock<u8>,
     persistence_failed: AtomicBool,
-    durable_request_gate: Mutex<()>,
     state_persist_gate: Mutex<()>,
     #[cfg(test)]
     fail_next_state_save: AtomicBool,
@@ -3310,15 +3240,13 @@ impl InProcessBackend {
             github_copilot_logins: Mutex::new(BTreeMap::new()),
             persistence,
             session_root_base,
-            idempotency: Mutex::new(BTreeMap::new()),
-            in_flight_requests: Mutex::new(BTreeMap::new()),
+            idempotency_store: IdempotencyStore::new(),
             session_admissions: Mutex::new(BTreeMap::new()),
             project_admissions: Mutex::new(BTreeMap::new()),
             workspace_project_admissions: Mutex::new(BTreeMap::new()),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),
             persistence_failed: AtomicBool::new(false),
-            durable_request_gate: Mutex::new(()),
             state_persist_gate: Mutex::new(()),
             #[cfg(test)]
             fail_next_state_save: AtomicBool::new(false),
@@ -3841,25 +3769,21 @@ impl InProcessBackend {
             provider_health: persistence.load_provider_health()?,
             workspace_configs: persistence.load_workspace_configs()?,
             provider_usage: persistence.load_provider_usage()?,
-            idempotency: {
-                let mut cache = persistence
-                    .load_idempotency_records()?
-                    .into_iter()
-                    .map(|(id, record)| {
-                        Ok((
-                            id,
-                            IdempotencyRecord {
-                                created_at: record.created_at,
-                                expires_at: record.expires_at,
-                                request: from_json(record.request)?,
-                                response: from_json(record.response)?,
-                            },
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?;
-                trim_idempotency_cache(&mut cache);
-                cache
-            },
+            idempotency: persistence
+                .load_idempotency_records()?
+                .into_iter()
+                .map(|(id, record)| {
+                    Ok((
+                        id,
+                        IdempotencyRecord {
+                            created_at: record.created_at,
+                            expires_at: record.expires_at,
+                            request: from_json(record.request)?,
+                            response: from_json(record.response)?,
+                        },
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?,
         };
         log::info!(
             "loaded persisted catalogs and feed cursors in {} ms",
@@ -3891,10 +3815,7 @@ impl InProcessBackend {
             }
             *target = state.journal;
         }
-        {
-            let mut target = self.idempotency()?;
-            *target = state.idempotency;
-        }
+        self.idempotency_store.replace_records(state.idempotency)?;
         {
             let mut target = self.session_policies()?;
             *target = state.session_policies;
@@ -4807,32 +4728,9 @@ impl InProcessBackend {
         };
         let workspace_records = self.workspace_records()?.export_state();
         let provider_usage = self.providers.usage()?;
-        let mut idempotency = self
-            .idempotency()?
-            .iter()
-            .map(|(id, record)| {
-                Ok((
-                    *id,
-                    DurableIdempotencyRecord {
-                        created_at: record.created_at,
-                        expires_at: record.expires_at,
-                        request: json_value(&record.request)?,
-                        response: json_value(&record.response)?,
-                    },
-                ))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
-        if let Some((request_id, record)) = &idempotency_candidate {
-            idempotency.insert(
-                *request_id,
-                DurableIdempotencyRecord {
-                    created_at: record.created_at,
-                    expires_at: record.expires_at,
-                    request: json_value(&record.request)?,
-                    response: json_value(&record.response)?,
-                },
-            );
-        }
+        let idempotency = self
+            .idempotency_store
+            .durable_records(idempotency_candidate.as_ref())?;
         #[cfg(test)]
         if self.fail_next_state_save.swap(false, Ordering::SeqCst) {
             self.persistence_failed.store(true, Ordering::SeqCst);
@@ -4968,31 +4866,6 @@ impl InProcessBackend {
         Ok(())
     }
 
-    fn idempotency(
-        &self,
-    ) -> Result<MutexGuard<'_, BTreeMap<loom_core::RequestId, IdempotencyRecord>>> {
-        self.idempotency.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "idempotency cache lock was poisoned",
-                true,
-            )
-        })
-    }
-
-    /// Serializes retries of one request id without serializing unrelated
-    /// mutations, so a long-running request cannot block a control request.
-    fn request_slot(&self, request_id: loom_core::RequestId) -> Result<Arc<Mutex<()>>> {
-        let mut in_flight = self.in_flight_requests.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "request serialization lock was poisoned",
-                true,
-            )
-        })?;
-        Ok(Arc::clone(in_flight.entry(request_id).or_default()))
-    }
-
     fn session_admission(&self, session_id: AgentSessionId) -> Result<Arc<Mutex<()>>> {
         let mut admissions = self.session_admissions.lock().map_err(|_| {
             LoomError::new(
@@ -5024,19 +4897,6 @@ impl InProcessBackend {
             )
         })?;
         Ok(Arc::clone(admissions.entry(workspace_id).or_default()))
-    }
-
-    fn release_request_slot(&self, request_id: loom_core::RequestId) {
-        let mut in_flight = self
-            .in_flight_requests
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if in_flight
-            .get(&request_id)
-            .is_some_and(|slot| Arc::strong_count(slot) == 1)
-        {
-            in_flight.remove(&request_id);
-        }
     }
 
     /// Journals one agent event and keeps the session state in step with it.
@@ -5257,34 +5117,6 @@ impl InProcessBackend {
             .worker
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(worker);
-        Ok(())
-    }
-
-    fn cached_response(
-        &self,
-        request_id: loom_core::RequestId,
-        request: &ClientRequest,
-    ) -> Result<Option<ResponseEnvelope>> {
-        let cache = self.idempotency()?;
-        let Some(record) = cache.get(&request_id) else {
-            return Ok(None);
-        };
-        if &record.request != request {
-            return Err(LoomError::conflict(format!(
-                "request id {request_id} was already used for a different mutation"
-            )));
-        }
-        Ok(Some(record.response.clone()))
-    }
-
-    fn publish_idempotency_record(
-        &self,
-        request_id: loom_core::RequestId,
-        record: IdempotencyRecord,
-    ) -> Result<()> {
-        let mut cache = self.idempotency()?;
-        cache.insert(request_id, record);
-        trim_idempotency_cache(&mut cache);
         Ok(())
     }
 
@@ -6835,18 +6667,9 @@ impl InProcessConnection {
         let serialize_durable_request = durable_mutation
             && !matches!(&request.request, ClientRequest::ControlProjectChild { .. });
         let _durable_request_guard = if serialize_durable_request {
-            match self.backend.durable_request_gate.lock() {
+            match self.backend.idempotency_store.durable_gate() {
                 Ok(guard) => Some(guard),
-                Err(_) => {
-                    return ResponseEnvelope::failure(
-                        request_id,
-                        LoomError::new(
-                            ErrorCode::Internal,
-                            "durable request serialization lock was poisoned",
-                            true,
-                        ),
-                    );
-                }
+                Err(error) => return ResponseEnvelope::failure(request_id, error),
             }
         } else {
             None
@@ -6863,11 +6686,16 @@ impl InProcessConnection {
         }
 
         let retryable = durable_mutation;
-        if retryable && let Err(error) = validate_retry_horizon(request_id, current_unix_millis()) {
+        if retryable
+            && let Err(error) = self
+                .backend
+                .idempotency_store
+                .validate_retry_horizon(request_id)
+        {
             return ResponseEnvelope::failure(request_id, error);
         }
         let slot = if retryable {
-            match self.backend.request_slot(request_id) {
+            match self.backend.idempotency_store.request_slot(request_id) {
                 Ok(slot) => Some(slot),
                 Err(error) => return ResponseEnvelope::failure(request_id, error),
             }
@@ -6882,7 +6710,11 @@ impl InProcessConnection {
             if let Err(error) = self.authorize_request_access(&request_for_cache) {
                 return ResponseEnvelope::failure(request_id, error);
             }
-            match self.backend.cached_response(request_id, &request_for_cache) {
+            match self
+                .backend
+                .idempotency_store
+                .cached_response(request_id, &request_for_cache)
+            {
                 Ok(Some(response)) => return response,
                 Ok(None) => {}
                 Err(error) => return ResponseEnvelope::failure(request_id, error),
@@ -6907,13 +6739,13 @@ impl InProcessConnection {
                         self.backend
                             .persist_state_with_idempotency_candidate((request_id, record.clone()))
                             .and_then(|()| {
-                                self.backend
-                                    .publish_idempotency_record(request_id, record)?;
+                                self.backend.idempotency_store.publish(request_id, record)?;
                                 Ok(response)
                             })
                     } else {
                         self.backend
-                            .publish_idempotency_record(request_id, record)
+                            .idempotency_store
+                            .publish(request_id, record)
                             .map(|()| response)
                     }
                 } else {
@@ -6934,7 +6766,9 @@ impl InProcessConnection {
         if retryable {
             drop(_request_guard);
             drop(slot);
-            self.backend.release_request_slot(request_id);
+            self.backend
+                .idempotency_store
+                .release_request_slot(request_id);
         }
         response
     }
@@ -20514,6 +20348,7 @@ mod tests {
         assert_eq!(failed.result.unwrap_err().code, ErrorCode::Internal);
         assert!(
             backend
+                .idempotency_store
                 .cached_response(request_id, &request)
                 .unwrap()
                 .is_none()
