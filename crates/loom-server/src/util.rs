@@ -1156,3 +1156,138 @@ pub(crate) fn unauthorized_session(session_id: AgentSessionId) -> LoomError {
         false,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_urls_reject_credentials_and_secure_only_where_expected() {
+        assert!(worker_node_url_is_safe("wss://worker.example/socket"));
+        assert!(worker_node_url_is_safe("ws://localhost:8080"));
+        assert!(!worker_node_url_is_safe("http://worker.example"));
+        assert!(!worker_node_url_is_safe("wss://user:pass@worker.example"));
+        assert!(!worker_node_url_is_safe(
+            "wss://worker.example?token=secret"
+        ));
+        assert!(!worker_node_url_is_safe("wss://worker.example#fragment"));
+        assert!(!worker_node_url_is_safe(""));
+    }
+
+    #[test]
+    fn session_relative_paths_must_be_normalized() {
+        assert_eq!(
+            checked_session_relative_path("a/b.txt").unwrap(),
+            PathBuf::from("a/b.txt")
+        );
+        assert!(checked_session_relative_path("").is_err());
+        assert!(checked_session_relative_path("..").is_err());
+        assert!(checked_session_relative_path("/etc/passwd").is_err());
+        assert!(checked_session_relative_path("a\\b").is_err());
+    }
+
+    #[test]
+    fn checked_session_path_confines_to_the_root() {
+        let root = std::env::temp_dir().join(format!("loom-util-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file.txt"), b"hi").unwrap();
+
+        let resolved = checked_session_path(&root, "file.txt").unwrap();
+        assert_eq!(resolved, fs::canonicalize(root.join("file.txt")).unwrap());
+        assert!(checked_session_path(&root, "missing.txt").is_err());
+        assert!(checked_session_path(&root, "../escape").is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repository_display_name_parses_urls_and_rejects_credentials() {
+        assert_eq!(
+            repository_display_name("https://github.com/org/repo.git").unwrap(),
+            "repo"
+        );
+        assert_eq!(
+            repository_display_name("ssh://git@github.com/org/other.git").unwrap(),
+            "other"
+        );
+        assert!(repository_display_name("http://github.com/org/repo").is_err());
+        assert!(repository_display_name("https://user:pass@github.com/org/repo").is_err());
+        assert!(repository_display_name("not a path or url").is_err());
+    }
+
+    #[test]
+    fn resource_percentages_are_bounded() {
+        assert_eq!(cpu_usage_percent(0.0), Some(0));
+        assert_eq!(cpu_usage_percent(150.0), Some(100));
+        assert_eq!(cpu_usage_percent(f32::NAN), None);
+        assert_eq!(cpu_usage_percent(f32::INFINITY), None);
+        assert_eq!(memory_usage_percent(Some(100), Some(40)), Some(60));
+        assert_eq!(memory_usage_percent(Some(0), Some(0)), None);
+        assert_eq!(memory_usage_percent(None, Some(1)), None);
+    }
+
+    #[test]
+    fn capacity_and_terminal_states() {
+        assert!(project_agent_capacity_available(1, 2));
+        assert!(!project_agent_capacity_available(2, 2));
+        assert!(project_agent_slot_released(AgentSessionState::Completed));
+        assert!(!project_agent_slot_released(AgentSessionState::Executing));
+        assert!(is_terminal_agent_run_state(AgentRunState::Cancelled));
+        assert!(!is_terminal_agent_run_state(AgentRunState::Planning));
+    }
+
+    #[test]
+    fn delegated_child_model_id_resolves_current() {
+        let current = ModelId::new("gpt-6-luna");
+        assert_eq!(
+            delegated_child_model_id(None, &current),
+            "gpt-6-luna".to_owned()
+        );
+        assert_eq!(
+            delegated_child_model_id(Some("current".to_owned()), &current),
+            "gpt-6-luna".to_owned()
+        );
+        assert_eq!(
+            delegated_child_model_id(Some("custom".to_owned()), &current),
+            "custom".to_owned()
+        );
+    }
+
+    #[test]
+    fn bounded_review_text_truncates_with_marker() {
+        assert_eq!(bounded_review_text("abc", 8), "abc");
+        let long = "x".repeat(20);
+        let bounded = bounded_review_text(&long, 5);
+        assert!(bounded.starts_with("xxxxx"));
+        assert!(bounded.ends_with("[review output truncated]"));
+    }
+
+    #[test]
+    fn bounded_transcript_content_marks_truncation() {
+        let (content, truncated) = bounded_transcript_content(b"hello", 5);
+        assert_eq!(content, "hello");
+        assert!(!truncated);
+        let (content, truncated) = bounded_transcript_content(
+            b"hello",
+            u64::from(MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES) + 1,
+        );
+        assert!(truncated);
+        assert!(content.ends_with("[message truncated]"));
+    }
+
+    #[test]
+    fn add_usage_accumulates_tokens_and_cost() {
+        let mut total = UsageSnapshot::default();
+        let mut current = UsageSnapshot::default();
+        current.add_tokens(10, 5, 2);
+        current.add_cost_micros(7);
+        current.tool_calls = 3;
+        add_usage(&mut total, &current);
+        add_usage(&mut total, &current);
+        assert_eq!(total.input_tokens, 20);
+        assert_eq!(total.output_tokens, 10);
+        assert_eq!(total.cached_input_tokens, 4);
+        assert_eq!(total.cost_micros, 14);
+        assert_eq!(total.tool_calls, 6);
+    }
+}
