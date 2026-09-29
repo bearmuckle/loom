@@ -298,6 +298,16 @@ Diff rendering polish is implemented on branch `ui/inspector-diff-polish`:
   headers) and copies it.
 
 This trades per-line text selection for highlighting; the diff can still be
-copied whole via "copy patch". Deferred to later slices: side-by-side mode,
-collapsible hunks/expand-context, the Changes filter input, a deep file tree,
+copied whole via "copy patch".
+
+Changes usability is implemented on branch `ui/inspector-usability`:
+
+- **Collapsible hunks.** Each hunk header toggles its lines; the caret reflects
+  the state and hunk navigation still works while collapsed.
+- **File filter.** A filter field above the changed-file list narrows
+  repository and workspace changes by path, with a matching empty state.
+- **Accessibility labels.** The hunk, wrap, and copy diff controls carry
+  accessibility labels alongside their tooltips.
+
+Deferred to later slices: side-by-side mode, expand-context, a deep file tree,
 and keyboard navigation.

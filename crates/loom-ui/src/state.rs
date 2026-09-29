@@ -150,6 +150,7 @@ pub(crate) struct ReviewState {
     pub(crate) wrap_lines: bool,
     pub(crate) rows: Vec<ReviewRow>,
     pub(crate) hunk_rows: Vec<usize>,
+    pub(crate) collapsed_hunks: BTreeSet<usize>,
     pub(crate) selected_hunk: usize,
     pub(crate) list_state: ListState,
     pub(crate) usage: UsageState,
@@ -169,9 +170,24 @@ pub(crate) enum ReviewRow {
 
 impl ReviewState {
     pub(crate) fn show_diff(&mut self, diff: GitDiff) {
+        self.collapsed_hunks.clear();
+        self.selected_diff = Some(diff);
+        self.selected_hunk = 0;
+        self.loading_diff = false;
+        self.diff_error = None;
+        self.rebuild_rows();
+    }
+
+    /// Rebuilds the virtual rows from the selected diff, hiding the lines of
+    /// any collapsed hunk.
+    pub(crate) fn rebuild_rows(&mut self) {
         self.rows.clear();
         self.hunk_rows.clear();
-        for hunk in &diff.hunks {
+        let Some(diff) = self.selected_diff.as_ref() else {
+            self.list_state.reset(0);
+            return;
+        };
+        for (hunk_index, hunk) in diff.hunks.iter().enumerate() {
             self.hunk_rows.push(self.rows.len());
             self.rows.push(ReviewRow::Hunk {
                 old_start: hunk.old_start,
@@ -179,14 +195,28 @@ impl ReviewState {
                 new_start: hunk.new_start,
                 new_lines: hunk.new_lines,
             });
-            self.rows
-                .extend(hunk.lines.iter().cloned().map(ReviewRow::Line));
+            if !self.collapsed_hunks.contains(&hunk_index) {
+                self.rows
+                    .extend(hunk.lines.iter().cloned().map(ReviewRow::Line));
+            }
         }
         self.list_state.reset(self.rows.len());
-        self.selected_hunk = 0;
-        self.selected_diff = Some(diff);
-        self.loading_diff = false;
-        self.diff_error = None;
+    }
+
+    /// Toggles the collapse state of the hunk whose header is at `row`.
+    pub(crate) fn toggle_hunk(&mut self, row: usize) -> bool {
+        let Some(hunk_index) = self
+            .hunk_rows
+            .iter()
+            .position(|candidate| *candidate == row)
+        else {
+            return false;
+        };
+        if !self.collapsed_hunks.remove(&hunk_index) {
+            self.collapsed_hunks.insert(hunk_index);
+        }
+        self.rebuild_rows();
+        true
     }
 }
 
@@ -254,6 +284,7 @@ impl Default for ReviewState {
             wrap_lines: false,
             rows: Vec::new(),
             hunk_rows: Vec::new(),
+            collapsed_hunks: BTreeSet::new(),
             selected_hunk: 0,
             list_state: ListState::new(0, ListAlignment::Top, px(120.)),
             usage: UsageState::default(),
@@ -625,6 +656,54 @@ mod tests {
         });
         assert_eq!(review.hunk_rows, vec![0, 2]);
         assert_eq!(review.list_state.item_count(), 4);
+    }
+
+    #[test]
+    fn collapsed_hunks_hide_their_lines_until_expanded() {
+        let mut review = ReviewState::default();
+        review.show_diff(GitDiff {
+            path: Some("src/lib.rs".to_owned()),
+            staged: false,
+            patch: String::new(),
+            binary: false,
+            truncated: false,
+            hunks: vec![
+                GitDiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![GitDiffLine {
+                        kind: GitDiffLineKind::Removed,
+                        old_line: Some(1),
+                        new_line: None,
+                        content: "old".to_owned(),
+                    }],
+                },
+                GitDiffHunk {
+                    old_start: 9,
+                    old_lines: 1,
+                    new_start: 9,
+                    new_lines: 1,
+                    lines: vec![GitDiffLine {
+                        kind: GitDiffLineKind::Added,
+                        old_line: None,
+                        new_line: Some(9),
+                        content: "new".to_owned(),
+                    }],
+                },
+            ],
+        });
+        assert_eq!(review.rows.len(), 4);
+        assert!(review.toggle_hunk(0));
+        assert!(review.collapsed_hunks.contains(&0));
+        assert_eq!(review.rows.len(), 3);
+        // The remaining hunk header keeps a valid row index.
+        assert_eq!(review.hunk_rows, vec![0, 1]);
+        assert_eq!(review.list_state.item_count(), 3);
+        assert!(review.toggle_hunk(0));
+        assert_eq!(review.rows.len(), 4);
+        assert!(!review.toggle_hunk(999));
     }
 
     #[test]

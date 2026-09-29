@@ -96,6 +96,17 @@ impl Render for LoomView {
                 }));
             self.session_filter_input = Some(input);
         }
+        if self.review_filter_input.is_none() {
+            let input =
+                cx.new(|cx| InputState::new(window, cx).placeholder("Filter changed files…"));
+            self.input_subscriptions
+                .push(cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        cx.notify();
+                    }
+                }));
+            self.review_filter_input = Some(input);
+        }
         if self.node_input_state.is_none() {
             let initial_value = self.node_input_initial.clone();
             let input = cx.new(|cx| InputState::new(window, cx).default_value(initial_value));

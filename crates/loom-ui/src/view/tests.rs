@@ -1242,6 +1242,8 @@ mod loom_view_render_tests {
                     content: "context".to_owned(),
                 }),
             ];
+            view.review.hunk_rows = vec![0];
+            view.review.collapsed_hunks.insert(0);
             for index in 0..=view.review.rows.len() {
                 let _ = view.render_review_row(index);
             }
