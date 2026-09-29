@@ -4260,7 +4260,7 @@ fn project_task_queries_and_cancellation_cover_lifecycle_paths() {
         context_references: task.context_references.clone(),
         dependencies: Vec::new(),
         code_change: false,
-        permissions: task.permissions.clone(),
+        permissions: task.permissions,
     };
     assert_eq!(
         persistence
