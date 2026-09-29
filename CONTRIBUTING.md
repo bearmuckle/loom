@@ -20,9 +20,13 @@ Install Rust 1.95 or newer and the native system dependencies listed in the
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo llvm-cov --workspace --all-features --locked --fail-under-lines 75
+cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
 cargo build --workspace --locked
 ```
+
+Coverage is enforced per pull request as **patch coverage**: at least 75% of the
+non-test lines changed by the PR must be covered (via `diff-cover` against the
+base branch). There is no flat workspace threshold.
 
 The same commands are collected in `./scripts/ci-check.sh`. CI runs these
 checks for pull requests and builds the workspace on pushes to `main`.

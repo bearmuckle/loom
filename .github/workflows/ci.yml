@@ -64,8 +64,18 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - name: Run tests and enforce coverage threshold
-        run: cargo llvm-cov --workspace --all-features --locked --fail-under-lines 75 --lcov --output-path lcov.info
+      - name: Run tests and collect coverage
+        run: cargo llvm-cov --workspace --all-features --locked --lcov --output-path lcov.info
+      - name: Enforce patch coverage on changed lines
+        if: github.event_name == 'pull_request'
+        run: |
+          python3 -m pip install --quiet diff-cover
+          git fetch --depth=1 origin "${{ github.base_ref }}"
+          diff-cover lcov.info \
+            --compare-branch="origin/${{ github.base_ref }}" \
+            --fail-under=75 \
+            --exclude 'crates/*/src/tests.rs' \
+            --exclude 'crates/*/tests/*'
       - name: Build application binaries
         if: github.event_name == 'pull_request'
         run: cargo build -p loom-ui -p loom-cli --locked
