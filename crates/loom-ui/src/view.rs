@@ -393,6 +393,11 @@ fn header_tooltip(
         .child(child)
 }
 
+#[cfg(not(target_family = "wasm"))]
+use crate::connection::{
+    list_models, list_provider_ids, negotiate, set_workspace_config, start_run, worker_node_status,
+    workspace_config,
+};
 #[cfg(target_family = "wasm")]
 use crate::{
     browser::BrowserOptions,
@@ -402,15 +407,9 @@ use crate::{
     },
 };
 #[cfg(not(target_family = "wasm"))]
-use crate::{
-    connection::{
-        list_models, list_provider_ids, negotiate, set_workspace_config, start_run,
-        worker_node_status, workspace_config,
-    },
-    platform::{PeerCredentialStore, UiOptions, backend_persistence_path, prepare_workspace},
-};
-#[cfg(not(target_family = "wasm"))]
 use log::info;
+#[cfg(not(target_family = "wasm"))]
+use loom_local::{PeerCredentialStore, UiOptions, backend_persistence_path, prepare_workspace};
 
 #[cfg(target_family = "wasm")]
 use futures_channel::oneshot;

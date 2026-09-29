@@ -12,7 +12,6 @@ mod assets;
 mod browser;
 mod connection;
 #[cfg(not(target_family = "wasm"))]
-mod platform;
 mod state;
 mod syntax;
 mod theme;
@@ -32,7 +31,9 @@ use log::{error, info};
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::describe_startup_connection_error;
 #[cfg(not(target_family = "wasm"))]
-use crate::{platform::UiOptions, view::LoomView};
+use crate::view::LoomView;
+#[cfg(not(target_family = "wasm"))]
+use loom_local::UiOptions;
 
 #[cfg(not(target_family = "wasm"))]
 fn init_logging() {
@@ -71,7 +72,7 @@ fn main() {
         },
         options.model.as_str()
     );
-    if let Err(error) = crate::platform::prepare_backend_state(&options) {
+    if let Err(error) = loom_local::prepare_backend_state(&options) {
         error!("{error}");
         std::process::exit(1);
     }

@@ -58,15 +58,21 @@ impl PeerCredentialBackend for OsCredentialBackend {
     }
 }
 
-pub(crate) struct PeerCredentialStore {
+pub struct PeerCredentialStore {
     backend: Arc<dyn PeerCredentialBackend>,
 }
 
-impl PeerCredentialStore {
-    pub(crate) fn new() -> Self {
+impl Default for PeerCredentialStore {
+    fn default() -> Self {
         Self {
             backend: Arc::new(OsCredentialBackend),
         }
+    }
+}
+
+impl PeerCredentialStore {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     #[cfg(test)]
@@ -74,28 +80,19 @@ impl PeerCredentialStore {
         Self { backend }
     }
 
-    pub(crate) fn get(
-        &self,
-        workspace_id: WorkspaceId,
-        url: &str,
-    ) -> Result<Option<String>, LoomError> {
+    pub fn get(&self, workspace_id: WorkspaceId, url: &str) -> Result<Option<String>, LoomError> {
         self.backend
             .get(peer_credential_reference(workspace_id, url).as_str())
             .map_err(|error| peer_credential_error("read", error))
     }
 
-    pub(crate) fn set(
-        &self,
-        workspace_id: WorkspaceId,
-        url: &str,
-        token: &str,
-    ) -> Result<(), LoomError> {
+    pub fn set(&self, workspace_id: WorkspaceId, url: &str, token: &str) -> Result<(), LoomError> {
         self.backend
             .set(peer_credential_reference(workspace_id, url).as_str(), token)
             .map_err(|error| peer_credential_error("save", error))
     }
 
-    pub(crate) fn delete(&self, workspace_id: WorkspaceId, url: &str) -> Result<(), LoomError> {
+    pub fn delete(&self, workspace_id: WorkspaceId, url: &str) -> Result<(), LoomError> {
         self.backend
             .delete(peer_credential_reference(workspace_id, url).as_str())
             .map_err(|error| peer_credential_error("remove", error))
@@ -148,20 +145,20 @@ impl PeerCredentialBackend for MemoryPeerCredentialBackend {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct UiOptions {
-    pub(crate) project: Option<PathBuf>,
-    pub(crate) task: String,
-    pub(crate) demo: bool,
-    pub(crate) model: ModelId,
-    pub(crate) endpoint: Option<String>,
-    pub(crate) api_key: Option<String>,
-    pub(crate) remote: Option<String>,
-    pub(crate) token: Option<String>,
-    pub(crate) reset_state: bool,
+pub struct UiOptions {
+    pub project: Option<PathBuf>,
+    pub task: String,
+    pub demo: bool,
+    pub model: ModelId,
+    pub endpoint: Option<String>,
+    pub api_key: Option<String>,
+    pub remote: Option<String>,
+    pub token: Option<String>,
+    pub reset_state: bool,
 }
 
 impl UiOptions {
-    pub(crate) fn parse<I>(args: I) -> Result<Self, LoomError>
+    pub fn parse<I>(args: I) -> Result<Self, LoomError>
     where
         I: IntoIterator<Item = String>,
     {
@@ -267,7 +264,7 @@ impl UiOptions {
 /// incompatible database is wiped only when the operator passed
 /// `--reset-state` or explicitly confirmed the interactive prompt; otherwise
 /// the error is returned so the GUI reports it instead of failing silently.
-pub(crate) fn prepare_backend_state(options: &UiOptions) -> Result<(), LoomError> {
+pub fn prepare_backend_state(options: &UiOptions) -> Result<(), LoomError> {
     if options.remote.is_some() || options.demo {
         return Ok(());
     }
@@ -309,7 +306,7 @@ fn confirm_state_wipe(
     ))
 }
 
-pub(crate) fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomError> {
+pub fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomError> {
     if let Some(project) = &options.project {
         let root = fs::canonicalize(project).map_err(|error| {
             LoomError::new(
@@ -374,7 +371,7 @@ pub(crate) fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), 
     Ok((root, options.demo))
 }
 
-pub(crate) fn backend_persistence_path() -> PathBuf {
+pub fn backend_persistence_path() -> PathBuf {
     state_root().join("loom").join("state.db")
 }
 

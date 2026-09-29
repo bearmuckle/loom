@@ -4286,6 +4286,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-local"
+version = "0.1.0"
+dependencies = [
+ "keyring",
+ "loom-core",
+ "loom-model",
+ "loom-persistence",
+ "loom-providers",
+ "loom-vcs",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "loom-model"
 version = "0.1.0"
 dependencies = [
@@ -4413,6 +4426,7 @@ dependencies = [
  "keyring",
  "log",
  "loom-core",
+ "loom-local",
  "loom-model",
  "loom-persistence",
  "loom-protocol",
