@@ -581,7 +581,7 @@ mod session_header_render_tests {
 mod loom_view_render_tests {
     use super::{
         LoomView, SETTINGS_SECTIONS, SessionSourceChoice, SessionSourceDialog,
-        SessionSourceDialogPurpose, WorkerConnectionState, WorkerNodeEntry,
+        SessionSourceDialogPurpose, SettingsSection, WorkerConnectionState, WorkerNodeEntry,
     };
     use crate::state::GitHubLoginState;
     use crate::state::RenameDialogState;
@@ -973,11 +973,19 @@ mod loom_view_render_tests {
         .unwrap();
         cx.run_until_parked();
         cx.update_window(control_window, |_, _, cx| {
-            assert!(control_view.read(cx).timeline.iter().any(|item| {
-                matches!(item, TimelineItem::System(note)
-                    if note.tone == SystemTone::Error
-                        && note.heading.as_deref().is_some_and(|heading| heading.starts_with("control project child")))
-            }));
+            assert!(
+                control_view
+                    .read(cx)
+                    .status_banner
+                    .as_ref()
+                    .is_some_and(|note| {
+                        note.tone == SystemTone::Error
+                            && note
+                                .heading
+                                .as_deref()
+                                .is_some_and(|heading| heading.starts_with("control project child"))
+                    })
+            );
         })
         .unwrap();
 
@@ -1000,11 +1008,19 @@ mod loom_view_render_tests {
         .unwrap();
         cx.run_until_parked();
         cx.update_window(review_window, |_, _, cx| {
-            assert!(review_view.read(cx).timeline.iter().any(|item| {
-                matches!(item, TimelineItem::System(note)
-                    if note.tone == SystemTone::Error
-                        && note.heading.as_deref().is_some_and(|heading| heading.starts_with("review project child")))
-            }));
+            assert!(
+                review_view
+                    .read(cx)
+                    .status_banner
+                    .as_ref()
+                    .is_some_and(|note| {
+                        note.tone == SystemTone::Error
+                            && note
+                                .heading
+                                .as_deref()
+                                .is_some_and(|heading| heading.starts_with("review project child"))
+                    })
+            );
         })
         .unwrap();
 
@@ -1016,11 +1032,18 @@ mod loom_view_render_tests {
         .unwrap();
         cx.run_until_parked();
         cx.update_window(integration_window, |_, _, cx| {
-            assert!(integration_view.read(cx).timeline.iter().any(|item| {
-                matches!(item, TimelineItem::System(note)
-                    if note.tone == SystemTone::Error
-                        && note.heading.as_deref().is_some_and(|heading| heading.starts_with("check child review before integration")))
-            }));
+            assert!(
+                integration_view
+                    .read(cx)
+                    .status_banner
+                    .as_ref()
+                    .is_some_and(|note| {
+                        note.tone == SystemTone::Error
+                            && note.heading.as_deref().is_some_and(|heading| {
+                                heading.starts_with("check child review before integration")
+                            })
+                    })
+            );
         })
         .unwrap();
 
@@ -1223,11 +1246,17 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
-    fn settings_about_and_providers_dialogs_render(cx: &mut TestAppContext) {
+    fn settings_about_and_providers_panes_render(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         render_scenario(cx, |view| view.settings_open = true);
-        render_scenario(cx, |view| view.about_open = true);
-        render_scenario(cx, |view| view.providers_open = true);
+        render_scenario(cx, |view| {
+            view.settings_open = true;
+            view.settings_section = SettingsSection::About;
+        });
+        render_scenario(cx, |view| {
+            view.settings_open = true;
+            view.settings_section = SettingsSection::Providers;
+        });
     }
 
     #[gpui_kit::test]
@@ -1340,11 +1369,7 @@ mod loom_view_render_tests {
                 view.choose_source(SessionSourceChoice::LocalDirectory, cx);
                 view.confirm_source_dialog(cx);
                 assert!(view.source_dialog.is_some());
-                assert!(
-                    view.timeline
-                        .iter()
-                        .any(|item| matches!(item, TimelineItem::System(_)))
-                );
+                assert!(view.status_banner.is_some());
 
                 view.choose_source(SessionSourceChoice::GitHub, cx);
                 view.choose_source(SessionSourceChoice::Empty, cx);
@@ -1378,22 +1403,18 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
-    fn account_views_and_theme_actions_update_the_view_state(cx: &mut TestAppContext) {
+    fn settings_provider_views_and_theme_actions_update_the_view_state(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
             view.review.open = true;
             view.settings_open = true;
             view.github_login = Some(GitHubLoginState::Starting);
-            view.open_about_from_menu(cx);
-            assert!(view.about_open);
-            assert!(!view.settings_open);
+            view.open_providers_from_menu(cx);
+            assert!(view.settings_open);
+            assert_eq!(view.settings_section, SettingsSection::Providers);
             assert!(!view.review.open);
             assert!(view.github_login.is_none());
-
-            view.open_providers_from_menu(cx);
-            assert!(view.providers_open);
-            assert!(!view.about_open);
             assert_eq!(view.providers_node_id.as_deref(), Some("test-node"));
 
             view.observe_system_appearance(window, cx);
@@ -1536,6 +1557,52 @@ mod loom_view_render_tests {
             });
             window.render_frame(cx);
             assert!(window.try_find("composer-completions").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn primary_shift_p_opens_the_command_palette(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            LoomView::new_for_test(cx.focus_handle())
+        });
+        let window: gpui_kit::AnyWindowHandle = handle.into();
+        cx.update_window(window, |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        // Platform key events report the shifted character for `key`, so the
+        // binding must match `P` as well as `p`.
+        let shortcut = || gpui_kit::Keystroke {
+            modifiers: gpui_kit::Modifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            },
+            key: "P".to_owned(),
+            key_char: None,
+        };
+        cx.dispatch_keystroke(window, shortcut());
+        cx.update_window(window, |view, window, cx| {
+            let view = view.downcast::<LoomView>().unwrap();
+            assert!(view.read(cx).command_palette_open);
+            window.render_frame(cx);
+            assert!(window.try_find("command-palette").is_some());
+        })
+        .unwrap();
+        // Pressing it again while the palette's own input is focused must
+        // close the palette, not get swallowed by that input.
+        cx.dispatch_keystroke(window, shortcut());
+        cx.update_window(window, |view, window, cx| {
+            let view = view.downcast::<LoomView>().unwrap();
+            assert!(!view.read(cx).command_palette_open);
+            // Tear down the palette input, dropping focus, before pressing again.
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.dispatch_keystroke(window, shortcut());
+        cx.update_window(window, |view, _window, cx| {
+            let view = view.downcast::<LoomView>().unwrap();
+            assert!(view.read(cx).command_palette_open);
         })
         .unwrap();
     }
@@ -1737,24 +1804,48 @@ mod loom_view_render_tests {
         cx.update(|cx| {
             let mut view = LoomView::new_for_test(cx.focus_handle());
             let mut inspection = loom_protocol::ContextInspection {
-                items: Vec::new(), total_tokens: 200, included_tokens: 200, omitted_tokens: 0,
+                items: Vec::new(),
+                total_tokens: 200,
+                included_tokens: 200,
+                omitted_tokens: 0,
                 budget: loom_protocol::ContextBudget::new(Some(1_000), None, 100).unwrap(),
-                compacted: false, summary: None,
+                compacted: false,
+                summary: None,
             };
             let run_id = RunId::new();
-            view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected { run_id, inspection: inspection.clone() });
+            view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected {
+                run_id,
+                inspection: inspection.clone(),
+            });
             assert!(view.timeline.is_empty());
-            assert_eq!(view.context_inspection.as_ref().unwrap().included_tokens, 200);
+            assert_eq!(
+                view.context_inspection.as_ref().unwrap().included_tokens,
+                200
+            );
             inspection.compacted = true;
             inspection.omitted_tokens = 120;
             inspection.included_tokens = 80;
-            view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected { run_id, inspection: inspection.clone() });
-            assert!(matches!(view.timeline.last(), Some(TimelineItem::System(note)) if note.text.contains("Context compacted") && note.text.contains("lossy excerpts")));
+            view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected {
+                run_id,
+                inspection: inspection.clone(),
+            });
+            assert!(
+                view.status_banner
+                    .as_ref()
+                    .is_some_and(|note| note.text.contains("Context compacted")
+                        && note.text.contains("lossy excerpts"))
+            );
             let count = view.timeline.len();
             inspection.compacted = false;
-            view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected { run_id, inspection });
+            view.consume_agent_event(&loom_protocol::AgentEvent::ContextInspected {
+                run_id,
+                inspection,
+            });
             assert_eq!(view.timeline.len(), count);
-            assert_eq!(view.context_inspection.as_ref().unwrap().included_tokens, 80);
+            assert_eq!(
+                view.context_inspection.as_ref().unwrap().included_tokens,
+                80
+            );
             view.reset_projection();
             assert!(view.context_inspection.is_none());
         });
@@ -2151,13 +2242,14 @@ mod loom_view_render_tests {
             view.model = ModelId::new("worker/uncached-model");
             view.model_catalog_node_id = None;
             view.send_message("uncached model task".to_owned(), cx);
-            assert!(view.timeline.iter().any(|item| matches!(
-                item,
-                TimelineItem::System(note)
-                    if note.tone == SystemTone::Error
-                        && note.heading.as_deref().is_some_and(|heading| heading.starts_with("start run"))
-                        && note.text.contains("has not been refreshed")
-            )));
+            assert!(view.status_banner.as_ref().is_some_and(|note| {
+                note.tone == SystemTone::Error
+                    && note
+                        .heading
+                        .as_deref()
+                        .is_some_and(|heading| heading.starts_with("start run"))
+                    && note.text.contains("has not been refreshed")
+            }));
 
             view.model = ModelId::new("deterministic/demo");
             view.send_message("try a task".to_owned(), cx);
@@ -2250,11 +2342,7 @@ mod loom_view_render_tests {
                 health: ProviderHealth::default(),
             });
             assert_eq!(view.session_state, loom_core::AgentSessionState::Archived);
-            assert!(
-                view.timeline
-                    .iter()
-                    .any(|item| matches!(item, TimelineItem::System(_)))
-            );
+            assert!(view.status_banner.is_some());
             view
         });
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
@@ -2327,7 +2415,8 @@ mod loom_view_render_tests {
         render_scenario(cx, |view| {
             let local_provider_id = loom_model::ProviderId::new("company-gateway");
             let github_provider_id = loom_model::ProviderId::new("github-copilot");
-            view.providers_open = true;
+            view.settings_open = true;
+            view.settings_section = SettingsSection::Providers;
             view.github_connected = true;
             view.providers = vec![
                 ProviderSummary {
@@ -2835,10 +2924,11 @@ mod loom_view_render_tests {
                         .update(cx, |view, cx| {
                             view.confirm_source_dialog(cx);
                             assert!(view.source_dialog.is_some());
-                            assert!(view.timeline.iter().any(|item| matches!(
-                        item,
-                        TimelineItem::System(note) if note.text == "Choose a GitHub repository"
-                    )));
+                            assert!(
+                                view.status_banner
+                                    .as_ref()
+                                    .is_some_and(|note| note.text == "Choose a GitHub repository")
+                            );
                         });
                 });
         })
@@ -3207,34 +3297,24 @@ mod responsive_layout_tests {
     #[test]
     fn review_panel_visibility_is_a_pure_layout_decision() {
         let desktop = responsive_layout(px(1280.));
-        assert!(review_panel_is_visible(
-            desktop, true, 1, false, false, false, false
-        ));
-        assert!(!review_panel_is_visible(
-            desktop, false, 1, false, false, false, false
-        ));
-        assert!(!review_panel_is_visible(
-            desktop, true, 0, false, false, false, false
-        ));
-        for modal_open in 0..4 {
-            let mut blockers = [false; 4];
+        assert!(review_panel_is_visible(desktop, true, 1, false, false));
+        assert!(!review_panel_is_visible(desktop, false, 1, false, false));
+        assert!(!review_panel_is_visible(desktop, true, 0, false, false));
+        for modal_open in 0..2 {
+            let mut blockers = [false; 2];
             blockers[modal_open] = true;
             assert!(!review_panel_is_visible(
                 desktop,
                 true,
                 1,
                 blockers[0],
-                blockers[1],
-                blockers[2],
-                blockers[3]
+                blockers[1]
             ));
         }
         assert!(!review_panel_is_visible(
             responsive_layout(px(390.)),
             true,
             1,
-            false,
-            false,
             false,
             false
         ));
@@ -4812,9 +4892,8 @@ mod provider_control_tests {
             view.open_settings_from_menu(cx);
             assert!(view.settings_open);
             view.open_providers_for_node("test-node".to_owned(), cx);
-            assert!(view.providers_open);
-            view.open_about_from_menu(cx);
-            assert!(view.about_open);
+            assert!(view.settings_open);
+            assert_eq!(view.settings_section, SettingsSection::Providers);
 
             view.handle_github_provider_configured("test-node".to_owned(), cx);
             assert!(view.github_connected);
@@ -5019,10 +5098,12 @@ mod render_state_tests {
             });
         }
         render_with(cx, |view| {
-            view.providers_open = true;
+            view.settings_open = true;
+            view.settings_section = SettingsSection::Providers;
         });
         render_with(cx, |view| {
-            view.about_open = true;
+            view.settings_open = true;
+            view.settings_section = SettingsSection::About;
         });
         render_with(cx, |view| {
             view.command_palette_open = true;

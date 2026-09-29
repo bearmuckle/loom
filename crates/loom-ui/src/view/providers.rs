@@ -652,11 +652,18 @@ impl LoomView {
         self.github_login = None;
         self.session_drawer_open = false;
         self.review.open = false;
-        self.providers_open = false;
-        self.about_open = false;
         self.settings_open = true;
         let node_id = self.default_backend_node_id.clone();
         self.refresh_github_write_access(node_id.clone(), cx);
+        self.load_provider_scope(node_id, cx);
+        cx.notify();
+    }
+
+    /// Loads the provider list for `node_id` and scopes provider settings to it.
+    fn load_provider_scope(&mut self, node_id: String, cx: &mut Context<Self>) {
+        self.providers_node_id = Some(node_id.clone());
+        self.providers.clear();
+        self.github_connected = false;
         self.dispatch_to_node(
             cx,
             node_id,
@@ -668,14 +675,13 @@ impl LoomView {
                         .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
                     view.providers = providers;
                 }
-                Err(error) => view.record_backend_error("check GitHub connection", error),
+                Err(error) => view.record_backend_error("list providers", error),
                 Ok(response) => view.record_backend_error(
-                    "check GitHub connection",
+                    "list providers",
                     unexpected_response("provider list", response),
                 ),
             },
         );
-        cx.notify();
     }
 
     pub(crate) fn persist_and_distribute_workspace_config(
@@ -806,48 +812,20 @@ impl LoomView {
         .detach();
     }
 
-    pub(crate) fn open_about_from_menu(&mut self, cx: &mut Context<Self>) {
-        self.github_login = None;
-        self.session_drawer_open = false;
-        self.review.open = false;
-        self.settings_open = false;
-        self.providers_open = false;
-        self.about_open = true;
-        cx.notify();
-    }
-
     pub(crate) fn open_providers_from_menu(&mut self, cx: &mut Context<Self>) {
-        self.open_providers_for_node(self.default_backend_node_id.clone(), cx);
+        self.settings_section = SettingsSection::Providers;
+        self.open_settings_from_menu(cx);
     }
 
+    /// Opens the Providers settings pane scoped to a specific worker node.
     pub(crate) fn open_providers_for_node(&mut self, node_id: String, cx: &mut Context<Self>) {
         self.github_login = None;
         self.session_drawer_open = false;
         self.review.open = false;
-        self.settings_open = false;
-        self.about_open = false;
-        self.providers_open = true;
-        self.providers_node_id = Some(node_id.clone());
-        self.providers.clear();
-        self.github_connected = false;
-        self.dispatch_to_node(
-            cx,
-            node_id,
-            ClientRequest::Provider(ProviderRequest::ListProviders),
-            |view, response, _| match response.result {
-                Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) => {
-                    view.github_connected = providers
-                        .iter()
-                        .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
-                    view.providers = providers;
-                }
-                Err(error) => view.record_backend_error("list providers", error),
-                Ok(response) => view.record_backend_error(
-                    "list providers",
-                    unexpected_response("provider list", response),
-                ),
-            },
-        );
+        self.settings_section = SettingsSection::Providers;
+        self.settings_open = true;
+        self.refresh_github_write_access(node_id.clone(), cx);
+        self.load_provider_scope(node_id, cx);
         cx.notify();
     }
 
@@ -923,11 +901,8 @@ impl LoomView {
                         ),
                     );
                     view.record_status(format!("Provider configured on {node_id}"));
-                    view.open_providers_for_node(node_id, cx);
-                    view.refresh_models_for_node_async(
-                        view.providers_node_id.clone().unwrap_or_default(),
-                        cx,
-                    );
+                    view.load_provider_scope(node_id.clone(), cx);
+                    view.refresh_models_for_node_async(node_id, cx);
                 }
                 Err(error) => {
                     view.provider_setup_status.insert(
@@ -948,33 +923,18 @@ impl LoomView {
         );
     }
 
-    pub(crate) fn close_providers(
+    pub(crate) fn close_settings(
         &mut self,
         _: &ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.providers_open = false;
+        self.settings_open = false;
         for input in self.provider_api_key_inputs.values() {
             input.update(cx, |state, cx| state.set_value("", window, cx));
         }
         self.provider_api_key_inputs.clear();
         self.provider_setup_status.clear();
-        cx.notify();
-    }
-
-    pub(crate) fn close_settings(
-        &mut self,
-        _: &ClickEvent,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.settings_open = false;
-        cx.notify();
-    }
-
-    pub(crate) fn close_about(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.about_open = false;
         cx.notify();
     }
 

@@ -143,17 +143,9 @@ pub(crate) fn review_panel_is_visible(
     review_open: bool,
     session_count: usize,
     settings_open: bool,
-    about_open: bool,
-    providers_open: bool,
     github_login_open: bool,
 ) -> bool {
-    !layout.phone
-        && review_open
-        && session_count > 0
-        && !settings_open
-        && !about_open
-        && !providers_open
-        && !github_login_open
+    !layout.phone && review_open && session_count > 0 && !settings_open && !github_login_open
 }
 
 #[cfg(test)]
