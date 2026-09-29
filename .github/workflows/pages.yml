@@ -28,7 +28,7 @@ jobs:
           node-version: 24
 
       - name: Test browser entry point
-        run: node --experimental-vm-modules --test scripts/browser-entry.test.mjs
+        run: node --experimental-vm-modules --test scripts/browser-entry.test.mjs scripts/pwa.test.mjs
 
       - name: Install Rust and WASM target
         uses: dtolnay/rust-toolchain@stable

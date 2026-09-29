@@ -2,18 +2,69 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
     <title>Loom</title>
+    <meta
+      name="description"
+      content="Local agent workspace and orchestration client for running coding agents."
+    />
+    <meta
+      name="theme-color"
+      content="#111318"
+      media="(prefers-color-scheme: dark)"
+    />
+    <meta
+      name="theme-color"
+      content="#f8fafc"
+      media="(prefers-color-scheme: light)"
+    />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="Loom" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <link data-trunk rel="copy-file" href="pwa/manifest.webmanifest" />
+    <link data-trunk rel="copy-file" href="pwa/sw.js" />
+    <link data-trunk rel="copy-file" href="pwa/icon.svg" />
+    <link data-trunk rel="copy-file" href="pwa/icon-192.png" />
+    <link data-trunk rel="copy-file" href="pwa/icon-512.png" />
+    <link data-trunk rel="copy-file" href="pwa/icon-maskable-512.png" />
+    <link data-trunk rel="copy-file" href="pwa/apple-touch-icon.png" />
     <style>
       html,
       body {
         margin: 0;
         height: 100%;
+        overflow: hidden;
+        overscroll-behavior: none;
         color-scheme: light dark;
         background: Canvas;
       }
+
+      body {
+        box-sizing: border-box;
+        /* Keep the rendered canvas clear of notches and the home indicator on
+           devices with safe areas while still filling the rest of the screen. */
+        padding: env(safe-area-inset-top) env(safe-area-inset-right)
+          env(safe-area-inset-bottom) env(safe-area-inset-left);
+        -webkit-tap-highlight-color: transparent;
+      }
     </style>
     <link data-trunk rel="rust" data-bin="loom-ui" data-wasm-opt="0" />
+    <script>
+      // A registered service worker is required for browsers to offer
+      // "Install app" and launch Loom standalone (fullscreen) on mobile.
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          navigator.serviceWorker.register("sw.js").catch(() => {});
+        });
+      }
+    </script>
   </head>
   <body></body>
 </html>
