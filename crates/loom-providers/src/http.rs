@@ -88,3 +88,33 @@ pub fn health_endpoint(endpoint: &str) -> String {
         .strip_suffix("/chat/completions")
         .map_or_else(|| endpoint.to_owned(), |base| format!("{base}/models"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoint_helpers_normalize_paths() {
+        assert_eq!(bearer_header("abc"), "Bearer abc");
+        assert_eq!(
+            trim_endpoint("https://api.example/v1/"),
+            "https://api.example/v1"
+        );
+        assert_eq!(
+            ollama_chat_endpoint("http://localhost:11434/".to_owned()),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert_eq!(
+            ollama_chat_endpoint("http://localhost:11434/v1/chat/completions".to_owned()),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert_eq!(
+            health_endpoint("https://api.example/v1/chat/completions"),
+            "https://api.example/v1/models"
+        );
+        assert_eq!(
+            health_endpoint("https://api.example/v1/models"),
+            "https://api.example/v1/models"
+        );
+    }
+}

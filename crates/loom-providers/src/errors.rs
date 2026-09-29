@@ -52,3 +52,39 @@ pub fn normalize_transport_error(provider: &str, _detail: &str) -> LoomError {
         true,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cost_uses_per_thousand_micros() {
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            cached_input_tokens: 0,
+        };
+        assert_eq!(cost_for_usage(&usage, 1_000, 2_000), 4_000);
+        assert_eq!(cost_for_usage(&usage, 0, 0), 0);
+    }
+
+    #[test]
+    fn provider_status_errors_map_to_stable_codes() {
+        assert_eq!(
+            normalize_provider_error("openai", 401).code,
+            ErrorCode::ProviderAuthentication
+        );
+        assert_eq!(
+            normalize_provider_error("openai", 429).code,
+            ErrorCode::ProviderRateLimited
+        );
+        assert_eq!(
+            normalize_provider_error("openai", 503).code,
+            ErrorCode::ProviderUnavailable
+        );
+        assert_eq!(
+            normalize_provider_error("openai", 400).code,
+            ErrorCode::ProviderInvalidResponse
+        );
+    }
+}
