@@ -581,7 +581,12 @@ impl LoomView {
             .into_any()
     }
 
-    pub(crate) fn render_settings_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_settings_dialog(
+        &self,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let phone = layout.phone;
         let default_model_body = self.default_model_select.as_ref().map_or_else(
             || div().into_any_element(),
             |state| {
@@ -625,12 +630,19 @@ impl LoomView {
                                     }
                                 }),
                             true,
+                            phone,
                         ))
                         .child(settings_row(
                             "Default model for new sessions",
                             "Used when a session has no model of its own",
-                            div().w(px(320.)).child(default_model_body),
+                            if phone {
+                                div().w_full()
+                            } else {
+                                div().w(px(320.))
+                            }
+                            .child(default_model_body),
                             false,
+                            phone,
                         ))
                         .child(settings_row(
                             "Session indicator pulse threshold",
@@ -664,6 +676,7 @@ impl LoomView {
                                     })),
                             ),
                             false,
+                            phone,
                         ))
                         .child(settings_row(
                             "Parallel project agents",
@@ -694,6 +707,7 @@ impl LoomView {
                                     })),
                             ),
                             false,
+                            phone,
                         )),
                 )
                 .into_any_element(),
@@ -720,6 +734,7 @@ impl LoomView {
                         div()
                             .w_full()
                             .flex()
+                            .flex_wrap()
                             .items_start()
                             .gap_3()
                             .px_4()
@@ -804,6 +819,7 @@ impl LoomView {
                                 }
                             }),
                         true,
+                        phone,
                     )),
                 )
                 .child(self.render_api_key_providers(cx))
@@ -836,6 +852,7 @@ impl LoomView {
                     div()
                         .w_full()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .gap_2()
                         .px_4()
@@ -958,6 +975,7 @@ impl LoomView {
                             "Follow the system or choose a palette",
                             div()
                                 .flex()
+                                .flex_wrap()
                                 .items_center()
                                 .gap_1()
                                 .p_1()
@@ -990,6 +1008,7 @@ impl LoomView {
                                     },
                                 )),
                             true,
+                            phone,
                         ))
                         .child(settings_row(
                             "Font size",
@@ -1048,6 +1067,7 @@ impl LoomView {
                                         })),
                                 ),
                             false,
+                            phone,
                         )),
                 )
                 .into_any_element(),
@@ -1103,8 +1123,9 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .px_6()
-                    .py_4()
+                    .px_4()
+                    .when(!phone, |element| element.px_6().py_4())
+                    .when(phone, |element| element.py_3())
                     .border_b_1()
                     .border_color(rgb(0x242833))
                     .child(div().text_sm().text_color(rgb(0xf3f4f6)).child("Settings"))
@@ -1137,14 +1158,19 @@ impl LoomView {
                     .flex_1()
                     .min_h(px(0.))
                     .flex()
-                    .child(settings_nav(section, cx))
+                    .when(phone, |element| element.flex_col())
+                    .child(settings_nav(section, phone, cx))
                     .child(
                         div()
                             .id("settings-content")
+                            .test_support()
                             .flex_1()
                             .min_w(px(0.))
+                            .min_h(px(0.))
+                            .w_full()
                             .h_full()
-                            .p_6()
+                            .p_4()
+                            .when(!phone, |element| element.p_6())
                             .overflow_y_scroll()
                             .child(content),
                     ),

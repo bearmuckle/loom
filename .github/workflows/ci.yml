@@ -21,7 +21,7 @@ jobs:
         with:
           node-version: 24
       - name: Test browser entry point
-        run: node --experimental-vm-modules --test scripts/browser-entry.test.mjs
+        run: node --experimental-vm-modules --test scripts/browser-entry.test.mjs scripts/pwa.test.mjs
 
   rust:
     runs-on: ubuntu-latest

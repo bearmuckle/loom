@@ -740,18 +740,27 @@ fn settings_card() -> gpui_kit::Div {
 }
 
 /// One settings row: title and description on the left, a single control on the
-/// right. `first` suppresses the divider on the first row of a card.
+/// right. On phone layouts the control moves below the text and spans the full
+/// width so wide controls never overflow the card. `first` suppresses the
+/// divider on the first row of a card.
 fn settings_row(
     label: &str,
     description: &str,
     control: impl IntoElement,
     first: bool,
+    phone: bool,
 ) -> impl IntoElement {
+    let control = if phone {
+        div().w_full().child(control)
+    } else {
+        div().flex_shrink_0().child(control)
+    };
     div()
         .w_full()
-        .flex()
-        .items_center()
-        .gap_4()
+        .when(phone, |element| {
+            element.flex().flex_col().items_start().gap_2()
+        })
+        .when(!phone, |element| element.flex().items_center().gap_4())
         .px_4()
         .py_3()
         .when(!first, |element| {
@@ -759,8 +768,8 @@ fn settings_row(
         })
         .child(
             div()
-                .flex_1()
                 .min_w(px(0.))
+                .when(!phone, |element| element.flex_1())
                 .child(div().text_sm().child(label.to_owned()))
                 .child(
                     div()
@@ -769,7 +778,7 @@ fn settings_row(
                         .child(description.to_owned()),
                 ),
         )
-        .child(div().flex_shrink_0().child(control))
+        .child(control)
 }
 
 /// A `- value +` control used by numeric settings rows.
@@ -787,17 +796,36 @@ fn settings_stepper(
         .child(increase)
 }
 
-/// The settings dialog's section navigation.
-fn settings_nav(section: SettingsSection, cx: &mut Context<LoomView>) -> impl IntoElement {
+/// The settings dialog's section navigation. On phone layouts the sections
+/// become a wrapping tab strip above the content; on larger screens they stay
+/// a vertical sidebar.
+fn settings_nav(
+    section: SettingsSection,
+    phone: bool,
+    cx: &mut Context<LoomView>,
+) -> impl IntoElement {
     div()
         .flex_shrink_0()
-        .w(px(180.))
-        .h_full()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .p_3()
-        .border_r_1()
+        .when(phone, |element| {
+            element
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .p_3()
+                .border_b_1()
+        })
+        .when(!phone, |element| {
+            element
+                .w(px(180.))
+                .h_full()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_3()
+                .border_r_1()
+        })
         .border_color(rgb(0x242833))
         .children(
             SETTINGS_SECTIONS
@@ -808,6 +836,7 @@ fn settings_nav(section: SettingsSection, cx: &mut Context<LoomView>) -> impl In
                     div()
                         .id(("settings-section", index))
                         .test_support()
+                        .flex_shrink_0()
                         .px_3()
                         .py_2()
                         .rounded_md()
