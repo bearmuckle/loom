@@ -4183,3 +4183,13 @@ fn schema_records_baseline_version_and_rejects_future_versions() {
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn in_memory_backend_shares_the_sqlite_code_path() {
+    let store = FilePersistence::in_memory();
+    store
+        .save_state_with_sessions(&SessionManager::default().export_state())
+        .unwrap();
+    let loaded = store.load_sessions().unwrap();
+    assert!(loaded.is_none_or(|state| state.sessions.is_empty()));
+}

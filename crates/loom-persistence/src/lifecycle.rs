@@ -17,7 +17,20 @@ impl FilePersistence {
             path,
             connection: Arc::new(Mutex::new(None)),
             owner_lock: Arc::new(Mutex::new(None)),
+            in_memory: false,
         })
+    }
+
+    /// Opens a private, in-memory SQLite store that shares the file-backed
+    /// schema, repository, and migration code path. Used for tests, previews,
+    /// and ephemeral local state.
+    pub fn in_memory() -> Self {
+        Self {
+            path: PathBuf::from(":memory:"),
+            connection: Arc::new(Mutex::new(None)),
+            owner_lock: Arc::new(Mutex::new(None)),
+            in_memory: true,
+        }
     }
 
     /// Opens the store as the exclusive writer for a backend process. The lock
@@ -429,7 +442,7 @@ impl FilePersistence {
             )
         })?;
         if cached.is_none() {
-            if !create && !self.path.is_file() {
+            if !create && !self.in_memory && !self.path.is_file() {
                 return Err(persistence_error(
                     "persistence database does not exist".to_owned(),
                     false,

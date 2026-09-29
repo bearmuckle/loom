@@ -94,6 +94,7 @@ pub struct FilePersistence {
     path: PathBuf,
     connection: Arc<Mutex<Option<Connection>>>,
     owner_lock: Arc<Mutex<Option<fs::File>>>,
+    in_memory: bool,
 }
 
 struct CachedConnection<'a>(MutexGuard<'a, Option<Connection>>);
