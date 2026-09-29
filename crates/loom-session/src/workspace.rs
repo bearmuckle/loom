@@ -1,12 +1,8 @@
 use std::{cmp::Reverse, collections::BTreeMap};
 
-use loom_core::{LoomError, Result, Timestamp, WorkspaceId, WorkspaceRecord};
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceManagerState {
-    pub workspaces: BTreeMap<WorkspaceId, WorkspaceRecord>,
-}
+use loom_core::{
+    LoomError, Result, Timestamp, WorkspaceId, WorkspaceManagerState, WorkspaceRecord,
+};
 
 #[derive(Debug, Default)]
 pub struct WorkspaceManager {

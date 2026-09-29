@@ -18,6 +18,16 @@ use regex::RegexBuilder;
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
+
+fn run_async<T>(
+    future: impl std::future::Future<Output = std::result::Result<T, String>>,
+) -> std::result::Result<T, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start the HTTP runtime: {error}"))?
+        .block_on(future)
+}
 use url::Url;
 
 /// A server-owned set of tools attached to one agent session. Extensions can
@@ -220,21 +230,28 @@ impl WebSearchProvider for HtmlSearchProvider {
             let mut query = url.query_pairs_mut();
             query.append_pair("q", &request.query);
         }
-        let mut response = ureq::get(url.as_str())
-            .header("User-Agent", "Loom/0.1 (web search)")
-            .config()
-            .timeout_global(Some(WEB_SEARCH_TIMEOUT))
-            .http_status_as_error(false)
-            .build()
-            .call()
-            .map_err(|error| format!("web search request failed: {error}"))?;
-        let status = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_WEB_SEARCH_BODY_BYTES)
-            .read_to_string()
-            .map_err(|error| format!("could not read web search response: {error}"))?;
+        let (status, body) = run_async(async {
+            let client = reqwest::Client::builder()
+                .timeout(WEB_SEARCH_TIMEOUT)
+                .build()
+                .map_err(|error| format!("web search request failed: {error}"))?;
+            let response = client
+                .get(url.as_str())
+                .header("User-Agent", "Loom/0.1 (web search)")
+                .send()
+                .await
+                .map_err(|error| format!("web search request failed: {error}"))?;
+            let status = response.status().as_u16();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| format!("could not read web search response: {error}"))?;
+            let text = text
+                .chars()
+                .take(MAX_WEB_SEARCH_BODY_BYTES as usize)
+                .collect::<String>();
+            Ok::<_, String>((status, text))
+        })?;
         if status >= 400 {
             return Err(format!(
                 "web search provider rejected the request (HTTP {status}): {}",
@@ -964,42 +981,40 @@ impl ToolExecutor {
             return Err("repository must be in owner/name format".to_owned());
         }
         let url = format!("https://api.github.com/repos/{repository}/{path}");
-        let response = match method {
-            "GET" => ureq::get(&url)
+        let (status, body) = run_async(async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|error| format!("GitHub request failed: {error}"))?;
+            let request = match method {
+                "GET" => client.get(&url),
+                "POST" => client
+                    .post(&url)
+                    .json(&body.unwrap_or(serde_json::Value::Null)),
+                _ => return Err("unsupported GitHub API method".to_owned()),
+            };
+            let response = request
                 .header("Accept", "application/vnd.github+json")
-                .header("Authorization", &format!("Bearer {token}"))
+                .header("Authorization", format!("Bearer {token}"))
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .header("User-Agent", "Loom")
-                .config()
-                .timeout_global(Some(Duration::from_secs(15)))
-                .http_status_as_error(false)
-                .build()
-                .call(),
-            "POST" => ureq::post(&url)
-                .header("Accept", "application/vnd.github+json")
-                .header("Authorization", &format!("Bearer {token}"))
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .header("User-Agent", "Loom")
-                .config()
-                .timeout_global(Some(Duration::from_secs(15)))
-                .http_status_as_error(false)
-                .build()
-                .send_json(body.unwrap_or(serde_json::Value::Null)),
-            _ => return Err("unsupported GitHub API method".to_owned()),
-        }
-        .map_err(|error| format!("GitHub request failed: {error}"))?;
-        let status = response.status().as_u16();
-        let mut response = response;
+                .send()
+                .await
+                .map_err(|error| format!("GitHub request failed: {error}"))?;
+            let status = response.status().as_u16();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| format!("GitHub request failed: {error}"))?;
+            Ok::<_, String>((status, text))
+        })?;
         if status >= 400 {
-            let detail = response.body_mut().read_to_string().unwrap_or_default();
             return Err(format!(
                 "GitHub API returned HTTP {status}: {}",
-                truncate_text(&detail, 1024)
+                truncate_text(&body, 1024)
             ));
         }
-        response
-            .body_mut()
-            .read_json()
+        serde_json::from_str(&body)
             .map_err(|error| format!("GitHub returned an invalid response: {error}"))
     }
 
@@ -2358,5 +2373,82 @@ mod tests {
                 .get("max_results")
                 .is_some()
         );
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn domain_normalization_and_filtering() {
+        assert_eq!(
+            normalize_domains(vec![
+                " Example.COM ".to_owned(),
+                "example.com".to_owned(),
+                "a.b.".to_owned(),
+            ])
+            .unwrap(),
+            vec!["example.com".to_owned(), "a.b".to_owned()]
+        );
+        assert!(normalize_domains(vec!["bad/domain".to_owned()]).is_err());
+        assert!(normalize_domains(vec!["with space".to_owned()]).is_err());
+        assert!(normalize_domains(vec!["".to_owned()]).is_err());
+        assert!(domain_is_allowed(
+            "https://sub.example.com/x",
+            &["example.com".to_owned()]
+        ));
+        assert!(!domain_is_allowed(
+            "https://evil.test",
+            &["example.com".to_owned()]
+        ));
+        assert!(domain_is_allowed("not a url", &[]));
+        assert!(!domain_is_allowed("not a url", &["example.com".to_owned()]));
+    }
+
+    #[test]
+    fn search_url_normalization() {
+        assert_eq!(
+            normalize_search_url("https://example.com/x"),
+            Some("https://example.com/x".to_owned())
+        );
+        assert!(normalize_search_url("//example.com/x").is_some());
+        assert!(normalize_search_url("javascript:alert(1)").is_none());
+        assert_eq!(
+            normalize_search_url("https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com"),
+            Some("https://example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn truncation_helpers_preserve_boundaries() {
+        assert_eq!(truncate_text("abc", 10), "abc");
+        assert_eq!(truncate_text("abcdef", 3), "abc...");
+        assert_eq!(floor_char_boundary("héllo", 2), 1);
+        assert_eq!(ceil_char_boundary("héllo", 2), 3);
+        assert_eq!(floor_char_boundary("abc", 100), 3);
+        assert_eq!(ceil_char_boundary("abc", 100), 3);
+        let middle = truncate_middle(&"x".repeat(1000), 100);
+        assert!(middle.len() <= 100);
+        assert!(middle.contains("bytes omitted"));
+    }
+
+    #[test]
+    fn limit_glob_and_repository_validation() {
+        assert_eq!(parse_limit(None, 5, 10, "x").unwrap(), 5);
+        assert_eq!(parse_limit(Some(3), 5, 10, "x").unwrap(), 3);
+        assert!(parse_limit(Some(0), 5, 10, "x").is_err());
+        assert!(parse_limit(Some(11), 5, 10, "x").is_err());
+        assert!(compile_glob(Some("*.rs")).unwrap().is_some());
+        assert!(compile_glob(Some("[")).is_err());
+        assert!(compile_glob(None).unwrap().is_none());
+        assert!(valid_github_repository("owner/name"));
+        assert!(valid_github_repository("owner/na-me_1.2"));
+        assert!(!valid_github_repository("owner"));
+        assert!(!valid_github_repository("owner/"));
+        assert!(!valid_github_repository("owner/name/extra"));
+        assert!(!valid_github_repository("ow ner/name"));
+        assert_eq!(entry_depth("a", "a"), 0);
+        assert_eq!(entry_depth("a/b/c", "a"), 2);
     }
 }

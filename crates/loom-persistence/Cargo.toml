@@ -17,8 +17,6 @@ harness = false
 [dependencies]
 loom-core.workspace = true
 loom-model.workspace = true
-loom-providers.workspace = true
-loom-session.workspace = true
 loom-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -26,3 +24,6 @@ uuid.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
 flate2.workspace = true
+
+[dev-dependencies]
+loom-session.workspace = true

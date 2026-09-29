@@ -25,10 +25,12 @@ pub use project::{
     ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProjectWorktreeStatus,
     TaskContextReference,
 };
-pub use session::{AgentSessionSnapshot, AgentSessionState, SessionEvent, SessionEventRecord};
+pub use session::{
+    AgentSessionSnapshot, AgentSessionState, SessionEvent, SessionEventRecord, SessionManagerState,
+};
 pub use time::Timestamp;
 pub use version::ProtocolVersion;
-pub use workspace::WorkspaceRecord;
+pub use workspace::{WorkspaceManagerState, WorkspaceRecord};
 
 use serde::{Deserialize, Serialize};
 

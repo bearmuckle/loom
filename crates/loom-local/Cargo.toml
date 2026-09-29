@@ -1,0 +1,19 @@
+[package]
+name = "loom-local"
+description = "Native launcher and local backend embedding for Loom clients."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-core.workspace = true
+loom-model.workspace = true
+loom-protocol.workspace = true
+loom-server.workspace = true
+loom-persistence.workspace = true
+loom-providers.workspace = true
+loom-vcs.workspace = true
+sha2.workspace = true
+keyring.workspace = true
+tokio.workspace = true

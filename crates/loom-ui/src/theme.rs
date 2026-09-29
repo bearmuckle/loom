@@ -422,11 +422,11 @@ pub(crate) fn apply_theme(appearance: WindowAppearance, cx: &mut App) {
     sync_palette(cx);
 }
 
-pub(crate) fn change_color(kind: loom_workspace::WorkspaceChangeKind) -> Rgba {
+pub(crate) fn change_color(kind: loom_protocol::WorkspaceChangeKind) -> Rgba {
     match kind {
-        loom_workspace::WorkspaceChangeKind::Created => rgb(0x9ad7bd),
-        loom_workspace::WorkspaceChangeKind::Deleted => rgb(0xfca5a5),
-        loom_workspace::WorkspaceChangeKind::Modified => rgb(0xfef3c7),
+        loom_protocol::WorkspaceChangeKind::Created => rgb(0x9ad7bd),
+        loom_protocol::WorkspaceChangeKind::Deleted => rgb(0xfca5a5),
+        loom_protocol::WorkspaceChangeKind::Modified => rgb(0xfef3c7),
     }
 }
 
@@ -529,15 +529,15 @@ mod tests {
     #[test]
     fn workspace_change_colors_keep_their_semantic_defaults() {
         assert_eq!(
-            change_color(loom_workspace::WorkspaceChangeKind::Created),
+            change_color(loom_protocol::WorkspaceChangeKind::Created),
             gpui_kit::rgb(0x9ad7bd)
         );
         assert_eq!(
-            change_color(loom_workspace::WorkspaceChangeKind::Deleted),
+            change_color(loom_protocol::WorkspaceChangeKind::Deleted),
             gpui_kit::rgb(0xfca5a5)
         );
         assert_eq!(
-            change_color(loom_workspace::WorkspaceChangeKind::Modified),
+            change_color(loom_protocol::WorkspaceChangeKind::Modified),
             gpui_kit::rgb(0xfef3c7)
         );
     }

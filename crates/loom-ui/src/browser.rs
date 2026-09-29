@@ -249,15 +249,10 @@ fn browser_storage() -> Result<Storage, LoomError> {
         })
 }
 
-/// Appends the bearer token as a query parameter, since a browser
-/// `WebSocket` cannot set an `Authorization` header during the handshake.
-fn websocket_url(remote: &str, token: &str) -> String {
-    let separator = if remote.contains('?') { '&' } else { '?' };
-    format!(
-        "{remote}{separator}access_token={}",
-        js_sys::encode_uri_component(token)
-    )
-}
+/// Prefix for the bearer token subprotocol. A browser `WebSocket` cannot set an
+/// `Authorization` header during the handshake, so the token travels in
+/// `Sec-WebSocket-Protocol` instead of the URL.
+const BEARER_SUBPROTOCOL_PREFIX: &str = "loom.bearer.";
 
 struct SocketState {
     socket: WebSocket,
@@ -296,7 +291,11 @@ pub(crate) struct BrowserConnection {
 
 impl BrowserConnection {
     pub(crate) fn connect(remote: &str, token: &str) -> Result<Self, LoomError> {
-        let socket = WebSocket::new(&websocket_url(remote, token)).map_err(|_| {
+        let protocols = js_sys::Array::new();
+        protocols.push(&JsValue::from_str(&format!(
+            "{BEARER_SUBPROTOCOL_PREFIX}{token}"
+        )));
+        let socket = WebSocket::new_with_str_sequence(remote, &protocols).map_err(|_| {
             LoomError::new(
                 ErrorCode::InvalidRequest,
                 "could not open a worker WebSocket; check the ws:// or wss:// URL and path",

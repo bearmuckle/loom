@@ -4,21 +4,14 @@ use loom_core::{
     AgentSessionId, AgentSessionSnapshot, AgentSessionState, EventSequence, LoomError, Result,
     SessionEvent, SessionEventRecord, Timestamp, WorkspaceId,
 };
-use serde::{Deserialize, Serialize};
-
 mod project;
 mod workspace;
 
+pub use loom_core::{SessionManagerState, WorkspaceManagerState};
 pub use project::{
     AgentMembership, MAX_AGENT_DEPTH, ProjectManager, ProjectManagerState, ProjectRecord,
 };
-pub use workspace::{WorkspaceManager, WorkspaceManagerState};
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SessionManagerState {
-    pub sessions: BTreeMap<AgentSessionId, AgentSessionSnapshot>,
-    pub next_sequence: EventSequence,
-}
+pub use workspace::WorkspaceManager;
 
 #[derive(Debug, Default)]
 pub struct SessionManager {

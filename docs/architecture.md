@@ -29,8 +29,10 @@
 The frontend is a GPUI application using `gpui-kit` for shared native and
 browser support. `loom-ui` is organized into:
 
-- `view`: the session navigator, run canvas, composer, review drawer, and the
-  client-side projection they render.
+- `view`: screen modules (navigator, canvas, composer, review drawer, settings)
+  plus the client-side projection they render. The `LoomView` implementation is
+  split by concern under `view/{lifecycle,sessions,project,runs,composer,
+  providers,workers,source,review,render,helpers}`.
 - `state`: projection types and pure formatting helpers derived from protocol
   responses and events.
 - `connection`: the transport-independent protocol client plus the connection
@@ -38,9 +40,14 @@ browser support. `loom-ui` is organized into:
 - `theme`: the semantic colour palette resolved against the active
   `gpui-kit` theme. Window chrome and decorations are provided by
   `gpui-kit`'s window root, not by Loom.
-- `platform`: native adapters (process arguments, workspace preparation, local
-  credential storage, repository bootstrap) that a browser target cannot use
-  unchanged.
+
+Native adapters (process arguments, workspace preparation, local credential
+storage, repository bootstrap, backend state files, the in-process/remote
+transport, and the GitHub Copilot device-login flow) live in `loom-local`, not
+in the UI. `loom-ui` therefore depends only on `loom-protocol` (plus
+`loom-core`/`loom-model` for protocol types and `loom-local` on native
+targets), so the native and browser paths share the same protocol client
+surface and neither links the backend implementation.
 
 Backend requests are submitted to a single connection worker thread and
 awaited on a background task, so no UI handler blocks on backend latency. The
@@ -77,15 +84,22 @@ Suggested backend boundaries:
 - `loom-model`: provider-independent model requests, streamed responses,
   tool-call normalization, token accounting, and model capabilities.
 - `loom-providers`: adapters for hosted APIs, OpenAI-compatible endpoints,
-  local model servers, authentication, rate limits, and provider health.
+  local model servers, authentication, rate limits, and provider health. HTTP
+  and streaming use an async `reqwest`/`tokio` client driven from synchronous
+  workers with a runtime.
 - `loom-context`: context inspection and assembly, repository/system
   instructions, summaries, compaction, and explicit token budgets.
-- `loom-persistence`: typed, indexed SQLite state storage with a single
-  baseline schema used by the in-process backend. Durable state is written in
-  per-mutation transactions, and large immutable payloads live in a
-  content-addressed store inside SQLite. There is no migration ladder, so an
-  incompatible database is rejected and must be wiped; domain and protocol
-  types remain provider-neutral.
+- `loom-persistence`: typed, indexed SQLite state storage used by the
+  in-process backend, split into per-aggregate repository traits (catalog,
+  session, run, filesystem, feed, project) behind a `Persistence` supertrait.
+  Durable state is written in per-mutation transactions, and large immutable
+  payloads live in a content-addressed store inside SQLite. It uses a single
+  baseline schema (currently version 2); a database written by any other
+  revision is rejected unchanged and must be wiped. `FilePersistence` and
+  `FilePersistence::in_memory()` share the same schema, repository, and
+  serialization code path. The crate depends only on neutral domain crates
+  (`loom-core`/`loom-model`) and the protocol contract, never on
+  `loom-session`/`loom-providers`.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
   result normalization, and tool adapters. Workspace exploration is bounded:
   search supports literal or regex matching with context and a result cap,
@@ -104,7 +118,15 @@ Suggested backend boundaries:
   backend implementation; the backend crates depend on the contract and
   produce its types.
 - `loom-server`: listeners, authentication, connection management, and
-  deployment configuration.
+  deployment configuration. The composition root owns the `InProcessBackend`,
+  whose request dispatch is split into per-domain modules under `dispatch/`,
+  per-domain connection helpers under `connection/`, and owned services
+  (`IdempotencyStore`, `CredentialService`, `AdmissionService`) under
+  `services/`.
+- `loom-local`: the native launcher and local backend host. It owns process
+  arguments, persistence-path preparation, schema status/reset, local
+  credential storage, repository bootstrap, and native backend embedding, so
+  `loom-ui` does not link backend implementation crates directly.
 - `loom-cli`: local server startup, diagnostics, and administration.
 
 The backend should expose domain services rather than exposing raw model APIs,
@@ -263,16 +285,17 @@ raw keys.
 
 The persistence layer stores typed SQLite tables covering session state, the
 authoritative event journal, serializable agent runtime state, workspace state
-and checkpoints, policy decisions, provider health, and usage ledgers. Loom is
-pre-1.0 and has no migration ladder: a database written by another revision is
-rejected unchanged and must be wiped. A runtime that was executing during a
-process crash is recovered in `paused` state so a new connection must
-explicitly resume it.
+and checkpoints, policy decisions, provider health, and usage ledgers. It uses
+a single baseline schema; a database written by another revision is rejected
+unchanged and must be wiped. A runtime that was executing during a process
+crash is recovered in `paused` state so a new connection must explicitly
+resume it.
 
 Remote access uses the same domain services through a transport adapter:
 
 ```text
-HTTP upgrade + bearer token
+HTTP upgrade + bearer credential
+ (Authorization header or loom.bearer subprotocol)
           |
   bounded WebSocket connection
           |
@@ -291,7 +314,7 @@ entered the synchronous runtime is deliberately not tied to the connection.
 
 ## Repository layout
 
-The repository should evolve toward a Rust workspace:
+The repository is a Rust workspace:
 
 ```text
 crates/
@@ -308,6 +331,7 @@ crates/
   loom-vcs/
   loom-protocol/
   loom-server/
+  loom-local/
   loom-cli/
   loom-ui/
 ```

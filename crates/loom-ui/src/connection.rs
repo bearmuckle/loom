@@ -10,20 +10,12 @@
 
 use std::collections::BTreeMap;
 #[cfg(not(target_family = "wasm"))]
-use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-#[cfg(not(target_family = "wasm"))]
-use std::{
-    sync::mpsc::{self, Sender},
-    time::Duration,
-};
-
-#[cfg(all(not(target_family = "wasm"), not(test)))]
-use std::thread;
-
+#[cfg(target_family = "wasm")]
 use futures_channel::oneshot;
 use loom_core::{
-    AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, RequestId, WorkspaceId,
+    AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, WorkspaceId,
     WorkspaceRecord,
 };
 use loom_model::ModelId;
@@ -32,11 +24,17 @@ use loom_model::ProviderId;
 #[cfg(not(target_family = "wasm"))]
 use loom_protocol::AgentRunSnapshot;
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ResponseEnvelope, ServerResponse,
-    SessionRepository, WorkerNodeStatus, WorkspaceConfig,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, ProviderRequest,
+    ProviderResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope, ResponseEnvelope,
+    ServerResponse, SessionRepository, SessionResponse, WorkerNodeStatus, WorkspaceConfig,
+    WorkspaceRequest, WorkspaceResponse,
 };
+#[cfg(not(target_family = "wasm"))]
+use loom_protocol::{RunRequest, RunResponse};
 #[cfg(target_family = "wasm")]
 use std::task::Poll;
+
+pub(crate) use crate::backend_host::BackendWorker;
 
 pub(crate) fn redact_secret(value: &str, secret: &str) -> String {
     if secret.is_empty() {
@@ -122,9 +120,6 @@ pub(crate) fn describe_startup_connection_error(error: &LoomError, secret: &str)
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-use loom_server::{InProcessConnection, WebSocketConnection, WebSocketTransport};
-
 #[cfg(target_family = "wasm")]
 use crate::browser::BrowserConnection;
 #[cfg(target_family = "wasm")]
@@ -133,13 +128,9 @@ use wasm_bindgen::{JsCast, closure::Closure};
 #[derive(Clone)]
 pub(crate) enum ClientConnection {
     #[cfg(not(target_family = "wasm"))]
-    InProcess(Box<InProcessConnection>),
+    InProcess(Box<loom_local::LocalConnection>),
     #[cfg(not(target_family = "wasm"))]
-    Remote {
-        runtime: Arc<tokio::runtime::Runtime>,
-        connection: Arc<Mutex<WebSocketConnection>>,
-        secure_for_secrets: bool,
-    },
+    Remote(loom_local::RemoteConnection),
     #[cfg(target_family = "wasm")]
     Disconnected,
     #[cfg(target_family = "wasm")]
@@ -176,38 +167,11 @@ impl ClientConnection {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn remote(url: String, token: String) -> Result<Self, LoomError> {
         let secure_for_secrets = remote_url_is_secure_for_secrets(&url);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Internal,
-                    format!("could not create remote client runtime: {error}"),
-                    false,
-                )
-            })?;
-        let connection = runtime.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(15),
-                WebSocketTransport::new(&url, &token).connect(),
-            )
-            .await
-        });
-        let connection = match connection {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(LoomError::new(
-                    ErrorCode::DeadlineExceeded,
-                    "worker connection timed out",
-                    true,
-                ));
-            }
-        };
-        Ok(Self::Remote {
-            runtime: Arc::new(runtime),
-            connection: Arc::new(Mutex::new(connection)),
+        Ok(Self::Remote(loom_local::RemoteConnection::connect(
+            &url,
+            &token,
             secure_for_secrets,
-        })
+        )?))
     }
 
     #[cfg(target_family = "wasm")]
@@ -220,20 +184,7 @@ impl ClientConnection {
         {
             match self {
                 Self::InProcess(_) => Ok(()),
-                Self::Remote {
-                    runtime,
-                    connection,
-                    ..
-                } => {
-                    let mut connection = connection.lock().map_err(|_| {
-                        LoomError::new(
-                            ErrorCode::Internal,
-                            "remote connection lock was poisoned",
-                            true,
-                        )
-                    })?;
-                    runtime.block_on(connection.close())
-                }
+                Self::Remote(connection) => connection.close(),
             }
         }
         #[cfg(target_family = "wasm")]
@@ -250,9 +201,7 @@ impl ClientConnection {
             #[cfg(not(target_family = "wasm"))]
             Self::InProcess(_) => true,
             #[cfg(not(target_family = "wasm"))]
-            Self::Remote {
-                secure_for_secrets, ..
-            } => *secure_for_secrets,
+            Self::Remote(connection) => connection.secure_for_secrets(),
             #[cfg(target_family = "wasm")]
             Self::Disconnected => false,
             #[cfg(target_family = "wasm")]
@@ -269,27 +218,7 @@ impl ClientConnection {
     pub(crate) fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
         match self {
             Self::InProcess(connection) => connection.request(request),
-            Self::Remote {
-                runtime,
-                connection,
-                ..
-            } => {
-                let request_id = request.request_id;
-                let result = connection
-                    .lock()
-                    .map_err(|_| {
-                        LoomError::new(
-                            ErrorCode::Internal,
-                            "remote connection lock was poisoned",
-                            true,
-                        )
-                    })
-                    .and_then(|mut connection| runtime.block_on(connection.request(request)));
-                match result {
-                    Ok(response) => response,
-                    Err(error) => ResponseEnvelope::failure(request_id, error),
-                }
-            }
+            Self::Remote(connection) => connection.request(request),
         }
     }
 
@@ -299,37 +228,9 @@ impl ClientConnection {
         request: RequestEnvelope,
         timeout: Duration,
     ) -> ResponseEnvelope {
-        let request_id = request.request_id;
         match self {
             Self::InProcess(connection) => connection.request(request),
-            Self::Remote {
-                runtime,
-                connection,
-                ..
-            } => {
-                let result = connection
-                    .lock()
-                    .map_err(|_| {
-                        LoomError::new(
-                            ErrorCode::Internal,
-                            "remote connection lock was poisoned",
-                            true,
-                        )
-                    })
-                    .and_then(|mut connection| {
-                        runtime.block_on(async {
-                            match tokio::time::timeout(timeout, connection.request(request)).await {
-                                Ok(result) => result,
-                                Err(_) => Err(LoomError::new(
-                                    ErrorCode::DeadlineExceeded,
-                                    "worker request timed out",
-                                    true,
-                                )),
-                            }
-                        })
-                    });
-                result.unwrap_or_else(|error| ResponseEnvelope::failure(request_id, error))
-            }
+            Self::Remote(connection) => connection.request_with_timeout(request, timeout),
         }
     }
 
@@ -396,14 +297,14 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> {
     let response = connection.request_with_timeout(
-        RequestEnvelope::new(ClientRequest::Negotiate {
+        RequestEnvelope::new(ClientRequest::Control(ControlRequest::Negotiate {
             client_version: CURRENT_PROTOCOL_VERSION,
             capabilities: negotiation_capabilities(),
-        }),
+        })),
         Duration::from_secs(15),
     );
     match response.result? {
-        ServerResponse::Negotiated(_) => Ok(()),
+        ServerResponse::Control(ControlResponse::Negotiated(_)) => Ok(()),
         response => Err(unexpected_response("negotiation", response)),
     }
 }
@@ -456,11 +357,11 @@ pub(crate) fn worker_node_status(
     connection: &ClientConnection,
 ) -> Result<WorkerNodeStatus, LoomError> {
     let response = connection.request_with_timeout(
-        RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus),
+        RequestEnvelope::new(ClientRequest::Control(ControlRequest::GetWorkerNodeStatus)),
         Duration::from_secs(15),
     );
     match response.result? {
-        ServerResponse::WorkerNodeStatus(status) => Ok(status),
+        ServerResponse::Control(ControlResponse::WorkerNodeStatus(status)) => Ok(status),
         response => Err(unexpected_response("worker node status", response)),
     }
 }
@@ -471,11 +372,11 @@ pub(crate) async fn worker_node_status_async(
 ) -> Result<WorkerNodeStatus, LoomError> {
     let response = request_with_timeout(
         connection,
-        RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus),
+        RequestEnvelope::new(ClientRequest::Control(ControlRequest::GetWorkerNodeStatus)),
     )
     .await?;
     match response.result? {
-        ServerResponse::WorkerNodeStatus(status) => Ok(status),
+        ServerResponse::Control(ControlResponse::WorkerNodeStatus(status)) => Ok(status),
         response => Err(unexpected_response("worker node status", response)),
     }
 }
@@ -536,11 +437,11 @@ pub(crate) fn workspace_config(
     connection: &ClientConnection,
     workspace_id: WorkspaceId,
 ) -> Result<WorkspaceConfig, LoomError> {
-    let response = connection.request(RequestEnvelope::new(
-        ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
-    ));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::GetWorkspaceConfigForWorkspace { workspace_id },
+    )));
     match response.result? {
-        ServerResponse::WorkspaceConfig(config) => Ok(config),
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceConfig(config)) => Ok(config),
         response => Err(unexpected_response("workspace config", response)),
     }
 }
@@ -551,12 +452,12 @@ pub(crate) async fn workspace_config_async(
     workspace_id: WorkspaceId,
 ) -> Result<WorkspaceConfig, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
-        ))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::GetWorkspaceConfigForWorkspace { workspace_id },
+        )))
         .await;
     match response.result? {
-        ServerResponse::WorkspaceConfig(config) => Ok(config),
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceConfig(config)) => Ok(config),
         response => Err(unexpected_response("workspace config", response)),
     }
 }
@@ -567,14 +468,14 @@ pub(crate) fn set_workspace_config(
     workspace_id: WorkspaceId,
     config: WorkspaceConfig,
 ) -> Result<(), LoomError> {
-    let response = connection.request(RequestEnvelope::new(
-        ClientRequest::SetWorkspaceConfigForWorkspace {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::SetWorkspaceConfigForWorkspace {
             workspace_id,
             config,
         },
-    ));
+    )));
     match response.result? {
-        ServerResponse::WorkspaceConfigUpdated => Ok(()),
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceConfigUpdated) => Ok(()),
         response => Err(unexpected_response("workspace config update", response)),
     }
 }
@@ -586,15 +487,15 @@ pub(crate) async fn set_workspace_config_async(
     config: WorkspaceConfig,
 ) -> Result<(), LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::SetWorkspaceConfigForWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                 workspace_id,
                 config,
             },
-        ))
+        )))
         .await;
     match response.result? {
-        ServerResponse::WorkspaceConfigUpdated => Ok(()),
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceConfigUpdated) => Ok(()),
         response => Err(unexpected_response("workspace config update", response)),
     }
 }
@@ -603,14 +504,14 @@ pub(crate) async fn set_workspace_config_async(
 pub(crate) async fn negotiate_async(connection: &ClientConnection) -> Result<(), LoomError> {
     let response = request_with_timeout(
         connection,
-        RequestEnvelope::new(ClientRequest::Negotiate {
+        RequestEnvelope::new(ClientRequest::Control(ControlRequest::Negotiate {
             client_version: CURRENT_PROTOCOL_VERSION,
             capabilities: negotiation_capabilities(),
-        }),
+        })),
     )
     .await?;
     match response.result? {
-        ServerResponse::Negotiated(_) => Ok(()),
+        ServerResponse::Control(ControlResponse::Negotiated(_)) => Ok(()),
         response => Err(unexpected_response("negotiation", response)),
     }
 }
@@ -619,9 +520,11 @@ pub(crate) async fn negotiate_async(connection: &ClientConnection) -> Result<(),
 pub(crate) fn list_workspaces(
     connection: &ClientConnection,
 ) -> Result<Vec<WorkspaceRecord>, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaces,
+    )));
     match response.result? {
-        ServerResponse::Workspaces { workspaces } => Ok(workspaces),
+        ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces }) => Ok(workspaces),
         response => Err(unexpected_response("workspace list", response)),
     }
 }
@@ -631,10 +534,12 @@ pub(crate) async fn list_workspaces_async(
     connection: &ClientConnection,
 ) -> Result<Vec<WorkspaceRecord>, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::ListWorkspaces))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaces,
+        )))
         .await;
     match response.result? {
-        ServerResponse::Workspaces { workspaces } => Ok(workspaces),
+        ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces }) => Ok(workspaces),
         response => Err(unexpected_response("workspace list", response)),
     }
 }
@@ -644,11 +549,13 @@ pub(crate) fn create_workspace(
     connection: &ClientConnection,
     name: &str,
 ) -> Result<WorkspaceRecord, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: name.to_owned(),
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: name.to_owned(),
+        },
+    )));
     match response.result? {
-        ServerResponse::WorkspaceCreated(workspace) => Ok(workspace),
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => Ok(workspace),
         response => Err(unexpected_response("workspace creation", response)),
     }
 }
@@ -659,12 +566,14 @@ pub(crate) async fn create_workspace_async(
     name: &str,
 ) -> Result<WorkspaceRecord, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: name.to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: name.to_owned(),
+            },
+        )))
         .await;
     match response.result? {
-        ServerResponse::WorkspaceCreated(workspace) => Ok(workspace),
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => Ok(workspace),
         response => Err(unexpected_response("workspace creation", response)),
     }
 }
@@ -674,11 +583,11 @@ pub(crate) fn register_workspace(
     connection: &ClientConnection,
     workspace: WorkspaceRecord,
 ) -> Result<(), LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::RegisterWorkspace {
-        workspace,
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::RegisterWorkspace { workspace },
+    )));
     match response.result? {
-        ServerResponse::WorkspaceCreated(_) => Ok(()),
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(_)) => Ok(()),
         response => Err(unexpected_response("workspace registration", response)),
     }
 }
@@ -689,12 +598,12 @@ pub(crate) async fn register_workspace_async(
     workspace: WorkspaceRecord,
 ) -> Result<(), LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::RegisterWorkspace {
-            workspace,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::RegisterWorkspace { workspace },
+        )))
         .await;
     match response.result? {
-        ServerResponse::WorkspaceCreated(_) => Ok(()),
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(_)) => Ok(()),
         response => Err(unexpected_response("workspace registration", response)),
     }
 }
@@ -704,12 +613,14 @@ pub(crate) fn list_workspace_sessions(
     connection: &ClientConnection,
     workspace_id: WorkspaceId,
 ) -> Result<Vec<AgentSessionSnapshot>, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
-        workspace_id,
-        include_archived: false,
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaceSessions {
+            workspace_id,
+            include_archived: false,
+        },
+    )));
     match response.result? {
-        ServerResponse::AgentSessions { sessions } => Ok(sessions),
+        ServerResponse::Session(SessionResponse::AgentSessions { sessions }) => Ok(sessions),
         response => Err(unexpected_response("workspace session list", response)),
     }
 }
@@ -720,13 +631,15 @@ pub(crate) async fn list_workspace_sessions_async(
     workspace_id: WorkspaceId,
 ) -> Result<Vec<AgentSessionSnapshot>, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
-            workspace_id,
-            include_archived: false,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaceSessions {
+                workspace_id,
+                include_archived: false,
+            },
+        )))
         .await;
     match response.result? {
-        ServerResponse::AgentSessions { sessions } => Ok(sessions),
+        ServerResponse::Session(SessionResponse::AgentSessions { sessions }) => Ok(sessions),
         response => Err(unexpected_response("workspace session list", response)),
     }
 }
@@ -737,14 +650,14 @@ pub(crate) fn create_session_in_workspace(
     workspace_id: WorkspaceId,
     name: &str,
 ) -> Result<AgentSessionSnapshot, LoomError> {
-    let response = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id,
             name: name.to_owned(),
         },
-    ));
+    )));
     match response.result? {
-        ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => Ok(snapshot),
         response => Err(unexpected_response("workspace session creation", response)),
     }
 }
@@ -756,15 +669,15 @@ pub(crate) async fn create_session_in_workspace_async(
     name: &str,
 ) -> Result<AgentSessionSnapshot, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id,
                 name: name.to_owned(),
             },
-        ))
+        )))
         .await;
     match response.result? {
-        ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => Ok(snapshot),
         response => Err(unexpected_response("workspace session creation", response)),
     }
 }
@@ -776,16 +689,18 @@ pub(crate) fn attach_session_repository(
     source: &str,
     path: &str,
 ) -> Result<SessionRepository, LoomError> {
-    let response = connection.request(RequestEnvelope::new(
-        ClientRequest::AttachSessionRepository {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
             session_id,
             source: source.to_owned(),
             path: path.to_owned(),
             revision: None,
         },
-    ));
+    )));
     match response.result? {
-        ServerResponse::SessionRepositoryAttached(repository) => Ok(repository),
+        ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository)) => {
+            Ok(repository)
+        }
         response => Err(unexpected_response("repository attachment", response)),
     }
 }
@@ -798,26 +713,32 @@ pub(crate) async fn attach_session_repository_async(
     path: &str,
 ) -> Result<SessionRepository, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::AttachSessionRepository {
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
                 session_id,
                 source: source.to_owned(),
                 path: path.to_owned(),
                 revision: None,
             },
-        ))
+        )))
         .await;
     match response.result? {
-        ServerResponse::SessionRepositoryAttached(repository) => Ok(repository),
+        ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository)) => {
+            Ok(repository)
+        }
         response => Err(unexpected_response("repository attachment", response)),
     }
 }
 
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn list_models(connection: &ClientConnection) -> Result<ModelCatalog, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ListModels));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ListModels,
+    )));
     match response.result? {
-        ServerResponse::Models { models } => Ok(model_catalog_from_descriptors(models)),
+        ServerResponse::Provider(ProviderResponse::Models { models }) => {
+            Ok(model_catalog_from_descriptors(models))
+        }
         response => Err(unexpected_response("model list", response)),
     }
 }
@@ -827,10 +748,14 @@ pub(crate) async fn list_models_async(
     connection: &ClientConnection,
 ) -> Result<ModelCatalog, LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::ListModels))
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ListModels,
+        )))
         .await;
     match response.result? {
-        ServerResponse::Models { models } => Ok(model_catalog_from_descriptors(models)),
+        ServerResponse::Provider(ProviderResponse::Models { models }) => {
+            Ok(model_catalog_from_descriptors(models))
+        }
         response => Err(unexpected_response("model list", response)),
     }
 }
@@ -896,7 +821,7 @@ fn include_discovered_models(
     discovery_errors: &mut Vec<ModelDiscoveryError>,
 ) {
     match result {
-        Ok(ServerResponse::Models { models: discovered }) => {
+        Ok(ServerResponse::Provider(ProviderResponse::Models { models: discovered })) => {
             for model in discovered {
                 provider_names.insert(model.id.clone(), provider_name.to_owned());
                 models.push(model.id);
@@ -917,11 +842,13 @@ pub(crate) async fn list_models_from_backend(
     backend: &BackendWorker,
 ) -> Result<ModelCatalog, LoomError> {
     let response = backend
-        .submit(RequestEnvelope::new(ClientRequest::ListProviders))
+        .submit(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ListProviders,
+        )))
         .wait()
         .await;
     let providers = match response.result? {
-        ServerResponse::Providers { providers } => providers,
+        ServerResponse::Provider(ProviderResponse::Providers { providers }) => providers,
         response => return Err(unexpected_response("provider list", response)),
     };
     let mut models = providers
@@ -942,11 +869,11 @@ pub(crate) async fn list_models_from_backend(
         let provider_id = provider.id.as_str().to_owned();
         let provider_name = provider.display_name;
         let response = backend
-            .submit(RequestEnvelope::new(
-                ClientRequest::DiscoverProviderModels {
+            .submit(RequestEnvelope::new(ClientRequest::Provider(
+                ProviderRequest::DiscoverProviderModels {
                     provider_id: provider.id.clone(),
                 },
-            ))
+            )))
             .wait()
             .await;
         include_discovered_models(
@@ -971,9 +898,11 @@ pub(crate) async fn list_models_from_backend(
 pub(crate) fn list_provider_ids(
     connection: &ClientConnection,
 ) -> Result<Vec<ProviderId>, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ListProviders));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ListProviders,
+    )));
     match response.result? {
-        ServerResponse::Providers { providers } => {
+        ServerResponse::Provider(ProviderResponse::Providers { providers }) => {
             Ok(providers.into_iter().map(|provider| provider.id).collect())
         }
         response => Err(unexpected_response("provider list", response)),
@@ -987,19 +916,21 @@ pub(crate) fn start_run(
     model: &ModelId,
     task: &str,
 ) -> Result<AgentRunSnapshot, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-        session_id: session.id,
-        task: task.to_owned(),
-        model: model.clone(),
-        system_instructions: Some(
-            "Work methodically, use the available tools, and report validation.".to_owned(),
-        ),
-        repository_instructions: Some(
-            "Keep the change focused and provide reviewable evidence.".to_owned(),
-        ),
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: session.id,
+            task: task.to_owned(),
+            model: model.clone(),
+            system_instructions: Some(
+                "Work methodically, use the available tools, and report validation.".to_owned(),
+            ),
+            repository_instructions: Some(
+                "Keep the change focused and provide reviewable evidence.".to_owned(),
+            ),
+        },
+    )));
     match response.result? {
-        ServerResponse::AgentRunStarted(run) => Ok(run),
+        ServerResponse::Run(RunResponse::AgentRunStarted(run)) => Ok(run),
         response => Err(unexpected_response("agent run start", response)),
     }
 }
@@ -1011,148 +942,6 @@ pub(crate) fn unexpected_response(operation: &str, response: ServerResponse) -> 
         format!("backend returned unexpected {operation} response: {response:?}"),
         false,
     )
-}
-
-/// A submitted request whose response has not arrived yet.
-pub(crate) struct PendingResponse {
-    request_id: RequestId,
-    reply: oneshot::Receiver<ResponseEnvelope>,
-}
-
-impl PendingResponse {
-    /// Awaits the worker's answer.
-    ///
-    /// Natively this runs on a background OS thread and the underlying
-    /// worker call is a genuine blocking wait; in the browser it awaits a
-    /// channel fed by the WebSocket's `onmessage` callback. Either way,
-    /// callers just do `pending.wait().await`.
-    pub(crate) async fn wait(self) -> ResponseEnvelope {
-        self.reply.await.unwrap_or_else(|_| {
-            ResponseEnvelope::failure(
-                self.request_id,
-                LoomError::new(
-                    ErrorCode::Internal,
-                    "the client connection worker stopped before answering",
-                    false,
-                ),
-            )
-        })
-    }
-}
-
-/// Owns the protocol connection.
-///
-/// Natively, a dedicated worker thread executes requests in submission
-/// order, which also keeps the remote transport's single in-flight request
-/// contract; UI handlers submit a request and await a [`PendingResponse`] on
-/// a background task, so a handler never blocks the GPUI thread on backend
-/// latency. In the browser there is only one JS thread, so each submitted
-/// request is instead driven forward as its own cooperative task on that
-/// same thread; the browser transport already supports overlapping in-flight
-/// requests (it correlates responses by request id), so no additional
-/// serialization is needed there.
-#[derive(Clone)]
-pub(crate) struct BackendWorker {
-    #[cfg(not(target_family = "wasm"))]
-    jobs: Sender<Job>,
-    #[cfg(all(not(target_family = "wasm"), test))]
-    test_connection: Option<ClientConnection>,
-    #[cfg(target_family = "wasm")]
-    connection: ClientConnection,
-    secure_for_secrets: bool,
-}
-
-#[cfg(not(target_family = "wasm"))]
-#[allow(dead_code)]
-struct Job {
-    request: RequestEnvelope,
-    reply: oneshot::Sender<ResponseEnvelope>,
-}
-
-impl BackendWorker {
-    #[cfg(all(not(target_family = "wasm"), test))]
-    pub(crate) fn spawn(connection: ClientConnection) -> Self {
-        let secure_for_secrets = connection.secure_for_secrets();
-        let (jobs, _incoming) = mpsc::channel::<Job>();
-        Self {
-            jobs,
-            test_connection: Some(connection),
-            secure_for_secrets,
-        }
-    }
-
-    #[cfg(all(not(target_family = "wasm"), not(test)))]
-    pub(crate) fn spawn(connection: ClientConnection) -> Self {
-        let secure_for_secrets = connection.secure_for_secrets();
-        let (jobs, incoming) = mpsc::channel::<Job>();
-        thread::spawn(move || {
-            while let Ok(job) = incoming.recv() {
-                let response = connection.request(job.request);
-                // A dropped receiver means the view stopped caring about this
-                // request; the backend has already applied it either way.
-                let _ = job.reply.send(response);
-            }
-        });
-        Self {
-            jobs,
-            secure_for_secrets,
-        }
-    }
-
-    #[cfg(target_family = "wasm")]
-    pub(crate) fn spawn(connection: ClientConnection) -> Self {
-        let secure_for_secrets = connection.secure_for_secrets();
-        Self {
-            connection,
-            secure_for_secrets,
-        }
-    }
-
-    pub(crate) fn secure_for_secrets(&self) -> bool {
-        self.secure_for_secrets
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    pub(crate) fn submit(&self, request: RequestEnvelope) -> PendingResponse {
-        let request_id = request.request_id;
-        let (reply, receiver) = oneshot::channel();
-        #[cfg(test)]
-        if let Some(connection) = &self.test_connection {
-            let _ = reply.send(connection.request(request));
-            return PendingResponse {
-                request_id,
-                reply: receiver,
-            };
-        }
-        if self.jobs.send(Job { request, reply }).is_err() {
-            // The worker thread is gone; return a receiver that will
-            // immediately resolve to the "stopped before answering" error.
-            let (_, receiver) = oneshot::channel();
-            return PendingResponse {
-                request_id,
-                reply: receiver,
-            };
-        }
-        PendingResponse {
-            request_id,
-            reply: receiver,
-        }
-    }
-
-    #[cfg(target_family = "wasm")]
-    pub(crate) fn submit(&self, request: RequestEnvelope) -> PendingResponse {
-        let request_id = request.request_id;
-        let (reply, receiver) = oneshot::channel();
-        let connection = self.connection.clone();
-        wasm_bindgen_futures::spawn_local(async move {
-            let response = connection.request(request).await;
-            let _ = reply.send(response);
-        });
-        PendingResponse {
-            request_id,
-            reply: receiver,
-        }
-    }
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
@@ -1169,10 +958,8 @@ mod tests {
         Capability, ErrorCode, LoomError as CoreLoomError, Timestamp, WorkspaceId, WorkspaceRecord,
     };
     use loom_model::ModelId;
-    use loom_protocol::{ServerResponse, WorkspaceConfig};
-    use loom_server::{
-        AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
-    };
+    use loom_protocol::{RepositoryResponse, ServerResponse, WorkspaceConfig};
+    use loom_server::{AuthTokenStore, AuthorizationScope, RemoteServer, RemoteServerConfig};
     use std::sync::Arc;
 
     #[test]
@@ -1237,15 +1024,19 @@ mod tests {
         assert_eq!(redact_secret("?token=a%2Fb", "a/b"), "?token=[redacted]");
         assert_eq!(redact_secret("unchanged", ""), "unchanged");
         assert!(
-            unexpected_response("probe", ServerResponse::SessionRepositoryDetached)
-                .message
-                .contains("probe")
+            unexpected_response(
+                "probe",
+                ServerResponse::Repository(RepositoryResponse::SessionRepositoryDetached)
+            )
+            .message
+            .contains("probe")
         );
     }
 
     #[test]
     fn in_process_connection_exercises_workspace_and_session_client_operations() {
-        let connection = ClientConnection::InProcess(Box::new(InProcessBackend::new().connect()));
+        let connection =
+            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
         negotiate(&connection).unwrap();
         let created = create_workspace(&connection, "client wrapper test").unwrap();
         assert_eq!(created.name, "client wrapper test");
@@ -1277,7 +1068,8 @@ mod tests {
 
     #[test]
     fn workspace_client_operations_report_backend_errors_and_register_external_records() {
-        let connection = ClientConnection::InProcess(Box::new(InProcessBackend::new().connect()));
+        let connection =
+            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
         negotiate(&connection).unwrap();
         let timestamp = Timestamp::from_unix_millis(1);
         let external = WorkspaceRecord {
@@ -1332,7 +1124,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("test server runtime should start");
-        let backend = InProcessBackend::new();
+        let backend = loom_server::InProcessBackend::new();
         let auth = Arc::new(AuthTokenStore::new());
         let token = auth
             .insert("gpui-background-test", AuthorizationScope::all())

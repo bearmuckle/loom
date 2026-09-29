@@ -71,8 +71,9 @@ preference; the session-scoped `SetApprovalPolicy` form updates both for
 subsequent runs.
 
 The WebSocket service authenticates during the HTTP upgrade using a bearer
-token, then creates an authenticated view of the existing in-process
-connection. Each request re-checks the token so revocation takes effect
+token supplied in the `Authorization` header, or in a `loom.bearer.<token>`
+subprotocol for browser clients that cannot set handshake headers, then
+creates an authenticated view of the existing in-process connection. Each request re-checks the token so revocation takes effect
 without restarting the service. Capability negotiation is intersected with the token grant, and every
 workspace/session/run request is checked against the token's explicit scope.
 

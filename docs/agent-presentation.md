@@ -184,13 +184,12 @@ duplicate denials across restarts remain open.
 The projection and rendering changes above are implemented in `loom-ui`:
 message-part assistant turns, unified tool blocks, collapsed status chrome,
 streaming cursor, composer send/stop, actionable evidence, single-run plans,
-de-emphasized project messages, and a collapsed reasoning disclosure. Syntax
-highlighting and inline patch previews remain open.
+de-emphasized project messages, and a collapsed reasoning disclosure.
 
 ## Presentation polish
 
-A follow-up pass (see `crates/loom-ui/src/syntax.rs` and `view.rs`) closes most
-of the remaining gap with terminal agent harnesses:
+The projection and rendering code lives under `crates/loom-ui/src/view` and
+`crates/loom-ui/src/syntax.rs`:
 
 - **Code legibility.** Tool results render in the theme's monospace family with
   lightweight syntax highlighting for the common transcript languages.

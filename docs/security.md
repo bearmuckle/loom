@@ -32,9 +32,12 @@ connection is never implicitly trusted.
 - Support revoking a client/session without restarting the backend.
 
 M4's standalone service uses opaque bearer tokens stored as SHA-256 digests
-in memory. Issued-token debug output is redacted, authentication failures do
-not echo the supplied token, and authorization headers are not copied into
-protocol events. Revocation is checked on every request, including requests
+in memory. Native clients present the token in an `Authorization: Bearer`
+header; browser `WebSocket` clients, which cannot set handshake headers, pass
+it in a `loom.bearer.<token>` subprotocol so credentials never appear in the
+connection URL (and therefore not in logs, referrers, or the address bar).
+Issued-token debug output is redacted, authentication failures do not echo the
+supplied token, and authorization headers are not copied into protocol events. Revocation is checked on every request, including requests
 from an already-upgraded WebSocket. Token grants can restrict capabilities,
 workspaces, and sessions; an unrestricted grant is an explicit deployment
 choice rather than an implicit network default.
