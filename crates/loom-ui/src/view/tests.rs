@@ -4707,3 +4707,423 @@ mod transcript_paging_tests {
         }));
     }
 }
+
+#[cfg(test)]
+mod provider_control_tests {
+    use super::*;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+
+    #[gpui_kit::test]
+    fn provider_model_and_mode_controls_update_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sync_model_select_states(window, cx);
+            view.sync_agent_mode_select_state(window, cx);
+            assert!(view.model_select.is_some());
+            assert!(view.agent_mode_select.is_some());
+
+            view.select_model(ModelId::new("deterministic/demo"), cx);
+            assert_eq!(view.model, ModelId::new("deterministic/demo"));
+            view.select_model(ModelId::new("missing/model"), cx);
+
+            view.select_default_model(ModelId::new("deterministic/demo"), cx);
+            assert_eq!(view.default_model, ModelId::new("deterministic/demo"));
+            view.select_default_model(ModelId::new("missing/model"), cx);
+
+            view.select_agent_mode(AgentMode::Edit, cx);
+            view.toggle_auto_approve_actions(cx);
+            view.observe_system_appearance(window, cx);
+            view.observe_system_appearance(window, cx);
+
+            view.open_settings_from_menu(cx);
+            assert!(view.settings_open);
+            view.open_providers_for_node("test-node".to_owned(), cx);
+            assert!(view.providers_open);
+            view.open_about_from_menu(cx);
+            assert!(view.about_open);
+
+            view.handle_github_provider_configured("test-node".to_owned(), cx);
+            assert!(view.github_connected);
+
+            let appearance = window.appearance();
+            view.apply_appearance(appearance, window, cx);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod state_toggle_tests {
+    use super::*;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+
+    #[gpui_kit::test]
+    fn review_composer_and_worker_controls_toggle(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.toggle_review_pane(cx);
+            assert!(view.review.open);
+            view.toggle_review_pane(cx);
+            assert!(!view.review.open);
+
+            let tool_id = loom_core::ToolCallId::new();
+            view.toggle_tool(tool_id, cx);
+            view.toggle_tool(tool_id, cx);
+            view.toggle_tool_group(7, cx);
+            view.toggle_tool_group(7, cx);
+            view.toggle_reasoning(9, cx);
+            view.toggle_reasoning(9, cx);
+
+            view.toggle_command_palette(cx);
+            assert!(view.command_palette_open);
+            view.close_command_palette(cx);
+            assert!(!view.command_palette_open);
+            view.run_slash_command("/help", cx);
+            view.run_command("unknown-command", None, cx);
+
+            view.adjust_cpu_pulse_threshold(5, cx);
+            view.adjust_project_agent_concurrency(1, cx);
+            view.adjust_font_scale(1, window, cx);
+            view.set_font_scale_percent(120, window, cx);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod session_run_action_tests {
+    use super::*;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+
+    #[gpui_kit::test]
+    fn session_and_run_actions_update_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let session = empty_session_snapshot(view.workspace_id);
+            view.activate_session(session.clone());
+            view.load_session(session.clone());
+            view.select_session(session.clone(), cx);
+            view.begin_session_rename(session.clone(), false, window, cx);
+            assert!(view.rename_dialog.is_some());
+            view.confirm_rename(cx);
+            view.archive_active(cx);
+            view.select_session_repository(loom_core::RepositoryId::new(), cx);
+            view.detach_session_repository(loom_core::RepositoryId::new(), cx);
+            view.detach_session_directory("dir".to_owned(), cx);
+            view.send_message("hello".to_owned(), cx);
+            view.approve_pending_action(cx);
+            view.reject_pending_action(cx);
+            view.interrupt_active_run(cx);
+            view.begin_transcript_page(None, cx);
+            view.ensure_session_task_message(view.active_session.id);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod project_action_tests {
+    use super::*;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+
+    #[gpui_kit::test]
+    fn project_actions_update_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.rebuild_project_message_timeline();
+            view.refresh_active_project_snapshot(cx);
+            view.refresh_project_messages(cx);
+            let _ = view.project_root_is_active();
+            let _ = view.project_has_live_children();
+            let manager = AgentSessionId::new();
+            view.control_project_child_from_ui(
+                manager,
+                loom_core::ProjectId::new(),
+                loom_core::TaskId::new(),
+                loom_protocol::ProjectChildControlAction::Continue,
+                cx,
+            );
+            view.review_project_child_from_ui(
+                manager,
+                loom_core::ProjectId::new(),
+                loom_core::TaskId::new(),
+                cx,
+            );
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod render_state_tests {
+    use super::*;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+
+    fn render_with(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = LoomView::new_for_test(cx.focus_handle());
+                configure(&mut view);
+                view
+            });
+            gpui_kit::component::Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn settings_sections_and_dialogs_render(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        for section in [
+            SettingsSection::Agents,
+            SettingsSection::Providers,
+            SettingsSection::Workers,
+            SettingsSection::Appearance,
+        ] {
+            render_with(cx, move |view| {
+                view.settings_open = true;
+                view.settings_section = section;
+            });
+        }
+        render_with(cx, |view| {
+            view.providers_open = true;
+        });
+        render_with(cx, |view| {
+            view.about_open = true;
+        });
+        render_with(cx, |view| {
+            view.command_palette_open = true;
+        });
+        render_with(cx, |view| {
+            view.review.open = true;
+        });
+        render_with(cx, |view| {
+            view.github_login = Some(GitHubLoginState::Starting);
+        });
+        render_with(cx, |view| {
+            view.github_login = Some(GitHubLoginState::Awaiting {
+                verification_uri: "https://github.com/login/device".to_owned(),
+                user_code: "ABCD-1234".to_owned(),
+                expires_in: 900,
+            });
+        });
+        render_with(cx, |view| {
+            view.github_login = Some(GitHubLoginState::Error("failed".to_owned()));
+        });
+        render_with(cx, |view| {
+            view.github_login = Some(GitHubLoginState::Success);
+        });
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_source_action_tests {
+    use super::*;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+
+    #[gpui_kit::test]
+    fn lifecycle_source_and_worker_actions(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let _ = view.refresh_sessions();
+            view.reload_sessions(cx);
+            view.reset_projection();
+            view.update_session_list();
+            view.refresh_models();
+            view.apply_models(vec![ModelId::new("deterministic/demo")]);
+            view.schedule_project_poll(cx);
+            view.schedule_run_poll(cx);
+            view.schedule_worker_node_poll(cx);
+            view.poll_run_once(cx);
+
+            view.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
+            view.choose_source(SessionSourceChoice::LocalDirectory, cx);
+            view.choose_source(SessionSourceChoice::GitHub, cx);
+            view.choose_source(SessionSourceChoice::Empty, cx);
+            view.confirm_source_dialog(cx);
+            view.set_worker_node_connection_failure(999, "wss://none", "detail".to_owned());
+            view.add_source_to_active_session(
+                SessionCreationSource::LocalDirectory("/tmp".to_owned()),
+                cx,
+            );
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod review_project_action_tests {
+    use super::*;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+
+    #[gpui_kit::test]
+    fn review_and_project_child_actions(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.refresh_review(cx);
+            view.open_review_file("src/lib.rs".to_owned(), cx);
+            view.open_review_diff("src/lib.rs".to_owned(), false, cx);
+            view.jump_review_hunk(true, cx);
+            view.jump_review_hunk(false, cx);
+            let manager = AgentSessionId::new();
+            let project = loom_core::ProjectId::new();
+            let task = loom_core::TaskId::new();
+            view.integrate_project_child_from_ui(
+                manager,
+                project,
+                task,
+                "parent".to_owned(),
+                "child".to_owned(),
+                cx,
+            );
+            view.cleanup_project_child_from_ui(
+                manager,
+                project,
+                task,
+                loom_core::ProjectWorktreeCleanupDisposition::RemoveClean,
+                cx,
+            );
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod worker_failure_tests {
+    use super::*;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use loom_core::CapabilitySet;
+
+    fn remote_node(id: u64, url: &str, state: WorkerConnectionState) -> WorkerNodeEntry {
+        WorkerNodeEntry {
+            id,
+            status: WorkerNodeStatus {
+                node_id: format!("worker-{id}"),
+                name: format!("Worker {id}"),
+                online: false,
+                capabilities: CapabilitySet::default(),
+                resources: WorkerNodeResources {
+                    cpu_count: 2,
+                    cpu_usage_percent: Some(50),
+                    memory_usage_percent: Some(75),
+                    memory_total_bytes: Some(8),
+                    memory_available_bytes: Some(2),
+                    disk_total_bytes: None,
+                    disk_available_bytes: None,
+                },
+            },
+            is_local: false,
+            url: Some(url.to_owned()),
+            connection: None,
+            connection_state: state,
+            connection_detail: None,
+            severe_load_streak: 0,
+        }
+    }
+
+    #[gpui_kit::test]
+    fn worker_failures_and_removal_update_nodes(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_window, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.worker_nodes.push(remote_node(
+                1,
+                "wss://one.example/ws",
+                WorkerConnectionState::Connecting,
+            ));
+            view.worker_nodes.push(remote_node(
+                2,
+                "wss://two.example/ws",
+                WorkerConnectionState::Connected,
+            ));
+            view.set_worker_node_connection_failure(1, "wss://one.example/ws", "boom".to_owned());
+            assert_eq!(
+                view.worker_nodes[0].connection_state,
+                WorkerConnectionState::Failed
+            );
+            let error = loom_core::LoomError::new(
+                loom_core::ErrorCode::ProviderUnavailable,
+                "connection refused",
+                true,
+            );
+            view.fail_worker_node_connection(
+                2,
+                "wss://two.example/ws",
+                WorkerConnectionStage::Transport,
+                &error,
+                Some("secret-token"),
+                false,
+            );
+            assert!(view.worker_nodes[1].connection_detail.is_some());
+            view.remove_worker_node(1, cx);
+            assert!(view.worker_nodes.iter().all(|node| node.id != 1));
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod provider_mode_tests {
+    use super::*;
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+
+    #[gpui_kit::test]
+    fn agent_modes_and_provider_selection(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.open_providers_for_node("test-node".to_owned(), cx);
+            view.configure_api_key_provider(loom_model::ProviderId::new("openai"), window, cx);
+            view.providers_node_id = Some("test-node".to_owned());
+            view.copy_github_login_value("ABCD".to_owned(), "device code", cx);
+
+            for mode in [
+                AgentMode::Ask,
+                AgentMode::Edit,
+                AgentMode::Agent,
+                AgentMode::AutoApprove,
+            ] {
+                view.select_agent_mode(mode, cx);
+                view.sync_agent_mode_select_state(window, cx);
+            }
+            view.toggle_auto_approve_actions(cx);
+            view.toggle_auto_approve_actions(cx);
+            view.sync_model_select_states(window, cx);
+            view.select_model(ModelId::new("deterministic/demo"), cx);
+            view.select_default_model(ModelId::new("deterministic/demo"), cx);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+}

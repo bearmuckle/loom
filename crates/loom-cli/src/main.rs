@@ -1637,4 +1637,105 @@ mod tests {
         assert!(!path.exists());
         std::fs::remove_file(&path).ok();
     }
+
+    #[cfg(test)]
+    mod cli_args_tests {
+        use super::*;
+
+        fn parse(args: &[&str]) -> Result<Option<CliOptions>, loom_core::LoomError> {
+            parse_args(args.iter().map(|value| (*value).to_owned()))
+        }
+
+        #[test]
+        fn parse_args_supports_spaced_forms() {
+            let options = parse(&[
+                "--name",
+                "n",
+                "--task",
+                "t",
+                "--model",
+                "m",
+                "--root",
+                "/r",
+                "--manual-approval",
+                "--m2-demo",
+                "--m3-demo",
+                "--serve",
+                "--m4-demo",
+                "--reset-state",
+                "--bind",
+                "127.0.0.1:9000",
+                "--token",
+                "tok",
+                "--login",
+                "github-copilot",
+                "--persistence",
+                "/p",
+            ])
+            .unwrap()
+            .unwrap();
+            assert_eq!(options.name, "n");
+            assert_eq!(options.task, "t");
+            assert_eq!(options.model, ModelId::new("m"));
+            assert_eq!(options.root.as_deref(), Some(std::path::Path::new("/r")));
+            assert!(options.manual_approval);
+            assert!(options.m2_demo);
+            assert!(options.m3_demo);
+            assert!(options.serve);
+            assert!(options.m4_demo);
+            assert!(options.reset_state);
+            assert_eq!(options.bind.to_string(), "127.0.0.1:9000");
+            assert_eq!(options.token.as_deref(), Some("tok"));
+            assert_eq!(options.login_provider.as_deref(), Some("github-copilot"));
+            assert_eq!(
+                options.persistence.as_deref(),
+                Some(std::path::Path::new("/p"))
+            );
+        }
+
+        #[test]
+        fn parse_args_supports_equals_forms() {
+            let options = parse(&[
+                "--name=n2",
+                "--task=t2",
+                "--model=m2",
+                "--root=/r2",
+                "--persistence=/p2",
+                "--bind=127.0.0.1:9001",
+                "--token=tok2",
+                "--login=github-copilot",
+            ])
+            .unwrap()
+            .unwrap();
+            assert_eq!(options.name, "n2");
+            assert_eq!(options.task, "t2");
+            assert_eq!(options.model, ModelId::new("m2"));
+            assert_eq!(options.root.as_deref(), Some(std::path::Path::new("/r2")));
+            assert_eq!(
+                options.persistence.as_deref(),
+                Some(std::path::Path::new("/p2"))
+            );
+            assert_eq!(options.bind.to_string(), "127.0.0.1:9001");
+            assert_eq!(options.token.as_deref(), Some("tok2"));
+            assert_eq!(options.login_provider.as_deref(), Some("github-copilot"));
+        }
+
+        #[test]
+        fn parse_args_defaults_and_help() {
+            let options = parse(&[]).unwrap().unwrap();
+            assert_eq!(options.name, "M1 demo");
+            assert_eq!(options.model, ModelId::new("deterministic/demo"));
+            assert!(!options.serve);
+            assert!(parse(&["--help"]).unwrap().is_none());
+            assert!(parse(&["-h"]).unwrap().is_none());
+        }
+
+        #[test]
+        fn parse_args_rejects_bad_input() {
+            assert!(parse(&["--unknown"]).is_err());
+            assert!(parse(&["--name"]).is_err());
+            assert!(parse(&["--bind", "not-an-address"]).is_err());
+            assert!(parse(&["--bind=bad"]).is_err());
+        }
+    }
 }
