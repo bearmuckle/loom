@@ -397,8 +397,6 @@ pub enum SchemaStatus {
     Absent,
     /// The database is at the current baseline schema version.
     Current,
-    /// The database is at an older known version that opening will migrate.
-    Migratable(u32),
     /// The database was written at an unknown or newer schema version.
     OtherVersion(u32),
     /// The file exists but is not a recognizable SQLite database.
@@ -408,7 +406,7 @@ pub enum SchemaStatus {
 impl SchemaStatus {
     /// Whether the database can be opened without wiping it.
     pub fn is_compatible(self) -> bool {
-        matches!(self, Self::Absent | Self::Current | Self::Migratable(_))
+        matches!(self, Self::Absent | Self::Current)
     }
 
     /// Short description used in prompts and error messages.
@@ -416,9 +414,6 @@ impl SchemaStatus {
         match self {
             Self::Absent => "no existing database".to_owned(),
             Self::Current => format!("schema version {DATABASE_SCHEMA_VERSION}"),
-            Self::Migratable(version) => {
-                format!("schema version {version}, migratable to {DATABASE_SCHEMA_VERSION}")
-            }
             Self::OtherVersion(version) => format!("schema version {version}"),
             Self::Unrecognized => "an unrecognized format".to_owned(),
         }

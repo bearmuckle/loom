@@ -1,11 +1,11 @@
 # Project sessions and coordinated sub-agents
 
-> **Storage note.** Loom uses a single SQLite database with an ordered migration
-> ladder recorded in `PRAGMA user_version`; an unknown or newer database is
-> rejected unchanged and must be wiped explicitly. Per-run project-agent grants
-> are one versioned JSON payload (`run_runtime_config.project_grants`) and
-> delegated-task grants are `delegated_tasks.permissions`. See
-> [durable storage](storage.md).
+> **Storage note.** Loom uses a single SQLite database with a single baseline
+> schema (currently version 2) and no migration ladder; a database written by
+> any other revision is rejected unchanged and must be wiped explicitly.
+> Per-run project-agent grants are one versioned JSON payload
+> (`run_runtime_config.project_grants`) and delegated-task grants are
+> `delegated_tasks.permissions`. See [durable storage](storage.md).
 
 ## Status and scope
 

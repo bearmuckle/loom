@@ -2,13 +2,12 @@
 
 ## Status
 
-Loom stores durable backend state in one SQLite database. Schema changes are
-applied through an ordered migration ladder recorded in `PRAGMA user_version`:
-opening a database at an older version applies the pending steps in order and
-commits each step with its version. A database from an unknown or newer version
-is rejected unchanged so it is never silently downgraded or corrupted. New
-schema changes append a migration step with the next version rather than
-editing the baseline definition.
+Loom stores durable backend state in one SQLite database with a single
+baseline schema, currently version 2. Loom is pre-1.0: there is no migration
+ladder and no legacy import path. A database written by any other Loom revision
+is rejected unchanged, and the operator must wipe it before starting. When the
+domain model changes, the baseline version and the typed schema definitions
+change together.
 
 Per-run project-agent grants are stored as one versioned JSON payload
 (`run_runtime_config.project_grants`), and delegated-task grants as

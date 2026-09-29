@@ -39,10 +39,9 @@ session only and the UI warns that it will not reconnect after restart. Linux
 uses Secret Service, which requires an available user session/keyring. Browser
 peer-token behavior is unchanged.
 
-Schema changes are applied through an ordered migration ladder that records
-each step in `PRAGMA user_version`. Opening a database at an older version
-applies the pending migrations in order; a database from an unknown or newer
-version is rejected unchanged so it is never silently downgraded or corrupted.
+The database uses a single baseline schema, currently version 2. Loom is
+pre-1.0 and has no migration ladder and no legacy import: a database written by
+any other revision is rejected unchanged and must be wiped by the operator.
 Per-run project-agent grants are stored as one versioned JSON payload
 (`run_runtime_config.project_grants`) and delegated-task grants as
 `delegated_tasks.permissions`, so adding a grant is a code change rather than a

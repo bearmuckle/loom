@@ -284,12 +284,11 @@ raw keys.
 
 The persistence layer stores typed SQLite tables covering session state, the
 authoritative event journal, serializable agent runtime state, workspace state
-and checkpoints, policy decisions, provider health, and usage ledgers. Schema
-changes are applied through an ordered migration ladder recorded in
-`PRAGMA user_version`; a database from an unknown or newer version is rejected
-unchanged rather than overwritten. A runtime that was executing during a
-process crash is recovered in `paused` state so a new connection must
-explicitly resume it.
+and checkpoints, policy decisions, provider health, and usage ledgers. It uses
+a single baseline schema; a database written by another revision is rejected
+unchanged and must be wiped. A runtime that was executing during a process
+crash is recovered in `paused` state so a new connection must explicitly
+resume it.
 
 Remote access uses the same domain services through a transport adapter:
 

@@ -845,8 +845,6 @@ pub(crate) fn map_schema_version(version: u32) -> SchemaStatus {
         // A SQLite file that has not been initialized yet; `initialize_schema`
         // decides whether it is empty or an unrecognized layout.
         SchemaStatus::Absent
-    } else if version < DATABASE_SCHEMA_VERSION {
-        SchemaStatus::Migratable(version)
     } else {
         SchemaStatus::OtherVersion(version)
     }
@@ -898,55 +896,6 @@ pub(crate) fn schema_status_from_header(path: &Path) -> Result<SchemaStatus> {
     Ok(map_schema_version(version))
 }
 
-/// A single schema migration, applied in ascending order. Each step is
-/// committed with its version recorded in `PRAGMA user_version`.
-struct Migration {
-    version: u32,
-    description: &'static str,
-    apply: fn(&Transaction<'_>) -> rusqlite::Result<()>,
-}
-
-/// The ordered schema migration ladder. New schema changes append a step with
-/// the next version instead of editing the baseline.
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        description: "baseline typed catalog, runs, filesystem, and feed schema",
-        apply: apply_baseline,
-    },
-    Migration {
-        version: 2,
-        description: "record applied schema migrations in schema_migrations",
-        apply: apply_schema_migrations,
-    },
-];
-
-fn apply_baseline(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
-    transaction.execute_batch(DATABASE_SCHEMA)?;
-    transaction.execute_batch(PROJECT_TASK_SCHEMA)?;
-    transaction.execute_batch(PROJECT_WORKTREE_SCHEMA)?;
-    transaction.execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)?;
-    transaction.execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)?;
-    Ok(())
-}
-
-fn apply_schema_migrations(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
-    transaction.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_at INTEGER NOT NULL
-        ) STRICT;",
-    )?;
-    let applied_at = Timestamp::now().as_unix_millis() as i64;
-    for version in 1..=2 {
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?1, ?2)",
-            params![version, applied_at],
-        )?;
-    }
-    Ok(())
-}
-
 pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
     let database_version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -959,33 +908,30 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
     if database_version == DATABASE_SCHEMA_VERSION {
         return Ok(());
     }
-    if database_version > DATABASE_SCHEMA_VERSION {
-        // A database written by a newer build cannot be downgraded.
+
+    // Loom is pre-1.0 and uses a single baseline schema. A database written by
+    // any other revision is rejected unchanged and must be wiped.
+    if database_version != 0 {
         return Err(unsupported_database_error(database_version));
     }
 
-    if database_version == 0 {
-        // A fresh SQLite file is initialized in place. A non-empty file that
-        // lacks a recorded version is an unrecognized layout, not a migration
-        // source, so it is rejected rather than overwritten.
-        let has_user_tables: bool = connection
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM sqlite_master
-                    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-                )",
-                [],
-                |row| row.get(0),
+    let has_user_tables: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not inspect persistence database: {error}"),
+                true,
             )
-            .map_err(|error| {
-                persistence_error(
-                    format!("could not inspect persistence database: {error}"),
-                    true,
-                )
-            })?;
-        if has_user_tables {
-            return Err(unsupported_database_error(0));
-        }
+        })?;
+    if has_user_tables {
+        return Err(unsupported_database_error(0));
     }
 
     connection
@@ -1003,31 +949,54 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
             true,
         )
     })?;
-    for migration in MIGRATIONS
-        .iter()
-        .filter(|migration| migration.version > database_version)
-    {
-        (migration.apply)(&transaction).map_err(|error| {
+    transaction
+        .execute_batch(DATABASE_SCHEMA)
+        .map_err(|error| {
             persistence_error(
-                format!(
-                    "could not apply persistence migration {} ({}): {error}",
-                    migration.version, migration.description
-                ),
+                format!("could not create persistence schema: {error}"),
                 true,
             )
         })?;
-        transaction
-            .pragma_update(None, "user_version", migration.version)
-            .map_err(|error| {
-                persistence_error(
-                    format!(
-                        "could not record persistence schema version {}: {error}",
-                        migration.version
-                    ),
-                    true,
-                )
-            })?;
-    }
+    transaction
+        .execute_batch(PROJECT_TASK_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project task schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(PROJECT_WORKTREE_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project worktree schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project manager wait schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project cancellation recovery schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record persistence schema version: {error}"),
+                true,
+            )
+        })?;
     transaction.commit().map_err(|error| {
         persistence_error(
             format!("could not commit persistence schema: {error}"),
