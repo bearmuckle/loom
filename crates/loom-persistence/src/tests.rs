@@ -4193,3 +4193,178 @@ fn in_memory_backend_shares_the_sqlite_code_path() {
     let loaded = store.load_sessions().unwrap();
     assert!(loaded.is_none_or(|state| state.sessions.is_empty()));
 }
+
+#[test]
+fn project_task_queries_and_cancellation_cover_lifecycle_paths() {
+    let path = std::env::temp_dir().join(format!("loom-project-{}.db", Uuid::new_v4()));
+    let persistence = FilePersistence::open(&path).unwrap();
+    let mut manager = SessionManager::default();
+    let (root, _) = manager
+        .create_in_workspace(WorkspaceId::new(), "Project manager")
+        .unwrap();
+    persistence
+        .save_state_with_sessions(&manager.export_state())
+        .unwrap();
+
+    let child_id = AgentSessionId::new();
+    let now = Timestamp::now();
+    let child_snapshot = AgentSessionSnapshot {
+        id: child_id,
+        workspace_id: root.workspace_id,
+        name: "Research agent".to_owned(),
+        state: AgentSessionState::Idle,
+        created_at: now,
+        updated_at: now,
+    };
+    let task = DelegatedTaskRecord {
+        task_id: TaskId::new(),
+        project_id: ProjectId::from_uuid(*root.id.as_uuid()),
+        requester_session_id: root.id,
+        target_session_id: child_id,
+        child_name: child_snapshot.name.clone(),
+        intent: "Inspect the relevant module".to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: vec![TaskContextReference {
+            label: "architecture".to_owned(),
+            uri: "docs/architecture.md".to_owned(),
+        }],
+        dependencies: Vec::new(),
+        code_change: false,
+        permissions: ProjectAgentPermissions {
+            delegation: false,
+            branch_messaging: true,
+            child_control: false,
+            inspection: true,
+            worktree_creation: true,
+            review: true,
+            integration: false,
+        },
+        status: DelegatedTaskStatus::Queued,
+        created_at: now,
+        updated_at: now,
+    };
+    let request_id = RequestId::new();
+    let created = persistence
+        .create_project_child(
+            request_id,
+            &child_snapshot,
+            manager.export_state().next_sequence,
+            &task,
+        )
+        .unwrap();
+    assert_eq!(created, task);
+
+    let spec = DelegatedTaskSpec {
+        intent: task.intent.clone(),
+        model_id: task.model_id.clone(),
+        context_references: task.context_references.clone(),
+        dependencies: Vec::new(),
+        code_change: false,
+        permissions: task.permissions.clone(),
+    };
+    assert_eq!(
+        persistence
+            .load_project_child_by_request(
+                request_id,
+                task.project_id,
+                root.id,
+                &child_snapshot.name,
+                &spec,
+            )
+            .unwrap(),
+        Some(task.clone())
+    );
+    assert_eq!(
+        persistence.list_project_tasks(task.project_id).unwrap(),
+        vec![task.clone()]
+    );
+    assert_eq!(
+        persistence
+            .load_delegated_task_for_target(child_id)
+            .unwrap(),
+        Some(task.clone())
+    );
+    assert!(
+        persistence
+            .update_delegated_task_status(
+                task.task_id,
+                DelegatedTaskStatus::Running,
+                Timestamp::now(),
+            )
+            .unwrap()
+    );
+    assert!(
+        !persistence
+            .update_delegated_task_status_if_queued(
+                task.task_id,
+                DelegatedTaskStatus::Cancelled,
+                Timestamp::now(),
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        persistence
+            .load_project_snapshot_for_session(child_id)
+            .unwrap()
+            .unwrap()
+            .root_session_id,
+        root.id
+    );
+
+    let draft = AgentMessageDraft {
+        project_id: task.project_id,
+        task_id: Some(task.task_id),
+        sender_session_id: root.id,
+        target_session_id: child_id,
+        kind: AgentMessageKind::Direction,
+        body: "Continue with the next step".to_owned(),
+    };
+    let message_request = RequestId::new();
+    let message = persistence
+        .accept_agent_message(message_request, &draft)
+        .unwrap();
+    assert_eq!(
+        persistence
+            .load_agent_message_by_request(message_request)
+            .unwrap()
+            .map(|record| record.message_id),
+        Some(message.message_id)
+    );
+    assert_eq!(
+        persistence
+            .list_agent_messages(task.project_id, child_id, 0, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let cascade = ProjectCancellationCascadeRecord {
+        project_id: task.project_id,
+        root_task_id: task.task_id,
+        manager_session_id: root.id,
+        members: vec![(task.task_id, child_id)],
+        created_at: Timestamp::now(),
+    };
+    persistence
+        .begin_project_cancellation_cascade(&cascade)
+        .unwrap();
+    assert!(
+        persistence
+            .has_pending_project_cancellation_cascade(task.project_id)
+            .unwrap()
+    );
+    assert_eq!(
+        persistence
+            .list_pending_project_cancellation_cascades()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        persistence
+            .complete_project_cancellation_cascade(task.project_id, task.task_id)
+            .unwrap()
+    );
+
+    let _ = fs::remove_file(&path);
+}
