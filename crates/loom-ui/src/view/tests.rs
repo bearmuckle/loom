@@ -87,12 +87,13 @@ mod session_name_tests {
 mod display_helper_tests {
     use super::{
         AgentActivityData, AgentActivityRecord, AgentActivityStatus, CompletionKind,
-        FileActivityOperation, ToolPartStatus, activity_output, change_kind_label, command_line,
-        command_purpose, commands_matching, completion_for_value, composer_height, format_bytes,
-        format_duration, format_percentage, humanize_tool_output, is_redundant_completion_summary,
-        relative_time, replace_command_token, replace_last_token, rgb, run_state_color,
-        run_state_label, session_is_active, session_status_pill, tool_detail, tool_group_label,
-        tool_part_from_activity, tool_status, tool_title, tool_title_for_activity,
+        FileActivityOperation, ToolPart, ToolPartStatus, activity_output, change_kind_label,
+        command_line, command_purpose, commands_matching, completion_for_value, composer_height,
+        format_bytes, format_duration, format_percentage, humanize_tool_output,
+        is_redundant_completion_summary, relative_time, replace_command_token, replace_last_token,
+        rgb, run_state_color, run_state_label, session_is_active, session_status_pill, tool_detail,
+        tool_group_label, tool_group_status, tool_part_from_activity, tool_status, tool_title,
+        tool_title_for_activity,
     };
     use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
     use loom_model::{ModelId, ToolCall};
@@ -393,6 +394,42 @@ mod display_helper_tests {
         assert_eq!(tool_group_label("run_command", 3), "Ran 3 commands");
         assert_eq!(tool_group_label("search_text", 5), "Searched 5 times");
         assert_eq!(tool_group_label("mystery_tool", 2), "mystery_tool × 2");
+    }
+
+    fn grouped_part(status: ToolPartStatus) -> ToolPart {
+        ToolPart {
+            id: loom_core::ToolCallId::new(),
+            name: "run_command".to_owned(),
+            title: "Run command".to_owned(),
+            status,
+            detail: None,
+            output: None,
+            elapsed_ms: None,
+            approval_pending: false,
+        }
+    }
+
+    #[test]
+    fn tool_group_status_reflects_unfinished_children() {
+        use ToolPartStatus::{AwaitingApproval, Cancelled, Completed, Failed, Queued, Running};
+
+        let status = |statuses: &[ToolPartStatus]| {
+            let parts = statuses
+                .iter()
+                .copied()
+                .map(grouped_part)
+                .collect::<Vec<_>>();
+            let refs = parts.iter().collect::<Vec<_>>();
+            tool_group_status(&refs)
+        };
+
+        assert_eq!(status(&[]), Completed);
+        assert_eq!(status(&[Completed, Completed]), Completed);
+        assert_eq!(status(&[Completed, Queued, Queued]), Queued);
+        assert_eq!(status(&[Queued, Running]), Running);
+        assert_eq!(status(&[Completed, AwaitingApproval]), Running);
+        assert_eq!(status(&[Completed, Failed]), Failed);
+        assert_eq!(status(&[Completed, Cancelled]), Cancelled);
     }
 
     #[test]
@@ -1433,6 +1470,41 @@ mod loom_view_render_tests {
             });
         })
         .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn tool_groups_render_pending_active_and_failed_statuses(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.timeline = [
+                ToolPartStatus::Queued,
+                ToolPartStatus::Running,
+                ToolPartStatus::Failed,
+                ToolPartStatus::Cancelled,
+            ]
+            .into_iter()
+            .map(|status| {
+                let parts = (0..3)
+                    .map(|offset| {
+                        AssistantPart::Tool(Box::new(ToolPart {
+                            id: ToolCallId::new(),
+                            name: "run_command".to_owned(),
+                            title: format!("Run command {offset}"),
+                            status,
+                            detail: None,
+                            output: None,
+                            elapsed_ms: None,
+                            approval_pending: false,
+                        }))
+                    })
+                    .collect();
+                TimelineItem::Assistant(AssistantTurn {
+                    parts,
+                    streaming: false,
+                })
+            })
+            .collect();
+        });
     }
 
     #[gpui_kit::test]
