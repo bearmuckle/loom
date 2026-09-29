@@ -295,7 +295,7 @@ impl LoomView {
                         Some((worktree.clone(), status.clone(), diff.clone()));
                     view.project_snapshot_stale = true;
                     view.review.open = true;
-                    view.review.panel = ReviewPanel::Changes;
+                    view.review.tab = InspectorTab::Changes;
                     view.review.selected_file = None;
                     view.review.selected_path = Some(format!(
                         "{} · diff from {}",
@@ -353,7 +353,7 @@ impl LoomView {
                         Some((worktree.clone(), status.clone(), diff.clone()));
                     view.project_snapshot_stale = true;
                     view.review.open = true;
-                    view.review.panel = ReviewPanel::Changes;
+                    view.review.tab = InspectorTab::Changes;
                     view.review.selected_file = None;
                     view.review.selected_path = Some(format!(
                         "{} · diff from {}",

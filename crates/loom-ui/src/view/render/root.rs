@@ -580,7 +580,7 @@ impl Render for LoomView {
                     .flex_none()
                     .visible(review_panel_visible)
                     .child(div().size_full().when(review_panel_visible, |element| {
-                        element.child(self.render_review(window, cx))
+                        element.child(self.render_inspector(window, cx))
                     })),
             ]);
         let content = div()
@@ -714,7 +714,7 @@ impl Render for LoomView {
                             && !self.sessions.is_empty()
                             && !self.settings_open
                             && self.github_login.is_none(),
-                        |element| element.child(self.render_review(window, cx)),
+                        |element| element.child(self.render_inspector(window, cx)),
                     ),
             )
             .when(self.command_palette_open, |element| {

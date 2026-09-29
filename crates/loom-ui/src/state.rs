@@ -8,17 +8,81 @@ use std::collections::BTreeSet;
 use gpui_kit::{ListAlignment, ListState, px};
 use loom_core::{
     AgentMessageRecord, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ToolCallId,
+    UsageSnapshot,
 };
+use loom_model::ProviderUsageSummary;
 use loom_protocol::{
     AgentRunState, GitDiff, GitDiffLine, GitRepositoryStatus, SessionFilesystemChange,
-    SessionFilesystemFile,
+    SessionFilesystemFile, WorkspaceEntry,
 };
 
 use crate::MAX_TIMELINE_OUTPUT;
 
+/// The active pane in the right-hand inspector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReviewPanel {
+pub(crate) enum InspectorTab {
     Changes,
+    Agent,
+    Context,
+    Files,
+}
+
+impl InspectorTab {
+    pub(crate) const ALL: [Self; 4] = [Self::Changes, Self::Agent, Self::Context, Self::Files];
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Changes => "Changes",
+            Self::Agent => "Agent",
+            Self::Context => "Context",
+            Self::Files => "Files",
+        }
+    }
+
+    pub(crate) fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|candidate| *candidate == self)
+            .unwrap_or(0)
+    }
+}
+
+/// Token and cost accounting surfaced by the Context and Agent tabs. Session
+/// and run figures are kept separately because only one may be current.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UsageState {
+    pub(crate) session: Option<UsageSnapshot>,
+    pub(crate) run: Option<UsageSnapshot>,
+    pub(crate) session_provider: Option<ProviderUsageSummary>,
+    pub(crate) run_provider: Option<ProviderUsageSummary>,
+    pub(crate) loading: bool,
+    pub(crate) error: Option<String>,
+}
+
+impl UsageState {
+    /// The snapshot to show for the active run, falling back to the session.
+    pub(crate) fn total(&self) -> Option<&UsageSnapshot> {
+        self.run.as_ref().or(self.session.as_ref())
+    }
+
+    pub(crate) fn provider(&self) -> Option<&ProviderUsageSummary> {
+        self.run_provider
+            .as_ref()
+            .or(self.session_provider.as_ref())
+    }
+}
+
+/// The read-only file browser shown in the Files tab.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FilesState {
+    pub(crate) entries: Vec<WorkspaceEntry>,
+    pub(crate) loading: bool,
+    pub(crate) loaded: bool,
+    pub(crate) error: Option<String>,
+    pub(crate) selected_path: Option<String>,
+    pub(crate) selected_file: Option<SessionFilesystemFile>,
+    pub(crate) file_loading: bool,
+    pub(crate) file_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,7 +136,7 @@ impl AgentMode {
 #[derive(Clone, Debug)]
 pub(crate) struct ReviewState {
     pub(crate) open: bool,
-    pub(crate) panel: ReviewPanel,
+    pub(crate) tab: InspectorTab,
     pub(crate) changes: Vec<SessionFilesystemChange>,
     pub(crate) vcs: Option<GitRepositoryStatus>,
     pub(crate) repositories_loaded: bool,
@@ -83,10 +147,13 @@ pub(crate) struct ReviewState {
     pub(crate) selected_diff: Option<GitDiff>,
     pub(crate) diff_error: Option<String>,
     pub(crate) loading_diff: bool,
+    pub(crate) wrap_lines: bool,
     pub(crate) rows: Vec<ReviewRow>,
     pub(crate) hunk_rows: Vec<usize>,
     pub(crate) selected_hunk: usize,
     pub(crate) list_state: ListState,
+    pub(crate) usage: UsageState,
+    pub(crate) files: FilesState,
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +240,7 @@ impl Default for ReviewState {
     fn default() -> Self {
         Self {
             open: false,
-            panel: ReviewPanel::Changes,
+            tab: InspectorTab::Changes,
             changes: Vec::new(),
             vcs: None,
             repositories_loaded: false,
@@ -184,10 +251,13 @@ impl Default for ReviewState {
             selected_diff: None,
             diff_error: None,
             loading_diff: false,
+            wrap_lines: false,
             rows: Vec::new(),
             hunk_rows: Vec::new(),
             selected_hunk: 0,
             list_state: ListState::new(0, ListAlignment::Top, px(120.)),
+            usage: UsageState::default(),
+            files: FilesState::default(),
         }
     }
 }
@@ -478,6 +548,44 @@ mod tests {
     use super::*;
     use loom_core::ToolCallId;
     use loom_protocol::{GitDiffHunk, GitDiffLineKind};
+
+    #[test]
+    fn inspector_tabs_report_stable_labels_and_indexes() {
+        assert_eq!(
+            InspectorTab::ALL.map(InspectorTab::label),
+            ["Changes", "Agent", "Context", "Files"]
+        );
+        for (index, tab) in InspectorTab::ALL.into_iter().enumerate() {
+            assert_eq!(tab.index(), index);
+        }
+    }
+
+    #[test]
+    fn usage_state_prefers_run_over_session() {
+        let mut usage = UsageState::default();
+        assert!(usage.total().is_none());
+        assert!(usage.provider().is_none());
+        usage.session = Some(UsageSnapshot {
+            input_tokens: 10,
+            ..UsageSnapshot::default()
+        });
+        usage.session_provider = Some(ProviderUsageSummary {
+            requests: 1,
+            ..ProviderUsageSummary::default()
+        });
+        assert_eq!(usage.total().unwrap().input_tokens, 10);
+        assert_eq!(usage.provider().unwrap().requests, 1);
+        usage.run = Some(UsageSnapshot {
+            input_tokens: 20,
+            ..UsageSnapshot::default()
+        });
+        usage.run_provider = Some(ProviderUsageSummary {
+            requests: 2,
+            ..ProviderUsageSummary::default()
+        });
+        assert_eq!(usage.total().unwrap().input_tokens, 20);
+        assert_eq!(usage.provider().unwrap().requests, 2);
+    }
 
     #[test]
     fn review_hunks_map_to_virtual_rows() {
