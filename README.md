@@ -23,13 +23,13 @@ workspace and diff review, and a standalone WebSocket backend. Provider code
 includes a deterministic provider, OpenAI-compatible and Ollama adapters, and
 GitHub Copilot login.
 
-The browser client is still a development surface. Remote browser connections
-pass a bearer token in the WebSocket URL because browser WebSocket APIs cannot
-set authorization headers. URLs can be retained in browser history and
-observed by infrastructure logs; use short-lived, narrowly scoped credentials
-and a trusted TLS deployment boundary. The standalone backend speaks plain
-`ws://` and must not be exposed directly to an untrusted network. See the
-[security and trust model](docs/security.md).
+The browser client is still a development surface. Browser `WebSocket` clients
+cannot set authorization headers, so remote browser connections carry the bearer
+token in a `loom.bearer.<token>` WebSocket subprotocol instead of the connection
+URL, keeping it out of browser history and infrastructure logs. Use short-lived,
+narrowly scoped credentials and a trusted TLS deployment boundary. The
+standalone backend speaks plain `ws://` and must not be exposed directly to an
+untrusted network. See the [security and trust model](docs/security.md).
 
 Loom does not provide OS-level process sandboxing or a complete multi-user
 identity system. A session filesystem root is a path ownership boundary, not

@@ -3,10 +3,10 @@
 Each milestone should end with a demonstrable vertical slice. Avoid building
 an entire layer in isolation before proving the end-to-end path.
 
-> **Storage baseline note (after M7.4).** Loom has since been reset to a single
-> SQLite baseline schema (version 1) with no migration ladder and no legacy
-> import: a database written by another revision is rejected unchanged and must
-> be wiped. Per-run project-agent grants are now one versioned JSON payload
+> **Storage note.** Backend state lives in a single SQLite database managed
+> through an ordered migration ladder recorded in `PRAGMA user_version`; an
+> unknown or newer database is rejected unchanged and must be wiped explicitly.
+> Per-run project-agent grants are one versioned JSON payload
 > (`run_runtime_config.project_grants`) and delegated-task grants are
 > `delegated_tasks.permissions`. See [durable storage](storage.md) and
 > [the storage design](storage-design.md).

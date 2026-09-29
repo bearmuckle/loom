@@ -284,16 +284,18 @@ raw keys.
 
 The persistence layer stores typed SQLite tables covering session state, the
 authoritative event journal, serializable agent runtime state, workspace state
-and checkpoints, policy decisions, provider health, and usage ledgers. Loom is
-pre-1.0 and has no migration ladder: a database written by another revision is
-rejected unchanged and must be wiped. A runtime that was executing during a
+and checkpoints, policy decisions, provider health, and usage ledgers. Schema
+changes are applied through an ordered migration ladder recorded in
+`PRAGMA user_version`; a database from an unknown or newer version is rejected
+unchanged rather than overwritten. A runtime that was executing during a
 process crash is recovered in `paused` state so a new connection must
 explicitly resume it.
 
 Remote access uses the same domain services through a transport adapter:
 
 ```text
-HTTP upgrade + bearer token
+HTTP upgrade + bearer credential
+ (Authorization header or loom.bearer subprotocol)
           |
   bounded WebSocket connection
           |
@@ -312,7 +314,7 @@ entered the synchronous runtime is deliberately not tied to the connection.
 
 ## Repository layout
 
-The repository should evolve toward a Rust workspace:
+The repository is a Rust workspace:
 
 ```text
 crates/
@@ -329,6 +331,7 @@ crates/
   loom-vcs/
   loom-protocol/
   loom-server/
+  loom-local/
   loom-cli/
   loom-ui/
 ```

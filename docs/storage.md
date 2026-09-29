@@ -39,21 +39,21 @@ session only and the UI warns that it will not reconnect after restart. Linux
 uses Secret Service, which requires an available user session/keyring. Browser
 peer-token behavior is unchanged.
 
-The database has a single baseline schema, currently version 1. Loom is
-pre-1.0, so there is no migration ladder and no legacy import: a database
-written by any other revision is rejected unchanged and must be wiped by the
-operator. When the model changes, the baseline version and the schema
-definitions change together. Per-run project-agent grants are stored as one
-versioned JSON payload (`run_runtime_config.project_grants`) and delegated-task
-grants as `delegated_tasks.permissions`, so adding a grant is a code change
-rather than a schema change. JSON is otherwise used only for small bounded
-configuration, diagnostic payloads, and child collections read with their
-parent; it is not used for query keys.
+Schema changes are applied through an ordered migration ladder that records
+each step in `PRAGMA user_version`. Opening a database at an older version
+applies the pending migrations in order; a database from an unknown or newer
+version is rejected unchanged so it is never silently downgraded or corrupted.
+Per-run project-agent grants are stored as one versioned JSON payload
+(`run_runtime_config.project_grants`) and delegated-task grants as
+`delegated_tasks.permissions`, so adding a grant is a code change rather than a
+schema change. JSON is otherwise used only for small bounded configuration,
+diagnostic payloads, and child collections read with their parent; it is not
+used for query keys.
 
-When a database from another revision is found, Loom reports it and offers to
-wipe it: pass `--reset-state`, or confirm the interactive prompt when running
-in a terminal. Loom never wipes state implicitly, and it refuses to wipe a
-database that another backend currently owns.
+When a rejected database is found, Loom reports it and offers to wipe it: pass
+`--reset-state`, or confirm the interactive prompt when running in a terminal.
+Loom never wipes state implicitly, and it refuses to wipe a database that
+another backend currently owns.
 
 SQLite checkpoints and WAL files are managed by SQLite. Reconnect events,
 idempotency responses, and filesystem change pages have explicit retention

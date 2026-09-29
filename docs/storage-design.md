@@ -2,13 +2,13 @@
 
 ## Status
 
-Loom stores durable backend state in one SQLite database with a single
-baseline schema, currently version 1. Loom is pre-1.0: there is no migration
-ladder and no legacy import path. A database written by any other Loom
-revision is rejected unchanged, and the operator must wipe it before starting
-from a new database. When the domain model changes, the baseline version and
-the typed schema definitions change together; incremental migrations are
-deliberately not supported.
+Loom stores durable backend state in one SQLite database. Schema changes are
+applied through an ordered migration ladder recorded in `PRAGMA user_version`:
+opening a database at an older version applies the pending steps in order and
+commits each step with its version. A database from an unknown or newer version
+is rejected unchanged so it is never silently downgraded or corrupted. New
+schema changes append a migration step with the next version rather than
+editing the baseline definition.
 
 Per-run project-agent grants are stored as one versioned JSON payload
 (`run_runtime_config.project_grants`), and delegated-task grants as
@@ -18,9 +18,9 @@ rather than a schema change. JSON is otherwise reserved for small bounded
 configuration or diagnostic payloads that are not used as query keys.
 
 Wiping is always opt-in. On startup the native client and CLI inspect the
-database without modifying it; an incompatible file is reported and wiped only
-when `--reset-state` is passed or the user confirms an interactive prompt on a
-terminal. The wipe removes the database and its SQLite sidecar files and
+database without modifying it; an unknown or newer database is reported and
+wiped only when `--reset-state` is passed or the user confirms an interactive
+prompt on a terminal. The wipe removes the database and its SQLite sidecar files and
 refuses to run while another backend holds the writer lock.
 
 ## Data model
