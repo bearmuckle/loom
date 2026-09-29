@@ -6,5 +6,6 @@
 
 use super::*;
 
+pub(crate) mod admission;
 pub(crate) mod credential;
 pub(crate) mod idempotency;

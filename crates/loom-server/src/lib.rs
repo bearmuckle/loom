@@ -62,6 +62,7 @@ mod dispatch;
 mod remote;
 mod services;
 
+use services::admission::AdmissionService;
 use services::credential::CredentialService;
 #[cfg(test)]
 use services::idempotency::{
@@ -1834,9 +1835,7 @@ pub struct InProcessBackend {
     persistence: Option<FilePersistence>,
     session_root_base: PathBuf,
     idempotency_store: IdempotencyStore,
-    session_admissions: Mutex<BTreeMap<AgentSessionId, Arc<Mutex<()>>>>,
-    project_admissions: Mutex<BTreeMap<ProjectId, Arc<Mutex<()>>>>,
-    workspace_project_admissions: Mutex<BTreeMap<WorkspaceId, Arc<Mutex<()>>>>,
+    admissions: AdmissionService,
     self_reference: Mutex<Weak<InProcessBackend>>,
     request_lifecycle: RwLock<u8>,
     persistence_failed: AtomicBool,
@@ -3237,9 +3236,7 @@ impl InProcessBackend {
             persistence,
             session_root_base,
             idempotency_store: IdempotencyStore::new(),
-            session_admissions: Mutex::new(BTreeMap::new()),
-            project_admissions: Mutex::new(BTreeMap::new()),
-            workspace_project_admissions: Mutex::new(BTreeMap::new()),
+            admissions: AdmissionService::new(),
             self_reference: Mutex::new(Weak::new()),
             request_lifecycle: RwLock::new(0),
             persistence_failed: AtomicBool::new(false),
@@ -4860,39 +4857,6 @@ impl InProcessBackend {
             }
         }
         Ok(())
-    }
-
-    fn session_admission(&self, session_id: AgentSessionId) -> Result<Arc<Mutex<()>>> {
-        let mut admissions = self.session_admissions.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session admission lock was poisoned",
-                true,
-            )
-        })?;
-        Ok(Arc::clone(admissions.entry(session_id).or_default()))
-    }
-
-    fn project_admission(&self, project_id: ProjectId) -> Result<Arc<Mutex<()>>> {
-        let mut admissions = self.project_admissions.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "project scheduling lock was poisoned",
-                true,
-            )
-        })?;
-        Ok(Arc::clone(admissions.entry(project_id).or_default()))
-    }
-
-    fn workspace_project_admission(&self, workspace_id: WorkspaceId) -> Result<Arc<Mutex<()>>> {
-        let mut admissions = self.workspace_project_admissions.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "workspace project scheduling lock was poisoned",
-                true,
-            )
-        })?;
-        Ok(Arc::clone(admissions.entry(workspace_id).or_default()))
     }
 
     /// Journals one agent event and keeps the session state in step with it.
@@ -7185,7 +7149,7 @@ impl InProcessConnection {
                 child,
             });
         }
-        let admission = self.backend.project_admission(project_id)?;
+        let admission = self.backend.admissions.project(project_id)?;
         let admission_guard = admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -7203,7 +7167,8 @@ impl InProcessConnection {
         let parent_snapshot = self.backend.sessions()?.get(parent_session_id)?;
         let workspace_admission = self
             .backend
-            .workspace_project_admission(parent_snapshot.workspace_id)?;
+            .admissions
+            .workspace_project(parent_snapshot.workspace_id)?;
         let workspace_admission_guard = workspace_admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -7672,7 +7637,7 @@ impl InProcessConnection {
                             .sessions()?
                             .get(task.target_session_id)?
                             .workspace_id;
-                        let admission = self.backend.workspace_project_admission(workspace_id)?;
+                        let admission = self.backend.admissions.workspace_project(workspace_id)?;
                         let _admission = admission.lock().map_err(|_| {
                             LoomError::new(
                                 ErrorCode::Internal,
@@ -7734,7 +7699,7 @@ impl InProcessConnection {
                 }
             }
             ProjectChildControlAction::Cancel => {
-                let admission = self.backend.project_admission(project_id)?;
+                let admission = self.backend.admissions.project(project_id)?;
                 let admission_guard = admission.lock().map_err(|_| {
                     LoomError::new(
                         ErrorCode::Internal,
@@ -7826,7 +7791,8 @@ impl InProcessConnection {
                     .sessions()?
                     .get(task.target_session_id)?
                     .workspace_id;
-                let workspace_admission = self.backend.workspace_project_admission(workspace_id)?;
+                let workspace_admission =
+                    self.backend.admissions.workspace_project(workspace_id)?;
                 let workspace_admission_guard = workspace_admission.lock().map_err(|_| {
                     LoomError::new(
                         ErrorCode::Internal,
@@ -8039,7 +8005,7 @@ impl InProcessConnection {
                 false,
             )
         })?;
-        let project_admission = self.backend.project_admission(cascade.project_id)?;
+        let project_admission = self.backend.admissions.project(cascade.project_id)?;
         let _project_admission_guard = project_admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -8064,7 +8030,7 @@ impl InProcessConnection {
             .sessions()?
             .get(root_task.target_session_id)?
             .workspace_id;
-        let workspace_admission = self.backend.workspace_project_admission(workspace_id)?;
+        let workspace_admission = self.backend.admissions.workspace_project(workspace_id)?;
         let workspace_admission_guard = workspace_admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -8366,7 +8332,7 @@ impl InProcessConnection {
         manager_session_id: AgentSessionId,
         task_id: loom_core::TaskId,
     ) -> Result<ServerResponse> {
-        let admission = self.backend.project_admission(project_id)?;
+        let admission = self.backend.admissions.project(project_id)?;
         let _admission = admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -8429,7 +8395,7 @@ impl InProcessConnection {
                 false,
             ));
         }
-        let admission = self.backend.project_admission(project_id)?;
+        let admission = self.backend.admissions.project(project_id)?;
         let _admission = admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -8623,7 +8589,7 @@ impl InProcessConnection {
                 false,
             ));
         }
-        let admission = self.backend.project_admission(project_id)?;
+        let admission = self.backend.admissions.project(project_id)?;
         let _admission = admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -8932,7 +8898,7 @@ impl InProcessConnection {
         workspace_id: WorkspaceId,
         recovering: bool,
     ) -> Result<()> {
-        let admission = self.backend.workspace_project_admission(workspace_id)?;
+        let admission = self.backend.admissions.workspace_project(workspace_id)?;
         let _admission = admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -10186,7 +10152,7 @@ impl InProcessConnection {
     }
 
     fn start_run_with_options(&self, mut input: StartRunInput) -> Result<ServerResponse> {
-        let admission = self.backend.session_admission(input.session_id)?;
+        let admission = self.backend.admissions.session(input.session_id)?;
         let _admission_guard = admission.try_lock().map_err(|_| {
             LoomError::conflict("another agent run is already being started for this session")
         })?;
@@ -10479,7 +10445,7 @@ impl InProcessConnection {
             .sessions()?
             .get(handle.session_id)?
             .workspace_id;
-        let admission = self.backend.workspace_project_admission(workspace_id)?;
+        let admission = self.backend.admissions.workspace_project(workspace_id)?;
         let _admission = admission.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
