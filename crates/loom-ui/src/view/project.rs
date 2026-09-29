@@ -29,9 +29,9 @@ impl LoomView {
             }
         };
         self.project_snapshot_stale = false;
-        let request = backend.submit(RequestEnvelope::new(
-            ClientRequest::GetProjectSnapshotForSession { session_id },
-        ));
+        let request = backend.submit(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::GetProjectSnapshotForSession { session_id },
+        )));
         cx.spawn(async move |view, cx| {
             let response = cx
                 .background_spawn(async move { request.wait().await })
@@ -42,7 +42,7 @@ impl LoomView {
                 }
                 let mut reload_sessions = false;
                 match response.result {
-                    Ok(ServerResponse::ProjectSnapshot(snapshot)) => {
+                    Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) => {
                         reload_sessions =
                             project_snapshot_has_unloaded_agent_sessions(&snapshot, &view.sessions);
                         view.project_tree_snapshots
@@ -121,22 +121,22 @@ impl LoomView {
             for session_id in recipients {
                 let mut cursor = cursors.get(&session_id).copied();
                 loop {
-                    let request = backend.submit(RequestEnvelope::new(
-                        ClientRequest::ListProjectAgentMessages {
+                    let request = backend.submit(RequestEnvelope::new(ClientRequest::Project(
+                        ProjectRequest::ListProjectAgentMessages {
                             project_id,
                             session_id,
                             after_project_sequence: cursor,
                             limit: 512,
                         },
-                    ));
+                    )));
                     let response = cx
                         .background_spawn(async move { request.wait().await })
                         .await;
                     match response.result {
-                        Ok(ServerResponse::ProjectAgentMessages {
+                        Ok(ServerResponse::Project(ProjectResponse::ProjectAgentMessages {
                             messages: page,
                             next_after_project_sequence,
-                        }) => {
+                        })) => {
                             if let Some(last) = page.last() {
                                 cursor = Some(last.project_sequence);
                                 cursors.insert(session_id, last.project_sequence);
@@ -247,14 +247,17 @@ impl LoomView {
     ) {
         self.dispatch(
             cx,
-            ClientRequest::ControlProjectChild {
+            ClientRequest::Project(ProjectRequest::ControlProjectChild {
                 project_id,
                 manager_session_id,
                 task_id,
                 action,
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::ProjectChildControlled { task, .. }) => {
+                Ok(ServerResponse::Project(ProjectResponse::ProjectChildControlled {
+                    task,
+                    ..
+                })) => {
                     view.record_status(format!("{} · {:?}", task.child_name, task.status));
                     view.project_snapshot_stale = true;
                     view.refresh_active_project_snapshot(cx);
@@ -277,17 +280,17 @@ impl LoomView {
     ) {
         self.dispatch(
             cx,
-            ClientRequest::GetProjectChildReview {
+            ClientRequest::Project(ProjectRequest::GetProjectChildReview {
                 project_id,
                 manager_session_id,
                 task_id,
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::ProjectChildReview {
+                Ok(ServerResponse::Project(ProjectResponse::ProjectChildReview {
                     worktree,
                     status,
                     diff,
-                }) => {
+                })) => {
                     view.project_child_review =
                         Some((worktree.clone(), status.clone(), diff.clone()));
                     view.project_snapshot_stale = true;
@@ -324,13 +327,13 @@ impl LoomView {
     ) {
         self.dispatch(
             cx,
-            ClientRequest::GetProjectChildReview {
+            ClientRequest::Project(ProjectRequest::GetProjectChildReview{
                 project_id,
                 manager_session_id,
                 task_id,
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::ProjectChildReview { status, .. }) if status.clean
+                Ok(ServerResponse::Project(ProjectResponse::ProjectChildReview{ status, .. })) if status.clean
                     && status.head.as_deref() == Some(expected_child_revision.as_str()) =>
                 {
                     view.submit_project_child_integration(
@@ -341,11 +344,11 @@ impl LoomView {
                         cx,
                     );
                 }
-                Ok(ServerResponse::ProjectChildReview {
+                Ok(ServerResponse::Project(ProjectResponse::ProjectChildReview{
                     worktree,
                     status,
                     diff,
-                }) => {
+                })) => {
                     view.project_child_review =
                         Some((worktree.clone(), status.clone(), diff.clone()));
                     view.project_snapshot_stale = true;
@@ -384,14 +387,16 @@ impl LoomView {
     ) {
         self.dispatch(
             cx,
-            ClientRequest::IntegrateProjectChild {
+            ClientRequest::Project(ProjectRequest::IntegrateProjectChild {
                 project_id,
                 manager_session_id,
                 task_id,
                 expected_parent_revision,
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree)) => {
+                Ok(ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(
+                    worktree,
+                ))) => {
                     view.project_child_review = None;
                     view.project_snapshot_stale = true;
                     view.record_status(format!(
@@ -423,14 +428,16 @@ impl LoomView {
     ) {
         self.dispatch(
             cx,
-            ClientRequest::CleanupProjectChildWorktree {
+            ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree {
                 project_id,
                 manager_session_id,
                 task_id,
                 disposition,
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree)) => {
+                Ok(ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(
+                    worktree,
+                ))) => {
                     view.project_snapshot_stale = true;
                     view.record_status(format!("Child checkout is {:?}", worktree.status));
                     if view

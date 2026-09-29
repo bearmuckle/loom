@@ -77,12 +77,12 @@ impl LoomView {
                 return;
             };
             self.optimistic_messages.push(message.clone());
-            ClientRequest::SendAgentMessage {
+            ClientRequest::Run(RunRequest::SendAgentMessage {
                 run_id,
                 attempt_id: run.attempt_id,
                 expected_control_revision: run.control_revision,
                 message: message.clone(),
-            }
+            })
         } else {
             if !self.demo_workspace && self.model.as_str() == "deterministic/demo" {
                 self.sending_message = false;
@@ -94,7 +94,7 @@ impl LoomView {
                 );
                 return;
             }
-            ClientRequest::StartSessionAgentRun {
+            ClientRequest::Run(RunRequest::StartSessionAgentRun {
                 session_id: self.active_session.id,
                 task: message.clone(),
                 model: self.model.clone(),
@@ -104,15 +104,17 @@ impl LoomView {
                 repository_instructions: Some(
                     "Keep the change focused and provide reviewable evidence.".to_owned(),
                 ),
-            }
+            })
         };
         self.timeline.push(TimelineItem::User(message));
         let session_id = self.active_session.id;
         let rename_request = session_title.map(|title| {
-            backend.submit(RequestEnvelope::new(ClientRequest::RenameAgentSession {
-                session_id,
-                name: title,
-            }))
+            backend.submit(RequestEnvelope::new(ClientRequest::Session(
+                SessionRequest::RenameAgentSession {
+                    session_id,
+                    name: title,
+                },
+            )))
         });
         let run_request = backend.submit(RequestEnvelope::new(request));
         cx.spawn(async move |view, cx| {
@@ -139,7 +141,8 @@ impl LoomView {
     ) {
         self.sending_message = false;
         match response.result {
-            Ok(ServerResponse::AgentRunStarted(run)) | Ok(ServerResponse::AgentRun(run)) => {
+            Ok(ServerResponse::Run(RunResponse::AgentRunStarted(run)))
+            | Ok(ServerResponse::Run(RunResponse::AgentRun(run))) => {
                 self.session_task_cache
                     .insert(self.active_session.id, run.task.clone());
                 self.active_run = Some(run);
@@ -194,12 +197,12 @@ impl LoomView {
         self.approval_request_in_flight = true;
         self.dispatch(
             cx,
-            ClientRequest::ApproveAgentAction {
+            ClientRequest::Run(RunRequest::ApproveAgentAction {
                 run_id,
                 attempt_id: run.attempt_id,
                 expected_control_revision: run.control_revision,
                 tool_call_id: call.id,
-            },
+            }),
             |view, response, cx| view.finish_approval_response(response, cx),
         );
     }
@@ -221,13 +224,13 @@ impl LoomView {
         self.approval_request_in_flight = true;
         self.dispatch(
             cx,
-            ClientRequest::RejectAgentAction {
+            ClientRequest::Run(RunRequest::RejectAgentAction {
                 run_id,
                 attempt_id: run.attempt_id,
                 expected_control_revision: run.control_revision,
                 tool_call_id: call.id,
                 reason: None,
-            },
+            }),
             |view, response, cx| view.finish_approval_response(response, cx),
         );
     }
@@ -238,7 +241,8 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         match response.result {
-            Ok(ServerResponse::AgentRun(run)) | Ok(ServerResponse::AgentRunStarted(run)) => {
+            Ok(ServerResponse::Run(RunResponse::AgentRun(run)))
+            | Ok(ServerResponse::Run(RunResponse::AgentRunStarted(run))) => {
                 self.active_run = Some(run.clone());
                 self.active_run_id = Some(run.id);
                 self.run_state = Some(run.state);
@@ -273,11 +277,11 @@ impl LoomView {
         };
         self.dispatch(
             cx,
-            ClientRequest::InterruptAgentRun { run_id },
+            ClientRequest::Run(RunRequest::InterruptAgentRun { run_id }),
             |view, response, cx| {
                 match response.result {
-                    Ok(ServerResponse::AgentRun(run))
-                    | Ok(ServerResponse::AgentRunStarted(run)) => {
+                    Ok(ServerResponse::Run(RunResponse::AgentRun(run)))
+                    | Ok(ServerResponse::Run(RunResponse::AgentRunStarted(run))) => {
                         view.active_run_id = Some(run.id);
                         view.active_run = Some(run.clone());
                         view.run_state = Some(run.state);

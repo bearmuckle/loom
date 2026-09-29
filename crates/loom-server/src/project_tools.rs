@@ -546,19 +546,21 @@ impl ProjectAgentTools {
             arguments.child_name,
             spec,
         ) {
-            Ok(ServerResponse::ProjectChildCreated { task, child }) => ToolResult {
-                tool_call_id: call.id,
-                name: call.name.clone(),
-                success: true,
-                output: serde_json::to_string(&serde_json::json!({
-                    "task_id": task.task_id,
-                    "child_session_id": child.session_id,
-                    "status": task.status,
-                    "child_name": task.child_name,
-                    "intent": task.intent,
-                }))
-                .unwrap_or_else(|error| format!("could not encode delegation result: {error}")),
-            },
+            Ok(ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child })) => {
+                ToolResult {
+                    tool_call_id: call.id,
+                    name: call.name.clone(),
+                    success: true,
+                    output: serde_json::to_string(&serde_json::json!({
+                        "task_id": task.task_id,
+                        "child_session_id": child.session_id,
+                        "status": task.status,
+                        "child_name": task.child_name,
+                        "intent": task.intent,
+                    }))
+                    .unwrap_or_else(|error| format!("could not encode delegation result: {error}")),
+                }
+            }
             Ok(_) => ToolResult::failure(call, "project delegation returned an unexpected result"),
             Err(error) => ToolResult::failure(call, error.message),
         }
@@ -600,21 +602,23 @@ impl ProjectAgentTools {
             self.can_branch_message,
             draft,
         ) {
-            Ok(ServerResponse::ProjectAgentMessageAccepted(message)) => ToolResult {
-                tool_call_id: call.id,
-                name: call.name.clone(),
-                success: true,
-                output: serde_json::to_string(&serde_json::json!({
-                    "message_id": message.message_id,
-                    "project_sequence": message.project_sequence,
-                    "accepted_at": message.accepted_at,
-                    "target_session_id": message.target_session_id,
-                    "kind": message.kind,
-                }))
-                .unwrap_or_else(|error| {
-                    format!("could not encode project message result: {error}")
-                }),
-            },
+            Ok(ServerResponse::Project(ProjectResponse::ProjectAgentMessageAccepted(message))) => {
+                ToolResult {
+                    tool_call_id: call.id,
+                    name: call.name.clone(),
+                    success: true,
+                    output: serde_json::to_string(&serde_json::json!({
+                        "message_id": message.message_id,
+                        "project_sequence": message.project_sequence,
+                        "accepted_at": message.accepted_at,
+                        "target_session_id": message.target_session_id,
+                        "kind": message.kind,
+                    }))
+                    .unwrap_or_else(|error| {
+                        format!("could not encode project message result: {error}")
+                    }),
+                }
+            }
             Ok(_) => ToolResult::failure(call, "project messaging returned an unexpected result"),
             Err(error) => ToolResult::failure(call, error.message),
         }
@@ -814,13 +818,15 @@ impl ProjectAgentTools {
             self.session_id,
             arguments.task_id,
         ) {
-            Ok(response @ ServerResponse::ProjectChildReview { .. }) => ToolResult {
-                tool_call_id: call.id,
-                name: call.name.clone(),
-                success: true,
-                output: serde_json::to_string(&response)
-                    .unwrap_or_else(|error| format!("could not encode child review: {error}")),
-            },
+            Ok(response @ ServerResponse::Project(ProjectResponse::ProjectChildReview { .. })) => {
+                ToolResult {
+                    tool_call_id: call.id,
+                    name: call.name.clone(),
+                    success: true,
+                    output: serde_json::to_string(&response)
+                        .unwrap_or_else(|error| format!("could not encode child review: {error}")),
+                }
+            }
             Ok(_) => {
                 ToolResult::failure(call, "project child review returned an unexpected result")
             }
@@ -858,17 +864,19 @@ impl ProjectAgentTools {
             arguments.task_id,
             arguments.expected_parent_revision,
         ) {
-            Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree)) => ToolResult {
-                tool_call_id: call.id,
-                name: call.name.clone(),
-                success: true,
-                output: serde_json::to_string(&serde_json::json!({
-                    "task_id": worktree.task_id,
-                    "status": worktree.status,
-                    "integrated_revision": worktree.integrated_revision,
-                }))
-                .unwrap_or_else(|error| format!("could not encode child integration: {error}")),
-            },
+            Ok(ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(worktree))) => {
+                ToolResult {
+                    tool_call_id: call.id,
+                    name: call.name.clone(),
+                    success: true,
+                    output: serde_json::to_string(&serde_json::json!({
+                        "task_id": worktree.task_id,
+                        "status": worktree.status,
+                        "integrated_revision": worktree.integrated_revision,
+                    }))
+                    .unwrap_or_else(|error| format!("could not encode child integration: {error}")),
+                }
+            }
             Ok(_) => ToolResult::failure(
                 call,
                 "project child integration returned an unexpected result",

@@ -9,19 +9,21 @@ impl LoomView {
     ) -> Result<(), LoomError> {
         let session_id = self.active_session.id;
         for resync_attempt in 0..=1 {
-            let response =
-                self.connection
-                    .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            let response = self
+                .connection
+                .request(RequestEnvelope::new(ClientRequest::Events(
+                    EventsRequest::GetSessionEvents {
                         session_id: Some(session_id),
                         workspace_id: None,
                         after_sequence,
                         stream_epoch: self.event_stream_epoch.clone(),
-                    }));
+                    },
+                )));
             match response.result? {
-                ServerResponse::SessionEvents {
+                ServerResponse::Events(EventsResponse::SessionEvents {
                     events,
                     stream_epoch,
-                } => {
+                }) => {
                     self.reset_projection();
                     self.after_sequence = after_sequence;
                     self.event_stream_epoch = stream_epoch;
@@ -36,19 +38,23 @@ impl LoomView {
                     }
                     return Ok(());
                 }
-                ServerResponse::SessionEventsSnapshot {
+                ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
                     session,
                     events,
                     latest_sequence,
                     stream_epoch,
                     ..
-                } if resync_attempt == 0 => {
+                }) if resync_attempt == 0 => {
                     self.event_stream_epoch = stream_epoch;
                     self.active_session = session;
-                    let refreshed = self.connection.request(RequestEnvelope::new(
-                        ClientRequest::GetAgentSessionInitialState { session_id },
-                    ));
-                    if let Ok(ServerResponse::AgentSessionInitialState(initial)) = refreshed.result
+                    let refreshed =
+                        self.connection
+                            .request(RequestEnvelope::new(ClientRequest::Session(
+                                SessionRequest::GetAgentSessionInitialState { session_id },
+                            )));
+                    if let Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(
+                        initial,
+                    ))) = refreshed.result
                     {
                         after_sequence = Some(initial.cursor);
                         fallback = initial.projection.active_run;
@@ -63,13 +69,13 @@ impl LoomView {
                     self.apply_event_snapshot(events, latest_sequence, fallback);
                     return Ok(());
                 }
-                ServerResponse::SessionEventsSnapshot {
+                ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
                     session,
                     events,
                     latest_sequence,
                     stream_epoch,
                     ..
-                } => {
+                }) => {
                     self.active_session = session;
                     self.event_stream_epoch = stream_epoch;
                     self.apply_event_snapshot(events, latest_sequence, fallback);

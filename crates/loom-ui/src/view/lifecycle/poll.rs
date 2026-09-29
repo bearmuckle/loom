@@ -54,12 +54,12 @@ impl LoomView {
         let stream_epoch = self.project_feed_epoch.clone();
         self.dispatch(
             cx,
-            ClientRequest::GetSessionEvents {
+            ClientRequest::Events(EventsRequest::GetSessionEvents {
                 session_id: None,
                 workspace_id: Some(workspace_id),
                 after_sequence,
                 stream_epoch,
-            },
+            }),
             move |view, response, cx| {
                 if view.active_session.id != root_session_id
                     || view.active_session.workspace_id != workspace_id
@@ -69,11 +69,11 @@ impl LoomView {
                 }
                 view.project_poll_scheduled = false;
                 match response.result {
-                    Ok(ServerResponse::WorkspaceEvents {
+                    Ok(ServerResponse::Events(EventsResponse::WorkspaceEvents {
                         workspace_id: response_workspace,
                         events,
                         stream_epoch,
-                    }) if response_workspace == workspace_id => {
+                    })) if response_workspace == workspace_id => {
                         view.project_feed_epoch = stream_epoch;
                         if let Some(latest) = events.iter().map(workspace_feed_event_sequence).max()
                         {
@@ -90,13 +90,13 @@ impl LoomView {
                             view.project_messages_stale = true;
                         }
                     }
-                    Ok(ServerResponse::WorkspaceEventsSnapshot {
+                    Ok(ServerResponse::Events(EventsResponse::WorkspaceEventsSnapshot {
                         workspace_id: response_workspace,
                         events,
                         latest_sequence,
                         stream_epoch,
                         ..
-                    }) if response_workspace == workspace_id => {
+                    })) if response_workspace == workspace_id => {
                         view.project_feed_epoch = stream_epoch;
                         view.project_feed_after_sequence = Some(latest_sequence);
                         view.project_snapshot_stale = true;
@@ -128,31 +128,31 @@ impl LoomView {
     pub(crate) fn poll_run_once(&mut self, cx: &mut Context<Self>) {
         self.dispatch(
             cx,
-            ClientRequest::GetSessionEvents {
+            ClientRequest::Events(EventsRequest::GetSessionEvents {
                 session_id: Some(self.active_session.id),
                 workspace_id: None,
                 after_sequence: self.after_sequence,
                 stream_epoch: self.event_stream_epoch.clone(),
-            },
+            }),
             |view, response, cx| {
                 match response.result {
-                    Ok(ServerResponse::SessionEvents {
+                    Ok(ServerResponse::Events(EventsResponse::SessionEvents {
                         events,
                         stream_epoch,
-                    }) => {
+                    })) => {
                         view.event_stream_epoch = stream_epoch;
                         for event in events {
                             view.after_sequence = Some(event.sequence);
                             view.consume_event(&event.event);
                         }
                     }
-                    Ok(ServerResponse::SessionEventsSnapshot {
+                    Ok(ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
                         session,
                         events,
                         latest_sequence,
                         stream_epoch,
                         ..
-                    }) => {
+                    })) => {
                         view.event_stream_epoch = stream_epoch;
                         view.active_session = session;
                         view.reset_projection();

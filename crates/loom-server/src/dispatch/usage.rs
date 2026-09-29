@@ -7,19 +7,19 @@ impl InProcessConnection {
         _request_id: RequestId,
     ) -> Result<ServerResponse> {
         match request {
-            ClientRequest::GetRunUsage { run_id } => {
+            ClientRequest::Usage(UsageRequest::GetRunUsage { run_id }) => {
                 let summary = self.run_summary(run_id)?;
                 let provider = self
                     .backend
                     .providers
                     .usage()?
                     .summary(None, Some(&summary.snapshot.model));
-                Ok(ServerResponse::RunUsage {
+                Ok(ServerResponse::Usage(UsageResponse::RunUsage {
                     usage: summary.usage,
                     provider,
-                })
+                }))
             }
-            ClientRequest::GetSessionUsage { session_id } => {
+            ClientRequest::Usage(UsageRequest::GetSessionUsage { session_id }) => {
                 self.backend.sessions()?.get(session_id)?;
                 let loaded_ids = {
                     let runs = self.backend.runs()?;
@@ -44,10 +44,10 @@ impl InProcessConnection {
                         add_usage(&mut usage, &handle.state().usage);
                     }
                 }
-                Ok(ServerResponse::SessionUsage {
+                Ok(ServerResponse::Usage(UsageResponse::SessionUsage {
                     usage,
                     provider: self.backend.providers.usage()?.summary(None, None),
-                })
+                }))
             }
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }

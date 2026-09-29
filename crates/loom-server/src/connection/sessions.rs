@@ -129,7 +129,9 @@ impl InProcessConnection {
 
         let (snapshot, record) = self.backend.sessions()?.archive(session_id)?;
         self.backend.journal()?.append_session(record);
-        Ok(ServerResponse::AgentSessionArchived(snapshot))
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionArchived(snapshot),
+        ))
     }
 }
 

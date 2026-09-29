@@ -10,7 +10,8 @@ use loom_persistence::{
 };
 use loom_protocol::{
     AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile,
-    ClientRequest, RequestEnvelope, ServerResponse, WorkspaceControl,
+    ClientRequest, ControlRequest, ControlResponse, RequestEnvelope, ServerResponse,
+    SessionResponse, WorkspaceControl, WorkspaceRequest,
 };
 use loom_server::InProcessBackend;
 use loom_session::{SessionManager, WorkspaceManager};
@@ -161,20 +162,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let backend = InProcessBackend::open_persistent(&path)?;
         let elapsed = started.elapsed();
         let connection = backend.connect();
-        let negotiation = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: CapabilitySet::new([Capability::ReadAgentSession]),
-        }));
-        if !matches!(negotiation.result, Ok(ServerResponse::Negotiated(_))) {
+        let negotiation = connection.request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: CapabilitySet::new([Capability::ReadAgentSession]),
+            },
+        )));
+        if !matches!(
+            negotiation.result,
+            Ok(ServerResponse::Control(ControlResponse::Negotiated(_)))
+        ) {
             return Err("restore benchmark client negotiation failed".into());
         }
-        let listed =
-            connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+        let listed = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaceSessions {
                 workspace_id: workspace.id,
                 include_archived: true,
-            }));
+            },
+        )));
         match listed.result? {
-            ServerResponse::AgentSessions { sessions } if sessions.len() == session_count => {}
+            ServerResponse::Session(SessionResponse::AgentSessions { sessions })
+                if sessions.len() == session_count => {}
             other => return Err(format!("restore validation returned {other:?}").into()),
         }
         drop(backend);

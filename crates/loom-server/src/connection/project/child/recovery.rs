@@ -121,7 +121,7 @@ impl InProcessConnection {
                     self.set_project_task_status(persistence, &mut task, status)?;
                 } else {
                     let response = self.stop_run(snapshot.id, RunStop::Interrupt)?;
-                    let ServerResponse::AgentRun(stopped) = response else {
+                    let ServerResponse::Run(RunResponse::AgentRun(stopped)) = response else {
                         return Err(LoomError::new(
                             ErrorCode::Internal,
                             "project child cancel returned an unexpected response",

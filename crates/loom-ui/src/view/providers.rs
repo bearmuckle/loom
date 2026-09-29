@@ -82,18 +82,20 @@ impl LoomView {
             cx.notify();
             return;
         };
-        let pending = backend.submit(RequestEnvelope::new(ClientRequest::StartGitHubCopilotLogin));
+        let pending = backend.submit(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::StartGitHubCopilotLogin,
+        )));
         cx.spawn(async move |view, cx| {
             let response = pending.wait().await;
             let (login_id, user_code, verification_uri, expires_in, interval) =
                 match response.result {
-                    Ok(ServerResponse::GitHubCopilotLoginStarted {
+                    Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStarted {
                         login_id,
                         user_code,
                         verification_uri,
                         expires_in,
                         interval,
-                    }) => (login_id, user_code, verification_uri, expires_in, interval),
+                    })) => (login_id, user_code, verification_uri, expires_in, interval),
                     Err(error) => {
                         view.update(cx, |view, cx| {
                             view.github_login = Some(GitHubLoginState::Error(error.message));
@@ -137,29 +139,29 @@ impl LoomView {
                     return;
                 }
                 let response = backend
-                    .submit(RequestEnvelope::new(
-                        ClientRequest::GetGitHubCopilotLoginStatus {
+                    .submit(RequestEnvelope::new(ClientRequest::Provider(
+                        ProviderRequest::GetGitHubCopilotLoginStatus {
                             login_id: login_id.clone(),
                         },
-                    ))
+                    )))
                     .wait()
                     .await;
                 match response.result {
-                    Ok(ServerResponse::GitHubCopilotLoginStatus {
+                    Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
                         status: GitHubCopilotLoginStatus::Pending,
-                    }) => {}
-                    Ok(ServerResponse::GitHubCopilotLoginStatus {
+                    })) => {}
+                    Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
                         status: GitHubCopilotLoginStatus::Configured,
-                    }) => {
+                    })) => {
                         view.update(cx, |view, cx| {
                             view.handle_github_provider_configured(node_id, cx);
                         })
                         .ok();
                         return;
                     }
-                    Ok(ServerResponse::GitHubCopilotLoginStatus {
+                    Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
                         status: GitHubCopilotLoginStatus::Failed { message },
-                    }) => {
+                    })) => {
                         view.update(cx, |view, cx| {
                             view.github_login = Some(GitHubLoginState::Error(message));
                             cx.notify();
@@ -242,11 +244,11 @@ impl LoomView {
         self.dispatch_to_node(
             cx,
             node_id.clone(),
-            ClientRequest::ConfigureGitHubCopilot {
+            ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot {
                 access_token: token,
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::ProviderConfigured) => {
+                Ok(ServerResponse::Provider(ProviderResponse::ProviderConfigured)) => {
                     view.handle_github_provider_configured(node_id, cx)
                 }
                 Err(error) => {
@@ -287,9 +289,9 @@ impl LoomView {
         self.dispatch_to_node(
             cx,
             node_id.clone(),
-            ClientRequest::ListProviders,
+            ClientRequest::Provider(ProviderRequest::ListProviders),
             move |view, response, _| match response.result {
-                Ok(ServerResponse::Providers { providers }) => {
+                Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) => {
                     if should_select_copilot
                         && view.model.as_str() == "deterministic/demo"
                         && let Some(model) = providers
@@ -499,18 +501,18 @@ impl LoomView {
         self.approval_settings_request_in_flight = true;
         self.dispatch(
             cx,
-            ClientRequest::SetSessionApprovalPolicy {
+            ClientRequest::Session(SessionRequest::SetSessionApprovalPolicy {
                 session_id,
                 policy,
                 auto_approve_actions: Some(self.auto_approve_actions),
-            },
+            }),
             move |view, response, _| {
                 if view.active_session.id != session_id {
                     return;
                 }
                 view.approval_settings_request_in_flight = false;
                 match response.result {
-                    Ok(ServerResponse::ApprovalPolicy(_)) => {
+                    Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(_))) => {
                         view.agent_mode = mode;
                         view.session_auto_approve_actions
                             .insert(session_id, view.auto_approve_actions);
@@ -537,18 +539,18 @@ impl LoomView {
         self.approval_settings_request_in_flight = true;
         self.dispatch(
             cx,
-            ClientRequest::SetSessionApprovalPolicy {
+            ClientRequest::Session(SessionRequest::SetSessionApprovalPolicy {
                 session_id,
                 policy,
                 auto_approve_actions: Some(auto_approve_actions),
-            },
+            }),
             move |view, response, _| {
                 if view.active_session.id != session_id {
                     return;
                 }
                 view.approval_settings_request_in_flight = false;
                 match response.result {
-                    Ok(ServerResponse::ApprovalPolicy(_)) => {
+                    Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(_))) => {
                         view.auto_approve_actions = auto_approve_actions;
                         view.session_auto_approve_actions
                             .insert(session_id, auto_approve_actions);
@@ -605,9 +607,9 @@ impl LoomView {
         self.dispatch_to_node(
             cx,
             node_id,
-            ClientRequest::ListProviders,
+            ClientRequest::Provider(ProviderRequest::ListProviders),
             |view, response, _| match response.result {
-                Ok(ServerResponse::Providers { providers }) => {
+                Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) => {
                     view.github_connected = providers
                         .iter()
                         .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
@@ -778,9 +780,9 @@ impl LoomView {
         self.dispatch_to_node(
             cx,
             node_id,
-            ClientRequest::ListProviders,
+            ClientRequest::Provider(ProviderRequest::ListProviders),
             |view, response, _| match response.result {
-                Ok(ServerResponse::Providers { providers }) => {
+                Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) => {
                     view.github_connected = providers
                         .iter()
                         .any(|provider| provider.kind == ProviderKind::GitHubCopilot);
@@ -851,12 +853,12 @@ impl LoomView {
         self.dispatch_to_node(
             cx,
             node_id.clone(),
-            ClientRequest::ConfigureApiKeyProvider {
+            ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider {
                 provider_id: provider_id.clone(),
                 api_key,
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::ProviderConfigured) => {
+                Ok(ServerResponse::Provider(ProviderResponse::ProviderConfigured)) => {
                     view.provider_setup_status.insert(
                         provider_id.clone(),
                         format!(

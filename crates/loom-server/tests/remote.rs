@@ -8,8 +8,10 @@ use loom_core::{
 };
 use loom_model::ModelId;
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
-    WorkerNodeStatus, decode_response,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, EventsRequest,
+    EventsResponse, ProviderRequest, ProviderResponse, RequestEnvelope, RunRequest, RunResponse,
+    ServerEvent, ServerResponse, SessionRequest, SessionResponse, TerminalRequest,
+    TerminalResponse, WorkerNodeStatus, WorkspaceRequest, WorkspaceResponse, decode_response,
 };
 use loom_server::{
     AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
@@ -104,34 +106,43 @@ async fn invalid_websocket_url_errors_do_not_echo_credentials() {
 
 async fn negotiate(connection: &mut WebSocketConnection) {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::DiscoverCapabilities,
+        )))
         .await
         .unwrap();
     assert!(matches!(
         response.result,
-        Ok(ServerResponse::Capabilities(_))
+        Ok(ServerResponse::Control(ControlResponse::Capabilities(_)))
     ));
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: capabilities(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: capabilities(),
+            },
+        )))
         .await
         .unwrap();
-    assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
+    assert!(matches!(
+        response.result,
+        Ok(ServerResponse::Control(ControlResponse::Negotiated(_)))
+    ));
 }
 
 async fn create_workspace(connection: &mut WebSocketConnection) -> WorkspaceId {
     match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "remote workspace".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "remote workspace".to_owned(),
+            },
+        )))
         .await
         .unwrap()
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace.id,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace.id,
         response => panic!("unexpected workspace response: {response:?}"),
     }
 }
@@ -141,18 +152,18 @@ async fn session(
     workspace_id: WorkspaceId,
 ) -> loom_core::AgentSessionSnapshot {
     match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id,
                 name: "remote session".to_owned(),
             },
-        ))
+        )))
         .await
         .unwrap()
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot,
         response => panic!("unexpected session response: {response:?}"),
     }
 }
@@ -163,32 +174,36 @@ async fn events(
     after_sequence: Option<EventSequence>,
 ) -> Vec<loom_protocol::ServerEventEnvelope> {
     match connection
-        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(session_id),
-            workspace_id: None,
-            after_sequence,
-            stream_epoch: None,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                workspace_id: None,
+                after_sequence,
+                stream_epoch: None,
+            },
+        )))
         .await
         .unwrap()
         .result
         .unwrap()
     {
-        ServerResponse::SessionEvents { events, .. }
-        | ServerResponse::SessionEventsSnapshot { events, .. } => events,
+        ServerResponse::Events(EventsResponse::SessionEvents { events, .. })
+        | ServerResponse::Events(EventsResponse::SessionEventsSnapshot { events, .. }) => events,
         response => panic!("unexpected event response: {response:?}"),
     }
 }
 
 async fn worker_status(connection: &mut WebSocketConnection) -> WorkerNodeStatus {
     match connection
-        .request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus))
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::GetWorkerNodeStatus,
+        )))
         .await
         .unwrap()
         .result
         .unwrap()
     {
-        ServerResponse::WorkerNodeStatus(status) => status,
+        ServerResponse::Control(ControlResponse::WorkerNodeStatus(status)) => status,
         response => panic!("unexpected worker status response: {response:?}"),
     }
 }
@@ -214,11 +229,13 @@ async fn authorized_client_can_discover_and_revoke_access() {
     let mut connection = transport.connect().await.unwrap();
     negotiate(&mut connection).await;
     let discovered = connection
-        .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::DiscoverCapabilities,
+        )))
         .await
         .unwrap();
     let discovered = match discovered.result {
-        Ok(ServerResponse::Capabilities(result)) => result.capabilities,
+        Ok(ServerResponse::Control(ControlResponse::Capabilities(result))) => result.capabilities,
         other => panic!("unexpected capability response: {other:?}"),
     };
     assert!(discovered.contains(Capability::ReadSessionFilesystem));
@@ -227,7 +244,9 @@ async fn authorized_client_can_discover_and_revoke_access() {
     let _ = session(&mut connection, workspace_id).await;
     auth.revoke(&token.token_id).unwrap();
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::ListModels))
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ListModels,
+        )))
         .await
         .unwrap();
     assert_eq!(
@@ -247,23 +266,28 @@ async fn authorized_client_can_configure_copilot_on_remote_worker() {
     negotiate(&mut connection).await;
 
     let response = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::ConfigureGitHubCopilot {
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ConfigureGitHubCopilot {
                 access_token: "github-device-flow-token".to_owned(),
             },
-        ))
+        )))
         .await
         .unwrap();
     assert!(matches!(
         response.result,
-        Ok(ServerResponse::ProviderConfigured)
+        Ok(ServerResponse::Provider(
+            ProviderResponse::ProviderConfigured
+        ))
     ));
 
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::ListProviders))
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ListProviders,
+        )))
         .await
         .unwrap();
-    let Ok(ServerResponse::Providers { providers }) = response.result else {
+    let Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) = response.result
+    else {
         panic!("unexpected provider response: {:?}", response.result);
     };
     assert!(
@@ -273,11 +297,11 @@ async fn authorized_client_can_configure_copilot_on_remote_worker() {
     );
 
     let response = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::GetGitHubCopilotLoginStatus {
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::GetGitHubCopilotLoginStatus {
                 login_id: "missing-login".to_owned(),
             },
-        ))
+        )))
         .await
         .unwrap();
     assert_eq!(response.result.unwrap_err().code, ErrorCode::NotFound);
@@ -300,25 +324,30 @@ async fn authorized_client_can_configure_api_key_provider_on_remote_worker() {
 
     let secret = "remote-provider-key-must-stay-private";
     let response = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::ConfigureApiKeyProvider {
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ConfigureApiKeyProvider {
                 provider_id: loom_model::ProviderId::new("openai"),
                 api_key: secret.to_owned(),
             },
-        ))
+        )))
         .await
         .unwrap();
     assert!(matches!(
         response.result,
-        Ok(ServerResponse::ProviderConfigured)
+        Ok(ServerResponse::Provider(
+            ProviderResponse::ProviderConfigured
+        ))
     ));
     assert!(!format!("{response:?}").contains(secret));
 
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::ListProviders))
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ListProviders,
+        )))
         .await
         .unwrap();
-    let Ok(ServerResponse::Providers { providers }) = response.result else {
+    let Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) = response.result
+    else {
         panic!("unexpected provider response: {:?}", response.result);
     };
     let provider = providers
@@ -352,11 +381,11 @@ async fn provider_configuration_requires_its_dedicated_capability() {
     negotiate(&mut connection).await;
 
     let response = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::ConfigureGitHubCopilot {
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ConfigureGitHubCopilot {
                 access_token: "github-device-flow-token".to_owned(),
             },
-        ))
+        )))
         .await
         .unwrap();
     assert_eq!(
@@ -365,10 +394,10 @@ async fn provider_configuration_requires_its_dedicated_capability() {
     );
 
     for request in [
-        ClientRequest::StartGitHubCopilotLogin,
-        ClientRequest::GetGitHubCopilotLoginStatus {
+        ClientRequest::Provider(ProviderRequest::StartGitHubCopilotLogin),
+        ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus {
             login_id: "unknown".to_owned(),
-        },
+        }),
     ] {
         let response = connection
             .request(RequestEnvelope::new(request))
@@ -476,20 +505,24 @@ async fn workspace_scopes_restrict_session_creation() {
     let backend = InProcessBackend::new();
     let setup = backend.connect();
     setup
-        .request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: capabilities(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: capabilities(),
+            },
+        )))
         .result
         .unwrap();
     let allowed_workspace = match setup
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "allowed".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "allowed".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace.id,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace.id,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let auth = Arc::new(AuthTokenStore::new());
@@ -514,12 +547,12 @@ async fn workspace_scopes_restrict_session_creation() {
     let mut connection = transport.connect().await.unwrap();
     negotiate(&mut connection).await;
     let denied = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: WorkspaceId::new(),
                 name: "denied".to_owned(),
             },
-        ))
+        )))
         .await
         .unwrap();
     assert_eq!(
@@ -528,9 +561,11 @@ async fn workspace_scopes_restrict_session_creation() {
     );
     let allowed = session(&mut connection, allowed_workspace).await;
     let denied = connection
-        .request(RequestEnvelope::new(ClientRequest::GetAgentSession {
-            session_id: allowed.id,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::GetAgentSession {
+                session_id: allowed.id,
+            },
+        )))
         .await
         .unwrap();
     assert!(denied.result.is_ok());
@@ -542,39 +577,43 @@ async fn session_scopes_filter_workspace_session_listing() {
     let backend = InProcessBackend::new();
     let setup = backend.connect();
     setup
-        .request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: capabilities(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: capabilities(),
+            },
+        )))
         .result
         .unwrap();
     let workspace_id = match setup
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "scoped workspace".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "scoped workspace".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace.id,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace.id,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let create_session = || {
         setup
-            .request(RequestEnvelope::new(
-                ClientRequest::CreateAgentSessionInWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateAgentSessionInWorkspace {
                     workspace_id,
                     name: "scoped session".to_owned(),
                 },
-            ))
+            )))
             .result
             .unwrap()
     };
     let allowed_session = match create_session() {
-        ServerResponse::AgentSessionCreated(session) => session,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
         response => panic!("unexpected session response: {response:?}"),
     };
     let hidden_session = match create_session() {
-        ServerResponse::AgentSessionCreated(session) => session,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
         response => panic!("unexpected session response: {response:?}"),
     };
 
@@ -603,15 +642,17 @@ async fn session_scopes_filter_workspace_session_listing() {
     negotiate(&mut connection).await;
 
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
-            workspace_id,
-            include_archived: false,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaceSessions {
+                workspace_id,
+                include_archived: false,
+            },
+        )))
         .await
         .unwrap()
         .result
         .unwrap();
-    let ServerResponse::AgentSessions { sessions } = response else {
+    let ServerResponse::Session(SessionResponse::AgentSessions { sessions }) = response else {
         panic!("unexpected session listing response: {response:?}");
     };
     assert_eq!(
@@ -628,12 +669,12 @@ async fn session_scopes_filter_workspace_session_listing() {
     );
 
     let response = connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id,
                 name: "unauthorized".to_owned(),
             },
-        ))
+        )))
         .await
         .unwrap();
     assert_eq!(
@@ -652,31 +693,33 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
     let workspace_id = create_workspace(&mut first).await;
     let session = session(&mut first, workspace_id).await;
     first
-        .request(RequestEnvelope::new(
-            ClientRequest::SetSessionApprovalPolicy {
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::SetSessionApprovalPolicy {
                 session_id: session.id,
                 policy: ApprovalPolicy::default(),
                 auto_approve_actions: Some(false),
             },
-        ))
+        )))
         .await
         .unwrap()
         .result
         .unwrap();
     let run_id = match first
-        .request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-            session_id: session.id,
-            task: "remote durable task".to_owned(),
-            model: ModelId::new("deterministic/demo"),
-            system_instructions: None,
-            repository_instructions: None,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: session.id,
+                task: "remote durable task".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
         .await
         .unwrap()
         .result
         .unwrap()
     {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected run response: {response:?}"),
     };
     drop(first);
@@ -709,12 +752,14 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
             {
                 approvals += 1;
                 second
-                    .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
-                        run_id,
-                        attempt_id: *attempt_id,
-                        expected_control_revision: *control_revision,
-                        tool_call_id: call.id,
-                    }))
+                    .request(RequestEnvelope::new(ClientRequest::Run(
+                        RunRequest::ApproveAgentAction {
+                            run_id,
+                            attempt_id: *attempt_id,
+                            expected_control_revision: *control_revision,
+                            tool_call_id: call.id,
+                        },
+                    )))
                     .await
                     .unwrap()
                     .result
@@ -736,12 +781,14 @@ async fn reconnect_resumes_journal_and_approves_a_run_after_disconnect() {
     assert!(approvals >= 2);
     assert!(completed);
     let run = second
-        .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }))
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRun { run_id },
+        )))
         .await
         .unwrap();
     assert!(matches!(
         run.result.unwrap(),
-        ServerResponse::AgentRun(snapshot)
+        ServerResponse::Run(RunResponse::AgentRun(snapshot))
             if snapshot.state == loom_agent::AgentRunState::Completed
     ));
     server.stop().await.unwrap();
@@ -760,10 +807,12 @@ async fn stale_cursors_return_a_snapshot_fallback() {
     let _third = session(&mut connection, workspace_id).await;
     for name in ["first-a", "first-b", "first-c"] {
         connection
-            .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
-                session_id: first.id,
-                name: name.to_owned(),
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Session(
+                SessionRequest::RenameAgentSession {
+                    session_id: first.id,
+                    name: name.to_owned(),
+                },
+            )))
             .await
             .unwrap()
             .result
@@ -771,22 +820,24 @@ async fn stale_cursors_return_a_snapshot_fallback() {
     }
     let _fourth = session(&mut connection, workspace_id).await;
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(first.id),
-            workspace_id: None,
-            after_sequence: Some(EventSequence::new(1)),
-            stream_epoch: None,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(first.id),
+                workspace_id: None,
+                after_sequence: Some(EventSequence::new(1)),
+                stream_epoch: None,
+            },
+        )))
         .await
         .unwrap();
     let stream_epoch = match response.result.unwrap() {
-        ServerResponse::SessionEventsSnapshot {
+        ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
             session,
             events,
             oldest_sequence,
             latest_sequence,
             stream_epoch: Some(stream_epoch),
-        } => {
+        }) => {
             assert_eq!(session.id, first.id);
             assert_eq!(events.len(), 2);
             assert_eq!(oldest_sequence.value(), 5);
@@ -796,20 +847,22 @@ async fn stale_cursors_return_a_snapshot_fallback() {
         response => panic!("expected snapshot fallback, got {response:?}"),
     };
     let resumed = connection
-        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(first.id),
-            workspace_id: None,
-            after_sequence: Some(EventSequence::new(6)),
-            stream_epoch: Some(stream_epoch.clone()),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(first.id),
+                workspace_id: None,
+                after_sequence: Some(EventSequence::new(6)),
+                stream_epoch: Some(stream_epoch.clone()),
+            },
+        )))
         .await
         .unwrap();
     assert!(matches!(
         resumed.result.unwrap(),
-        ServerResponse::SessionEvents {
+        ServerResponse::Events(EventsResponse::SessionEvents{
             stream_epoch: Some(epoch),
             ..
-        } if epoch == stream_epoch
+        }) if epoch == stream_epoch
     ));
     server.stop().await.unwrap();
 }
@@ -824,15 +877,19 @@ async fn session_cursor_before_creation_ignores_other_sessions_events() {
     let _earlier_session = session(&mut connection, workspace_id).await;
     let target_session = session(&mut connection, workspace_id).await;
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(target_session.id),
-            workspace_id: None,
-            after_sequence: Some(EventSequence::default()),
-            stream_epoch: None,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(target_session.id),
+                workspace_id: None,
+                after_sequence: Some(EventSequence::default()),
+                stream_epoch: None,
+            },
+        )))
         .await
         .unwrap();
-    let ServerResponse::SessionEvents { events, .. } = response.result.unwrap() else {
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        response.result.unwrap()
+    else {
         panic!("an unrelated session's prior events must not stale this cursor");
     };
     assert!(events.iter().any(|event| {
@@ -855,10 +912,10 @@ async fn duplicate_mutation_request_ids_are_idempotent() {
     let request_id = RequestId::new();
     let request = RequestEnvelope::with_request_id(
         request_id,
-        ClientRequest::CreateAgentSessionInWorkspace {
+        ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id,
             name: "idempotent".to_owned(),
-        },
+        }),
     );
     let first = connection.request(request.clone()).await.unwrap();
     drop(connection);
@@ -866,7 +923,9 @@ async fn duplicate_mutation_request_ids_are_idempotent() {
     negotiate(&mut reconnected).await;
     let second = reconnected.request(request).await.unwrap();
     assert_eq!(first, second);
-    let ServerResponse::AgentSessionCreated(snapshot) = first.result.unwrap() else {
+    let ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) =
+        first.result.unwrap()
+    else {
         panic!("unexpected idempotent response");
     };
     let events = events(&mut reconnected, snapshot.id, None).await;
@@ -918,18 +977,20 @@ async fn terminal_execution_continues_after_client_disconnect() {
     let workspace_id = create_workspace(&mut first).await;
     let session = session(&mut first, workspace_id).await;
     let terminal = match first
-        .request(RequestEnvelope::new(ClientRequest::OpenSessionTerminal {
-            session_id: session.id,
-            command: "sh".to_owned(),
-            args: vec!["-c".to_owned(), "sleep 0.05; printf done".to_owned()],
-            cwd: None,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Terminal(
+            TerminalRequest::OpenSessionTerminal {
+                session_id: session.id,
+                command: "sh".to_owned(),
+                args: vec!["-c".to_owned(), "sleep 0.05; printf done".to_owned()],
+                cwd: None,
+            },
+        )))
         .await
         .unwrap()
         .result
         .unwrap()
     {
-        ServerResponse::TerminalOpened(snapshot) => snapshot,
+        ServerResponse::Terminal(TerminalResponse::TerminalOpened(snapshot)) => snapshot,
         response => panic!("unexpected terminal response: {response:?}"),
     };
     drop(first);
@@ -939,16 +1000,18 @@ async fn terminal_execution_continues_after_client_disconnect() {
     let mut exited = false;
     for _ in 0..100 {
         let response = second
-            .request(RequestEnvelope::new(
-                ClientRequest::GetSessionTerminalEvents {
+            .request(RequestEnvelope::new(ClientRequest::Terminal(
+                TerminalRequest::GetSessionTerminalEvents {
                     session_id: session.id,
                     terminal_id: terminal.id,
                     after_sequence: None,
                 },
-            ))
+            )))
             .await
             .unwrap();
-        let ServerResponse::TerminalEvents { events } = response.result.unwrap() else {
+        let ServerResponse::Terminal(TerminalResponse::TerminalEvents { events }) =
+            response.result.unwrap()
+        else {
             panic!("unexpected terminal event response");
         };
         if events

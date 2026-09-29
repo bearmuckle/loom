@@ -608,7 +608,9 @@ impl InProcessConnection {
         if progress.continues {
             self.backend.spawn_run_worker(Arc::clone(&handle))?;
         }
-        Ok(ServerResponse::AgentRunStarted(handle.snapshot()))
+        Ok(ServerResponse::Run(RunResponse::AgentRunStarted(
+            handle.snapshot(),
+        )))
     }
 
     /// Applies an operation that may leave the run with more work, then hands
@@ -632,7 +634,9 @@ impl InProcessConnection {
         if progress.continues {
             self.backend.spawn_run_worker(Arc::clone(&handle))?;
         }
-        Ok(ServerResponse::AgentRun(handle.snapshot()))
+        Ok(ServerResponse::Run(RunResponse::AgentRun(
+            handle.snapshot(),
+        )))
     }
 
     pub(crate) fn resume_agent_run(&self, run_id: loom_core::RunId) -> Result<ServerResponse> {
@@ -689,7 +693,7 @@ impl InProcessConnection {
         let response = self.continue_run(run_id, AgentRuntime::resume_entry)?;
         let resumed_is_active = matches!(
             &response,
-            ServerResponse::AgentRun(snapshot)
+            ServerResponse::Run(RunResponse::AgentRun(snapshot))
                 if matches!(
                     snapshot.state,
                     AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
@@ -758,7 +762,9 @@ impl InProcessConnection {
                 }
                 handle.control.clear_request();
             }
-            return Ok(ServerResponse::AgentRun(handle.snapshot()));
+            return Ok(ServerResponse::Run(RunResponse::AgentRun(
+                handle.snapshot(),
+            )));
         }
         let mut runtime = handle.runtime_for_entry()?;
         let result = match stop {
@@ -770,7 +776,9 @@ impl InProcessConnection {
         result?;
         self.backend.persist_run_checkpoint(&handle)?;
         self.backend.after_run_checkpoint(&handle)?;
-        Ok(ServerResponse::AgentRun(handle.snapshot()))
+        Ok(ServerResponse::Run(RunResponse::AgentRun(
+            handle.snapshot(),
+        )))
     }
 
     pub(crate) fn retry_from_checkpoint(

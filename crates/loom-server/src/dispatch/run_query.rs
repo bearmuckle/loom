@@ -7,51 +7,55 @@ impl InProcessConnection {
         _request_id: RequestId,
     ) -> Result<ServerResponse> {
         match request {
-            ClientRequest::GetAgentRun { run_id } => {
-                Ok(ServerResponse::AgentRun(self.run_summary(run_id)?.snapshot))
-            }
-            ClientRequest::GetAgentRunMessagePage {
+            ClientRequest::Run(RunRequest::GetAgentRun { run_id }) => Ok(ServerResponse::Run(
+                RunResponse::AgentRun(self.run_summary(run_id)?.snapshot),
+            )),
+            ClientRequest::Run(RunRequest::GetAgentRunMessagePage {
                 run_id,
                 before_ordinal,
                 limit,
-            } => Ok(ServerResponse::AgentRunMessagePage {
+            }) => Ok(ServerResponse::Run(RunResponse::AgentRunMessagePage {
                 run_id,
                 messages: self.run_message_page(run_id, before_ordinal, limit)?,
-            }),
-            ClientRequest::GetAgentRunTranscriptPage {
+            })),
+            ClientRequest::Run(RunRequest::GetAgentRunTranscriptPage {
                 run_id,
                 before_ordinal,
                 limit,
-            } => {
+            }) => {
                 let (messages, next_before, has_older) =
                     self.run_transcript_page(run_id, before_ordinal, limit)?;
-                Ok(ServerResponse::AgentRunTranscriptPage {
+                Ok(ServerResponse::Run(RunResponse::AgentRunTranscriptPage {
                     run_id,
                     messages,
                     next_before,
                     has_older,
-                })
+                }))
             }
-            ClientRequest::GetAgentRunMessageContentRange {
+            ClientRequest::Run(RunRequest::GetAgentRunMessageContentRange {
                 run_id,
                 message_ordinal,
                 byte_offset,
                 length,
-            } => Ok(ServerResponse::AgentRunMessageContentRange {
-                run_id,
-                message_ordinal,
-                byte_offset,
-                content: self.run_message_content_range(
+            }) => Ok(ServerResponse::Run(
+                RunResponse::AgentRunMessageContentRange {
                     run_id,
                     message_ordinal,
                     byte_offset,
-                    length,
-                )?,
-            }),
-            ClientRequest::GetAgentRunSnapshot { run_id } => Ok(ServerResponse::AgentRunSnapshot(
-                self.run_snapshot_projection(run_id)?,
+                    content: self.run_message_content_range(
+                        run_id,
+                        message_ordinal,
+                        byte_offset,
+                        length,
+                    )?,
+                },
             )),
-            ClientRequest::GetRunCheckpoint { run_id } => {
+            ClientRequest::Run(RunRequest::GetAgentRunSnapshot { run_id }) => {
+                Ok(ServerResponse::Run(RunResponse::AgentRunSnapshot(
+                    self.run_snapshot_projection(run_id)?,
+                )))
+            }
+            ClientRequest::Run(RunRequest::GetRunCheckpoint { run_id }) => {
                 let (session_id, checkpoint_id) = {
                     let handle = self.run_handle(run_id)?;
                     let session = self.backend.sessions()?.get(handle.session_id)?;
@@ -66,12 +70,12 @@ impl InProcessConnection {
                         })?,
                     )
                 };
-                Ok(ServerResponse::RunCheckpoint(
+                Ok(ServerResponse::Run(RunResponse::RunCheckpoint(
                     self.session_filesystem(session_id)?
                         .checkpoint(checkpoint_id)?,
-                ))
+                )))
             }
-            ClientRequest::InspectAgentContext { run_id } => {
+            ClientRequest::Context(ContextRequest::InspectAgentContext { run_id }) => {
                 let inspection = self
                     .run_handle(run_id)?
                     .state()
@@ -83,7 +87,9 @@ impl InProcessConnection {
                             false,
                         )
                     })?;
-                Ok(ServerResponse::ContextInspection(inspection))
+                Ok(ServerResponse::Context(ContextResponse::ContextInspection(
+                    inspection,
+                )))
             }
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }

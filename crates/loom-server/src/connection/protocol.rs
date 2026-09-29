@@ -42,7 +42,10 @@ impl InProcessConnection {
         // run controls are, so the request that stops a child is never queued
         // behind unrelated durable writes.
         let serialize_durable_request = durable_mutation
-            && !matches!(&request.request, ClientRequest::ControlProjectChild { .. });
+            && !matches!(
+                &request.request,
+                ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
+            );
         let _durable_request_guard = if serialize_durable_request {
             match self.backend.idempotency_store.durable_gate() {
                 Ok(guard) => Some(guard),
@@ -99,11 +102,13 @@ impl InProcessConnection {
         }
 
         let result = match request.request {
-            ClientRequest::Negotiate {
+            ClientRequest::Control(ControlRequest::Negotiate {
                 client_version,
                 capabilities,
-            } => self.negotiate(client_version, capabilities),
-            ClientRequest::DiscoverCapabilities => self.discover_capabilities(),
+            }) => self.negotiate(client_version, capabilities),
+            ClientRequest::Control(ControlRequest::DiscoverCapabilities) => {
+                self.discover_capabilities()
+            }
             request => self.handle_after_negotiation(request, request_id),
         };
         let result = match result {
@@ -163,10 +168,12 @@ impl InProcessConnection {
             .intersection(&self.authorized_capabilities());
         *self.negotiated_capabilities()? = Some(negotiated.clone());
 
-        Ok(ServerResponse::Negotiated(NegotiationResult {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: negotiated,
-        }))
+        Ok(ServerResponse::Control(ControlResponse::Negotiated(
+            NegotiationResult {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: negotiated,
+            },
+        )))
     }
 
     pub(crate) fn discover_capabilities(&self) -> Result<ServerResponse> {
@@ -174,10 +181,12 @@ impl InProcessConnection {
             .backend
             .supported_capabilities
             .intersection(&self.authorized_capabilities());
-        Ok(ServerResponse::Capabilities(NegotiationResult {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            capabilities,
-        }))
+        Ok(ServerResponse::Control(ControlResponse::Capabilities(
+            NegotiationResult {
+                protocol_version: CURRENT_PROTOCOL_VERSION,
+                capabilities,
+            },
+        )))
     }
 
     pub(crate) fn authorize_request_access(&self, request: &ClientRequest) -> Result<()> {
@@ -207,12 +216,12 @@ impl InProcessConnection {
         if self.backend.persistence.is_none()
             && matches!(
                 &request,
-                ClientRequest::SendProjectAgentMessage { .. }
-                    | ClientRequest::ListProjectAgentMessages { .. }
-                    | ClientRequest::ControlProjectChild { .. }
-                    | ClientRequest::GetProjectChildReview { .. }
-                    | ClientRequest::IntegrateProjectChild { .. }
-                    | ClientRequest::CleanupProjectChildWorktree { .. }
+                ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { .. })
+                    | ClientRequest::Project(ProjectRequest::ListProjectAgentMessages { .. })
+                    | ClientRequest::Project(ProjectRequest::ControlProjectChild { .. })
+                    | ClientRequest::Project(ProjectRequest::GetProjectChildReview { .. })
+                    | ClientRequest::Project(ProjectRequest::IntegrateProjectChild { .. })
+                    | ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree { .. })
             )
         {
             return Err(LoomError::new(
@@ -305,18 +314,22 @@ impl InProcessConnection {
             ));
         }
 
-        Ok(ServerResponse::GitHubCopilotLoginStarted {
-            login_id,
-            user_code: device.user_code,
-            verification_uri: device.verification_uri,
-            expires_in: device.expires_in,
-            interval: device.interval,
-        })
+        Ok(ServerResponse::Provider(
+            ProviderResponse::GitHubCopilotLoginStarted {
+                login_id,
+                user_code: device.user_code,
+                verification_uri: device.verification_uri,
+                expires_in: device.expires_in,
+                interval: device.interval,
+            },
+        ))
     }
 
     pub(crate) fn github_copilot_login_status(&self, login_id: &str) -> Result<ServerResponse> {
         let status = self.backend.credentials.status(login_id, Instant::now())?;
-        Ok(ServerResponse::GitHubCopilotLoginStatus { status })
+        Ok(ServerResponse::Provider(
+            ProviderResponse::GitHubCopilotLoginStatus { status },
+        ))
     }
 
     pub(crate) fn authorize_request(&self, request: &ClientRequest) -> Result<()> {
@@ -337,7 +350,7 @@ impl InProcessConnection {
         let mut session_id = None;
         let mut run_id = None;
         match request {
-            ClientRequest::CreateWorkspace { .. } => {
+            ClientRequest::Workspace(WorkspaceRequest::CreateWorkspace { .. }) => {
                 if auth.scope().workspaces.is_some() || auth.scope().sessions.is_some() {
                     return Err(LoomError::new(
                         ErrorCode::AuthorizationDenied,
@@ -346,7 +359,7 @@ impl InProcessConnection {
                     ));
                 }
             }
-            ClientRequest::GetProjectSnapshot { project_id } => {
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id }) => {
                 let root_session_id = AgentSessionId::from_uuid(*project_id.as_uuid());
                 if !auth.scope().allows_session(root_session_id) {
                     return Err(unauthorized_session(root_session_id));
@@ -363,7 +376,7 @@ impl InProcessConnection {
                 let snapshot = self.load_project_snapshot(*project_id)?;
                 self.authorize_project_snapshot(auth, &snapshot)?;
             }
-            ClientRequest::GetProjectSnapshotForSession { session_id } => {
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession { session_id }) => {
                 if !auth.scope().allows_session(*session_id) {
                     return Err(unauthorized_session(*session_id));
                 }
@@ -378,7 +391,7 @@ impl InProcessConnection {
                 let snapshot = self.load_project_snapshot_for_session(*session_id)?;
                 self.authorize_project_snapshot(auth, &snapshot)?;
             }
-            ClientRequest::RegisterWorkspace { workspace } => {
+            ClientRequest::Workspace(WorkspaceRequest::RegisterWorkspace { workspace }) => {
                 if auth.scope().sessions.is_some() {
                     return Err(LoomError::new(
                         ErrorCode::AuthorizationDenied,
@@ -388,10 +401,10 @@ impl InProcessConnection {
                 }
                 workspace_id = Some(workspace.id);
             }
-            ClientRequest::CreateAgentSessionInWorkspace {
+            ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: requested_workspace,
                 ..
-            } => {
+            }) => {
                 if auth.scope().sessions.is_some() {
                     return Err(LoomError::new(
                         ErrorCode::AuthorizationDenied,
@@ -401,14 +414,14 @@ impl InProcessConnection {
                 }
                 workspace_id = Some(*requested_workspace);
             }
-            ClientRequest::RenameWorkspace {
+            ClientRequest::Workspace(WorkspaceRequest::RenameWorkspace {
                 workspace_id: requested_workspace,
                 ..
-            }
-            | ClientRequest::SetWorkspaceConfigForWorkspace {
+            })
+            | ClientRequest::Workspace(WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                 workspace_id: requested_workspace,
                 ..
-            } => {
+            }) => {
                 if auth.scope().sessions.is_some() {
                     return Err(LoomError::new(
                         ErrorCode::AuthorizationDenied,
@@ -418,76 +431,76 @@ impl InProcessConnection {
                 }
                 workspace_id = Some(*requested_workspace);
             }
-            ClientRequest::ListWorkspaceSessions {
+            ClientRequest::Workspace(WorkspaceRequest::ListWorkspaceSessions {
                 workspace_id: requested_workspace,
                 ..
-            }
-            | ClientRequest::GetWorkspaceConfigForWorkspace {
+            })
+            | ClientRequest::Workspace(WorkspaceRequest::GetWorkspaceConfigForWorkspace {
                 workspace_id: requested_workspace,
-            } => workspace_id = Some(*requested_workspace),
-            ClientRequest::GetAgentSession {
+            }) => workspace_id = Some(*requested_workspace),
+            ClientRequest::Session(SessionRequest::GetAgentSession {
                 session_id: requested_session,
-            }
-            | ClientRequest::GetAgentSessionSnapshot {
+            })
+            | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot {
                 session_id: requested_session,
-            }
-            | ClientRequest::GetAgentSessionSnapshotMetadata {
+            })
+            | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
                 session_id: requested_session,
-            }
-            | ClientRequest::GetAgentSessionInitialState {
+            })
+            | ClientRequest::Session(SessionRequest::GetAgentSessionInitialState {
                 session_id: requested_session,
-            }
-            | ClientRequest::RenameAgentSession {
-                session_id: requested_session,
-                ..
-            }
-            | ClientRequest::ArchiveAgentSession {
-                session_id: requested_session,
-            }
-            | ClientRequest::GetSessionUsage {
-                session_id: requested_session,
-            }
-            | ClientRequest::ForkAgentSession {
+            })
+            | ClientRequest::Session(SessionRequest::RenameAgentSession {
                 session_id: requested_session,
                 ..
-            } => session_id = Some(*requested_session),
-            ClientRequest::GetSessionEvents {
+            })
+            | ClientRequest::Session(SessionRequest::ArchiveAgentSession {
+                session_id: requested_session,
+            })
+            | ClientRequest::Usage(UsageRequest::GetSessionUsage {
+                session_id: requested_session,
+            })
+            | ClientRequest::Session(SessionRequest::ForkAgentSession {
+                session_id: requested_session,
+                ..
+            }) => session_id = Some(*requested_session),
+            ClientRequest::Events(EventsRequest::GetSessionEvents {
                 session_id: requested_session,
                 workspace_id: None,
                 ..
-            } => session_id = *requested_session,
-            ClientRequest::GetSessionEvents {
+            }) => session_id = *requested_session,
+            ClientRequest::Events(EventsRequest::GetSessionEvents {
                 workspace_id: Some(requested_workspace),
                 ..
-            } => workspace_id = Some(*requested_workspace),
-            ClientRequest::GetRecentSessionEvents {
+            }) => workspace_id = Some(*requested_workspace),
+            ClientRequest::Events(EventsRequest::GetRecentSessionEvents {
                 session_id: requested_session,
                 ..
-            } => session_id = Some(*requested_session),
-            ClientRequest::ListProjectAgentMessages {
+            }) => session_id = Some(*requested_session),
+            ClientRequest::Project(ProjectRequest::ListProjectAgentMessages {
                 session_id: requested_session,
                 ..
-            } => session_id = Some(*requested_session),
-            ClientRequest::ControlProjectChild {
+            }) => session_id = Some(*requested_session),
+            ClientRequest::Project(ProjectRequest::ControlProjectChild {
                 manager_session_id,
                 task_id,
                 ..
-            }
-            | ClientRequest::GetProjectChildReview {
+            })
+            | ClientRequest::Project(ProjectRequest::GetProjectChildReview {
                 manager_session_id,
                 task_id,
                 ..
-            }
-            | ClientRequest::IntegrateProjectChild {
+            })
+            | ClientRequest::Project(ProjectRequest::IntegrateProjectChild {
                 manager_session_id,
                 task_id,
                 ..
-            }
-            | ClientRequest::CleanupProjectChildWorktree {
+            })
+            | ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree {
                 manager_session_id,
                 task_id,
                 ..
-            } => {
+            }) => {
                 session_id = Some(*manager_session_id);
                 let Some(task) = self
                     .backend
@@ -511,7 +524,7 @@ impl InProcessConnection {
                     ));
                 }
             }
-            ClientRequest::SendProjectAgentMessage { message } => {
+            ClientRequest::Project(ProjectRequest::SendProjectAgentMessage { message }) => {
                 if !auth.scope().allows_session(message.sender_session_id) {
                     return Err(unauthorized_session(message.sender_session_id));
                 }
@@ -519,213 +532,219 @@ impl InProcessConnection {
                     return Err(unauthorized_session(message.target_session_id));
                 }
             }
-            ClientRequest::StartSessionAgentRun {
+            ClientRequest::Run(RunRequest::StartSessionAgentRun {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::StartSessionAgentRunWithOptions {
+            })
+            | ClientRequest::Run(RunRequest::StartSessionAgentRunWithOptions {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::AttachSessionRepository {
+            })
+            | ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::ImportSessionDirectory {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::ImportSessionDirectory {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::AttachSessionDirectory {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::ListSessionDirectories {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories {
                 session_id: requested_session,
-            }
-            | ClientRequest::DetachSessionDirectory {
-                session_id: requested_session,
-                ..
-            }
-            | ClientRequest::ListSessionRepositories {
-                session_id: requested_session,
-            }
-            | ClientRequest::DetachSessionRepository {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::DetachSessionDirectory {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::GetSessionFilesystemSnapshot {
+            })
+            | ClientRequest::Repository(RepositoryRequest::ListSessionRepositories {
                 session_id: requested_session,
-            }
-            | ClientRequest::GetSessionFilesystemChanges {
-                session_id: requested_session,
-                ..
-            }
-            | ClientRequest::ReadSessionFile {
+            })
+            | ClientRequest::Repository(RepositoryRequest::DetachSessionRepository {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::ApplySessionFilesystemEdit {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::GetSessionFilesystemSnapshot {
+                session_id: requested_session,
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::GetSessionFilesystemChanges {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::TakeSessionFilesystemControl {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::ReadSessionFile {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::CreateSessionCheckpoint {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::ApplySessionFilesystemEdit {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::RevertSessionCheckpoint {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::TakeSessionFilesystemControl {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::UndoSessionEdit {
-                session_id: requested_session,
-            }
-            | ClientRequest::GetSessionContextFiles {
-                session_id: requested_session,
-            }
-            | ClientRequest::GetSessionVcsStatus {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::CreateSessionCheckpoint {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::GetSessionVcsDiff {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::RevertSessionCheckpoint {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::GetSessionVcsBranches {
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::UndoSessionEdit {
+                session_id: requested_session,
+            })
+            | ClientRequest::Filesystem(FilesystemRequest::GetSessionContextFiles {
+                session_id: requested_session,
+            })
+            | ClientRequest::Repository(RepositoryRequest::GetSessionVcsStatus {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::GetSessionVcsConflicts {
+            })
+            | ClientRequest::Repository(RepositoryRequest::GetSessionVcsDiff {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::OpenSessionTerminal {
+            })
+            | ClientRequest::Repository(RepositoryRequest::GetSessionVcsBranches {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::WriteSessionTerminalInput {
+            })
+            | ClientRequest::Repository(RepositoryRequest::GetSessionVcsConflicts {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::ResizeSessionTerminal {
+            })
+            | ClientRequest::Terminal(TerminalRequest::OpenSessionTerminal {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::GetSessionTerminalEvents {
+            })
+            | ClientRequest::Terminal(TerminalRequest::WriteSessionTerminalInput {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::CancelSessionTerminal {
+            })
+            | ClientRequest::Terminal(TerminalRequest::ResizeSessionTerminal {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::StartSessionTask {
+            })
+            | ClientRequest::Terminal(TerminalRequest::GetSessionTerminalEvents {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::ListSessionTasks {
-                session_id: requested_session,
-            }
-            | ClientRequest::GetSessionTask {
+            })
+            | ClientRequest::Terminal(TerminalRequest::CancelSessionTerminal {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::GetSessionTaskEvents {
+            })
+            | ClientRequest::Task(TaskRequest::StartSessionTask {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::CancelSessionTask {
+            })
+            | ClientRequest::Task(TaskRequest::ListSessionTasks {
+                session_id: requested_session,
+            })
+            | ClientRequest::Task(TaskRequest::GetSessionTask {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::GetSessionTaskEvidence {
+            })
+            | ClientRequest::Task(TaskRequest::GetSessionTaskEvents {
                 session_id: requested_session,
                 ..
-            }
-            | ClientRequest::SetSessionApprovalPolicy {
+            })
+            | ClientRequest::Task(TaskRequest::CancelSessionTask {
                 session_id: requested_session,
                 ..
-            } => session_id = Some(*requested_session),
-            ClientRequest::GetAgentRun {
+            })
+            | ClientRequest::Task(TaskRequest::GetSessionTaskEvidence {
+                session_id: requested_session,
+                ..
+            })
+            | ClientRequest::Session(SessionRequest::SetSessionApprovalPolicy {
+                session_id: requested_session,
+                ..
+            }) => session_id = Some(*requested_session),
+            ClientRequest::Run(RunRequest::GetAgentRun {
                 run_id: requested_run,
-            }
-            | ClientRequest::GetAgentRunMessagePage {
-                run_id: requested_run,
-                ..
-            }
-            | ClientRequest::GetAgentRunTranscriptPage {
+            })
+            | ClientRequest::Run(RunRequest::GetAgentRunMessagePage {
                 run_id: requested_run,
                 ..
-            }
-            | ClientRequest::GetAgentRunMessageContentRange {
+            })
+            | ClientRequest::Run(RunRequest::GetAgentRunTranscriptPage {
                 run_id: requested_run,
                 ..
-            }
-            | ClientRequest::GetAgentRunSnapshot {
-                run_id: requested_run,
-            }
-            | ClientRequest::GetRunCheckpoint {
-                run_id: requested_run,
-            }
-            | ClientRequest::ApproveAgentAction {
+            })
+            | ClientRequest::Run(RunRequest::GetAgentRunMessageContentRange {
                 run_id: requested_run,
                 ..
-            }
-            | ClientRequest::RejectAgentAction {
+            })
+            | ClientRequest::Run(RunRequest::GetAgentRunSnapshot {
+                run_id: requested_run,
+            })
+            | ClientRequest::Run(RunRequest::GetRunCheckpoint {
+                run_id: requested_run,
+            })
+            | ClientRequest::Run(RunRequest::ApproveAgentAction {
                 run_id: requested_run,
                 ..
-            }
-            | ClientRequest::InterruptAgentRun {
-                run_id: requested_run,
-            }
-            | ClientRequest::RetryAgentStep {
-                run_id: requested_run,
-            }
-            | ClientRequest::PauseAgentRun {
-                run_id: requested_run,
-            }
-            | ClientRequest::ResumeAgentRun {
-                run_id: requested_run,
-            }
-            | ClientRequest::RetryAgentFromCheckpoint {
+            })
+            | ClientRequest::Run(RunRequest::RejectAgentAction {
                 run_id: requested_run,
                 ..
-            }
-            | ClientRequest::GetRunUsage {
+            })
+            | ClientRequest::Run(RunRequest::InterruptAgentRun {
                 run_id: requested_run,
-            }
-            | ClientRequest::InspectAgentContext {
+            })
+            | ClientRequest::Run(RunRequest::RetryAgentStep {
                 run_id: requested_run,
-            } => run_id = Some(*requested_run),
-            ClientRequest::SendAgentMessage {
+            })
+            | ClientRequest::Run(RunRequest::PauseAgentRun {
+                run_id: requested_run,
+            })
+            | ClientRequest::Run(RunRequest::ResumeAgentRun {
+                run_id: requested_run,
+            })
+            | ClientRequest::Run(RunRequest::RetryAgentFromCheckpoint {
                 run_id: requested_run,
                 ..
-            } => run_id = Some(*requested_run),
-            ClientRequest::AttachRunEvidence {
+            })
+            | ClientRequest::Usage(UsageRequest::GetRunUsage {
+                run_id: requested_run,
+            })
+            | ClientRequest::Context(ContextRequest::InspectAgentContext {
+                run_id: requested_run,
+            }) => run_id = Some(*requested_run),
+            ClientRequest::Run(RunRequest::SendAgentMessage {
                 run_id: requested_run,
                 ..
-            } => run_id = Some(*requested_run),
-            ClientRequest::Negotiate { .. }
-            | ClientRequest::DiscoverCapabilities
-            | ClientRequest::ListWorkspaces
-            | ClientRequest::ListModels
-            | ClientRequest::GetWorkerNodeStatus
-            | ClientRequest::ListProviders
-            | ClientRequest::ListGitHubRepositories
-            | ClientRequest::StartGitHubCopilotLogin
-            | ClientRequest::GetGitHubCopilotLoginStatus { .. }
-            | ClientRequest::DiscoverProviderModels { .. }
-            | ClientRequest::GetProviderHealth { .. } => {}
-            ClientRequest::ConfigureGitHubCopilot { .. }
-            | ClientRequest::ConfigureApiKeyProvider { .. } => {}
+            }) => run_id = Some(*requested_run),
+            ClientRequest::Run(RunRequest::AttachRunEvidence {
+                run_id: requested_run,
+                ..
+            }) => run_id = Some(*requested_run),
+            ClientRequest::Control(ControlRequest::Negotiate { .. })
+            | ClientRequest::Control(ControlRequest::DiscoverCapabilities)
+            | ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces)
+            | ClientRequest::Provider(ProviderRequest::ListModels)
+            | ClientRequest::Control(ControlRequest::GetWorkerNodeStatus)
+            | ClientRequest::Provider(ProviderRequest::ListProviders)
+            | ClientRequest::Repository(RepositoryRequest::ListGitHubRepositories)
+            | ClientRequest::Provider(ProviderRequest::StartGitHubCopilotLogin)
+            | ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. })
+            | ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { .. })
+            | ClientRequest::Provider(ProviderRequest::GetProviderHealth { .. }) => {}
+            ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
+            | ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. }) => {}
         }
 
-        if let ClientRequest::AttachSessionRepository { source, .. }
-        | ClientRequest::ImportSessionDirectory { source, .. }
-        | ClientRequest::AttachSessionDirectory { source, .. } = request
+        if let ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
+            source, ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::ImportSessionDirectory {
+            source, ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
+            source, ..
+        }) = request
             && Path::new(source).is_absolute()
             && !auth.scope().allows_repository_source(Path::new(source))
         {
@@ -760,11 +779,11 @@ impl InProcessConnection {
             && workspace_id.is_none()
             && matches!(
                 request,
-                ClientRequest::GetSessionEvents {
+                ClientRequest::Events(EventsRequest::GetSessionEvents {
                     session_id: None,
                     workspace_id: None,
                     ..
-                }
+                })
             )
             && (auth.scope().sessions.is_some() || auth.scope().workspaces.is_some())
         {

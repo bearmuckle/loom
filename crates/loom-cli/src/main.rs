@@ -15,7 +15,11 @@ use loom_core::{
 use loom_model::ModelId;
 use loom_process::{TaskKind, TaskSpec, TaskStatus, TerminalEvent, TerminalStatus};
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, RequestEnvelope, ServerEvent, ServerResponse,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, EventsRequest,
+    EventsResponse, FilesystemRequest, FilesystemResponse, ProviderRequest, ProviderResponse,
+    RepositoryRequest, RepositoryResponse, RequestEnvelope, RunRequest, RunResponse, ServerEvent,
+    ServerResponse, SessionRequest, SessionResponse, TaskRequest, TaskResponse, TerminalRequest,
+    TerminalResponse, WorkspaceRequest, WorkspaceResponse,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
@@ -408,42 +412,44 @@ async fn m4_demo_remote(
     let mut first = transport.connect().await?;
     negotiate_remote(&mut first).await?;
     let workspace = match first
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "M4 remote reconnect".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "M4 remote reconnect".to_owned(),
+            },
+        )))
         .await?
         .result?
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => return Err(unexpected_response("remote workspace creation", response)),
     };
     let session = match first
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "M4 remote reconnect".to_owned(),
             },
-        ))
+        )))
         .await?
         .result?
     {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot,
         response => return Err(unexpected_response("remote session creation", response)),
     };
     if workspace_root.join(".git").exists() {
         match first
-            .request(RequestEnvelope::new(
-                ClientRequest::AttachSessionRepository {
+            .request(RequestEnvelope::new(ClientRequest::Repository(
+                RepositoryRequest::AttachSessionRepository {
                     session_id: session.id,
                     source: workspace_root.display().to_string(),
                     path: "repo".to_owned(),
                     revision: None,
                 },
-            ))
+            )))
             .await?
             .result?
         {
-            ServerResponse::SessionRepositoryAttached(_) => {}
+            ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(_)) => {}
             response => {
                 return Err(unexpected_response(
                     "remote repository attachment",
@@ -453,27 +459,31 @@ async fn m4_demo_remote(
         }
     }
     first
-        .request(RequestEnvelope::new(
-            ClientRequest::SetSessionApprovalPolicy {
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::SetSessionApprovalPolicy {
                 session_id: session.id,
                 policy: loom_core::ApprovalPolicy::default(),
                 auto_approve_actions: Some(false),
             },
-        ))
+        )))
         .await?
         .result?;
     let run_id = match first
-        .request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-            session_id: session.id,
-            task,
-            model: ModelId::new("deterministic/demo"),
-            system_instructions: Some("Use the available tools and report validation.".to_owned()),
-            repository_instructions: Some("Keep the demonstration change small.".to_owned()),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: session.id,
+                task,
+                model: ModelId::new("deterministic/demo"),
+                system_instructions: Some(
+                    "Use the available tools and report validation.".to_owned(),
+                ),
+                repository_instructions: Some("Keep the demonstration change small.".to_owned()),
+            },
+        )))
         .await?
         .result?
     {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => return Err(unexpected_response("remote run start", response)),
     };
     println!("M4 client 1 started run {run_id}; disconnecting before approval");
@@ -486,23 +496,25 @@ async fn m4_demo_remote(
     let mut completed = false;
     for _ in 0..100 {
         let response = second
-            .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-                session_id: Some(session.id),
-                workspace_id: None,
-                after_sequence: after,
-                stream_epoch: stream_epoch.clone(),
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Events(
+                EventsRequest::GetSessionEvents {
+                    session_id: Some(session.id),
+                    workspace_id: None,
+                    after_sequence: after,
+                    stream_epoch: stream_epoch.clone(),
+                },
+            )))
             .await?;
         let events = match response.result? {
-            ServerResponse::SessionEvents {
+            ServerResponse::Events(EventsResponse::SessionEvents {
                 events,
                 stream_epoch: current_epoch,
-            }
-            | ServerResponse::SessionEventsSnapshot {
+            })
+            | ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
                 events,
                 stream_epoch: current_epoch,
                 ..
-            } => {
+            }) => {
                 stream_epoch = current_epoch;
                 events
             }
@@ -536,12 +548,14 @@ async fn m4_demo_remote(
             {
                 println!("M4 client 2 approving {}", call.name);
                 second
-                    .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
-                        run_id,
-                        attempt_id: *attempt_id,
-                        expected_control_revision: *control_revision,
-                        tool_call_id: call.id,
-                    }))
+                    .request(RequestEnvelope::new(ClientRequest::Run(
+                        RunRequest::ApproveAgentAction {
+                            run_id,
+                            attempt_id: *attempt_id,
+                            expected_control_revision: *control_revision,
+                            tool_call_id: call.id,
+                        },
+                    )))
                     .await?
                     .result?;
             }
@@ -559,9 +573,11 @@ async fn m4_demo_remote(
         }
     }
     let final_run = second
-        .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }))
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRun { run_id },
+        )))
         .await?;
-    let ServerResponse::AgentRun(snapshot) = final_run.result? else {
+    let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = final_run.result? else {
         return Err(LoomError::new(
             ErrorCode::Internal,
             "remote client received an unexpected final run response",
@@ -579,9 +595,14 @@ async fn m4_demo_remote(
 
 async fn negotiate_remote(connection: &mut WebSocketConnection) -> Result<(), LoomError> {
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::DiscoverCapabilities,
+        )))
         .await?;
-    if !matches!(response.result?, ServerResponse::Capabilities(_)) {
+    if !matches!(
+        response.result?,
+        ServerResponse::Control(ControlResponse::Capabilities(_))
+    ) {
         return Err(LoomError::new(
             ErrorCode::UnsupportedProtocol,
             "remote server did not return capability discovery",
@@ -589,13 +610,15 @@ async fn negotiate_remote(connection: &mut WebSocketConnection) -> Result<(), Lo
         ));
     }
     let response = connection
-        .request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities: client_capabilities(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities: client_capabilities(),
+            },
+        )))
         .await?;
     match response.result? {
-        ServerResponse::Negotiated(_) => Ok(()),
+        ServerResponse::Control(ControlResponse::Negotiated(_)) => Ok(()),
         response => Err(unexpected_response("remote negotiation", response)),
     }
 }
@@ -641,11 +664,13 @@ fn demonstrate_m2_services(
     connection: &InProcessConnection,
     session_id: AgentSessionId,
 ) -> Result<(), LoomError> {
-    let filesystem = connection.request(RequestEnvelope::new(
-        ClientRequest::GetSessionFilesystemSnapshot { session_id },
-    ));
+    let filesystem = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::GetSessionFilesystemSnapshot { session_id },
+    )));
     let snapshot = match filesystem.result? {
-        ServerResponse::SessionFilesystemSnapshot(snapshot) => snapshot,
+        ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemSnapshot(snapshot)) => {
+            snapshot
+        }
         response => return Err(unexpected_response("workspace open", response)),
     };
     println!(
@@ -663,38 +688,42 @@ fn demonstrate_m2_services(
         ("printf".to_owned(), vec!["terminal\\n".to_owned()])
     };
     let terminal = match connection
-        .request(RequestEnvelope::new(ClientRequest::OpenSessionTerminal {
-            session_id,
-            command,
-            args,
-            cwd: None,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Terminal(
+            TerminalRequest::OpenSessionTerminal {
+                session_id,
+                command,
+                args,
+                cwd: None,
+            },
+        )))
         .result?
     {
-        ServerResponse::TerminalOpened(snapshot) => snapshot,
+        ServerResponse::Terminal(TerminalResponse::TerminalOpened(snapshot)) => snapshot,
         response => return Err(unexpected_response("terminal open", response)),
     };
     connection
-        .request(RequestEnvelope::new(ClientRequest::ResizeSessionTerminal {
-            session_id,
-            terminal_id: terminal.id,
-            rows: 30,
-            columns: 100,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Terminal(
+            TerminalRequest::ResizeSessionTerminal {
+                session_id,
+                terminal_id: terminal.id,
+                rows: 30,
+                columns: 100,
+            },
+        )))
         .result?;
     let mut after_terminal = None;
     for _ in 0..100 {
         let events = match connection
-            .request(RequestEnvelope::new(
-                ClientRequest::GetSessionTerminalEvents {
+            .request(RequestEnvelope::new(ClientRequest::Terminal(
+                TerminalRequest::GetSessionTerminalEvents {
                     session_id,
                     terminal_id: terminal.id,
                     after_sequence: after_terminal,
                 },
-            ))
+            )))
             .result?
         {
-            ServerResponse::TerminalEvents { events } => events,
+            ServerResponse::Terminal(TerminalResponse::TerminalEvents { events }) => events,
             response => return Err(unexpected_response("terminal events", response)),
         };
         let finished = events.iter().any(|event| {
@@ -727,32 +756,36 @@ fn demonstrate_m2_services(
         ("printf".to_owned(), vec!["task\\n".to_owned()])
     };
     let task = match connection
-        .request(RequestEnvelope::new(ClientRequest::StartSessionTask {
-            session_id,
-            spec: TaskSpec {
-                kind: TaskKind::Test,
-                label: "M2 demo task".to_owned(),
-                command,
-                args,
-                cwd: None,
-                output_limit_bytes: Some(16 * 1024),
-                artifact_paths: Vec::new(),
+        .request(RequestEnvelope::new(ClientRequest::Task(
+            TaskRequest::StartSessionTask {
+                session_id,
+                spec: TaskSpec {
+                    kind: TaskKind::Test,
+                    label: "M2 demo task".to_owned(),
+                    command,
+                    args,
+                    cwd: None,
+                    output_limit_bytes: Some(16 * 1024),
+                    artifact_paths: Vec::new(),
+                },
             },
-        }))
+        )))
         .result?
     {
-        ServerResponse::TaskStarted(snapshot) => snapshot,
+        ServerResponse::Task(TaskResponse::TaskStarted(snapshot)) => snapshot,
         response => return Err(unexpected_response("task start", response)),
     };
     for _ in 0..100 {
         let snapshot = match connection
-            .request(RequestEnvelope::new(ClientRequest::GetSessionTask {
-                session_id,
-                task_id: task.id,
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Task(
+                TaskRequest::GetSessionTask {
+                    session_id,
+                    task_id: task.id,
+                },
+            )))
             .result?
         {
-            ServerResponse::Task(snapshot) => snapshot,
+            ServerResponse::Task(TaskResponse::Task(snapshot)) => snapshot,
             response => return Err(unexpected_response("task status", response)),
         };
         if matches!(
@@ -780,8 +813,10 @@ fn demonstrate_m3_recovery(
     session_id: AgentSessionId,
     run_id: RunId,
 ) -> Result<(), LoomError> {
-    let providers = connection.request(RequestEnvelope::new(ClientRequest::ListProviders));
-    if let ServerResponse::Providers { providers } = providers.result? {
+    let providers = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ListProviders,
+    )));
+    if let ServerResponse::Provider(ProviderResponse::Providers { providers }) = providers.result? {
         println!("M3 providers:");
         for provider in providers {
             println!(
@@ -800,33 +835,39 @@ fn demonstrate_m3_recovery(
     let recovered_backend = InProcessBackend::open_persistent(persistence_path)?;
     let recovered = recovered_backend.connect();
     negotiate(&recovered)?;
-    let session = recovered.request(RequestEnvelope::new(ClientRequest::GetAgentSession {
-        session_id,
-    }));
+    let session = recovered.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSession { session_id },
+    )));
     let session = match session.result? {
-        ServerResponse::AgentSession(snapshot) => snapshot,
+        ServerResponse::Session(SessionResponse::AgentSession(snapshot)) => snapshot,
         response => return Err(unexpected_response("recovered session", response)),
     };
-    let run = recovered.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+    let run = recovered.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun { run_id },
+    )));
     let run = match run.result? {
-        ServerResponse::AgentRun(snapshot) => snapshot,
+        ServerResponse::Run(RunResponse::AgentRun(snapshot)) => snapshot,
         response => return Err(unexpected_response("recovered run", response)),
     };
-    let events = recovered.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(session_id),
-        workspace_id: None,
-        after_sequence: None,
-        stream_epoch: None,
-    }));
+    let events = recovered.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
     let event_count = match events.result? {
-        ServerResponse::SessionEvents { events, .. } => events.len(),
+        ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) => events.len(),
         response => return Err(unexpected_response("recovered events", response)),
     };
-    let filesystem = recovered.request(RequestEnvelope::new(
-        ClientRequest::GetSessionFilesystemSnapshot { session_id },
-    ));
+    let filesystem = recovered.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::GetSessionFilesystemSnapshot { session_id },
+    )));
     let entries = match filesystem.result? {
-        ServerResponse::SessionFilesystemSnapshot(snapshot) => snapshot.entries.len(),
+        ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemSnapshot(snapshot)) => {
+            snapshot.entries.len()
+        }
         response => return Err(unexpected_response("recovered workspace", response)),
     };
     println!(
@@ -894,45 +935,47 @@ fn prepare_workspace(root: Option<PathBuf>) -> Result<PathBuf, LoomError> {
 }
 
 fn negotiate(connection: &InProcessConnection) -> Result<(), LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-        client_version: CURRENT_PROTOCOL_VERSION,
-        capabilities: CapabilitySet::new([
-            Capability::CreateAgentSession,
-            Capability::ReadAgentSession,
-            Capability::ManageWorkspaces,
-            Capability::ManageSessionRepositories,
-            Capability::ReadSessionFilesystem,
-            Capability::WriteSessionFilesystem,
-            Capability::SubscribeSessionEvents,
-            Capability::StartAgentRun,
-            Capability::ReadAgentRun,
-            Capability::ControlAgentRun,
-            Capability::PauseAgentRun,
-            Capability::ResumeAgentRun,
-            Capability::ForkAgentSession,
-            Capability::RetryFromCheckpoint,
-            Capability::ApproveAgentAction,
-            Capability::ListProviders,
-            Capability::ConfigureProviders,
-            Capability::ReadProviderHealth,
-            Capability::ReadUsage,
-            Capability::InspectContext,
-            Capability::ReadWorkspaceConfig,
-            Capability::OpenSessionTerminal,
-            Capability::ControlSessionTerminal,
-            Capability::ReadSessionTask,
-            Capability::StartSessionTask,
-            Capability::ControlSessionTask,
-            Capability::ConfigureApprovalPolicy,
-            Capability::ManageCheckpoints,
-            Capability::ReadVcsStatus,
-            Capability::ReadVcsDiff,
-            Capability::ReadSessionTaskEvidence,
-            Capability::JsonProtocol,
-        ]),
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities: CapabilitySet::new([
+                Capability::CreateAgentSession,
+                Capability::ReadAgentSession,
+                Capability::ManageWorkspaces,
+                Capability::ManageSessionRepositories,
+                Capability::ReadSessionFilesystem,
+                Capability::WriteSessionFilesystem,
+                Capability::SubscribeSessionEvents,
+                Capability::StartAgentRun,
+                Capability::ReadAgentRun,
+                Capability::ControlAgentRun,
+                Capability::PauseAgentRun,
+                Capability::ResumeAgentRun,
+                Capability::ForkAgentSession,
+                Capability::RetryFromCheckpoint,
+                Capability::ApproveAgentAction,
+                Capability::ListProviders,
+                Capability::ConfigureProviders,
+                Capability::ReadProviderHealth,
+                Capability::ReadUsage,
+                Capability::InspectContext,
+                Capability::ReadWorkspaceConfig,
+                Capability::OpenSessionTerminal,
+                Capability::ControlSessionTerminal,
+                Capability::ReadSessionTask,
+                Capability::StartSessionTask,
+                Capability::ControlSessionTask,
+                Capability::ConfigureApprovalPolicy,
+                Capability::ManageCheckpoints,
+                Capability::ReadVcsStatus,
+                Capability::ReadVcsDiff,
+                Capability::ReadSessionTaskEvidence,
+                Capability::JsonProtocol,
+            ]),
+        },
+    )));
     match response.result? {
-        ServerResponse::Negotiated(_) => Ok(()),
+        ServerResponse::Control(ControlResponse::Negotiated(_)) => Ok(()),
         response => Err(unexpected_response("negotiation", response)),
     }
 }
@@ -942,14 +985,14 @@ fn create_session(
     workspace_id: loom_core::WorkspaceId,
     name: &str,
 ) -> Result<loom_core::AgentSessionSnapshot, LoomError> {
-    let response = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id,
             name: name.to_owned(),
         },
-    ));
+    )));
     match response.result? {
-        ServerResponse::AgentSessionCreated(snapshot) => Ok(snapshot),
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => Ok(snapshot),
         response => Err(unexpected_response("session creation", response)),
     }
 }
@@ -958,11 +1001,13 @@ fn create_workspace(
     connection: &InProcessConnection,
     name: &str,
 ) -> Result<loom_core::WorkspaceRecord, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: name.to_owned(),
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: name.to_owned(),
+        },
+    )));
     match response.result? {
-        ServerResponse::WorkspaceCreated(workspace) => Ok(workspace),
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => Ok(workspace),
         response => Err(unexpected_response("workspace creation", response)),
     }
 }
@@ -972,16 +1017,16 @@ fn attach_repository(
     session_id: AgentSessionId,
     root: &Path,
 ) -> Result<(), LoomError> {
-    let response = connection.request(RequestEnvelope::new(
-        ClientRequest::AttachSessionRepository {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
             session_id,
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
         },
-    ));
+    )));
     match response.result? {
-        ServerResponse::SessionRepositoryAttached(_) => Ok(()),
+        ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(_)) => Ok(()),
         response => Err(unexpected_response("repository attachment", response)),
     }
 }
@@ -993,32 +1038,34 @@ fn start_run(
 ) -> Result<RunId, LoomError> {
     if options.manual_approval {
         match connection
-            .request(RequestEnvelope::new(
-                ClientRequest::SetSessionApprovalPolicy {
+            .request(RequestEnvelope::new(ClientRequest::Session(
+                SessionRequest::SetSessionApprovalPolicy {
                     session_id,
                     policy: loom_core::ApprovalPolicy::default(),
                     auto_approve_actions: Some(false),
                 },
-            ))
+            )))
             .result?
         {
-            ServerResponse::ApprovalPolicy(_) => {}
+            ServerResponse::Session(SessionResponse::ApprovalPolicy(_)) => {}
             response => return Err(unexpected_response("approval policy", response)),
         }
     }
-    let response = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-        session_id,
-        task: options.task.clone(),
-        model: options.model.clone(),
-        system_instructions: Some(
-            "Work methodically, use the available tools, and report validation.".to_owned(),
-        ),
-        repository_instructions: Some(
-            "Keep the demonstration change small and workspace-scoped.".to_owned(),
-        ),
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: options.task.clone(),
+            model: options.model.clone(),
+            system_instructions: Some(
+                "Work methodically, use the available tools, and report validation.".to_owned(),
+            ),
+            repository_instructions: Some(
+                "Keep the demonstration change small and workspace-scoped.".to_owned(),
+            ),
+        },
+    )));
     match response.result? {
-        ServerResponse::AgentRunStarted(snapshot) => Ok(snapshot.id),
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => Ok(snapshot.id),
         response => Err(unexpected_response("agent run start", response)),
     }
 }
@@ -1035,17 +1082,19 @@ fn stream_run(
     // current step has not journaled anything yet.
     let mut idle_polls = 0_u32;
     loop {
-        let response = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(session_id),
-            workspace_id: None,
-            after_sequence: after,
-            stream_epoch: stream_epoch.clone(),
-        }));
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                workspace_id: None,
+                after_sequence: after,
+                stream_epoch: stream_epoch.clone(),
+            },
+        )));
         let events = match response.result? {
-            ServerResponse::SessionEvents {
+            ServerResponse::Events(EventsResponse::SessionEvents {
                 events,
                 stream_epoch: current_epoch,
-            } => {
+            }) => {
                 stream_epoch = current_epoch;
                 events
             }
@@ -1090,20 +1139,20 @@ fn stream_run(
                     true
                 };
                 let request = if approved {
-                    ClientRequest::ApproveAgentAction {
+                    ClientRequest::Run(RunRequest::ApproveAgentAction {
                         run_id,
                         attempt_id: *attempt_id,
                         expected_control_revision: *control_revision,
                         tool_call_id: call.id,
-                    }
+                    })
                 } else {
-                    ClientRequest::RejectAgentAction {
+                    ClientRequest::Run(RunRequest::RejectAgentAction {
                         run_id,
                         attempt_id: *attempt_id,
                         expected_control_revision: *control_revision,
                         tool_call_id: call.id,
                         reason: Some("denied at the native shell".to_owned()),
-                    }
+                    })
                 };
                 let response = connection.request(RequestEnvelope::new(request));
                 response.result?;
@@ -1118,9 +1167,10 @@ fn stream_run(
             }
         }
         if completed {
-            let response =
-                connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
-            let ServerResponse::AgentRun(snapshot) = response.result? else {
+            let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+                RunRequest::GetAgentRun { run_id },
+            )));
+            let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = response.result? else {
                 return Err(LoomError::new(
                     ErrorCode::Internal,
                     "backend returned an unexpected final run response",

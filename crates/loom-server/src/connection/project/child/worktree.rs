@@ -185,11 +185,13 @@ impl InProcessConnection {
             worktree.updated_at = Timestamp::now();
             self.save_project_worktree_state(&worktree)?;
         }
-        Ok(ServerResponse::ProjectChildReview {
-            worktree,
-            status,
-            diff,
-        })
+        Ok(ServerResponse::Project(
+            ProjectResponse::ProjectChildReview {
+                worktree,
+                status,
+                diff,
+            },
+        ))
     }
 
     pub(crate) fn integrate_project_child(
@@ -233,7 +235,9 @@ impl InProcessConnection {
             ));
         }
         if worktree.status == ProjectWorktreeStatus::Integrated {
-            return Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree));
+            return Ok(ServerResponse::Project(
+                ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+            ));
         }
         if !matches!(
             worktree.status,
@@ -327,7 +331,9 @@ impl InProcessConnection {
                 worktree.error = None;
                 worktree.updated_at = Timestamp::now();
                 self.save_project_worktree_state(&worktree)?;
-                return Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree));
+                return Ok(ServerResponse::Project(
+                    ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+                ));
             }
             if parent_revision != worktree.base_revision {
                 worktree.status = ProjectWorktreeStatus::RecoveryRequired;
@@ -373,7 +379,9 @@ impl InProcessConnection {
                 worktree.error = None;
                 worktree.updated_at = Timestamp::now();
                 self.save_project_worktree_state(&worktree)?;
-                Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree))
+                Ok(ServerResponse::Project(
+                    ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+                ))
             }
             Err(error) => {
                 // Keep the integration intent retryable. A retry can detect a
@@ -433,7 +441,9 @@ impl InProcessConnection {
             ));
         }
         if worktree.status == ProjectWorktreeStatus::Removed {
-            return Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree));
+            return Ok(ServerResponse::Project(
+                ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+            ));
         }
         if worktree.status == ProjectWorktreeStatus::CleanupPending
             && worktree.cleanup_disposition != Some(disposition)
@@ -451,7 +461,9 @@ impl InProcessConnection {
             self.open_project_child_worktree(&worktree)?;
             worktree.status = ProjectWorktreeStatus::Retained;
             self.save_project_worktree_state(&worktree)?;
-            return Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree));
+            return Ok(ServerResponse::Project(
+                ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+            ));
         }
 
         worktree.status = ProjectWorktreeStatus::CleanupPending;
@@ -497,7 +509,9 @@ impl InProcessConnection {
                 worktree: worktree.clone(),
             },
         });
-        Ok(ServerResponse::ProjectChildWorktreeUpdated(worktree))
+        Ok(ServerResponse::Project(
+            ProjectResponse::ProjectChildWorktreeUpdated(worktree),
+        ))
     }
 
     pub(crate) fn save_project_worktree_state(

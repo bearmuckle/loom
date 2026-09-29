@@ -67,10 +67,12 @@ impl InProcessConnection {
         let next_after_project_sequence = (messages.len() == limit as usize)
             .then(|| messages.last().map(|message| message.project_sequence))
             .flatten();
-        Ok(ServerResponse::ProjectAgentMessages {
-            messages,
-            next_after_project_sequence,
-        })
+        Ok(ServerResponse::Project(
+            ProjectResponse::ProjectAgentMessages {
+                messages,
+                next_after_project_sequence,
+            },
+        ))
     }
 
     pub(crate) fn load_project_snapshot(&self, project_id: ProjectId) -> Result<ProjectSnapshot> {

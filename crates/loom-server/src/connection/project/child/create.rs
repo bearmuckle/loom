@@ -243,10 +243,12 @@ impl InProcessConnection {
                 self.ensure_project_worktree_ready(&mut worktree)?;
             }
             self.schedule_project_task_if_ready(&mut existing_task)?;
-            return Ok(ServerResponse::ProjectChildCreated {
-                task: existing_task,
-                child,
-            });
+            return Ok(ServerResponse::Project(
+                ProjectResponse::ProjectChildCreated {
+                    task: existing_task,
+                    child,
+                },
+            ));
         }
         let admission = self.backend.admissions.project(project_id)?;
         let admission_guard = admission.lock().map_err(|_| {
@@ -518,9 +520,11 @@ impl InProcessConnection {
             persisted_task = updated_task;
         }
         drop(workspace_admission_guard);
-        Ok(ServerResponse::ProjectChildCreated {
-            task: persisted_task,
-            child,
-        })
+        Ok(ServerResponse::Project(
+            ProjectResponse::ProjectChildCreated {
+                task: persisted_task,
+                child,
+            },
+        ))
     }
 }

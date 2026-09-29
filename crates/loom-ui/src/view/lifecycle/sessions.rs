@@ -5,14 +5,16 @@ impl LoomView {
     /// bootstrap. Interactive refreshes use [`Self::reload_sessions`].
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), LoomError> {
-        let response =
-            self.connection
-                .request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+        let response = self
+            .connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::ListWorkspaceSessions {
                     workspace_id: self.workspace_id,
                     include_archived: false,
-                }));
+                },
+            )));
         match response.result? {
-            ServerResponse::AgentSessions { sessions } => {
+            ServerResponse::Session(SessionResponse::AgentSessions { sessions }) => {
                 for session in &sessions {
                     self.session_node_ids
                         .insert(session.id, self.default_backend_node_id.clone());
@@ -46,10 +48,12 @@ impl LoomView {
                 node_requests
                     .entry(node.status.node_id.clone())
                     .or_insert_with(|| {
-                        backend.submit(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
-                            workspace_id,
-                            include_archived: false,
-                        }))
+                        backend.submit(RequestEnvelope::new(ClientRequest::Workspace(
+                            WorkspaceRequest::ListWorkspaceSessions {
+                                workspace_id,
+                                include_archived: false,
+                            },
+                        )))
                     });
             }
         }
@@ -69,7 +73,9 @@ impl LoomView {
                 let node_results = node_responses
                     .into_iter()
                     .filter_map(|(node_id, response)| match response.result {
-                        Ok(ServerResponse::AgentSessions { sessions }) => Some((node_id, sessions)),
+                        Ok(ServerResponse::Session(SessionResponse::AgentSessions {
+                            sessions,
+                        })) => Some((node_id, sessions)),
                         Err(error) => {
                             view.record_backend_error("session list refresh", error);
                             None

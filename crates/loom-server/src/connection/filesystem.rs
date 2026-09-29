@@ -20,10 +20,12 @@ impl InProcessConnection {
         if GitService::open(source_path).is_ok() {
             let repository =
                 self.attach_session_repository(session_id, source, relative_path.clone(), None)?;
-            return Ok(ServerResponse::SessionDirectoryImported {
-                path: relative_path,
-                repository: Some(repository),
-            });
+            return Ok(ServerResponse::Filesystem(
+                FilesystemResponse::SessionDirectoryImported {
+                    path: relative_path,
+                    repository: Some(repository),
+                },
+            ));
         }
         let session = self.backend.sessions()?.get(session_id)?;
         if matches!(
@@ -80,10 +82,12 @@ impl InProcessConnection {
                 .ok_or_else(|| LoomError::invalid_request("invalid session import path"))?,
         );
         copy_directory_contents(source_path, &destination)?;
-        Ok(ServerResponse::SessionDirectoryImported {
-            path: relative_path,
-            repository: None,
-        })
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::SessionDirectoryImported {
+                path: relative_path,
+                repository: None,
+            },
+        ))
     }
 
     pub(crate) fn attach_session_directory(
@@ -168,13 +172,15 @@ impl InProcessConnection {
                 .insert(repository.id, repository.clone());
             repositories.push(repository);
         }
-        Ok(ServerResponse::SessionDirectoryAttached {
-            directory: SessionDirectory {
-                source: source_path.display().to_string(),
-                path: relative_path,
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::SessionDirectoryAttached {
+                directory: SessionDirectory {
+                    source: source_path.display().to_string(),
+                    path: relative_path,
+                },
+                repositories,
             },
-            repositories,
-        })
+        ))
     }
 
     pub(crate) fn detach_session_directory(

@@ -7,30 +7,42 @@ impl InProcessConnection {
         _request_id: RequestId,
     ) -> Result<ServerResponse> {
         match request {
-            ClientRequest::GetAgentSession { session_id } => {
+            ClientRequest::Session(SessionRequest::GetAgentSession { session_id }) => {
                 let snapshot = self.backend.sessions()?.get(session_id)?;
-                Ok(ServerResponse::AgentSession(snapshot))
+                Ok(ServerResponse::Session(SessionResponse::AgentSession(
+                    snapshot,
+                )))
             }
-            ClientRequest::GetAgentSessionSnapshot { session_id } => {
-                Ok(ServerResponse::AgentSessionSnapshot(
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot { session_id }) => Ok(
+                ServerResponse::Session(SessionResponse::AgentSessionSnapshot(
                     self.session_snapshot_projection(session_id, true)?,
-                ))
-            }
-            ClientRequest::GetAgentSessionSnapshotMetadata { session_id } => {
-                Ok(ServerResponse::AgentSessionSnapshot(
-                    self.session_snapshot_projection(session_id, false)?,
-                ))
-            }
-            ClientRequest::GetAgentSessionInitialState { session_id } => Ok(
-                ServerResponse::AgentSessionInitialState(self.session_initial_state(session_id)?),
+                )),
             ),
-            ClientRequest::RenameAgentSession { session_id, name } => {
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata {
+                session_id,
+            }) => Ok(ServerResponse::Session(
+                SessionResponse::AgentSessionSnapshot(
+                    self.session_snapshot_projection(session_id, false)?,
+                ),
+            )),
+            ClientRequest::Session(SessionRequest::GetAgentSessionInitialState { session_id }) => {
+                Ok(ServerResponse::Session(
+                    SessionResponse::AgentSessionInitialState(
+                        self.session_initial_state(session_id)?,
+                    ),
+                ))
+            }
+            ClientRequest::Session(SessionRequest::RenameAgentSession { session_id, name }) => {
                 let (snapshot, record) = self.backend.sessions()?.rename(session_id, name)?;
                 self.backend.journal()?.append_session(record);
-                Ok(ServerResponse::AgentSessionRenamed(snapshot))
+                Ok(ServerResponse::Session(
+                    SessionResponse::AgentSessionRenamed(snapshot),
+                ))
             }
-            ClientRequest::ArchiveAgentSession { session_id } => self.archive_session(session_id),
-            ClientRequest::ForkAgentSession { session_id, name } => {
+            ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id }) => {
+                self.archive_session(session_id)
+            }
+            ClientRequest::Session(SessionRequest::ForkAgentSession { session_id, name }) => {
                 let source = self.backend.sessions()?.get(session_id)?;
                 if name.trim().is_empty() {
                     return Err(LoomError::invalid_request(
@@ -142,13 +154,15 @@ impl InProcessConnection {
                         event: event.event,
                     });
                 }
-                Ok(ServerResponse::AgentSessionForked(snapshot))
+                Ok(ServerResponse::Session(
+                    SessionResponse::AgentSessionForked(snapshot),
+                ))
             }
-            ClientRequest::SetSessionApprovalPolicy {
+            ClientRequest::Session(SessionRequest::SetSessionApprovalPolicy {
                 session_id,
                 policy,
                 auto_approve_actions,
-            } => {
+            }) => {
                 self.backend.sessions()?.get(session_id)?;
                 self.backend
                     .session_policies()?
@@ -158,7 +172,9 @@ impl InProcessConnection {
                         .auto_approve_actions()?
                         .insert(session_id, auto_approve_actions);
                 }
-                Ok(ServerResponse::ApprovalPolicy(policy))
+                Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(
+                    policy,
+                )))
             }
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }

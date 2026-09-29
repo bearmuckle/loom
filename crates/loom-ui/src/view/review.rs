@@ -6,11 +6,13 @@ impl LoomView {
         self.review.repositories_loaded = false;
         self.dispatch(
             cx,
-            ClientRequest::ListSessionDirectories {
+            ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories {
                 session_id: self.active_session.id,
-            },
+            }),
             |view, response, _| match response.result {
-                Ok(ServerResponse::SessionDirectories { directories }) => {
+                Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectories {
+                    directories,
+                })) => {
                     view.session_directories = directories;
                 }
                 Err(error) => view.record_backend_error("list session directories", error),
@@ -23,16 +25,18 @@ impl LoomView {
         let session_id = self.active_session.id;
         self.dispatch(
             cx,
-            ClientRequest::GetSessionFilesystemChanges {
+            ClientRequest::Filesystem(FilesystemRequest::GetSessionFilesystemChanges {
                 session_id,
                 after_sequence: None,
-            },
+            }),
             move |view, response, _| {
                 if view.active_session.id != session_id {
                     return;
                 }
                 match response.result {
-                    Ok(ServerResponse::SessionFilesystemChanges { changes, truncated }) => {
+                    Ok(ServerResponse::Filesystem(
+                        FilesystemResponse::SessionFilesystemChanges { changes, truncated },
+                    )) => {
                         let mut seen = BTreeSet::new();
                         view.review.changes = changes
                             .into_iter()
@@ -57,13 +61,15 @@ impl LoomView {
         let session_id = self.active_session.id;
         self.dispatch(
             cx,
-            ClientRequest::ListSessionRepositories { session_id },
+            ClientRequest::Repository(RepositoryRequest::ListSessionRepositories { session_id }),
             move |view, response, cx| {
                 if view.active_session.id != session_id {
                     return;
                 }
                 match response.result {
-                    Ok(ServerResponse::SessionRepositories { repositories }) => {
+                    Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
+                        repositories,
+                    })) => {
                         view.review.repositories_loaded = true;
                         let repository = repositories
                             .iter()
@@ -78,10 +84,10 @@ impl LoomView {
                             let session_id = view.active_session.id;
                             view.dispatch(
                                 cx,
-                                ClientRequest::GetSessionVcsStatus {
+                                ClientRequest::Repository(RepositoryRequest::GetSessionVcsStatus {
                                     session_id,
                                     repository_id,
-                                },
+                                }),
                                 move |view, response, _| {
                                     if view.active_session.id != session_id
                                         || view.selected_repository_id != Some(repository_id)
@@ -89,9 +95,9 @@ impl LoomView {
                                         return;
                                     }
                                     match response.result {
-                                        Ok(ServerResponse::VcsStatus(status)) => {
-                                            view.review.vcs = Some(status)
-                                        }
+                                        Ok(ServerResponse::Repository(
+                                            RepositoryResponse::VcsStatus(status),
+                                        )) => view.review.vcs = Some(status),
                                         Err(error) => {
                                             view.review.vcs = None;
                                             view.record_status(format!(
@@ -157,7 +163,7 @@ impl LoomView {
         let requested_path = path.clone();
         self.dispatch(
             cx,
-            ClientRequest::ReadSessionFile { session_id, path },
+            ClientRequest::Filesystem(FilesystemRequest::ReadSessionFile { session_id, path }),
             move |view, response, _| {
                 if view.active_session.id != session_id
                     || view.review.selected_path.as_deref() != Some(&requested_path)
@@ -167,7 +173,9 @@ impl LoomView {
                     return;
                 }
                 match response.result {
-                    Ok(ServerResponse::SessionFilesystemFile(mut file)) => {
+                    Ok(ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(
+                        mut file,
+                    ))) => {
                         file.content = bounded_to(&file.content, MAX_REVIEW_DIFF);
                         view.review.selected_file = Some(loom_protocol::SessionFilesystemFile {
                             session_id: file.session_id,
@@ -237,12 +245,12 @@ impl LoomView {
         let session_id = self.active_session.id;
         self.dispatch(
             cx,
-            ClientRequest::GetSessionVcsDiff {
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsDiff {
                 session_id,
                 repository_id,
                 path: Some(path.clone()),
                 staged,
-            },
+            }),
             move |view, response, _| {
                 if view.active_session.id != session_id
                     || view.review.selected_path.as_deref() != Some(&path)
@@ -252,7 +260,9 @@ impl LoomView {
                     return;
                 }
                 match response.result {
-                    Ok(ServerResponse::VcsDiff(diff)) => view.review.show_diff(diff),
+                    Ok(ServerResponse::Repository(RepositoryResponse::VcsDiff(diff))) => {
+                        view.review.show_diff(diff)
+                    }
                     Err(error) => {
                         view.review.loading_diff = false;
                         view.review.diff_error = Some(error.to_string());

@@ -7,16 +7,22 @@ impl InProcessConnection {
         _request_id: RequestId,
     ) -> Result<ServerResponse> {
         match request {
-            ClientRequest::AttachSessionRepository {
+            ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
                 session_id,
                 source,
                 path,
                 revision,
-            } => Ok(ServerResponse::SessionRepositoryAttached(
-                self.attach_session_repository(session_id, source, path, revision)?,
+            }) => Ok(ServerResponse::Repository(
+                RepositoryResponse::SessionRepositoryAttached(
+                    self.attach_session_repository(session_id, source, path, revision)?,
+                ),
             )),
-            ClientRequest::ListGitHubRepositories => self.list_github_repositories(),
-            ClientRequest::ListSessionRepositories { session_id } => {
+            ClientRequest::Repository(RepositoryRequest::ListGitHubRepositories) => {
+                self.list_github_repositories()
+            }
+            ClientRequest::Repository(RepositoryRequest::ListSessionRepositories {
+                session_id,
+            }) => {
                 self.backend.sessions()?.get(session_id)?;
                 let repositories = self
                     .backend
@@ -31,27 +37,31 @@ impl InProcessConnection {
                         .map(|persisted| persisted.repositories.into_values().collect())
                         .unwrap_or_default(),
                 };
-                Ok(ServerResponse::SessionRepositories { repositories })
+                Ok(ServerResponse::Repository(
+                    RepositoryResponse::SessionRepositories { repositories },
+                ))
             }
-            ClientRequest::DetachSessionRepository {
+            ClientRequest::Repository(RepositoryRequest::DetachSessionRepository {
                 session_id,
                 repository_id,
-            } => {
+            }) => {
                 self.detach_session_repository(session_id, repository_id)?;
-                Ok(ServerResponse::SessionRepositoryDetached)
+                Ok(ServerResponse::Repository(
+                    RepositoryResponse::SessionRepositoryDetached,
+                ))
             }
-            ClientRequest::GetSessionVcsStatus {
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsStatus {
                 session_id,
                 repository_id,
-            } => Ok(ServerResponse::VcsStatus(
+            }) => Ok(ServerResponse::Repository(RepositoryResponse::VcsStatus(
                 self.session_git(session_id, repository_id)?.status()?,
-            )),
-            ClientRequest::GetSessionVcsDiff {
+            ))),
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsDiff {
                 session_id,
                 repository_id,
                 path,
                 staged,
-            } => {
+            }) => {
                 let mut diff = self
                     .session_git(session_id, repository_id)?
                     .diff(path.as_deref(), staged)?;
@@ -84,20 +94,26 @@ impl InProcessConnection {
                 diff.hunks.retain(|hunk| !hunk.lines.is_empty());
                 diff.truncated = truncated;
                 diff.patch = bounded_review_text(&diff.patch, MAX_REVIEW_DIFF_BYTES);
-                Ok(ServerResponse::VcsDiff(diff))
+                Ok(ServerResponse::Repository(RepositoryResponse::VcsDiff(
+                    diff,
+                )))
             }
-            ClientRequest::GetSessionVcsBranches {
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsBranches {
                 session_id,
                 repository_id,
-            } => Ok(ServerResponse::VcsBranches {
-                branches: self.session_git(session_id, repository_id)?.branches()?,
-            }),
-            ClientRequest::GetSessionVcsConflicts {
+            }) => Ok(ServerResponse::Repository(
+                RepositoryResponse::VcsBranches {
+                    branches: self.session_git(session_id, repository_id)?.branches()?,
+                },
+            )),
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsConflicts {
                 session_id,
                 repository_id,
-            } => Ok(ServerResponse::VcsConflicts {
-                paths: self.session_git(session_id, repository_id)?.conflicts()?,
-            }),
+            }) => Ok(ServerResponse::Repository(
+                RepositoryResponse::VcsConflicts {
+                    paths: self.session_git(session_id, repository_id)?.conflicts()?,
+                },
+            )),
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }
     }

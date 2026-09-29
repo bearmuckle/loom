@@ -4,7 +4,9 @@ impl InProcessConnection {
     pub(crate) fn list_github_repositories(&self) -> Result<ServerResponse> {
         let token = self.backend.providers.github_account_token()?;
         let repositories = fetch_github_repositories(&token, "https://api.github.com/user/repos")?;
-        Ok(ServerResponse::GitHubRepositories { repositories })
+        Ok(ServerResponse::Repository(
+            RepositoryResponse::GitHubRepositories { repositories },
+        ))
     }
 
     pub(crate) fn attach_session_repository(

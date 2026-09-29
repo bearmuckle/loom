@@ -24,13 +24,15 @@ impl LoomView {
         let mut provider_names = catalog.provider_names;
         let mut models = catalog.models;
         for provider_id in provider_ids {
-            let response = self.connection.request(RequestEnvelope::new(
-                ClientRequest::DiscoverProviderModels {
-                    provider_id: provider_id.clone(),
-                },
-            ));
+            let response = self
+                .connection
+                .request(RequestEnvelope::new(ClientRequest::Provider(
+                    ProviderRequest::DiscoverProviderModels {
+                        provider_id: provider_id.clone(),
+                    },
+                )));
             match response.result {
-                Ok(ServerResponse::Models { models: discovered }) => {
+                Ok(ServerResponse::Provider(ProviderResponse::Models { models: discovered })) => {
                     for model in discovered {
                         provider_names.insert(
                             model.id.clone(),
@@ -89,14 +91,16 @@ impl LoomView {
         cx.spawn(async move |view, cx| {
             let result = list_models_from_backend(&backend).await;
             let provider_response = backend
-                .submit(RequestEnvelope::new(ClientRequest::ListProviders))
+                .submit(RequestEnvelope::new(ClientRequest::Provider(
+                    ProviderRequest::ListProviders,
+                )))
                 .wait()
                 .await;
             view.update(cx, |view, cx| {
                 view.model_refreshes_in_flight.remove(&node_id);
                 if view.providers_node_id.as_deref() == Some(node_id.as_str()) {
                     match provider_response.result {
-                        Ok(ServerResponse::Providers { providers }) => {
+                        Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) => {
                             view.providers = providers;
                         }
                         Err(error) => view.record_backend_error("list providers", error),

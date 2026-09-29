@@ -105,12 +105,14 @@ impl LoomView {
         self.dispatch_to_node(
             cx,
             node_id,
-            ClientRequest::ListGitHubRepositories,
+            ClientRequest::Repository(RepositoryRequest::ListGitHubRepositories),
             |view, response, _| {
                 if let Some(dialog) = &mut view.source_dialog {
                     dialog.repositories_loading = false;
                     match response.result {
-                        Ok(ServerResponse::GitHubRepositories { repositories }) => {
+                        Ok(ServerResponse::Repository(
+                            RepositoryResponse::GitHubRepositories { repositories },
+                        )) => {
                             dialog.repositories = repositories;
                             dialog.error = None;
                         }
@@ -194,16 +196,18 @@ impl LoomView {
         match source {
             SessionCreationSource::LocalDirectory(source) => self.dispatch(
                 cx,
-                ClientRequest::AttachSessionDirectory {
+                ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
                     session_id,
                     source,
                     path: format!("sources/{}", uuid::Uuid::new_v4()),
-                },
+                }),
                 |view, response, cx| match response.result {
-                    Ok(ServerResponse::SessionDirectoryAttached {
-                        directory,
-                        repositories,
-                    }) => {
+                    Ok(ServerResponse::Filesystem(
+                        FilesystemResponse::SessionDirectoryAttached {
+                            directory,
+                            repositories,
+                        },
+                    )) => {
                         view.session_directories.push(directory);
                         if let Some(repository) = repositories.first() {
                             view.selected_repository_id = Some(repository.id);
@@ -223,14 +227,16 @@ impl LoomView {
                 let repository_id = RepositoryId::new();
                 self.dispatch(
                     cx,
-                    ClientRequest::AttachSessionRepository {
+                    ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
                         session_id,
                         source: repository.clone_url,
                         path: format!("repositories/{repository_id}"),
                         revision: None,
-                    },
+                    }),
                     move |view, response, cx| match response.result {
-                        Ok(ServerResponse::SessionRepositoryAttached(repository)) => {
+                        Ok(ServerResponse::Repository(
+                            RepositoryResponse::SessionRepositoryAttached(repository),
+                        )) => {
                             view.selected_repository_id = Some(repository.id);
                             view.session_repositories.push(repository);
                             view.refresh_review(cx);

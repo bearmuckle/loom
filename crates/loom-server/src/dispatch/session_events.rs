@@ -7,12 +7,12 @@ impl InProcessConnection {
         _request_id: RequestId,
     ) -> Result<ServerResponse> {
         match request {
-            ClientRequest::GetSessionEvents {
+            ClientRequest::Events(EventsRequest::GetSessionEvents {
                 session_id,
                 workspace_id,
                 after_sequence,
                 stream_epoch,
-            } => {
+            }) => {
                 if session_id.is_some() && workspace_id.is_some() {
                     return Err(LoomError::invalid_request(
                         "session_id and workspace_id cannot both scope an event stream",
@@ -106,23 +106,25 @@ impl InProcessConnection {
                                     .map(|cursor| cursor.pruned_through.next())
                             })
                             .unwrap_or_else(|| latest_sequence.next());
-                        return Ok(ServerResponse::WorkspaceEventsSnapshot {
-                            workspace_id,
-                            sessions: self
-                                .backend
-                                .sessions()?
-                                .list_in_workspace(Some(workspace_id), true),
-                            events,
-                            oldest_sequence,
-                            latest_sequence,
-                            stream_epoch: current_stream_epoch,
-                        });
+                        return Ok(ServerResponse::Events(
+                            EventsResponse::WorkspaceEventsSnapshot {
+                                workspace_id,
+                                sessions: self
+                                    .backend
+                                    .sessions()?
+                                    .list_in_workspace(Some(workspace_id), true),
+                                events,
+                                oldest_sequence,
+                                latest_sequence,
+                                stream_epoch: current_stream_epoch,
+                            },
+                        ));
                     }
-                    return Ok(ServerResponse::WorkspaceEvents {
+                    return Ok(ServerResponse::Events(EventsResponse::WorkspaceEvents {
                         workspace_id,
                         events,
                         stream_epoch: current_stream_epoch,
-                    });
+                    }));
                 }
                 let (events, session_latest_sequence) = match session_id {
                     Some(session_id) => {
@@ -168,26 +170,28 @@ impl InProcessConnection {
                                     .unwrap_or(journal.next_sequence)
                                     .next()
                             });
-                        return Ok(ServerResponse::SessionEventsSnapshot {
-                            session: self.backend.sessions()?.get(session_id)?,
-                            events,
-                            oldest_sequence,
-                            latest_sequence: session_latest_sequence
-                                .unwrap_or(journal.next_sequence),
-                            stream_epoch: current_stream_epoch,
-                        });
+                        return Ok(ServerResponse::Events(
+                            EventsResponse::SessionEventsSnapshot {
+                                session: self.backend.sessions()?.get(session_id)?,
+                                events,
+                                oldest_sequence,
+                                latest_sequence: session_latest_sequence
+                                    .unwrap_or(journal.next_sequence),
+                                stream_epoch: current_stream_epoch,
+                            },
+                        ));
                     }
                 }
-                Ok(ServerResponse::SessionEvents {
+                Ok(ServerResponse::Events(EventsResponse::SessionEvents {
                     events,
                     stream_epoch: session_id.map(|_| self.backend.node_id.clone()),
-                })
+                }))
             }
-            ClientRequest::GetRecentSessionEvents { session_id, limit } => {
-                Ok(ServerResponse::SessionEvents {
+            ClientRequest::Events(EventsRequest::GetRecentSessionEvents { session_id, limit }) => {
+                Ok(ServerResponse::Events(EventsResponse::SessionEvents {
                     events: self.recent_session_events(session_id, limit as usize)?,
                     stream_epoch: Some(self.backend.node_id.clone()),
-                })
+                }))
             }
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }

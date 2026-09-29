@@ -196,524 +196,242 @@ impl RequestEnvelope {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum ClientRequest {
-    Negotiate {
-        client_version: ProtocolVersion,
-        capabilities: CapabilitySet,
-    },
-    DiscoverCapabilities,
-    GetWorkerNodeStatus,
-    CreateWorkspace {
-        name: String,
-    },
-    RegisterWorkspace {
-        workspace: WorkspaceRecord,
-    },
-    ListWorkspaces,
-    RenameWorkspace {
-        workspace_id: WorkspaceId,
-        name: String,
-    },
-    ListWorkspaceSessions {
-        workspace_id: WorkspaceId,
-        include_archived: bool,
-    },
-    CreateAgentSessionInWorkspace {
-        workspace_id: WorkspaceId,
-        name: String,
-    },
-    GetWorkspaceConfigForWorkspace {
-        workspace_id: WorkspaceId,
-    },
-    SetWorkspaceConfigForWorkspace {
-        workspace_id: WorkspaceId,
-        config: WorkspaceConfig,
-    },
-    AttachSessionRepository {
-        session_id: AgentSessionId,
-        source: String,
-        path: String,
-        revision: Option<String>,
-    },
-    ListSessionRepositories {
-        session_id: AgentSessionId,
-    },
-    DetachSessionRepository {
-        session_id: AgentSessionId,
-        repository_id: RepositoryId,
-    },
-    ImportSessionDirectory {
-        session_id: AgentSessionId,
-        source: String,
-        path: String,
-    },
-    AttachSessionDirectory {
-        session_id: AgentSessionId,
-        source: String,
-        path: String,
-    },
-    ListSessionDirectories {
-        session_id: AgentSessionId,
-    },
-    DetachSessionDirectory {
-        session_id: AgentSessionId,
-        path: String,
-    },
-    ListGitHubRepositories,
-    StartSessionAgentRun {
-        session_id: AgentSessionId,
-        task: String,
-        model: ModelId,
-        system_instructions: Option<String>,
-        repository_instructions: Option<String>,
-    },
-    StartSessionAgentRunWithOptions {
-        session_id: AgentSessionId,
-        task: String,
-        model: ModelId,
-        system_instructions: Option<String>,
-        repository_instructions: Option<String>,
-        limits: SessionLimits,
-        context: ContextAssemblyOptions,
-    },
-    GetSessionFilesystemSnapshot {
-        session_id: AgentSessionId,
-    },
-    GetSessionFilesystemChanges {
-        session_id: AgentSessionId,
-        after_sequence: Option<EventSequence>,
-    },
-    ReadSessionFile {
-        session_id: AgentSessionId,
-        path: String,
-    },
-    ApplySessionFilesystemEdit {
-        session_id: AgentSessionId,
-        edit: WorkspaceEdit,
-    },
-    TakeSessionFilesystemControl {
-        session_id: AgentSessionId,
-        control: WorkspaceControl,
-    },
-    CreateSessionCheckpoint {
-        session_id: AgentSessionId,
-        label: String,
-    },
-    RevertSessionCheckpoint {
-        session_id: AgentSessionId,
-        checkpoint_id: loom_core::CheckpointId,
-    },
-    UndoSessionEdit {
-        session_id: AgentSessionId,
-    },
-    GetSessionContextFiles {
-        session_id: AgentSessionId,
-    },
-    GetSessionVcsStatus {
-        session_id: AgentSessionId,
-        repository_id: RepositoryId,
-    },
-    GetSessionVcsDiff {
-        session_id: AgentSessionId,
-        repository_id: RepositoryId,
-        path: Option<String>,
-        staged: bool,
-    },
-    GetSessionVcsBranches {
-        session_id: AgentSessionId,
-        repository_id: RepositoryId,
-    },
-    GetSessionVcsConflicts {
-        session_id: AgentSessionId,
-        repository_id: RepositoryId,
-    },
-    OpenSessionTerminal {
-        session_id: AgentSessionId,
-        command: String,
-        args: Vec<String>,
-        cwd: Option<String>,
-    },
-    WriteSessionTerminalInput {
-        session_id: AgentSessionId,
-        terminal_id: loom_core::TerminalId,
-        input: String,
-    },
-    ResizeSessionTerminal {
-        session_id: AgentSessionId,
-        terminal_id: loom_core::TerminalId,
-        rows: u16,
-        columns: u16,
-    },
-    GetSessionTerminalEvents {
-        session_id: AgentSessionId,
-        terminal_id: loom_core::TerminalId,
-        after_sequence: Option<EventSequence>,
-    },
-    CancelSessionTerminal {
-        session_id: AgentSessionId,
-        terminal_id: loom_core::TerminalId,
-    },
-    StartSessionTask {
-        session_id: AgentSessionId,
-        spec: TaskSpec,
-    },
-    ListSessionTasks {
-        session_id: AgentSessionId,
-    },
-    GetSessionTask {
-        session_id: AgentSessionId,
-        task_id: loom_core::TaskId,
-    },
-    GetSessionTaskEvents {
-        session_id: AgentSessionId,
-        task_id: loom_core::TaskId,
-        after_sequence: Option<EventSequence>,
-    },
-    CancelSessionTask {
-        session_id: AgentSessionId,
-        task_id: loom_core::TaskId,
-    },
-    GetSessionTaskEvidence {
-        session_id: AgentSessionId,
-        task_id: loom_core::TaskId,
-    },
-    SetSessionApprovalPolicy {
-        session_id: AgentSessionId,
-        policy: loom_core::ApprovalPolicy,
-        auto_approve_actions: Option<bool>,
-    },
-    GetAgentSession {
-        session_id: AgentSessionId,
-    },
-    GetAgentSessionSnapshot {
-        session_id: AgentSessionId,
-    },
-    /// Returns session/run metadata without materializing the run transcript.
-    /// Clients can load conversation history through the bounded message-page API.
-    GetAgentSessionSnapshotMetadata {
-        session_id: AgentSessionId,
-    },
-    GetAgentSessionInitialState {
-        session_id: AgentSessionId,
-    },
-    GetProjectSnapshot {
-        project_id: ProjectId,
-    },
-    GetProjectSnapshotForSession {
-        session_id: AgentSessionId,
-    },
-    SendProjectAgentMessage {
-        message: AgentMessageDraft,
-    },
-    ListProjectAgentMessages {
-        project_id: ProjectId,
-        session_id: AgentSessionId,
-        after_project_sequence: Option<u64>,
-        limit: u32,
-    },
-    ControlProjectChild {
-        project_id: ProjectId,
-        manager_session_id: AgentSessionId,
-        task_id: loom_core::TaskId,
-        action: ProjectChildControlAction,
-    },
-    GetProjectChildReview {
-        project_id: ProjectId,
-        manager_session_id: AgentSessionId,
-        task_id: loom_core::TaskId,
-    },
-    IntegrateProjectChild {
-        project_id: ProjectId,
-        manager_session_id: AgentSessionId,
-        task_id: loom_core::TaskId,
-        expected_parent_revision: String,
-    },
-    CleanupProjectChildWorktree {
-        project_id: ProjectId,
-        manager_session_id: AgentSessionId,
-        task_id: loom_core::TaskId,
-        disposition: ProjectWorktreeCleanupDisposition,
-    },
-    RenameAgentSession {
-        session_id: AgentSessionId,
-        name: String,
-    },
-    ArchiveAgentSession {
-        session_id: AgentSessionId,
-    },
-    GetSessionEvents {
-        session_id: Option<AgentSessionId>,
-        /// Workspace-wide event stream scope. Mutually exclusive with `session_id`.
-        #[serde(default)]
-        workspace_id: Option<WorkspaceId>,
-        /// Last global event sequence processed for the selected scope. Workspace event
-        /// sequences can have gaps because unrelated workspaces share the global counter.
-        after_sequence: Option<EventSequence>,
-        /// Backend-instance identity paired with `after_sequence`.
-        #[serde(default)]
-        stream_epoch: Option<String>,
-    },
-    GetRecentSessionEvents {
-        session_id: AgentSessionId,
-        limit: u32,
-    },
-    GetAgentRun {
-        run_id: RunId,
-    },
-    GetAgentRunMessagePage {
-        run_id: RunId,
-        before_ordinal: Option<u64>,
-        limit: u32,
-    },
-    GetAgentRunTranscriptPage {
-        run_id: RunId,
-        before_ordinal: Option<u64>,
-        limit: u32,
-    },
-    GetAgentRunMessageContentRange {
-        run_id: RunId,
-        message_ordinal: u64,
-        byte_offset: u64,
-        length: u32,
-    },
-    GetAgentRunSnapshot {
-        run_id: RunId,
-    },
-    GetRunCheckpoint {
-        run_id: RunId,
-    },
-    ApproveAgentAction {
-        run_id: RunId,
-        attempt_id: loom_core::RunAttemptId,
-        expected_control_revision: u64,
-        tool_call_id: ToolCallId,
-    },
-    RejectAgentAction {
-        run_id: RunId,
-        attempt_id: loom_core::RunAttemptId,
-        expected_control_revision: u64,
-        tool_call_id: ToolCallId,
-        reason: Option<String>,
-    },
-    SendAgentMessage {
-        run_id: RunId,
-        attempt_id: loom_core::RunAttemptId,
-        expected_control_revision: u64,
-        message: String,
-    },
-    InterruptAgentRun {
-        run_id: RunId,
-    },
-    RetryAgentStep {
-        run_id: RunId,
-    },
-    PauseAgentRun {
-        run_id: RunId,
-    },
-    ResumeAgentRun {
-        run_id: RunId,
-    },
-    RetryAgentFromCheckpoint {
-        run_id: RunId,
-        checkpoint_id: loom_core::CheckpointId,
-    },
-    ForkAgentSession {
-        session_id: AgentSessionId,
-        name: String,
-    },
-    ListModels,
-    ListProviders,
-    ConfigureGitHubCopilot {
-        access_token: String,
-    },
-    ConfigureApiKeyProvider {
-        provider_id: ProviderId,
-        api_key: String,
-    },
-    StartGitHubCopilotLogin,
-    GetGitHubCopilotLoginStatus {
-        login_id: String,
-    },
-    DiscoverProviderModels {
-        provider_id: ProviderId,
-    },
-    GetProviderHealth {
-        provider_id: ProviderId,
-    },
-    GetRunUsage {
-        run_id: RunId,
-    },
-    GetSessionUsage {
-        session_id: AgentSessionId,
-    },
-    InspectAgentContext {
-        run_id: RunId,
-    },
-    AttachRunEvidence {
-        run_id: RunId,
-        evidence: Vec<loom_core::EvidenceLink>,
-    },
+pub struct ResponseEnvelope {
+    pub protocol_version: ProtocolVersion,
+    pub request_id: RequestId,
+    pub result: std::result::Result<ServerResponse, LoomError>,
 }
+
+mod requests;
+mod responses;
+
+pub use requests::*;
+pub use responses::*;
 
 impl ClientRequest {
     pub const fn required_capability(&self) -> Option<Capability> {
         match self {
-            Self::Negotiate { .. } | Self::DiscoverCapabilities => None,
-            Self::GetWorkerNodeStatus => Some(Capability::ReadWorkerNodeStatus),
-            Self::CreateWorkspace { .. }
-            | Self::RegisterWorkspace { .. }
-            | Self::RenameWorkspace { .. } => Some(Capability::ManageWorkspaces),
-            Self::ListWorkspaces | Self::ListWorkspaceSessions { .. } => {
+            Self::Control(ControlRequest::Negotiate { .. })
+            | Self::Control(ControlRequest::DiscoverCapabilities) => None,
+            Self::Control(ControlRequest::GetWorkerNodeStatus) => {
+                Some(Capability::ReadWorkerNodeStatus)
+            }
+            Self::Workspace(WorkspaceRequest::CreateWorkspace { .. })
+            | Self::Workspace(WorkspaceRequest::RegisterWorkspace { .. })
+            | Self::Workspace(WorkspaceRequest::RenameWorkspace { .. }) => {
+                Some(Capability::ManageWorkspaces)
+            }
+            Self::Workspace(WorkspaceRequest::ListWorkspaces)
+            | Self::Workspace(WorkspaceRequest::ListWorkspaceSessions { .. }) => {
                 Some(Capability::ReadAgentSession)
             }
-            Self::CreateAgentSessionInWorkspace { .. } => Some(Capability::CreateAgentSession),
-            Self::GetWorkspaceConfigForWorkspace { .. } => Some(Capability::ReadWorkspaceConfig),
-            Self::SetWorkspaceConfigForWorkspace { .. } => Some(Capability::ManageWorkspaces),
-            Self::AttachSessionRepository { .. } | Self::DetachSessionRepository { .. } => {
+            Self::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace { .. }) => {
+                Some(Capability::CreateAgentSession)
+            }
+            Self::Workspace(WorkspaceRequest::GetWorkspaceConfigForWorkspace { .. }) => {
+                Some(Capability::ReadWorkspaceConfig)
+            }
+            Self::Workspace(WorkspaceRequest::SetWorkspaceConfigForWorkspace { .. }) => {
+                Some(Capability::ManageWorkspaces)
+            }
+            Self::Repository(RepositoryRequest::AttachSessionRepository { .. })
+            | Self::Repository(RepositoryRequest::DetachSessionRepository { .. }) => {
                 Some(Capability::ManageSessionRepositories)
             }
-            Self::ImportSessionDirectory { .. }
-            | Self::AttachSessionDirectory { .. }
-            | Self::DetachSessionDirectory { .. } => Some(Capability::WriteSessionFilesystem),
-            Self::ListGitHubRepositories => Some(Capability::BrowseGitHubRepositories),
-            Self::ListSessionRepositories { .. } | Self::ListSessionDirectories { .. } => {
+            Self::Filesystem(FilesystemRequest::ImportSessionDirectory { .. })
+            | Self::Filesystem(FilesystemRequest::AttachSessionDirectory { .. })
+            | Self::Filesystem(FilesystemRequest::DetachSessionDirectory { .. }) => {
+                Some(Capability::WriteSessionFilesystem)
+            }
+            Self::Repository(RepositoryRequest::ListGitHubRepositories) => {
+                Some(Capability::BrowseGitHubRepositories)
+            }
+            Self::Repository(RepositoryRequest::ListSessionRepositories { .. })
+            | Self::Filesystem(FilesystemRequest::ListSessionDirectories { .. }) => {
                 Some(Capability::ReadSessionFilesystem)
             }
-            Self::StartSessionAgentRun { .. } | Self::StartSessionAgentRunWithOptions { .. } => {
+            Self::Run(RunRequest::StartSessionAgentRun { .. })
+            | Self::Run(RunRequest::StartSessionAgentRunWithOptions { .. }) => {
                 Some(Capability::StartAgentRun)
             }
-            Self::GetSessionFilesystemSnapshot { .. }
-            | Self::GetSessionFilesystemChanges { .. }
-            | Self::ReadSessionFile { .. }
-            | Self::GetSessionContextFiles { .. } => Some(Capability::ReadSessionFilesystem),
-            Self::ApplySessionFilesystemEdit { .. } => Some(Capability::WriteSessionFilesystem),
-            Self::TakeSessionFilesystemControl { .. } => Some(Capability::WriteSessionFilesystem),
-            Self::CreateSessionCheckpoint { .. }
-            | Self::RevertSessionCheckpoint { .. }
-            | Self::UndoSessionEdit { .. } => Some(Capability::ManageCheckpoints),
-            Self::GetSessionVcsStatus { .. }
-            | Self::GetSessionVcsBranches { .. }
-            | Self::GetSessionVcsConflicts { .. } => Some(Capability::ReadVcsStatus),
-            Self::GetSessionVcsDiff { .. } => Some(Capability::ReadVcsDiff),
-            Self::OpenSessionTerminal { .. } => Some(Capability::OpenSessionTerminal),
-            Self::WriteSessionTerminalInput { .. }
-            | Self::ResizeSessionTerminal { .. }
-            | Self::CancelSessionTerminal { .. } => Some(Capability::ControlSessionTerminal),
-            Self::GetSessionTerminalEvents { .. } => Some(Capability::ControlSessionTerminal),
-            Self::StartSessionTask { .. } => Some(Capability::StartSessionTask),
-            Self::ListSessionTasks { .. }
-            | Self::GetSessionTask { .. }
-            | Self::GetSessionTaskEvents { .. } => Some(Capability::ReadSessionTask),
-            Self::CancelSessionTask { .. } => Some(Capability::ControlSessionTask),
-            Self::GetSessionTaskEvidence { .. } => Some(Capability::ReadSessionTaskEvidence),
-            Self::SetSessionApprovalPolicy { .. } => Some(Capability::ConfigureApprovalPolicy),
-            Self::GetAgentSession { .. }
-            | Self::GetAgentSessionSnapshot { .. }
-            | Self::GetAgentSessionSnapshotMetadata { .. }
-            | Self::GetAgentSessionInitialState { .. } => Some(Capability::ReadAgentSession),
-            Self::GetProjectSnapshot { .. } | Self::GetProjectSnapshotForSession { .. } => {
+            Self::Filesystem(FilesystemRequest::GetSessionFilesystemSnapshot { .. })
+            | Self::Filesystem(FilesystemRequest::GetSessionFilesystemChanges { .. })
+            | Self::Filesystem(FilesystemRequest::ReadSessionFile { .. })
+            | Self::Filesystem(FilesystemRequest::GetSessionContextFiles { .. }) => {
+                Some(Capability::ReadSessionFilesystem)
+            }
+            Self::Filesystem(FilesystemRequest::ApplySessionFilesystemEdit { .. }) => {
+                Some(Capability::WriteSessionFilesystem)
+            }
+            Self::Filesystem(FilesystemRequest::TakeSessionFilesystemControl { .. }) => {
+                Some(Capability::WriteSessionFilesystem)
+            }
+            Self::Filesystem(FilesystemRequest::CreateSessionCheckpoint { .. })
+            | Self::Filesystem(FilesystemRequest::RevertSessionCheckpoint { .. })
+            | Self::Filesystem(FilesystemRequest::UndoSessionEdit { .. }) => {
+                Some(Capability::ManageCheckpoints)
+            }
+            Self::Repository(RepositoryRequest::GetSessionVcsStatus { .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsBranches { .. })
+            | Self::Repository(RepositoryRequest::GetSessionVcsConflicts { .. }) => {
+                Some(Capability::ReadVcsStatus)
+            }
+            Self::Repository(RepositoryRequest::GetSessionVcsDiff { .. }) => {
+                Some(Capability::ReadVcsDiff)
+            }
+            Self::Terminal(TerminalRequest::OpenSessionTerminal { .. }) => {
+                Some(Capability::OpenSessionTerminal)
+            }
+            Self::Terminal(TerminalRequest::WriteSessionTerminalInput { .. })
+            | Self::Terminal(TerminalRequest::ResizeSessionTerminal { .. })
+            | Self::Terminal(TerminalRequest::CancelSessionTerminal { .. }) => {
+                Some(Capability::ControlSessionTerminal)
+            }
+            Self::Terminal(TerminalRequest::GetSessionTerminalEvents { .. }) => {
+                Some(Capability::ControlSessionTerminal)
+            }
+            Self::Task(TaskRequest::StartSessionTask { .. }) => Some(Capability::StartSessionTask),
+            Self::Task(TaskRequest::ListSessionTasks { .. })
+            | Self::Task(TaskRequest::GetSessionTask { .. })
+            | Self::Task(TaskRequest::GetSessionTaskEvents { .. }) => {
+                Some(Capability::ReadSessionTask)
+            }
+            Self::Task(TaskRequest::CancelSessionTask { .. }) => {
+                Some(Capability::ControlSessionTask)
+            }
+            Self::Task(TaskRequest::GetSessionTaskEvidence { .. }) => {
+                Some(Capability::ReadSessionTaskEvidence)
+            }
+            Self::Session(SessionRequest::SetSessionApprovalPolicy { .. }) => {
+                Some(Capability::ConfigureApprovalPolicy)
+            }
+            Self::Session(SessionRequest::GetAgentSession { .. })
+            | Self::Session(SessionRequest::GetAgentSessionSnapshot { .. })
+            | Self::Session(SessionRequest::GetAgentSessionSnapshotMetadata { .. })
+            | Self::Session(SessionRequest::GetAgentSessionInitialState { .. }) => {
+                Some(Capability::ReadAgentSession)
+            }
+            Self::Project(ProjectRequest::GetProjectSnapshot { .. })
+            | Self::Project(ProjectRequest::GetProjectSnapshotForSession { .. }) => {
                 Some(Capability::ReadProject)
             }
-            Self::SendProjectAgentMessage { .. } => Some(Capability::SendProjectAgentMessage),
-            Self::ListProjectAgentMessages { .. } => Some(Capability::ReadProjectAgentMessages),
-            Self::ControlProjectChild { .. } => Some(Capability::ControlProjectChild),
-            Self::GetProjectChildReview { .. } => Some(Capability::ReadProjectChildReview),
-            Self::IntegrateProjectChild { .. } => Some(Capability::IntegrateProjectChild),
-            Self::CleanupProjectChildWorktree { .. } => {
+            Self::Project(ProjectRequest::SendProjectAgentMessage { .. }) => {
+                Some(Capability::SendProjectAgentMessage)
+            }
+            Self::Project(ProjectRequest::ListProjectAgentMessages { .. }) => {
+                Some(Capability::ReadProjectAgentMessages)
+            }
+            Self::Project(ProjectRequest::ControlProjectChild { .. }) => {
+                Some(Capability::ControlProjectChild)
+            }
+            Self::Project(ProjectRequest::GetProjectChildReview { .. }) => {
+                Some(Capability::ReadProjectChildReview)
+            }
+            Self::Project(ProjectRequest::IntegrateProjectChild { .. }) => {
+                Some(Capability::IntegrateProjectChild)
+            }
+            Self::Project(ProjectRequest::CleanupProjectChildWorktree { .. }) => {
                 Some(Capability::CleanupProjectChildWorktree)
             }
-            Self::RenameAgentSession { .. } | Self::ArchiveAgentSession { .. } => {
+            Self::Session(SessionRequest::RenameAgentSession { .. })
+            | Self::Session(SessionRequest::ArchiveAgentSession { .. }) => {
                 Some(Capability::ControlAgentSession)
             }
-            Self::GetSessionEvents { .. } | Self::GetRecentSessionEvents { .. } => {
+            Self::Events(EventsRequest::GetSessionEvents { .. })
+            | Self::Events(EventsRequest::GetRecentSessionEvents { .. }) => {
                 Some(Capability::SubscribeSessionEvents)
             }
-            Self::GetAgentRun { .. } | Self::GetAgentRunSnapshot { .. } => {
-                Some(Capability::ReadAgentRun)
+            Self::Run(RunRequest::GetAgentRun { .. })
+            | Self::Run(RunRequest::GetAgentRunSnapshot { .. }) => Some(Capability::ReadAgentRun),
+            Self::Run(RunRequest::GetAgentRunMessagePage { .. })
+            | Self::Run(RunRequest::GetAgentRunTranscriptPage { .. })
+            | Self::Run(RunRequest::GetAgentRunMessageContentRange { .. }) => {
+                Some(Capability::ReadAgentRunMessages)
             }
-            Self::GetAgentRunMessagePage { .. }
-            | Self::GetAgentRunTranscriptPage { .. }
-            | Self::GetAgentRunMessageContentRange { .. } => Some(Capability::ReadAgentRunMessages),
-            Self::GetRunCheckpoint { .. } => Some(Capability::ReadAgentRun),
-            Self::ApproveAgentAction { .. } | Self::RejectAgentAction { .. } => {
+            Self::Run(RunRequest::GetRunCheckpoint { .. }) => Some(Capability::ReadAgentRun),
+            Self::Run(RunRequest::ApproveAgentAction { .. })
+            | Self::Run(RunRequest::RejectAgentAction { .. }) => {
                 Some(Capability::ApproveAgentAction)
             }
-            Self::InterruptAgentRun { .. } | Self::RetryAgentStep { .. } => {
-                Some(Capability::ControlAgentRun)
+            Self::Run(RunRequest::InterruptAgentRun { .. })
+            | Self::Run(RunRequest::RetryAgentStep { .. }) => Some(Capability::ControlAgentRun),
+            Self::Run(RunRequest::SendAgentMessage { .. }) => Some(Capability::ControlAgentRun),
+            Self::Run(RunRequest::PauseAgentRun { .. }) => Some(Capability::PauseAgentRun),
+            Self::Run(RunRequest::ResumeAgentRun { .. }) => Some(Capability::ResumeAgentRun),
+            Self::Run(RunRequest::RetryAgentFromCheckpoint { .. }) => {
+                Some(Capability::RetryFromCheckpoint)
             }
-            Self::SendAgentMessage { .. } => Some(Capability::ControlAgentRun),
-            Self::PauseAgentRun { .. } => Some(Capability::PauseAgentRun),
-            Self::ResumeAgentRun { .. } => Some(Capability::ResumeAgentRun),
-            Self::RetryAgentFromCheckpoint { .. } => Some(Capability::RetryFromCheckpoint),
-            Self::ForkAgentSession { .. } => Some(Capability::ForkAgentSession),
-            Self::ListModels => None,
-            Self::ListProviders => Some(Capability::ListProviders),
-            Self::ConfigureGitHubCopilot { .. }
-            | Self::ConfigureApiKeyProvider { .. }
-            | Self::StartGitHubCopilotLogin
-            | Self::GetGitHubCopilotLoginStatus { .. } => Some(Capability::ConfigureProviders),
-            Self::DiscoverProviderModels { .. } => Some(Capability::ListProviders),
-            Self::GetProviderHealth { .. } => Some(Capability::ReadProviderHealth),
-            Self::GetRunUsage { .. } => Some(Capability::ReadUsage),
-            Self::GetSessionUsage { .. } => Some(Capability::ReadUsage),
-            Self::InspectAgentContext { .. } => Some(Capability::InspectContext),
-            Self::AttachRunEvidence { .. } => Some(Capability::ControlAgentRun),
+            Self::Session(SessionRequest::ForkAgentSession { .. }) => {
+                Some(Capability::ForkAgentSession)
+            }
+            Self::Provider(ProviderRequest::ListModels) => None,
+            Self::Provider(ProviderRequest::ListProviders) => Some(Capability::ListProviders),
+            Self::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
+            | Self::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
+            | Self::Provider(ProviderRequest::StartGitHubCopilotLogin)
+            | Self::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. }) => {
+                Some(Capability::ConfigureProviders)
+            }
+            Self::Provider(ProviderRequest::DiscoverProviderModels { .. }) => {
+                Some(Capability::ListProviders)
+            }
+            Self::Provider(ProviderRequest::GetProviderHealth { .. }) => {
+                Some(Capability::ReadProviderHealth)
+            }
+            Self::Usage(UsageRequest::GetRunUsage { .. }) => Some(Capability::ReadUsage),
+            Self::Usage(UsageRequest::GetSessionUsage { .. }) => Some(Capability::ReadUsage),
+            Self::Context(ContextRequest::InspectAgentContext { .. }) => {
+                Some(Capability::InspectContext)
+            }
+            Self::Run(RunRequest::AttachRunEvidence { .. }) => Some(Capability::ControlAgentRun),
         }
     }
 
     pub const fn is_retryable_mutation(&self) -> bool {
         matches!(
             self,
-            Self::CreateWorkspace { .. }
-                | Self::RegisterWorkspace { .. }
-                | Self::RenameWorkspace { .. }
-                | Self::CreateAgentSessionInWorkspace { .. }
-                | Self::ControlProjectChild { .. }
-                | Self::IntegrateProjectChild { .. }
-                | Self::CleanupProjectChildWorktree { .. }
-                | Self::SetWorkspaceConfigForWorkspace { .. }
-                | Self::AttachSessionRepository { .. }
-                | Self::DetachSessionRepository { .. }
-                | Self::AttachSessionDirectory { .. }
-                | Self::DetachSessionDirectory { .. }
-                | Self::StartSessionAgentRun { .. }
-                | Self::StartSessionAgentRunWithOptions { .. }
-                | Self::ApplySessionFilesystemEdit { .. }
-                | Self::TakeSessionFilesystemControl { .. }
-                | Self::CreateSessionCheckpoint { .. }
-                | Self::RevertSessionCheckpoint { .. }
-                | Self::UndoSessionEdit { .. }
-                | Self::OpenSessionTerminal { .. }
-                | Self::WriteSessionTerminalInput { .. }
-                | Self::ResizeSessionTerminal { .. }
-                | Self::CancelSessionTerminal { .. }
-                | Self::StartSessionTask { .. }
-                | Self::CancelSessionTask { .. }
-                | Self::SetSessionApprovalPolicy { .. }
-                | Self::RenameAgentSession { .. }
-                | Self::ArchiveAgentSession { .. }
-                | Self::ApproveAgentAction { .. }
-                | Self::RejectAgentAction { .. }
-                | Self::SendAgentMessage { .. }
-                | Self::SendProjectAgentMessage { .. }
-                | Self::InterruptAgentRun { .. }
-                | Self::RetryAgentStep { .. }
-                | Self::PauseAgentRun { .. }
-                | Self::ResumeAgentRun { .. }
-                | Self::RetryAgentFromCheckpoint { .. }
-                | Self::ForkAgentSession { .. }
-                | Self::ConfigureGitHubCopilot { .. }
-                | Self::AttachRunEvidence { .. }
+            Self::Workspace(WorkspaceRequest::CreateWorkspace { .. })
+                | Self::Workspace(WorkspaceRequest::RegisterWorkspace { .. })
+                | Self::Workspace(WorkspaceRequest::RenameWorkspace { .. })
+                | Self::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace { .. })
+                | Self::Project(ProjectRequest::ControlProjectChild { .. })
+                | Self::Project(ProjectRequest::IntegrateProjectChild { .. })
+                | Self::Project(ProjectRequest::CleanupProjectChildWorktree { .. })
+                | Self::Workspace(WorkspaceRequest::SetWorkspaceConfigForWorkspace { .. })
+                | Self::Repository(RepositoryRequest::AttachSessionRepository { .. })
+                | Self::Repository(RepositoryRequest::DetachSessionRepository { .. })
+                | Self::Filesystem(FilesystemRequest::AttachSessionDirectory { .. })
+                | Self::Filesystem(FilesystemRequest::DetachSessionDirectory { .. })
+                | Self::Run(RunRequest::StartSessionAgentRun { .. })
+                | Self::Run(RunRequest::StartSessionAgentRunWithOptions { .. })
+                | Self::Filesystem(FilesystemRequest::ApplySessionFilesystemEdit { .. })
+                | Self::Filesystem(FilesystemRequest::TakeSessionFilesystemControl { .. })
+                | Self::Filesystem(FilesystemRequest::CreateSessionCheckpoint { .. })
+                | Self::Filesystem(FilesystemRequest::RevertSessionCheckpoint { .. })
+                | Self::Filesystem(FilesystemRequest::UndoSessionEdit { .. })
+                | Self::Terminal(TerminalRequest::OpenSessionTerminal { .. })
+                | Self::Terminal(TerminalRequest::WriteSessionTerminalInput { .. })
+                | Self::Terminal(TerminalRequest::ResizeSessionTerminal { .. })
+                | Self::Terminal(TerminalRequest::CancelSessionTerminal { .. })
+                | Self::Task(TaskRequest::StartSessionTask { .. })
+                | Self::Task(TaskRequest::CancelSessionTask { .. })
+                | Self::Session(SessionRequest::SetSessionApprovalPolicy { .. })
+                | Self::Session(SessionRequest::RenameAgentSession { .. })
+                | Self::Session(SessionRequest::ArchiveAgentSession { .. })
+                | Self::Run(RunRequest::ApproveAgentAction { .. })
+                | Self::Run(RunRequest::RejectAgentAction { .. })
+                | Self::Run(RunRequest::SendAgentMessage { .. })
+                | Self::Project(ProjectRequest::SendProjectAgentMessage { .. })
+                | Self::Run(RunRequest::InterruptAgentRun { .. })
+                | Self::Run(RunRequest::RetryAgentStep { .. })
+                | Self::Run(RunRequest::PauseAgentRun { .. })
+                | Self::Run(RunRequest::ResumeAgentRun { .. })
+                | Self::Run(RunRequest::RetryAgentFromCheckpoint { .. })
+                | Self::Session(SessionRequest::ForkAgentSession { .. })
+                | Self::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
+                | Self::Run(RunRequest::AttachRunEvidence { .. })
         )
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ResponseEnvelope {
-    pub protocol_version: ProtocolVersion,
-    pub request_id: RequestId,
-    pub result: std::result::Result<ServerResponse, LoomError>,
 }
 
 impl ResponseEnvelope {
@@ -732,188 +450,6 @@ impl ResponseEnvelope {
             result: Err(error),
         }
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum ServerResponse {
-    Negotiated(NegotiationResult),
-    Capabilities(NegotiationResult),
-    WorkerNodeStatus(WorkerNodeStatus),
-    WorkspaceCreated(WorkspaceRecord),
-    Workspaces {
-        workspaces: Vec<WorkspaceRecord>,
-    },
-    WorkspaceRenamed(WorkspaceRecord),
-    SessionRepositories {
-        repositories: Vec<SessionRepository>,
-    },
-    SessionRepositoryAttached(SessionRepository),
-    SessionRepositoryDetached,
-    SessionDirectoryImported {
-        path: String,
-        repository: Option<SessionRepository>,
-    },
-    SessionDirectoryAttached {
-        directory: SessionDirectory,
-        repositories: Vec<SessionRepository>,
-    },
-    SessionDirectories {
-        directories: Vec<SessionDirectory>,
-    },
-    SessionDirectoryDetached,
-    GitHubRepositories {
-        repositories: Vec<GitHubRepository>,
-    },
-    AgentSessions {
-        sessions: Vec<AgentSessionSnapshot>,
-    },
-    AgentSessionCreated(AgentSessionSnapshot),
-    AgentSessionForked(AgentSessionSnapshot),
-    AgentSession(AgentSessionSnapshot),
-    AgentSessionSnapshot(AgentSessionSnapshotProjection),
-    AgentSessionInitialState(AgentSessionInitialState),
-    ProjectSnapshot(ProjectSnapshot),
-    ProjectChildCreated {
-        task: DelegatedTaskRecord,
-        child: ProjectAgentRecord,
-    },
-    ProjectAgentMessageAccepted(AgentMessageRecord),
-    ProjectAgentMessages {
-        messages: Vec<AgentMessageRecord>,
-        next_after_project_sequence: Option<u64>,
-    },
-    ProjectChildControlled {
-        task: DelegatedTaskRecord,
-        run: Option<AgentRunSnapshot>,
-    },
-    ProjectChildReview {
-        worktree: ProjectWorktreeRecord,
-        status: GitRepositoryStatus,
-        diff: GitDiff,
-    },
-    ProjectChildWorktreeUpdated(ProjectWorktreeRecord),
-    AgentSessionRenamed(AgentSessionSnapshot),
-    AgentSessionArchived(AgentSessionSnapshot),
-    AgentRunStarted(AgentRunSnapshot),
-    AgentRun(AgentRunSnapshot),
-    AgentRunSnapshot(AgentRunSnapshotProjection),
-    AgentRunMessagePage {
-        run_id: RunId,
-        messages: Vec<AgentRunMessageHeader>,
-    },
-    AgentRunTranscriptPage {
-        run_id: RunId,
-        messages: Vec<AgentRunTranscriptMessage>,
-        next_before: Option<u64>,
-        has_older: bool,
-    },
-    AgentRunMessageContentRange {
-        run_id: RunId,
-        message_ordinal: u64,
-        byte_offset: u64,
-        content: Vec<u8>,
-    },
-    RunCheckpoint(Checkpoint),
-    SessionEvents {
-        events: Vec<ServerEventEnvelope>,
-        #[serde(default)]
-        stream_epoch: Option<String>,
-    },
-    WorkspaceEvents {
-        workspace_id: WorkspaceId,
-        events: Vec<WorkspaceFeedEvent>,
-        #[serde(default)]
-        stream_epoch: Option<String>,
-    },
-    SessionEventsSnapshot {
-        session: AgentSessionSnapshot,
-        events: Vec<ServerEventEnvelope>,
-        oldest_sequence: EventSequence,
-        latest_sequence: EventSequence,
-        #[serde(default)]
-        stream_epoch: Option<String>,
-    },
-    /// Returned when a workspace cursor is stale or the backend epoch changed. `sessions`
-    /// is the current workspace catalog snapshot; `events` contains the retained workspace
-    /// feed. `latest_sequence` is the latest event for this workspace, not the global head.
-    WorkspaceEventsSnapshot {
-        workspace_id: WorkspaceId,
-        sessions: Vec<AgentSessionSnapshot>,
-        events: Vec<WorkspaceFeedEvent>,
-        oldest_sequence: EventSequence,
-        latest_sequence: EventSequence,
-        #[serde(default)]
-        stream_epoch: Option<String>,
-    },
-    Models {
-        models: Vec<ModelDescriptor>,
-    },
-    Providers {
-        providers: Vec<ProviderSummary>,
-    },
-    ProviderConfigured,
-    GitHubCopilotLoginStarted {
-        login_id: String,
-        user_code: String,
-        verification_uri: String,
-        expires_in: u64,
-        interval: u64,
-    },
-    GitHubCopilotLoginStatus {
-        status: GitHubCopilotLoginStatus,
-    },
-    ProviderHealth(ProviderHealth),
-    RunUsage {
-        usage: UsageSnapshot,
-        provider: ProviderUsageSummary,
-    },
-    SessionUsage {
-        usage: UsageSnapshot,
-        provider: ProviderUsageSummary,
-    },
-    ContextInspection(ContextInspection),
-    WorkspaceConfig(WorkspaceConfig),
-    WorkspaceConfigUpdated,
-    SessionFilesystemSnapshot(SessionFilesystemSnapshot),
-    SessionFilesystemChanges {
-        changes: Vec<SessionFilesystemChange>,
-        truncated: bool,
-    },
-    SessionFilesystemFile(SessionFilesystemFile),
-    WorkspaceEditApplied(WorkspaceEditResult),
-    WorkspaceControl(WorkspaceControl),
-    CheckpointCreated(Checkpoint),
-    CheckpointReverted(RevertResult),
-    WorkspaceUndo(UndoResult),
-    ApprovalPolicy(loom_core::ApprovalPolicy),
-    TerminalOpened(TerminalSnapshot),
-    Terminal(TerminalSnapshot),
-    TerminalEvents {
-        events: Vec<TerminalEventRecord>,
-    },
-    TaskStarted(TaskSnapshot),
-    Tasks {
-        tasks: Vec<TaskSnapshot>,
-    },
-    Task(TaskSnapshot),
-    TaskEvents {
-        events: Vec<TaskEventRecord>,
-    },
-    ContextFiles {
-        files: Vec<ContextFileReference>,
-    },
-    VcsStatus(GitRepositoryStatus),
-    VcsDiff(GitDiff),
-    VcsBranches {
-        branches: Vec<GitBranch>,
-    },
-    VcsConflicts {
-        paths: Vec<String>,
-    },
-    TaskEvidence {
-        evidence: Vec<TaskEvidenceLink>,
-    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1153,7 +689,7 @@ mod run_message_protocol_tests {
     fn project_snapshot_request_uses_project_capability_and_round_trips() {
         assert_eq!(CURRENT_PROTOCOL_VERSION, ProtocolVersion::new(11, 1));
         let project_id = ProjectId::new();
-        let request = ClientRequest::GetProjectSnapshot { project_id };
+        let request = ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id });
         assert_eq!(request.required_capability(), Some(Capability::ReadProject));
         let encoded = encode_request(&RequestEnvelope::new(request)).unwrap();
         assert_eq!(
@@ -1162,13 +698,14 @@ mod run_message_protocol_tests {
         );
         assert_eq!(
             decode_request(&encoded).unwrap().request,
-            ClientRequest::GetProjectSnapshot { project_id }
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshot { project_id })
         );
 
         let child_session_id = AgentSessionId::new();
-        let session_request = ClientRequest::GetProjectSnapshotForSession {
-            session_id: child_session_id,
-        };
+        let session_request =
+            ClientRequest::Project(ProjectRequest::GetProjectSnapshotForSession {
+                session_id: child_session_id,
+            });
         assert_eq!(
             session_request.required_capability(),
             Some(Capability::ReadProject)
@@ -1199,7 +736,7 @@ mod run_message_protocol_tests {
             tasks: vec![],
             worktrees: vec![],
         };
-        let response = ServerResponse::ProjectSnapshot(snapshot);
+        let response = ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot));
         let encoded = encode_response(&ResponseEnvelope::success(
             RequestId::new(),
             response.clone(),
@@ -1220,9 +757,9 @@ mod run_message_protocol_tests {
             kind: loom_core::AgentMessageKind::Progress,
             body: "Status update".into(),
         };
-        let send_request = ClientRequest::SendProjectAgentMessage {
+        let send_request = ClientRequest::Project(ProjectRequest::SendProjectAgentMessage {
             message: draft.clone(),
-        };
+        });
         assert_eq!(
             send_request.required_capability(),
             Some(Capability::SendProjectAgentMessage)
@@ -1235,12 +772,12 @@ mod run_message_protocol_tests {
             send_request
         );
 
-        let list_request = ClientRequest::ListProjectAgentMessages {
+        let list_request = ClientRequest::Project(ProjectRequest::ListProjectAgentMessages {
             project_id,
             session_id: parent,
             after_project_sequence: Some(4),
             limit: 20,
-        };
+        });
         assert_eq!(
             list_request.required_capability(),
             Some(Capability::ReadProjectAgentMessages)
@@ -1252,12 +789,12 @@ mod run_message_protocol_tests {
             list_request
         );
 
-        let control_request = ClientRequest::ControlProjectChild {
+        let control_request = ClientRequest::Project(ProjectRequest::ControlProjectChild {
             project_id,
             manager_session_id: parent,
             task_id: loom_core::TaskId::new(),
             action: ProjectChildControlAction::Pause,
-        };
+        });
         assert_eq!(
             control_request.required_capability(),
             Some(Capability::ControlProjectChild)
@@ -1272,11 +809,11 @@ mod run_message_protocol_tests {
             control_request
         );
 
-        let review_request = ClientRequest::GetProjectChildReview {
+        let review_request = ClientRequest::Project(ProjectRequest::GetProjectChildReview {
             project_id,
             manager_session_id: parent,
             task_id: loom_core::TaskId::new(),
-        };
+        });
         assert_eq!(
             review_request.required_capability(),
             Some(Capability::ReadProjectChildReview)
@@ -1288,12 +825,12 @@ mod run_message_protocol_tests {
             review_request
         );
 
-        let integrate_request = ClientRequest::IntegrateProjectChild {
+        let integrate_request = ClientRequest::Project(ProjectRequest::IntegrateProjectChild {
             project_id,
             manager_session_id: parent,
             task_id: loom_core::TaskId::new(),
             expected_parent_revision: "a1b2c3".into(),
-        };
+        });
         assert_eq!(
             integrate_request.required_capability(),
             Some(Capability::IntegrateProjectChild)
@@ -1308,12 +845,12 @@ mod run_message_protocol_tests {
             integrate_request
         );
 
-        let cleanup_request = ClientRequest::CleanupProjectChildWorktree {
+        let cleanup_request = ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree {
             project_id,
             manager_session_id: parent,
             task_id: loom_core::TaskId::new(),
             disposition: ProjectWorktreeCleanupDisposition::Retain,
-        };
+        });
         assert_eq!(
             cleanup_request.required_capability(),
             Some(Capability::CleanupProjectChildWorktree)
@@ -1352,12 +889,13 @@ mod run_message_protocol_tests {
 
     #[test]
     fn stream_epoch_fields_default_for_sequence_only_peers() {
-        let request = RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(AgentSessionId::new()),
-            workspace_id: None,
-            after_sequence: Some(EventSequence::new(12)),
-            stream_epoch: None,
-        });
+        let request =
+            RequestEnvelope::new(ClientRequest::Events(EventsRequest::GetSessionEvents {
+                session_id: Some(AgentSessionId::new()),
+                workspace_id: None,
+                after_sequence: Some(EventSequence::new(12)),
+                stream_epoch: None,
+            }));
         let mut encoded = serde_json::to_value(&request).unwrap();
         encoded["request"]["data"]
             .as_object_mut()
@@ -1372,10 +910,10 @@ mod run_message_protocol_tests {
 
         let response = ResponseEnvelope::success(
             RequestId::new(),
-            ServerResponse::SessionEvents {
+            ServerResponse::Events(EventsResponse::SessionEvents {
                 events: Vec::new(),
                 stream_epoch: None,
-            },
+            }),
         );
         let mut encoded = serde_json::to_value(&response).unwrap();
         encoded["result"]["Ok"]["data"]
@@ -1385,10 +923,10 @@ mod run_message_protocol_tests {
         let decoded: ResponseEnvelope = serde_json::from_value(encoded).unwrap();
         assert_eq!(
             decoded.result.unwrap(),
-            ServerResponse::SessionEvents {
+            ServerResponse::Events(EventsResponse::SessionEvents {
                 events: Vec::new(),
                 stream_epoch: None,
-            }
+            })
         );
     }
 
@@ -1409,7 +947,7 @@ mod run_message_protocol_tests {
     fn workspace_event_snapshot_round_trips() {
         let session_id = AgentSessionId::new();
         let workspace_id = WorkspaceId::new();
-        let response = ServerResponse::WorkspaceEventsSnapshot {
+        let response = ServerResponse::Events(EventsResponse::WorkspaceEventsSnapshot {
             workspace_id,
             sessions: Vec::new(),
             events: vec![
@@ -1431,7 +969,7 @@ mod run_message_protocol_tests {
             oldest_sequence: EventSequence::new(4),
             latest_sequence: EventSequence::new(9),
             stream_epoch: Some("epoch".to_owned()),
-        };
+        });
         let encoded = serde_json::to_vec(&response).unwrap();
         assert_eq!(
             serde_json::from_slice::<ServerResponse>(&encoded).unwrap(),
@@ -1442,7 +980,8 @@ mod run_message_protocol_tests {
     #[test]
     fn transcript_page_and_range_frames_round_trip_with_their_capability() {
         let session_id = AgentSessionId::new();
-        let metadata_request = ClientRequest::GetAgentSessionSnapshotMetadata { session_id };
+        let metadata_request =
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata { session_id });
         assert_eq!(
             metadata_request.required_capability(),
             Some(Capability::ReadAgentSession)
@@ -1450,26 +989,26 @@ mod run_message_protocol_tests {
         let encoded = encode_request(&RequestEnvelope::new(metadata_request)).unwrap();
         assert_eq!(
             decode_request(&encoded).unwrap().request,
-            ClientRequest::GetAgentSessionSnapshotMetadata { session_id }
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata { session_id })
         );
 
         let run_id = RunId::new();
-        let page_request = ClientRequest::GetAgentRunMessagePage {
+        let page_request = ClientRequest::Run(RunRequest::GetAgentRunMessagePage {
             run_id,
             before_ordinal: Some(12),
             limit: 32,
-        };
+        });
         assert_eq!(
             page_request.required_capability(),
             Some(Capability::ReadAgentRunMessages)
         );
         assert_eq!(
-            ClientRequest::GetAgentRunMessageContentRange {
+            ClientRequest::Run(RunRequest::GetAgentRunMessageContentRange {
                 run_id,
                 message_ordinal: 12,
                 byte_offset: 0,
                 length: 1,
-            }
+            })
             .required_capability(),
             Some(Capability::ReadAgentRunMessages)
         );
@@ -1477,17 +1016,17 @@ mod run_message_protocol_tests {
         let decoded = decode_request(&encoded).unwrap();
         assert_eq!(
             decoded.request,
-            ClientRequest::GetAgentRunMessagePage {
+            ClientRequest::Run(RunRequest::GetAgentRunMessagePage {
                 run_id,
                 before_ordinal: Some(12),
                 limit: 32
-            }
+            })
         );
-        let transcript_request = ClientRequest::GetAgentRunTranscriptPage {
+        let transcript_request = ClientRequest::Run(RunRequest::GetAgentRunTranscriptPage {
             run_id,
             before_ordinal: Some(12),
             limit: 16,
-        };
+        });
         assert_eq!(
             transcript_request.required_capability(),
             Some(Capability::ReadAgentRunMessages)
@@ -1496,16 +1035,16 @@ mod run_message_protocol_tests {
             decode_request(&encode_request(&RequestEnvelope::new(transcript_request)).unwrap())
                 .unwrap()
                 .request,
-            ClientRequest::GetAgentRunTranscriptPage {
+            ClientRequest::Run(RunRequest::GetAgentRunTranscriptPage {
                 run_id,
                 before_ordinal: Some(12),
                 limit: 16,
-            }
+            })
         );
 
         let page_response = ResponseEnvelope::success(
             RequestId::new(),
-            ServerResponse::AgentRunMessagePage {
+            ServerResponse::Run(RunResponse::AgentRunMessagePage {
                 run_id,
                 messages: vec![AgentRunMessageHeader {
                     ordinal: 11,
@@ -1516,7 +1055,7 @@ mod run_message_protocol_tests {
                     tool_call_id: None,
                     tool_calls: Vec::new(),
                 }],
-            },
+            }),
         );
         assert_eq!(
             decode_response(&encode_response(&page_response).unwrap()).unwrap(),
@@ -1525,7 +1064,7 @@ mod run_message_protocol_tests {
 
         let transcript_response = ResponseEnvelope::success(
             RequestId::new(),
-            ServerResponse::AgentRunTranscriptPage {
+            ServerResponse::Run(RunResponse::AgentRunTranscriptPage {
                 run_id,
                 messages: vec![AgentRunTranscriptMessage {
                     ordinal: 11,
@@ -1535,7 +1074,7 @@ mod run_message_protocol_tests {
                 }],
                 next_before: Some(11),
                 has_older: true,
-            },
+            }),
         );
         assert_eq!(
             decode_response(&encode_response(&transcript_response).unwrap()).unwrap(),
@@ -1544,12 +1083,12 @@ mod run_message_protocol_tests {
 
         let response = ResponseEnvelope::success(
             RequestId::new(),
-            ServerResponse::AgentRunMessageContentRange {
+            ServerResponse::Run(RunResponse::AgentRunMessageContentRange {
                 run_id,
                 message_ordinal: 12,
                 byte_offset: 256,
                 content: b"bounded transcript".to_vec(),
-            },
+            }),
         );
         let decoded = decode_response(&encode_response(&response).unwrap()).unwrap();
         assert_eq!(decoded, response);

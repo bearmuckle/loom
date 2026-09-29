@@ -339,20 +339,20 @@ pub(crate) fn load_transcript_page_sync(
     run_id: RunId,
     before_ordinal: Option<u64>,
 ) -> Result<TranscriptPage, LoomError> {
-    let response = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunTranscriptPage {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunTranscriptPage {
             run_id,
             before_ordinal,
             limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
         },
-    ));
+    )));
     let (messages, next_before, has_older) = match response.result? {
-        ServerResponse::AgentRunTranscriptPage {
+        ServerResponse::Run(RunResponse::AgentRunTranscriptPage {
             run_id: response_run_id,
             messages,
             next_before,
             has_older,
-        } if response_run_id == run_id => (messages, next_before, has_older),
+        }) if response_run_id == run_id => (messages, next_before, has_older),
         response => return Err(unexpected_response("run transcript page", response)),
     };
     Ok((
@@ -532,77 +532,117 @@ pub(crate) fn session_id_for_request(
     active_session_id: AgentSessionId,
 ) -> Option<AgentSessionId> {
     match request {
-        ClientRequest::GetAgentSession { session_id }
-        | ClientRequest::GetAgentSessionSnapshot { session_id }
-        | ClientRequest::GetAgentSessionSnapshotMetadata { session_id }
-        | ClientRequest::GetAgentSessionInitialState { session_id }
-        | ClientRequest::RenameAgentSession { session_id, .. }
-        | ClientRequest::ArchiveAgentSession { session_id }
-        | ClientRequest::GetRecentSessionEvents { session_id, .. }
-        | ClientRequest::StartSessionAgentRun { session_id, .. }
-        | ClientRequest::StartSessionAgentRunWithOptions { session_id, .. }
-        | ClientRequest::AttachSessionRepository { session_id, .. }
-        | ClientRequest::AttachSessionDirectory { session_id, .. }
-        | ClientRequest::ListSessionDirectories { session_id }
-        | ClientRequest::DetachSessionDirectory { session_id, .. }
-        | ClientRequest::ListSessionRepositories { session_id }
-        | ClientRequest::DetachSessionRepository { session_id, .. }
-        | ClientRequest::GetSessionFilesystemSnapshot { session_id }
-        | ClientRequest::GetSessionFilesystemChanges { session_id, .. }
-        | ClientRequest::ReadSessionFile { session_id, .. }
-        | ClientRequest::ApplySessionFilesystemEdit { session_id, .. }
-        | ClientRequest::TakeSessionFilesystemControl { session_id, .. }
-        | ClientRequest::CreateSessionCheckpoint { session_id, .. }
-        | ClientRequest::RevertSessionCheckpoint { session_id, .. }
-        | ClientRequest::UndoSessionEdit { session_id }
-        | ClientRequest::GetSessionContextFiles { session_id }
-        | ClientRequest::GetSessionVcsStatus { session_id, .. }
-        | ClientRequest::GetSessionVcsDiff { session_id, .. }
-        | ClientRequest::GetSessionVcsBranches { session_id, .. }
-        | ClientRequest::GetSessionVcsConflicts { session_id, .. }
-        | ClientRequest::OpenSessionTerminal { session_id, .. }
-        | ClientRequest::WriteSessionTerminalInput { session_id, .. }
-        | ClientRequest::ResizeSessionTerminal { session_id, .. }
-        | ClientRequest::GetSessionTerminalEvents { session_id, .. }
-        | ClientRequest::CancelSessionTerminal { session_id, .. }
-        | ClientRequest::StartSessionTask { session_id, .. }
-        | ClientRequest::ListSessionTasks { session_id }
-        | ClientRequest::GetSessionTask { session_id, .. }
-        | ClientRequest::GetSessionTaskEvents { session_id, .. }
-        | ClientRequest::CancelSessionTask { session_id, .. }
-        | ClientRequest::GetSessionTaskEvidence { session_id, .. }
-        | ClientRequest::SetSessionApprovalPolicy { session_id, .. }
-        | ClientRequest::ForkAgentSession { session_id, .. }
-        | ClientRequest::GetSessionUsage { session_id } => Some(*session_id),
-        ClientRequest::ControlProjectChild {
+        ClientRequest::Session(SessionRequest::GetAgentSession { session_id })
+        | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot { session_id })
+        | ClientRequest::Session(SessionRequest::GetAgentSessionSnapshotMetadata { session_id })
+        | ClientRequest::Session(SessionRequest::GetAgentSessionInitialState { session_id })
+        | ClientRequest::Session(SessionRequest::RenameAgentSession { session_id, .. })
+        | ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id })
+        | ClientRequest::Events(EventsRequest::GetRecentSessionEvents { session_id, .. })
+        | ClientRequest::Run(RunRequest::StartSessionAgentRun { session_id, .. })
+        | ClientRequest::Run(RunRequest::StartSessionAgentRunWithOptions { session_id, .. })
+        | ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
+            session_id,
+            ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
+            session_id, ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories { session_id })
+        | ClientRequest::Filesystem(FilesystemRequest::DetachSessionDirectory {
+            session_id, ..
+        })
+        | ClientRequest::Repository(RepositoryRequest::ListSessionRepositories { session_id })
+        | ClientRequest::Repository(RepositoryRequest::DetachSessionRepository {
+            session_id,
+            ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::GetSessionFilesystemSnapshot {
+            session_id,
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::GetSessionFilesystemChanges {
+            session_id,
+            ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::ReadSessionFile { session_id, .. })
+        | ClientRequest::Filesystem(FilesystemRequest::ApplySessionFilesystemEdit {
+            session_id,
+            ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::TakeSessionFilesystemControl {
+            session_id,
+            ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::CreateSessionCheckpoint {
+            session_id,
+            ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::RevertSessionCheckpoint {
+            session_id,
+            ..
+        })
+        | ClientRequest::Filesystem(FilesystemRequest::UndoSessionEdit { session_id })
+        | ClientRequest::Filesystem(FilesystemRequest::GetSessionContextFiles { session_id })
+        | ClientRequest::Repository(RepositoryRequest::GetSessionVcsStatus {
+            session_id, ..
+        })
+        | ClientRequest::Repository(RepositoryRequest::GetSessionVcsDiff { session_id, .. })
+        | ClientRequest::Repository(RepositoryRequest::GetSessionVcsBranches {
+            session_id, ..
+        })
+        | ClientRequest::Repository(RepositoryRequest::GetSessionVcsConflicts {
+            session_id, ..
+        })
+        | ClientRequest::Terminal(TerminalRequest::OpenSessionTerminal { session_id, .. })
+        | ClientRequest::Terminal(TerminalRequest::WriteSessionTerminalInput {
+            session_id, ..
+        })
+        | ClientRequest::Terminal(TerminalRequest::ResizeSessionTerminal { session_id, .. })
+        | ClientRequest::Terminal(TerminalRequest::GetSessionTerminalEvents {
+            session_id, ..
+        })
+        | ClientRequest::Terminal(TerminalRequest::CancelSessionTerminal { session_id, .. })
+        | ClientRequest::Task(TaskRequest::StartSessionTask { session_id, .. })
+        | ClientRequest::Task(TaskRequest::ListSessionTasks { session_id })
+        | ClientRequest::Task(TaskRequest::GetSessionTask { session_id, .. })
+        | ClientRequest::Task(TaskRequest::GetSessionTaskEvents { session_id, .. })
+        | ClientRequest::Task(TaskRequest::CancelSessionTask { session_id, .. })
+        | ClientRequest::Task(TaskRequest::GetSessionTaskEvidence { session_id, .. })
+        | ClientRequest::Session(SessionRequest::SetSessionApprovalPolicy { session_id, .. })
+        | ClientRequest::Session(SessionRequest::ForkAgentSession { session_id, .. })
+        | ClientRequest::Usage(UsageRequest::GetSessionUsage { session_id }) => Some(*session_id),
+        ClientRequest::Project(ProjectRequest::ControlProjectChild {
             manager_session_id, ..
-        }
-        | ClientRequest::GetProjectChildReview {
-            manager_session_id, ..
-        }
-        | ClientRequest::IntegrateProjectChild {
-            manager_session_id, ..
-        }
-        | ClientRequest::CleanupProjectChildWorktree {
-            manager_session_id, ..
-        } => Some(*manager_session_id),
-        ClientRequest::GetSessionEvents { session_id, .. } => {
+        })
+        | ClientRequest::Project(ProjectRequest::GetProjectChildReview {
+            manager_session_id,
+            ..
+        })
+        | ClientRequest::Project(ProjectRequest::IntegrateProjectChild {
+            manager_session_id,
+            ..
+        })
+        | ClientRequest::Project(ProjectRequest::CleanupProjectChildWorktree {
+            manager_session_id,
+            ..
+        }) => Some(*manager_session_id),
+        ClientRequest::Events(EventsRequest::GetSessionEvents { session_id, .. }) => {
             Some(session_id.unwrap_or(active_session_id))
         }
-        ClientRequest::GetAgentRun { .. }
-        | ClientRequest::GetAgentRunSnapshot { .. }
-        | ClientRequest::GetRunCheckpoint { .. }
-        | ClientRequest::ApproveAgentAction { .. }
-        | ClientRequest::RejectAgentAction { .. }
-        | ClientRequest::SendAgentMessage { .. }
-        | ClientRequest::InterruptAgentRun { .. }
-        | ClientRequest::RetryAgentStep { .. }
-        | ClientRequest::PauseAgentRun { .. }
-        | ClientRequest::ResumeAgentRun { .. }
-        | ClientRequest::RetryAgentFromCheckpoint { .. }
-        | ClientRequest::GetRunUsage { .. }
-        | ClientRequest::InspectAgentContext { .. }
-        | ClientRequest::AttachRunEvidence { .. } => Some(active_session_id),
+        ClientRequest::Run(RunRequest::GetAgentRun { .. })
+        | ClientRequest::Run(RunRequest::GetAgentRunSnapshot { .. })
+        | ClientRequest::Run(RunRequest::GetRunCheckpoint { .. })
+        | ClientRequest::Run(RunRequest::ApproveAgentAction { .. })
+        | ClientRequest::Run(RunRequest::RejectAgentAction { .. })
+        | ClientRequest::Run(RunRequest::SendAgentMessage { .. })
+        | ClientRequest::Run(RunRequest::InterruptAgentRun { .. })
+        | ClientRequest::Run(RunRequest::RetryAgentStep { .. })
+        | ClientRequest::Run(RunRequest::PauseAgentRun { .. })
+        | ClientRequest::Run(RunRequest::ResumeAgentRun { .. })
+        | ClientRequest::Run(RunRequest::RetryAgentFromCheckpoint { .. })
+        | ClientRequest::Usage(UsageRequest::GetRunUsage { .. })
+        | ClientRequest::Context(ContextRequest::InspectAgentContext { .. })
+        | ClientRequest::Run(RunRequest::AttachRunEvidence { .. }) => Some(active_session_id),
         _ => None,
     }
 }

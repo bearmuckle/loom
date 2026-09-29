@@ -74,7 +74,8 @@ impl InProcessConnection {
                     match snapshot.state {
                         AgentRunState::Paused => {
                             let response = self.resume_agent_run(snapshot.id)?;
-                            let ServerResponse::AgentRun(snapshot) = response else {
+                            let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = response
+                            else {
                                 return Err(LoomError::new(
                                     ErrorCode::Internal,
                                     "project child resume returned an unexpected response",
@@ -144,7 +145,7 @@ impl InProcessConnection {
                     | AgentRunState::AwaitingApproval
                     | AgentRunState::Evaluating => {
                         let response = self.stop_run(snapshot.id, RunStop::Pause)?;
-                        let ServerResponse::AgentRun(snapshot) = response else {
+                        let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = response else {
                             return Err(LoomError::new(
                                 ErrorCode::Internal,
                                 "project child pause returned an unexpected response",
@@ -189,7 +190,7 @@ impl InProcessConnection {
                     ));
                 }
                 let response = self.stop_run(snapshot.id, RunStop::Interrupt)?;
-                let ServerResponse::AgentRun(snapshot) = response else {
+                let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = response else {
                     return Err(LoomError::new(
                         ErrorCode::Internal,
                         "project child interrupt returned an unexpected response",
@@ -244,7 +245,7 @@ impl InProcessConnection {
                             ));
                         }
                         let response = self.continue_run(snapshot.id, AgentRuntime::retry_entry)?;
-                        let ServerResponse::AgentRun(snapshot) = response else {
+                        let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = response else {
                             return Err(LoomError::new(
                                 ErrorCode::Internal,
                                 "project child retry returned an unexpected response",
@@ -466,7 +467,8 @@ impl InProcessConnection {
                             }
                             _ => {
                                 let response = self.stop_run(snapshot.id, RunStop::Interrupt)?;
-                                let ServerResponse::AgentRun(stopped) = response else {
+                                let ServerResponse::Run(RunResponse::AgentRun(stopped)) = response
+                                else {
                                     return Err(LoomError::new(
                                         ErrorCode::Internal,
                                         "project child cancel returned an unexpected response",

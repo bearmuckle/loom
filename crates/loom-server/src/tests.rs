@@ -16,8 +16,13 @@ use loom_core::{
 };
 use loom_process::{TaskEvent, TaskKind, TaskSpec, TaskStatus, TerminalEvent};
 use loom_protocol::{
-    AgentActivityStatus, AgentInteractionStatus, ApprovalDecision, ClientRequest, RequestEnvelope,
-    ServerEvent, ServerResponse, WorkerNodeConfig, WorkspaceConfig,
+    AgentActivityStatus, AgentInteractionStatus, ApprovalDecision, ClientRequest, ContextRequest,
+    ControlRequest, ControlResponse, EventsRequest, EventsResponse, FilesystemRequest,
+    FilesystemResponse, ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse,
+    RepositoryRequest, RepositoryResponse, RequestEnvelope, RunRequest, RunResponse, ServerEvent,
+    ServerResponse, SessionRequest, SessionResponse, TaskRequest, TaskResponse, TerminalRequest,
+    TerminalResponse, UsageRequest, UsageResponse, WorkerNodeConfig, WorkspaceConfig,
+    WorkspaceRequest, WorkspaceResponse,
 };
 use loom_providers::CredentialStore;
 use loom_workspace::{WorkspaceControl, WorkspaceEdit};
@@ -58,15 +63,17 @@ fn api_key_provider_configuration_is_backend_scoped_and_recovers_without_persist
     let first = InProcessBackend::new_persistent(&first_path).unwrap();
     let connection = first.connect();
     negotiate_m3(&connection);
-    let response = connection.request(RequestEnvelope::new(
-        ClientRequest::ConfigureApiKeyProvider {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ConfigureApiKeyProvider {
             provider_id: ProviderId::new("openai-compatible"),
             api_key: secret.to_owned(),
         },
-    ));
+    )));
     assert!(matches!(
         response.result,
-        Ok(ServerResponse::ProviderConfigured)
+        Ok(ServerResponse::Provider(
+            ProviderResponse::ProviderConfigured
+        ))
     ));
     let providers = first.provider_registry().list_providers().unwrap();
     let configured = providers
@@ -226,10 +233,10 @@ fn idempotency_cache_keeps_uuidv7_horizon_and_bounds_uuidv4_compatibility() {
                         issued_at + IDEMPOTENCY_RETENTION.as_millis() as u64,
                     )
                 }),
-                request: ClientRequest::ListWorkspaces,
+                request: ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces),
                 response: ResponseEnvelope::success(
                     request_id,
-                    ServerResponse::WorkspaceConfigUpdated,
+                    ServerResponse::Workspace(WorkspaceResponse::WorkspaceConfigUpdated),
                 ),
             },
         );
@@ -244,8 +251,11 @@ fn idempotency_cache_keeps_uuidv7_horizon_and_bounds_uuidv4_compatibility() {
         IdempotencyRecord {
             created_at: now,
             expires_at: Some(now),
-            request: ClientRequest::ListWorkspaces,
-            response: ResponseEnvelope::success(expired_id, ServerResponse::WorkspaceConfigUpdated),
+            request: ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces),
+            response: ResponseEnvelope::success(
+                expired_id,
+                ServerResponse::Workspace(WorkspaceResponse::WorkspaceConfigUpdated),
+            ),
         },
     );
     trim_idempotency_cache(&mut current);
@@ -260,10 +270,10 @@ fn idempotency_cache_keeps_uuidv7_horizon_and_bounds_uuidv4_compatibility() {
             IdempotencyRecord {
                 created_at: now,
                 expires_at: None,
-                request: ClientRequest::ListWorkspaces,
+                request: ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces),
                 response: ResponseEnvelope::success(
                     request_id,
-                    ServerResponse::WorkspaceConfigUpdated,
+                    ServerResponse::Workspace(WorkspaceResponse::WorkspaceConfigUpdated),
                 ),
             },
         );
@@ -441,11 +451,16 @@ fn worker_feed_capture_and_acknowledgement_are_session_scoped() {
 }
 
 fn negotiate(connection: &InProcessConnection) {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-        client_version: CURRENT_PROTOCOL_VERSION,
-        capabilities: connection.backend.supported_capabilities.clone(),
-    }));
-    assert!(matches!(response.result, Ok(ServerResponse::Negotiated(_))));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities: connection.backend.supported_capabilities.clone(),
+        },
+    )));
+    assert!(matches!(
+        response.result,
+        Ok(ServerResponse::Control(ControlResponse::Negotiated(_)))
+    ));
 }
 
 fn negotiate_m2(connection: &InProcessConnection) {
@@ -731,11 +746,15 @@ fn worker_node_status_reports_capabilities_and_resources() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     negotiate_m5(&connection);
-    let response = connection.request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::GetWorkerNodeStatus,
+    )));
     let response =
         loom_protocol::decode_response(&loom_protocol::encode_response(&response).unwrap())
             .unwrap();
-    let ServerResponse::WorkerNodeStatus(status) = response.result.unwrap() else {
+    let ServerResponse::Control(ControlResponse::WorkerNodeStatus(status)) =
+        response.result.unwrap()
+    else {
         panic!("expected worker node status");
     };
     assert!(status.online);
@@ -756,11 +775,15 @@ fn worker_node_status_reports_capabilities_and_resources() {
     );
 
     std::thread::sleep(Duration::from_millis(250));
-    let refreshed = connection.request(RequestEnvelope::new(ClientRequest::GetWorkerNodeStatus));
+    let refreshed = connection.request(RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::GetWorkerNodeStatus,
+    )));
     let refreshed =
         loom_protocol::decode_response(&loom_protocol::encode_response(&refreshed).unwrap())
             .unwrap();
-    let ServerResponse::WorkerNodeStatus(refreshed) = refreshed.result.unwrap() else {
+    let ServerResponse::Control(ControlResponse::WorkerNodeStatus(refreshed)) =
+        refreshed.result.unwrap()
+    else {
         panic!("expected refreshed worker node status");
     };
     assert!(
@@ -834,22 +857,28 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
         let backend = InProcessBackend::new_persistent(&path).unwrap();
         let connection = backend.connect();
         negotiate_m5(&connection);
-        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Config test".to_owned(),
-        }));
-        let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Config test".to_owned(),
+            },
+        )));
+        let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+            created.result
+        else {
             panic!("expected workspace creation");
         };
         workspace_id = workspace.id;
-        let response = connection.request(RequestEnvelope::new(
-            ClientRequest::SetWorkspaceConfigForWorkspace {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                 workspace_id: workspace.id,
                 config: config.clone(),
             },
-        ));
+        )));
         assert!(matches!(
             response.result,
-            Ok(ServerResponse::WorkspaceConfigUpdated)
+            Ok(ServerResponse::Workspace(
+                WorkspaceResponse::WorkspaceConfigUpdated
+            ))
         ));
         backend.shutdown().unwrap();
     }
@@ -858,15 +887,15 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
         let backend = InProcessBackend::new_persistent(&path).unwrap();
         let connection = backend.connect();
         negotiate_m5(&connection);
-        let response = connection.request(RequestEnvelope::new(
-            ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
-        ));
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::GetWorkspaceConfigForWorkspace { workspace_id },
+        )));
         assert!(matches!(
             response.result,
-            Ok(ServerResponse::WorkspaceConfig(saved)) if saved == config
+            Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceConfig(saved))) if saved == config
         ));
-        let response = connection.request(RequestEnvelope::new(
-            ClientRequest::SetWorkspaceConfigForWorkspace {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                 workspace_id,
                 config: WorkspaceConfig {
                     revision: 0,
@@ -877,24 +906,26 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
                     }],
                 },
             },
-        ));
+        )));
         assert!(matches!(
             response.result,
-            Ok(ServerResponse::WorkspaceConfigUpdated)
+            Ok(ServerResponse::Workspace(
+                WorkspaceResponse::WorkspaceConfigUpdated
+            ))
         ));
-        let response = connection.request(RequestEnvelope::new(
-            ClientRequest::GetWorkspaceConfigForWorkspace { workspace_id },
-        ));
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::GetWorkspaceConfigForWorkspace { workspace_id },
+        )));
         assert!(matches!(
             response.result,
-            Ok(ServerResponse::WorkspaceConfig(saved)) if saved == config
+            Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceConfig(saved))) if saved == config
         ));
         for url in [
             "wss://worker.example/ws?%61ccess_token=secret",
             "wss://user:secret@worker.example/ws",
         ] {
-            let response = connection.request(RequestEnvelope::new(
-                ClientRequest::SetWorkspaceConfigForWorkspace {
+            let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                     workspace_id,
                     config: WorkspaceConfig {
                         revision: 2,
@@ -905,18 +936,18 @@ fn workspace_config_is_persisted_and_excludes_access_tokens() {
                         }],
                     },
                 },
-            ));
+            )));
             assert!(response.result.is_err());
         }
         let invalid_concurrency = connection.request(RequestEnvelope::new(
-            ClientRequest::SetWorkspaceConfigForWorkspace {
+            ClientRequest::Workspace(WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                 workspace_id,
                 config: WorkspaceConfig {
                     revision: 2,
                     project_agent_concurrency: 0,
                     ..WorkspaceConfig::default()
                 },
-            },
+            }),
         ));
         assert!(matches!(
             invalid_concurrency.result,
@@ -935,10 +966,11 @@ fn await_settled_run(
 ) -> loom_agent::AgentRunSnapshot {
     let mut last_snapshot = None;
     for _ in 0..1_000 {
-        let response =
-            connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRun { run_id },
+        )));
         let snapshot = match response.result {
-            Ok(ServerResponse::AgentRun(snapshot)) => snapshot,
+            Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot))) => snapshot,
             result => panic!("unexpected run response for {run_id}: {result:?}"),
         };
         last_snapshot = Some(snapshot.clone());
@@ -1017,40 +1049,45 @@ fn attaching_local_directory_uses_original_and_discovers_immediate_repositories(
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     negotiate_m5(&connection);
-    let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Local source".to_owned(),
-    }));
-    let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Local source".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+        created.result
+    else {
         panic!("expected workspace creation");
     };
-    let created = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "Local source".to_owned(),
         },
-    ));
-    let Ok(ServerResponse::AgentSessionCreated(session)) = created.result else {
+    )));
+    let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) = created.result
+    else {
         panic!("expected session creation");
     };
-    let attached = connection.request(RequestEnvelope::new(
-        ClientRequest::AttachSessionDirectory {
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::AttachSessionDirectory {
             session_id: session.id,
             source: source.display().to_string(),
             path: "sources/local".to_owned(),
         },
-    ));
-    let Ok(ServerResponse::SessionDirectoryAttached {
+    )));
+    let Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectoryAttached {
         directory,
         repositories,
-    }) = attached.result
+    })) = attached.result
     else {
         panic!("expected directory attachment: {:?}", attached.result);
     };
     assert_eq!(directory.source, source.display().to_string());
     assert_eq!(repositories.len(), 1);
     assert_eq!(repositories[0].path, "sources/local/child-repo");
-    let edit = connection.request(RequestEnvelope::new(
-        ClientRequest::ApplySessionFilesystemEdit {
+    let edit = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ApplySessionFilesystemEdit {
             session_id: session.id,
             edit: WorkspaceEdit {
                 path: "sources/local/note.txt".to_owned(),
@@ -1059,52 +1096,58 @@ fn attaching_local_directory_uses_original_and_discovers_immediate_repositories(
                 expected_revision: None,
             },
         },
-    ));
+    )));
     assert!(matches!(
         edit.result,
-        Ok(ServerResponse::WorkspaceEditApplied(_))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::WorkspaceEditApplied(_)
+        ))
     ));
     assert_eq!(
         fs::read_to_string(source.join("note.txt")).unwrap(),
         "changed"
     );
-    let detached = connection.request(RequestEnvelope::new(
-        ClientRequest::DetachSessionDirectory {
+    let detached = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::DetachSessionDirectory {
             session_id: session.id,
             path: directory.path,
         },
-    ));
+    )));
     assert!(matches!(
         detached.result,
-        Ok(ServerResponse::SessionDirectoryDetached)
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::SessionDirectoryDetached
+        ))
     ));
     assert!(source.join("child-repo/.git").exists());
     let repository_root = git_repository();
-    let attached = connection.request(RequestEnvelope::new(
-        ClientRequest::AttachSessionDirectory {
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::AttachSessionDirectory {
             session_id: session.id,
             source: repository_root.display().to_string(),
             path: "sources/repo-root".to_owned(),
         },
-    ));
-    let Ok(ServerResponse::SessionDirectoryAttached {
+    )));
+    let Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectoryAttached {
         directory,
         repositories,
-    }) = attached.result
+    })) = attached.result
     else {
         panic!("expected repository root attachment");
     };
     assert_eq!(repositories.len(), 1);
     assert_eq!(repositories[0].path, "sources/repo-root");
-    let detached = connection.request(RequestEnvelope::new(
-        ClientRequest::DetachSessionDirectory {
+    let detached = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::DetachSessionDirectory {
             session_id: session.id,
             path: directory.path,
         },
-    ));
+    )));
     assert!(matches!(
         detached.result,
-        Ok(ServerResponse::SessionDirectoryDetached)
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::SessionDirectoryDetached
+        ))
     ));
     fs::remove_dir_all(repository_root).unwrap();
     fs::remove_dir_all(source).unwrap();
@@ -1126,29 +1169,37 @@ fn workspace_sessions_get_independent_filesystems_and_repository_clones() {
         Capability::ForkAgentSession,
         Capability::ReadVcsStatus,
     ]);
-    let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-        client_version: CURRENT_PROTOCOL_VERSION,
-        capabilities,
-    }));
+    let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::Negotiate {
+            client_version: CURRENT_PROTOCOL_VERSION,
+            capabilities,
+        },
+    )));
     assert!(matches!(
         negotiated.result,
-        Ok(ServerResponse::Negotiated(_))
+        Ok(ServerResponse::Control(ControlResponse::Negotiated(_)))
     ));
 
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Isolation test".to_owned(),
-    }));
-    let Ok(ServerResponse::WorkspaceCreated(workspace)) = workspace.result else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Isolation test".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+        workspace.result
+    else {
         panic!("expected workspace creation");
     };
     let create_session = |name: &str| {
-        let response = connection.request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: name.to_owned(),
             },
-        ));
-        let Ok(ServerResponse::AgentSessionCreated(session)) = response.result else {
+        )));
+        let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) =
+            response.result
+        else {
             panic!("expected session creation");
         };
         session
@@ -1156,15 +1207,18 @@ fn workspace_sessions_get_independent_filesystems_and_repository_clones() {
     let first = create_session("First");
     let second = create_session("Second");
     let attach_repository = |session_id| {
-        let response = connection.request(RequestEnvelope::new(
-            ClientRequest::AttachSessionRepository {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
                 session_id,
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
             },
-        ));
-        let Ok(ServerResponse::SessionRepositoryAttached(repository)) = response.result else {
+        )));
+        let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(
+            repository,
+        ))) = response.result
+        else {
             panic!("expected repository attachment");
         };
         repository
@@ -1173,8 +1227,8 @@ fn workspace_sessions_get_independent_filesystems_and_repository_clones() {
     let second_repository = attach_repository(second.id);
     assert_ne!(first_repository.id, second_repository.id);
 
-    let edit = connection.request(RequestEnvelope::new(
-        ClientRequest::ApplySessionFilesystemEdit {
+    let edit = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ApplySessionFilesystemEdit {
             session_id: first.id,
             edit: WorkspaceEdit {
                 path: "repo/README.md".to_owned(),
@@ -1183,31 +1237,37 @@ fn workspace_sessions_get_independent_filesystems_and_repository_clones() {
                 expected_revision: None,
             },
         },
-    ));
+    )));
     assert!(matches!(
         edit.result,
-        Ok(ServerResponse::WorkspaceEditApplied(_))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::WorkspaceEditApplied(_)
+        ))
     ));
 
-    let fork = connection.request(RequestEnvelope::new(ClientRequest::ForkAgentSession {
-        session_id: first.id,
-        name: "Forked first".to_owned(),
-    }));
-    let Ok(ServerResponse::AgentSessionForked(fork)) = fork.result else {
+    let fork = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ForkAgentSession {
+            session_id: first.id,
+            name: "Forked first".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Session(SessionResponse::AgentSessionForked(fork))) = fork.result else {
         panic!("expected forked session");
     };
-    let repositories = connection.request(RequestEnvelope::new(
-        ClientRequest::ListSessionRepositories {
+    let repositories = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::ListSessionRepositories {
             session_id: fork.id,
         },
-    ));
-    let Ok(ServerResponse::SessionRepositories { repositories }) = repositories.result else {
+    )));
+    let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories { repositories })) =
+        repositories.result
+    else {
         panic!("expected forked repositories");
     };
     let fork_repository = repositories.first().expect("repository was copied");
     assert_ne!(fork_repository.id, first_repository.id);
-    let fork_edit = connection.request(RequestEnvelope::new(
-        ClientRequest::ApplySessionFilesystemEdit {
+    let fork_edit = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ApplySessionFilesystemEdit {
             session_id: fork.id,
             edit: WorkspaceEdit {
                 path: "repo/README.md".to_owned(),
@@ -1216,19 +1276,25 @@ fn workspace_sessions_get_independent_filesystems_and_repository_clones() {
                 expected_revision: None,
             },
         },
-    ));
+    )));
     assert!(matches!(
         fork_edit.result,
-        Ok(ServerResponse::WorkspaceEditApplied(_))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::WorkspaceEditApplied(_)
+        ))
     ));
     for (session_id, expected_content) in
         [(first.id, "first session\n"), (fork.id, "forked session\n")]
     {
-        let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
-            session_id,
-            path: "repo/README.md".to_owned(),
-        }));
-        let Ok(ServerResponse::SessionFilesystemFile(file)) = file.result else {
+        let file = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::ReadSessionFile {
+                session_id,
+                path: "repo/README.md".to_owned(),
+            },
+        )));
+        let Ok(ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(file))) =
+            file.result
+        else {
             panic!("expected session file");
         };
         assert_eq!(file.content, expected_content);
@@ -1238,20 +1304,27 @@ fn workspace_sessions_get_independent_filesystems_and_repository_clones() {
         (first.id, "first session\n", first_repository.id, false),
         (second.id, "source\n", second_repository.id, true),
     ] {
-        let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
-            session_id,
-            path: "repo/README.md".to_owned(),
-        }));
-        let Ok(ServerResponse::SessionFilesystemFile(file)) = file.result else {
+        let file = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::ReadSessionFile {
+                session_id,
+                path: "repo/README.md".to_owned(),
+            },
+        )));
+        let Ok(ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(file))) =
+            file.result
+        else {
             panic!("expected session file");
         };
         assert_eq!(file.content, expected_content);
 
-        let status = connection.request(RequestEnvelope::new(ClientRequest::GetSessionVcsStatus {
-            session_id,
-            repository_id,
-        }));
-        let Ok(ServerResponse::VcsStatus(status)) = status.result else {
+        let status = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::GetSessionVcsStatus {
+                session_id,
+                repository_id,
+            },
+        )));
+        let Ok(ServerResponse::Repository(RepositoryResponse::VcsStatus(status))) = status.result
+        else {
             panic!("expected repository status");
         };
         assert_eq!(status.clean, expected_clean);
@@ -1282,52 +1355,64 @@ fn session_filesystem_and_repository_metadata_survive_restart() {
             Capability::ManageSessionRepositories,
             Capability::ReadVcsStatus,
         ]);
-        let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities,
-        }));
+        let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities,
+            },
+        )));
         assert!(matches!(
             negotiated.result,
-            Ok(ServerResponse::Negotiated(_))
+            Ok(ServerResponse::Control(ControlResponse::Negotiated(_)))
         ));
-        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Persistent workspace".to_owned(),
-        }));
-        let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Persistent workspace".to_owned(),
+            },
+        )));
+        let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+            created.result
+        else {
             panic!("expected workspace creation");
         };
-        let created = connection.request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Persistent session".to_owned(),
             },
-        ));
-        let Ok(ServerResponse::AgentSessionCreated(session)) = created.result else {
+        )));
+        let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) =
+            created.result
+        else {
             panic!("expected session creation");
         };
-        let attached = connection.request(RequestEnvelope::new(
-            ClientRequest::AttachSessionRepository {
+        let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
                 session_id: session.id,
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
             },
-        ));
+        )));
         assert!(
             matches!(
                 attached.result,
-                Ok(ServerResponse::SessionRepositoryAttached(_))
+                Ok(ServerResponse::Repository(
+                    RepositoryResponse::SessionRepositoryAttached(_)
+                ))
             ),
             "{:?}",
             attached.result
         );
-        let checkpoint = connection.request(RequestEnvelope::new(
-            ClientRequest::CreateSessionCheckpoint {
+        let checkpoint = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::CreateSessionCheckpoint {
                 session_id: session.id,
                 label: "before persistent edit".to_owned(),
             },
-        ));
-        let Ok(ServerResponse::CheckpointCreated(checkpoint)) = checkpoint.result else {
+        )));
+        let Ok(ServerResponse::Filesystem(FilesystemResponse::CheckpointCreated(checkpoint))) =
+            checkpoint.result
+        else {
             panic!("expected persisted checkpoint, got {:?}", checkpoint.result);
         };
         backend
@@ -1383,28 +1468,34 @@ fn session_filesystem_and_repository_metadata_survive_restart() {
             Capability::ManageCheckpoints,
             Capability::ReadVcsStatus,
         ]);
-        let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
-            client_version: CURRENT_PROTOCOL_VERSION,
-            capabilities,
-        }));
+        let negotiated = connection.request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::Negotiate {
+                client_version: CURRENT_PROTOCOL_VERSION,
+                capabilities,
+            },
+        )));
         assert!(matches!(
             negotiated.result,
-            Ok(ServerResponse::Negotiated(_))
+            Ok(ServerResponse::Control(ControlResponse::Negotiated(_)))
         ));
-        let sessions =
-            connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+        let sessions = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaceSessions {
                 workspace_id,
                 include_archived: false,
-            }));
+            },
+        )));
         assert!(matches!(
             sessions.result,
-            Ok(ServerResponse::AgentSessions { sessions })
+            Ok(ServerResponse::Session(SessionResponse::AgentSessions{ sessions }))
                 if sessions.iter().any(|session| session.id == session_id)
         ));
-        let repositories = connection.request(RequestEnvelope::new(
-            ClientRequest::ListSessionRepositories { session_id },
-        ));
-        let Ok(ServerResponse::SessionRepositories { repositories }) = repositories.result else {
+        let repositories = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::ListSessionRepositories { session_id },
+        )));
+        let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
+            repositories,
+        })) = repositories.result
+        else {
             panic!("expected restored repository metadata");
         };
         let repository = repositories.first().expect("repository was restored");
@@ -1438,11 +1529,15 @@ fn session_filesystem_and_repository_metadata_survive_restart() {
                         && change.sequence.value() > 0
                 })
         );
-        let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
-            session_id,
-            path: "repo/README.md".to_owned(),
-        }));
-        let Ok(ServerResponse::SessionFilesystemFile(file)) = file.result else {
+        let file = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::ReadSessionFile {
+                session_id,
+                path: "repo/README.md".to_owned(),
+            },
+        )));
+        let Ok(ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(file))) =
+            file.result
+        else {
             panic!("expected restored session file");
         };
         assert_eq!(file.content, "persisted session edit\n");
@@ -1450,30 +1545,42 @@ fn session_filesystem_and_repository_metadata_survive_restart() {
             persisted_filesystem.checkpoints[0].files["repo/README.md"].expected_revision,
             file.revision
         );
-        let reverted = connection.request(RequestEnvelope::new(
-            ClientRequest::RevertSessionCheckpoint {
+        let reverted = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::RevertSessionCheckpoint {
                 session_id,
                 checkpoint_id,
             },
-        ));
+        )));
         assert!(
-            matches!(reverted.result, Ok(ServerResponse::CheckpointReverted(_))),
+            matches!(
+                reverted.result,
+                Ok(ServerResponse::Filesystem(
+                    FilesystemResponse::CheckpointReverted(_)
+                ))
+            ),
             "checkpoint revert failed: {:?}",
             reverted.result
         );
-        let restored = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
-            session_id,
-            path: "repo/README.md".to_owned(),
-        }));
-        let Ok(ServerResponse::SessionFilesystemFile(restored)) = restored.result else {
+        let restored = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::ReadSessionFile {
+                session_id,
+                path: "repo/README.md".to_owned(),
+            },
+        )));
+        let Ok(ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(restored))) =
+            restored.result
+        else {
             panic!("expected checkpoint file contents after revert");
         };
         assert_eq!(restored.content, "source\n");
-        let status = connection.request(RequestEnvelope::new(ClientRequest::GetSessionVcsStatus {
-            session_id,
-            repository_id: repository.id,
-        }));
-        let Ok(ServerResponse::VcsStatus(status)) = status.result else {
+        let status = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::GetSessionVcsStatus {
+                session_id,
+                repository_id: repository.id,
+            },
+        )));
+        let Ok(ServerResponse::Repository(RepositoryResponse::VcsStatus(status))) = status.result
+        else {
             panic!("expected restored repository status");
         };
         assert!(status.clean);
@@ -1494,47 +1601,55 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
         let backend = InProcessBackend::new_persistent(&persistence).unwrap();
         let connection = backend.connect();
         negotiate_m5(&connection);
-        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Persistent fork workspace".to_owned(),
-        }));
-        let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Persistent fork workspace".to_owned(),
+            },
+        )));
+        let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+            created.result
+        else {
             panic!("expected workspace creation");
         };
-        let created = connection.request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Persistent source".to_owned(),
             },
-        ));
-        let Ok(ServerResponse::AgentSessionCreated(session)) = created.result else {
+        )));
+        let Ok(ServerResponse::Session(SessionResponse::AgentSessionCreated(session))) =
+            created.result
+        else {
             panic!("expected source session creation");
         };
         let policy = ApprovalPolicy::auto_approve();
-        let configured = connection.request(RequestEnvelope::new(
-            ClientRequest::SetSessionApprovalPolicy {
+        let configured = connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::SetSessionApprovalPolicy {
                 session_id: session.id,
                 policy: policy.clone(),
                 auto_approve_actions: Some(true),
             },
-        ));
+        )));
         assert!(matches!(
             configured.result,
-            Ok(ServerResponse::ApprovalPolicy(configured)) if configured == policy
+            Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(configured))) if configured == policy
         ));
-        let attached = connection.request(RequestEnvelope::new(
-            ClientRequest::AttachSessionRepository {
+        let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
                 session_id: session.id,
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
             },
-        ));
+        )));
         assert!(matches!(
             attached.result,
-            Ok(ServerResponse::SessionRepositoryAttached(_))
+            Ok(ServerResponse::Repository(
+                RepositoryResponse::SessionRepositoryAttached(_)
+            ))
         ));
-        let edited = connection.request(RequestEnvelope::new(
-            ClientRequest::ApplySessionFilesystemEdit {
+        let edited = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::ApplySessionFilesystemEdit {
                 session_id: session.id,
                 edit: WorkspaceEdit {
                     path: "repo/README.md".to_owned(),
@@ -1543,25 +1658,33 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
                     expected_revision: None,
                 },
             },
-        ));
+        )));
         assert!(matches!(
             edited.result,
-            Ok(ServerResponse::WorkspaceEditApplied(_))
+            Ok(ServerResponse::Filesystem(
+                FilesystemResponse::WorkspaceEditApplied(_)
+            ))
         ));
-        let forked = connection.request(RequestEnvelope::new(ClientRequest::ForkAgentSession {
-            session_id: session.id,
-            name: "Persistent fork".to_owned(),
-        }));
-        let Ok(ServerResponse::AgentSessionForked(forked)) = forked.result else {
+        let forked = connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::ForkAgentSession {
+                session_id: session.id,
+                name: "Persistent fork".to_owned(),
+            },
+        )));
+        let Ok(ServerResponse::Session(SessionResponse::AgentSessionForked(forked))) =
+            forked.result
+        else {
             panic!("expected fork creation: {:?}", forked.result);
         };
-        let checkpoint = connection.request(RequestEnvelope::new(
-            ClientRequest::CreateSessionCheckpoint {
+        let checkpoint = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::CreateSessionCheckpoint {
                 session_id: forked.id,
                 label: "fork baseline".to_owned(),
             },
-        ));
-        let Ok(ServerResponse::CheckpointCreated(checkpoint)) = checkpoint.result else {
+        )));
+        let Ok(ServerResponse::Filesystem(FilesystemResponse::CheckpointCreated(checkpoint))) =
+            checkpoint.result
+        else {
             panic!("expected fork checkpoint: {:?}", checkpoint.result);
         };
         backend
@@ -1592,12 +1715,15 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
         let backend = InProcessBackend::new_persistent(&persistence).unwrap();
         let connection = backend.connect();
         negotiate_m5(&connection);
-        let sessions =
-            connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
+        let sessions = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::ListWorkspaceSessions {
                 workspace_id,
                 include_archived: false,
-            }));
-        let Ok(ServerResponse::AgentSessions { sessions }) = sessions.result else {
+            },
+        )));
+        let Ok(ServerResponse::Session(SessionResponse::AgentSessions { sessions })) =
+            sessions.result
+        else {
             panic!("expected restored sessions");
         };
         assert!(
@@ -1607,36 +1733,38 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
         );
         assert!(sessions.iter().any(|session| session.id == fork_session_id));
 
-        let snapshot = connection.request(RequestEnvelope::new(
-            ClientRequest::GetAgentSessionSnapshot {
+        let snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::GetAgentSessionSnapshot {
                 session_id: fork_session_id,
             },
-        ));
-        let Ok(ServerResponse::AgentSessionSnapshot(snapshot)) = snapshot.result else {
+        )));
+        let Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot))) =
+            snapshot.result
+        else {
             panic!("expected restored fork snapshot");
         };
         assert!(snapshot.auto_approve_actions);
         assert_eq!(snapshot.approval_policy, ApprovalPolicy::auto_approve());
 
         let source_repositories = connection.request(RequestEnvelope::new(
-            ClientRequest::ListSessionRepositories {
+            ClientRequest::Repository(RepositoryRequest::ListSessionRepositories {
                 session_id: source_session_id,
-            },
+            }),
         ));
-        let Ok(ServerResponse::SessionRepositories {
+        let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
             repositories: source_repositories,
-        }) = source_repositories.result
+        })) = source_repositories.result
         else {
             panic!("expected restored source repository metadata");
         };
         let fork_repositories = connection.request(RequestEnvelope::new(
-            ClientRequest::ListSessionRepositories {
+            ClientRequest::Repository(RepositoryRequest::ListSessionRepositories {
                 session_id: fork_session_id,
-            },
+            }),
         ));
-        let Ok(ServerResponse::SessionRepositories {
+        let Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
             repositories: fork_repositories,
-        }) = fork_repositories.result
+        })) = fork_repositories.result
         else {
             panic!("expected restored fork repository metadata");
         };
@@ -1646,12 +1774,15 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
         );
 
         let read_file = |session_id| {
-            let response =
-                connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
+            let response = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+                FilesystemRequest::ReadSessionFile {
                     session_id,
                     path: "repo/README.md".to_owned(),
-                }));
-            let Ok(ServerResponse::SessionFilesystemFile(file)) = response.result else {
+                },
+            )));
+            let Ok(ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(file))) =
+                response.result
+            else {
                 panic!("expected restored session file: {:?}", response.result);
             };
             file.content
@@ -1659,13 +1790,17 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
         assert_eq!(read_file(source_session_id), "source branch\n");
         assert_eq!(read_file(fork_session_id), "fork-only change\n");
 
-        let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(fork_session_id),
-            workspace_id: None,
-            after_sequence: None,
-            stream_epoch: None,
-        }));
-        let Ok(ServerResponse::SessionEvents { events, .. }) = events.result else {
+        let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(fork_session_id),
+                workspace_id: None,
+                after_sequence: None,
+                stream_epoch: None,
+            },
+        )));
+        let Ok(ServerResponse::Events(EventsResponse::SessionEvents { events, .. })) =
+            events.result
+        else {
             panic!("expected restored fork event stream");
         };
         assert!(events.iter().any(|event| {
@@ -1678,14 +1813,19 @@ fn forked_session_filesystem_and_policy_survive_restart_and_checkpoint_revert() 
             )
         }));
 
-        let reverted = connection.request(RequestEnvelope::new(
-            ClientRequest::RevertSessionCheckpoint {
+        let reverted = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::RevertSessionCheckpoint {
                 session_id: fork_session_id,
                 checkpoint_id,
             },
-        ));
+        )));
         assert!(
-            matches!(reverted.result, Ok(ServerResponse::CheckpointReverted(_))),
+            matches!(
+                reverted.result,
+                Ok(ServerResponse::Filesystem(
+                    FilesystemResponse::CheckpointReverted(_)
+                ))
+            ),
             "fork checkpoint revert failed: {:?}",
             reverted.result
         );
@@ -1709,19 +1849,25 @@ fn persisted_session_filesystems_restore_lazily_and_survive_unrelated_writes() {
         session_root_base = backend.session_root_base.clone();
         let connection = backend.connect();
         negotiate_m3(&connection);
-        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Lazy restore workspace".to_owned(),
-        }));
-        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Lazy restore workspace".to_owned(),
+            },
+        )));
+        let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+            workspace.result.unwrap()
+        else {
             panic!("unexpected workspace response");
         };
-        let session = connection.request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Archived history".to_owned(),
             },
-        ));
-        let ServerResponse::AgentSessionCreated(session) = session.result.unwrap() else {
+        )));
+        let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+            session.result.unwrap()
+        else {
             panic!("unexpected session response");
         };
         let root = session_root_base
@@ -1744,13 +1890,17 @@ fn persisted_session_filesystems_restore_lazily_and_survive_unrelated_writes() {
         let backend = InProcessBackend::new_persistent(&persistence).unwrap();
         let connection = backend.connect();
         negotiate_m3(&connection);
-        let renamed = connection.request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
-            session_id,
-            name: "Still lazy".to_owned(),
-        }));
+        let renamed = connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::RenameAgentSession {
+                session_id,
+                name: "Still lazy".to_owned(),
+            },
+        )));
         assert!(matches!(
             renamed.result,
-            Ok(ServerResponse::AgentSessionRenamed(_))
+            Ok(ServerResponse::Session(
+                SessionResponse::AgentSessionRenamed(_)
+            ))
         ));
         backend.shutdown().unwrap();
     }
@@ -1759,11 +1909,15 @@ fn persisted_session_filesystems_restore_lazily_and_survive_unrelated_writes() {
         let backend = InProcessBackend::new_persistent(&persistence).unwrap();
         let connection = backend.connect();
         negotiate_m3(&connection);
-        let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
-            session_id,
-            path: "retained.txt".to_owned(),
-        }));
-        let ServerResponse::SessionFilesystemFile(file) = file.result.unwrap() else {
+        let file = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::ReadSessionFile {
+                session_id,
+                path: "retained.txt".to_owned(),
+            },
+        )));
+        let ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(file)) =
+            file.result.unwrap()
+        else {
             panic!("unexpected filesystem response");
         };
         assert_eq!(file.content, "retained content\n");
@@ -1779,69 +1933,85 @@ fn m5_session_projections_reconnect_and_archive_authoritatively() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     negotiate_m5(&connection);
-    let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Navigator".to_owned(),
-    }));
-    let Ok(ServerResponse::WorkspaceCreated(workspace)) = created.result else {
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Navigator".to_owned(),
+        },
+    )));
+    let Ok(ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace))) =
+        created.result
+    else {
         panic!("expected workspace creation");
     };
-    let created = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "Navigator session".to_owned(),
         },
-    ));
+    )));
     let session = match created.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot,
         response => panic!("unexpected response: {response:?}"),
     };
 
-    let attached = connection.request(RequestEnvelope::new(
-        ClientRequest::AttachSessionRepository {
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
             session_id: session.id,
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
         },
-    ));
+    )));
     assert!(matches!(
         attached.result,
-        Ok(ServerResponse::SessionRepositoryAttached(_))
+        Ok(ServerResponse::Repository(
+            RepositoryResponse::SessionRepositoryAttached(_)
+        ))
     ));
-    let workspaces = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
-    let ServerResponse::Workspaces { workspaces } = workspaces.result.unwrap() else {
+    let workspaces = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaces,
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::Workspaces { workspaces }) =
+        workspaces.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
     assert_eq!(workspaces, vec![workspace.clone()]);
 
-    let renamed = connection.request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
-        session_id: session.id,
-        name: "Renamed session".to_owned(),
-    }));
+    let renamed = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::RenameAgentSession {
+            session_id: session.id,
+            name: "Renamed session".to_owned(),
+        },
+    )));
     let session = match renamed.result.unwrap() {
-        ServerResponse::AgentSessionRenamed(snapshot) => snapshot,
+        ServerResponse::Session(SessionResponse::AgentSessionRenamed(snapshot)) => snapshot,
         response => panic!("unexpected rename response: {response:?}"),
     };
     assert_eq!(session.name, "Renamed session");
 
-    let started = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-        session_id: session.id,
-        task: "inspect the workspace".to_owned(),
-        model: loom_model::ModelId::new("deterministic/demo"),
-        system_instructions: None,
-        repository_instructions: None,
-    }));
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: session.id,
+            task: "inspect the workspace".to_owned(),
+            model: loom_model::ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
     let run_id = match started.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected run response: {response:?}"),
     };
 
-    let snapshot = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentSessionSnapshot {
+    let snapshot = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshot {
             session_id: session.id,
         },
-    ));
-    let ServerResponse::AgentSessionSnapshot(snapshot) = snapshot.result.unwrap() else {
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)) =
+        snapshot.result.unwrap()
+    else {
         panic!("unexpected session snapshot response");
     };
     assert_eq!(snapshot.session.id, session.id);
@@ -1851,12 +2021,14 @@ fn m5_session_projections_reconnect_and_archive_authoritatively() {
     );
     assert!(snapshot.active_run.unwrap().plan.is_empty());
 
-    let metadata = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentSessionSnapshotMetadata {
+    let metadata = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshotMetadata {
             session_id: session.id,
         },
-    ));
-    let ServerResponse::AgentSessionSnapshot(metadata) = metadata.result.unwrap() else {
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(metadata)) =
+        metadata.result.unwrap()
+    else {
         panic!("unexpected metadata snapshot response");
     };
     assert_eq!(
@@ -1869,38 +2041,48 @@ fn m5_session_projections_reconnect_and_archive_authoritatively() {
             .as_ref()
             .is_some_and(|run| run.messages.is_empty())
     );
-    let run = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
-        run_id,
-    }));
-    let ServerResponse::AgentRunSnapshot(run) = run.result.unwrap() else {
+    let run = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunSnapshot { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunSnapshot(run)) = run.result.unwrap() else {
         panic!("unexpected run snapshot response");
     };
     assert_eq!(run.run.id, run_id);
     assert!(!run.messages.is_empty());
 
-    let changes = connection.request(RequestEnvelope::new(
-        ClientRequest::GetSessionFilesystemChanges {
+    let changes = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::GetSessionFilesystemChanges {
             session_id: session.id,
             after_sequence: None,
         },
-    ));
+    )));
     assert!(matches!(
         changes.result,
-        Ok(ServerResponse::SessionFilesystemChanges { .. })
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::SessionFilesystemChanges { .. }
+        ))
     ));
 
-    let archived = connection.request(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
-        session_id: session.id,
-    }));
+    let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ArchiveAgentSession {
+            session_id: session.id,
+        },
+    )));
     assert!(matches!(
         archived.result,
-        Ok(ServerResponse::AgentSessionArchived(_))
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionArchived(_)
+        ))
     ));
-    let sessions = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
-        workspace_id: workspace.id,
-        include_archived: false,
-    }));
-    let ServerResponse::AgentSessions { sessions } = sessions.result.unwrap() else {
+    let sessions = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaceSessions {
+            workspace_id: workspace.id,
+            include_archived: false,
+        },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessions { sessions }) =
+        sessions.result.unwrap()
+    else {
         panic!("unexpected session list response");
     };
     assert!(sessions.is_empty());
@@ -1914,57 +2096,75 @@ fn creates_session_and_reads_event_stream() {
     let connection = backend.connect();
     negotiate(&connection);
 
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "In-process workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "In-process workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let create = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let create = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "In-process demo".to_owned(),
         },
-    ));
+    )));
     let session_id = match create.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
 
-    let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(session_id),
-        workspace_id: None,
-        after_sequence: None,
-        stream_epoch: None,
-    }));
-    let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
+    let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        events.result.unwrap()
+    else {
         panic!("unexpected response");
     };
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].session_id, session_id);
 
-    let initial = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentSessionInitialState { session_id },
-    ));
-    let ServerResponse::AgentSessionInitialState(initial) = initial.result.unwrap() else {
+    let initial = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionInitialState { session_id },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial)) =
+        initial.result.unwrap()
+    else {
         panic!("unexpected initial state response");
     };
     assert_eq!(initial.cursor, events[0].sequence);
-    let renamed = connection.request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
-        session_id,
-        name: "Renamed after snapshot".to_owned(),
-    }));
+    let renamed = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::RenameAgentSession {
+            session_id,
+            name: "Renamed after snapshot".to_owned(),
+        },
+    )));
     assert!(matches!(
         renamed.result,
-        Ok(ServerResponse::AgentSessionRenamed(_))
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionRenamed(_)
+        ))
     ));
-    let resumed = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(session_id),
-        workspace_id: None,
-        after_sequence: Some(initial.cursor),
-        stream_epoch: None,
-    }));
-    let ServerResponse::SessionEvents { events, .. } = resumed.result.unwrap() else {
+    let resumed = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: Some(initial.cursor),
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        resumed.result.unwrap()
+    else {
         panic!("unexpected incremental event response");
     };
     assert_eq!(events.len(), 1);
@@ -1980,66 +2180,78 @@ fn runs_deterministic_agent_through_approvals() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     negotiate(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "M1 workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "M1 workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let session = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "M1 run".to_owned(),
         },
-    ));
+    )));
     let session_id = match session.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
-    connection.request(RequestEnvelope::new(
-        ClientRequest::SetSessionApprovalPolicy {
+    connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetSessionApprovalPolicy {
             session_id,
             policy: ApprovalPolicy::default(),
             auto_approve_actions: Some(false),
         },
-    ));
-    let attached = connection.request(RequestEnvelope::new(
-        ClientRequest::AttachSessionRepository {
+    )));
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
             session_id,
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
         },
-    ));
+    )));
     assert!(
         matches!(
             attached.result,
-            Ok(ServerResponse::SessionRepositoryAttached(_))
+            Ok(ServerResponse::Repository(
+                RepositoryResponse::SessionRepositoryAttached(_)
+            ))
         ),
         "{:?}",
         attached.result
     );
-    let started = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-        session_id,
-        task: "create a demo file".to_owned(),
-        model: ModelId::new("deterministic/demo"),
-        system_instructions: Some("Be concise.".to_owned()),
-        repository_instructions: Some("Keep changes focused.".to_owned()),
-    }));
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: "create a demo file".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: Some("Be concise.".to_owned()),
+            repository_instructions: Some("Keep changes focused.".to_owned()),
+        },
+    )));
     let run_id = match started.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
 
     let mut after = None;
     loop {
-        let response = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(session_id),
-            workspace_id: None,
-            after_sequence: after,
-            stream_epoch: None,
-        }));
-        let ServerResponse::SessionEvents { events, .. } = response.result.unwrap() else {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                workspace_id: None,
+                after_sequence: after,
+                stream_epoch: None,
+            },
+        )));
+        let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+            response.result.unwrap()
+        else {
             panic!("unexpected response");
         };
         let mut completed = false;
@@ -2057,13 +2269,14 @@ fn runs_deterministic_agent_through_approvals() {
             } = &event.event
             {
                 assert_eq!(*event_run, run_id);
-                let response =
-                    connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+                let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+                    RunRequest::ApproveAgentAction {
                         run_id,
                         attempt_id: *attempt_id,
                         expected_control_revision: *control_revision,
                         tool_call_id: call.id,
-                    }));
+                    },
+                )));
                 assert!(response.result.is_ok());
             }
             if matches!(
@@ -2079,33 +2292,37 @@ fn runs_deterministic_agent_through_approvals() {
             break;
         }
     }
-    let final_run = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
-    let ServerResponse::AgentRun(snapshot) = final_run.result.unwrap() else {
+    let final_run = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = final_run.result.unwrap() else {
         panic!("unexpected response");
     };
     assert_eq!(snapshot.state, AgentRunState::Completed);
-    let page = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessagePage {
+    let page = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessagePage {
             run_id,
             before_ordinal: None,
             limit: 2,
         },
-    ));
-    let ServerResponse::AgentRunMessagePage { messages, .. } = page.result.unwrap() else {
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunMessagePage { messages, .. }) =
+        page.result.unwrap()
+    else {
         panic!("unexpected run message page response");
     };
     let oldest_ordinal = messages.last().unwrap().ordinal;
-    let previous_page = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessagePage {
+    let previous_page = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessagePage {
             run_id,
             before_ordinal: Some(oldest_ordinal),
             limit: 1,
         },
-    ));
-    let ServerResponse::AgentRunMessagePage {
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunMessagePage {
         messages: previous_messages,
         ..
-    } = previous_page.result.unwrap()
+    }) = previous_page.result.unwrap()
     else {
         panic!("unexpected previous run message page response");
     };
@@ -2119,61 +2336,66 @@ fn runs_deterministic_agent_through_approvals() {
         .find(|message| message.content_bytes > 0)
         .unwrap();
     let length = header.content_bytes.min(32) as u32;
-    let content = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessageContentRange {
+    let content = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessageContentRange {
             run_id,
             message_ordinal: header.ordinal,
             byte_offset: 0,
             length,
         },
-    ));
-    let ServerResponse::AgentRunMessageContentRange { content, .. } = content.result.unwrap()
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunMessageContentRange { content, .. }) =
+        content.result.unwrap()
     else {
         panic!("unexpected run message content response");
     };
     assert_eq!(content.len(), length as usize);
-    let beyond_content = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessageContentRange {
+    let beyond_content = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessageContentRange {
             run_id,
             message_ordinal: header.ordinal,
             byte_offset: u64::MAX,
             length: 8,
         },
-    ));
+    )));
     assert!(matches!(
         beyond_content.result,
-        Ok(ServerResponse::AgentRunMessageContentRange { content, .. }) if content.is_empty()
+        Ok(ServerResponse::Run(RunResponse::AgentRunMessageContentRange{ content, .. })) if content.is_empty()
     ));
-    let missing_message = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessageContentRange {
+    let missing_message = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessageContentRange {
             run_id,
             message_ordinal: oldest_ordinal + 1000,
             byte_offset: 0,
             length: 8,
         },
-    ));
+    )));
     assert_eq!(
         missing_message.result.unwrap_err().code,
         ErrorCode::NotFound
     );
-    let empty_page = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessagePage {
+    let empty_page = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessagePage {
             run_id,
             before_ordinal: Some(0),
             limit: 1,
         },
-    ));
+    )));
     assert!(matches!(
         empty_page.result,
-        Ok(ServerResponse::AgentRunMessagePage { messages, .. }) if messages.is_empty()
+        Ok(ServerResponse::Run(RunResponse::AgentRunMessagePage{ messages, .. })) if messages.is_empty()
     ));
-    let history = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(session_id),
-        workspace_id: None,
-        after_sequence: None,
-        stream_epoch: None,
-    }));
-    let ServerResponse::SessionEvents { events, .. } = history.result.unwrap() else {
+    let history = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        history.result.unwrap()
+    else {
         panic!("unexpected history response");
     };
     assert!(events.iter().any(|event| {
@@ -2200,7 +2422,9 @@ fn runs_deterministic_agent_through_approvals() {
 fn requires_negotiation_before_session_requests() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaces,
+    )));
 
     assert_eq!(response.result.unwrap_err().code, ErrorCode::InvalidRequest);
 }
@@ -2211,9 +2435,11 @@ fn unknown_run_is_structured_not_found() {
     let connection = backend.connect();
     negotiate(&connection);
 
-    let response = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun {
-        run_id: loom_core::RunId::new(),
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun {
+            run_id: loom_core::RunId::new(),
+        },
+    )));
 
     assert_eq!(response.result.unwrap_err().code, ErrorCode::NotFound);
 }
@@ -2224,38 +2450,48 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     negotiate_m2(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Filesystem controls".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Filesystem controls".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let created = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "Filesystem controls".to_owned(),
         },
-    ));
-    let ServerResponse::AgentSessionCreated(session) = created.result.unwrap() else {
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+        created.result.unwrap()
+    else {
         panic!("unexpected session response");
     };
     let session_id = session.id;
-    let attached = connection.request(RequestEnvelope::new(
-        ClientRequest::AttachSessionRepository {
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
             session_id,
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
         },
-    ));
+    )));
     assert!(matches!(
         attached.result,
-        Ok(ServerResponse::SessionRepositoryAttached(_))
+        Ok(ServerResponse::Repository(
+            RepositoryResponse::SessionRepositoryAttached(_)
+        ))
     ));
-    let snapshot = connection.request(RequestEnvelope::new(
-        ClientRequest::GetSessionFilesystemSnapshot { session_id },
-    ));
-    let ServerResponse::SessionFilesystemSnapshot(snapshot) = snapshot.result.unwrap() else {
+    let snapshot = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::GetSessionFilesystemSnapshot { session_id },
+    )));
+    let ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemSnapshot(snapshot)) =
+        snapshot.result.unwrap()
+    else {
         panic!("unexpected filesystem snapshot");
     };
     assert!(
@@ -2264,26 +2500,32 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
             .iter()
             .any(|entry| entry.path == "repo/README.md")
     );
-    let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
-        session_id,
-        path: "repo/README.md".to_owned(),
-    }));
+    let file = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ReadSessionFile {
+            session_id,
+            path: "repo/README.md".to_owned(),
+        },
+    )));
     let revision = match file.result.unwrap() {
-        ServerResponse::SessionFilesystemFile(file) => file.revision,
+        ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(file)) => {
+            file.revision
+        }
         response => panic!("unexpected response: {response:?}"),
     };
-    let checkpoint = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateSessionCheckpoint {
+    let checkpoint = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::CreateSessionCheckpoint {
             session_id,
             label: "before user edit".to_owned(),
         },
-    ));
+    )));
     let checkpoint_id = match checkpoint.result.unwrap() {
-        ServerResponse::CheckpointCreated(checkpoint) => checkpoint.id,
+        ServerResponse::Filesystem(FilesystemResponse::CheckpointCreated(checkpoint)) => {
+            checkpoint.id
+        }
         response => panic!("unexpected response: {response:?}"),
     };
-    let edit = connection.request(RequestEnvelope::new(
-        ClientRequest::ApplySessionFilesystemEdit {
+    let edit = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ApplySessionFilesystemEdit {
             session_id,
             edit: WorkspaceEdit {
                 path: "repo/README.md".to_owned(),
@@ -2292,39 +2534,46 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
                 expected_revision: Some(revision),
             },
         },
-    ));
+    )));
     assert!(matches!(
         edit.result,
-        Ok(ServerResponse::WorkspaceEditApplied(_))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::WorkspaceEditApplied(_)
+        ))
     ));
-    let changes = connection.request(RequestEnvelope::new(
-        ClientRequest::GetSessionFilesystemChanges {
+    let changes = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::GetSessionFilesystemChanges {
             session_id,
             after_sequence: None,
         },
-    ));
-    let ServerResponse::SessionFilesystemChanges { changes, .. } = changes.result.unwrap() else {
+    )));
+    let ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemChanges {
+        changes, ..
+    }) = changes.result.unwrap()
+    else {
         panic!("unexpected filesystem changes response");
     };
     assert!(changes.iter().any(|event| event.path == "repo/README.md"));
-    let revert = connection.request(RequestEnvelope::new(
-        ClientRequest::RevertSessionCheckpoint {
+    let revert = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::RevertSessionCheckpoint {
             session_id,
             checkpoint_id,
         },
-    ));
+    )));
     assert_eq!(
         revert.result.unwrap_err().code,
         ErrorCode::Conflict,
         "checkpoint revert must preserve the intervening user edit"
     );
-    let file = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
-        session_id,
-        path: "repo/README.md".to_owned(),
-    }));
+    let file = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ReadSessionFile {
+            session_id,
+            path: "repo/README.md".to_owned(),
+        },
+    )));
     assert!(matches!(
         file.result,
-        Ok(ServerResponse::SessionFilesystemFile(file)) if file.content == "user\n"
+        Ok(ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(file))) if file.content == "user\n"
     ));
 
     let terminal_command = if cfg!(windows) {
@@ -2335,26 +2584,30 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
     } else {
         ("printf".to_owned(), vec!["terminal".to_owned()])
     };
-    let terminal = connection.request(RequestEnvelope::new(ClientRequest::OpenSessionTerminal {
-        session_id,
-        command: terminal_command.0,
-        args: terminal_command.1,
-        cwd: None,
-    }));
+    let terminal = connection.request(RequestEnvelope::new(ClientRequest::Terminal(
+        TerminalRequest::OpenSessionTerminal {
+            session_id,
+            command: terminal_command.0,
+            args: terminal_command.1,
+            cwd: None,
+        },
+    )));
     let terminal_id = match terminal.result.unwrap() {
-        ServerResponse::TerminalOpened(snapshot) => snapshot.id,
+        ServerResponse::Terminal(TerminalResponse::TerminalOpened(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     let mut terminal_done = false;
     for _ in 0..100 {
-        let events = connection.request(RequestEnvelope::new(
-            ClientRequest::GetSessionTerminalEvents {
+        let events = connection.request(RequestEnvelope::new(ClientRequest::Terminal(
+            TerminalRequest::GetSessionTerminalEvents {
                 session_id,
                 terminal_id,
                 after_sequence: None,
             },
-        ));
-        let ServerResponse::TerminalEvents { events } = events.result.unwrap() else {
+        )));
+        let ServerResponse::Terminal(TerminalResponse::TerminalEvents { events }) =
+            events.result.unwrap()
+        else {
             panic!("unexpected terminal event response");
         };
         if events.iter().any(|event| {
@@ -2384,29 +2637,33 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
             vec!["-c".to_owned(), "printf artifact > artifact.txt".to_owned()],
         )
     };
-    let task = connection.request(RequestEnvelope::new(ClientRequest::StartSessionTask {
-        session_id,
-        spec: TaskSpec {
-            kind: TaskKind::Test,
-            label: "M2 task".to_owned(),
-            command: task_command.0,
-            args: task_command.1,
-            cwd: Some("repo".to_owned()),
-            output_limit_bytes: Some(4096),
-            artifact_paths: vec!["repo/artifact.txt".to_owned()],
+    let task = connection.request(RequestEnvelope::new(ClientRequest::Task(
+        TaskRequest::StartSessionTask {
+            session_id,
+            spec: TaskSpec {
+                kind: TaskKind::Test,
+                label: "M2 task".to_owned(),
+                command: task_command.0,
+                args: task_command.1,
+                cwd: Some("repo".to_owned()),
+                output_limit_bytes: Some(4096),
+                artifact_paths: vec!["repo/artifact.txt".to_owned()],
+            },
         },
-    }));
+    )));
     let task_id = match task.result.unwrap() {
-        ServerResponse::TaskStarted(snapshot) => snapshot.id,
+        ServerResponse::Task(TaskResponse::TaskStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     let mut task_done = false;
     for _ in 0..100 {
-        let current = connection.request(RequestEnvelope::new(ClientRequest::GetSessionTask {
-            session_id,
-            task_id,
-        }));
-        let ServerResponse::Task(snapshot) = current.result.unwrap() else {
+        let current = connection.request(RequestEnvelope::new(ClientRequest::Task(
+            TaskRequest::GetSessionTask {
+                session_id,
+                task_id,
+            },
+        )));
+        let ServerResponse::Task(TaskResponse::Task(snapshot)) = current.result.unwrap() else {
             panic!("unexpected task response");
         };
         if matches!(
@@ -2420,20 +2677,22 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(task_done);
-    let listed = connection.request(RequestEnvelope::new(ClientRequest::ListSessionTasks {
-        session_id,
-    }));
-    let ServerResponse::Tasks { tasks } = listed.result.unwrap() else {
+    let listed = connection.request(RequestEnvelope::new(ClientRequest::Task(
+        TaskRequest::ListSessionTasks { session_id },
+    )));
+    let ServerResponse::Task(TaskResponse::Tasks { tasks }) = listed.result.unwrap() else {
         panic!("unexpected task list response");
     };
     assert!(tasks.iter().any(|task| task.id == task_id));
-    let task_events =
-        connection.request(RequestEnvelope::new(ClientRequest::GetSessionTaskEvents {
+    let task_events = connection.request(RequestEnvelope::new(ClientRequest::Task(
+        TaskRequest::GetSessionTaskEvents {
             session_id,
             task_id,
             after_sequence: None,
-        }));
-    let ServerResponse::TaskEvents { events } = task_events.result.unwrap() else {
+        },
+    )));
+    let ServerResponse::Task(TaskResponse::TaskEvents { events }) = task_events.result.unwrap()
+    else {
         panic!("unexpected task event response");
     };
     assert!(
@@ -2442,15 +2701,17 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
             .any(|event| matches!(event.event, TaskEvent::Completed { .. }))
     );
 
-    let control = connection.request(RequestEnvelope::new(
-        ClientRequest::TakeSessionFilesystemControl {
+    let control = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::TakeSessionFilesystemControl {
             session_id,
             control: WorkspaceControl::User,
         },
-    ));
+    )));
     assert!(matches!(
         control.result,
-        Ok(ServerResponse::WorkspaceControl(WorkspaceControl::User))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::WorkspaceControl(WorkspaceControl::User)
+        ))
     ));
     fs::remove_dir_all(&backend.session_root_base).unwrap();
     fs::remove_dir_all(root).unwrap();
@@ -2461,26 +2722,31 @@ fn policy_decisions_are_visible_and_can_stop_agent_writes() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     negotiate_m2(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Policy workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Policy workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let session = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "M2 policy".to_owned(),
         },
-    ));
+    )));
     let session_id = match session.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
-    let default_settings = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentSessionSnapshot { session_id },
-    ));
-    let ServerResponse::AgentSessionSnapshot(default_settings) = default_settings.result.unwrap()
+    let default_settings = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshot { session_id },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(default_settings)) =
+        default_settings.result.unwrap()
     else {
         panic!("unexpected session snapshot response");
     };
@@ -2489,37 +2755,38 @@ fn policy_decisions_are_visible_and_can_stop_agent_writes() {
         default_settings.approval_policy,
         loom_core::ApprovalPolicy::auto_approve()
     );
-    let other_session = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let other_session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "Other session".to_owned(),
         },
-    ));
+    )));
     let other_session_id = match other_session.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     let policy = loom_core::ApprovalPolicy {
         write: PolicyDecision::Deny,
         ..Default::default()
     };
-    let policy_response = connection.request(RequestEnvelope::new(
-        ClientRequest::SetSessionApprovalPolicy {
+    let policy_response = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetSessionApprovalPolicy {
             session_id,
             policy,
             auto_approve_actions: Some(false),
         },
-    ));
+    )));
     assert!(matches!(
         policy_response.result,
-        Ok(ServerResponse::ApprovalPolicy(_))
+        Ok(ServerResponse::Session(SessionResponse::ApprovalPolicy(_)))
     ));
-    let other_settings = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentSessionSnapshot {
+    let other_settings = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshot {
             session_id: other_session_id,
         },
-    ));
-    let ServerResponse::AgentSessionSnapshot(other_settings) = other_settings.result.unwrap()
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(other_settings)) =
+        other_settings.result.unwrap()
     else {
         panic!("unexpected session snapshot response");
     };
@@ -2528,25 +2795,31 @@ fn policy_decisions_are_visible_and_can_stop_agent_writes() {
         other_settings.approval_policy,
         loom_core::ApprovalPolicy::auto_approve()
     );
-    let started = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-        session_id,
-        task: "attempt a write".to_owned(),
-        model: ModelId::new("deterministic/demo"),
-        system_instructions: None,
-        repository_instructions: None,
-    }));
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: "attempt a write".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
     let run_id = match started.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     await_settled_run(&connection, run_id);
-    let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(session_id),
-        workspace_id: None,
-        after_sequence: None,
-        stream_epoch: None,
-    }));
-    let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
+    let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        events.result.unwrap()
+    else {
         panic!("unexpected session event response");
     };
     assert!(events.iter().any(|event| {
@@ -2561,8 +2834,10 @@ fn policy_decisions_are_visible_and_can_stop_agent_writes() {
             } if *event_run == run_id && evaluation.decision == PolicyDecision::Deny
         )
     }));
-    let run = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
-    let ServerResponse::AgentRun(snapshot) = run.result.unwrap() else {
+    let run = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = run.result.unwrap() else {
         panic!("unexpected run response");
     };
     assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
@@ -2579,31 +2854,35 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         session_root_base = backend.session_root_base.clone();
         let connection = backend.connect();
         negotiate_m3(&connection);
-        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Durable workspace".to_owned(),
-        }));
-        let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Durable workspace".to_owned(),
+            },
+        )));
+        let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+            created.result.unwrap()
+        else {
             panic!("unexpected workspace response");
         };
-        let session = connection.request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "durable run".to_owned(),
             },
-        ));
+        )));
         let session_id = match session.result.unwrap() {
-            ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+            ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
-        connection.request(RequestEnvelope::new(
-            ClientRequest::SetSessionApprovalPolicy {
+        connection.request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::SetSessionApprovalPolicy {
                 session_id,
                 policy: ApprovalPolicy::default(),
                 auto_approve_actions: Some(false),
             },
-        ));
-        let started = connection.request(RequestEnvelope::new(
-            ClientRequest::StartSessionAgentRunWithOptions {
+        )));
+        let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRunWithOptions {
                 session_id,
                 task: "create a demo file".to_owned(),
                 model: ModelId::new("deterministic/demo"),
@@ -2619,9 +2898,9 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
                     reserved_output_tokens: Some(1_024),
                 },
             },
-        ));
+        )));
         let run_id = match started.result.unwrap() {
-            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
         await_settled_run(&connection, run_id);
@@ -2638,16 +2917,18 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         assert_eq!(runtime_config.context_options.context_window, Some(8_192));
         assert_eq!(runtime_config.limits.max_tool_calls, Some(20));
         let events = match connection
-            .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-                session_id: Some(session_id),
-                workspace_id: None,
-                after_sequence: None,
-                stream_epoch: None,
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Events(
+                EventsRequest::GetSessionEvents {
+                    session_id: Some(session_id),
+                    workspace_id: None,
+                    after_sequence: None,
+                    stream_epoch: None,
+                },
+            )))
             .result
             .unwrap()
         {
-            ServerResponse::SessionEvents { events, .. } => events,
+            ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) => events,
             response => panic!("unexpected response: {response:?}"),
         };
         let approval = events
@@ -2676,19 +2957,20 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     assert!(backend.persisted_runs().unwrap().contains_key(&run_id));
     let connection = backend.connect();
     negotiate_m3(&connection);
-    let recovered_session = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentSessionSnapshot { session_id },
-    ));
-    let ServerResponse::AgentSessionSnapshot(recovered_session) = recovered_session.result.unwrap()
+    let recovered_session = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshot { session_id },
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(recovered_session)) =
+        recovered_session.result.unwrap()
     else {
         panic!("unexpected recovered session snapshot response");
     };
     assert!(!recovered_session.auto_approve_actions);
     assert_eq!(recovered_session.approval_policy, ApprovalPolicy::default());
-    let detail = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
-        run_id,
-    }));
-    let ServerResponse::AgentRunSnapshot(detail) = detail.result.unwrap() else {
+    let detail = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunSnapshot { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunSnapshot(detail)) = detail.result.unwrap() else {
         panic!("unexpected run snapshot response");
     };
     assert_eq!(detail.run.id, run_id);
@@ -2706,8 +2988,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             .any(|activity| { activity.status == AgentActivityStatus::AwaitingApproval })
     );
     assert!(backend.runs().unwrap().is_empty());
-    let recovered = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
-    let ServerResponse::AgentRun(snapshot) = recovered.result.unwrap() else {
+    let recovered = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = recovered.result.unwrap() else {
         panic!("unexpected run response");
     };
     assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
@@ -2734,11 +3018,12 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             && interaction.tool_call_id == Some(approval.0)
             && interaction.status == AgentInteractionStatus::Pending
     }));
-    let recovered_snapshot =
-        connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
-            run_id,
-        }));
-    let ServerResponse::AgentRunSnapshot(projection) = recovered_snapshot.result.unwrap() else {
+    let recovered_snapshot = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunSnapshot { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunSnapshot(projection)) =
+        recovered_snapshot.result.unwrap()
+    else {
         panic!("unexpected run snapshot response");
     };
     assert!(!projection.activities.is_empty());
@@ -2748,17 +3033,17 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             .iter()
             .any(|activity| activity.status == AgentActivityStatus::AwaitingApproval)
     );
-    let page = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessagePage {
+    let page = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessagePage {
             run_id,
             before_ordinal: None,
             limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
         },
-    ));
-    let ServerResponse::AgentRunMessagePage {
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunMessagePage {
         run_id: page_run_id,
         messages,
-    } = page.result.unwrap()
+    }) = page.result.unwrap()
     else {
         panic!("unexpected run message page response");
     };
@@ -2770,13 +3055,13 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             .all(|pair| pair[0].ordinal > pair[1].ordinal),
         "message page must be in descending keyset order"
     );
-    let oversized_page = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessagePage {
+    let oversized_page = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessagePage {
             run_id,
             before_ordinal: None,
             limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE + 1,
         },
-    ));
+    )));
     assert_eq!(
         oversized_page.result.unwrap_err().code,
         ErrorCode::InvalidRequest
@@ -2785,20 +3070,20 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         .iter()
         .find(|message| message.content_bytes > 0)
         .unwrap();
-    let range = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessageContentRange {
+    let range = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessageContentRange {
             run_id,
             message_ordinal: message_header.ordinal,
             byte_offset: 0,
             length: message_header.content_bytes.min(32) as u32,
         },
-    ));
-    let ServerResponse::AgentRunMessageContentRange {
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunMessageContentRange {
         run_id: range_run_id,
         message_ordinal,
         byte_offset,
         content,
-    } = range.result.unwrap()
+    }) = range.result.unwrap()
     else {
         panic!("unexpected run message content response");
     };
@@ -2810,34 +3095,36 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         .content
         .as_bytes();
     assert_eq!(content, expected_content[..content.len()]);
-    let oversized_range = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessageContentRange {
+    let oversized_range = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessageContentRange {
             run_id,
             message_ordinal,
             byte_offset: 0,
             length: MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES + 1,
         },
-    ));
+    )));
     assert_eq!(
         oversized_range.result.unwrap_err().code,
         ErrorCode::InvalidRequest
     );
     let legacy_connection = backend.connect();
-    let legacy_negotiation =
-        legacy_connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+    let legacy_negotiation = legacy_connection.request(RequestEnvelope::new(
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: ProtocolVersion::new(2, 0),
             capabilities: backend.supported_capabilities.clone(),
-        }));
+        }),
+    ));
     assert_eq!(
         legacy_negotiation.result.unwrap_err().code,
         ErrorCode::UnsupportedProtocol
     );
     let protocol_3_connection = backend.connect();
-    let protocol_3_negotiation =
-        protocol_3_connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+    let protocol_3_negotiation = protocol_3_connection.request(RequestEnvelope::new(
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: ProtocolVersion::new(3, 0),
             capabilities: backend.supported_capabilities.clone(),
-        }));
+        }),
+    ));
     assert_eq!(
         protocol_3_negotiation.result.unwrap_err().code,
         ErrorCode::UnsupportedProtocol
@@ -2845,10 +3132,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     let protocol_4_connection = backend.connect();
     let protocol_4_negotiation = protocol_4_connection.request(RequestEnvelope::with_version(
         ProtocolVersion::new(4, 1),
-        ClientRequest::Negotiate {
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: ProtocolVersion::new(4, 1),
             capabilities: backend.supported_capabilities.clone(),
-        },
+        }),
     ));
     assert_eq!(
         protocol_4_negotiation.result.unwrap_err().code,
@@ -2857,10 +3144,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     let protocol_5_connection = backend.connect();
     let protocol_5_negotiation = protocol_5_connection.request(RequestEnvelope::with_version(
         ProtocolVersion::new(5, 0),
-        ClientRequest::Negotiate {
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: ProtocolVersion::new(5, 0),
             capabilities: backend.supported_capabilities.clone(),
-        },
+        }),
     ));
     assert_eq!(
         protocol_5_negotiation.result.unwrap_err().code,
@@ -2869,10 +3156,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     let protocol_6_connection = backend.connect();
     let protocol_6_negotiation = protocol_6_connection.request(RequestEnvelope::with_version(
         ProtocolVersion::new(6, 0),
-        ClientRequest::Negotiate {
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: ProtocolVersion::new(6, 0),
             capabilities: backend.supported_capabilities.clone(),
-        },
+        }),
     ));
     assert_eq!(
         protocol_6_negotiation.result.unwrap_err().code,
@@ -2881,10 +3168,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     let protocol_7_connection = backend.connect();
     let protocol_7_negotiation = protocol_7_connection.request(RequestEnvelope::with_version(
         ProtocolVersion::new(7, 0),
-        ClientRequest::Negotiate {
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: ProtocolVersion::new(7, 0),
             capabilities: backend.supported_capabilities.clone(),
-        },
+        }),
     ));
     assert_eq!(
         protocol_7_negotiation.result.unwrap_err().code,
@@ -2893,7 +3180,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     let protocol_8_connection = backend.connect();
     let protocol_8_discovery = protocol_8_connection.request(RequestEnvelope::with_version(
         ProtocolVersion::new(8, 0),
-        ClientRequest::DiscoverCapabilities,
+        ClientRequest::Control(ControlRequest::DiscoverCapabilities),
     ));
     assert_eq!(
         protocol_8_discovery.result.unwrap_err().code,
@@ -2901,10 +3188,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     );
     let protocol_8_negotiation = protocol_8_connection.request(RequestEnvelope::with_version(
         CURRENT_PROTOCOL_VERSION,
-        ClientRequest::Negotiate {
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: ProtocolVersion::new(8, 0),
             capabilities: backend.supported_capabilities.clone(),
-        },
+        }),
     ));
     assert_eq!(
         protocol_8_negotiation.result.unwrap_err().code,
@@ -2913,7 +3200,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     let protocol_9_connection = backend.connect();
     let protocol_9_discovery = protocol_9_connection.request(RequestEnvelope::with_version(
         ProtocolVersion::new(9, 0),
-        ClientRequest::DiscoverCapabilities,
+        ClientRequest::Control(ControlRequest::DiscoverCapabilities),
     ));
     assert_eq!(
         protocol_9_discovery.result.unwrap_err().code,
@@ -2921,10 +3208,10 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     );
     let protocol_9_negotiation = protocol_9_connection.request(RequestEnvelope::with_version(
         CURRENT_PROTOCOL_VERSION,
-        ClientRequest::Negotiate {
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: ProtocolVersion::new(9, 0),
             capabilities: backend.supported_capabilities.clone(),
-        },
+        }),
     ));
     assert_eq!(
         protocol_9_negotiation.result.unwrap_err().code,
@@ -2939,67 +3226,77 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             .copied()
             .filter(|capability| *capability != Capability::ReadAgentRunMessages),
     );
-    let current_negotiation =
-        capability_limited_connection.request(RequestEnvelope::new(ClientRequest::Negotiate {
+    let current_negotiation = capability_limited_connection.request(RequestEnvelope::new(
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: CURRENT_PROTOCOL_VERSION,
             capabilities: capability_limited,
-        }));
+        }),
+    ));
     assert!(matches!(
         current_negotiation.result,
-        Ok(ServerResponse::Negotiated(_))
+        Ok(ServerResponse::Control(ControlResponse::Negotiated(_)))
     ));
     let unsupported_page = capability_limited_connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessagePage {
+        ClientRequest::Run(RunRequest::GetAgentRunMessagePage {
             run_id,
             before_ordinal: None,
             limit: MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
-        },
+        }),
     ));
     assert_eq!(
         unsupported_page.result.unwrap_err().code,
         ErrorCode::CapabilityDenied
     );
-    let events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(session_id),
-        workspace_id: None,
-        after_sequence: None,
-        stream_epoch: None,
-    }));
-    let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
+    let events = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        events.result.unwrap()
+    else {
         panic!("unexpected events response");
     };
     assert!(events.len() >= 5);
-    let checkpoint = connection.request(RequestEnvelope::new(ClientRequest::GetRunCheckpoint {
-        run_id,
-    }));
-    let ServerResponse::RunCheckpoint(checkpoint) = checkpoint.result.unwrap() else {
+    let checkpoint = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetRunCheckpoint { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::RunCheckpoint(checkpoint)) = checkpoint.result.unwrap()
+    else {
         panic!("unexpected checkpoint response");
     };
     assert_eq!(checkpoint.session_id, session_id);
 
-    let wrong_attempt =
-        connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+    let wrong_attempt = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::ApproveAgentAction {
             run_id,
             attempt_id: loom_core::RunAttemptId::new(),
             expected_control_revision: approval.2,
             tool_call_id: approval.0,
-        }));
+        },
+    )));
     assert_eq!(wrong_attempt.result.unwrap_err().code, ErrorCode::Conflict);
-    let stale_revision =
-        connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
+    let stale_revision = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::ApproveAgentAction {
             run_id,
             attempt_id: approval.1,
             expected_control_revision: approval.2.saturating_sub(1),
             tool_call_id: approval.0,
-        }));
+        },
+    )));
     assert_eq!(stale_revision.result.unwrap_err().code, ErrorCode::Conflict);
 
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
-        run_id,
-        attempt_id: approval.1,
-        expected_control_revision: approval.2,
-        tool_call_id: approval.0,
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::ApproveAgentAction {
+            run_id,
+            attempt_id: approval.1,
+            expected_control_revision: approval.2,
+            tool_call_id: approval.0,
+        },
+    )));
     assert!(response.result.is_ok());
     await_settled_run(&connection, run_id);
     let resolved_interactions = backend
@@ -3016,16 +3313,18 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     let command_approval = (0..1_000)
         .find_map(|_| {
             let events = match connection
-                .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-                    session_id: Some(session_id),
-                    workspace_id: None,
-                    after_sequence: None,
-                    stream_epoch: None,
-                }))
+                .request(RequestEnvelope::new(ClientRequest::Events(
+                    EventsRequest::GetSessionEvents {
+                        session_id: Some(session_id),
+                        workspace_id: None,
+                        after_sequence: None,
+                        stream_epoch: None,
+                    },
+                )))
                 .result
                 .unwrap()
             {
-                ServerResponse::SessionEvents { events, .. } => events,
+                ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) => events,
                 response => panic!("unexpected events response: {response:?}"),
             };
             let approval = events.iter().find_map(|event| match &event.event {
@@ -3046,19 +3345,23 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             })
         })
         .expect("run_command approval did not arrive");
-    let response = connection.request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
-        run_id,
-        attempt_id: command_approval.1,
-        expected_control_revision: command_approval.2,
-        tool_call_id: command_approval.0,
-    }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::ApproveAgentAction {
+            run_id,
+            attempt_id: command_approval.1,
+            expected_control_revision: command_approval.2,
+            tool_call_id: command_approval.0,
+        },
+    )));
     assert!(response.result.is_ok());
     let mut usage = match connection
-        .request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }))
+        .request(RequestEnvelope::new(ClientRequest::Usage(
+            UsageRequest::GetRunUsage { run_id },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::RunUsage { usage, .. } => usage,
+        ServerResponse::Usage(UsageResponse::RunUsage { usage, .. }) => usage,
         response => panic!("unexpected usage response: {response:?}"),
     };
     for _ in 0..1_000 {
@@ -3067,29 +3370,35 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         }
         thread::sleep(Duration::from_millis(5));
         usage = match connection
-            .request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }))
+            .request(RequestEnvelope::new(ClientRequest::Usage(
+                UsageRequest::GetRunUsage { run_id },
+            )))
             .result
             .unwrap()
         {
-            ServerResponse::RunUsage { usage, .. } => usage,
+            ServerResponse::Usage(UsageResponse::RunUsage { usage, .. }) => usage,
             response => panic!("unexpected usage response: {response:?}"),
         };
     }
     assert_eq!(usage.input_tokens, 240);
     assert_eq!(usage.output_tokens, 52);
     assert_eq!(usage.tool_calls, 3);
-    let filesystem = connection.request(RequestEnvelope::new(
-        ClientRequest::GetSessionFilesystemSnapshot { session_id },
-    ));
+    let filesystem = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::GetSessionFilesystemSnapshot { session_id },
+    )));
     assert!(matches!(
         filesystem.result,
-        Ok(ServerResponse::SessionFilesystemSnapshot(_))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::SessionFilesystemSnapshot(_)
+        ))
     ));
     backend.shutdown().unwrap();
     backend.shutdown().unwrap();
     assert_eq!(
         connection
-            .request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }))
+            .request(RequestEnvelope::new(ClientRequest::Usage(
+                UsageRequest::GetRunUsage { run_id }
+            )))
             .result
             .unwrap_err()
             .code,
@@ -3100,16 +3409,21 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     let reopened = InProcessBackend::new_persistent(&persistence).unwrap();
     let reopened_connection = reopened.connect();
     negotiate_m3(&reopened_connection);
-    let recovered_usage =
-        reopened_connection.request(RequestEnvelope::new(ClientRequest::GetRunUsage { run_id }));
-    let ServerResponse::RunUsage { usage, .. } = recovered_usage.result.unwrap() else {
+    let recovered_usage = reopened_connection.request(RequestEnvelope::new(ClientRequest::Usage(
+        UsageRequest::GetRunUsage { run_id },
+    )));
+    let ServerResponse::Usage(UsageResponse::RunUsage { usage, .. }) =
+        recovered_usage.result.unwrap()
+    else {
         panic!("unexpected recovered usage response");
     };
     assert_eq!(usage.input_tokens, 240);
     assert_eq!(usage.output_tokens, 52);
-    let before_retry =
-        reopened_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
-    let ServerResponse::AgentRun(before_retry) = before_retry.result.unwrap() else {
+    let before_retry = reopened_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(before_retry)) = before_retry.result.unwrap()
+    else {
         panic!("unexpected run response before checkpoint retry");
     };
     let prior_attempts = reopened
@@ -3120,13 +3434,13 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         .unwrap();
     assert_eq!(prior_attempts.len(), 1);
     assert_eq!(prior_attempts[0].id, before_retry.attempt_id);
-    let retried = reopened_connection.request(RequestEnvelope::new(
-        ClientRequest::RetryAgentFromCheckpoint {
+    let retried = reopened_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::RetryAgentFromCheckpoint {
             run_id,
             checkpoint_id: checkpoint.id,
         },
-    ));
-    let ServerResponse::AgentRun(retried) = retried.result.unwrap() else {
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(retried)) = retried.result.unwrap() else {
         panic!("unexpected checkpoint retry response");
     };
     assert_ne!(retried.attempt_id, before_retry.attempt_id);
@@ -3134,9 +3448,11 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         await_settled_run(&reopened_connection, run_id).state,
         AgentRunState::AwaitingApproval
     );
-    let after_retry =
-        reopened_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
-    let ServerResponse::AgentRun(after_retry) = after_retry.result.unwrap() else {
+    let after_retry = reopened_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(after_retry)) = after_retry.result.unwrap()
+    else {
         panic!("unexpected run response after checkpoint retry");
     };
     assert_eq!(after_retry.attempt_id, retried.attempt_id);
@@ -3229,12 +3545,14 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         .session_id;
     let restored_connection = restored.connect();
     negotiate_m3(&restored_connection);
-    let metadata = restored_connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentSessionSnapshotMetadata {
+    let metadata = restored_connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshotMetadata {
             session_id: recovery_session_id,
         },
-    ));
-    let ServerResponse::AgentSessionSnapshot(metadata) = metadata.result.unwrap() else {
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(metadata)) =
+        metadata.result.unwrap()
+    else {
         panic!("unexpected metadata session snapshot response");
     };
     assert!(
@@ -3243,12 +3561,14 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             .as_ref()
             .is_some_and(|projection| projection.messages.is_empty())
     );
-    let initial = restored_connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentSessionInitialState {
+    let initial = restored_connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionInitialState {
             session_id: recovery_session_id,
         },
-    ));
-    let ServerResponse::AgentSessionInitialState(initial) = initial.result.unwrap() else {
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial)) =
+        initial.result.unwrap()
+    else {
         panic!("unexpected initial session state response");
     };
     assert_eq!(initial.cursor, initial.projection.latest_sequence);
@@ -3260,56 +3580,59 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
             .is_some_and(|projection| projection.messages.is_empty())
     );
     assert!(restored.runs().unwrap().is_empty());
-    let page = restored_connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessagePage {
+    let page = restored_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessagePage {
             run_id,
             before_ordinal: None,
             limit: 10,
         },
-    ));
-    let ServerResponse::AgentRunMessagePage { messages, .. } = page.result.unwrap() else {
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunMessagePage { messages, .. }) =
+        page.result.unwrap()
+    else {
         panic!("unexpected transcript page response");
     };
     assert!(!messages.is_empty());
     let first = messages.first().unwrap();
     assert!(first.content_bytes > 0);
-    let content = restored_connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunMessageContentRange {
+    let content = restored_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunMessageContentRange {
             run_id,
             message_ordinal: first.ordinal,
             byte_offset: 0,
             length: u32::try_from(first.content_bytes.min(128)).unwrap(),
         },
-    ));
-    let ServerResponse::AgentRunMessageContentRange { content, .. } = content.result.unwrap()
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunMessageContentRange { content, .. }) =
+        content.result.unwrap()
     else {
         panic!("unexpected transcript content response");
     };
     assert!(!content.is_empty());
-    let invalid_page = restored_connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunTranscriptPage {
+    let invalid_page = restored_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunTranscriptPage {
             run_id,
             before_ordinal: None,
             limit: 0,
         },
-    ));
+    )));
     assert_eq!(
         invalid_page.result.unwrap_err().code,
         ErrorCode::InvalidRequest
     );
-    let transcript_page = restored_connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentRunTranscriptPage {
+    let transcript_page = restored_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunTranscriptPage {
             run_id,
             before_ordinal: None,
             limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
         },
-    ));
-    let ServerResponse::AgentRunTranscriptPage {
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunTranscriptPage {
         messages,
         next_before,
         has_older,
         ..
-    } = transcript_page.result.unwrap()
+    }) = transcript_page.result.unwrap()
     else {
         panic!("unexpected bounded transcript page response");
     };
@@ -3322,11 +3645,11 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
     assert_eq!(next_before, messages.first().map(|message| message.ordinal));
     assert!(!has_older);
 
-    let projection =
-        restored_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
-            run_id,
-        }));
-    let ServerResponse::AgentRunSnapshot(projection) = projection.result.unwrap() else {
+    let projection = restored_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunSnapshot { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunSnapshot(projection)) = projection.result.unwrap()
+    else {
         panic!("unexpected lazily restored run snapshot response");
     };
     assert_eq!(projection.run.state, AgentRunState::Paused);
@@ -3341,14 +3664,17 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         .unwrap();
     assert_eq!(execution.state, AgentRunState::Paused);
     assert!(execution.pending_tool_execution.is_none());
-    let events =
-        restored_connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+    let events = restored_connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
             session_id: Some(recovery_session_id),
             workspace_id: None,
             after_sequence: None,
             stream_epoch: None,
-        }));
-    let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        events.result.unwrap()
+    else {
         panic!("unexpected recovery event response");
     };
     assert!(events.iter().any(|event| matches!(
@@ -3374,31 +3700,38 @@ fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
         let session_root_base = backend.session_root_base.clone();
         let connection = backend.connect();
         negotiate_m3(&connection);
-        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Run summary workspace".to_owned(),
-        }));
-        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Run summary workspace".to_owned(),
+            },
+        )));
+        let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+            workspace.result.unwrap()
+        else {
             panic!("unexpected workspace response");
         };
-        let session = connection.request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Completed history".to_owned(),
             },
-        ));
-        let ServerResponse::AgentSessionCreated(session) = session.result.unwrap() else {
+        )));
+        let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+            session.result.unwrap()
+        else {
             panic!("unexpected session response");
         };
-        let started =
-            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+        let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
                 session_id: session.id,
                 task: "answer briefly".to_owned(),
                 model: ModelId::new("deterministic/demo"),
                 system_instructions: None,
                 repository_instructions: None,
-            }));
+            },
+        )));
         let run_id = match started.result.unwrap() {
-            ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+            ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
             response => panic!("unexpected response: {response:?}"),
         };
         let settled = await_settled_run(&connection, run_id);
@@ -3413,17 +3746,19 @@ fn completed_runs_keep_indexed_summaries_without_restoring_runtime_objects() {
     assert!(backend.persisted_runs().unwrap().is_empty());
     let connection = backend.connect();
     negotiate_m3(&connection);
-    let response = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun { run_id },
+    )));
     assert!(matches!(
         response.result,
-        Ok(ServerResponse::AgentRun(snapshot)) if snapshot.state == AgentRunState::Completed
+        Ok(ServerResponse::Run(RunResponse::AgentRun(snapshot))) if snapshot.state == AgentRunState::Completed
     ));
-    let projection = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
-        run_id,
-    }));
+    let projection = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunSnapshot { run_id },
+    )));
     assert!(matches!(
         projection.result,
-        Ok(ServerResponse::AgentRunSnapshot(snapshot))
+        Ok(ServerResponse::Run(RunResponse::AgentRunSnapshot(snapshot)))
             if snapshot.run.state == AgentRunState::Completed && !snapshot.messages.is_empty()
     ));
     assert!(backend.runs().unwrap().is_empty());
@@ -3436,79 +3771,92 @@ fn pause_resume_fork_and_provider_discovery_are_protocol_operations() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     negotiate_m3(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Control workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Control workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let session = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "control run".to_owned(),
         },
-    ));
+    )));
     let session_id = match session.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
-    connection.request(RequestEnvelope::new(
-        ClientRequest::SetSessionApprovalPolicy {
+    connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetSessionApprovalPolicy {
             session_id,
             policy: ApprovalPolicy::default(),
             auto_approve_actions: Some(false),
         },
-    ));
-    let started = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-        session_id,
-        task: "control".to_owned(),
-        model: ModelId::new("deterministic/demo"),
-        system_instructions: None,
-        repository_instructions: None,
-    }));
+    )));
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: "control".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
     let run_id = match started.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     await_settled_run(&connection, run_id);
-    let paused = connection.request(RequestEnvelope::new(ClientRequest::PauseAgentRun {
-        run_id,
-    }));
-    let ServerResponse::AgentRun(snapshot) = paused.result.unwrap() else {
+    let paused = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::PauseAgentRun { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = paused.result.unwrap() else {
         panic!("unexpected pause response");
     };
     assert_eq!(snapshot.state, AgentRunState::Paused);
-    let resumed = connection.request(RequestEnvelope::new(ClientRequest::ResumeAgentRun {
-        run_id,
-    }));
-    let ServerResponse::AgentRun(snapshot) = resumed.result.unwrap() else {
+    let resumed = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::ResumeAgentRun { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = resumed.result.unwrap() else {
         panic!("unexpected resume response");
     };
     assert_eq!(snapshot.state, AgentRunState::AwaitingApproval);
 
-    let forked = connection.request(RequestEnvelope::new(ClientRequest::ForkAgentSession {
-        session_id,
-        name: "control fork".to_owned(),
-    }));
+    let forked = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ForkAgentSession {
+            session_id,
+            name: "control fork".to_owned(),
+        },
+    )));
     let forked_id = match forked.result.unwrap() {
-        ServerResponse::AgentSessionForked(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionForked(snapshot)) => snapshot.id,
         response => panic!("unexpected fork response: {response:?}"),
     };
     assert_ne!(forked_id, session_id);
-    let forked_settings = connection.request(RequestEnvelope::new(
-        ClientRequest::GetAgentSessionSnapshot {
+    let forked_settings = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::GetAgentSessionSnapshot {
             session_id: forked_id,
         },
-    ));
-    let ServerResponse::AgentSessionSnapshot(forked_settings) = forked_settings.result.unwrap()
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionSnapshot(forked_settings)) =
+        forked_settings.result.unwrap()
     else {
         panic!("unexpected forked session snapshot response");
     };
     assert!(!forked_settings.auto_approve_actions);
     assert_eq!(forked_settings.approval_policy, ApprovalPolicy::default());
 
-    let providers = connection.request(RequestEnvelope::new(ClientRequest::ListProviders));
-    let ServerResponse::Providers { providers } = providers.result.unwrap() else {
+    let providers = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ListProviders,
+    )));
+    let ServerResponse::Provider(ProviderResponse::Providers { providers }) =
+        providers.result.unwrap()
+    else {
         panic!("unexpected provider response");
     };
     assert!(
@@ -3529,24 +3877,28 @@ fn explicit_limits_and_context_inspection_are_durable_protocol_state() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     negotiate_m3(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Limited workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Limited workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let session = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "limited run".to_owned(),
         },
-    ));
+    )));
     let session_id = match session.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
-    let started = connection.request(RequestEnvelope::new(
-        ClientRequest::StartSessionAgentRunWithOptions {
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRunWithOptions {
             session_id,
             task: "limited".to_owned(),
             model: ModelId::new("deterministic/demo"),
@@ -3562,9 +3914,9 @@ fn explicit_limits_and_context_inspection_are_durable_protocol_state() {
                 reserved_output_tokens: Some(128),
             },
         },
-    ));
+    )));
     let run_id = match started.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     assert_eq!(
@@ -3572,16 +3924,18 @@ fn explicit_limits_and_context_inspection_are_durable_protocol_state() {
         AgentRunState::Failed
     );
     let events = match connection
-        .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(session_id),
-            workspace_id: None,
-            after_sequence: None,
-            stream_epoch: None,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                workspace_id: None,
+                after_sequence: None,
+                stream_epoch: None,
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::SessionEvents { events, .. } => events,
+        ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) => events,
         response => panic!("unexpected response: {response:?}"),
     };
     assert!(events.iter().any(|event| {
@@ -3592,16 +3946,17 @@ fn explicit_limits_and_context_inspection_are_durable_protocol_state() {
             } if status.exceeded.contains(&loom_core::LimitKind::ToolCalls)
         )
     }));
-    let usage = connection.request(RequestEnvelope::new(ClientRequest::GetSessionUsage {
-        session_id,
-    }));
-    let ServerResponse::SessionUsage { usage, .. } = usage.result.unwrap() else {
+    let usage = connection.request(RequestEnvelope::new(ClientRequest::Usage(
+        UsageRequest::GetSessionUsage { session_id },
+    )));
+    let ServerResponse::Usage(UsageResponse::SessionUsage { usage, .. }) = usage.result.unwrap()
+    else {
         panic!("unexpected session usage response");
     };
     assert_eq!(usage.tool_calls, 0);
-    let context = connection.request(RequestEnvelope::new(ClientRequest::InspectAgentContext {
-        run_id,
-    }));
+    let context = connection.request(RequestEnvelope::new(ClientRequest::Context(
+        ContextRequest::InspectAgentContext { run_id },
+    )));
     assert_eq!(context.result.unwrap_err().code, ErrorCode::InvalidState);
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
@@ -3647,97 +4002,118 @@ fn m5_workspace_context_vcs_and_task_evidence_are_authoritative() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     negotiate_m5(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Context workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Context workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let created = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "Context session".to_owned(),
         },
-    ));
-    let ServerResponse::AgentSessionCreated(session) = created.result.unwrap() else {
+    )));
+    let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+        created.result.unwrap()
+    else {
         panic!("unexpected session response");
     };
     let session_id = session.id;
-    let attached = connection.request(RequestEnvelope::new(
-        ClientRequest::AttachSessionRepository {
+    let attached = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::AttachSessionRepository {
             session_id,
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
         },
-    ));
+    )));
     assert!(matches!(
         attached.result,
-        Ok(ServerResponse::SessionRepositoryAttached(_))
+        Ok(ServerResponse::Repository(
+            RepositoryResponse::SessionRepositoryAttached(_)
+        ))
     ));
-    let context = connection.request(RequestEnvelope::new(
-        ClientRequest::GetSessionContextFiles { session_id },
-    ));
+    let context = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::GetSessionContextFiles { session_id },
+    )));
     assert!(matches!(
         context.result,
-        Ok(ServerResponse::ContextFiles { .. })
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::ContextFiles { .. }
+        ))
     ));
-    let repositories = connection.request(RequestEnvelope::new(
-        ClientRequest::ListSessionRepositories { session_id },
-    ));
-    let ServerResponse::SessionRepositories { repositories } = repositories.result.unwrap() else {
+    let repositories = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::ListSessionRepositories { session_id },
+    )));
+    let ServerResponse::Repository(RepositoryResponse::SessionRepositories { repositories }) =
+        repositories.result.unwrap()
+    else {
         panic!("unexpected session repositories");
     };
-    let vcs = connection.request(RequestEnvelope::new(ClientRequest::GetSessionVcsStatus {
-        session_id,
-        repository_id: repositories[0].id,
-    }));
-    assert!(matches!(vcs.result, Ok(ServerResponse::VcsStatus(_))));
-
-    let task = connection.request(RequestEnvelope::new(ClientRequest::StartSessionTask {
-        session_id,
-        spec: TaskSpec {
-            kind: TaskKind::Test,
-            label: "evidence fixture".to_owned(),
-            command: if cfg!(windows) {
-                "cmd".to_owned()
-            } else {
-                "printf".to_owned()
-            },
-            args: if cfg!(windows) {
-                vec!["/C".to_owned(), "ok".to_owned()]
-            } else {
-                vec!["ok".to_owned()]
-            },
-            cwd: None,
-            output_limit_bytes: Some(128),
-            artifact_paths: Vec::new(),
+    let vcs = connection.request(RequestEnvelope::new(ClientRequest::Repository(
+        RepositoryRequest::GetSessionVcsStatus {
+            session_id,
+            repository_id: repositories[0].id,
         },
-    }));
+    )));
+    assert!(matches!(
+        vcs.result,
+        Ok(ServerResponse::Repository(RepositoryResponse::VcsStatus(_)))
+    ));
+
+    let task = connection.request(RequestEnvelope::new(ClientRequest::Task(
+        TaskRequest::StartSessionTask {
+            session_id,
+            spec: TaskSpec {
+                kind: TaskKind::Test,
+                label: "evidence fixture".to_owned(),
+                command: if cfg!(windows) {
+                    "cmd".to_owned()
+                } else {
+                    "printf".to_owned()
+                },
+                args: if cfg!(windows) {
+                    vec!["/C".to_owned(), "ok".to_owned()]
+                } else {
+                    vec!["ok".to_owned()]
+                },
+                cwd: None,
+                output_limit_bytes: Some(128),
+                artifact_paths: Vec::new(),
+            },
+        },
+    )));
     let task_id = match task.result.unwrap() {
-        ServerResponse::TaskStarted(task) => task.id,
+        ServerResponse::Task(TaskResponse::TaskStarted(task)) => task.id,
         response => panic!("unexpected task response: {response:?}"),
     };
     for _ in 0..100 {
-        let current = connection.request(RequestEnvelope::new(ClientRequest::GetSessionTask {
-            session_id,
-            task_id,
-        }));
-        if let Ok(ServerResponse::Task(snapshot)) = current.result
+        let current = connection.request(RequestEnvelope::new(ClientRequest::Task(
+            TaskRequest::GetSessionTask {
+                session_id,
+                task_id,
+            },
+        )));
+        if let Ok(ServerResponse::Task(TaskResponse::Task(snapshot))) = current.result
             && matches!(
                 snapshot.status,
                 TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
             )
         {
-            let evidence = connection.request(RequestEnvelope::new(
-                ClientRequest::GetSessionTaskEvidence {
+            let evidence = connection.request(RequestEnvelope::new(ClientRequest::Task(
+                TaskRequest::GetSessionTaskEvidence {
                     session_id,
                     task_id,
                 },
-            ));
+            )));
             assert!(matches!(
                 evidence.result,
-                Ok(ServerResponse::TaskEvidence { .. })
+                Ok(ServerResponse::Task(TaskResponse::TaskEvidence { .. }))
             ));
             fs::remove_dir_all(&backend.session_root_base).unwrap();
             fs::remove_dir_all(root).unwrap();
@@ -3754,31 +4130,33 @@ fn protocol_filesystem_requests_cover_snapshots_edits_checkpoints_and_undo() {
     let connection = backend.connect();
     negotiate_m5(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Filesystem protocol".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Filesystem protocol".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let session_id = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Filesystem session".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
 
-    let created = connection.request(RequestEnvelope::new(
-        ClientRequest::ApplySessionFilesystemEdit {
+    let created = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ApplySessionFilesystemEdit {
             session_id,
             edit: WorkspaceEdit {
                 path: "notes/plan.md".to_owned(),
@@ -3787,30 +4165,36 @@ fn protocol_filesystem_requests_cover_snapshots_edits_checkpoints_and_undo() {
                 expected_revision: None,
             },
         },
-    ));
+    )));
     assert!(matches!(
         created.result,
-        Ok(ServerResponse::WorkspaceEditApplied(_))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::WorkspaceEditApplied(_)
+        ))
     ));
     let checkpoint_id = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateSessionCheckpoint {
+        .request(RequestEnvelope::new(ClientRequest::Filesystem(
+            FilesystemRequest::CreateSessionCheckpoint {
                 session_id,
                 label: "before update".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::CheckpointCreated(checkpoint) => checkpoint.id,
+        ServerResponse::Filesystem(FilesystemResponse::CheckpointCreated(checkpoint)) => {
+            checkpoint.id
+        }
         response => panic!("unexpected checkpoint response: {response:?}"),
     };
-    let read = connection.request(RequestEnvelope::new(ClientRequest::ReadSessionFile {
-        session_id,
-        path: "notes/plan.md".to_owned(),
-    }));
+    let read = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ReadSessionFile {
+            session_id,
+            path: "notes/plan.md".to_owned(),
+        },
+    )));
     let revision = match read.result.unwrap() {
-        ServerResponse::SessionFilesystemFile(file) => {
+        ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemFile(file)) => {
             assert_eq!(file.content, "first version");
             file.revision
         }
@@ -3818,17 +4202,19 @@ fn protocol_filesystem_requests_cover_snapshots_edits_checkpoints_and_undo() {
     };
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::RevertSessionCheckpoint {
+            .request(RequestEnvelope::new(ClientRequest::Filesystem(
+                FilesystemRequest::RevertSessionCheckpoint {
                     session_id,
                     checkpoint_id,
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::CheckpointReverted(_))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::CheckpointReverted(_)
+        ))
     ));
-    let updated = connection.request(RequestEnvelope::new(
-        ClientRequest::ApplySessionFilesystemEdit {
+    let updated = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ApplySessionFilesystemEdit {
             session_id,
             edit: WorkspaceEdit {
                 path: "notes/plan.md".to_owned(),
@@ -3837,41 +4223,49 @@ fn protocol_filesystem_requests_cover_snapshots_edits_checkpoints_and_undo() {
                 expected_revision: Some(revision),
             },
         },
-    ));
+    )));
     assert!(matches!(
         updated.result,
-        Ok(ServerResponse::WorkspaceEditApplied(_))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::WorkspaceEditApplied(_)
+        ))
     ));
-    let undo = connection.request(RequestEnvelope::new(ClientRequest::UndoSessionEdit {
-        session_id,
-    }));
+    let undo = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::UndoSessionEdit { session_id },
+    )));
     assert_eq!(undo.result.unwrap_err().code, ErrorCode::InvalidState);
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::GetSessionFilesystemSnapshot { session_id },
-            ))
+            .request(RequestEnvelope::new(ClientRequest::Filesystem(
+                FilesystemRequest::GetSessionFilesystemSnapshot { session_id }
+            ),))
             .result,
-        Ok(ServerResponse::SessionFilesystemSnapshot(_))
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::SessionFilesystemSnapshot(_)
+        ))
     ));
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::GetSessionFilesystemChanges {
+            .request(RequestEnvelope::new(ClientRequest::Filesystem(
+                FilesystemRequest::GetSessionFilesystemChanges {
                     session_id,
                     after_sequence: None,
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::SessionFilesystemChanges { .. })
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::SessionFilesystemChanges { .. }
+        ))
     ));
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::GetSessionContextFiles { session_id }
-            ))
+            .request(RequestEnvelope::new(ClientRequest::Filesystem(
+                FilesystemRequest::GetSessionContextFiles { session_id }
+            )))
             .result,
-        Ok(ServerResponse::ContextFiles { .. })
+        Ok(ServerResponse::Filesystem(
+            FilesystemResponse::ContextFiles { .. }
+        ))
     ));
     fs::remove_dir_all(&backend.session_root_base).unwrap();
 }
@@ -3882,73 +4276,91 @@ fn session_scoped_tokens_are_limited_to_their_sessions_and_source_roots() {
     let unrestricted = backend.connect();
     negotiate(&unrestricted);
     let workspace = match unrestricted
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Scoped access".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Scoped access".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let session_id = match unrestricted
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Authorized session".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
 
     assert!(matches!(
         unrestricted
-            .request(RequestEnvelope::new(ClientRequest::ListWorkspaces))
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::ListWorkspaces
+            )))
             .result,
-        Ok(ServerResponse::Workspaces { .. })
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::Workspaces { .. }
+        ))
     ));
     assert!(matches!(
         unrestricted
-            .request(RequestEnvelope::new(
-                ClientRequest::GetWorkspaceConfigForWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::GetWorkspaceConfigForWorkspace {
                     workspace_id: workspace.id,
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::WorkspaceConfig(_))
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfig(_)
+        ))
     ));
     assert!(matches!(
         unrestricted
-            .request(RequestEnvelope::new(
-                ClientRequest::SetWorkspaceConfigForWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                     workspace_id: workspace.id,
                     config: WorkspaceConfig::default(),
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::WorkspaceConfigUpdated)
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
     ));
     assert!(matches!(
         unrestricted
-            .request(RequestEnvelope::new(ClientRequest::RenameWorkspace {
-                workspace_id: workspace.id,
-                name: "Renamed workspace".to_owned(),
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::RenameWorkspace {
+                    workspace_id: workspace.id,
+                    name: "Renamed workspace".to_owned(),
+                }
+            )))
             .result,
-        Ok(ServerResponse::WorkspaceRenamed(_))
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceRenamed(_)
+        ))
     ));
     assert!(matches!(
         unrestricted
-            .request(RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
-                workspace_id: workspace.id,
-                include_archived: false,
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::ListWorkspaceSessions {
+                    workspace_id: workspace.id,
+                    include_archived: false,
+                }
+            )))
             .result,
-        Ok(ServerResponse::AgentSessions { .. })
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessions { .. }
+        ))
     ));
 
     let tokens = AuthTokenStore::new();
@@ -3962,17 +4374,19 @@ fn session_scoped_tokens_are_limited_to_their_sessions_and_source_roots() {
     negotiate(&scoped);
     assert!(matches!(
         scoped
-            .request(RequestEnvelope::new(ClientRequest::GetAgentSession {
-                session_id
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Session(
+                SessionRequest::GetAgentSession { session_id }
+            )))
             .result,
-        Ok(ServerResponse::AgentSession(_))
+        Ok(ServerResponse::Session(SessionResponse::AgentSession(_)))
     ));
     assert_eq!(
         scoped
-            .request(RequestEnvelope::new(ClientRequest::GetAgentSession {
-                session_id: AgentSessionId::new(),
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Session(
+                SessionRequest::GetAgentSession {
+                    session_id: AgentSessionId::new(),
+                }
+            )))
             .result
             .unwrap_err()
             .code,
@@ -3980,9 +4394,11 @@ fn session_scoped_tokens_are_limited_to_their_sessions_and_source_roots() {
     );
     assert_eq!(
         scoped
-            .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-                name: "Denied workspace".to_owned(),
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateWorkspace {
+                    name: "Denied workspace".to_owned(),
+                }
+            )))
             .result
             .unwrap_err()
             .code,
@@ -3990,12 +4406,12 @@ fn session_scoped_tokens_are_limited_to_their_sessions_and_source_roots() {
     );
     assert_eq!(
         scoped
-            .request(RequestEnvelope::new(
-                ClientRequest::CreateAgentSessionInWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateAgentSessionInWorkspace {
                     workspace_id: workspace.id,
                     name: "Denied session".to_owned(),
-                },
-            ))
+                }
+            ),))
             .result
             .unwrap_err()
             .code,
@@ -4003,13 +4419,13 @@ fn session_scoped_tokens_are_limited_to_their_sessions_and_source_roots() {
     );
     assert_eq!(
         scoped
-            .request(RequestEnvelope::new(
-                ClientRequest::AttachSessionDirectory {
+            .request(RequestEnvelope::new(ClientRequest::Filesystem(
+                FilesystemRequest::AttachSessionDirectory {
                     session_id,
                     source: std::env::temp_dir().display().to_string(),
                     path: "sources/local".to_owned(),
                 }
-            ))
+            )))
             .result
             .unwrap_err()
             .code,
@@ -4017,12 +4433,14 @@ fn session_scoped_tokens_are_limited_to_their_sessions_and_source_roots() {
     );
     assert_eq!(
         scoped
-            .request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-                session_id: None,
-                workspace_id: None,
-                after_sequence: None,
-                stream_epoch: None,
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Events(
+                EventsRequest::GetSessionEvents {
+                    session_id: None,
+                    workspace_id: None,
+                    after_sequence: None,
+                    stream_epoch: None,
+                }
+            )))
             .result
             .unwrap_err()
             .code,
@@ -4038,36 +4456,38 @@ fn project_snapshot_is_available_to_authorized_tokens_and_scoped_by_membership()
     let unrestricted = backend.connect();
     negotiate(&unrestricted);
     let workspace = match unrestricted
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project snapshots".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project snapshots".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match unrestricted
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Project root".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(root) => root,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(root)) => root,
         response => panic!("unexpected session response: {response:?}"),
     };
     let project_id = ProjectId::from_uuid(*root.id.as_uuid());
     let snapshot = unrestricted
-        .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
-            project_id,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::GetProjectSnapshot { project_id },
+        )))
         .result
         .unwrap();
-    let ServerResponse::ProjectSnapshot(snapshot) = snapshot else {
+    let ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot)) = snapshot else {
         panic!("expected project snapshot, received {snapshot:?}");
     };
     assert_eq!(snapshot.project_id, project_id);
@@ -4079,9 +4499,11 @@ fn project_snapshot_is_available_to_authorized_tokens_and_scoped_by_membership()
     let unknown_project_id = ProjectId::new();
     assert_eq!(
         unrestricted
-            .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
-                project_id: unknown_project_id,
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Project(
+                ProjectRequest::GetProjectSnapshot {
+                    project_id: unknown_project_id,
+                }
+            )))
             .result
             .unwrap_err()
             .code,
@@ -4099,9 +4521,9 @@ fn project_snapshot_is_available_to_authorized_tokens_and_scoped_by_membership()
     negotiate(&scoped);
     assert_eq!(
         scoped
-            .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
-                project_id,
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Project(
+                ProjectRequest::GetProjectSnapshot { project_id }
+            )))
             .result
             .unwrap_err()
             .code,
@@ -4118,9 +4540,9 @@ fn project_snapshot_is_available_to_authorized_tokens_and_scoped_by_membership()
     negotiate(&workspace_scoped);
     assert_eq!(
         workspace_scoped
-            .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
-                project_id,
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Project(
+                ProjectRequest::GetProjectSnapshot { project_id }
+            )))
             .result
             .unwrap_err()
             .code,
@@ -4141,26 +4563,28 @@ fn archiving_project_requires_terminal_children_then_archives_the_tree() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Archive policy".into(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Archive policy".into(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Manager".into(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
         response => panic!("unexpected session response: {response:?}"),
     };
     let child_id = AgentSessionId::new();
@@ -4209,9 +4633,11 @@ fn archiving_project_requires_terminal_children_then_archives_the_tree() {
 
     assert_eq!(
         connection
-            .request(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
-                session_id: root.id,
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Session(
+                SessionRequest::ArchiveAgentSession {
+                    session_id: root.id,
+                }
+            )))
             .result
             .unwrap_err()
             .code,
@@ -4234,11 +4660,11 @@ fn archiving_project_requires_terminal_children_then_archives_the_tree() {
         .unwrap();
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
+            .request(RequestEnvelope::new(ClientRequest::Session(SessionRequest::ArchiveAgentSession{
                 session_id: root.id,
-            }))
+            })))
             .result,
-        Ok(ServerResponse::AgentSessionArchived(session))
+        Ok(ServerResponse::Session(SessionResponse::AgentSessionArchived(session)))
             if session.state == AgentSessionState::Archived
     ));
     assert_eq!(
@@ -4261,26 +4687,28 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project agents".into(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project agents".into(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Manager".into(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
 
@@ -4296,20 +4724,22 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
     let response =
         connection.create_project_child(request_id, root, "worker-1".into(), create_spec.clone());
     let (task, child) = match response.unwrap() {
-        ServerResponse::ProjectChildCreated { task, child } => (task, child),
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (task, child)
+        }
         response => panic!("unexpected child response: {response:?}"),
     };
     assert_eq!(task.requester_session_id, root);
     assert_eq!(task.target_session_id, child.session_id);
     assert_eq!(child.depth, 2);
-    let child_project_snapshot = connection.request(RequestEnvelope::new(
-        ClientRequest::GetProjectSnapshotForSession {
+    let child_project_snapshot = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::GetProjectSnapshotForSession {
             session_id: child.session_id,
         },
-    ));
+    )));
     assert!(matches!(
         child_project_snapshot.result,
-        Ok(ServerResponse::ProjectSnapshot(snapshot))
+        Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot)))
             if snapshot.project_id == task.project_id
                 && snapshot.root_session_id == root
                 && snapshot.agents.len() == 2
@@ -4321,22 +4751,26 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
             "worker-1".into(),
             create_spec.clone(),
         ),
-        Ok(ServerResponse::ProjectChildCreated { task: repeated, child: repeated_child })
+        Ok(ServerResponse::Project(ProjectResponse::ProjectChildCreated{ task: repeated, child: repeated_child }))
             if repeated.task_id == task.task_id && repeated_child.session_id == child.session_id
     ));
     let snapshot = connection
-        .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
-            project_id: ProjectId::from_uuid(*root.as_uuid()),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::GetProjectSnapshot {
+                project_id: ProjectId::from_uuid(*root.as_uuid()),
+            },
+        )))
         .result
         .unwrap();
     assert!(
-        matches!(snapshot, ServerResponse::ProjectSnapshot(snapshot) if snapshot.agents.len() == 2)
+        matches!(snapshot, ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot)) if snapshot.agents.len() == 2)
     );
-    let ServerResponse::ProjectSnapshot(project_snapshot) = connection
-        .request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
-            project_id: ProjectId::from_uuid(*root.as_uuid()),
-        }))
+    let ServerResponse::Project(ProjectResponse::ProjectSnapshot(project_snapshot)) = connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::GetProjectSnapshot {
+                project_id: ProjectId::from_uuid(*root.as_uuid()),
+            },
+        )))
         .result
         .unwrap()
     else {
@@ -4366,43 +4800,45 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
     ] {
         assert_eq!(
             connection
-                .request(RequestEnvelope::new(
-                    ClientRequest::SendProjectAgentMessage {
+                .request(RequestEnvelope::new(ClientRequest::Project(
+                    ProjectRequest::SendProjectAgentMessage {
                         message: untrusted_message,
                     }
-                ))
+                )))
                 .result
                 .unwrap_err()
                 .code,
             ErrorCode::AuthorizationDenied
         );
     }
-    let root_events = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(root),
-        workspace_id: None,
-        after_sequence: Some(EventSequence::default()),
-        stream_epoch: None,
-    }));
+    let root_events = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(root),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::default()),
+            stream_epoch: None,
+        },
+    )));
     assert!(matches!(
         root_events.result,
-        Ok(ServerResponse::SessionEvents { events, .. })
+        Ok(ServerResponse::Events(EventsResponse::SessionEvents{ events, .. }))
             if events.iter().all(|event| !matches!(
                 &event.event,
                 ServerEvent::ProjectAgentMessageAccepted { message: accepted }
                     if accepted.project_id == message.project_id
             ))
     ));
-    let messages = connection.request(RequestEnvelope::new(
-        ClientRequest::ListProjectAgentMessages {
+    let messages = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::ListProjectAgentMessages {
             project_id: message.project_id,
             session_id: child.session_id,
             after_project_sequence: None,
             limit: 10,
         },
-    ));
+    )));
     assert!(matches!(
         messages.result,
-        Ok(ServerResponse::ProjectAgentMessages { messages, .. }) if messages.is_empty()
+        Ok(ServerResponse::Project(ProjectResponse::ProjectAgentMessages{ messages, .. })) if messages.is_empty()
     ));
     let tokens = AuthTokenStore::new();
     let scoped_token = tokens
@@ -4415,11 +4851,11 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
     negotiate(&scoped);
     assert_eq!(
         scoped
-            .request(RequestEnvelope::new(
-                ClientRequest::SendProjectAgentMessage {
+            .request(RequestEnvelope::new(ClientRequest::Project(
+                ProjectRequest::SendProjectAgentMessage {
                     message: message.clone(),
                 }
-            ))
+            )))
             .result
             .unwrap_err()
             .code,
@@ -4430,11 +4866,11 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
     negotiate(&broad);
     assert_eq!(
         broad
-            .request(RequestEnvelope::new(
-                ClientRequest::SendProjectAgentMessage {
+            .request(RequestEnvelope::new(ClientRequest::Project(
+                ProjectRequest::SendProjectAgentMessage {
                     message: message.clone(),
                 }
-            ))
+            )))
             .result
             .unwrap_err()
             .code,
@@ -4442,27 +4878,27 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
     );
     assert_eq!(
         scoped
-            .request(RequestEnvelope::new(
-                ClientRequest::ListProjectAgentMessages {
+            .request(RequestEnvelope::new(ClientRequest::Project(
+                ProjectRequest::ListProjectAgentMessages {
                     project_id: message.project_id,
                     session_id: child.session_id,
                     after_project_sequence: None,
                     limit: 10,
                 }
-            ))
+            )))
             .result
             .unwrap_err()
             .code,
         ErrorCode::AuthorizationDenied
     );
-    let wrong_direction = connection.request(RequestEnvelope::new(
-        ClientRequest::SendProjectAgentMessage {
+    let wrong_direction = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::SendProjectAgentMessage {
             message: loom_core::AgentMessageDraft {
                 target_session_id: AgentSessionId::new(),
                 ..message.clone()
             },
         },
-    ));
+    )));
     assert!(matches!(
         wrong_direction.result,
         Err(error) if error.code == ErrorCode::AuthorizationDenied
@@ -4503,7 +4939,9 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
         );
         assert!(matches!(
             result,
-            Ok(ServerResponse::ProjectChildCreated { .. })
+            Ok(ServerResponse::Project(
+                ProjectResponse::ProjectChildCreated { .. }
+            ))
         ));
     }
     let additional_child = connection.create_project_child(
@@ -4522,7 +4960,9 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
     assert!(
         matches!(
             additional_child,
-            Ok(ServerResponse::ProjectChildCreated { .. })
+            Ok(ServerResponse::Project(
+                ProjectResponse::ProjectChildCreated { .. }
+            ))
         ),
         "unexpected additional child response: {additional_child:?}"
     );
@@ -4556,41 +4996,45 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace_record = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project worktree".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project worktree".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace_record.id,
                 name: "Manager".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
         response => panic!("unexpected session response: {response:?}"),
     };
     let parent_repository = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::AttachSessionRepository {
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
                 session_id: root.id,
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::SessionRepositoryAttached(repository) => repository,
+        ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository)) => {
+            repository
+        }
         response => panic!("unexpected repository response: {response:?}"),
     };
     let parent_git = connection
@@ -4709,28 +5153,31 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         )
         .unwrap();
 
-    let integration_before_review =
-        connection.request(RequestEnvelope::new(ClientRequest::IntegrateProjectChild {
+    let integration_before_review = connection.request(RequestEnvelope::new(
+        ClientRequest::Project(ProjectRequest::IntegrateProjectChild {
             project_id: task.project_id,
             manager_session_id: root.id,
             task_id,
             expected_parent_revision: worktree.base_revision.clone(),
-        }));
+        }),
+    ));
     assert!(matches!(
         integration_before_review.result,
         Err(error) if error.code == ErrorCode::InvalidState
     ));
 
-    let review = connection.request(RequestEnvelope::new(ClientRequest::GetProjectChildReview {
-        project_id: task.project_id,
-        manager_session_id: root.id,
-        task_id,
-    }));
-    let ServerResponse::ProjectChildReview {
+    let review = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::GetProjectChildReview {
+            project_id: task.project_id,
+            manager_session_id: root.id,
+            task_id,
+        },
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildReview {
         worktree: reviewed,
         status: reviewed_status,
         diff,
-    } = review.result.unwrap()
+    }) = review.result.unwrap()
     else {
         panic!("unexpected child review response");
     };
@@ -4765,14 +5212,16 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
     );
     fs::remove_file(unreviewed_path).unwrap();
 
-    let integration =
-        connection.request(RequestEnvelope::new(ClientRequest::IntegrateProjectChild {
+    let integration = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::IntegrateProjectChild {
             project_id: task.project_id,
             manager_session_id: root.id,
             task_id,
             expected_parent_revision: worktree.base_revision.clone(),
-        }));
-    let ServerResponse::ProjectChildWorktreeUpdated(integrated) = integration.result.unwrap()
+        },
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated)) =
+        integration.result.unwrap()
     else {
         panic!("unexpected child integration response");
     };
@@ -4782,15 +5231,17 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
         integrated.integrated_revision
     );
 
-    let cleanup = connection.request(RequestEnvelope::new(
-        ClientRequest::CleanupProjectChildWorktree {
+    let cleanup = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::CleanupProjectChildWorktree {
             project_id: task.project_id,
             manager_session_id: root.id,
             task_id,
             disposition: ProjectWorktreeCleanupDisposition::RemoveClean,
         },
-    ));
-    let ServerResponse::ProjectChildWorktreeUpdated(removed) = cleanup.result.unwrap() else {
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(removed)) =
+        cleanup.result.unwrap()
+    else {
         panic!("unexpected child cleanup response");
     };
     assert_eq!(removed.status, ProjectWorktreeStatus::Removed);
@@ -4824,55 +5275,61 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Nested project worktree integration".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Nested project worktree integration".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Root manager".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::SetWorkspaceConfigForWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                     workspace_id: workspace.id,
                     config: WorkspaceConfig {
                         project_agent_concurrency: 1,
                         ..WorkspaceConfig::default()
                     },
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::WorkspaceConfigUpdated)
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
     ));
     let root_repository = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::AttachSessionRepository {
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
                 session_id: root,
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::SessionRepositoryAttached(repository) => repository,
+        ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository)) => {
+            repository
+        }
         response => panic!("unexpected repository response: {response:?}"),
     };
     let root_git = connection.session_git(root, root_repository.id).unwrap();
@@ -4901,7 +5358,9 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
         )
         .unwrap()
     {
-        ServerResponse::ProjectChildCreated { task, child } => (task, child),
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (task, child)
+        }
         response => panic!("unexpected manager creation response: {response:?}"),
     };
     assert_eq!(manager_task.status, loom_core::DelegatedTaskStatus::Running);
@@ -4958,7 +5417,9 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
         )
         .unwrap()
     {
-        ServerResponse::ProjectChildCreated { task, child } => (task, child),
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (task, child)
+        }
         response => panic!("unexpected nested child creation response: {response:?}"),
     };
     assert_eq!(
@@ -5027,16 +5488,18 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
         )
         .unwrap();
 
-    let review = connection.request(RequestEnvelope::new(ClientRequest::GetProjectChildReview {
-        project_id,
-        manager_session_id: manager_session,
-        task_id: grandchild_task.task_id,
-    }));
-    let ServerResponse::ProjectChildReview {
+    let review = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::GetProjectChildReview {
+            project_id,
+            manager_session_id: manager_session,
+            task_id: grandchild_task.task_id,
+        },
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildReview {
         worktree: reviewed_grandchild,
         status: grandchild_status,
         diff,
-    } = review.result.unwrap()
+    }) = review.result.unwrap()
     else {
         panic!("unexpected nested child review response");
     };
@@ -5056,15 +5519,17 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
         "the nested change should not reach root before either integration"
     );
 
-    let integration =
-        connection.request(RequestEnvelope::new(ClientRequest::IntegrateProjectChild {
+    let integration = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::IntegrateProjectChild {
             project_id,
             manager_session_id: manager_session,
             task_id: grandchild_task.task_id,
             expected_parent_revision: grandchild_worktree.base_revision.clone(),
-        }));
-    let ServerResponse::ProjectChildWorktreeUpdated(integrated_grandchild) =
-        integration.result.unwrap()
+        },
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(
+        integrated_grandchild,
+    )) = integration.result.unwrap()
     else {
         panic!("unexpected nested child integration response");
     };
@@ -5127,17 +5592,18 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
         thread::sleep(Duration::from_millis(5));
     }
 
-    let root_review =
-        connection.request(RequestEnvelope::new(ClientRequest::GetProjectChildReview {
+    let root_review = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::GetProjectChildReview {
             project_id,
             manager_session_id: root,
             task_id: manager_task.task_id,
-        }));
-    let ServerResponse::ProjectChildReview {
+        },
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildReview {
         worktree: reviewed_manager,
         status: manager_status,
         diff: manager_diff,
-    } = root_review.result.unwrap()
+    }) = root_review.result.unwrap()
     else {
         panic!("unexpected manager review response");
     };
@@ -5152,14 +5618,15 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
         "manager worktree should retain its original root-relative base"
     );
 
-    let root_integration =
-        connection.request(RequestEnvelope::new(ClientRequest::IntegrateProjectChild {
+    let root_integration = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::IntegrateProjectChild {
             project_id,
             manager_session_id: root,
             task_id: manager_task.task_id,
             expected_parent_revision: manager_worktree.base_revision.clone(),
-        }));
-    let ServerResponse::ProjectChildWorktreeUpdated(integrated_manager) =
+        },
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated_manager)) =
         root_integration.result.unwrap()
     else {
         panic!("unexpected manager integration response");
@@ -5204,41 +5671,45 @@ fn project_concurrency_limit_queues_additional_children() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project concurrency".into(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project concurrency".into(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Manager".into(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::SetWorkspaceConfigForWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                     workspace_id: workspace.id,
                     config: WorkspaceConfig {
                         project_agent_concurrency: 1,
                         ..WorkspaceConfig::default()
                     },
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::WorkspaceConfigUpdated)
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
     ));
 
     let create_child = |child_name: &str| {
@@ -5258,14 +5729,18 @@ fn project_concurrency_limit_queues_additional_children() {
     };
 
     let first = match create_child("worker-1").unwrap() {
-        ServerResponse::ProjectChildCreated { task, child } => (task, child),
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (task, child)
+        }
         response => panic!("unexpected first child response: {response:?}"),
     };
     request_seen
         .recv_timeout(Duration::from_secs(3))
         .expect("first child should begin its provider request");
     let second = match create_child("worker-2").unwrap() {
-        ServerResponse::ProjectChildCreated { task, child } => (task, child),
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (task, child)
+        }
         response => panic!("unexpected second child response: {response:?}"),
     };
     assert_eq!(first.0.status, loom_core::DelegatedTaskStatus::Running);
@@ -5274,13 +5749,13 @@ fn project_concurrency_limit_queues_additional_children() {
     assert!(matches!(
         connection
             .request(RequestEnvelope::new(
-                ClientRequest::StartSessionAgentRun {
+                ClientRequest::Run(RunRequest::StartSessionAgentRun{
                     session_id: second.1.session_id,
                     task: "Bypass the project queue".into(),
                     model: ModelId::new("slow/model"),
                     system_instructions: None,
                     repository_instructions: None,
-                },
+                }),
             ))
             .result,
         Err(error) if error.code == ErrorCode::Conflict
@@ -5306,26 +5781,28 @@ fn project_manager_tool_creates_an_idempotent_non_code_child() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project tool test".into(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project tool test".into(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Manager".into(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
     assert!(
@@ -5671,17 +6148,19 @@ fn project_manager_tool_creates_an_idempotent_non_code_child() {
     let cancellation = tools.execute(&cancel_call);
     assert!(cancellation.success, "{}", cancellation.output);
     let direct_control = connection
-        .request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
-            project_id: idle_task.project_id,
-            manager_session_id: root,
-            task_id: idle_task.task_id,
-            action: ProjectChildControlAction::Cancel,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::ControlProjectChild {
+                project_id: idle_task.project_id,
+                manager_session_id: root,
+                task_id: idle_task.task_id,
+                action: ProjectChildControlAction::Cancel,
+            },
+        )))
         .result
         .unwrap();
     assert!(matches!(
         direct_control,
-        ServerResponse::ProjectChildControlled { task, .. }
+        ServerResponse::Project(ProjectResponse::ProjectChildControlled{ task, .. })
             if task.status == loom_core::DelegatedTaskStatus::Cancelled
     ));
     assert_eq!(
@@ -5795,26 +6274,28 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project child control test".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project child control test".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let manager_session_id = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Manager".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
     let child_session_id = AgentSessionId::new();
@@ -5874,23 +6355,29 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         .insert(child_session_id, BTreeMap::new());
 
     let control_task = |task_id, action| {
-        connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
-            project_id,
-            manager_session_id,
-            task_id,
-            action,
-        }))
+        connection.request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::ControlProjectChild {
+                project_id,
+                manager_session_id,
+                task_id,
+                action,
+            },
+        )))
     };
     let control = |action| control_task(task_id, action);
     let continued = control(ProjectChildControlAction::Continue);
-    let ServerResponse::ProjectChildControlled { task, run } = continued.result.unwrap() else {
+    let ServerResponse::Project(ProjectResponse::ProjectChildControlled { task, run }) =
+        continued.result.unwrap()
+    else {
         panic!("unexpected child continue response");
     };
     assert_eq!(task.status, loom_core::DelegatedTaskStatus::Blocked);
     assert!(run.is_none());
 
     let retried = control(ProjectChildControlAction::Continue);
-    let ServerResponse::ProjectChildControlled { task, run } = retried.result.unwrap() else {
+    let ServerResponse::Project(ProjectResponse::ProjectChildControlled { task, run }) =
+        retried.result.unwrap()
+    else {
         panic!("unexpected blocked child continue response");
     };
     assert_eq!(task.status, loom_core::DelegatedTaskStatus::Blocked);
@@ -5962,26 +6449,30 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         .unwrap()
         .insert(resumable_session_id, BTreeMap::new());
     connection
-        .request(RequestEnvelope::new(
-            ClientRequest::SetSessionApprovalPolicy {
+        .request(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::SetSessionApprovalPolicy {
                 session_id: resumable_session_id,
                 policy: ApprovalPolicy::default(),
                 auto_approve_actions: Some(false),
             },
-        ))
+        )))
         .result
         .unwrap();
 
     let continue_resumable = || {
-        connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
-            project_id,
-            manager_session_id,
-            task_id: resumable_task.task_id,
-            action: ProjectChildControlAction::Continue,
-        }))
+        connection.request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::ControlProjectChild {
+                project_id,
+                manager_session_id,
+                task_id: resumable_task.task_id,
+                action: ProjectChildControlAction::Continue,
+            },
+        )))
     };
     let started = continue_resumable();
-    let ServerResponse::ProjectChildControlled { run, .. } = started.result.unwrap() else {
+    let ServerResponse::Project(ProjectResponse::ProjectChildControlled { run, .. }) =
+        started.result.unwrap()
+    else {
         panic!("unexpected resumable child response");
     };
     let run_id = run.expect("queued child should start a run").id;
@@ -6008,20 +6499,24 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         );
     }
     let waiting_snapshot = match connection
-        .request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }))
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRun { run_id },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentRun(snapshot) => snapshot,
+        ServerResponse::Run(RunResponse::AgentRun(snapshot)) => snapshot,
         response => panic!("unexpected waiting child response: {response:?}"),
     };
     connection
-        .request(RequestEnvelope::new(ClientRequest::SendAgentMessage {
-            run_id,
-            attempt_id: waiting_snapshot.attempt_id,
-            expected_control_revision: waiting_snapshot.control_revision,
-            message: "Use the first option".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::SendAgentMessage {
+                run_id,
+                attempt_id: waiting_snapshot.attempt_id,
+                expected_control_revision: waiting_snapshot.control_revision,
+                message: "Use the first option".to_owned(),
+            },
+        )))
         .result
         .unwrap();
     let approval_turn = model.next_for_child();
@@ -6038,26 +6533,34 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         await_settled_run(&connection, run_id).state,
         AgentRunState::AwaitingApproval
     );
-    let paused = connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
-        project_id,
-        manager_session_id,
-        task_id: resumable_task.task_id,
-        action: ProjectChildControlAction::Pause,
-    }));
-    let ServerResponse::ProjectChildControlled { run, .. } = paused.result.unwrap() else {
+    let paused = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::ControlProjectChild {
+            project_id,
+            manager_session_id,
+            task_id: resumable_task.task_id,
+            action: ProjectChildControlAction::Pause,
+        },
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildControlled { run, .. }) =
+        paused.result.unwrap()
+    else {
         panic!("unexpected child pause response");
     };
     assert!(matches!(run, Some(run)
         if run.id == run_id && run.state == AgentRunState::Paused));
     let paused_again = control_task(resumable_task.task_id, ProjectChildControlAction::Pause);
-    let ServerResponse::ProjectChildControlled { run, .. } = paused_again.result.unwrap() else {
+    let ServerResponse::Project(ProjectResponse::ProjectChildControlled { run, .. }) =
+        paused_again.result.unwrap()
+    else {
         panic!("unexpected repeated child pause response");
     };
     assert!(matches!(run, Some(run)
         if run.id == run_id && run.state == AgentRunState::Paused));
 
     let resumed = continue_resumable();
-    let ServerResponse::ProjectChildControlled { run, .. } = resumed.result.unwrap() else {
+    let ServerResponse::Project(ProjectResponse::ProjectChildControlled { run, .. }) =
+        resumed.result.unwrap()
+    else {
         panic!("unexpected child resume response");
     };
     assert!(matches!(run, Some(run)
@@ -6066,24 +6569,25 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         resumable_task.task_id,
         ProjectChildControlAction::RetryFailedStep,
     );
-    let ServerResponse::ProjectChildControlled { run, .. } =
+    let ServerResponse::Project(ProjectResponse::ProjectChildControlled { run, .. }) =
         retry_while_awaiting_approval.result.unwrap()
     else {
         panic!("unexpected retry response for a run awaiting approval");
     };
     assert!(matches!(run, Some(run)
         if run.id == run_id && run.state == AgentRunState::AwaitingApproval));
-    let approval_events =
-        connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+    let approval_events = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
             session_id: Some(resumable_session_id),
             workspace_id: None,
             after_sequence: None,
             stream_epoch: None,
-        }));
-    let ServerResponse::SessionEvents {
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents {
         events: approval_events,
         ..
-    } = approval_events.result.unwrap()
+    }) = approval_events.result.unwrap()
     else {
         panic!("unexpected child approval events response");
     };
@@ -6103,12 +6607,14 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         })
         .expect("resumed child should retain its pending tool approval");
     connection
-        .request(RequestEnvelope::new(ClientRequest::ApproveAgentAction {
-            run_id,
-            attempt_id: approval_attempt_id,
-            expected_control_revision: approval_control_revision,
-            tool_call_id: approval_call_id,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::ApproveAgentAction {
+                run_id,
+                attempt_id: approval_attempt_id,
+                expected_control_revision: approval_control_revision,
+                tool_call_id: approval_call_id,
+            },
+        )))
         .result
         .unwrap();
     let completion_turn = model.next_for_child();
@@ -6125,12 +6631,14 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
     ] {
         assert_eq!(
             connection
-                .request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
-                    project_id,
-                    manager_session_id,
-                    task_id: resumable_task.task_id,
-                    action,
-                }))
+                .request(RequestEnvelope::new(ClientRequest::Project(
+                    ProjectRequest::ControlProjectChild {
+                        project_id,
+                        manager_session_id,
+                        task_id: resumable_task.task_id,
+                        action,
+                    }
+                )))
                 .result
                 .unwrap_err()
                 .code,
@@ -6188,13 +6696,14 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
         .session_repositories()
         .unwrap()
         .insert(grandchild_session_id, BTreeMap::new());
-    let child_manager_control =
-        connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+    let child_manager_control = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::ControlProjectChild {
             project_id,
             manager_session_id: child_session_id,
             task_id: grandchild_task.task_id,
             action: ProjectChildControlAction::Cancel,
-        }));
+        },
+    )));
     assert_eq!(
         control_task(grandchild_task.task_id, ProjectChildControlAction::Cancel)
             .result
@@ -6210,7 +6719,7 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
     );
     assert!(matches!(
         control(ProjectChildControlAction::Cancel).result,
-        Ok(ServerResponse::ProjectChildControlled { task, run: None })
+        Ok(ServerResponse::Project(ProjectResponse::ProjectChildControlled{ task, run: None }))
             if task.status == loom_core::DelegatedTaskStatus::Cancelled
     ));
     assert_eq!(
@@ -6247,55 +6756,61 @@ fn durable_manager_wait_releases_workspace_slot_and_resumes_once() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project manager wait e2e".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project manager wait e2e".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Manager".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::SetWorkspaceConfigForWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                     workspace_id: workspace.id,
                     config: WorkspaceConfig {
                         project_agent_concurrency: 1,
                         ..WorkspaceConfig::default()
                     },
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::WorkspaceConfigUpdated)
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
     ));
 
     let root_run_id = match connection
-        .request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-            session_id: root,
-            task: "Coordinate a bounded investigation with a submanager.".to_owned(),
-            model: model_id.clone(),
-            system_instructions: None,
-            repository_instructions: None,
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Coordinate a bounded investigation with a submanager.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected run response: {response:?}"),
     };
 
@@ -6436,7 +6951,7 @@ fn durable_manager_wait_releases_workspace_slot_and_resumes_once() {
         )
         .unwrap();
     let sibling_task = match sibling {
-        ServerResponse::ProjectChildCreated { task, .. } => task,
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, .. }) => task,
         response => panic!("unexpected sibling task response: {response:?}"),
     };
     assert!(sibling_task.created_at > wait.created_at);
@@ -6623,41 +7138,45 @@ fn durable_manager_wait_recovers_after_restart_and_resumes_once() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project manager wait restart e2e".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project manager wait restart e2e".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Project root".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::SetWorkspaceConfigForWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                     workspace_id: workspace.id,
                     config: WorkspaceConfig {
                         project_agent_concurrency: 1,
                         ..WorkspaceConfig::default()
                     },
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::WorkspaceConfigUpdated)
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
     ));
 
     let (manager_task, manager_session) = match connection
@@ -6680,7 +7199,9 @@ fn durable_manager_wait_recovers_after_restart_and_resumes_once() {
         )
         .unwrap()
     {
-        ServerResponse::ProjectChildCreated { task, child } => (task, child),
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (task, child)
+        }
         response => panic!("unexpected manager creation response: {response:?}"),
     };
     assert_eq!(manager_task.requester_session_id, root);
@@ -6712,7 +7233,7 @@ fn durable_manager_wait_recovers_after_restart_and_resumes_once() {
         )
         .unwrap();
     let sibling_task = match sibling {
-        ServerResponse::ProjectChildCreated { task, .. } => task,
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, .. }) => task,
         response => panic!("unexpected sibling task response: {response:?}"),
     };
     assert_eq!(sibling_task.status, loom_core::DelegatedTaskStatus::Queued);
@@ -6927,11 +7448,13 @@ fn durable_manager_wait_recovers_after_restart_and_resumes_once() {
     // The grandchild remains queued because its prerequisite was paused.
     // Resume and finish that prerequisite, then complete the admitted
     // grandchild; its completion should resume the manager exactly once.
-    let resumed_prerequisite =
-        reopened_connection.request(RequestEnvelope::new(ClientRequest::ResumeAgentRun {
+    let resumed_prerequisite = reopened_connection.request(RequestEnvelope::new(
+        ClientRequest::Run(RunRequest::ResumeAgentRun {
             run_id: sibling_run_id,
-        }));
-    let ServerResponse::AgentRun(resumed_prerequisite) = resumed_prerequisite.result.unwrap()
+        }),
+    ));
+    let ServerResponse::Run(RunResponse::AgentRun(resumed_prerequisite)) =
+        resumed_prerequisite.result.unwrap()
     else {
         panic!("unexpected prerequisite resume response");
     };
@@ -7060,41 +7583,45 @@ fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_f
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Failed dependency manager wait e2e".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Failed dependency manager wait e2e".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Project root".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::SetWorkspaceConfigForWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                     workspace_id: workspace.id,
                     config: WorkspaceConfig {
                         project_agent_concurrency: 1,
                         ..WorkspaceConfig::default()
                     },
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::WorkspaceConfigUpdated)
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
     ));
 
     let (manager_task, manager_session) = match connection
@@ -7117,7 +7644,9 @@ fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_f
         )
         .unwrap()
     {
-        ServerResponse::ProjectChildCreated { task, child } => (task, child),
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (task, child)
+        }
         response => panic!("unexpected manager creation response: {response:?}"),
     };
     assert_eq!(manager_task.requester_session_id, root);
@@ -7148,7 +7677,7 @@ fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_f
         )
         .unwrap();
     let prerequisite_task = match prerequisite {
-        ServerResponse::ProjectChildCreated { task, .. } => task,
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, .. }) => task,
         response => panic!("unexpected prerequisite task response: {response:?}"),
     };
     assert_eq!(
@@ -7206,10 +7735,12 @@ fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_f
     );
     let settle_deadline = Instant::now() + Duration::from_secs(5);
     let manager_after_wait = loop {
-        let response = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun {
-            run_id: manager_run_id,
-        }));
-        let ServerResponse::AgentRun(snapshot) = response.result.unwrap() else {
+        let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRun {
+                run_id: manager_run_id,
+            },
+        )));
+        let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = response.result.unwrap() else {
             panic!("unexpected manager run response");
         };
         if !matches!(
@@ -7290,16 +7821,18 @@ fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_f
         None
     } else {
         let stream = hold_scripted_model_stream_until_cancelled(prerequisite_turn);
-        let cancel = connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
-            project_id,
-            manager_session_id: root,
-            task_id: prerequisite_task.task_id,
-            action: loom_protocol::ProjectChildControlAction::Cancel,
-        }));
-        let ServerResponse::ProjectChildControlled {
+        let cancel = connection.request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::ControlProjectChild {
+                project_id,
+                manager_session_id: root,
+                task_id: prerequisite_task.task_id,
+                action: loom_protocol::ProjectChildControlAction::Cancel,
+            },
+        )));
+        let ServerResponse::Project(ProjectResponse::ProjectChildControlled {
             task: cancelled_prerequisite,
             run: cancelled_run,
-        } = cancel.result.unwrap()
+        }) = cancel.result.unwrap()
         else {
             panic!("unexpected prerequisite cancellation response");
         };
@@ -7381,17 +7914,18 @@ fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_f
     // manager's completion guard. Hold its next provider turn open and
     // cancel the manager for cleanup after verifying the one replay.
     let manager_turn_stream = hold_scripted_model_stream_until_cancelled(resumed_manager_turn);
-    let cancel_manager =
-        connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+    let cancel_manager = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::ControlProjectChild {
             project_id,
             manager_session_id: root,
             task_id: manager_task.task_id,
             action: loom_protocol::ProjectChildControlAction::Cancel,
-        }));
-    let ServerResponse::ProjectChildControlled {
+        },
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildControlled {
         task: cancelled_manager,
         run: cancelled_manager_run,
-    } = cancel_manager.result.unwrap()
+    }) = cancel_manager.result.unwrap()
     else {
         panic!("unexpected manager cancellation response");
     };
@@ -7454,37 +7988,41 @@ fn project_coordination_exchange_and_transcripts_survive_restart() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project coordination e2e".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project coordination e2e".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Manager".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
-    let started = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-        session_id: root,
-        task: "Coordinate a short investigation with a child agent.".to_owned(),
-        model: model_id.clone(),
-        system_instructions: None,
-        repository_instructions: None,
-    }));
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id: root,
+            task: "Coordinate a short investigation with a child agent.".to_owned(),
+            model: model_id.clone(),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
     let root_run_id = match started.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected run response: {response:?}"),
     };
 
@@ -7786,11 +8324,12 @@ fn project_coordination_exchange_and_transcripts_survive_restart() {
             .unwrap();
     let reopened_connection = reopened.connect();
     negotiate(&reopened_connection);
-    let project =
-        reopened_connection.request(RequestEnvelope::new(ClientRequest::GetProjectSnapshot {
-            project_id,
-        }));
-    let ServerResponse::ProjectSnapshot(project) = project.result.unwrap() else {
+    let project = reopened_connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::GetProjectSnapshot { project_id },
+    )));
+    let ServerResponse::Project(ProjectResponse::ProjectSnapshot(project)) =
+        project.result.unwrap()
+    else {
         panic!("unexpected recovered project response");
     };
     assert_eq!(project.agents.len(), 2);
@@ -7890,11 +8429,14 @@ fn project_coordination_exchange_and_transcripts_survive_restart() {
         .unwrap();
     assert!(recovered_child_runtime_config.project_messaging_enabled);
     assert!(!recovered_child_runtime_config.project_child_control_enabled);
-    let child_detail =
-        reopened_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+    let child_detail = reopened_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunSnapshot {
             run_id: child_run_id,
-        }));
-    let ServerResponse::AgentRunSnapshot(child_detail) = child_detail.result.unwrap() else {
+        },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunSnapshot(child_detail)) =
+        child_detail.result.unwrap()
+    else {
         panic!("unexpected recovered child run response");
     };
     assert_eq!(child_detail.run.state, AgentRunState::Completed);
@@ -7906,11 +8448,14 @@ fn project_coordination_exchange_and_transcripts_survive_restart() {
         message.name.as_deref() == Some("loom_project_message")
             && message.content.contains("Redirect the investigation")
     }));
-    let root_detail =
-        reopened_connection.request(RequestEnvelope::new(ClientRequest::GetAgentRunSnapshot {
+    let root_detail = reopened_connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRunSnapshot {
             run_id: root_run_id,
-        }));
-    let ServerResponse::AgentRunSnapshot(root_detail) = root_detail.result.unwrap() else {
+        },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRunSnapshot(root_detail)) =
+        root_detail.result.unwrap()
+    else {
         panic!("unexpected recovered manager run response");
     };
     assert_eq!(root_detail.run.state, AgentRunState::Completed);
@@ -7971,41 +8516,45 @@ fn cancelling_project_child_cascades_deepest_first_and_survives_restart() {
     let connection = backend.connect();
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Project cancellation cascade e2e".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project cancellation cascade e2e".to_owned(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Project root".to_owned(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
     assert!(matches!(
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::SetWorkspaceConfigForWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                     workspace_id: workspace.id,
                     config: WorkspaceConfig {
                         project_agent_concurrency: 2,
                         ..WorkspaceConfig::default()
                     },
-                },
-            ))
+                }
+            ),))
             .result,
-        Ok(ServerResponse::WorkspaceConfigUpdated)
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
     ));
 
     let (manager_task, manager_session) = match connection
@@ -8027,7 +8576,9 @@ fn cancelling_project_child_cascades_deepest_first_and_survives_restart() {
         )
         .unwrap()
     {
-        ServerResponse::ProjectChildCreated { task, child } => (task, child),
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (task, child)
+        }
         response => panic!("unexpected manager creation response: {response:?}"),
     };
     assert_eq!(manager_task.requester_session_id, root);
@@ -8054,7 +8605,7 @@ fn cancelling_project_child_cascades_deepest_first_and_survives_restart() {
         )
         .unwrap()
     {
-        ServerResponse::ProjectChildCreated { task, .. } => task,
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, .. }) => task,
         response => panic!("unexpected sibling task response: {response:?}"),
     };
     assert_eq!(sibling_task.status, loom_core::DelegatedTaskStatus::Running);
@@ -8130,13 +8681,14 @@ fn cancelling_project_child_cascades_deepest_first_and_survives_restart() {
     backend
         .project_cancellation_failpoint
         .store(usize::MAX, Ordering::SeqCst);
-    let cancel_response =
-        connection.request(RequestEnvelope::new(ClientRequest::ControlProjectChild {
+    let cancel_response = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::ControlProjectChild {
             project_id,
             manager_session_id: root,
             task_id: manager_task.task_id,
             action: ProjectChildControlAction::Cancel,
-        }));
+        },
+    )));
     assert_eq!(
         cancel_response.result.unwrap_err().code,
         ErrorCode::RecoveryRequired
@@ -8260,37 +8812,41 @@ fn delegated_children_require_durable_storage_on_ephemeral_backends() {
     let backend = InProcessBackend::new();
     let connection = backend.connect();
     let discovered = connection
-        .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+        .request(RequestEnvelope::new(ClientRequest::Control(
+            ControlRequest::DiscoverCapabilities,
+        )))
         .result
         .unwrap();
     assert!(matches!(
         discovered,
-        ServerResponse::Capabilities(result)
+        ServerResponse::Control(ControlResponse::Capabilities(result))
             if !result.capabilities.contains(Capability::CreateProjectChild)
                 && !result.capabilities.contains(Capability::SendProjectAgentMessage)
     ));
     negotiate(&connection);
     let workspace = match connection
-        .request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Ephemeral project".into(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Ephemeral project".into(),
+            },
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::WorkspaceCreated(workspace) => workspace,
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
         response => panic!("unexpected workspace response: {response:?}"),
     };
     let root = match connection
-        .request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Manager".into(),
             },
-        ))
+        )))
         .result
         .unwrap()
     {
-        ServerResponse::AgentSessionCreated(session) => session.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
         response => panic!("unexpected session response: {response:?}"),
     };
     assert!(
@@ -8710,31 +9266,37 @@ fn streamed_message_fragments_batch_until_the_time_threshold() {
     let session_root_base = backend.session_root_base.clone();
     let connection = backend.connect();
     negotiate_m3(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Batched transcript workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Batched transcript workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let session = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "batched transcript".to_owned(),
         },
-    ));
+    )));
     let session_id = match session.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
-    let started = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-        session_id,
-        task: "stream a response".to_owned(),
-        model: ModelId::new("slow/model"),
-        system_instructions: None,
-        repository_instructions: None,
-    }));
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: "stream a response".to_owned(),
+            model: ModelId::new("slow/model"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
     let run_id = match started.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     first_delta
@@ -8833,31 +9395,37 @@ fn streamed_message_fragments_flush_at_the_byte_threshold_without_splitting_utf8
     let session_root_base = backend.session_root_base.clone();
     let connection = backend.connect();
     negotiate_m3(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Large transcript workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Large transcript workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let session = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "large transcript".to_owned(),
         },
-    ));
+    )));
     let session_id = match session.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
-    let started = connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
-        session_id,
-        task: "stream a large response".to_owned(),
-        model: ModelId::new("slow/model"),
-        system_instructions: None,
-        repository_instructions: None,
-    }));
+    let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
+            session_id,
+            task: "stream a large response".to_owned(),
+            model: ModelId::new("slow/model"),
+            system_instructions: None,
+            repository_instructions: None,
+        },
+    )));
     let run_id = match started.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     first_delta
@@ -8901,32 +9469,37 @@ fn a_running_model_call_can_be_interrupted_without_blocking_the_request() {
         InProcessBackend::with_openai_compatible(endpoint, "key", ModelId::new("slow/model"));
     let connection = backend.connect();
     negotiate_m3(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Interruptible workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Interruptible workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let session = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "interruptible run".to_owned(),
         },
-    ));
+    )));
     let session_id = match session.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
-    let started_run =
-        connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+    let started_run = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
             session_id,
             task: "stream for a long time".to_owned(),
             model: ModelId::new("slow/model"),
             system_instructions: None,
             repository_instructions: None,
-        }));
+        },
+    )));
     let run_id = match started_run.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     started
@@ -8941,13 +9514,17 @@ fn a_running_model_call_can_be_interrupted_without_blocking_the_request() {
     // client sees it before the run ends.
     let mut streamed = false;
     for _ in 0..1_000 {
-        let events = observer.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(session_id),
-            workspace_id: None,
-            after_sequence: None,
-            stream_epoch: None,
-        }));
-        let ServerResponse::SessionEvents { events, .. } = events.result.unwrap() else {
+        let events = observer.request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session_id),
+                workspace_id: None,
+                after_sequence: None,
+                stream_epoch: None,
+            },
+        )));
+        let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+            events.result.unwrap()
+        else {
             panic!("unexpected events response");
         };
         if events.iter().any(|event| {
@@ -8969,11 +9546,11 @@ fn a_running_model_call_can_be_interrupted_without_blocking_the_request() {
     );
 
     let before = Instant::now();
-    let interrupted = observer.request(RequestEnvelope::new(ClientRequest::InterruptAgentRun {
-        run_id,
-    }));
+    let interrupted = observer.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::InterruptAgentRun { run_id },
+    )));
     let elapsed = before.elapsed();
-    let ServerResponse::AgentRun(snapshot) = interrupted.result.unwrap() else {
+    let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = interrupted.result.unwrap() else {
         panic!("unexpected interrupt response");
     };
     assert_eq!(snapshot.state, AgentRunState::Cancelled);
@@ -8991,43 +9568,48 @@ fn a_running_model_call_can_be_paused_and_resumed() {
         InProcessBackend::with_openai_compatible(endpoint, "key", ModelId::new("slow/model"));
     let connection = backend.connect();
     negotiate_m3(&connection);
-    let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Pausable workspace".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+    let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Pausable workspace".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        workspace.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
-    let session = connection.request(RequestEnvelope::new(
-        ClientRequest::CreateAgentSessionInWorkspace {
+    let session = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id: workspace.id,
             name: "pausable run".to_owned(),
         },
-    ));
+    )));
     let session_id = match session.result.unwrap() {
-        ServerResponse::AgentSessionCreated(snapshot) => snapshot.id,
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
-    let started_run =
-        connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+    let started_run = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRun {
             session_id,
             task: "stream for a long time".to_owned(),
             model: ModelId::new("slow/model"),
             system_instructions: None,
             repository_instructions: None,
-        }));
+        },
+    )));
     let run_id = match started_run.result.unwrap() {
-        ServerResponse::AgentRunStarted(snapshot) => snapshot.id,
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
         response => panic!("unexpected response: {response:?}"),
     };
     started
         .recv_timeout(Duration::from_secs(10))
         .expect("model stream started");
     let before = Instant::now();
-    let paused = connection.request(RequestEnvelope::new(ClientRequest::PauseAgentRun {
-        run_id,
-    }));
+    let paused = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::PauseAgentRun { run_id },
+    )));
     let elapsed = before.elapsed();
-    let ServerResponse::AgentRun(snapshot) = paused.result.unwrap() else {
+    let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = paused.result.unwrap() else {
         panic!("unexpected pause response");
     };
     assert_eq!(snapshot.state, AgentRunState::Paused);
@@ -9035,8 +9617,10 @@ fn a_running_model_call_can_be_paused_and_resumed() {
         elapsed < Duration::from_secs(5),
         "pause waited {elapsed:?} for the model call"
     );
-    let current = connection.request(RequestEnvelope::new(ClientRequest::GetAgentRun { run_id }));
-    let ServerResponse::AgentRun(snapshot) = current.result.unwrap() else {
+    let current = connection.request(RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::GetAgentRun { run_id },
+    )));
+    let ServerResponse::Run(RunResponse::AgentRun(snapshot)) = current.result.unwrap() else {
         panic!("unexpected run response");
     };
     assert_eq!(snapshot.state, AgentRunState::Paused);
@@ -9052,18 +9636,22 @@ fn retryable_mutation_idempotency_survives_backend_restart() {
         let backend = InProcessBackend::new_persistent(&path).unwrap();
         let connection = backend.connect();
         negotiate(&connection);
-        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Idempotency workspace".to_owned(),
-        }));
-        let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Idempotency workspace".to_owned(),
+            },
+        )));
+        let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+            created.result.unwrap()
+        else {
             panic!("unexpected workspace response");
         };
         let request = RequestEnvelope::with_request_id(
             request_id,
-            ClientRequest::CreateAgentSessionInWorkspace {
+            ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "durable idempotency".to_owned(),
-            },
+            }),
         );
         let response = connection.request(request);
         backend.shutdown().unwrap();
@@ -9074,16 +9662,18 @@ fn retryable_mutation_idempotency_survives_backend_restart() {
     negotiate(&connection);
     let request = RequestEnvelope::with_request_id(
         request_id,
-        ClientRequest::CreateAgentSessionInWorkspace {
+        ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace {
             workspace_id,
             name: "durable idempotency".to_owned(),
-        },
+        }),
     );
     let second = connection.request(request);
     assert_eq!(first, second);
     assert!(matches!(
         first.result,
-        Ok(ServerResponse::AgentSessionCreated(_))
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionCreated(_)
+        ))
     ));
     let expired_request_id = request_id_with_issued_at(
         current_unix_millis()
@@ -9092,18 +9682,20 @@ fn retryable_mutation_idempotency_survives_backend_restart() {
     );
     let expired = connection.request(RequestEnvelope::with_request_id(
         expired_request_id,
-        ClientRequest::CreateWorkspace {
+        ClientRequest::Workspace(WorkspaceRequest::CreateWorkspace {
             name: "must not be replayed".to_owned(),
-        },
+        }),
     ));
     assert_eq!(
         expired.result.unwrap_err().code,
         ErrorCode::DeadlineExceeded
     );
-    let workspaces = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+    let workspaces = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaces,
+    )));
     assert!(matches!(
         workspaces.result,
-        Ok(ServerResponse::Workspaces { workspaces }) if workspaces.len() == 1
+        Ok(ServerResponse::Workspace(WorkspaceResponse::Workspaces{ workspaces })) if workspaces.len() == 1
     ));
     fs::remove_file(path).unwrap();
 }
@@ -9118,9 +9710,9 @@ fn retryable_mutation_save_failure_does_not_cache_success() {
     let connection = backend.connect();
     negotiate(&connection);
     let request_id = loom_core::RequestId::new();
-    let request = ClientRequest::CreateWorkspace {
+    let request = ClientRequest::Workspace(WorkspaceRequest::CreateWorkspace {
         name: "failure boundary".to_owned(),
-    };
+    });
     backend.fail_next_state_save.store(true, Ordering::SeqCst);
     let failed = connection.request(RequestEnvelope::with_request_id(
         request_id,
@@ -9140,7 +9732,9 @@ fn retryable_mutation_save_failure_does_not_cache_success() {
     // in-memory state; reopening restores the last committed disk state.
     let retried = connection.request(RequestEnvelope::with_request_id(request_id, request));
     assert_eq!(retried.result.unwrap_err().code, ErrorCode::Persistence);
-    let listed = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+    let listed = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaces,
+    )));
     assert_eq!(listed.result.unwrap_err().code, ErrorCode::Persistence);
     backend.shutdown().unwrap();
     drop(connection);
@@ -9148,9 +9742,11 @@ fn retryable_mutation_save_failure_does_not_cache_success() {
     let reopened = InProcessBackend::new_persistent(&path).unwrap();
     let connection = reopened.connect();
     negotiate(&connection);
-    let listed = connection.request(RequestEnvelope::new(ClientRequest::ListWorkspaces));
+    let listed = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaces,
+    )));
     assert!(
-        matches!(listed.result, Ok(ServerResponse::Workspaces { workspaces }) if workspaces.is_empty())
+        matches!(listed.result, Ok(ServerResponse::Workspace(WorkspaceResponse::Workspaces{ workspaces })) if workspaces.is_empty())
     );
     drop(connection);
     drop(reopened);
@@ -9165,27 +9761,35 @@ fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
         backend.set_event_retention(1).unwrap();
         let connection = backend.connect();
         negotiate(&connection);
-        let workspace = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Lazy feed workspace".to_owned(),
-        }));
-        let ServerResponse::WorkspaceCreated(workspace) = workspace.result.unwrap() else {
+        let workspace = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Lazy feed workspace".to_owned(),
+            },
+        )));
+        let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+            workspace.result.unwrap()
+        else {
             panic!("unexpected workspace response");
         };
-        let created = connection.request(RequestEnvelope::new(
-            ClientRequest::CreateAgentSessionInWorkspace {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
                 workspace_id: workspace.id,
                 name: "Lazy feed session".to_owned(),
             },
-        ));
-        let ServerResponse::AgentSessionCreated(session) = created.result.unwrap() else {
+        )));
+        let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+            created.result.unwrap()
+        else {
             panic!("unexpected session response");
         };
         for name in ["renamed once", "renamed twice"] {
             connection
-                .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
-                    session_id: session.id,
-                    name: name.to_owned(),
-                }))
+                .request(RequestEnvelope::new(ClientRequest::Session(
+                    SessionRequest::RenameAgentSession {
+                        session_id: session.id,
+                        name: name.to_owned(),
+                    },
+                )))
                 .result
                 .unwrap();
         }
@@ -9203,18 +9807,20 @@ fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
     assert!(backend.journal().unwrap().events.is_empty());
     let connection = backend.connect();
     negotiate(&connection);
-    let stale = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(session_id),
-        workspace_id: None,
-        after_sequence: Some(EventSequence::new(1)),
-        stream_epoch: None,
-    }));
-    let ServerResponse::SessionEventsSnapshot {
+    let stale = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::new(1)),
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
         events,
         oldest_sequence,
         latest_sequence,
         ..
-    } = stale.result.unwrap()
+    }) = stale.result.unwrap()
     else {
         panic!("expected a stale-cursor snapshot");
     };
@@ -9223,18 +9829,20 @@ fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
     assert_eq!(oldest_sequence, EventSequence::new(3));
     assert_eq!(latest_sequence, EventSequence::new(3));
 
-    let changed_epoch = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(session_id),
-        workspace_id: None,
-        after_sequence: Some(EventSequence::new(3)),
-        stream_epoch: Some(previous_stream_epoch.clone()),
-    }));
-    let ServerResponse::SessionEventsSnapshot {
+    let changed_epoch = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::new(3)),
+            stream_epoch: Some(previous_stream_epoch.clone()),
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
         events,
         latest_sequence,
         stream_epoch: Some(current_epoch),
         ..
-    } = changed_epoch.result.unwrap()
+    }) = changed_epoch.result.unwrap()
     else {
         panic!("expected a snapshot after the feed epoch changed");
     };
@@ -9242,13 +9850,17 @@ fn reconnect_feed_payloads_load_lazily_and_keep_pruned_cursor_after_restart() {
     assert_eq!(latest_sequence, EventSequence::new(3));
     assert_eq!(events.len(), 1);
 
-    let current = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: Some(session_id),
-        workspace_id: None,
-        after_sequence: Some(EventSequence::new(2)),
-        stream_epoch: None,
-    }));
-    let ServerResponse::SessionEvents { events, .. } = current.result.unwrap() else {
+    let current = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: Some(session_id),
+            workspace_id: None,
+            after_sequence: Some(EventSequence::new(2)),
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::SessionEvents { events, .. }) =
+        current.result.unwrap()
+    else {
         panic!("expected retained session events");
     };
     assert_eq!(events.len(), 1);
@@ -9270,11 +9882,14 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
         let connection = backend.connect();
         negotiate(&connection);
         let create_workspace = |name: &str| {
-            let response =
-                connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
+            let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateWorkspace {
                     name: name.to_owned(),
-                }));
-            let ServerResponse::WorkspaceCreated(workspace) = response.result.unwrap() else {
+                },
+            )));
+            let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+                response.result.unwrap()
+            else {
                 panic!("unexpected workspace response");
             };
             workspace.id
@@ -9282,13 +9897,15 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
         let workspace_a = create_workspace("Workspace feed A");
         let workspace_b = create_workspace("Workspace feed B");
         let create_session = |workspace_id, name: &str| {
-            let response = connection.request(RequestEnvelope::new(
-                ClientRequest::CreateAgentSessionInWorkspace {
+            let response = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateAgentSessionInWorkspace {
                     workspace_id,
                     name: name.to_owned(),
                 },
-            ));
-            let ServerResponse::AgentSessionCreated(session) = response.result.unwrap() else {
+            )));
+            let ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) =
+                response.result.unwrap()
+            else {
                 panic!("unexpected session response");
             };
             session.id
@@ -9298,29 +9915,32 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
         for (session_id, label) in [(session_a, "A"), (session_b, "B")] {
             for revision in 1..=2 {
                 connection
-                    .request(RequestEnvelope::new(ClientRequest::RenameAgentSession {
-                        session_id,
-                        name: format!("{label} {revision}"),
-                    }))
+                    .request(RequestEnvelope::new(ClientRequest::Session(
+                        SessionRequest::RenameAgentSession {
+                            session_id,
+                            name: format!("{label} {revision}"),
+                        },
+                    )))
                     .result
                     .unwrap();
             }
         }
 
         for workspace_id in [workspace_a, workspace_b] {
-            let response =
-                connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
+                EventsRequest::GetSessionEvents {
                     session_id: None,
                     workspace_id: Some(workspace_id),
                     after_sequence: None,
                     stream_epoch: None,
-                }));
-            let ServerResponse::WorkspaceEventsSnapshot {
+                },
+            )));
+            let ServerResponse::Events(EventsResponse::WorkspaceEventsSnapshot {
                 workspace_id: returned_workspace,
                 sessions,
                 events,
                 ..
-            } = response.result.unwrap()
+            }) = response.result.unwrap()
             else {
                 panic!("expected a snapshot after in-memory feed pruning");
             };
@@ -9330,19 +9950,23 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
                         WorkspaceFeedEvent::Session(event) if event.session_id == sessions[0].id)));
         }
 
-        let ambiguous = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: Some(session_a),
-            workspace_id: Some(workspace_a),
-            after_sequence: None,
-            stream_epoch: None,
-        }));
+        let ambiguous = connection.request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: Some(session_a),
+                workspace_id: Some(workspace_a),
+                after_sequence: None,
+                stream_epoch: None,
+            },
+        )));
         assert!(ambiguous.result.is_err());
-        let unknown = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-            session_id: None,
-            workspace_id: Some(WorkspaceId::new()),
-            after_sequence: None,
-            stream_epoch: None,
-        }));
+        let unknown = connection.request(RequestEnvelope::new(ClientRequest::Events(
+            EventsRequest::GetSessionEvents {
+                session_id: None,
+                workspace_id: Some(WorkspaceId::new()),
+                after_sequence: None,
+                stream_epoch: None,
+            },
+        )));
         assert!(unknown.result.is_err());
 
         backend.flush().unwrap();
@@ -9360,20 +9984,22 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
     let backend = InProcessBackend::new_persistent(&path).unwrap();
     let connection = backend.connect();
     negotiate(&connection);
-    let stale = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: None,
-        workspace_id: Some(workspace_a),
-        after_sequence: Some(EventSequence::new(1)),
-        stream_epoch: None,
-    }));
-    let ServerResponse::WorkspaceEventsSnapshot {
+    let stale = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace_a),
+            after_sequence: Some(EventSequence::new(1)),
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::WorkspaceEventsSnapshot {
         workspace_id,
         sessions,
         events,
         oldest_sequence,
         latest_sequence,
         stream_epoch: Some(current_epoch),
-    } = stale.result.unwrap()
+    }) = stale.result.unwrap()
     else {
         panic!("expected a workspace snapshot after persisted pruning");
     };
@@ -9387,19 +10013,21 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
     assert!(oldest_sequence <= latest_sequence);
     assert_ne!(current_epoch, previous_epoch);
 
-    let events_b = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: None,
-        workspace_id: Some(workspace_b),
-        after_sequence: None,
-        stream_epoch: None,
-    }));
-    let ServerResponse::WorkspaceEventsSnapshot {
+    let events_b = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace_b),
+            after_sequence: None,
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::WorkspaceEventsSnapshot {
         sessions,
         events,
         latest_sequence: global_cursor,
         stream_epoch: Some(current_epoch),
         ..
-    } = events_b.result.unwrap()
+    }) = events_b.result.unwrap()
     else {
         panic!("expected a workspace snapshot after persisted pruning");
     };
@@ -9408,16 +10036,17 @@ fn workspace_reconnect_feed_isolated_and_pruned_cursors_resync_to_workspace_snap
     assert!(events.iter().all(|event| matches!(event,
         WorkspaceFeedEvent::Session(event) if event.session_id == session_b)));
 
-    let advanced_cursor =
-        connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+    let advanced_cursor = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
             session_id: None,
             workspace_id: Some(workspace_a),
             after_sequence: Some(global_cursor),
             stream_epoch: Some(current_epoch),
-        }));
+        },
+    )));
     assert!(matches!(
         advanced_cursor.result.unwrap(),
-        ServerResponse::WorkspaceEvents { events, .. } if events.is_empty()
+        ServerResponse::Events(EventsResponse::WorkspaceEvents{ events, .. }) if events.is_empty()
     ));
 
     fs::remove_file(path).unwrap();
@@ -9433,17 +10062,23 @@ fn workspace_rename_and_config_changes_are_durable_workspace_events() {
         let backend = InProcessBackend::new_persistent(&path).unwrap();
         let connection = backend.connect();
         negotiate(&connection);
-        let created = connection.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-            name: "Before rename".to_owned(),
-        }));
-        let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+        let created = connection.request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Before rename".to_owned(),
+            },
+        )));
+        let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+            created.result.unwrap()
+        else {
             panic!("unexpected workspace response");
         };
         connection
-            .request(RequestEnvelope::new(ClientRequest::RenameWorkspace {
-                workspace_id: workspace.id,
-                name: "After rename".to_owned(),
-            }))
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::RenameWorkspace {
+                    workspace_id: workspace.id,
+                    name: "After rename".to_owned(),
+                },
+            )))
             .result
             .unwrap();
         let config = WorkspaceConfig {
@@ -9451,12 +10086,12 @@ fn workspace_rename_and_config_changes_are_durable_workspace_events() {
             ..WorkspaceConfig::default()
         };
         connection
-            .request(RequestEnvelope::new(
-                ClientRequest::SetWorkspaceConfigForWorkspace {
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
                     workspace_id: workspace.id,
                     config,
                 },
-            ))
+            )))
             .result
             .unwrap();
         backend.flush().unwrap();
@@ -9468,17 +10103,19 @@ fn workspace_rename_and_config_changes_are_durable_workspace_events() {
     let backend = InProcessBackend::new_persistent(&path).unwrap();
     let connection = backend.connect();
     negotiate(&connection);
-    let response = connection.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: None,
-        workspace_id: Some(workspace_id),
-        after_sequence: Some(EventSequence::default()),
-        stream_epoch: None,
-    }));
-    let ServerResponse::WorkspaceEvents {
+    let response = connection.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace_id),
+            after_sequence: Some(EventSequence::default()),
+            stream_epoch: None,
+        },
+    )));
+    let ServerResponse::Events(EventsResponse::WorkspaceEvents {
         workspace_id: returned,
         events,
         ..
-    } = response.result.unwrap()
+    }) = response.result.unwrap()
     else {
         panic!("expected workspace event batch");
     };
@@ -9508,17 +10145,23 @@ fn workspace_event_requests_require_workspace_event_capability() {
     let backend = InProcessBackend::new_persistent(&path).unwrap();
     let writer = backend.connect();
     negotiate(&writer);
-    let created = writer.request(RequestEnvelope::new(ClientRequest::CreateWorkspace {
-        name: "Before".to_owned(),
-    }));
-    let ServerResponse::WorkspaceCreated(workspace) = created.result.unwrap() else {
+    let created = writer.request(RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::CreateWorkspace {
+            name: "Before".to_owned(),
+        },
+    )));
+    let ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) =
+        created.result.unwrap()
+    else {
         panic!("unexpected workspace response");
     };
     writer
-        .request(RequestEnvelope::new(ClientRequest::RenameWorkspace {
-            workspace_id: workspace.id,
-            name: "After".to_owned(),
-        }))
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::RenameWorkspace {
+                workspace_id: workspace.id,
+                name: "After".to_owned(),
+            },
+        )))
         .result
         .unwrap();
 
@@ -9526,23 +10169,23 @@ fn workspace_event_requests_require_workspace_event_capability() {
     let limited_capabilities = CapabilitySet::new([Capability::SubscribeSessionEvents]);
     let negotiated = limited.request(RequestEnvelope::with_version(
         CURRENT_PROTOCOL_VERSION,
-        ClientRequest::Negotiate {
+        ClientRequest::Control(ControlRequest::Negotiate {
             client_version: CURRENT_PROTOCOL_VERSION,
             capabilities: limited_capabilities,
-        },
+        }),
     ));
     assert!(matches!(
         negotiated.result,
-        Ok(ServerResponse::Negotiated(_))
+        Ok(ServerResponse::Control(ControlResponse::Negotiated(_)))
     ));
     let unsupported_events = limited.request(RequestEnvelope::with_version(
         CURRENT_PROTOCOL_VERSION,
-        ClientRequest::GetSessionEvents {
+        ClientRequest::Events(EventsRequest::GetSessionEvents {
             session_id: None,
             workspace_id: Some(workspace.id),
             after_sequence: Some(EventSequence::default()),
             stream_epoch: None,
-        },
+        }),
     ));
     assert_eq!(
         unsupported_events.result.unwrap_err().code,
@@ -9551,14 +10194,16 @@ fn workspace_event_requests_require_workspace_event_capability() {
 
     let current = backend.connect();
     negotiate(&current);
-    let current_events = current.request(RequestEnvelope::new(ClientRequest::GetSessionEvents {
-        session_id: None,
-        workspace_id: Some(workspace.id),
-        after_sequence: Some(EventSequence::default()),
-        stream_epoch: None,
-    }));
+    let current_events = current.request(RequestEnvelope::new(ClientRequest::Events(
+        EventsRequest::GetSessionEvents {
+            session_id: None,
+            workspace_id: Some(workspace.id),
+            after_sequence: Some(EventSequence::default()),
+            stream_epoch: None,
+        },
+    )));
     assert!(matches!(current_events.result.unwrap(),
-        ServerResponse::WorkspaceEvents { events, .. }
+        ServerResponse::Events(EventsResponse::WorkspaceEvents{ events, .. })
             if matches!(events.as_slice(), [WorkspaceFeedEvent::Workspace(_)])));
     fs::remove_file(path).unwrap();
 }

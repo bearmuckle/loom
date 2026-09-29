@@ -316,7 +316,9 @@ impl InProcessBackend {
             .is_some()
         {
             let message = persistence.accept_agent_message(request_id, &draft)?;
-            return Ok(ServerResponse::ProjectAgentMessageAccepted(message));
+            return Ok(ServerResponse::Project(
+                ProjectResponse::ProjectAgentMessageAccepted(message),
+            ));
         }
         if matches!(
             target.state,
@@ -366,6 +368,8 @@ impl InProcessBackend {
                 },
             });
         }
-        Ok(ServerResponse::ProjectAgentMessageAccepted(message))
+        Ok(ServerResponse::Project(
+            ProjectResponse::ProjectAgentMessageAccepted(message),
+        ))
     }
 }

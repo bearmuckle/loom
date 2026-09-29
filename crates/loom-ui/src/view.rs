@@ -47,11 +47,15 @@ use loom_model::{MessageRole, ModelId, ModelMessage, ProviderKind, ProviderSumma
 use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
-    AgentRunSnapshotProjection, AgentRunState, ClientRequest, FileActivityOperation,
-    GitDiffLineKind, GitFileStatusKind, GitHubRepository, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
-    ProjectChildControlAction, RequestEnvelope, ResponseEnvelope, ServerEvent, ServerResponse,
-    SessionDirectory, SessionRepository, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus,
-    WorkspaceConfig, WorkspaceFeedEvent,
+    AgentRunSnapshotProjection, AgentRunState, ClientRequest, ContextRequest, EventsRequest,
+    EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse, GitDiffLineKind,
+    GitFileStatusKind, GitHubRepository, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
+    ProjectChildControlAction, ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse,
+    RepositoryRequest, RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest,
+    RunResponse, ServerEvent, ServerResponse, SessionDirectory, SessionRepository, SessionRequest,
+    SessionResponse, TaskRequest, TerminalRequest, UsageRequest, WorkerNodeConfig,
+    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceFeedEvent, WorkspaceRequest,
+    WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_family = "wasm"))]
@@ -284,22 +288,22 @@ async fn load_transcript_page(
     before_ordinal: Option<u64>,
 ) -> Result<TranscriptPage, LoomError> {
     let response = backend
-        .submit(RequestEnvelope::new(
-            ClientRequest::GetAgentRunTranscriptPage {
+        .submit(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRunTranscriptPage {
                 run_id,
                 before_ordinal,
                 limit: MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
             },
-        ))
+        )))
         .wait()
         .await;
     let (messages, next_before, has_older) = match response.result? {
-        ServerResponse::AgentRunTranscriptPage {
+        ServerResponse::Run(RunResponse::AgentRunTranscriptPage {
             run_id: response_run_id,
             messages,
             next_before,
             has_older,
-        } if response_run_id == run_id => (messages, next_before, has_older),
+        }) if response_run_id == run_id => (messages, next_before, has_older),
         response => {
             return Err(unexpected_response("run transcript page", response));
         }

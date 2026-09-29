@@ -7,34 +7,39 @@ use loom_model::{ModelId, ToolCall};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
     AgentPlanStep, AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientFrame,
-    ClientRequest, ContextAssemblyOptions, FileActivityOperation, GitHubCopilotLoginStatus,
-    RequestEnvelope, ResponseEnvelope, ServerEvent, ServerEventEnvelope, ServerFrame,
-    ServerResponse, SessionFilesystemSnapshot, TaskKind, TaskSpec, ToolResult, WorkerNodeResources,
-    WorkerNodeStatus, WorkspaceConfig, WorkspaceEdit, WorkspaceRecord, decode_client_frame,
-    decode_event, decode_request, decode_response, decode_server_frame, encode_client_frame,
-    encode_event, encode_request, encode_response, encode_server_frame,
+    ClientRequest, ContextAssemblyOptions, ControlRequest, ControlResponse, FileActivityOperation,
+    FilesystemRequest, FilesystemResponse, GitHubCopilotLoginStatus, ProviderRequest,
+    ProviderResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
+    ServerEventEnvelope, ServerFrame, ServerResponse, SessionFilesystemSnapshot, SessionRequest,
+    TaskKind, TaskRequest, TaskResponse, TaskSpec, ToolResult, WorkerNodeResources,
+    WorkerNodeStatus, WorkspaceConfig, WorkspaceEdit, WorkspaceRecord, WorkspaceRequest,
+    WorkspaceResponse, decode_client_frame, decode_event, decode_request, decode_response,
+    decode_server_frame, encode_client_frame, encode_event, encode_request, encode_response,
+    encode_server_frame,
 };
 
 #[test]
 fn request_json_round_trip_preserves_typed_envelope() {
-    let request = RequestEnvelope::new(ClientRequest::Negotiate {
+    let request = RequestEnvelope::new(ClientRequest::Control(ControlRequest::Negotiate {
         client_version: CURRENT_PROTOCOL_VERSION,
         capabilities: CapabilitySet::new([
             Capability::CreateAgentSession,
             Capability::SubscribeSessionEvents,
         ]),
-    });
+    }));
 
     let encoded = encode_request(&request).unwrap();
     let decoded = decode_request(&encoded).unwrap();
 
     assert_eq!(decoded, request);
 
-    let approval_settings = RequestEnvelope::new(ClientRequest::SetSessionApprovalPolicy {
-        session_id: AgentSessionId::new(),
-        policy: loom_core::ApprovalPolicy::default(),
-        auto_approve_actions: Some(false),
-    });
+    let approval_settings = RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::SetSessionApprovalPolicy {
+            session_id: AgentSessionId::new(),
+            policy: loom_core::ApprovalPolicy::default(),
+            auto_approve_actions: Some(false),
+        },
+    ));
     assert_eq!(
         decode_request(&encode_request(&approval_settings).unwrap()).unwrap(),
         approval_settings
@@ -56,7 +61,9 @@ fn response_json_round_trip_preserves_structured_errors() {
 
 #[test]
 fn browser_copilot_login_round_trips_without_access_tokens() {
-    let request = RequestEnvelope::new(ClientRequest::StartGitHubCopilotLogin);
+    let request = RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::StartGitHubCopilotLogin,
+    ));
     assert_eq!(
         request.request.required_capability(),
         Some(Capability::ConfigureProviders)
@@ -68,22 +75,24 @@ fn browser_copilot_login_round_trips_without_access_tokens() {
 
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::GitHubCopilotLoginStarted {
+        ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStarted {
             login_id: "login-1".to_owned(),
             user_code: "ABCD-EFGH".to_owned(),
             verification_uri: "https://github.com/login/device".to_owned(),
             expires_in: 900,
             interval: 5,
-        },
+        }),
     );
     assert_eq!(
         decode_response(&encode_response(&response).unwrap()).unwrap(),
         response
     );
 
-    let status_request = RequestEnvelope::new(ClientRequest::GetGitHubCopilotLoginStatus {
-        login_id: "login-1".to_owned(),
-    });
+    let status_request = RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::GetGitHubCopilotLoginStatus {
+            login_id: "login-1".to_owned(),
+        },
+    ));
     assert_eq!(
         status_request.request.required_capability(),
         Some(Capability::ConfigureProviders)
@@ -94,9 +103,9 @@ fn browser_copilot_login_round_trips_without_access_tokens() {
     );
     let status_response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::GitHubCopilotLoginStatus {
+        ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
             status: GitHubCopilotLoginStatus::Configured,
-        },
+        }),
     );
     assert_eq!(
         decode_response(&encode_response(&status_response).unwrap()).unwrap(),
@@ -147,7 +156,7 @@ fn event_json_round_trip_preserves_sequence_and_session() {
 fn response_can_carry_model_list_without_provider_specific_types() {
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::Models { models: Vec::new() },
+        ServerResponse::Provider(ProviderResponse::Models { models: Vec::new() }),
     );
 
     let encoded = encode_response(&response).unwrap();
@@ -175,7 +184,7 @@ fn older_provider_summaries_default_api_key_setup_to_unsupported() {
 fn worker_status_response_round_trip_preserves_resource_samples() {
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::WorkerNodeStatus(WorkerNodeStatus {
+        ServerResponse::Control(ControlResponse::WorkerNodeStatus(WorkerNodeStatus {
             node_id: "worker-1".to_owned(),
             name: "Worker one".to_owned(),
             online: true,
@@ -189,7 +198,7 @@ fn worker_status_response_round_trip_preserves_resource_samples() {
                 disk_total_bytes: Some(1 << 40),
                 disk_available_bytes: Some(1 << 39),
             },
-        }),
+        })),
     );
 
     let encoded = encode_response(&response).unwrap();
@@ -309,15 +318,17 @@ fn activity_event_round_trip_preserves_typed_work_and_relationships() {
 
 #[test]
 fn m2_workspace_and_task_requests_round_trip_without_untyped_envelopes() {
-    let request = RequestEnvelope::new(ClientRequest::ApplySessionFilesystemEdit {
-        session_id: AgentSessionId::new(),
-        edit: WorkspaceEdit {
-            path: "src/lib.rs".to_owned(),
-            old_text: "old".to_owned(),
-            new_text: "new".to_owned(),
-            expected_revision: Some("revision".to_owned()),
+    let request = RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::ApplySessionFilesystemEdit {
+            session_id: AgentSessionId::new(),
+            edit: WorkspaceEdit {
+                path: "src/lib.rs".to_owned(),
+                old_text: "old".to_owned(),
+                new_text: "new".to_owned(),
+                expected_revision: Some("revision".to_owned()),
+            },
         },
-    });
+    ));
     let decoded = decode_request(&encode_request(&request).unwrap()).unwrap();
     assert_eq!(decoded, request);
 
@@ -332,12 +343,14 @@ fn m2_workspace_and_task_requests_round_trip_without_untyped_envelopes() {
     };
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::SessionFilesystemSnapshot(SessionFilesystemSnapshot {
-            session_id: AgentSessionId::new(),
-            root: "/workspace".to_owned(),
-            captured_at: Timestamp::from_unix_millis(4),
-            entries: Vec::new(),
-        }),
+        ServerResponse::Filesystem(FilesystemResponse::SessionFilesystemSnapshot(
+            SessionFilesystemSnapshot {
+                session_id: AgentSessionId::new(),
+                root: "/workspace".to_owned(),
+                captured_at: Timestamp::from_unix_millis(4),
+                entries: Vec::new(),
+            },
+        )),
     );
     let decoded_response = decode_response(&encode_response(&response).unwrap()).unwrap();
     assert_eq!(decoded_response, response);
@@ -346,23 +359,25 @@ fn m2_workspace_and_task_requests_round_trip_without_untyped_envelopes() {
 
 #[test]
 fn m3_run_options_provider_and_context_contracts_round_trip() {
-    let request = RequestEnvelope::new(ClientRequest::StartSessionAgentRunWithOptions {
-        session_id: AgentSessionId::new(),
-        task: "durable task".to_owned(),
-        model: ModelId::new("deterministic/demo"),
-        system_instructions: Some("system".to_owned()),
-        repository_instructions: Some("repository".to_owned()),
-        limits: SessionLimits {
-            max_tool_calls: Some(3),
-            max_cost_micros: Some(10_000),
-            ..Default::default()
+    let request = RequestEnvelope::new(ClientRequest::Run(
+        RunRequest::StartSessionAgentRunWithOptions {
+            session_id: AgentSessionId::new(),
+            task: "durable task".to_owned(),
+            model: ModelId::new("deterministic/demo"),
+            system_instructions: Some("system".to_owned()),
+            repository_instructions: Some("repository".to_owned()),
+            limits: SessionLimits {
+                max_tool_calls: Some(3),
+                max_cost_micros: Some(10_000),
+                ..Default::default()
+            },
+            context: ContextAssemblyOptions {
+                context_window: Some(4_096),
+                max_input_tokens: Some(2_048),
+                reserved_output_tokens: Some(512),
+            },
         },
-        context: ContextAssemblyOptions {
-            context_window: Some(4_096),
-            max_input_tokens: Some(2_048),
-            reserved_output_tokens: Some(512),
-        },
-    });
+    ));
     assert_eq!(
         decode_request(&encode_request(&request).unwrap()).unwrap(),
         request
@@ -370,9 +385,9 @@ fn m3_run_options_provider_and_context_contracts_round_trip() {
 
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::Providers {
+        ServerResponse::Provider(ProviderResponse::Providers {
             providers: Vec::new(),
-        },
+        }),
     );
     assert_eq!(
         decode_response(&encode_response(&response).unwrap()).unwrap(),
@@ -384,7 +399,7 @@ fn m3_run_options_provider_and_context_contracts_round_trip() {
 fn capability_discovery_accepts_current_major_and_rejects_old_major() {
     let request = RequestEnvelope::with_version(
         CURRENT_PROTOCOL_VERSION,
-        ClientRequest::DiscoverCapabilities,
+        ClientRequest::Control(ControlRequest::DiscoverCapabilities),
     );
     assert_eq!(
         decode_request(&encode_request(&request).unwrap()).unwrap(),
@@ -412,9 +427,9 @@ fn capability_discovery_accepts_current_major_and_rejects_old_major() {
 
 #[test]
 fn m4_transport_frames_preserve_typed_envelopes() {
-    let request = ClientFrame::Request(Box::new(RequestEnvelope::new(
-        ClientRequest::DiscoverCapabilities,
-    )));
+    let request = ClientFrame::Request(Box::new(RequestEnvelope::new(ClientRequest::Control(
+        ControlRequest::DiscoverCapabilities,
+    ))));
     assert_eq!(
         decode_client_frame(&encode_client_frame(&request).unwrap()).unwrap(),
         request
@@ -433,49 +448,53 @@ fn m4_transport_frames_preserve_typed_envelopes() {
 #[test]
 fn m5_session_run_review_and_evidence_contracts_round_trip() {
     let workspace_id = WorkspaceId::new();
-    let sessions = RequestEnvelope::new(ClientRequest::ListWorkspaceSessions {
-        workspace_id,
-        include_archived: false,
-    });
+    let sessions = RequestEnvelope::new(ClientRequest::Workspace(
+        WorkspaceRequest::ListWorkspaceSessions {
+            workspace_id,
+            include_archived: false,
+        },
+    ));
     assert_eq!(
         decode_request(&encode_request(&sessions).unwrap()).unwrap(),
         sessions
     );
-    let message = RequestEnvelope::new(ClientRequest::SendAgentMessage {
+    let message = RequestEnvelope::new(ClientRequest::Run(RunRequest::SendAgentMessage {
         run_id: RunId::new(),
         attempt_id: loom_core::RunAttemptId::new(),
         expected_control_revision: 3,
         message: "continue with validation".to_owned(),
-    });
+    }));
     assert_eq!(
         decode_request(&encode_request(&message).unwrap()).unwrap(),
         message
     );
-    let changes = RequestEnvelope::new(ClientRequest::GetSessionFilesystemChanges {
-        session_id: AgentSessionId::new(),
-        after_sequence: Some(EventSequence::new(4)),
-    });
+    let changes = RequestEnvelope::new(ClientRequest::Filesystem(
+        FilesystemRequest::GetSessionFilesystemChanges {
+            session_id: AgentSessionId::new(),
+            after_sequence: Some(EventSequence::new(4)),
+        },
+    ));
     assert_eq!(
         decode_request(&encode_request(&changes).unwrap()).unwrap(),
         changes
     );
-    let tasks = RequestEnvelope::new(ClientRequest::ListSessionTasks {
+    let tasks = RequestEnvelope::new(ClientRequest::Task(TaskRequest::ListSessionTasks {
         session_id: AgentSessionId::new(),
-    });
+    }));
     assert_eq!(
         decode_request(&encode_request(&tasks).unwrap()).unwrap(),
         tasks
     );
     let response = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::Workspaces {
+        ServerResponse::Workspace(WorkspaceResponse::Workspaces {
             workspaces: vec![WorkspaceRecord {
                 id: workspace_id,
                 name: "workspace".to_owned(),
                 created_at: Timestamp::from_unix_millis(5),
                 updated_at: Timestamp::from_unix_millis(5),
             }],
-        },
+        }),
     );
     assert_eq!(
         decode_response(&encode_response(&response).unwrap()).unwrap(),
@@ -497,19 +516,21 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
     };
     let run_snapshot = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::AgentRunSnapshot(loom_protocol::AgentRunSnapshotProjection {
-            run,
-            plan: vec![AgentPlanStep {
-                id: "validate".to_owned(),
-                description: "Validate the change".to_owned(),
-            }],
-            messages: Vec::new(),
-            pending_approval: None,
-            pending_input: None,
-            usage: Default::default(),
-            activities: Vec::new(),
-            message_timeline_ordinals: Vec::new(),
-        }),
+        ServerResponse::Run(RunResponse::AgentRunSnapshot(
+            loom_protocol::AgentRunSnapshotProjection {
+                run,
+                plan: vec![AgentPlanStep {
+                    id: "validate".to_owned(),
+                    description: "Validate the change".to_owned(),
+                }],
+                messages: Vec::new(),
+                pending_approval: None,
+                pending_input: None,
+                usage: Default::default(),
+                activities: Vec::new(),
+                message_timeline_ordinals: Vec::new(),
+            },
+        )),
     );
     assert_eq!(
         decode_response(&encode_response(&run_snapshot).unwrap()).unwrap(),
@@ -517,9 +538,9 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
     );
     let evidence = ResponseEnvelope::success(
         loom_core::RequestId::new(),
-        ServerResponse::TaskEvidence {
+        ServerResponse::Task(TaskResponse::TaskEvidence {
             evidence: Vec::new(),
-        },
+        }),
     );
     assert_eq!(
         decode_response(&encode_response(&evidence).unwrap()).unwrap(),

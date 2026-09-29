@@ -53,31 +53,36 @@ impl LoomView {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn load_session(&mut self, session: AgentSessionSnapshot) {
         self.activate_session(session);
-        let metadata_response = self.connection.request(RequestEnvelope::new(
-            ClientRequest::GetAgentSessionInitialState {
-                session_id: self.active_session.id,
-            },
-        ));
+        let metadata_response =
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::Session(
+                    SessionRequest::GetAgentSessionInitialState {
+                        session_id: self.active_session.id,
+                    },
+                )));
         let snapshot_response = if metadata_response.result.is_err() {
-            self.connection.request(RequestEnvelope::new(
-                ClientRequest::GetAgentSessionSnapshot {
-                    session_id: self.active_session.id,
-                },
-            ))
+            self.connection
+                .request(RequestEnvelope::new(ClientRequest::Session(
+                    SessionRequest::GetAgentSessionSnapshot {
+                        session_id: self.active_session.id,
+                    },
+                )))
         } else {
             metadata_response
         };
         let mut event_cursor = None;
         let snapshot_result = match snapshot_response.result {
-            Ok(ServerResponse::AgentSessionInitialState(initial)) => {
+            Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial))) => {
                 event_cursor = Some(initial.cursor);
-                Ok(ServerResponse::AgentSessionSnapshot(initial.projection))
+                Ok(ServerResponse::Session(
+                    SessionResponse::AgentSessionSnapshot(initial.projection),
+                ))
             }
             result => result,
         };
         let mut needs_transcript_page = false;
         let fallback_projection = match snapshot_result {
-            Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
+            Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
                 needs_transcript_page = projection
                     .active_run
                     .as_ref()
@@ -128,14 +133,16 @@ impl LoomView {
         }
         match self
             .connection
-            .request(RequestEnvelope::new(
-                ClientRequest::ListSessionRepositories {
+            .request(RequestEnvelope::new(ClientRequest::Repository(
+                RepositoryRequest::ListSessionRepositories {
                     session_id: self.active_session.id,
                 },
-            ))
+            )))
             .result
         {
-            Ok(ServerResponse::SessionRepositories { repositories }) => {
+            Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositories {
+                repositories,
+            })) => {
                 self.selected_repository_id = repositories.first().map(|repository| repository.id);
                 self.session_repositories = repositories;
             }
@@ -145,24 +152,26 @@ impl LoomView {
                 unexpected_response("session repository list", response),
             ),
         }
-        if let Ok(ServerResponse::SessionDirectories { directories }) = self
+        if let Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectories {
+            directories,
+        })) = self
             .connection
-            .request(RequestEnvelope::new(
-                ClientRequest::ListSessionDirectories {
+            .request(RequestEnvelope::new(ClientRequest::Filesystem(
+                FilesystemRequest::ListSessionDirectories {
                     session_id: self.active_session.id,
                 },
-            ))
+            )))
             .result
         {
             self.session_directories = directories;
         }
-        if let Ok(ServerResponse::ProjectSnapshot(snapshot)) = self
+        if let Ok(ServerResponse::Project(ProjectResponse::ProjectSnapshot(snapshot))) = self
             .connection
-            .request(RequestEnvelope::new(
-                ClientRequest::GetProjectSnapshotForSession {
+            .request(RequestEnvelope::new(ClientRequest::Project(
+                ProjectRequest::GetProjectSnapshotForSession {
                     session_id: self.active_session.id,
                 },
-            ))
+            )))
             .result
         {
             self.project_tree_snapshots
@@ -191,12 +200,12 @@ impl LoomView {
         }
         self.dispatch(
             cx,
-            ClientRequest::RenameAgentSession {
+            ClientRequest::Session(SessionRequest::RenameAgentSession {
                 session_id: dialog.session.id,
                 name,
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::AgentSessionRenamed(snapshot)) => {
+                Ok(ServerResponse::Session(SessionResponse::AgentSessionRenamed(snapshot))) => {
                     view.active_session = snapshot;
                     view.reload_sessions(cx);
                 }
@@ -221,11 +230,13 @@ impl LoomView {
         let session_id = self.active_session.id;
         self.dispatch(
             cx,
-            ClientRequest::ArchiveAgentSession { session_id },
+            ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id }),
             move |view, response, cx| {
                 view.archive_request_in_flight = false;
                 match response.result {
-                    Ok(ServerResponse::AgentSessionArchived(snapshot)) => {
+                    Ok(ServerResponse::Session(SessionResponse::AgentSessionArchived(
+                        snapshot,
+                    ))) => {
                         view.sessions.retain(|session| session.id != snapshot.id);
                         view.session_node_ids.remove(&snapshot.id);
                         if let Some(session) = view.sessions.first().cloned() {
@@ -278,67 +289,80 @@ impl LoomView {
         self.ensure_session_task_message(session.id);
         let session_id = session.id;
         let mut event_stream_epoch = self.event_stream_epoch.clone();
-        let snapshot_request = backend.submit(RequestEnvelope::new(
-            ClientRequest::GetAgentSessionInitialState { session_id },
-        ));
+        let snapshot_request = backend.submit(RequestEnvelope::new(ClientRequest::Session(
+            SessionRequest::GetAgentSessionInitialState { session_id },
+        )));
         cx.spawn(async move |view, cx| {
             let mut snapshot = cx
                 .background_spawn(async move { snapshot_request.wait().await })
                 .await;
             if snapshot.result.is_err() {
                 snapshot = backend
-                    .submit(RequestEnvelope::new(
-                        ClientRequest::GetAgentSessionSnapshot { session_id },
-                    ))
+                    .submit(RequestEnvelope::new(ClientRequest::Session(
+                        SessionRequest::GetAgentSessionSnapshot { session_id },
+                    )))
                     .wait()
                     .await;
             }
             let cursor = match &snapshot.result {
-                Ok(ServerResponse::AgentSessionInitialState(initial)) => Some(initial.cursor),
+                Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial))) => {
+                    Some(initial.cursor)
+                }
                 _ => None,
             };
-            if let Ok(ServerResponse::AgentSessionInitialState(initial)) = snapshot.result.clone() {
-                snapshot.result = Ok(ServerResponse::AgentSessionSnapshot(initial.projection));
+            if let Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(initial))) =
+                snapshot.result.clone()
+            {
+                snapshot.result = Ok(ServerResponse::Session(
+                    SessionResponse::AgentSessionSnapshot(initial.projection),
+                ));
             }
-            let events_request =
-                backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+            let events_request = backend.submit(RequestEnvelope::new(ClientRequest::Events(
+                EventsRequest::GetSessionEvents {
                     session_id: Some(session_id),
                     workspace_id: None,
                     after_sequence: cursor,
                     stream_epoch: event_stream_epoch.clone(),
-                }));
+                },
+            )));
             let mut events = cx
                 .background_spawn(async move { events_request.wait().await })
                 .await;
-            if let Ok(ServerResponse::SessionEventsSnapshot {
+            if let Ok(ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
                 stream_epoch: Some(epoch),
                 ..
-            }) = &events.result
+            })) = &events.result
             {
                 event_stream_epoch = Some(epoch.clone());
             }
             if matches!(
                 &events.result,
-                Ok(ServerResponse::SessionEventsSnapshot { .. })
+                Ok(ServerResponse::Events(
+                    EventsResponse::SessionEventsSnapshot { .. }
+                ))
             ) {
-                let refresh_request = backend.submit(RequestEnvelope::new(
-                    ClientRequest::GetAgentSessionInitialState { session_id },
-                ));
+                let refresh_request = backend.submit(RequestEnvelope::new(ClientRequest::Session(
+                    SessionRequest::GetAgentSessionInitialState { session_id },
+                )));
                 let mut refreshed = cx
                     .background_spawn(async move { refresh_request.wait().await })
                     .await;
-                if let Ok(ServerResponse::AgentSessionInitialState(initial)) =
-                    refreshed.result.clone()
+                if let Ok(ServerResponse::Session(SessionResponse::AgentSessionInitialState(
+                    initial,
+                ))) = refreshed.result.clone()
                 {
                     let refreshed_cursor = initial.cursor;
-                    refreshed.result = Ok(ServerResponse::AgentSessionSnapshot(initial.projection));
-                    let retry_request =
-                        backend.submit(RequestEnvelope::new(ClientRequest::GetSessionEvents {
+                    refreshed.result = Ok(ServerResponse::Session(
+                        SessionResponse::AgentSessionSnapshot(initial.projection),
+                    ));
+                    let retry_request = backend.submit(RequestEnvelope::new(
+                        ClientRequest::Events(EventsRequest::GetSessionEvents {
                             session_id: Some(session_id),
                             workspace_id: None,
                             after_sequence: Some(refreshed_cursor),
                             stream_epoch: event_stream_epoch.clone(),
-                        }));
+                        }),
+                    ));
                     snapshot = refreshed;
                     events = cx
                         .background_spawn(async move { retry_request.wait().await })
@@ -365,14 +389,16 @@ impl LoomView {
             return;
         }
         let needs_transcript_page = match &snapshot_response.result {
-            Ok(ServerResponse::AgentSessionSnapshot(projection)) => projection
-                .active_run
-                .as_ref()
-                .is_some_and(|run| run.messages.is_empty()),
+            Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
+                projection
+                    .active_run
+                    .as_ref()
+                    .is_some_and(|run| run.messages.is_empty())
+            }
             _ => false,
         };
         let fallback_projection = match snapshot_response.result {
-            Ok(ServerResponse::AgentSessionSnapshot(projection)) => {
+            Ok(ServerResponse::Session(SessionResponse::AgentSessionSnapshot(projection))) => {
                 self.active_session = projection.session.clone();
                 self.auto_approve_actions = projection.auto_approve_actions;
                 self.session_auto_approve_actions
@@ -403,10 +429,10 @@ impl LoomView {
             .as_ref()
             .map(|projection| projection.latest_sequence);
         match events_response.result {
-            Ok(ServerResponse::SessionEvents {
+            Ok(ServerResponse::Events(EventsResponse::SessionEvents {
                 events,
                 stream_epoch,
-            }) => {
+            })) => {
                 self.event_stream_epoch = stream_epoch;
                 for event in events {
                     self.after_sequence = Some(event.sequence);
@@ -420,13 +446,13 @@ impl LoomView {
                     self.apply_run_projection(projection);
                 }
             }
-            Ok(ServerResponse::SessionEventsSnapshot {
+            Ok(ServerResponse::Events(EventsResponse::SessionEventsSnapshot {
                 session,
                 events,
                 latest_sequence,
                 stream_epoch,
                 ..
-            }) => {
+            })) => {
                 self.event_stream_epoch = stream_epoch;
                 self.active_session = session;
                 self.reset_projection();
@@ -557,25 +583,25 @@ impl LoomView {
             let result = async {
                 log::info!("registering workspace before session creation");
                 let registered = backend
-                    .submit(RequestEnvelope::new(ClientRequest::RegisterWorkspace {
+                    .submit(RequestEnvelope::new(ClientRequest::Workspace(WorkspaceRequest::RegisterWorkspace{
                         workspace: workspace.clone(),
-                    }))
+                    })))
                     .wait()
                     .await;
                 match registered.result? {
-                    ServerResponse::WorkspaceCreated(_) => {}
+                    ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(_)) => {}
                     response => {
                         return Err(unexpected_response("workspace registration", response));
                     }
                 }
                 let response = backend
                     .submit(RequestEnvelope::new(
-                        ClientRequest::CreateAgentSessionInWorkspace { workspace_id, name },
+                        ClientRequest::Workspace(WorkspaceRequest::CreateAgentSessionInWorkspace{ workspace_id, name }),
                     ))
                     .wait()
                     .await;
                 let snapshot = match response.result? {
-                    ServerResponse::AgentSessionCreated(snapshot) => snapshot,
+                    ServerResponse::Session(SessionResponse::AgentSessionCreated(snapshot)) => snapshot,
                     response => return Err(unexpected_response("session creation", response)),
                 };
                 log::info!("created session {}; attaching source", snapshot.id);
@@ -583,15 +609,15 @@ impl LoomView {
                     None => Ok(()),
                     Some(SessionCreationSource::LocalDirectory(source)) => {
                         let response = backend
-                            .submit(RequestEnvelope::new(ClientRequest::AttachSessionDirectory {
+                            .submit(RequestEnvelope::new(ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory{
                                 session_id: snapshot.id,
                                 source,
                                 path: format!("sources/{}", uuid::Uuid::new_v4()),
-                            }))
+                            })))
                             .wait()
                             .await;
                         match response.result? {
-                            ServerResponse::SessionDirectoryAttached { .. } => Ok(()),
+                            ServerResponse::Filesystem(FilesystemResponse::SessionDirectoryAttached{ .. }) => Ok(()),
                             response => Err(unexpected_response("directory attachment", response)),
                         }
                     }
@@ -599,16 +625,16 @@ impl LoomView {
                         log::info!("cloning GitHub repository {} into session {}", repository.full_name, snapshot.id);
                         let repository_id = RepositoryId::new();
                         let response = backend
-                            .submit(RequestEnvelope::new(ClientRequest::AttachSessionRepository {
+                            .submit(RequestEnvelope::new(ClientRequest::Repository(RepositoryRequest::AttachSessionRepository{
                                 session_id: snapshot.id,
                                 source: repository.clone_url,
                                 path: format!("repositories/{repository_id}"),
                                 revision: None,
-                            }))
+                            })))
                             .wait()
                             .await;
                         match response.result? {
-                            ServerResponse::SessionRepositoryAttached(_) => Ok(()),
+                            ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(_)) => Ok(()),
                             response => Err(unexpected_response("repository attachment", response)),
                         }
                     }
@@ -616,9 +642,9 @@ impl LoomView {
                 if let Err(error) = setup {
                     log::error!("session source setup failed: {}", error.message);
                     let _ = backend
-                        .submit(RequestEnvelope::new(ClientRequest::ArchiveAgentSession {
+                        .submit(RequestEnvelope::new(ClientRequest::Session(SessionRequest::ArchiveAgentSession{
                             session_id: snapshot.id,
-                        }))
+                        })))
                         .wait()
                         .await;
                     return Err(error);
@@ -680,10 +706,10 @@ impl LoomView {
         self.review.vcs = None;
         self.dispatch(
             cx,
-            ClientRequest::GetSessionVcsStatus {
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsStatus {
                 session_id,
                 repository_id,
-            },
+            }),
             move |view, response, _| {
                 if view.active_session.id != session_id
                     || view.selected_repository_id != Some(repository_id)
@@ -691,7 +717,9 @@ impl LoomView {
                     return;
                 }
                 match response.result {
-                    Ok(ServerResponse::VcsStatus(status)) => view.review.vcs = Some(status),
+                    Ok(ServerResponse::Repository(RepositoryResponse::VcsStatus(status))) => {
+                        view.review.vcs = Some(status)
+                    }
                     Err(error) => {
                         view.review.vcs = None;
                         view.record_status(format!("VCS review unavailable: {error}"));
@@ -713,12 +741,12 @@ impl LoomView {
     ) {
         self.dispatch(
             cx,
-            ClientRequest::DetachSessionRepository {
+            ClientRequest::Repository(RepositoryRequest::DetachSessionRepository {
                 session_id: self.active_session.id,
                 repository_id,
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::SessionRepositoryDetached) => {
+                Ok(ServerResponse::Repository(RepositoryResponse::SessionRepositoryDetached)) => {
                     view.session_repositories
                         .retain(|repository| repository.id != repository_id);
                     if view.selected_repository_id == Some(repository_id) {
@@ -741,12 +769,12 @@ impl LoomView {
     pub(crate) fn detach_session_directory(&mut self, path: String, cx: &mut Context<Self>) {
         self.dispatch(
             cx,
-            ClientRequest::DetachSessionDirectory {
+            ClientRequest::Filesystem(FilesystemRequest::DetachSessionDirectory {
                 session_id: self.active_session.id,
                 path: path.clone(),
-            },
+            }),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::SessionDirectoryDetached) => {
+                Ok(ServerResponse::Filesystem(FilesystemResponse::SessionDirectoryDetached)) => {
                     view.session_directories
                         .retain(|directory| directory.path != path);
                     view.session_repositories.retain(|repository| {

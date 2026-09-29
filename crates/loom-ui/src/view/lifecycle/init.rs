@@ -150,15 +150,17 @@ impl LoomView {
         let has_session = had_sessions || new_session;
         if new_session && !workspace_root.as_os_str().is_empty() {
             if options.remote.is_none() {
-                let response = connection.request(RequestEnvelope::new(
-                    ClientRequest::AttachSessionDirectory {
+                let response = connection.request(RequestEnvelope::new(ClientRequest::Filesystem(
+                    FilesystemRequest::AttachSessionDirectory {
                         session_id: session.id,
                         source: workspace_root.display().to_string(),
                         path: "sources/local".to_owned(),
                     },
-                ));
+                )));
                 match response.result? {
-                    ServerResponse::SessionDirectoryAttached { .. } => {}
+                    ServerResponse::Filesystem(FilesystemResponse::SessionDirectoryAttached {
+                        ..
+                    }) => {}
                     response => {
                         return Err(unexpected_response("directory attachment", response));
                     }

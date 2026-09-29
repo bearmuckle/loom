@@ -864,8 +864,8 @@ mod unit_tests {
     };
     use loom_core::{ErrorCode, ProtocolVersion, RequestId};
     use loom_protocol::{
-        ClientFrame, ClientRequest, RequestEnvelope, ResponseEnvelope, ServerResponse,
-        decode_response, encode_client_frame, encode_request,
+        ClientFrame, ClientRequest, ControlRequest, ControlResponse, RequestEnvelope,
+        ResponseEnvelope, ServerResponse, decode_response, encode_client_frame, encode_request,
     };
     use std::{
         collections::HashMap,
@@ -907,7 +907,7 @@ mod unit_tests {
         let protocol_9 = connection
             .request(RequestEnvelope::with_version(
                 ProtocolVersion::new(9, 0),
-                ClientRequest::DiscoverCapabilities,
+                ClientRequest::Control(ControlRequest::DiscoverCapabilities),
             ))
             .await
             .unwrap();
@@ -917,12 +917,14 @@ mod unit_tests {
         );
 
         let protocol_10 = connection
-            .request(RequestEnvelope::new(ClientRequest::DiscoverCapabilities))
+            .request(RequestEnvelope::new(ClientRequest::Control(
+                ControlRequest::DiscoverCapabilities,
+            )))
             .await
             .unwrap();
         assert!(matches!(
             protocol_10.result,
-            Ok(ServerResponse::Capabilities(_))
+            Ok(ServerResponse::Control(ControlResponse::Capabilities(_)))
         ));
 
         drop(connection);
@@ -1129,7 +1131,8 @@ mod unit_tests {
             ErrorCode::RequestCancelled
         );
 
-        let request = RequestEnvelope::new(ClientRequest::DiscoverCapabilities);
+        let request =
+            RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
         let wrapped = encode_client_frame(&ClientFrame::Request(Box::new(request))).unwrap();
         process_text(
             &wrapped,
@@ -1155,7 +1158,8 @@ mod unit_tests {
         let (control, _) = mpsc::channel(1);
         let mut pending = HashMap::new();
 
-        let request = RequestEnvelope::new(ClientRequest::DiscoverCapabilities);
+        let request =
+            RequestEnvelope::new(ClientRequest::Control(ControlRequest::DiscoverCapabilities));
         let request_id = request.request_id;
         process_text(
             &encode_request(&request).unwrap(),

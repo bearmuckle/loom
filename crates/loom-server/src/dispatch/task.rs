@@ -7,42 +7,46 @@ impl InProcessConnection {
         _request_id: RequestId,
     ) -> Result<ServerResponse> {
         match request {
-            ClientRequest::StartSessionTask { session_id, spec } => Ok(
-                ServerResponse::TaskStarted(self.session_task_supervisor(session_id)?.start(spec)?),
-            ),
-            ClientRequest::ListSessionTasks { session_id } => Ok(ServerResponse::Tasks {
-                tasks: self.session_task_supervisor(session_id)?.list()?,
-            }),
-            ClientRequest::GetSessionTask {
+            ClientRequest::Task(TaskRequest::StartSessionTask { session_id, spec }) => {
+                Ok(ServerResponse::Task(TaskResponse::TaskStarted(
+                    self.session_task_supervisor(session_id)?.start(spec)?,
+                )))
+            }
+            ClientRequest::Task(TaskRequest::ListSessionTasks { session_id }) => {
+                Ok(ServerResponse::Task(TaskResponse::Tasks {
+                    tasks: self.session_task_supervisor(session_id)?.list()?,
+                }))
+            }
+            ClientRequest::Task(TaskRequest::GetSessionTask {
                 session_id,
                 task_id,
-            } => Ok(ServerResponse::Task(
+            }) => Ok(ServerResponse::Task(TaskResponse::Task(
                 self.session_task_supervisor(session_id)?.get(task_id)?,
-            )),
-            ClientRequest::GetSessionTaskEvents {
+            ))),
+            ClientRequest::Task(TaskRequest::GetSessionTaskEvents {
                 session_id,
                 task_id,
                 after_sequence,
-            } => Ok(ServerResponse::TaskEvents {
+            }) => Ok(ServerResponse::Task(TaskResponse::TaskEvents {
                 events: self
                     .session_task_supervisor(session_id)?
                     .events_since(task_id, after_sequence)?,
-            }),
-            ClientRequest::CancelSessionTask {
+            })),
+            ClientRequest::Task(TaskRequest::CancelSessionTask {
                 session_id,
                 task_id,
-            } => Ok(ServerResponse::Task(
+            }) => Ok(ServerResponse::Task(TaskResponse::Task(
                 self.session_task_supervisor(session_id)?.cancel(task_id)?,
-            )),
-            ClientRequest::GetSessionTaskEvidence {
+            ))),
+            ClientRequest::Task(TaskRequest::GetSessionTaskEvidence {
                 session_id,
                 task_id,
-            } => Ok(ServerResponse::TaskEvidence {
+            }) => Ok(ServerResponse::Task(TaskResponse::TaskEvidence {
                 evidence: self
                     .session_task_supervisor(session_id)?
                     .get(task_id)?
                     .evidence,
-            }),
+            })),
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }
     }

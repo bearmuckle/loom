@@ -7,8 +7,10 @@ impl InProcessConnection {
         _request_id: RequestId,
     ) -> Result<ServerResponse> {
         match request {
-            ClientRequest::GetWorkerNodeStatus => {
-                Ok(ServerResponse::WorkerNodeStatus(self.worker_node_status()?))
+            ClientRequest::Control(ControlRequest::GetWorkerNodeStatus) => {
+                Ok(ServerResponse::Control(ControlResponse::WorkerNodeStatus(
+                    self.worker_node_status()?,
+                )))
             }
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }

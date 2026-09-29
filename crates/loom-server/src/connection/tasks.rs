@@ -285,7 +285,7 @@ impl InProcessConnection {
             options: AgentRuntimeOptions::default(),
         });
         match result {
-            Ok(ServerResponse::AgentRunStarted(_)) => Ok(()),
+            Ok(ServerResponse::Run(RunResponse::AgentRunStarted(_))) => Ok(()),
             Ok(_) => {
                 persistence.update_delegated_task_status(
                     task.task_id,

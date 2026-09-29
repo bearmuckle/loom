@@ -566,10 +566,12 @@ mod loom_view_render_tests {
     use loom_protocol::ToolResult;
     use loom_protocol::{
         AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
-        ClientRequest, FileActivityOperation, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind,
-        GitFileStatus, GitFileStatusKind, GitHubRepository, GitRepositoryStatus, RequestEnvelope,
-        ServerResponse, SessionFilesystemChange, SessionFilesystemFile, SessionRepository,
-        WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind,
+        ClientRequest, EventsResponse, FileActivityOperation, FilesystemRequest,
+        FilesystemResponse, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
+        GitFileStatusKind, GitHubRepository, GitRepositoryStatus, ProviderRequest, RequestEnvelope,
+        RunRequest, RunResponse, ServerResponse, SessionFilesystemChange, SessionFilesystemFile,
+        SessionRepository, SessionRequest, SessionResponse, WorkerNodeResources, WorkerNodeStatus,
+        WorkspaceChangeKind, WorkspaceRequest,
     };
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -837,7 +839,9 @@ mod loom_view_render_tests {
             view.shutdown_owned_backend();
             assert!(
                 connection_after_teardown
-                    .request(RequestEnvelope::new(ClientRequest::ListWorkspaces))
+                    .request(RequestEnvelope::new(ClientRequest::Workspace(
+                        WorkspaceRequest::ListWorkspaces
+                    )))
                     .result
                     .is_err()
             );
@@ -1134,14 +1138,16 @@ mod loom_view_render_tests {
             assert!(view.active_run_id.is_none());
             assert!(view.review.selected_path.is_none());
             assert!(
-                view.backend_for_request(&loom_protocol::ClientRequest::GetAgentSessionSnapshot {
-                    session_id,
-                })
+                view.backend_for_request(&loom_protocol::ClientRequest::Session(
+                    SessionRequest::GetAgentSessionSnapshot { session_id }
+                ))
                 .is_ok()
             );
             assert!(
-                view.backend_for_request(&loom_protocol::ClientRequest::ListProviders)
-                    .is_ok()
+                view.backend_for_request(&loom_protocol::ClientRequest::Provider(
+                    ProviderRequest::ListProviders
+                ))
+                .is_ok()
             );
 
             view.review.rows = vec![
@@ -1933,17 +1939,19 @@ mod loom_view_render_tests {
                 "Loaded session",
             )
             .unwrap();
-            let started = view.connection.request(RequestEnvelope::new(
-                ClientRequest::StartSessionAgentRun {
-                    session_id: session.id,
-                    task: "startup transcript page".to_owned(),
-                    model: ModelId::new("deterministic/demo"),
-                    system_instructions: None,
-                    repository_instructions: None,
-                },
-            ));
+            let started = view
+                .connection
+                .request(RequestEnvelope::new(ClientRequest::Run(
+                    RunRequest::StartSessionAgentRun {
+                        session_id: session.id,
+                        task: "startup transcript page".to_owned(),
+                        model: ModelId::new("deterministic/demo"),
+                        system_instructions: None,
+                        repository_instructions: None,
+                    },
+                )));
             let run_id = match started.result.unwrap() {
-                ServerResponse::AgentRunStarted(run) => run.id,
+                ServerResponse::Run(RunResponse::AgentRunStarted(run)) => run.id,
                 response => panic!("unexpected run start response: {response:?}"),
             };
             view.workspace_id = workspace.id;
@@ -2012,14 +2020,14 @@ mod loom_view_render_tests {
                 session_id,
                 loom_protocol::ResponseEnvelope::success(
                     loom_core::RequestId::new(),
-                    loom_protocol::ServerResponse::AgentSessionSnapshot(snapshot),
+                    loom_protocol::ServerResponse::Session(SessionResponse::AgentSessionSnapshot(snapshot)),
                 ),
                 loom_protocol::ResponseEnvelope::success(
                     loom_core::RequestId::new(),
-                    loom_protocol::ServerResponse::SessionEvents {
+                    loom_protocol::ServerResponse::Events(EventsResponse::SessionEvents{
                         events: Vec::new(),
                         stream_epoch: None,
-                    },
+                    }),
                 ),
                 cx,
             );
@@ -2616,20 +2624,24 @@ mod loom_view_render_tests {
                 "repo",
             )
             .unwrap();
-            let edit = view.connection.request(RequestEnvelope::new(
-                ClientRequest::ApplySessionFilesystemEdit {
-                    session_id: session.id,
-                    edit: loom_protocol::WorkspaceEdit {
-                        path: "repo/README.md".to_owned(),
-                        old_text: "before".to_owned(),
-                        new_text: "after".to_owned(),
-                        expected_revision: None,
+            let edit = view
+                .connection
+                .request(RequestEnvelope::new(ClientRequest::Filesystem(
+                    FilesystemRequest::ApplySessionFilesystemEdit {
+                        session_id: session.id,
+                        edit: loom_protocol::WorkspaceEdit {
+                            path: "repo/README.md".to_owned(),
+                            old_text: "before".to_owned(),
+                            new_text: "after".to_owned(),
+                            expected_revision: None,
+                        },
                     },
-                },
-            ));
+                )));
             assert!(matches!(
                 edit.result,
-                Ok(ServerResponse::WorkspaceEditApplied(_))
+                Ok(ServerResponse::Filesystem(
+                    FilesystemResponse::WorkspaceEditApplied(_)
+                ))
             ));
             view.workspace_id = workspace.id;
             view.workspaces.push(workspace);
@@ -3183,7 +3195,9 @@ mod worker_node_tests {
     use loom_core::{ErrorCode, LoomError};
     use loom_model::ModelId;
     use loom_protocol::{
-        ClientRequest, ProjectChildControlAction, WorkerNodeResources, WorkerNodeStatus,
+        ClientRequest, EventsRequest, FilesystemRequest, ProjectChildControlAction,
+        RepositoryRequest, RunRequest, SessionRequest, TaskRequest, TerminalRequest, UsageRequest,
+        WorkerNodeResources, WorkerNodeStatus, WorkspaceRequest,
     };
     use std::collections::BTreeMap;
 
@@ -3975,7 +3989,7 @@ mod worker_node_tests {
         );
         assert_eq!(
             session_id_for_request(
-                &ClientRequest::GetAgentSessionSnapshot { session_id },
+                &ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot { session_id }),
                 AgentSessionId::new()
             ),
             Some(session_id)
@@ -3988,12 +4002,12 @@ mod worker_node_tests {
         let owners = BTreeMap::from([(active_session_id, "peer-node".to_owned())]);
         assert_eq!(
             session_id_for_request(
-                &ClientRequest::SendAgentMessage {
+                &ClientRequest::Run(RunRequest::SendAgentMessage {
                     run_id: RunId::new(),
                     attempt_id: loom_core::RunAttemptId::new(),
                     expected_control_revision: 0,
                     message: "hello".to_owned(),
-                },
+                }),
                 active_session_id
             ),
             Some(active_session_id)
@@ -4004,15 +4018,18 @@ mod worker_node_tests {
         );
         assert!(assigned_node_id(&BTreeMap::new(), active_session_id).is_err());
         assert_eq!(
-            session_id_for_request(&ClientRequest::ListWorkspaces, active_session_id),
+            session_id_for_request(
+                &ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces),
+                active_session_id
+            ),
             None
         );
         assert_eq!(
             session_id_for_request(
-                &ClientRequest::CreateSessionCheckpoint {
+                &ClientRequest::Filesystem(FilesystemRequest::CreateSessionCheckpoint {
                     session_id: active_session_id,
                     label: "checkpoint".to_owned(),
-                },
+                }),
                 AgentSessionId::new()
             ),
             Some(active_session_id)
@@ -4028,31 +4045,31 @@ mod worker_node_tests {
         let task = loom_core::TaskId::new();
         let checkpoint = loom_core::CheckpointId::new();
         let explicit_requests = vec![
-            ClientRequest::GetAgentSession {
+            ClientRequest::Session(SessionRequest::GetAgentSession {
                 session_id: session,
-            },
-            ClientRequest::GetAgentSessionSnapshot {
+            }),
+            ClientRequest::Session(SessionRequest::GetAgentSessionSnapshot {
                 session_id: session,
-            },
-            ClientRequest::RenameAgentSession {
+            }),
+            ClientRequest::Session(SessionRequest::RenameAgentSession {
                 session_id: session,
                 name: "renamed".into(),
-            },
-            ClientRequest::ArchiveAgentSession {
+            }),
+            ClientRequest::Session(SessionRequest::ArchiveAgentSession {
                 session_id: session,
-            },
-            ClientRequest::GetRecentSessionEvents {
+            }),
+            ClientRequest::Events(EventsRequest::GetRecentSessionEvents {
                 session_id: session,
                 limit: 5,
-            },
-            ClientRequest::StartSessionAgentRun {
+            }),
+            ClientRequest::Run(RunRequest::StartSessionAgentRun {
                 session_id: session,
                 task: "task".into(),
                 model: ModelId::new("model"),
                 system_instructions: None,
                 repository_instructions: None,
-            },
-            ClientRequest::StartSessionAgentRunWithOptions {
+            }),
+            ClientRequest::Run(RunRequest::StartSessionAgentRunWithOptions {
                 session_id: session,
                 task: "task".into(),
                 model: ModelId::new("model"),
@@ -4060,44 +4077,44 @@ mod worker_node_tests {
                 repository_instructions: None,
                 limits: loom_core::SessionLimits::default(),
                 context: loom_protocol::ContextAssemblyOptions::default(),
-            },
-            ClientRequest::AttachSessionRepository {
+            }),
+            ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
                 session_id: session,
                 source: "/repo".into(),
                 path: "repo".into(),
                 revision: None,
-            },
-            ClientRequest::AttachSessionDirectory {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
                 session_id: session,
                 source: "/folder".into(),
                 path: "folder".into(),
-            },
-            ClientRequest::ListSessionDirectories {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::ListSessionDirectories {
                 session_id: session,
-            },
-            ClientRequest::DetachSessionDirectory {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::DetachSessionDirectory {
                 session_id: session,
                 path: "folder".into(),
-            },
-            ClientRequest::ListSessionRepositories {
+            }),
+            ClientRequest::Repository(RepositoryRequest::ListSessionRepositories {
                 session_id: session,
-            },
-            ClientRequest::DetachSessionRepository {
+            }),
+            ClientRequest::Repository(RepositoryRequest::DetachSessionRepository {
                 session_id: session,
                 repository_id: repository,
-            },
-            ClientRequest::GetSessionFilesystemSnapshot {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::GetSessionFilesystemSnapshot {
                 session_id: session,
-            },
-            ClientRequest::GetSessionFilesystemChanges {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::GetSessionFilesystemChanges {
                 session_id: session,
                 after_sequence: None,
-            },
-            ClientRequest::ReadSessionFile {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::ReadSessionFile {
                 session_id: session,
                 path: "file".into(),
-            },
-            ClientRequest::ApplySessionFilesystemEdit {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::ApplySessionFilesystemEdit {
                 session_id: session,
                 edit: loom_protocol::WorkspaceEdit {
                     path: "file".into(),
@@ -4105,70 +4122,70 @@ mod worker_node_tests {
                     new_text: "new".into(),
                     expected_revision: None,
                 },
-            },
-            ClientRequest::TakeSessionFilesystemControl {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::TakeSessionFilesystemControl {
                 session_id: session,
                 control: loom_protocol::WorkspaceControl::Agent,
-            },
-            ClientRequest::CreateSessionCheckpoint {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::CreateSessionCheckpoint {
                 session_id: session,
                 label: "checkpoint".into(),
-            },
-            ClientRequest::RevertSessionCheckpoint {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::RevertSessionCheckpoint {
                 session_id: session,
                 checkpoint_id: checkpoint,
-            },
-            ClientRequest::UndoSessionEdit {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::UndoSessionEdit {
                 session_id: session,
-            },
-            ClientRequest::GetSessionContextFiles {
+            }),
+            ClientRequest::Filesystem(FilesystemRequest::GetSessionContextFiles {
                 session_id: session,
-            },
-            ClientRequest::GetSessionVcsStatus {
+            }),
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsStatus {
                 session_id: session,
                 repository_id: repository,
-            },
-            ClientRequest::GetSessionVcsDiff {
+            }),
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsDiff {
                 session_id: session,
                 repository_id: repository,
                 path: None,
                 staged: false,
-            },
-            ClientRequest::GetSessionVcsBranches {
+            }),
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsBranches {
                 session_id: session,
                 repository_id: repository,
-            },
-            ClientRequest::GetSessionVcsConflicts {
+            }),
+            ClientRequest::Repository(RepositoryRequest::GetSessionVcsConflicts {
                 session_id: session,
                 repository_id: repository,
-            },
-            ClientRequest::OpenSessionTerminal {
+            }),
+            ClientRequest::Terminal(TerminalRequest::OpenSessionTerminal {
                 session_id: session,
                 command: "sh".into(),
                 args: Vec::new(),
                 cwd: None,
-            },
-            ClientRequest::WriteSessionTerminalInput {
+            }),
+            ClientRequest::Terminal(TerminalRequest::WriteSessionTerminalInput {
                 session_id: session,
                 terminal_id: terminal,
                 input: "exit".into(),
-            },
-            ClientRequest::ResizeSessionTerminal {
+            }),
+            ClientRequest::Terminal(TerminalRequest::ResizeSessionTerminal {
                 session_id: session,
                 terminal_id: terminal,
                 rows: 24,
                 columns: 80,
-            },
-            ClientRequest::GetSessionTerminalEvents {
+            }),
+            ClientRequest::Terminal(TerminalRequest::GetSessionTerminalEvents {
                 session_id: session,
                 terminal_id: terminal,
                 after_sequence: None,
-            },
-            ClientRequest::CancelSessionTerminal {
+            }),
+            ClientRequest::Terminal(TerminalRequest::CancelSessionTerminal {
                 session_id: session,
                 terminal_id: terminal,
-            },
-            ClientRequest::StartSessionTask {
+            }),
+            ClientRequest::Task(TaskRequest::StartSessionTask {
                 session_id: session,
                 spec: loom_protocol::TaskSpec {
                     kind: loom_protocol::TaskKind::Test,
@@ -4179,39 +4196,39 @@ mod worker_node_tests {
                     output_limit_bytes: None,
                     artifact_paths: Vec::new(),
                 },
-            },
-            ClientRequest::ListSessionTasks {
+            }),
+            ClientRequest::Task(TaskRequest::ListSessionTasks {
                 session_id: session,
-            },
-            ClientRequest::GetSessionTask {
+            }),
+            ClientRequest::Task(TaskRequest::GetSessionTask {
                 session_id: session,
                 task_id: task,
-            },
-            ClientRequest::GetSessionTaskEvents {
+            }),
+            ClientRequest::Task(TaskRequest::GetSessionTaskEvents {
                 session_id: session,
                 task_id: task,
                 after_sequence: None,
-            },
-            ClientRequest::CancelSessionTask {
+            }),
+            ClientRequest::Task(TaskRequest::CancelSessionTask {
                 session_id: session,
                 task_id: task,
-            },
-            ClientRequest::GetSessionTaskEvidence {
+            }),
+            ClientRequest::Task(TaskRequest::GetSessionTaskEvidence {
                 session_id: session,
                 task_id: task,
-            },
-            ClientRequest::SetSessionApprovalPolicy {
+            }),
+            ClientRequest::Session(SessionRequest::SetSessionApprovalPolicy {
                 session_id: session,
                 policy: loom_core::ApprovalPolicy::default(),
                 auto_approve_actions: None,
-            },
-            ClientRequest::ForkAgentSession {
+            }),
+            ClientRequest::Session(SessionRequest::ForkAgentSession {
                 session_id: session,
                 name: "fork".into(),
-            },
-            ClientRequest::GetSessionUsage {
+            }),
+            ClientRequest::Usage(UsageRequest::GetSessionUsage {
                 session_id: session,
-            },
+            }),
         ];
         assert!(
             explicit_requests
@@ -4221,48 +4238,51 @@ mod worker_node_tests {
 
         assert_eq!(
             session_id_for_request(
-                &ClientRequest::GetSessionEvents {
+                &ClientRequest::Events(EventsRequest::GetSessionEvents {
                     session_id: None,
                     workspace_id: None,
                     after_sequence: None,
                     stream_epoch: None,
-                },
+                }),
                 active
             ),
             Some(active)
         );
         assert_eq!(
             session_id_for_request(
-                &ClientRequest::GetSessionEvents {
+                &ClientRequest::Events(EventsRequest::GetSessionEvents {
                     session_id: Some(session),
                     workspace_id: None,
                     after_sequence: None,
                     stream_epoch: None,
-                },
+                }),
                 active
             ),
             Some(session)
         );
         assert_eq!(
             session_id_for_request(
-                &ClientRequest::GetAgentRun {
+                &ClientRequest::Run(RunRequest::GetAgentRun {
                     run_id: RunId::new()
-                },
+                }),
                 active
             ),
             Some(active)
         );
         assert_eq!(
             session_id_for_request(
-                &ClientRequest::GetRunUsage {
+                &ClientRequest::Usage(UsageRequest::GetRunUsage {
                     run_id: RunId::new()
-                },
+                }),
                 active
             ),
             Some(active)
         );
         assert_eq!(
-            session_id_for_request(&ClientRequest::ListWorkspaces, active),
+            session_id_for_request(
+                &ClientRequest::Workspace(WorkspaceRequest::ListWorkspaces),
+                active
+            ),
             None
         );
     }
@@ -4644,7 +4664,9 @@ mod transcript_paging_tests {
     #[test]
     fn asynchronous_page_loader_uses_the_bounded_transcript_endpoint() {
         use super::{BackendWorker, ClientConnection, load_transcript_page};
-        use loom_protocol::{ClientRequest, RequestEnvelope, ServerResponse};
+        use loom_protocol::{
+            ClientRequest, RequestEnvelope, RunRequest, RunResponse, ServerResponse,
+        };
 
         let backend = loom_local::OwnedBackend::new();
         let connection = ClientConnection::InProcess(Box::new(backend.connect()));
@@ -4657,16 +4679,17 @@ mod transcript_paging_tests {
             "Paged session",
         )
         .unwrap();
-        let started =
-            connection.request(RequestEnvelope::new(ClientRequest::StartSessionAgentRun {
+        let started = connection.request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
                 session_id: session.id,
                 task: "load only a transcript page".to_owned(),
                 model: loom_model::ModelId::new("deterministic/demo"),
                 system_instructions: None,
                 repository_instructions: None,
-            }));
+            },
+        )));
         let run_id = match started.result.unwrap() {
-            ServerResponse::AgentRunStarted(run) => run.id,
+            ServerResponse::Run(RunResponse::AgentRunStarted(run)) => run.id,
             response => panic!("unexpected run start response: {response:?}"),
         };
         let worker = BackendWorker::spawn(connection);

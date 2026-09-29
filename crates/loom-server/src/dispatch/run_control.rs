@@ -7,13 +7,13 @@ impl InProcessConnection {
         _request_id: RequestId,
     ) -> Result<ServerResponse> {
         match request {
-            ClientRequest::StartSessionAgentRun {
+            ClientRequest::Run(RunRequest::StartSessionAgentRun {
                 session_id,
                 task,
                 model,
                 system_instructions,
                 repository_instructions,
-            } => self.start_run_with_options(StartRunInput {
+            }) => self.start_run_with_options(StartRunInput {
                 session_id,
                 project_task_id: None,
                 task,
@@ -22,7 +22,7 @@ impl InProcessConnection {
                 repository_instructions,
                 options: AgentRuntimeOptions::default(),
             }),
-            ClientRequest::StartSessionAgentRunWithOptions {
+            ClientRequest::Run(RunRequest::StartSessionAgentRunWithOptions {
                 session_id,
                 task,
                 model,
@@ -30,7 +30,7 @@ impl InProcessConnection {
                 repository_instructions,
                 limits,
                 context,
-            } => self.start_run_with_options(StartRunInput {
+            }) => self.start_run_with_options(StartRunInput {
                 session_id,
                 project_task_id: None,
                 task,
@@ -44,49 +44,55 @@ impl InProcessConnection {
                     ..Default::default()
                 },
             }),
-            ClientRequest::ApproveAgentAction {
+            ClientRequest::Run(RunRequest::ApproveAgentAction {
                 run_id,
                 attempt_id,
                 expected_control_revision,
                 tool_call_id,
-            } => self.continue_run(run_id, |run| {
+            }) => self.continue_run(run_id, |run| {
                 run.approve_entry(tool_call_id, attempt_id, expected_control_revision)
             }),
-            ClientRequest::RejectAgentAction {
+            ClientRequest::Run(RunRequest::RejectAgentAction {
                 run_id,
                 attempt_id,
                 expected_control_revision,
                 tool_call_id,
                 reason,
-            } => self.continue_run(run_id, |run| {
+            }) => self.continue_run(run_id, |run| {
                 run.reject_entry(tool_call_id, reason, attempt_id, expected_control_revision)
             }),
-            ClientRequest::SendAgentMessage {
+            ClientRequest::Run(RunRequest::SendAgentMessage {
                 run_id,
                 attempt_id,
                 expected_control_revision,
                 message,
-            } => self.continue_run(run_id, |run| {
+            }) => self.continue_run(run_id, |run| {
                 run.message_entry_at_revision(message, attempt_id, expected_control_revision)
             }),
-            ClientRequest::InterruptAgentRun { run_id } => {
+            ClientRequest::Run(RunRequest::InterruptAgentRun { run_id }) => {
                 self.stop_run(run_id, RunStop::Interrupt)
             }
-            ClientRequest::RetryAgentStep { run_id } => {
+            ClientRequest::Run(RunRequest::RetryAgentStep { run_id }) => {
                 self.continue_run(run_id, AgentRuntime::retry_entry)
             }
-            ClientRequest::PauseAgentRun { run_id } => self.stop_run(run_id, RunStop::Pause),
-            ClientRequest::ResumeAgentRun { run_id } => self.resume_agent_run(run_id),
-            ClientRequest::RetryAgentFromCheckpoint {
+            ClientRequest::Run(RunRequest::PauseAgentRun { run_id }) => {
+                self.stop_run(run_id, RunStop::Pause)
+            }
+            ClientRequest::Run(RunRequest::ResumeAgentRun { run_id }) => {
+                self.resume_agent_run(run_id)
+            }
+            ClientRequest::Run(RunRequest::RetryAgentFromCheckpoint {
                 run_id,
                 checkpoint_id,
-            } => self.retry_from_checkpoint(run_id, checkpoint_id),
-            ClientRequest::AttachRunEvidence { run_id, evidence } => {
+            }) => self.retry_from_checkpoint(run_id, checkpoint_id),
+            ClientRequest::Run(RunRequest::AttachRunEvidence { run_id, evidence }) => {
                 let handle = self.run_handle(run_id)?;
                 let mut runtime = handle.runtime_for_entry()?;
                 runtime.add_evidence(evidence);
                 handle.refresh(&runtime);
-                Ok(ServerResponse::AgentRun(handle.snapshot()))
+                Ok(ServerResponse::Run(RunResponse::AgentRun(
+                    handle.snapshot(),
+                )))
             }
             _ => unreachable!("request was routed to the wrong dispatch domain"),
         }
