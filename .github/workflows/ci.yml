@@ -48,9 +48,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
+            clang \
             libdbus-1-dev \
             libxcb1-dev \
             libfontconfig1-dev \
+            mold \
             pkg-config \
             libxkbcommon-dev \
             libxkbcommon-x11-dev
