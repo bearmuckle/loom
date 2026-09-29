@@ -4368,3 +4368,71 @@ fn project_task_queries_and_cancellation_cover_lifecycle_paths() {
 
     let _ = fs::remove_file(&path);
 }
+
+#[test]
+fn persistence_trait_object_forwards_read_paths_on_an_empty_store() {
+    let store: std::sync::Arc<dyn Persistence> = std::sync::Arc::new(FilePersistence::in_memory());
+    let _ = store.path();
+    let _ = store.load_sessions();
+    let _ = store.load_workspaces();
+    let _ = store.load_session_settings();
+    let _ = store.load_workspace_configs();
+    let _ = store.load_provider_configs();
+    let _ = store.load_provider_health();
+    let _ = store.load_provider_usage();
+    let _ = store.load_idempotency_records();
+    let _ = store.list_filesystem_sessions();
+    let _ = store.list_pending_project_cancellation_cascades();
+    let _ = store.list_project_manager_waits_by_child(TaskId::new());
+    let _ = store.list_unfinished_project_manager_waits();
+    let _ = store.list_project_tasks(ProjectId::new());
+    let _ = store.list_agent_messages(ProjectId::new(), AgentSessionId::new(), 0, 10);
+    let _ = store.has_pending_project_cancellation_cascade(ProjectId::new());
+    let _ = store.load_active_run_summaries();
+    let _ = store.load_delegated_task(TaskId::new());
+    let _ = store.load_delegated_task_for_target(AgentSessionId::new());
+    let _ = store.load_project_child_by_request(
+        RequestId::new(),
+        ProjectId::new(),
+        AgentSessionId::new(),
+        "child",
+        &DelegatedTaskSpec {
+            intent: "inspect".to_owned(),
+            model_id: "deterministic/demo".to_owned(),
+            context_references: Vec::new(),
+            dependencies: Vec::new(),
+            code_change: false,
+            permissions: ProjectAgentPermissions::default(),
+        },
+    );
+    let _ = store.load_project_manager_wait(ProjectManagerWaitId::new());
+    let _ = store.load_project_snapshot(ProjectId::new());
+    let _ = store.load_project_snapshot_for_session(AgentSessionId::new());
+    let _ = store.load_project_worktree_by_task(TaskId::new());
+    let _ = store.load_latest_run_summary_for_session(AgentSessionId::new());
+    let _ = store.load_run_activities(RunId::new());
+    let _ = store.load_run_attempts(RunId::new());
+    let _ = store.load_run_context_checkpoint(RunId::new());
+    let _ = store.load_run_execution_state(RunId::new());
+    let _ = store.load_run_interactions(RunId::new());
+    let _ = store.load_run_message_content_range(RunId::new(), 0, 0, 4);
+    let _ = store.load_run_messages(RunId::new());
+    let _ = store.load_run_plan(RunId::new());
+    let _ = store.load_run_runtime_config(RunId::new());
+    let _ = store.load_run_summary(RunId::new());
+    let _ = store.load_session_projection_read(AgentSessionId::new());
+    let _ = store.load_session_usage(AgentSessionId::new(), &BTreeSet::new());
+    let _ = store.load_feed_header();
+    let _ = store.load_feed_events_since(None, None);
+    let _ = store.load_feed_session_cursor(AgentSessionId::new());
+    let _ = store.load_feed_workspace_cursor(WorkspaceId::new());
+    let _ = store.load_feed_workspace_events_since(WorkspaceId::new(), None);
+    let _ = store.load_recent_feed_events(AgentSessionId::new(), 1);
+    let _ = store.load_filesystem_changes_page(AgentSessionId::new(), None, 1);
+    let _ = store.load_filesystem_record(AgentSessionId::new());
+    let _ = store.load_run_message_page(RunId::new(), None, 10);
+    let _ = store.next_run_message_fragment_position(RunId::new(), 0);
+    let _ = store.prune_expired_idempotency_records(Timestamp::now());
+    let _ = store.load_agent_message_by_request(RequestId::new());
+    let _ = store.release_exclusive_writer();
+}
