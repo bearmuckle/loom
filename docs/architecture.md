@@ -29,8 +29,10 @@
 The frontend is a GPUI application using `gpui-kit` for shared native and
 browser support. `loom-ui` is organized into:
 
-- `view`: the session navigator, run canvas, composer, review drawer, and the
-  client-side projection they render.
+- `view`: screen modules (navigator, canvas, composer, review drawer, settings)
+  plus the client-side projection they render. The `LoomView` implementation is
+  split by concern under `view/{lifecycle,sessions,project,runs,composer,
+  providers,workers,source,review,render,helpers}`.
 - `state`: projection types and pure formatting helpers derived from protocol
   responses and events.
 - `connection`: the transport-independent protocol client plus the connection
@@ -38,9 +40,11 @@ browser support. `loom-ui` is organized into:
 - `theme`: the semantic colour palette resolved against the active
   `gpui-kit` theme. Window chrome and decorations are provided by
   `gpui-kit`'s window root, not by Loom.
-- `platform`: native adapters (process arguments, workspace preparation, local
-  credential storage, repository bootstrap) that a browser target cannot use
-  unchanged.
+
+Native adapters (process arguments, workspace preparation, local credential
+storage, repository bootstrap, and backend state files) live in `loom-local`,
+not in the UI, so the UI stays protocol-oriented and the native and browser
+paths share the same client surface.
 
 Backend requests are submitted to a single connection worker thread and
 awaited on a background task, so no UI handler blocks on backend latency. The
@@ -80,12 +84,16 @@ Suggested backend boundaries:
   local model servers, authentication, rate limits, and provider health.
 - `loom-context`: context inspection and assembly, repository/system
   instructions, summaries, compaction, and explicit token budgets.
-- `loom-persistence`: typed, indexed SQLite state storage with a single
-  baseline schema used by the in-process backend. Durable state is written in
-  per-mutation transactions, and large immutable payloads live in a
-  content-addressed store inside SQLite. There is no migration ladder, so an
-  incompatible database is rejected and must be wiped; domain and protocol
-  types remain provider-neutral.
+- `loom-persistence`: typed, indexed SQLite state storage used by the
+  in-process backend, split into per-aggregate modules (sessions, runs,
+  messages, filesystem, projects, catalog, feed, blobs). Durable state is
+  written in per-mutation transactions, and large immutable payloads live in a
+  content-addressed store inside SQLite. Schema changes are applied through an
+  ordered `MIGRATIONS` ladder that records each step in `PRAGMA user_version`;
+  a database from an unknown or newer version is still rejected rather than
+  overwritten. The crate depends only on neutral domain crates
+  (`loom-core`/`loom-model`) and the protocol contract, never on
+  `loom-session`/`loom-providers`.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
   result normalization, and tool adapters. Workspace exploration is bounded:
   search supports literal or regex matching with context and a result cap,
@@ -104,7 +112,15 @@ Suggested backend boundaries:
   backend implementation; the backend crates depend on the contract and
   produce its types.
 - `loom-server`: listeners, authentication, connection management, and
-  deployment configuration.
+  deployment configuration. The composition root owns the `InProcessBackend`,
+  whose request dispatch is split into per-domain modules under `dispatch/`,
+  per-domain connection helpers under `connection/`, and owned services
+  (`IdempotencyStore`, `CredentialService`, `AdmissionService`) under
+  `services/`.
+- `loom-local`: the native launcher and local backend host. It owns process
+  arguments, persistence-path preparation, schema status/reset, local
+  credential storage, repository bootstrap, and native backend embedding, so
+  `loom-ui` does not link backend implementation crates directly.
 - `loom-cli`: local server startup, diagnostics, and administration.
 
 The backend should expose domain services rather than exposing raw model APIs,
