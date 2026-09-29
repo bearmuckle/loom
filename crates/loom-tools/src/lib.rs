@@ -18,6 +18,16 @@ use regex::RegexBuilder;
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
+
+fn run_async<T>(
+    future: impl std::future::Future<Output = std::result::Result<T, String>>,
+) -> std::result::Result<T, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not start the HTTP runtime: {error}"))?
+        .block_on(future)
+}
 use url::Url;
 
 /// A server-owned set of tools attached to one agent session. Extensions can
@@ -220,21 +230,28 @@ impl WebSearchProvider for HtmlSearchProvider {
             let mut query = url.query_pairs_mut();
             query.append_pair("q", &request.query);
         }
-        let mut response = ureq::get(url.as_str())
-            .header("User-Agent", "Loom/0.1 (web search)")
-            .config()
-            .timeout_global(Some(WEB_SEARCH_TIMEOUT))
-            .http_status_as_error(false)
-            .build()
-            .call()
-            .map_err(|error| format!("web search request failed: {error}"))?;
-        let status = response.status().as_u16();
-        let body = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_WEB_SEARCH_BODY_BYTES)
-            .read_to_string()
-            .map_err(|error| format!("could not read web search response: {error}"))?;
+        let (status, body) = run_async(async {
+            let client = reqwest::Client::builder()
+                .timeout(WEB_SEARCH_TIMEOUT)
+                .build()
+                .map_err(|error| format!("web search request failed: {error}"))?;
+            let response = client
+                .get(url.as_str())
+                .header("User-Agent", "Loom/0.1 (web search)")
+                .send()
+                .await
+                .map_err(|error| format!("web search request failed: {error}"))?;
+            let status = response.status().as_u16();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| format!("could not read web search response: {error}"))?;
+            let text = text
+                .chars()
+                .take(MAX_WEB_SEARCH_BODY_BYTES as usize)
+                .collect::<String>();
+            Ok::<_, String>((status, text))
+        })?;
         if status >= 400 {
             return Err(format!(
                 "web search provider rejected the request (HTTP {status}): {}",
@@ -964,42 +981,40 @@ impl ToolExecutor {
             return Err("repository must be in owner/name format".to_owned());
         }
         let url = format!("https://api.github.com/repos/{repository}/{path}");
-        let response = match method {
-            "GET" => ureq::get(&url)
+        let (status, body) = run_async(async {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .map_err(|error| format!("GitHub request failed: {error}"))?;
+            let request = match method {
+                "GET" => client.get(&url),
+                "POST" => client
+                    .post(&url)
+                    .json(&body.unwrap_or(serde_json::Value::Null)),
+                _ => return Err("unsupported GitHub API method".to_owned()),
+            };
+            let response = request
                 .header("Accept", "application/vnd.github+json")
-                .header("Authorization", &format!("Bearer {token}"))
+                .header("Authorization", format!("Bearer {token}"))
                 .header("X-GitHub-Api-Version", "2022-11-28")
                 .header("User-Agent", "Loom")
-                .config()
-                .timeout_global(Some(Duration::from_secs(15)))
-                .http_status_as_error(false)
-                .build()
-                .call(),
-            "POST" => ureq::post(&url)
-                .header("Accept", "application/vnd.github+json")
-                .header("Authorization", &format!("Bearer {token}"))
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .header("User-Agent", "Loom")
-                .config()
-                .timeout_global(Some(Duration::from_secs(15)))
-                .http_status_as_error(false)
-                .build()
-                .send_json(body.unwrap_or(serde_json::Value::Null)),
-            _ => return Err("unsupported GitHub API method".to_owned()),
-        }
-        .map_err(|error| format!("GitHub request failed: {error}"))?;
-        let status = response.status().as_u16();
-        let mut response = response;
+                .send()
+                .await
+                .map_err(|error| format!("GitHub request failed: {error}"))?;
+            let status = response.status().as_u16();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| format!("GitHub request failed: {error}"))?;
+            Ok::<_, String>((status, text))
+        })?;
         if status >= 400 {
-            let detail = response.body_mut().read_to_string().unwrap_or_default();
             return Err(format!(
                 "GitHub API returned HTTP {status}: {}",
-                truncate_text(&detail, 1024)
+                truncate_text(&body, 1024)
             ));
         }
-        response
-            .body_mut()
-            .read_json()
+        serde_json::from_str(&body)
             .map_err(|error| format!("GitHub returned an invalid response: {error}"))
     }
 

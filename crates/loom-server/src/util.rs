@@ -33,48 +33,87 @@ pub(crate) fn fetch_github_repositories(
     token: &str,
     endpoint: &str,
 ) -> Result<Vec<GitHubRepository>> {
-    let mut repositories = Vec::new();
-    for page in 1..=100 {
-        let url = format!("{endpoint}?per_page=100&sort=updated&page={page}");
-        let mut response = ureq::get(&url)
-            .header("Accept", "application/vnd.github+json")
-            .header("Authorization", &format!("Bearer {token}"))
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("User-Agent", "Loom")
-            .call()
+    run_github_async(async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
             .map_err(|error| {
                 LoomError::new(
-                    ErrorCode::ProviderAuthentication,
-                    format!("could not list GitHub repositories: {error}"),
+                    ErrorCode::Internal,
+                    format!("could not start the GitHub client: {error}"),
                     true,
                 )
             })?;
-        let page_repositories: Vec<GitHubApiRepository> =
-            response.body_mut().read_json().map_err(|error| {
-                LoomError::new(
-                    ErrorCode::ProviderInvalidResponse,
-                    format!("GitHub returned an invalid repository list: {error}"),
-                    false,
-                )
-            })?;
-        let page_len = page_repositories.len();
-        repositories.extend(
-            page_repositories
-                .into_iter()
-                .map(|repository| GitHubRepository {
-                    full_name: repository.full_name,
-                    description: repository.description,
-                    clone_url: repository.clone_url,
-                    private: repository.private,
-                    default_branch: repository.default_branch,
-                }),
-        );
-        if page_len < 100 {
-            break;
+        let mut repositories = Vec::new();
+        for page in 1..=100 {
+            let url = format!("{endpoint}?per_page=100&sort=updated&page={page}");
+            let response = client
+                .get(&url)
+                .header("Accept", "application/vnd.github+json")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "Loom")
+                .send()
+                .await
+                .map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::ProviderAuthentication,
+                        format!("could not list GitHub repositories: {error}"),
+                        true,
+                    )
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(LoomError::new(
+                    ErrorCode::ProviderAuthentication,
+                    format!(
+                        "could not list GitHub repositories (HTTP {})",
+                        status.as_u16()
+                    ),
+                    true,
+                ));
+            }
+            let page_repositories: Vec<GitHubApiRepository> =
+                response.json().await.map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::ProviderInvalidResponse,
+                        format!("GitHub returned an invalid repository list: {error}"),
+                        false,
+                    )
+                })?;
+            let page_len = page_repositories.len();
+            repositories.extend(
+                page_repositories
+                    .into_iter()
+                    .map(|repository| GitHubRepository {
+                        full_name: repository.full_name,
+                        description: repository.description,
+                        clone_url: repository.clone_url,
+                        private: repository.private,
+                        default_branch: repository.default_branch,
+                    }),
+            );
+            if page_len < 100 {
+                break;
+            }
         }
-    }
-    repositories.sort_by(|left, right| left.full_name.cmp(&right.full_name));
-    Ok(repositories)
+        repositories.sort_by(|left, right| left.full_name.cmp(&right.full_name));
+        Ok(repositories)
+    })
+}
+
+fn run_github_async<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not start the GitHub runtime: {error}"),
+                true,
+            )
+        })?
+        .block_on(future)
 }
 
 pub(crate) fn copy_directory_contents(source: &Path, destination: &Path) -> Result<()> {

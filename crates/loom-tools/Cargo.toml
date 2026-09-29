@@ -17,5 +17,6 @@ ignore.workspace = true
 globset.workspace = true
 regex.workspace = true
 scraper.workspace = true
-ureq.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
 url.workspace = true

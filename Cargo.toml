@@ -62,7 +62,6 @@ subtle = "2.6.1"
 tiktoken-rs = "0.12.0"
 gpui-kit = "0.7.0"
 open = "5.4.4"
-ureq = { version = "3.4.2", default-features = false, features = ["json", "rustls"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 uuid = { version = "1.26.1", features = ["serde", "v4", "v7"] }
 axum = { version = "0.8.9", features = ["ws"] }
