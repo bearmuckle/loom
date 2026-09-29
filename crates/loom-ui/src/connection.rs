@@ -10,9 +10,6 @@
 
 use std::collections::BTreeMap;
 #[cfg(not(target_family = "wasm"))]
-use std::sync::{Arc, Mutex};
-
-#[cfg(not(target_family = "wasm"))]
 use std::{
     sync::mpsc::{self, Sender},
     time::Duration,
@@ -122,9 +119,6 @@ pub(crate) fn describe_startup_connection_error(error: &LoomError, secret: &str)
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
-use loom_server::{InProcessConnection, WebSocketConnection, WebSocketTransport};
-
 #[cfg(target_family = "wasm")]
 use crate::browser::BrowserConnection;
 #[cfg(target_family = "wasm")]
@@ -133,13 +127,9 @@ use wasm_bindgen::{JsCast, closure::Closure};
 #[derive(Clone)]
 pub(crate) enum ClientConnection {
     #[cfg(not(target_family = "wasm"))]
-    InProcess(Box<InProcessConnection>),
+    InProcess(Box<loom_local::LocalConnection>),
     #[cfg(not(target_family = "wasm"))]
-    Remote {
-        runtime: Arc<tokio::runtime::Runtime>,
-        connection: Arc<Mutex<WebSocketConnection>>,
-        secure_for_secrets: bool,
-    },
+    Remote(loom_local::RemoteConnection),
     #[cfg(target_family = "wasm")]
     Disconnected,
     #[cfg(target_family = "wasm")]
@@ -176,38 +166,11 @@ impl ClientConnection {
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn remote(url: String, token: String) -> Result<Self, LoomError> {
         let secure_for_secrets = remote_url_is_secure_for_secrets(&url);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| {
-                LoomError::new(
-                    ErrorCode::Internal,
-                    format!("could not create remote client runtime: {error}"),
-                    false,
-                )
-            })?;
-        let connection = runtime.block_on(async {
-            tokio::time::timeout(
-                Duration::from_secs(15),
-                WebSocketTransport::new(&url, &token).connect(),
-            )
-            .await
-        });
-        let connection = match connection {
-            Ok(result) => result?,
-            Err(_) => {
-                return Err(LoomError::new(
-                    ErrorCode::DeadlineExceeded,
-                    "worker connection timed out",
-                    true,
-                ));
-            }
-        };
-        Ok(Self::Remote {
-            runtime: Arc::new(runtime),
-            connection: Arc::new(Mutex::new(connection)),
+        Ok(Self::Remote(loom_local::RemoteConnection::connect(
+            &url,
+            &token,
             secure_for_secrets,
-        })
+        )?))
     }
 
     #[cfg(target_family = "wasm")]
@@ -220,20 +183,7 @@ impl ClientConnection {
         {
             match self {
                 Self::InProcess(_) => Ok(()),
-                Self::Remote {
-                    runtime,
-                    connection,
-                    ..
-                } => {
-                    let mut connection = connection.lock().map_err(|_| {
-                        LoomError::new(
-                            ErrorCode::Internal,
-                            "remote connection lock was poisoned",
-                            true,
-                        )
-                    })?;
-                    runtime.block_on(connection.close())
-                }
+                Self::Remote(connection) => connection.close(),
             }
         }
         #[cfg(target_family = "wasm")]
@@ -250,9 +200,7 @@ impl ClientConnection {
             #[cfg(not(target_family = "wasm"))]
             Self::InProcess(_) => true,
             #[cfg(not(target_family = "wasm"))]
-            Self::Remote {
-                secure_for_secrets, ..
-            } => *secure_for_secrets,
+            Self::Remote(connection) => connection.secure_for_secrets(),
             #[cfg(target_family = "wasm")]
             Self::Disconnected => false,
             #[cfg(target_family = "wasm")]
@@ -269,27 +217,7 @@ impl ClientConnection {
     pub(crate) fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
         match self {
             Self::InProcess(connection) => connection.request(request),
-            Self::Remote {
-                runtime,
-                connection,
-                ..
-            } => {
-                let request_id = request.request_id;
-                let result = connection
-                    .lock()
-                    .map_err(|_| {
-                        LoomError::new(
-                            ErrorCode::Internal,
-                            "remote connection lock was poisoned",
-                            true,
-                        )
-                    })
-                    .and_then(|mut connection| runtime.block_on(connection.request(request)));
-                match result {
-                    Ok(response) => response,
-                    Err(error) => ResponseEnvelope::failure(request_id, error),
-                }
-            }
+            Self::Remote(connection) => connection.request(request),
         }
     }
 
@@ -299,37 +227,9 @@ impl ClientConnection {
         request: RequestEnvelope,
         timeout: Duration,
     ) -> ResponseEnvelope {
-        let request_id = request.request_id;
         match self {
             Self::InProcess(connection) => connection.request(request),
-            Self::Remote {
-                runtime,
-                connection,
-                ..
-            } => {
-                let result = connection
-                    .lock()
-                    .map_err(|_| {
-                        LoomError::new(
-                            ErrorCode::Internal,
-                            "remote connection lock was poisoned",
-                            true,
-                        )
-                    })
-                    .and_then(|mut connection| {
-                        runtime.block_on(async {
-                            match tokio::time::timeout(timeout, connection.request(request)).await {
-                                Ok(result) => result,
-                                Err(_) => Err(LoomError::new(
-                                    ErrorCode::DeadlineExceeded,
-                                    "worker request timed out",
-                                    true,
-                                )),
-                            }
-                        })
-                    });
-                result.unwrap_or_else(|error| ResponseEnvelope::failure(request_id, error))
-            }
+            Self::Remote(connection) => connection.request_with_timeout(request, timeout),
         }
     }
 
@@ -1170,9 +1070,7 @@ mod tests {
     };
     use loom_model::ModelId;
     use loom_protocol::{ServerResponse, WorkspaceConfig};
-    use loom_server::{
-        AuthTokenStore, AuthorizationScope, InProcessBackend, RemoteServer, RemoteServerConfig,
-    };
+    use loom_server::{AuthTokenStore, AuthorizationScope, RemoteServer, RemoteServerConfig};
     use std::sync::Arc;
 
     #[test]
@@ -1245,7 +1143,8 @@ mod tests {
 
     #[test]
     fn in_process_connection_exercises_workspace_and_session_client_operations() {
-        let connection = ClientConnection::InProcess(Box::new(InProcessBackend::new().connect()));
+        let connection =
+            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
         negotiate(&connection).unwrap();
         let created = create_workspace(&connection, "client wrapper test").unwrap();
         assert_eq!(created.name, "client wrapper test");
@@ -1277,7 +1176,8 @@ mod tests {
 
     #[test]
     fn workspace_client_operations_report_backend_errors_and_register_external_records() {
-        let connection = ClientConnection::InProcess(Box::new(InProcessBackend::new().connect()));
+        let connection =
+            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
         negotiate(&connection).unwrap();
         let timestamp = Timestamp::from_unix_millis(1);
         let external = WorkspaceRecord {
@@ -1332,7 +1232,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("test server runtime should start");
-        let backend = InProcessBackend::new();
+        let backend = loom_server::InProcessBackend::new();
         let auth = Arc::new(AuthTokenStore::new());
         let token = auth
             .insert("gpui-background-test", AuthorizationScope::all())

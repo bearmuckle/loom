@@ -47,14 +47,14 @@ impl LoomView {
             );
             let backend = if demo_workspace {
                 info!("starting demo backend");
-                InProcessBackend::demo_with_github_copilot()?
+                loom_local::OwnedBackend::demo_with_github_copilot()?
             } else if let Some(endpoint) = &options.endpoint {
                 let persistence_path = backend_persistence_path();
                 info!(
                     "starting local backend with OpenAI-compatible endpoint; state '{}'",
                     persistence_path.display()
                 );
-                InProcessBackend::with_openai_compatible_persistent_with_github_copilot(
+                loom_local::OwnedBackend::with_openai_compatible_persistent_with_github_copilot(
                     endpoint,
                     options.api_key.as_deref().unwrap_or_default(),
                     options.model.clone(),
@@ -66,7 +66,7 @@ impl LoomView {
                     "starting local backend with GitHub Copilot; state '{}'",
                     persistence_path.display()
                 );
-                InProcessBackend::new_persistent_with_github_copilot(persistence_path)?
+                loom_local::OwnedBackend::new_persistent_with_github_copilot(persistence_path)?
             };
             (
                 ClientConnection::InProcess(Box::new(backend.connect())),

@@ -26,17 +26,13 @@ uuid.workspace = true
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }
+loom-server.workspace = true
+tokio.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 env_logger.workspace = true
 open.workspace = true
-loom-persistence.workspace = true
-loom-server.workspace = true
-loom-vcs.workspace = true
 loom-local.workspace = true
-sha2.workspace = true
-tokio.workspace = true
-keyring.workspace = true
 
 [target.'cfg(target_family = "wasm")'.dependencies]
 console_log.workspace = true

@@ -19,6 +19,10 @@ use loom_providers::{CredentialRef, GITHUB_COPILOT_DEFAULT_MODEL};
 use loom_vcs::GitService;
 use sha2::{Digest, Sha256};
 
+mod connection;
+
+pub use connection::{LocalConnection, OwnedBackend, RemoteConnection};
+
 const PEER_CREDENTIAL_SERVICE: &str = "com.bearmuckle.loom.worker-peer";
 
 type SecretResult<T> = std::result::Result<T, String>;

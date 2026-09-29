@@ -812,7 +812,7 @@ mod loom_view_render_tests {
             let workspace_root =
                 std::env::temp_dir().join(format!("loom-ui-bootstrap-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir(&workspace_root).unwrap();
-            let local_backend = loom_server::InProcessBackend::new();
+            let local_backend = loom_local::OwnedBackend::new();
             let connection = super::ClientConnection::InProcess(Box::new(local_backend.connect()));
             let connection_after_teardown = connection.clone();
             crate::connection::negotiate(&connection).unwrap();
@@ -3411,9 +3411,8 @@ mod worker_node_tests {
         assert_eq!(placeholder.connection_detail.as_deref(), Some("offline"));
 
         let local_status = node(ACTIVE_BACKEND_NODE_ENTRY_ID, true).status;
-        let local_connection = super::ClientConnection::InProcess(Box::new(
-            loom_server::InProcessBackend::new().connect(),
-        ));
+        let local_connection =
+            super::ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
         let config = loom_protocol::WorkspaceConfig {
             worker_nodes: vec![
                 loom_protocol::WorkerNodeConfig {
@@ -3447,7 +3446,7 @@ mod worker_node_tests {
     #[test]
     fn failed_connection_state_clears_transport_and_keeps_node_url() {
         let mut node = node(7, false);
-        let backend = loom_server::InProcessBackend::new();
+        let backend = loom_local::OwnedBackend::new();
         node.connection = Some(super::ClientConnection::InProcess(Box::new(
             backend.connect(),
         )));
@@ -4647,7 +4646,7 @@ mod transcript_paging_tests {
         use super::{BackendWorker, ClientConnection, load_transcript_page};
         use loom_protocol::{ClientRequest, RequestEnvelope, ServerResponse};
 
-        let backend = loom_server::InProcessBackend::new();
+        let backend = loom_local::OwnedBackend::new();
         let connection = ClientConnection::InProcess(Box::new(backend.connect()));
         crate::connection::negotiate(&connection).unwrap();
         let workspace =

@@ -1,7 +1,5 @@
 //! The GPUI view: session navigator, run canvas, composer, and review drawer.
 
-#[cfg(not(target_family = "wasm"))]
-use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -57,7 +55,6 @@ use loom_protocol::{
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_family = "wasm"))]
-use loom_server::InProcessBackend;
 #[cfg(not(target_family = "wasm"))]
 use std::fs;
 
@@ -364,7 +361,7 @@ pub(crate) struct LoomView {
     /// Used for the synchronous bootstrap before the window exists.
     pub(crate) connection: ClientConnection,
     #[cfg(not(target_family = "wasm"))]
-    owned_backend: Option<Arc<InProcessBackend>>,
+    owned_backend: Option<loom_local::OwnedBackend>,
     /// Used for every request made once the view is interactive.
     pub(crate) backend: BackendWorker,
     /// The startup backend remains the default for workspace requests and new sessions.
@@ -1150,7 +1147,8 @@ pub(crate) struct TimelineView {
 impl LoomView {
     #[cfg(test)]
     fn new_for_test(focus_handle: FocusHandle) -> Self {
-        let connection = ClientConnection::InProcess(Box::new(InProcessBackend::new().connect()));
+        let connection =
+            ClientConnection::InProcess(Box::new(loom_local::OwnedBackend::new().connect()));
         let backend = BackendWorker::spawn(connection.clone());
         let workspace_id = WorkspaceId::new();
         let active_session = empty_session_snapshot(workspace_id);
