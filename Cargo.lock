@@ -4393,6 +4393,7 @@ dependencies = [
  "loom-model",
  "loom-protocol",
  "loom-workspace",
+ "regex",
  "scraper",
  "serde",
  "serde_json",

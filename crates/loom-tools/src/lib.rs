@@ -1,10 +1,12 @@
 use std::{
     collections::BTreeSet,
     fs,
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use globset::Glob;
@@ -12,6 +14,7 @@ use loom_core::{ActionKind, AgentSessionId, ApprovalPolicy, PolicyEvaluation, Re
 use loom_model::{ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
 use loom_workspace::{Workspace, WorkspaceEdit};
+use regex::RegexBuilder;
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use serde::Serialize;
@@ -46,6 +49,7 @@ pub enum ToolKind {
     ListFiles,
     ReadFile,
     SearchText,
+    Glob,
     WebSearch,
     ProposePlan,
     AskUser,
@@ -62,6 +66,7 @@ impl ToolKind {
             "list_files" => Some(Self::ListFiles),
             "read_file" => Some(Self::ReadFile),
             "search_text" => Some(Self::SearchText),
+            "glob" => Some(Self::Glob),
             "web_search" => Some(Self::WebSearch),
             "propose_plan" => Some(Self::ProposePlan),
             "ask_user" => Some(Self::AskUser),
@@ -79,6 +84,7 @@ impl ToolKind {
             Self::ListFiles => "list_files",
             Self::ReadFile => "read_file",
             Self::SearchText => "search_text",
+            Self::Glob => "glob",
             Self::WebSearch => "web_search",
             Self::ProposePlan => "propose_plan",
             Self::AskUser => "ask_user",
@@ -107,6 +113,7 @@ impl ToolKind {
             Self::ListFiles
             | Self::ReadFile
             | Self::SearchText
+            | Self::Glob
             | Self::ProposePlan
             | Self::AskUser => ActionKind::Read,
             Self::WebSearch | Self::GitHubListPullRequests | Self::GitHubGetPullRequest => {
@@ -129,6 +136,28 @@ const MAX_WEB_SEARCH_BODY_BYTES: u64 = 1024 * 1024;
 const WEB_SEARCH_TIMEOUT: Duration = Duration::from_secs(15);
 const WEB_SEARCH_ENDPOINT_ENV: &str = "LOOM_WEB_SEARCH_ENDPOINT";
 const DEFAULT_WEB_SEARCH_ENDPOINT: &str = "https://html.duckduckgo.com/html/";
+
+/// Default tool result budget. Keeping both ends of an oversized result matters
+/// for build logs, where the failing summary is usually at the tail.
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// Upper bound for the truncation marker so the final result cannot exceed the
+/// configured budget.
+const TRUNCATION_MARKER_RESERVE: usize = 64;
+
+const DEFAULT_SEARCH_MAX_RESULTS: usize = 100;
+const MAX_SEARCH_MAX_RESULTS: usize = 1_000;
+const DEFAULT_SEARCH_CONTEXT_LINES: usize = 0;
+const MAX_SEARCH_CONTEXT_LINES: usize = 5;
+
+const DEFAULT_LIST_MAX_ENTRIES: usize = 1_000;
+const MAX_LIST_MAX_ENTRIES: usize = 10_000;
+const MAX_LIST_DEPTH: usize = 32;
+
+const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 30_000;
+const MIN_COMMAND_TIMEOUT_MS: u64 = 100;
+const MAX_COMMAND_TIMEOUT_MS: u64 = 600_000;
+/// Poll interval while waiting for a child process to exit.
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WebSearchRequest {
@@ -276,7 +305,7 @@ impl ToolExecutor {
         let root = workspace.root().to_owned();
         Self {
             root,
-            max_output_bytes: 64 * 1024,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             workspace,
             web_search_provider: None,
             github_token: None,
@@ -383,6 +412,7 @@ impl ToolExecutor {
             ToolKind::ListFiles => self.list_files(call),
             ToolKind::ReadFile => self.read_file(call),
             ToolKind::SearchText => self.search_text(call),
+            ToolKind::Glob => self.glob(call),
             ToolKind::WebSearch => self.web_search(call),
             ToolKind::ProposePlan | ToolKind::AskUser => ToolResult::failure(
                 call,
@@ -406,12 +436,42 @@ impl ToolExecutor {
             Ok(path) => path,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let mut files = Vec::new();
-        if let Err(error) = self.collect_files(&path, relative, &mut files) {
-            return ToolResult::failure(call, error);
-        }
+        let depth = match arguments.depth {
+            Some(depth) if depth == 0 || depth as usize > MAX_LIST_DEPTH => {
+                return ToolResult::failure(
+                    call,
+                    format!("depth must be between 1 and {MAX_LIST_DEPTH}"),
+                );
+            }
+            Some(depth) => Some(depth as usize),
+            None => None,
+        };
+        let matcher = match compile_glob(arguments.glob.as_deref()) {
+            Ok(matcher) => matcher,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let max_entries = match parse_limit(
+            arguments.max_entries,
+            DEFAULT_LIST_MAX_ENTRIES,
+            MAX_LIST_MAX_ENTRIES,
+            "max_entries",
+        ) {
+            Ok(max_entries) => max_entries,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let (mut files, truncated) =
+            match self.collect_files(&path, relative, depth, matcher.as_ref(), max_entries) {
+                Ok(collected) => collected,
+                Err(error) => return ToolResult::failure(call, error),
+            };
         files.sort();
-        ToolResult::success(call, self.limit_output(files.join("\n")))
+        let mut output = files.join("\n");
+        if truncated {
+            output.push_str(&format!(
+                "\n[... showing first {max_entries} entries; add a glob, lower depth, or narrow the path ...]"
+            ));
+        }
+        ToolResult::success(call, self.limit_output(output))
     }
 
     fn read_file(&self, call: &ToolCall) -> ToolResult {
@@ -423,27 +483,54 @@ impl ToolExecutor {
             Ok(path) => path,
             Err(error) => return ToolResult::failure(call, error),
         };
-        match fs::read_to_string(&path) {
-            Ok(contents) => {
-                if arguments.line_start.is_none() && arguments.line_end.is_none() {
-                    return ToolResult::success(call, self.limit_output(contents));
-                }
-                let start = arguments.line_start.unwrap_or(1).max(1) as usize;
-                let end = arguments.line_end.unwrap_or(u64::MAX) as usize;
-                let ranged = contents
-                    .lines()
-                    .enumerate()
-                    .filter(|(index, _)| *index + 1 >= start && *index < end)
-                    .map(|(index, line)| format!("{}:{}", index + 1, line))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                ToolResult::success(call, self.limit_output(ranged))
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                return ToolResult::failure(
+                    call,
+                    format!("could not read '{}': {error}", arguments.path),
+                );
             }
-            Err(error) => ToolResult::failure(
-                call,
-                format!("could not read '{}': {error}", arguments.path),
-            ),
+        };
+        let total_lines = contents.lines().count();
+        if arguments.line_start.is_none() && arguments.line_end.is_none() {
+            if contents.len() <= self.max_output_bytes {
+                return ToolResult::success(call, contents);
+            }
+            let note = format!(
+                "\n[file has {total_lines} lines; read a section with line_start and line_end]"
+            );
+            let budget = self.max_output_bytes.saturating_sub(note.len());
+            let mut output = truncate_middle(&contents, budget);
+            output.push_str(&note);
+            return ToolResult::success(call, output);
         }
+        let start = arguments.line_start.unwrap_or(1).max(1);
+        let end = arguments
+            .line_end
+            .map_or(total_lines as u64, |end| end.min(total_lines as u64));
+        let ranged = contents
+            .lines()
+            .enumerate()
+            .filter(|(index, _)| {
+                let number = *index as u64 + 1;
+                number >= start && number <= end
+            })
+            .map(|(index, line)| format!("{}:{}", index + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let note = if end < total_lines as u64 {
+            format!(
+                "\n[showing lines {start}-{end} of {total_lines}; continue with line_start={}]",
+                end + 1
+            )
+        } else {
+            String::new()
+        };
+        let budget = self.max_output_bytes.saturating_sub(note.len());
+        let mut output = truncate_middle(&ranged, budget);
+        output.push_str(&note);
+        ToolResult::success(call, output)
     }
 
     fn search_text(&self, call: &ToolCall) -> ToolResult {
@@ -459,17 +546,99 @@ impl ToolExecutor {
             Ok(path) => path,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let mut matches = Vec::new();
-        if let Err(error) = self.collect_matches(
+        let context = arguments
+            .context
+            .unwrap_or(DEFAULT_SEARCH_CONTEXT_LINES)
+            .min(MAX_SEARCH_CONTEXT_LINES);
+        let max_results = match parse_limit(
+            arguments.max_results,
+            DEFAULT_SEARCH_MAX_RESULTS,
+            MAX_SEARCH_MAX_RESULTS,
+            "max_results",
+        ) {
+            Ok(max_results) => max_results,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let matcher = match SearchMatcher::new(
+            &arguments.query,
+            arguments.regex.unwrap_or(false),
+            arguments.case_sensitive.unwrap_or(true),
+        ) {
+            Ok(matcher) => matcher,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        match self.collect_matches(
             &path,
             relative,
-            &arguments.query,
+            &matcher,
             arguments.glob.as_deref(),
-            &mut matches,
+            context,
+            max_results,
         ) {
-            return ToolResult::failure(call, error);
+            Ok(output) => ToolResult::success(call, self.limit_output(output)),
+            Err(error) => ToolResult::failure(call, error),
         }
-        ToolResult::success(call, self.limit_output(matches.join("\n")))
+    }
+
+    fn glob(&self, call: &ToolCall) -> ToolResult {
+        let arguments: GlobArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        if arguments.pattern.trim().is_empty() {
+            return ToolResult::failure(call, "glob pattern must not be empty");
+        }
+        let relative = arguments.path.as_deref().unwrap_or(".");
+        let path = match self.resolve_relative(relative) {
+            Ok(path) => path,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let matcher = match compile_glob(Some(&arguments.pattern)) {
+            Ok(Some(matcher)) => matcher,
+            Ok(None) => return ToolResult::failure(call, "glob pattern must not be empty"),
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let max_entries = match parse_limit(
+            arguments.max_entries,
+            DEFAULT_LIST_MAX_ENTRIES,
+            MAX_LIST_MAX_ENTRIES,
+            "max_entries",
+        ) {
+            Ok(max_entries) => max_entries,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let mut files = Vec::new();
+        let mut truncated = false;
+        let entries = match self.workspace.snapshot() {
+            Ok(snapshot) => snapshot.entries,
+            Err(error) => return ToolResult::failure(call, error.message),
+        };
+        for entry in entries {
+            if entry.kind != loom_workspace::WorkspaceEntryKind::File {
+                continue;
+            }
+            match self.entry_in_scope(&entry.path, relative, &path) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => return ToolResult::failure(call, error),
+            }
+            if !matcher.is_match(Path::new(&entry.path)) {
+                continue;
+            }
+            if files.len() >= max_entries {
+                truncated = true;
+                break;
+            }
+            files.push(entry.path);
+        }
+        files.sort();
+        let mut output = files.join("\n");
+        if truncated {
+            output.push_str(&format!(
+                "\n[... showing first {max_entries} entries; narrow the pattern or path ...]"
+            ));
+        }
+        ToolResult::success(call, self.limit_output(output))
     }
 
     fn web_search(&self, call: &ToolCall) -> ToolResult {
@@ -537,33 +706,59 @@ impl ToolExecutor {
             Ok(arguments) => arguments,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let current_file = match self.workspace.read_file(&arguments.path) {
+        let edits = match arguments.edits() {
+            Ok(edits) => edits,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let path = arguments.path.clone();
+        let mut diffs = Vec::with_capacity(edits.len());
+        for (old_text, new_text) in edits {
+            match self.apply_single_edit(&path, old_text, new_text) {
+                Ok(diff) => diffs.push(diff),
+                Err(error) => return ToolResult::failure(call, error),
+            }
+        }
+        let summary = if diffs.len() == 1 {
+            format!("updated {path}")
+        } else {
+            format!("updated {path} ({} edits)", diffs.len())
+        };
+        ToolResult::success(
+            call,
+            self.limit_output(format!("{summary}\n{}", diffs.join("\n"))),
+        )
+    }
+
+    fn apply_single_edit(
+        &self,
+        path: &str,
+        old_text: String,
+        new_text: String,
+    ) -> std::result::Result<String, String> {
+        let current_file = match self.workspace.read_file(path) {
             Ok(file) => file,
             Err(error) if error.code == loom_core::ErrorCode::NotFound => {
                 loom_workspace::SessionFilesystemFile {
                     session_id: self.workspace.session_id(),
-                    path: arguments.path.clone(),
+                    path: path.to_owned(),
                     content: String::new(),
                     revision: String::new(),
                 }
             }
-            Err(error) => return ToolResult::failure(call, error.message),
+            Err(error) => return Err(error.message),
         };
         match self.workspace.apply_edit(WorkspaceEdit {
-            path: arguments.path.clone(),
-            old_text: arguments.old_text,
-            new_text: arguments.new_text,
+            path: path.to_owned(),
+            old_text,
+            new_text,
             expected_revision: if current_file.revision.is_empty() {
                 None
             } else {
                 Some(current_file.revision)
             },
         }) {
-            Ok(result) => ToolResult::success(
-                call,
-                self.limit_output(format!("updated {}\n{}", result.path, result.diff)),
-            ),
-            Err(error) => ToolResult::failure(call, error.message),
+            Ok(result) => Ok(result.diff),
+            Err(error) => Err(error.message),
         }
     }
 
@@ -575,6 +770,15 @@ impl ToolExecutor {
         if arguments.command.trim().is_empty() {
             return ToolResult::failure(call, "command must not be empty");
         }
+        let timeout_ms = arguments.timeout_ms.unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS);
+        if !(MIN_COMMAND_TIMEOUT_MS..=MAX_COMMAND_TIMEOUT_MS).contains(&timeout_ms) {
+            return ToolResult::failure(
+                call,
+                format!(
+                    "timeout_ms must be between {MIN_COMMAND_TIMEOUT_MS} and {MAX_COMMAND_TIMEOUT_MS}"
+                ),
+            );
+        }
         let cwd = match arguments
             .cwd
             .as_deref()
@@ -583,36 +787,74 @@ impl ToolExecutor {
             Ok(cwd) => cwd,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let output = match Command::new(&arguments.command)
-            .args(&arguments.args)
-            .current_dir(cwd)
-            .output()
-        {
-            Ok(output) => output,
-            Err(error) => {
-                return ToolResult::failure(
-                    call,
-                    format!("could not start '{}': {error}", arguments.command),
-                );
-            }
-        };
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.is_empty() {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(&stderr);
-        }
-        if text.is_empty() {
-            text = format!("command exited with {}", output.status);
-        }
-        let text = self.limit_output(text);
-        if output.status.success() {
+        let output =
+            match self.execute_command(&arguments.command, &arguments.args, &cwd, timeout_ms) {
+                Ok(output) => output,
+                Err(error) => return ToolResult::failure(call, error),
+            };
+        let text = self.limit_output(output.render());
+        if output.success() {
             ToolResult::success(call, text)
         } else {
             ToolResult::failure(call, text)
         }
+    }
+
+    fn execute_command(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        timeout_ms: u64,
+    ) -> std::result::Result<CommandOutput, String> {
+        let mut child = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not start '{program}': {error}"))?;
+        let cap = self.max_output_bytes.max(1);
+        let stdout_reader = child
+            .stdout
+            .take()
+            .map(|stdout| thread::spawn(move || read_capped(stdout, cap)));
+        let stderr_reader = child
+            .stderr
+            .take()
+            .map(|stderr| thread::spawn(move || read_capped(stderr, cap)));
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut status = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    break;
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    thread::sleep(COMMAND_POLL_INTERVAL);
+                }
+                Err(error) => return Err(format!("could not wait for '{program}': {error}")),
+            }
+        }
+        let (stdout, stdout_truncated) = stdout_reader.map_or((Vec::new(), false), |reader| {
+            reader.join().unwrap_or_default()
+        });
+        let (stderr, stderr_truncated) = stderr_reader.map_or((Vec::new(), false), |reader| {
+            reader.join().unwrap_or_default()
+        });
+        Ok(CommandOutput {
+            status,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        })
     }
 
     fn github_list_pull_requests(&self, call: &ToolCall) -> ToolResult {
@@ -787,12 +1029,35 @@ impl ToolExecutor {
             .map_err(|error| error.message)
     }
 
+    /// True when a workspace entry is inside the requested path, either through
+    /// a relative prefix or through a mounted directory resolved to an absolute
+    /// path.
+    fn entry_in_scope(
+        &self,
+        entry_path: &str,
+        requested_relative: &str,
+        requested_path: &Path,
+    ) -> std::result::Result<bool, String> {
+        if requested_relative == "." || Path::new(entry_path).starts_with(requested_relative) {
+            return Ok(true);
+        }
+        let child = self
+            .workspace
+            .resolve_path(entry_path, false)
+            .map_err(|error| error.message)?;
+        Ok(child.starts_with(requested_path))
+    }
+
     fn collect_files(
         &self,
         requested_path: &Path,
         requested_relative: &str,
-        files: &mut Vec<String>,
-    ) -> std::result::Result<(), String> {
+        depth: Option<usize>,
+        glob: Option<&globset::GlobMatcher>,
+        max_entries: usize,
+    ) -> std::result::Result<(Vec<String>, bool), String> {
+        let mut files = Vec::new();
+        let mut truncated = false;
         for entry in self
             .workspace
             .snapshot()
@@ -802,35 +1067,37 @@ impl ToolExecutor {
             if entry.kind != loom_workspace::WorkspaceEntryKind::File {
                 continue;
             }
-            let child = self
-                .workspace
-                .resolve_path(&entry.path, false)
-                .map_err(|error| error.message)?;
-            if requested_relative == "."
-                || Path::new(&entry.path).starts_with(requested_relative)
-                || child.starts_with(requested_path)
-            {
-                files.push(entry.path);
+            if !self.entry_in_scope(&entry.path, requested_relative, requested_path)? {
+                continue;
             }
+            if depth.is_some_and(|depth| entry_depth(&entry.path, requested_relative) > depth) {
+                continue;
+            }
+            if glob.is_some_and(|glob| !glob.is_match(Path::new(&entry.path))) {
+                continue;
+            }
+            if files.len() >= max_entries {
+                truncated = true;
+                break;
+            }
+            files.push(entry.path);
         }
-        Ok(())
+        Ok((files, truncated))
     }
 
     fn collect_matches(
         &self,
         requested_path: &Path,
         requested_relative: &str,
-        query: &str,
+        matcher: &SearchMatcher,
         glob: Option<&str>,
-        matches: &mut Vec<String>,
-    ) -> std::result::Result<(), String> {
-        let matcher = glob
-            .map(|pattern| {
-                Glob::new(pattern)
-                    .map(|glob| glob.compile_matcher())
-                    .map_err(|error| format!("invalid glob '{pattern}': {error}"))
-            })
-            .transpose()?;
+        context: usize,
+        max_results: usize,
+    ) -> std::result::Result<String, String> {
+        let glob = compile_glob(glob)?;
+        let mut rendered = Vec::new();
+        let mut matched = 0usize;
+        let mut truncated = false;
         for entry in self
             .workspace
             .snapshot()
@@ -840,23 +1107,20 @@ impl ToolExecutor {
             if entry.kind != loom_workspace::WorkspaceEntryKind::File {
                 continue;
             }
+            if !self.entry_in_scope(&entry.path, requested_relative, requested_path)? {
+                continue;
+            }
+            let child_relative = Path::new(&entry.path);
+            if glob
+                .as_ref()
+                .is_some_and(|glob| !glob.is_match(child_relative))
+            {
+                continue;
+            }
             let path = self
                 .workspace
                 .resolve_path(&entry.path, false)
                 .map_err(|error| error.message)?;
-            if requested_relative != "."
-                && !Path::new(&entry.path).starts_with(requested_relative)
-                && !path.starts_with(requested_path)
-            {
-                continue;
-            }
-            let child_relative = Path::new(&entry.path);
-            if matcher
-                .as_ref()
-                .is_some_and(|matcher| !matcher.is_match(child_relative))
-            {
-                continue;
-            }
             let contents = match fs::read_to_string(&path) {
                 Ok(contents) => contents,
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
@@ -867,31 +1131,275 @@ impl ToolExecutor {
                     ));
                 }
             };
-            for (line_number, line) in contents.lines().enumerate() {
-                if line.contains(query) {
-                    matches.push(format!(
-                        "{}:{}:{}",
-                        child_relative.display(),
-                        line_number + 1,
-                        line
-                    ));
-                }
+            let lines = contents.lines().collect::<Vec<_>>();
+            let indices = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| matcher.is_match(line))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if indices.is_empty() {
+                continue;
+            }
+            let remaining = max_results.saturating_sub(matched);
+            let take = indices.len().min(remaining);
+            rendered.extend(render_file_matches(
+                &entry.path,
+                &lines,
+                &indices[..take],
+                context,
+            ));
+            matched += take;
+            if take < indices.len() {
+                truncated = true;
+                break;
+            }
+            if matched >= max_results {
+                truncated = true;
+                break;
             }
         }
-        Ok(())
+        let mut output = rendered.join("\n");
+        if truncated {
+            output.push_str(&format!(
+                "\n[... stopped at {max_results} matches; refine the query or raise max_results ...]"
+            ));
+        }
+        Ok(output)
     }
 
-    fn limit_output(&self, mut output: String) -> String {
-        if output.len() > self.max_output_bytes {
-            let mut boundary = self.max_output_bytes;
-            while boundary > 0 && !output.is_char_boundary(boundary) {
-                boundary -= 1;
-            }
-            output.truncate(boundary);
-            output.push_str("\n[output truncated]");
-        }
-        output
+    fn limit_output(&self, output: String) -> String {
+        truncate_middle(&output, self.max_output_bytes)
     }
+}
+
+fn entry_depth(entry_path: &str, requested_relative: &str) -> usize {
+    let entry = Path::new(entry_path);
+    let relative = if requested_relative == "." {
+        entry
+    } else {
+        entry.strip_prefix(requested_relative).unwrap_or(entry)
+    };
+    relative
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)))
+        .count()
+}
+
+fn render_file_matches(
+    path: &str,
+    lines: &[&str],
+    indices: &[usize],
+    context: usize,
+) -> Vec<String> {
+    let matched = indices.iter().copied().collect::<BTreeSet<_>>();
+    let mut intervals: Vec<(usize, usize)> = Vec::new();
+    for &index in indices {
+        let start = index.saturating_sub(context);
+        let end = index
+            .saturating_add(context)
+            .min(lines.len().saturating_sub(1));
+        match intervals.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => intervals.push((start, end)),
+        }
+    }
+    let mut output = Vec::new();
+    for (start, end) in intervals {
+        for (index, line) in lines.iter().enumerate().take(end + 1).skip(start) {
+            let separator = if matched.contains(&index) { ':' } else { '-' };
+            output.push(format!("{path}{separator}{}{separator}{line}", index + 1));
+        }
+    }
+    output
+}
+
+#[derive(Debug)]
+enum SearchMatcher {
+    Literal {
+        needle: String,
+        case_sensitive: bool,
+    },
+    Regex(regex::Regex),
+}
+
+impl SearchMatcher {
+    fn new(query: &str, regex: bool, case_sensitive: bool) -> std::result::Result<Self, String> {
+        if regex {
+            let matcher = RegexBuilder::new(query)
+                .case_insensitive(!case_sensitive)
+                .build()
+                .map_err(|error| format!("invalid regular expression '{query}': {error}"))?;
+            Ok(Self::Regex(matcher))
+        } else if case_sensitive {
+            Ok(Self::Literal {
+                needle: query.to_owned(),
+                case_sensitive,
+            })
+        } else {
+            Ok(Self::Literal {
+                needle: query.to_lowercase(),
+                case_sensitive,
+            })
+        }
+    }
+
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Self::Literal {
+                needle,
+                case_sensitive: true,
+            } => line.contains(needle),
+            Self::Literal {
+                needle,
+                case_sensitive: false,
+            } => line.to_lowercase().contains(needle),
+            Self::Regex(regex) => regex.is_match(line),
+        }
+    }
+}
+
+fn compile_glob(
+    pattern: Option<&str>,
+) -> std::result::Result<Option<globset::GlobMatcher>, String> {
+    pattern
+        .map(|pattern| {
+            Glob::new(pattern)
+                .map(|glob| glob.compile_matcher())
+                .map_err(|error| format!("invalid glob '{pattern}': {error}"))
+        })
+        .transpose()
+}
+
+fn parse_limit(
+    value: Option<usize>,
+    default: usize,
+    max: usize,
+    name: &str,
+) -> std::result::Result<usize, String> {
+    let value = value.unwrap_or(default);
+    if value == 0 || value > max {
+        return Err(format!("{name} must be between 1 and {max}"));
+    }
+    Ok(value)
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+fn ceil_char_boundary(text: &str, mut index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    while index < text.len() && !text.is_char_boundary(index) {
+        index += 1;
+    }
+    index
+}
+
+/// Truncate to a byte budget while preserving both ends. Build and test output
+/// usually puts the meaningful summary at the tail, so a head-only cut hides
+/// the signal that tells the model whether the command passed.
+fn truncate_middle(output: &str, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
+        return output.to_owned();
+    }
+    if max_bytes <= TRUNCATION_MARKER_RESERVE {
+        return output[..floor_char_boundary(output, max_bytes)].to_owned();
+    }
+    let available = max_bytes - TRUNCATION_MARKER_RESERVE;
+    let head_budget = available - available / 3;
+    let tail_budget = available - head_budget;
+    let head_end = floor_char_boundary(output, head_budget);
+    let tail_start = ceil_char_boundary(output, output.len() - tail_budget);
+    if tail_start <= head_end {
+        return output[..floor_char_boundary(output, max_bytes)].to_owned();
+    }
+    let omitted = tail_start - head_end;
+    let marker = format!("\n[... {omitted} bytes omitted ...]\n");
+    let mut result = String::with_capacity(head_end + marker.len() + (output.len() - tail_start));
+    result.push_str(&output[..head_end]);
+    result.push_str(&marker);
+    result.push_str(&output[tail_start..]);
+    result
+}
+
+#[derive(Debug)]
+struct CommandOutput {
+    status: Option<std::process::ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+impl CommandOutput {
+    fn success(&self) -> bool {
+        self.status.is_some_and(|status| status.success())
+    }
+
+    fn render(&self) -> String {
+        let stdout = String::from_utf8_lossy(&self.stdout);
+        let stderr = String::from_utf8_lossy(&self.stderr);
+        let mut text = String::new();
+        if !stdout.is_empty() {
+            text.push_str("stdout:\n");
+            text.push_str(&stdout);
+            if self.stdout_truncated {
+                text.push_str("\n[stdout truncated]");
+            }
+        }
+        if !stderr.is_empty() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("stderr:\n");
+            text.push_str(&stderr);
+            if self.stderr_truncated {
+                text.push_str("\n[stderr truncated]");
+            }
+        }
+        let status = match self.status {
+            Some(status) => format!("exit status: {status}"),
+            None => "command timed out and was killed".to_owned(),
+        };
+        if text.is_empty() {
+            status
+        } else {
+            format!("{text}\n{status}")
+        }
+    }
+}
+
+fn read_capped(mut reader: impl Read, cap: usize) -> (Vec<u8>, bool) {
+    let mut stored = Vec::new();
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                if stored.len() < cap {
+                    let take = (cap - stored.len()).min(read);
+                    stored.extend_from_slice(&buffer[..take]);
+                    if take < read {
+                        truncated = true;
+                    }
+                } else {
+                    truncated = true;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    (stored, truncated)
 }
 
 fn parse_arguments<T: for<'de> Deserialize<'de>>(
@@ -944,16 +1452,21 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: ToolKind::ListFiles.name().to_owned(),
-            description: "List files below a workspace-relative path.".to_owned(),
+            description: "List workspace files below a path, optionally limited by depth and filtered by a glob. Results are bounded; narrow with path, depth, or glob rather than listing a large tree.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "depth": {"type": "integer", "minimum": 1, "maximum": 32},
+                    "glob": {"type": "string"},
+                    "max_entries": {"type": "integer", "minimum": 1, "maximum": 10_000}
+                },
                 "additionalProperties": false
             }),
         },
         ToolDefinition {
             name: ToolKind::ReadFile.name().to_owned(),
-            description: "Read a UTF-8 text file inside the workspace.".to_owned(),
+            description: "Read a UTF-8 text file inside the workspace. Returns the whole file, or an inclusive line range with line numbers when line_start/line_end are given. Oversized reads keep both ends and report the total line count so you can request a range.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -967,15 +1480,33 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::SearchText.name().to_owned(),
-            description: "Search text files for an exact string.".to_owned(),
+            description: "Search workspace text files and return bounded matching lines as path:line:content. `query` is a literal string unless `regex` is true. Prefer this over reading whole files when locating code; refine the query or raise max_results instead of searching broadly.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
                     "path": {"type": "string"},
-                    "glob": {"type": "string"}
+                    "glob": {"type": "string"},
+                    "regex": {"type": "boolean"},
+                    "case_sensitive": {"type": "boolean"},
+                    "context": {"type": "integer", "minimum": 0, "maximum": 5},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 1_000}
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::Glob.name().to_owned(),
+            description: "Find workspace files whose path matches a glob pattern (for example `**/*.rs`). Returns bounded, sorted paths. Use this to discover files before reading or searching them.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                    "max_entries": {"type": "integer", "minimum": 1, "maximum": 10_000}
+                },
+                "required": ["pattern"],
                 "additionalProperties": false
             }),
         },
@@ -1026,27 +1557,40 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: ToolKind::ApplyPatch.name().to_owned(),
-            description: "Apply one exact text replacement to a workspace file.".to_owned(),
+            description: "Edit a workspace file with one or more exact text replacements. Provide `edits` (each an old_text/new_text pair), or the single old_text/new_text pair. Each old_text must match exactly once. Returns a unified diff.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "old_text": {"type": "string"},
-                    "new_text": {"type": "string"}
+                    "new_text": {"type": "string"},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string"},
+                                "new_text": {"type": "string"}
+                            },
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": false
+                        }
+                    }
                 },
-                "required": ["path", "old_text", "new_text"],
+                "required": ["path"],
                 "additionalProperties": false
             }),
         },
         ToolDefinition {
             name: ToolKind::RunCommand.name().to_owned(),
-            description: "Run a command directly without a shell in the workspace.".to_owned(),
+            description: "Run a program directly without a shell in the workspace, with an optional timeout and working directory. Returns stdout and stderr separately with the exit status; output is bounded.".to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
                     "args": {"type": "array", "items": {"type": "string"}},
-                    "cwd": {"type": "string"}
+                    "cwd": {"type": "string"},
+                    "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 600_000}
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -1101,6 +1645,9 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
 #[derive(Debug, Deserialize)]
 struct ListFilesArguments {
     path: Option<String>,
+    depth: Option<u32>,
+    glob: Option<String>,
+    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1117,6 +1664,17 @@ struct SearchTextArguments {
     query: String,
     path: Option<String>,
     glob: Option<String>,
+    regex: Option<bool>,
+    case_sensitive: Option<bool>,
+    context: Option<usize>,
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlobArguments {
+    pattern: String,
+    path: Option<String>,
+    max_entries: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1130,8 +1688,38 @@ struct WebSearchArguments {
 #[derive(Debug, Deserialize)]
 struct ApplyPatchArguments {
     path: String,
+    old_text: Option<String>,
+    new_text: Option<String>,
+    #[serde(default)]
+    edits: Vec<ApplyPatchEdit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyPatchEdit {
     old_text: String,
     new_text: String,
+}
+
+impl ApplyPatchArguments {
+    fn edits(&self) -> std::result::Result<Vec<(String, String)>, String> {
+        let legacy = self.old_text.is_some() || self.new_text.is_some();
+        if !self.edits.is_empty() && legacy {
+            return Err(
+                "apply_patch accepts either edits or old_text/new_text, not both".to_owned(),
+            );
+        }
+        if !self.edits.is_empty() {
+            return Ok(self
+                .edits
+                .iter()
+                .map(|edit| (edit.old_text.clone(), edit.new_text.clone()))
+                .collect());
+        }
+        match (&self.old_text, &self.new_text) {
+            (Some(old_text), Some(new_text)) => Ok(vec![(old_text.clone(), new_text.clone())]),
+            _ => Err("apply_patch requires edits, or both old_text and new_text".to_owned()),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1140,6 +1728,7 @@ struct RunCommandArguments {
     #[serde(default)]
     args: Vec<String>,
     cwd: Option<String>,
+    timeout_ms: Option<u64>,
 }
 
 fn normalize_domains(domains: Vec<String>) -> std::result::Result<Vec<String>, String> {
@@ -1500,12 +2089,274 @@ mod tests {
     }
 
     #[test]
-    fn truncates_unicode_without_panicking() {
+    fn truncates_unicode_while_keeping_both_ends() {
         let root = workspace();
         let executor = ToolExecutor::new(&root).unwrap();
-        let output = executor.limit_output(format!("{}x", "😀".repeat(20_000)));
-        assert!(output.ends_with("[output truncated]"));
+        let output = executor.limit_output(format!("head{}tail", "😀".repeat(20_000)));
+        assert!(output.starts_with("head"));
+        assert!(output.ends_with("tail"));
+        assert!(output.contains("bytes omitted"));
+        assert!(output.len() <= 64 * 1024);
         assert!(std::str::from_utf8(output.as_bytes()).is_ok());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn search_text_supports_literal_regex_context_and_limits() {
+        let root = workspace();
+        fs::write(
+            root.join("src/main.rs"),
+            "fn main() {}\nlet Needle = 1;\nlet other = 2;\n",
+        )
+        .unwrap();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        let literal =
+            executor.execute(&call("search_text", serde_json::json!({"query": "Needle"})));
+        assert!(literal.success);
+        assert!(literal.output.contains("src/main.rs:2:let Needle = 1;"));
+
+        let regex = executor.execute(&call(
+            "search_text",
+            serde_json::json!({
+                "query": "needle = \\d+",
+                "regex": true,
+                "case_sensitive": false,
+                "context": 1
+            }),
+        ));
+        assert!(regex.success);
+        assert!(regex.output.contains("src/main.rs:2:let Needle = 1;"));
+        assert!(regex.output.contains("src/main.rs-1-fn main() {}"));
+        assert!(regex.output.contains("src/main.rs-3-let other = 2;"));
+
+        let invalid = executor.execute(&call(
+            "search_text",
+            serde_json::json!({"query": "(", "regex": true}),
+        ));
+        assert!(!invalid.success);
+        assert!(invalid.output.contains("invalid regular expression"));
+
+        let empty = executor.execute(&call(
+            "search_text",
+            serde_json::json!({"query": "", "regex": true}),
+        ));
+        assert!(!empty.success);
+
+        let capped = executor.execute(&call(
+            "search_text",
+            serde_json::json!({"query": "let", "max_results": 1}),
+        ));
+        assert!(capped.success);
+        assert!(capped.output.contains("stopped at 1 matches"));
+        assert_eq!(capped.output.matches("src/main.rs").count(), 1);
+
+        let zero = executor.execute(&call(
+            "search_text",
+            serde_json::json!({"query": "let", "max_results": 0}),
+        ));
+        assert!(!zero.success);
+        assert!(zero.output.contains("max_results must be between"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_file_reports_line_ranges_and_file_size() {
+        let root = workspace();
+        fs::write(
+            root.join("src/main.rs"),
+            (1..=100)
+                .map(|line| format!("line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        let whole = executor.execute(&call(
+            "read_file",
+            serde_json::json!({"path": "src/main.rs"}),
+        ));
+        assert!(whole.success);
+        assert!(whole.output.starts_with("line 1\n"));
+        assert!(whole.output.ends_with("line 100"));
+
+        let ranged = executor.execute(&call(
+            "read_file",
+            serde_json::json!({"path": "src/main.rs", "line_start": 10, "line_end": 20}),
+        ));
+        assert!(ranged.success);
+        assert!(ranged.output.starts_with("10:line 10\n"));
+        assert!(
+            ranged
+                .output
+                .contains("showing lines 10-20 of 100; continue with line_start=21")
+        );
+
+        let past_end = executor.execute(&call(
+            "read_file",
+            serde_json::json!({"path": "src/main.rs", "line_start": 2, "line_end": 3}),
+        ));
+        assert!(past_end.output.starts_with("2:line 2\n3:line 3\n"));
+        assert!(
+            past_end
+                .output
+                .contains("of 100; continue with line_start=4")
+        );
+
+        let large = executor.execute(&call("read_file", serde_json::json!({"path": "README.md"})));
+        assert_eq!(large.output, "Loom workspace\n");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_files_supports_depth_glob_and_entry_limits() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        let shallow = executor.execute(&call("list_files", serde_json::json!({"depth": 1})));
+        assert!(shallow.success);
+        assert!(shallow.output.contains("README.md"));
+        assert!(!shallow.output.contains("src/main.rs"));
+
+        let globbed = executor.execute(&call("list_files", serde_json::json!({"glob": "**/*.rs"})));
+        assert!(globbed.success);
+        assert!(globbed.output.contains("src/main.rs"));
+        assert!(!globbed.output.contains("README.md"));
+
+        let capped = executor.execute(&call("list_files", serde_json::json!({"max_entries": 1})));
+        assert!(capped.success);
+        assert!(capped.output.contains("showing first 1 entries"));
+
+        let invalid_depth = executor.execute(&call("list_files", serde_json::json!({"depth": 0})));
+        assert!(!invalid_depth.success);
+        assert!(invalid_depth.output.contains("depth must be between"));
+
+        let invalid_glob = executor.execute(&call("list_files", serde_json::json!({"glob": "["})));
+        assert!(!invalid_glob.success);
+        assert!(invalid_glob.output.contains("invalid glob"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn glob_returns_bounded_matching_paths() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        let result = executor.execute(&call(
+            "glob",
+            serde_json::json!({"pattern": "**/*.rs", "max_entries": 5}),
+        ));
+        assert!(result.success);
+        assert!(result.output.contains("src/main.rs"));
+        assert!(!result.output.contains("README.md"));
+
+        let empty = executor.execute(&call("glob", serde_json::json!({"pattern": ""})));
+        assert!(!empty.success);
+
+        let capped = executor.execute(&call(
+            "glob",
+            serde_json::json!({"pattern": "**/*", "max_entries": 1}),
+        ));
+        assert!(capped.success);
+        assert!(capped.output.contains("showing first 1 entries"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_patch_supports_multiple_edits_and_rejects_mixed_forms() {
+        let root = workspace();
+        fs::write(root.join("src/main.rs"), "alpha\nbeta\ngamma\n").unwrap();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        let applied = executor.execute(&call(
+            "apply_patch",
+            serde_json::json!({
+                "path": "src/main.rs",
+                "edits": [
+                    {"old_text": "alpha", "new_text": "ALPHA"},
+                    {"old_text": "gamma", "new_text": "GAMMA"}
+                ]
+            }),
+        ));
+        assert!(applied.success);
+        assert_eq!(
+            fs::read_to_string(root.join("src/main.rs")).unwrap(),
+            "ALPHA\nbeta\nGAMMA\n"
+        );
+
+        let mixed = executor.execute(&call(
+            "apply_patch",
+            serde_json::json!({
+                "path": "src/main.rs",
+                "old_text": "ALPHA",
+                "new_text": "x",
+                "edits": [{"old_text": "beta", "new_text": "y"}]
+            }),
+        ));
+        assert!(!mixed.success);
+        assert!(mixed.output.contains("not both"));
+
+        let missing = executor.execute(&call(
+            "apply_patch",
+            serde_json::json!({"path": "src/main.rs"}),
+        ));
+        assert!(!missing.success);
+        assert!(missing.output.contains("requires edits"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_separates_streams_and_enforces_timeout() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+
+        let streams = executor.execute(&call(
+            "run_command",
+            serde_json::json!({
+                "command": "sh",
+                "args": ["-c", "echo out; echo err 1>&2"]
+            }),
+        ));
+        assert!(streams.success);
+        assert!(streams.output.contains("stdout:\nout"));
+        assert!(streams.output.contains("stderr:\nerr"));
+        assert!(streams.output.contains("exit status:"));
+
+        let timed_out = executor.execute(&call(
+            "run_command",
+            serde_json::json!({"command": "sleep", "args": ["5"], "timeout_ms": 200}),
+        ));
+        assert!(!timed_out.success);
+        assert!(timed_out.output.contains("timed out"));
+
+        let invalid = executor.execute(&call(
+            "run_command",
+            serde_json::json!({"command": "true", "timeout_ms": 50}),
+        ));
+        assert!(!invalid.success);
+        assert!(invalid.output.contains("timeout_ms must be between"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tool_definitions_include_context_controls() {
+        let definitions = tool_definitions();
+        let glob = definitions
+            .iter()
+            .find(|definition| definition.name == "glob")
+            .expect("glob tool definition");
+        assert!(glob.input_schema["required"][0] == "pattern");
+        let search = definitions
+            .iter()
+            .find(|definition| definition.name == "search_text")
+            .expect("search tool definition");
+        assert!(search.input_schema["properties"].get("regex").is_some());
+        assert!(
+            search.input_schema["properties"]
+                .get("max_results")
+                .is_some()
+        );
     }
 }
