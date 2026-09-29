@@ -1,6 +1,12 @@
 use super::*;
 
 impl AgentRuntime {
+    /// Refreshes the GitHub token and write grant from the backend so a settings
+    /// change applies to an already-registered run at the next step.
+    pub fn set_github_access(&mut self, token: Option<String>, write_access: bool) {
+        self.tools.set_github_access(token, write_access);
+    }
+
     pub(crate) fn execute_tool(&mut self, call: &ToolCall) -> (Vec<AgentEvent>, ToolResult) {
         let mut events = vec![AgentEvent::ToolCallStarted {
             run_id: self.run.id,
