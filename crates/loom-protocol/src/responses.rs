@@ -220,6 +220,10 @@ pub enum ProviderResponse {
         status: GitHubCopilotLoginStatus,
     },
 
+    GitHubWriteAccess {
+        enabled: bool,
+    },
+
     ProviderHealth(ProviderHealth),
 }
 

@@ -72,7 +72,8 @@ impl InProcessConnection {
             }
         };
         let tools = ToolExecutor::new_with_workspace(workspace)
-            .with_github_token(self.backend.providers.github_account_token().ok());
+            .with_github_token(self.backend.providers.github_account_token().ok())
+            .with_github_write_access(self.backend.providers.github_write_access());
         let tools = self.backend.with_project_agent_tools(
             tools,
             state.session_id,
@@ -558,7 +559,8 @@ impl InProcessConnection {
         let checkpoint = workspace.create_checkpoint("before agent run")?;
         input.options.checkpoint_id = Some(checkpoint.id);
         let tools = ToolExecutor::new_with_workspace(workspace)
-            .with_github_token(self.backend.providers.github_account_token().ok());
+            .with_github_token(self.backend.providers.github_account_token().ok())
+            .with_github_write_access(self.backend.providers.github_write_access());
         let tools = self.backend.with_project_agent_tools(
             tools,
             session.id,

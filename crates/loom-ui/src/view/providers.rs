@@ -317,6 +317,58 @@ impl LoomView {
         cx.notify();
     }
 
+    pub(crate) fn refresh_github_write_access(&self, node_id: String, cx: &mut Context<Self>) {
+        self.dispatch_to_node(
+            cx,
+            node_id,
+            ClientRequest::Provider(ProviderRequest::GetGitHubWriteAccess),
+            |view, response, _| match response.result {
+                Ok(ServerResponse::Provider(ProviderResponse::GitHubWriteAccess { enabled })) => {
+                    view.github_write_access = enabled;
+                }
+                Err(error) => view.record_backend_error("read GitHub write access", error),
+                Ok(response) => view.record_backend_error(
+                    "read GitHub write access",
+                    unexpected_response("GitHub write access", response),
+                ),
+            },
+        );
+    }
+
+    pub(crate) fn toggle_github_write_access(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        self.github_write_access = enabled;
+        let node_id = self.default_backend_node_id.clone();
+        self.dispatch_to_node(
+            cx,
+            node_id,
+            ClientRequest::Provider(ProviderRequest::ConfigureGitHubWriteAccess { enabled }),
+            move |view, response, _| match response.result {
+                Ok(ServerResponse::Provider(ProviderResponse::GitHubWriteAccess {
+                    enabled: configured,
+                })) => {
+                    view.github_write_access = configured;
+                    view.record_status(if configured {
+                        "GitHub write access enabled"
+                    } else {
+                        "GitHub write access disabled"
+                    });
+                }
+                Err(error) => {
+                    view.github_write_access = !enabled;
+                    view.record_backend_error("configure GitHub write access", error);
+                }
+                Ok(response) => {
+                    view.github_write_access = !enabled;
+                    view.record_backend_error(
+                        "configure GitHub write access",
+                        unexpected_response("GitHub write access", response),
+                    );
+                }
+            },
+        );
+        cx.notify();
+    }
+
     pub(crate) fn sync_model_select_states(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active_node = self
             .session_node_ids
@@ -604,6 +656,7 @@ impl LoomView {
         self.about_open = false;
         self.settings_open = true;
         let node_id = self.default_backend_node_id.clone();
+        self.refresh_github_write_access(node_id.clone(), cx);
         self.dispatch_to_node(
             cx,
             node_id,

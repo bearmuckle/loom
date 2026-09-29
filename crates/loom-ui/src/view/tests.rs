@@ -4754,6 +4754,49 @@ mod provider_control_tests {
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
             .unwrap();
     }
+
+    #[gpui_kit::test]
+    fn github_write_access_toggle_round_trips(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            assert!(!view.github_write_access);
+            view.github_connected = true;
+            view.settings_open = true;
+            view.settings_section = SettingsSection::Providers;
+            view
+        });
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .within("settings-dialog")
+                .click("github-write-access-toggle", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window.root::<LoomView>().unwrap().unwrap();
+            view.update(cx, |view, cx| {
+                assert!(view.github_write_access);
+                view.toggle_github_write_access(false, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window.root::<LoomView>().unwrap().unwrap();
+            view.update(cx, |view, cx| {
+                assert!(!view.github_write_access);
+                view.refresh_github_write_access("missing-node".to_owned(), cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
 }
 
 #[cfg(test)]

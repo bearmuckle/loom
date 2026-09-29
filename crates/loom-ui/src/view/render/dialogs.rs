@@ -772,6 +772,26 @@ impl LoomView {
                             ),
                     ),
                 )
+                .child(
+                    settings_card().child(settings_row(
+                        "Allow GitHub writes and pull requests",
+                        "Let the agent push branches and open pull requests with the connected account",
+                        Switch::new("github-write-access-toggle")
+                            .checked(self.github_write_access)
+                            .disabled(!self.github_connected)
+                            .accessibility_label("Allow GitHub writes and pull requests")
+                            .on_change({
+                                let view = cx.entity();
+                                move |checked, _window, cx| {
+                                    let enabled = *checked;
+                                    view.update(cx, |view, cx| {
+                                        view.toggle_github_write_access(enabled, cx);
+                                    });
+                                }
+                            }),
+                        true,
+                    )),
+                )
                 .into_any_element(),
             SettingsSection::Workers => {
                 let mut card = settings_card();

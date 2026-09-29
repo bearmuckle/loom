@@ -13,6 +13,7 @@ use globset::Glob;
 use loom_core::{ActionKind, AgentSessionId, ApprovalPolicy, PolicyEvaluation, Result};
 use loom_model::{ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
+use loom_vcs::GitService;
 use loom_workspace::{Workspace, WorkspaceEdit};
 use regex::RegexBuilder;
 use scraper::{Html, Selector};
@@ -68,6 +69,7 @@ pub enum ToolKind {
     GitHubListPullRequests,
     GitHubGetPullRequest,
     GitHubCreatePullRequest,
+    GitHubPushBranch,
 }
 
 impl ToolKind {
@@ -85,6 +87,7 @@ impl ToolKind {
             "github_list_pull_requests" => Some(Self::GitHubListPullRequests),
             "github_get_pull_request" => Some(Self::GitHubGetPullRequest),
             "github_create_pull_request" => Some(Self::GitHubCreatePullRequest),
+            "github_push_branch" => Some(Self::GitHubPushBranch),
             _ => None,
         }
     }
@@ -103,6 +106,7 @@ impl ToolKind {
             Self::GitHubListPullRequests => "github_list_pull_requests",
             Self::GitHubGetPullRequest => "github_get_pull_request",
             Self::GitHubCreatePullRequest => "github_create_pull_request",
+            Self::GitHubPushBranch => "github_push_branch",
         }
     }
 
@@ -115,6 +119,7 @@ impl ToolKind {
                 | Self::GitHubListPullRequests
                 | Self::GitHubGetPullRequest
                 | Self::GitHubCreatePullRequest
+                | Self::GitHubPushBranch
         )
     }
 
@@ -129,7 +134,7 @@ impl ToolKind {
             Self::WebSearch | Self::GitHubListPullRequests | Self::GitHubGetPullRequest => {
                 ActionKind::Network
             }
-            Self::GitHubCreatePullRequest => ActionKind::Write,
+            Self::GitHubCreatePullRequest | Self::GitHubPushBranch => ActionKind::Write,
             Self::ApplyPatch => ActionKind::Write,
             Self::RunCommand => ActionKind::Command,
         }
@@ -168,6 +173,11 @@ const MIN_COMMAND_TIMEOUT_MS: u64 = 100;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 600_000;
 /// Poll interval while waiting for a child process to exit.
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+const GITHUB_NOT_CONNECTED: &str =
+    "GitHub is not connected; connect a GitHub account in Loom settings";
+const GITHUB_WRITE_DISABLED: &str =
+    "GitHub write access is disabled; enable writes and pull requests in Loom settings";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WebSearchRequest {
@@ -309,6 +319,7 @@ pub struct ToolExecutor {
     workspace: Workspace,
     web_search_provider: Option<Arc<dyn WebSearchProvider>>,
     github_token: Option<String>,
+    github_write_enabled: bool,
     extension: Option<Arc<dyn ToolExtension>>,
 }
 
@@ -326,6 +337,7 @@ impl ToolExecutor {
             workspace,
             web_search_provider: None,
             github_token: None,
+            github_write_enabled: false,
             extension: None,
         }
     }
@@ -340,6 +352,13 @@ impl ToolExecutor {
         self
     }
 
+    /// Enables the opt-in GitHub write tools (pushing branches and creating
+    /// pull requests). Disabled by default.
+    pub fn with_github_write_access(mut self, enabled: bool) -> Self {
+        self.github_write_enabled = enabled;
+        self
+    }
+
     pub fn with_extension(mut self, extension: Arc<dyn ToolExtension>) -> Self {
         self.extension = Some(extension);
         self
@@ -347,6 +366,18 @@ impl ToolExecutor {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut definitions = tool_definitions();
+        if !self.github_write_enabled {
+            // The push tool is only useful once the GitHub write grant is
+            // enabled, so it is not advertised until then. Pull request
+            // creation stays advertised (with its existing write approval) and
+            // is refused at execution time when the grant is missing.
+            definitions.retain(|definition| {
+                !matches!(
+                    ToolKind::from_name(&definition.name),
+                    Some(ToolKind::GitHubPushBranch)
+                )
+            });
+        }
         if let Some(extension) = &self.extension {
             let mut names = definitions
                 .iter()
@@ -440,6 +471,7 @@ impl ToolExecutor {
             ToolKind::GitHubListPullRequests => self.github_list_pull_requests(call),
             ToolKind::GitHubGetPullRequest => self.github_get_pull_request(call),
             ToolKind::GitHubCreatePullRequest => self.github_create_pull_request(call),
+            ToolKind::GitHubPushBranch => self.github_push_branch(call),
         }
     }
 
@@ -944,6 +976,9 @@ impl ToolExecutor {
     }
 
     fn github_create_pull_request(&self, call: &ToolCall) -> ToolResult {
+        if !self.github_write_enabled {
+            return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
+        }
         let arguments: GitHubCreatePullRequestArguments = match parse_arguments(call) {
             Ok(arguments) => arguments,
             Err(error) => return ToolResult::failure(call, error),
@@ -967,6 +1002,83 @@ impl ToolExecutor {
         }
     }
 
+    fn github_push_branch(&self, call: &ToolCall) -> ToolResult {
+        if !self.github_write_enabled {
+            return ToolResult::failure(call, GITHUB_WRITE_DISABLED);
+        }
+        let arguments: GitHubPushBranchArguments = match parse_arguments(call) {
+            Ok(arguments) => arguments,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let token = match self.github_token.as_deref() {
+            Some(token) => token,
+            None => return ToolResult::failure(call, GITHUB_NOT_CONNECTED),
+        };
+        if !valid_github_repository(&arguments.repository) {
+            return ToolResult::failure(call, "repository must be in owner/name format");
+        }
+        let cwd = match arguments
+            .path
+            .as_deref()
+            .map_or_else(|| Ok(self.root.clone()), |path| self.resolve_relative(path))
+        {
+            Ok(cwd) => cwd,
+            Err(error) => return ToolResult::failure(call, error),
+        };
+        let service = match GitService::open(&cwd) {
+            Ok(service) => service,
+            Err(error) => return ToolResult::failure(call, error.message),
+        };
+        let origin = match service.remote_url("origin") {
+            Ok(Some(origin)) => origin,
+            Ok(None) => {
+                return ToolResult::failure(
+                    call,
+                    "the repository has no 'origin' remote to push to",
+                );
+            }
+            Err(error) => return ToolResult::failure(call, error.message),
+        };
+        let target = match classify_push_remote(&origin) {
+            Some(PushRemote::GitHub(repository)) => {
+                if !repository.eq_ignore_ascii_case(&arguments.repository) {
+                    return ToolResult::failure(
+                        call,
+                        format!(
+                            "the 'origin' remote points at {repository}, not the requested repository {}",
+                            arguments.repository
+                        ),
+                    );
+                }
+                repository
+            }
+            Some(PushRemote::Local) => origin.clone(),
+            None => {
+                return ToolResult::failure(
+                    call,
+                    format!("the 'origin' remote is not a GitHub repository URL: {origin}"),
+                );
+            }
+        };
+        let branch = match arguments.branch {
+            Some(branch) => branch,
+            None => match service.current_branch() {
+                Ok(Some(branch)) => branch,
+                Ok(None) => {
+                    return ToolResult::failure(
+                        call,
+                        "the repository is not on a local branch; specify a branch to push",
+                    );
+                }
+                Err(error) => return ToolResult::failure(call, error.message),
+            },
+        };
+        match service.push_branch_authenticated(&branch, token) {
+            Ok(()) => ToolResult::success(call, format!("Pushed branch '{branch}' to {target}.")),
+            Err(error) => ToolResult::failure(call, error.message),
+        }
+    }
+
     fn github_api(
         &self,
         method: &str,
@@ -974,9 +1086,10 @@ impl ToolExecutor {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> std::result::Result<serde_json::Value, String> {
-        let token = self.github_token.as_deref().ok_or_else(|| {
-            "GitHub is not connected; connect a GitHub account in Loom settings".to_owned()
-        })?;
+        let token = self
+            .github_token
+            .as_deref()
+            .ok_or_else(|| GITHUB_NOT_CONNECTED.to_owned())?;
         if !valid_github_repository(repository) {
             return Err("repository must be in owner/name format".to_owned());
         }
@@ -1463,6 +1576,49 @@ struct GitHubCreatePullRequestArguments {
     draft: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubPushBranchArguments {
+    repository: String,
+    branch: Option<String>,
+    path: Option<String>,
+}
+
+enum PushRemote {
+    /// A GitHub remote whose `owner/name` must match the requested repository.
+    GitHub(String),
+    /// A local filesystem remote that never receives credentials.
+    Local,
+}
+
+/// Classifies an origin URL as a GitHub remote, a local remote, or an
+/// unsupported (potentially credential-receiving) network remote.
+fn classify_push_remote(origin: &str) -> Option<PushRemote> {
+    if let Some(repository) = github_repository_from_remote(origin) {
+        return Some(PushRemote::GitHub(repository));
+    }
+    let trimmed = origin.trim();
+    let is_local = trimmed.starts_with("file://")
+        || Path::new(trimmed).is_absolute()
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../");
+    is_local.then_some(PushRemote::Local)
+}
+
+/// Extracts the `owner/name` repository from a GitHub HTTPS or SSH remote URL.
+fn github_repository_from_remote(remote: &str) -> Option<String> {
+    let trimmed = remote.trim();
+    let path = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| trimmed.strip_prefix("git@github.com:"))?;
+    let repository = path
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or_else(|| path.trim_end_matches('/'));
+    valid_github_repository(repository).then(|| repository.to_owned())
+}
+
 pub fn tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -1651,6 +1807,20 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "draft": {"type": "boolean"}
                 },
                 "required": ["repository", "title", "head", "base"],
+                "additionalProperties": false
+            }),
+        },
+        ToolDefinition {
+            name: ToolKind::GitHubPushBranch.name().to_owned(),
+            description: "Push a local branch in the workspace to the GitHub repository's origin remote using the connected account, so a pull request can be opened. Requires explicit write approval and enabled GitHub write access.".to_owned(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "repository": {"type": "string", "description": "Repository in owner/name format; must match the checkout's origin."},
+                    "branch": {"type": "string", "description": "Branch to push. Defaults to the current branch."},
+                    "path": {"type": "string", "description": "Workspace-relative path to the Git checkout. Defaults to the workspace root."}
+                },
+                "required": ["repository"],
                 "additionalProperties": false
             }),
         },
@@ -1862,6 +2032,37 @@ mod tests {
             name: name.to_owned(),
             arguments,
         }
+    }
+
+    fn run_git(root: &Path, arguments: &[&str]) {
+        assert!(
+            Command::new("git")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_COMMON_DIR")
+                .args(arguments)
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn init_git_repository(root: &Path) -> String {
+        fs::create_dir_all(root).unwrap();
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.email", "loom@example.test"]);
+        run_git(root, &["config", "user.name", "Loom Test"]);
+        fs::write(root.join("README.md"), "Loom workspace\n").unwrap();
+        run_git(root, &["add", "--", "README.md"]);
+        run_git(root, &["commit", "-qm", "initial"]);
+        let output = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
     #[derive(Clone)]
@@ -2374,6 +2575,163 @@ mod tests {
                 .is_some()
         );
     }
+
+    #[test]
+    fn github_write_tools_are_advertised_only_when_enabled() {
+        let root = workspace();
+        let disabled = ToolExecutor::new(&root).unwrap();
+        assert!(
+            !disabled
+                .definitions()
+                .iter()
+                .any(|definition| definition.name == "github_push_branch")
+        );
+        assert!(
+            disabled
+                .definitions()
+                .iter()
+                .any(|definition| definition.name == "github_create_pull_request")
+        );
+
+        let enabled = ToolExecutor::new(&root)
+            .unwrap()
+            .with_github_write_access(true);
+        assert!(
+            enabled
+                .definitions()
+                .iter()
+                .any(|definition| definition.name == "github_push_branch")
+        );
+        assert!(
+            enabled
+                .definitions()
+                .iter()
+                .any(|definition| definition.name == "github_create_pull_request")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_write_tools_are_refused_without_the_grant() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        for (name, arguments) in [
+            (
+                "github_push_branch",
+                serde_json::json!({"repository": "owner/name"}),
+            ),
+            (
+                "github_create_pull_request",
+                serde_json::json!({
+                    "repository": "owner/name",
+                    "title": "title",
+                    "head": "head",
+                    "base": "base"
+                }),
+            ),
+        ] {
+            let result = executor.execute(&call(name, arguments));
+            assert!(!result.success);
+            assert!(result.output.contains("write access is disabled"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_push_branch_pushes_the_current_branch() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        let branch = init_git_repository(&root);
+        let bare = std::env::temp_dir().join(format!("loom-push-bare-{}", AgentSessionId::new()));
+        run_git(
+            &std::env::temp_dir(),
+            &["init", "--bare", "-q", bare.to_str().unwrap()],
+        );
+        run_git(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+
+        let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
+        let executor = ToolExecutor::new_with_workspace(workspace)
+            .with_github_token(Some("test-token".to_owned()))
+            .with_github_write_access(true);
+        let pushed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+        assert!(pushed.success, "{}", pushed.output);
+        assert!(pushed.output.contains(&format!("Pushed branch '{branch}'")));
+        let output = Command::new("git")
+            .args(["branch", "--list", &branch])
+            .current_dir(&bare)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains(&branch));
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn github_push_branch_checks_the_origin_repository() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        init_git_repository(&root);
+        run_git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/owner/name.git",
+            ],
+        );
+        let executor = ToolExecutor::new(&root)
+            .unwrap()
+            .with_github_token(Some("test-token".to_owned()))
+            .with_github_write_access(true);
+        let mismatched = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "other/name"}),
+        ));
+        assert!(!mismatched.success);
+        assert!(mismatched.output.contains("points at owner/name"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_push_branch_requires_a_github_origin_and_connection() {
+        let root = std::env::temp_dir().join(format!("loom-push-{}", AgentSessionId::new()));
+        init_git_repository(&root);
+        run_git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.com/owner/name.git",
+            ],
+        );
+
+        let workspace = Workspace::open(AgentSessionId::new(), &root).unwrap();
+        let executor = ToolExecutor::new_with_workspace(workspace)
+            .with_github_token(Some("test-token".to_owned()))
+            .with_github_write_access(true);
+        let not_github = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+        assert!(!not_github.success);
+        assert!(not_github.output.contains("not a GitHub repository URL"));
+
+        let disconnected = ToolExecutor::new(&root)
+            .unwrap()
+            .with_github_write_access(true);
+        let not_connected = disconnected.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+        assert!(!not_connected.success);
+        assert!(not_connected.output.contains("not connected"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -2450,5 +2808,28 @@ mod helper_tests {
         assert!(!valid_github_repository("ow ner/name"));
         assert_eq!(entry_depth("a", "a"), 0);
         assert_eq!(entry_depth("a/b/c", "a"), 2);
+    }
+
+    #[test]
+    fn github_remote_repository_parsing() {
+        assert_eq!(
+            github_repository_from_remote("https://github.com/owner/name.git").as_deref(),
+            Some("owner/name")
+        );
+        assert_eq!(
+            github_repository_from_remote("https://github.com/owner/name/").as_deref(),
+            Some("owner/name")
+        );
+        assert_eq!(
+            github_repository_from_remote("git@github.com:owner/name.git").as_deref(),
+            Some("owner/name")
+        );
+        assert_eq!(
+            github_repository_from_remote("ssh://git@github.com/owner/name").as_deref(),
+            Some("owner/name")
+        );
+        assert!(github_repository_from_remote("https://gitlab.com/owner/name.git").is_none());
+        assert!(github_repository_from_remote("https://github.com/owner").is_none());
+        assert!(github_repository_from_remote("git@example.com:owner/name.git").is_none());
     }
 }

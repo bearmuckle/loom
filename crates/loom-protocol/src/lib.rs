@@ -369,8 +369,12 @@ impl ClientRequest {
             Self::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
             | Self::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
             | Self::Provider(ProviderRequest::StartGitHubCopilotLogin)
-            | Self::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. }) => {
+            | Self::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. })
+            | Self::Provider(ProviderRequest::ConfigureGitHubWriteAccess { .. }) => {
                 Some(Capability::ConfigureProviders)
+            }
+            Self::Provider(ProviderRequest::GetGitHubWriteAccess) => {
+                Some(Capability::ListProviders)
             }
             Self::Provider(ProviderRequest::DiscoverProviderModels { .. }) => {
                 Some(Capability::ListProviders)
@@ -429,6 +433,7 @@ impl ClientRequest {
                 | Self::Run(RunRequest::RetryAgentFromCheckpoint { .. })
                 | Self::Session(SessionRequest::ForkAgentSession { .. })
                 | Self::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
+                | Self::Provider(ProviderRequest::ConfigureGitHubWriteAccess { .. })
                 | Self::Run(RunRequest::AttachRunEvidence { .. })
         )
     }

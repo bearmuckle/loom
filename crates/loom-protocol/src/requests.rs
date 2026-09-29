@@ -357,6 +357,12 @@ pub enum ProviderRequest {
         login_id: String,
     },
 
+    ConfigureGitHubWriteAccess {
+        enabled: bool,
+    },
+
+    GetGitHubWriteAccess,
+
     DiscoverProviderModels {
         provider_id: ProviderId,
     },

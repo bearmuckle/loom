@@ -274,6 +274,12 @@ impl InProcessConnection {
             ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. }) => {
                 self.provider_dispatch(request, request_id)
             }
+            ClientRequest::Provider(ProviderRequest::ConfigureGitHubWriteAccess { .. }) => {
+                self.provider_dispatch(request, request_id)
+            }
+            ClientRequest::Provider(ProviderRequest::GetGitHubWriteAccess) => {
+                self.provider_dispatch(request, request_id)
+            }
             ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { .. }) => {
                 self.provider_dispatch(request, request_id)
             }
