@@ -790,3 +790,86 @@ impl InProcessConnection {
         self.continue_run(run_id, AgentRuntime::checkpoint_retry_entry)
     }
 }
+
+impl InProcessConnection {
+    pub(crate) fn run_snapshot_projection(
+        &self,
+        run_id: loom_core::RunId,
+    ) -> Result<AgentRunSnapshotProjection> {
+        if let Some(handle) = self.backend.runs()?.get(&run_id).cloned() {
+            return Ok(run_snapshot_projection(&handle.state()));
+        }
+        let summary = self.run_summary(run_id)?;
+        let state = self.load_persisted_run_state(&summary, true)?;
+        Ok(run_snapshot_projection(&state))
+    }
+
+    pub(crate) fn load_persisted_run_state_from_projection(
+        &self,
+        summary: &PersistedRunSummary,
+        persisted: &DurableSessionProjectionRead,
+    ) -> Result<AgentRuntimeState> {
+        let run_id = summary.snapshot.id;
+        let durable_summary = persisted.latest_run.as_ref().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "persisted run disappeared",
+                true,
+            )
+        })?;
+        if durable_summary.snapshot.id != run_id {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "persisted projection does not contain the selected run",
+                true,
+            ));
+        }
+        let runtime_config = persisted.runtime_config.clone().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("persisted run {run_id} has no runtime configuration"),
+                true,
+            )
+        })?;
+        let mut state = runtime_state_from_durable_config(summary, runtime_config)?;
+        let execution_state = persisted.execution_state.clone().ok_or_else(|| {
+            LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("persisted run {run_id} has no typed execution state"),
+                true,
+            )
+        })?;
+        hydrate_runtime_execution_state(&mut state, execution_state)?;
+        state.plan = persisted.plan.clone();
+        state.messages.clear();
+        if let Some(checkpoint) = &persisted.context_checkpoint {
+            if checkpoint.session_id != state.session_id {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "run context checkpoint belongs to a different session",
+                    false,
+                ));
+            }
+            state.context_checkpoint = Some(checkpoint.summary.clone());
+            if let Some(inspection) = &mut state.context_inspection {
+                inspection.summary = Some(checkpoint.summary.clone());
+            }
+        } else {
+            state.context_checkpoint = None;
+            if let Some(inspection) = &mut state.context_inspection {
+                inspection.summary = None;
+            }
+        }
+        state.activities = persisted.activities.clone();
+        state.attempts = persisted.attempts.clone();
+        if state.attempts.is_empty() {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                format!("persisted run {run_id} has no typed attempt history"),
+                true,
+            ));
+        }
+        state.interactions = persisted.interactions.clone();
+        Ok(state)
+    }
+}

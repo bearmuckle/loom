@@ -132,3 +132,86 @@ impl InProcessConnection {
         Ok(ServerResponse::AgentSessionArchived(snapshot))
     }
 }
+
+impl InProcessConnection {
+    pub(crate) fn session_snapshot_projection(
+        &self,
+        session_id: AgentSessionId,
+        include_messages: bool,
+    ) -> Result<AgentSessionSnapshotProjection> {
+        let session = self.backend.sessions()?.get(session_id)?;
+        let (loaded_ids, latest_loaded) = {
+            let runs = self.backend.runs()?;
+            let loaded_ids = runs.keys().copied().collect::<BTreeSet<_>>();
+            let latest = runs
+                .values()
+                .filter(|handle| handle.session_id == session_id)
+                .max_by_key(|handle| handle.snapshot().updated_at)
+                .cloned();
+            (loaded_ids, latest)
+        };
+        let persisted_projection = match &self.backend.persistence {
+            Some(persistence) if !include_messages => {
+                Some(persistence.load_session_projection_read(session_id)?)
+            }
+            _ => None,
+        };
+        let latest_persisted = if let Some(projection) = &persisted_projection {
+            projection
+                .latest_run
+                .as_ref()
+                .map(|summary| PersistedRunSummary {
+                    snapshot: summary.snapshot.clone(),
+                    usage: summary.usage.clone(),
+                })
+                .filter(|summary| !loaded_ids.contains(&summary.snapshot.id))
+        } else {
+            match &self.backend.persistence {
+                Some(persistence) => persistence
+                    .load_latest_run_summary_for_session(session_id)?
+                    .map(|summary| PersistedRunSummary {
+                        snapshot: summary.snapshot,
+                        usage: summary.usage,
+                    })
+                    .filter(|summary| !loaded_ids.contains(&summary.snapshot.id)),
+                None => None,
+            }
+        };
+        let load_selected_persisted = |summary: &PersistedRunSummary| {
+            if let Some(projection) = &persisted_projection {
+                self.load_persisted_run_state_from_projection(summary, projection)
+            } else {
+                self.load_persisted_run_state(summary, include_messages)
+            }
+        };
+        let active_run = match (latest_loaded, latest_persisted) {
+            (Some(handle), Some(summary)) => {
+                let projection = handle.snapshot_projection(include_messages);
+                if projection.run.updated_at >= summary.snapshot.updated_at {
+                    Some(projection)
+                } else {
+                    Some(run_snapshot_projection(&load_selected_persisted(&summary)?))
+                }
+            }
+            (Some(handle), None) => Some(handle.snapshot_projection(include_messages)),
+            (None, Some(summary)) => {
+                Some(run_snapshot_projection(&load_selected_persisted(&summary)?))
+            }
+            (None, None) => None,
+        };
+        let latest_sequence = persisted_projection
+            .as_ref()
+            .and_then(|projection| projection.latest_sequence)
+            .map(Ok)
+            .unwrap_or_else(|| self.latest_session_event_sequence(session_id))?;
+        let approval_policy = self.policy(session_id)?;
+        let auto_approve_actions = self.auto_approve_actions(session_id)?;
+        Ok(AgentSessionSnapshotProjection {
+            session,
+            active_run,
+            latest_sequence,
+            approval_policy,
+            auto_approve_actions,
+        })
+    }
+}
