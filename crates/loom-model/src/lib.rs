@@ -4,9 +4,9 @@ mod provider;
 pub use config::{
     CredentialRef, CredentialReference, DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL,
     DEEPSEEK_PROVIDER_ID, GITHUB_COPILOT_API_ENDPOINT, GITHUB_COPILOT_CREDENTIAL_REF,
-    GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID, OPENAI_API_ENDPOINT,
-    OPENAI_DEFAULT_MODEL, OPENAI_PROVIDER_ID, ProviderConfig, ProviderUsageKey, UsageLedger,
-    deterministic_descriptor, github_copilot_descriptor,
+    GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID, GITHUB_REPOSITORY_CREDENTIAL_REF,
+    OPENAI_API_ENDPOINT, OPENAI_DEFAULT_MODEL, OPENAI_PROVIDER_ID, ProviderConfig,
+    ProviderUsageKey, UsageLedger, deterministic_descriptor, github_copilot_descriptor,
 };
 pub use provider::{
     CancellationToken, CollectingSink, ModelProvider, ModelStreamSink, ProviderDescriptor,

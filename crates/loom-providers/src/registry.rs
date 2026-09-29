@@ -307,11 +307,37 @@ impl ProviderRegistry {
         Ok(())
     }
 
-    /// Resolves the GitHub account token used by Copilot and repository
-    /// browsing. Callers must keep this token backend-only.
+    /// Resolves the GitHub token used for repository operations (clone, browse,
+    /// push, and pull requests). Prefers the repository-scoped credential
+    /// obtained from the GitHub CLI OAuth app and falls back to the Copilot
+    /// token, which can only browse public repositories. Callers must keep this
+    /// token backend-only.
     pub fn github_account_token(&self) -> Result<String> {
+        self.github_repository_token().or_else(|_| {
+            self.credentials
+                .resolve(&CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF))
+        })
+    }
+
+    /// Resolves the repository-scoped GitHub credential, if one is configured.
+    pub fn github_repository_token(&self) -> Result<String> {
         self.credentials
-            .resolve(&CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF))
+            .resolve(&CredentialRef::new(GITHUB_REPOSITORY_CREDENTIAL_REF))
+    }
+
+    /// Stores a repository-scoped GitHub token obtained from the GitHub CLI
+    /// OAuth app device flow. This token authorizes clone, push, and pull
+    /// requests on the worker, which has no ambient Git credentials.
+    pub fn configure_github_repository(&self, access_token: String) -> Result<()> {
+        if access_token.trim().is_empty() {
+            return Err(LoomError::invalid_request(
+                "GitHub repository access token must not be empty",
+            ));
+        }
+        self.credentials.store(
+            &CredentialRef::new(GITHUB_REPOSITORY_CREDENTIAL_REF),
+            access_token,
+        )
     }
 
     /// Whether the connected GitHub account is authorized for writes and pull

@@ -10,6 +10,7 @@ use crate::{
 
 pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 pub const GITHUB_COPILOT_CREDENTIAL_REF: &str = "github-copilot";
+pub const GITHUB_REPOSITORY_CREDENTIAL_REF: &str = "github-repository";
 pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-6-luna";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 pub const OPENAI_API_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";

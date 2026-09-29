@@ -357,6 +357,18 @@ pub enum ProviderRequest {
         login_id: String,
     },
 
+    ConfigureGitHubRepository {
+        access_token: String,
+    },
+
+    StartGitHubRepositoryLogin,
+
+    GetGitHubRepositoryLoginStatus {
+        login_id: String,
+    },
+
+    GetGitHubRepositoryAccess,
+
     ConfigureGitHubWriteAccess {
         enabled: bool,
     },

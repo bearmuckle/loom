@@ -29,6 +29,15 @@ impl Default for GitHubCopilotAuthenticator {
 }
 
 impl GitHubCopilotAuthenticator {
+    /// Device authorization against the GitHub CLI OAuth app, which yields a
+    /// repository-scoped user token usable for cloning, pushing, and creating
+    /// pull requests. The Copilot app token cannot do repository writes.
+    pub fn repository() -> Self {
+        Self {
+            client_id: GITHUB_REPOSITORY_OAUTH_CLIENT_ID.to_owned(),
+        }
+    }
+
     pub fn begin(&self) -> Result<GitHubDeviceCode> {
         let (status, body) = run_async(request_json(
             reqwest::Method::POST,

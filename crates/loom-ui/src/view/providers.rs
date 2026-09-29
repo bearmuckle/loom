@@ -7,6 +7,22 @@ impl LoomView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.begin_github_login(GitHubLoginKind::Copilot, cx);
+    }
+
+    /// Starts the device flow that grants repository access (clone, push, and
+    /// pull requests) through the GitHub CLI OAuth app.
+    pub(crate) fn authorize_github_repository(
+        &mut self,
+        _: &ClickEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_github_login(GitHubLoginKind::Repository, cx);
+    }
+
+    /// Shared entry point for the Copilot and repository device-login flows.
+    pub(crate) fn begin_github_login(&mut self, kind: GitHubLoginKind, cx: &mut Context<Self>) {
         if let Some(state) = &self.github_login {
             if matches!(
                 state,
@@ -28,14 +44,14 @@ impl LoomView {
                 .is_some_and(BackendWorker::secure_for_secrets)
         {
             self.github_login = Some(GitHubLoginState::Error(
-                "GitHub Copilot sign-in requires a secure worker connection (wss:// or loopback ws://)."
-                    .to_owned(),
+                kind.secure_connection_message().to_owned(),
             ));
             cx.notify();
             return;
         }
         self.settings_open = false;
         self.review.open = false;
+        self.github_login_kind = kind;
         self.start_github_login(cx);
     }
 
@@ -58,7 +74,15 @@ impl LoomView {
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn start_github_login_flow(&mut self, cx: &mut Context<Self>) {
-        let task = cx.background_spawn(async { loom_local::github_copilot_login_begin() });
+        let kind = self.github_login_kind;
+        let task = cx.background_spawn(async move {
+            match kind {
+                GitHubLoginKind::Copilot => loom_local::github_copilot_login_begin(),
+                GitHubLoginKind::Repository => {
+                    loom_local::GitHubCopilotAuthenticator::repository().begin()
+                }
+            }
+        });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             view.update(cx, |view, cx| view.handle_github_device_code(result, cx))
@@ -82,21 +106,39 @@ impl LoomView {
             cx.notify();
             return;
         };
-        let pending = backend.submit(RequestEnvelope::new(ClientRequest::Provider(
-            ProviderRequest::StartGitHubCopilotLogin,
-        )));
+        let kind = self.github_login_kind;
+        let start_request = match kind {
+            GitHubLoginKind::Copilot => ProviderRequest::StartGitHubCopilotLogin,
+            GitHubLoginKind::Repository => ProviderRequest::StartGitHubRepositoryLogin,
+        };
+        let pending = backend.submit(RequestEnvelope::new(ClientRequest::Provider(start_request)));
         cx.spawn(async move |view, cx| {
             let response = pending.wait().await;
             let (login_id, user_code, verification_uri, expires_in, interval) =
-                match response.result {
-                    Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStarted {
-                        login_id,
-                        user_code,
-                        verification_uri,
-                        expires_in,
-                        interval,
-                    })) => (login_id, user_code, verification_uri, expires_in, interval),
-                    Err(error) => {
+                match (kind, response.result) {
+                    (
+                        GitHubLoginKind::Copilot,
+                        Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStarted {
+                            login_id,
+                            user_code,
+                            verification_uri,
+                            expires_in,
+                            interval,
+                        })),
+                    )
+                    | (
+                        GitHubLoginKind::Repository,
+                        Ok(ServerResponse::Provider(
+                            ProviderResponse::GitHubRepositoryLoginStarted {
+                                login_id,
+                                user_code,
+                                verification_uri,
+                                expires_in,
+                                interval,
+                            },
+                        )),
+                    ) => (login_id, user_code, verification_uri, expires_in, interval),
+                    (_, Err(error)) => {
                         view.update(cx, |view, cx| {
                             view.github_login = Some(GitHubLoginState::Error(error.message));
                             cx.notify();
@@ -104,8 +146,8 @@ impl LoomView {
                         .ok();
                         return;
                     }
-                    Ok(response) => {
-                        let error = unexpected_response("GitHub Copilot login start", response);
+                    (_, Ok(response)) => {
+                        let error = unexpected_response("GitHub login start", response);
                         view.update(cx, |view, cx| {
                             view.github_login = Some(GitHubLoginState::Error(error.message));
                             cx.notify();
@@ -138,49 +180,70 @@ impl LoomView {
                     .ok();
                     return;
                 }
+                let status_request = match kind {
+                    GitHubLoginKind::Copilot => ProviderRequest::GetGitHubCopilotLoginStatus {
+                        login_id: login_id.clone(),
+                    },
+                    GitHubLoginKind::Repository => {
+                        ProviderRequest::GetGitHubRepositoryLoginStatus {
+                            login_id: login_id.clone(),
+                        }
+                    }
+                };
                 let response = backend
                     .submit(RequestEnvelope::new(ClientRequest::Provider(
-                        ProviderRequest::GetGitHubCopilotLoginStatus {
-                            login_id: login_id.clone(),
-                        },
+                        status_request,
                     )))
                     .wait()
                     .await;
-                match response.result {
-                    Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
-                        status: GitHubCopilotLoginStatus::Pending,
-                    })) => {}
-                    Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
-                        status: GitHubCopilotLoginStatus::Configured,
-                    })) => {
+                let status = match (kind, response.result) {
+                    (
+                        GitHubLoginKind::Copilot,
+                        Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
+                            status,
+                        })),
+                    )
+                    | (
+                        GitHubLoginKind::Repository,
+                        Ok(ServerResponse::Provider(
+                            ProviderResponse::GitHubRepositoryLoginStatus { status },
+                        )),
+                    ) => status,
+                    (_, Err(error)) => {
                         view.update(cx, |view, cx| {
-                            view.handle_github_provider_configured(node_id, cx);
+                            view.github_login = Some(GitHubLoginState::Error(error.message));
+                            cx.notify();
                         })
                         .ok();
                         return;
                     }
-                    Ok(ServerResponse::Provider(ProviderResponse::GitHubCopilotLoginStatus {
-                        status: GitHubCopilotLoginStatus::Failed { message },
-                    })) => {
+                    (_, Ok(response)) => {
+                        let error = unexpected_response("GitHub login status", response);
+                        view.update(cx, |view, cx| {
+                            view.github_login = Some(GitHubLoginState::Error(error.message));
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                };
+                match status {
+                    GitHubCopilotLoginStatus::Pending => {}
+                    GitHubCopilotLoginStatus::Configured => {
+                        view.update(cx, |view, cx| match kind {
+                            GitHubLoginKind::Copilot => {
+                                view.handle_github_provider_configured(node_id.clone(), cx);
+                            }
+                            GitHubLoginKind::Repository => {
+                                view.handle_github_repository_configured(node_id.clone(), cx);
+                            }
+                        })
+                        .ok();
+                        return;
+                    }
+                    GitHubCopilotLoginStatus::Failed { message } => {
                         view.update(cx, |view, cx| {
                             view.github_login = Some(GitHubLoginState::Error(message));
-                            cx.notify();
-                        })
-                        .ok();
-                        return;
-                    }
-                    Err(error) => {
-                        view.update(cx, |view, cx| {
-                            view.github_login = Some(GitHubLoginState::Error(error.message));
-                            cx.notify();
-                        })
-                        .ok();
-                        return;
-                    }
-                    Ok(response) => {
-                        let error = unexpected_response("GitHub Copilot login status", response);
-                        view.update(cx, |view, cx| {
-                            view.github_login = Some(GitHubLoginState::Error(error.message));
                             cx.notify();
                         })
                         .ok();
@@ -212,8 +275,15 @@ impl LoomView {
             expires_in: device.expires_in,
         });
         cx.notify();
-        let task =
-            cx.background_spawn(async move { loom_local::github_copilot_login_poll(&device) });
+        let kind = self.github_login_kind;
+        let task = cx.background_spawn(async move {
+            match kind {
+                GitHubLoginKind::Copilot => loom_local::github_copilot_login_poll(&device),
+                GitHubLoginKind::Repository => {
+                    loom_local::GitHubCopilotAuthenticator::repository().poll(&device)
+                }
+            }
+        });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             view.update(cx, |view, cx| view.finish_github_login(result, cx))
@@ -237,6 +307,15 @@ impl LoomView {
                 return;
             }
         };
+        let kind = self.github_login_kind;
+        let request = match kind {
+            GitHubLoginKind::Copilot => ProviderRequest::ConfigureGitHubCopilot {
+                access_token: token,
+            },
+            GitHubLoginKind::Repository => ProviderRequest::ConfigureGitHubRepository {
+                access_token: token,
+            },
+        };
         let node_id = self
             .providers_node_id
             .clone()
@@ -244,22 +323,42 @@ impl LoomView {
         self.dispatch_to_node(
             cx,
             node_id.clone(),
-            ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot {
-                access_token: token,
-            }),
+            ClientRequest::Provider(request),
             move |view, response, cx| match response.result {
-                Ok(ServerResponse::Provider(ProviderResponse::ProviderConfigured)) => {
-                    view.handle_github_provider_configured(node_id, cx)
-                }
+                Ok(ServerResponse::Provider(ProviderResponse::ProviderConfigured)) => match kind {
+                    GitHubLoginKind::Copilot => {
+                        view.handle_github_provider_configured(node_id, cx);
+                    }
+                    GitHubLoginKind::Repository => {
+                        view.handle_github_repository_configured(node_id, cx);
+                    }
+                },
                 Err(error) => {
                     view.github_login = Some(GitHubLoginState::Error(error.message));
                 }
                 Ok(response) => view.record_backend_error(
-                    "configure GitHub Copilot",
+                    "configure GitHub access",
                     unexpected_response("provider configuration", response),
                 ),
             },
         );
+        cx.notify();
+    }
+
+    /// Marks repository access as configured and reflects it in settings.
+    pub(crate) fn handle_github_repository_configured(
+        &mut self,
+        node_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.github_login = Some(GitHubLoginState::Success);
+        self.github_repository_connected = true;
+        self.record_status(format!(
+            "GitHub repository access configured on {}",
+            self.node_names
+                .get(&node_id)
+                .map_or(node_id.as_str(), String::as_str)
+        ));
         cx.notify();
     }
 
@@ -330,6 +429,26 @@ impl LoomView {
                 Ok(response) => view.record_backend_error(
                     "read GitHub write access",
                     unexpected_response("GitHub write access", response),
+                ),
+            },
+        );
+    }
+
+    pub(crate) fn refresh_github_repository_access(&self, node_id: String, cx: &mut Context<Self>) {
+        self.dispatch_to_node(
+            cx,
+            node_id,
+            ClientRequest::Provider(ProviderRequest::GetGitHubRepositoryAccess),
+            |view, response, _| match response.result {
+                Ok(ServerResponse::Provider(ProviderResponse::GitHubRepositoryAccess {
+                    connected,
+                })) => {
+                    view.github_repository_connected = connected;
+                }
+                Err(error) => view.record_backend_error("read GitHub repository access", error),
+                Ok(response) => view.record_backend_error(
+                    "read GitHub repository access",
+                    unexpected_response("GitHub repository access", response),
                 ),
             },
         );
@@ -655,6 +774,7 @@ impl LoomView {
         self.settings_open = true;
         let node_id = self.default_backend_node_id.clone();
         self.refresh_github_write_access(node_id.clone(), cx);
+        self.refresh_github_repository_access(node_id.clone(), cx);
         self.load_provider_scope(node_id, cx);
         cx.notify();
     }
@@ -825,6 +945,7 @@ impl LoomView {
         self.settings_section = SettingsSection::Providers;
         self.settings_open = true;
         self.refresh_github_write_access(node_id.clone(), cx);
+        self.refresh_github_repository_access(node_id.clone(), cx);
         self.load_provider_scope(node_id, cx);
         cx.notify();
     }
