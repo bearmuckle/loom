@@ -310,6 +310,13 @@ impl LoomView {
         cx.notify();
     }
 
+    /// Collapses or expands the hunk whose header row is at `row`.
+    pub(crate) fn toggle_review_hunk(&mut self, row: usize, cx: &mut Context<Self>) {
+        if self.review.toggle_hunk(row) {
+            cx.notify();
+        }
+    }
+
     pub(crate) fn close_review(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.review.open = false;
         self.project_child_review = None;

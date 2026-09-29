@@ -1224,16 +1224,16 @@ mod loom_view_render_tests {
                     new_lines: 1,
                 },
                 ReviewRow::Line(GitDiffLine {
-                    kind: GitDiffLineKind::Added,
-                    old_line: None,
-                    new_line: Some(1),
-                    content: "added".to_owned(),
-                }),
-                ReviewRow::Line(GitDiffLine {
                     kind: GitDiffLineKind::Removed,
                     old_line: Some(1),
                     new_line: None,
                     content: "removed".to_owned(),
+                }),
+                ReviewRow::Line(GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "added".to_owned(),
                 }),
                 ReviewRow::Line(GitDiffLine {
                     kind: GitDiffLineKind::Context,
@@ -1242,6 +1242,8 @@ mod loom_view_render_tests {
                     content: "context".to_owned(),
                 }),
             ];
+            view.review.hunk_rows = vec![0];
+            view.review.collapsed_hunks.insert(0);
             for index in 0..=view.review.rows.len() {
                 let _ = view.render_review_row(index);
             }

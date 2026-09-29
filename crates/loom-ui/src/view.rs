@@ -9,7 +9,7 @@ use std::{
 
 use gpui_kit::TestSupportExt as _;
 use gpui_kit::assets::IconName as AssetIconName;
-use gpui_kit::base::{Disableable, Selectable, SelectableText, TextSelectionLayer};
+use gpui_kit::base::{Disableable, Selectable, TextSelectionLayer};
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants};
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{
@@ -508,6 +508,7 @@ pub(crate) struct LoomView {
     command_palette_input: Option<Entity<InputState>>,
     command_palette_selection: usize,
     session_filter_input: Option<Entity<InputState>>,
+    review_filter_input: Option<Entity<InputState>>,
     input_subscriptions: Vec<Subscription>,
     clear_composer_on_render: bool,
     clear_node_on_render: bool,
@@ -1327,6 +1328,7 @@ impl LoomView {
             command_palette_input: None,
             command_palette_selection: 0,
             session_filter_input: None,
+            review_filter_input: None,
             input_subscriptions: Vec::new(),
             clear_composer_on_render: false,
             clear_node_on_render: false,
