@@ -93,3 +93,40 @@ impl CredentialService {
         Ok(login.status.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_logins_are_bounded_expire_and_finish() {
+        let store = CredentialService::new();
+        let now = Instant::now();
+        let retention = Duration::from_secs(300);
+        let expires = now + Duration::from_secs(3600);
+        store
+            .begin_pending("login-0".to_owned(), now, retention, 2, expires)
+            .unwrap();
+        store
+            .begin_pending("login-1".to_owned(), now, retention, 2, expires)
+            .unwrap();
+        assert!(
+            store
+                .begin_pending("login-2".to_owned(), now, retention, 2, expires)
+                .is_err()
+        );
+
+        store.finish("login-0", GitHubCopilotLoginStatus::Configured);
+        store
+            .begin_pending("login-3".to_owned(), now, retention, 2, expires)
+            .unwrap();
+
+        let expired = store
+            .status("login-1", now + Duration::from_secs(7200))
+            .unwrap();
+        assert!(matches!(expired, GitHubCopilotLoginStatus::Failed { .. }));
+        assert!(store.status("missing", now).is_err());
+        store.remove("login-1");
+        assert!(store.status("login-1", now).is_err());
+    }
+}

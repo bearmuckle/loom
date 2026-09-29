@@ -52,3 +52,32 @@ impl AdmissionService {
         Ok(Arc::clone(admissions.entry(workspace_id).or_default()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_locks_are_stable_per_entity() {
+        let service = AdmissionService::new();
+        let session_id = AgentSessionId::new();
+        assert!(Arc::ptr_eq(
+            &service.session(session_id).unwrap(),
+            &service.session(session_id).unwrap()
+        ));
+        let project_id = ProjectId::new();
+        assert!(Arc::ptr_eq(
+            &service.project(project_id).unwrap(),
+            &service.project(project_id).unwrap()
+        ));
+        let workspace_id = WorkspaceId::new();
+        assert!(Arc::ptr_eq(
+            &service.workspace_project(workspace_id).unwrap(),
+            &service.workspace_project(workspace_id).unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            &service.session(session_id).unwrap(),
+            &service.session(AgentSessionId::new()).unwrap()
+        ));
+    }
+}

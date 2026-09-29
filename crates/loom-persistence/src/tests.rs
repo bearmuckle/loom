@@ -4149,3 +4149,37 @@ fn reconnect_event_decoder_accepts_compressed_rows_and_rejects_corruption() {
         ErrorCode::MalformedPayload
     );
 }
+
+#[test]
+fn schema_records_baseline_version_and_rejects_future_versions() {
+    let dir = std::env::temp_dir().join(format!("loom-schema-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+
+    {
+        let connection = Connection::open(&path).unwrap();
+        initialize_schema(&connection).unwrap();
+    }
+    assert_eq!(
+        FilePersistence::schema_status(&path).unwrap(),
+        SchemaStatus::Current
+    );
+
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", 999u32)
+            .unwrap();
+    }
+    assert!(matches!(
+        FilePersistence::schema_status(&path).unwrap(),
+        SchemaStatus::OtherVersion(999)
+    ));
+    assert_eq!(prepare_database(&path, true).unwrap(), SchemaStatus::Absent);
+    assert_eq!(
+        FilePersistence::schema_status(&path).unwrap(),
+        SchemaStatus::Absent
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
