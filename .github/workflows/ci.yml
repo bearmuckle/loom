@@ -42,6 +42,8 @@ jobs:
           rm_cmd: "rmz"
           rmz_version: "3.2.0"
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install native UI dependencies
         run: |
           sudo apt-get update
@@ -70,7 +72,7 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           python3 -m pip install --quiet diff-cover
-          git fetch --depth=1 origin "${{ github.base_ref }}"
+          git fetch origin "${{ github.base_ref }}"
           diff-cover lcov.info \
             --compare-branch="origin/${{ github.base_ref }}" \
             --fail-under=75 \
