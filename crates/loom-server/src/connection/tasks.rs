@@ -47,7 +47,7 @@ impl InProcessConnection {
 
     pub(crate) fn set_project_task_status(
         &self,
-        persistence: &FilePersistence,
+        persistence: &dyn Persistence,
         task: &mut loom_core::DelegatedTaskRecord,
         status: loom_core::DelegatedTaskStatus,
     ) -> Result<()> {

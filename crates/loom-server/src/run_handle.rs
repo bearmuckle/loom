@@ -57,7 +57,7 @@ impl RunHandle {
 
     pub(crate) fn append_message_delta(
         &self,
-        persistence: &FilePersistence,
+        persistence: &dyn Persistence,
         text: &str,
     ) -> Result<()> {
         if text.is_empty() {
@@ -136,7 +136,7 @@ impl RunHandle {
         Ok(())
     }
 
-    pub(crate) fn flush_message_fragments(&self, persistence: &FilePersistence) -> Result<()> {
+    pub(crate) fn flush_message_fragments(&self, persistence: &dyn Persistence) -> Result<()> {
         let mut fragments = self.message_fragments.lock().map_err(|_| {
             LoomError::new(
                 ErrorCode::Internal,
@@ -149,7 +149,7 @@ impl RunHandle {
 
     pub(crate) fn flush_message_fragments_locked(
         &self,
-        persistence: &FilePersistence,
+        persistence: &dyn Persistence,
         fragments: &mut MessageFragmentState,
     ) -> Result<()> {
         let ordinals = fragments.pending.keys().copied().collect::<Vec<_>>();
@@ -267,7 +267,7 @@ impl RunHandle {
 
     pub(crate) fn flush_message_fragments_until_stopped(
         handle: Weak<Self>,
-        persistence: FilePersistence,
+        persistence: Arc<dyn Persistence>,
     ) {
         loop {
             let Some(handle) = handle.upgrade() else {

@@ -29,7 +29,7 @@ use loom_persistence::{
     DurableRunCheckpointWrite, DurableRunContextCheckpoint, DurableRunMessage,
     DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary,
     DurableSessionProjectionRead, DurableSessionSettings, DurableStateWrite, FilePersistence,
-    ProjectCancellationCascadeRecord,
+    Persistence, ProjectCancellationCascadeRecord,
 };
 use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
@@ -272,7 +272,7 @@ pub struct InProcessBackend {
     supported_capabilities: CapabilitySet,
     providers: ProviderRegistry,
     credentials: CredentialService,
-    persistence: Option<FilePersistence>,
+    persistence: Option<Arc<dyn Persistence>>,
     session_root_base: PathBuf,
     idempotency_store: IdempotencyStore,
     admissions: AdmissionService,

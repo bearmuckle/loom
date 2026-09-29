@@ -45,9 +45,12 @@ mod content;
 mod feed;
 mod filesystem;
 mod lifecycle;
+mod persistence_trait;
 mod project;
 mod runs;
 mod schema;
+
+pub use persistence_trait::Persistence;
 
 use catalog::*;
 use codec::*;

@@ -163,7 +163,7 @@ impl InProcessConnection {
 
     pub(crate) fn abandon_project_manager_waits_owned_by(
         &self,
-        persistence: &FilePersistence,
+        persistence: &dyn Persistence,
         sessions: &[AgentSessionId],
     ) -> Result<()> {
         let sessions = sessions.iter().copied().collect::<BTreeSet<_>>();

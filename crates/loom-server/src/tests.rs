@@ -960,7 +960,7 @@ fn await_settled_run(
 }
 
 fn await_project_manager_wait_status(
-    persistence: &FilePersistence,
+    persistence: &dyn Persistence,
     wait_id: loom_core::ProjectManagerWaitId,
     expected_status: loom_core::ProjectManagerWaitStatus,
 ) -> loom_core::ProjectManagerWaitRecord {

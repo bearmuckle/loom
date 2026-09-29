@@ -152,7 +152,10 @@ impl InProcessBackend {
         let providers = ProviderRegistry::demo();
         Self::with_provider_registry_and_persistence(
             providers,
-            Some(FilePersistence::open_exclusive_writer(path.into())?),
+            Some(
+                Arc::new(FilePersistence::open_exclusive_writer(path.into())?)
+                    as Arc<dyn Persistence>,
+            ),
         )
     }
 
@@ -178,7 +181,10 @@ impl InProcessBackend {
     ) -> Result<Arc<Self>> {
         Self::with_provider_registry_and_persistence(
             providers,
-            Some(FilePersistence::open_exclusive_writer(path.into())?),
+            Some(
+                Arc::new(FilePersistence::open_exclusive_writer(path.into())?)
+                    as Arc<dyn Persistence>,
+            ),
         )
     }
 
@@ -188,14 +194,17 @@ impl InProcessBackend {
     ) -> Result<Arc<Self>> {
         Self::with_provider_registry_and_persistence(
             providers,
-            path.map(FilePersistence::open_exclusive_writer)
-                .transpose()?,
+            path.map(|path| {
+                FilePersistence::open_exclusive_writer(path)
+                    .map(|store| Arc::new(store) as Arc<dyn Persistence>)
+            })
+            .transpose()?,
         )
     }
 
     pub(crate) fn with_provider_registry_and_persistence(
         providers: ProviderRegistry,
-        persistence: Option<FilePersistence>,
+        persistence: Option<Arc<dyn Persistence>>,
     ) -> Result<Arc<Self>> {
         if let Some(persistence) = &persistence {
             let credential_path = persistence.path().with_extension("credentials.json");

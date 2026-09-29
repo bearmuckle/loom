@@ -94,9 +94,11 @@ Suggested backend boundaries:
   content-addressed store inside SQLite. Schema changes are applied through an
   ordered `MIGRATIONS` ladder that records each step in `PRAGMA user_version`;
   a database from an unknown or newer version is still rejected rather than
-  overwritten. The crate depends only on neutral domain crates
-  (`loom-core`/`loom-model`) and the protocol contract, never on
-  `loom-session`/`loom-providers`.
+  overwritten. The composition root holds storage behind the `Persistence`
+  trait (`Arc<dyn Persistence>`), and `FilePersistence::in_memory()` shares the
+  same schema, repository, and migration code path as the file-backed store.
+  The crate depends only on neutral domain crates (`loom-core`/`loom-model`)
+  and the protocol contract, never on `loom-session`/`loom-providers`.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
   result normalization, and tool adapters. Workspace exploration is bounded:
   search supports literal or regex matching with context and a result cap,

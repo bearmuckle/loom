@@ -523,7 +523,7 @@ pub(crate) fn persisted_run_messages(messages: Vec<DurableRunMessage>) -> Vec<Mo
 }
 
 pub(crate) fn hydrate_run_context_checkpoint(
-    persistence: &FilePersistence,
+    persistence: &dyn Persistence,
     run_id: loom_core::RunId,
     state: &mut AgentRuntimeState,
 ) -> Result<()> {
@@ -568,7 +568,7 @@ pub(crate) fn sync_cached_run_attempt(state: &mut AgentRuntimeState) {
 }
 
 pub(crate) fn deliver_project_agent_messages(
-    persistence: &FilePersistence,
+    persistence: &dyn Persistence,
     runtime: &mut AgentRuntime,
 ) -> Result<bool> {
     let session_id = runtime.session_id();
@@ -593,7 +593,7 @@ pub(crate) fn deliver_project_agent_messages(
 }
 
 pub(crate) fn project_member_branch_messaging_enabled(
-    persistence: &FilePersistence,
+    persistence: &dyn Persistence,
     root_session_id: AgentSessionId,
     member_session_id: AgentSessionId,
 ) -> Result<bool> {
@@ -899,7 +899,7 @@ pub(crate) fn project_agent_slot_released(state: AgentSessionState) -> bool {
 }
 
 pub(crate) fn project_manager_wait_result_summary(
-    persistence: &FilePersistence,
+    persistence: &dyn Persistence,
     wait: &loom_core::ProjectManagerWaitRecord,
 ) -> Result<Option<String>> {
     let mut children = Vec::with_capacity(wait.child_task_ids.len());
@@ -1055,7 +1055,7 @@ pub(crate) fn is_terminal_agent_run_state(state: AgentRunState) -> bool {
 }
 
 pub(crate) fn abandon_project_manager_wait_if_run_terminal(
-    persistence: &FilePersistence,
+    persistence: &dyn Persistence,
     wait: &loom_core::ProjectManagerWaitRecord,
 ) -> Result<bool> {
     let Some(summary) = persistence.load_run_summary(wait.run_id)? else {
