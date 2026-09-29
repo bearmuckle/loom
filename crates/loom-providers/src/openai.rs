@@ -122,14 +122,17 @@ impl ModelProvider for OpenAiCompatibleProvider {
     }
 
     fn health_check(&mut self) -> Result<()> {
-        let response = configure_request(ureq::get(&health_endpoint(&self.endpoint))).call();
-        match response {
-            Ok(response) => ensure_success(self.descriptor.provider.as_str(), response).map(|_| ()),
-            Err(error) => Err(normalize_provider_request_error(
-                self.descriptor.provider.as_str(),
-                error,
-            )),
+        let provider = self.descriptor.provider.as_str();
+        let (status, _) = run_async(request_json(
+            reqwest::Method::GET,
+            &health_endpoint(&self.endpoint),
+            &[],
+            None,
+        ))?;
+        if status >= 400 {
+            return Err(normalize_provider_error(provider, status));
         }
+        Ok(())
     }
 }
 

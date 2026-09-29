@@ -419,26 +419,19 @@ impl ProviderRegistry {
             .transpose()?
             .unwrap_or_default();
         // Credentials are attached only to the backend request.
-        let request = configure_request(ureq::get(&health_endpoint(endpoint)));
-        let request = if credential.is_empty() {
-            request
-        } else {
-            request.header("Authorization", format!("Bearer {credential}"))
-        };
-        let response = request
-            .call()
-            .map_err(|error| normalize_provider_request_error(provider_id.as_str(), error))?;
-        let mut response = ensure_success(provider_id.as_str(), response)?;
-        let body: serde_json::Value = response.body_mut().read_json().map_err(|error| {
-            LoomError::new(
-                ErrorCode::ProviderInvalidResponse,
-                format!(
-                    "{} model discovery returned invalid JSON: {error}",
-                    provider_id.as_str()
-                ),
-                false,
-            )
-        })?;
+        let mut headers = Vec::new();
+        if !credential.is_empty() {
+            headers.push(("Authorization", format!("Bearer {credential}")));
+        }
+        let (status, body) = run_async(request_json(
+            reqwest::Method::GET,
+            &health_endpoint(endpoint),
+            &headers,
+            None,
+        ))?;
+        if status >= 400 {
+            return Err(normalize_provider_error(provider_id.as_str(), status));
+        }
         let models = body
             .get("data")
             .and_then(serde_json::Value::as_array)

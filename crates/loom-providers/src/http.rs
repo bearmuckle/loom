@@ -10,54 +10,57 @@ pub fn trim_endpoint(endpoint: &str) -> String {
     endpoint.trim_end_matches('/').to_owned()
 }
 
-pub fn configure_request<B>(request: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
-    request
-        .config()
-        .timeout_global(Some(PROVIDER_REQUEST_TIMEOUT))
-        .http_status_as_error(false)
+/// Drives an async provider request to completion from a synchronous caller.
+pub fn run_async<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not start the provider runtime: {error}"),
+                true,
+            )
+        })?
+        .block_on(future)
 }
 
-pub fn ensure_success(
-    provider: &str,
-    mut response: ureq::http::Response<ureq::Body>,
-) -> Result<ureq::http::Response<ureq::Body>> {
+/// Sends a JSON request and returns the status code and decoded body (or
+/// `Value::Null` when the body is empty or not JSON).
+pub async fn request_json(
+    method: reqwest::Method,
+    endpoint: &str,
+    headers: &[(&str, String)],
+    body: Option<serde_json::Value>,
+) -> Result<(u16, serde_json::Value)> {
+    let client = reqwest::Client::builder()
+        .timeout(PROVIDER_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| normalize_transport_error("provider", &error.to_string()))?;
+    let mut request = client
+        .request(method, endpoint)
+        .header("Accept", "application/json");
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    for (name, value) in headers {
+        request = request.header(*name, value.clone());
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| normalize_transport_error("provider", &error.to_string()))?;
     let status = response.status().as_u16();
-    if status < 400 {
-        return Ok(response);
-    }
-    let detail = response.body_mut().read_to_string().unwrap_or_default();
-    let detail = detail
-        .replace("Bearer ", "****** ")
-        .replace("token ", "token [redacted] ");
-    let detail = detail.chars().take(512).collect::<String>();
-    if detail.trim().is_empty() {
-        Err(normalize_provider_error(provider, status))
+    let text = response
+        .text()
+        .await
+        .map_err(|error| normalize_transport_error("provider", &error.to_string()))?;
+    let value = if text.trim().is_empty() {
+        serde_json::Value::Null
     } else {
-        Err(LoomError::new(
-            ErrorCode::ProviderInvalidResponse,
-            format!("{provider} rejected the request (HTTP {status}): {detail}"),
-            false,
-        ))
-    }
-}
-
-pub fn normalize_provider_request_error(provider: &str, error: ureq::Error) -> LoomError {
-    match error {
-        ureq::Error::StatusCode(status) => normalize_provider_error(provider, status),
-        error => normalize_transport_error(provider, &error.to_string()),
-    }
-}
-
-pub fn normalize_oauth_error(operation: &str, error: ureq::Error) -> LoomError {
-    match error {
-        ureq::Error::StatusCode(status) => LoomError::new(
-            ErrorCode::ProviderAuthentication,
-            format!("{operation} failed (HTTP {status})"),
-            false,
-        ),
-        error => normalize_transport_error(operation, &error.to_string()),
-    }
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+    };
+    Ok((status, value))
 }
 
 pub fn oauth_response_error(response: OAuthTokenResponse) -> LoomError {

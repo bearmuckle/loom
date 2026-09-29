@@ -30,16 +30,22 @@ impl Default for GitHubCopilotAuthenticator {
 
 impl GitHubCopilotAuthenticator {
     pub fn begin(&self) -> Result<GitHubDeviceCode> {
-        let response = configure_request(ureq::post(GITHUB_DEVICE_CODE_URL))
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .send_json(serde_json::json!({
+        let (status, body) = run_async(request_json(
+            reqwest::Method::POST,
+            GITHUB_DEVICE_CODE_URL,
+            &[],
+            Some(serde_json::json!({
                 "client_id": self.client_id.as_str(),
                 "scope": "read:user repo"
-            }))
-            .map_err(|error| normalize_oauth_error("GitHub device authorization", error))?;
-        let mut response = ensure_success("GitHub device authorization", response)?;
-        response.body_mut().read_json().map_err(|error| {
+            })),
+        ))?;
+        if status >= 400 {
+            return Err(normalize_provider_error(
+                "GitHub device authorization",
+                status,
+            ));
+        }
+        serde_json::from_value(body).map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
                 format!("GitHub device authorization returned invalid JSON: {error}"),
@@ -59,53 +65,41 @@ impl GitHubCopilotAuthenticator {
                     false,
                 ));
             }
-            let response = configure_request(ureq::post(GITHUB_ACCESS_TOKEN_URL))
-                .header("Accept", "application/json")
-                .header("Content-Type", "application/json")
-                .send_json(serde_json::json!({
+            let (status, body) = run_async(request_json(
+                reqwest::Method::POST,
+                GITHUB_ACCESS_TOKEN_URL,
+                &[],
+                Some(serde_json::json!({
                     "client_id": self.client_id.as_str(),
                     "device_code": device.device_code.as_str(),
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
-                }));
-            match response {
-                Ok(mut response) if response.status().as_u16() == 400 => {
-                    let body: OAuthTokenResponse =
-                        response.body_mut().read_json().unwrap_or_default();
-                    match body.error.as_deref() {
-                        Some("authorization_pending") => thread::sleep(interval),
-                        Some("slow_down") => {
-                            interval = interval.saturating_add(Duration::from_secs(5));
-                            thread::sleep(interval);
-                        }
-                        _ => return Err(oauth_response_error(body)),
+                })),
+            ))?;
+            let body: OAuthTokenResponse = serde_json::from_value(body).unwrap_or_default();
+            if status == 400 {
+                match body.error.as_deref() {
+                    Some("authorization_pending") => thread::sleep(interval),
+                    Some("slow_down") => {
+                        interval = interval.saturating_add(Duration::from_secs(5));
+                        thread::sleep(interval);
                     }
+                    _ => return Err(oauth_response_error(body)),
                 }
-                Ok(mut response) => {
-                    let body: OAuthTokenResponse =
-                        response.body_mut().read_json().map_err(|error| {
-                            LoomError::new(
-                                ErrorCode::ProviderInvalidResponse,
-                                format!("GitHub token response was invalid JSON: {error}"),
-                                false,
-                            )
-                        })?;
-                    if let Some(token) =
-                        body.access_token.as_ref().filter(|token| !token.is_empty())
-                    {
-                        return Ok(token.clone());
-                    }
-                    match body.error.as_deref() {
-                        Some("authorization_pending") => thread::sleep(interval),
-                        Some("slow_down") => {
-                            interval = interval.saturating_add(Duration::from_secs(5));
-                            thread::sleep(interval);
-                        }
-                        _ => return Err(oauth_response_error(body)),
-                    }
+                continue;
+            }
+            if status >= 400 {
+                return Err(normalize_provider_error("GitHub token exchange", status));
+            }
+            if let Some(token) = body.access_token.as_ref().filter(|token| !token.is_empty()) {
+                return Ok(token.clone());
+            }
+            match body.error.as_deref() {
+                Some("authorization_pending") => thread::sleep(interval),
+                Some("slow_down") => {
+                    interval = interval.saturating_add(Duration::from_secs(5));
+                    thread::sleep(interval);
                 }
-                Err(error) => {
-                    return Err(normalize_oauth_error("GitHub token exchange", error));
-                }
+                _ => return Err(oauth_response_error(body)),
             }
         }
     }
@@ -177,31 +171,33 @@ impl GitHubCopilotProvider {
 
     pub fn discover_models(&self) -> Result<Vec<ModelDescriptor>> {
         let token = self.fetch_copilot_token()?;
-        let response = configure_request(ureq::get(&format!(
-            "{}/models",
-            trim_endpoint(&token.api_endpoint)
-        )))
-        .header("Accept", "application/json")
-        .header("Authorization", &format!("Bearer {}", token.value))
-        .header("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
-        .header("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION)
-        .header("Copilot-Integration-Id", "vscode-chat")
-        .header("Openai-Intent", "conversation-panel")
-        .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-        .header("X-Vscode-User-Agent-Library-Version", "electron-fetch")
-        .header("User-Agent", GITHUB_COPILOT_USER_AGENT)
-        .call()
-        .map_err(|error| {
-            normalize_provider_request_error("github-copilot model discovery", error)
-        })?;
-        let mut response = ensure_success("github-copilot model discovery", response)?;
-        let body: serde_json::Value = response.body_mut().read_json().map_err(|error| {
-            LoomError::new(
-                ErrorCode::ProviderInvalidResponse,
-                format!("GitHub Copilot model discovery returned invalid JSON: {error}"),
-                false,
-            )
-        })?;
+        let (status, body) = run_async(request_json(
+            reqwest::Method::GET,
+            &format!("{}/models", trim_endpoint(&token.api_endpoint)),
+            &[
+                ("Authorization", format!("Bearer {}", token.value)),
+                ("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION.to_owned()),
+                (
+                    "Editor-Plugin-Version",
+                    GITHUB_COPILOT_PLUGIN_VERSION.to_owned(),
+                ),
+                ("Copilot-Integration-Id", "vscode-chat".to_owned()),
+                ("Openai-Intent", "conversation-panel".to_owned()),
+                ("X-GitHub-Api-Version", GITHUB_API_VERSION.to_owned()),
+                (
+                    "X-Vscode-User-Agent-Library-Version",
+                    "electron-fetch".to_owned(),
+                ),
+                ("User-Agent", GITHUB_COPILOT_USER_AGENT.to_owned()),
+            ],
+            None,
+        ))?;
+        if status >= 400 {
+            return Err(normalize_provider_error(
+                "github-copilot model discovery",
+                status,
+            ));
+        }
         let models = body
             .get("data")
             .and_then(serde_json::Value::as_array)
@@ -258,27 +254,32 @@ impl GitHubCopilotProvider {
     }
 
     pub fn fetch_copilot_token(&self) -> Result<CopilotAccessToken> {
-        let response = configure_request(ureq::get(&self.token_endpoint))
-            .header("Accept", "application/json")
-            .header("Authorization", format!("token {}", self.github_token))
-            .header("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION)
-            .header("Editor-Plugin-Version", GITHUB_COPILOT_PLUGIN_VERSION)
-            .header("Copilot-Integration-Id", "vscode-chat")
-            .header("X-GitHub-Api-Version", GITHUB_API_VERSION)
-            .header("X-Vscode-User-Agent-Library-Version", "electron-fetch")
-            .header("User-Agent", GITHUB_COPILOT_USER_AGENT)
-            .call()
-            .map_err(|error| {
-                normalize_provider_request_error("github-copilot token exchange", error)
-            })?;
-        let mut response = ensure_success("github-copilot token exchange", response)?;
-        let body: serde_json::Value = response.body_mut().read_json().map_err(|error| {
-            LoomError::new(
-                ErrorCode::ProviderInvalidResponse,
-                format!("GitHub Copilot token response was invalid JSON: {error}"),
-                false,
-            )
-        })?;
+        let (status, body) = run_async(request_json(
+            reqwest::Method::GET,
+            &self.token_endpoint,
+            &[
+                ("Authorization", format!("token {}", self.github_token)),
+                ("Editor-Version", GITHUB_COPILOT_EDITOR_VERSION.to_owned()),
+                (
+                    "Editor-Plugin-Version",
+                    GITHUB_COPILOT_PLUGIN_VERSION.to_owned(),
+                ),
+                ("Copilot-Integration-Id", "vscode-chat".to_owned()),
+                ("X-GitHub-Api-Version", GITHUB_API_VERSION.to_owned()),
+                (
+                    "X-Vscode-User-Agent-Library-Version",
+                    "electron-fetch".to_owned(),
+                ),
+                ("User-Agent", GITHUB_COPILOT_USER_AGENT.to_owned()),
+            ],
+            None,
+        ))?;
+        if status >= 400 {
+            return Err(normalize_provider_error(
+                "github-copilot token exchange",
+                status,
+            ));
+        }
         let value = body
             .get("token")
             .and_then(serde_json::Value::as_str)
