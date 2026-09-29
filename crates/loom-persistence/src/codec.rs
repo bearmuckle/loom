@@ -428,3 +428,143 @@ pub(crate) fn decode_json<T: DeserializeOwned>(payload: &str, field: &str) -> Re
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_and_session_states_round_trip() {
+        for state in [
+            AgentRunState::Planning,
+            AgentRunState::Executing,
+            AgentRunState::Completed,
+            AgentRunState::Failed,
+            AgentRunState::Cancelled,
+        ] {
+            assert_eq!(parse_run_state(run_state_name(state)).unwrap(), state);
+        }
+        for state in [
+            AgentSessionState::Idle,
+            AgentSessionState::Executing,
+            AgentSessionState::Completed,
+            AgentSessionState::Failed,
+        ] {
+            assert_eq!(
+                parse_session_state(session_state_name(state)).unwrap(),
+                state
+            );
+        }
+        assert!(parse_run_state("bogus").is_err());
+        assert!(parse_session_state("bogus").is_err());
+    }
+
+    #[test]
+    fn activity_and_interaction_codecs_round_trip() {
+        for kind in [
+            AgentActivityKind::ModelTurn,
+            AgentActivityKind::ToolCall,
+            AgentActivityKind::File,
+            AgentActivityKind::Search,
+            AgentActivityKind::Command,
+        ] {
+            assert_eq!(parse_activity_kind(activity_kind_name(kind)).unwrap(), kind);
+        }
+        for status in [
+            AgentActivityStatus::Started,
+            AgentActivityStatus::Completed,
+            AgentActivityStatus::Failed,
+            AgentActivityStatus::Cancelled,
+        ] {
+            assert_eq!(
+                parse_activity_status(activity_status_name(status)).unwrap(),
+                status
+            );
+        }
+        for state in [
+            AgentToolAttemptState::Queued,
+            AgentToolAttemptState::Running,
+            AgentToolAttemptState::Completed,
+            AgentToolAttemptState::OutcomeUnknown,
+        ] {
+            assert_eq!(
+                parse_tool_attempt_state(tool_attempt_state_name(state)).unwrap(),
+                state
+            );
+        }
+        for kind in [
+            AgentInteractionKind::ToolApproval,
+            AgentInteractionKind::UserInput,
+        ] {
+            assert_eq!(
+                parse_interaction_kind(interaction_kind_name(kind)).unwrap(),
+                kind
+            );
+        }
+        for status in [
+            AgentInteractionStatus::Pending,
+            AgentInteractionStatus::Answered,
+            AgentInteractionStatus::Abandoned,
+        ] {
+            assert_eq!(
+                parse_interaction_status(interaction_status_name(status)).unwrap(),
+                status
+            );
+        }
+        for decision in [ApprovalDecision::Approved, ApprovalDecision::Rejected] {
+            assert_eq!(
+                parse_approval_decision(approval_decision_name(decision)).unwrap(),
+                decision
+            );
+        }
+        for control in [WorkspaceControl::Agent, WorkspaceControl::User] {
+            assert_eq!(
+                parse_workspace_control(workspace_control_name(control)).unwrap(),
+                control
+            );
+        }
+        for kind in [
+            WorkspaceChangeKind::Created,
+            WorkspaceChangeKind::Modified,
+            WorkspaceChangeKind::Deleted,
+        ] {
+            assert_eq!(
+                parse_workspace_change_kind(workspace_change_kind_name(kind)).unwrap(),
+                kind
+            );
+        }
+        assert!(parse_activity_kind("bogus").is_err());
+        assert!(parse_interaction_status("bogus").is_err());
+        assert!(parse_approval_decision("bogus").is_err());
+        assert!(parse_workspace_control("bogus").is_err());
+        assert!(parse_workspace_change_kind("bogus").is_err());
+    }
+
+    #[test]
+    fn counters_and_timestamps_validate_ranges() {
+        assert_eq!(encode_counter(42, "test").unwrap(), 42);
+        assert_eq!(decode_counter(42, "test").unwrap(), 42);
+        assert!(encode_counter(i64::MAX as u64 + 1, "test").is_err());
+        assert!(decode_counter(-1, "test").is_err());
+        assert_eq!(decode_optional_u64(Some(7), "test").unwrap(), Some(7));
+        assert_eq!(decode_optional_u64(None, "test").unwrap(), None);
+        assert!(decode_optional_u64(Some(-1), "test").is_err());
+        assert_eq!(encode_optional_counter(Some(7), "test").unwrap(), Some(7));
+        assert_eq!(encode_optional_counter(None, "test").unwrap(), None);
+
+        let timestamp = Timestamp::from_unix_millis(1_700_000_000_123);
+        let encoded = encode_timestamp(timestamp).unwrap();
+        assert_eq!(decode_timestamp(encoded).unwrap(), timestamp);
+    }
+
+    #[test]
+    fn uuid_and_json_decoding_reject_bad_input() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(decode_uuid(id.as_bytes(), "id").unwrap(), id);
+        assert!(decode_uuid(&[0u8; 4], "id").is_err());
+
+        let decoded: serde_json::Value = decode_json("{\"a\":1}", "payload").unwrap();
+        assert_eq!(decoded["a"], 1);
+        assert!(decode_json::<serde_json::Value>("not json", "payload").is_err());
+    }
+}
