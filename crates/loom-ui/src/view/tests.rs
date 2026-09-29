@@ -4711,8 +4711,8 @@ mod transcript_paging_tests {
 #[cfg(test)]
 mod provider_control_tests {
     use super::*;
-    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, px, size};
 
     #[gpui_kit::test]
     fn provider_model_and_mode_controls_update_state(cx: &mut TestAppContext) {
@@ -4759,8 +4759,8 @@ mod provider_control_tests {
 #[cfg(test)]
 mod state_toggle_tests {
     use super::*;
-    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, px, size};
 
     #[gpui_kit::test]
     fn review_composer_and_worker_controls_toggle(cx: &mut TestAppContext) {
@@ -4801,8 +4801,8 @@ mod state_toggle_tests {
 #[cfg(test)]
 mod session_run_action_tests {
     use super::*;
-    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, px, size};
 
     #[gpui_kit::test]
     fn session_and_run_actions_update_state(cx: &mut TestAppContext) {
@@ -4836,8 +4836,8 @@ mod session_run_action_tests {
 #[cfg(test)]
 mod project_action_tests {
     use super::*;
-    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, px, size};
 
     #[gpui_kit::test]
     fn project_actions_update_state(cx: &mut TestAppContext) {
@@ -4873,8 +4873,8 @@ mod project_action_tests {
 #[cfg(test)]
 mod render_state_tests {
     use super::*;
-    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, px, size};
 
     fn render_with(cx: &mut TestAppContext, configure: impl FnOnce(&mut LoomView)) {
         let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
@@ -4937,8 +4937,8 @@ mod render_state_tests {
 #[cfg(test)]
 mod lifecycle_source_action_tests {
     use super::*;
-    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, px, size};
 
     #[gpui_kit::test]
     fn lifecycle_source_and_worker_actions(cx: &mut TestAppContext) {
@@ -4976,8 +4976,8 @@ mod lifecycle_source_action_tests {
 #[cfg(test)]
 mod review_project_action_tests {
     use super::*;
-    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, px, size};
 
     #[gpui_kit::test]
     fn review_and_project_child_actions(cx: &mut TestAppContext) {
@@ -5017,8 +5017,8 @@ mod review_project_action_tests {
 #[cfg(test)]
 mod worker_failure_tests {
     use super::*;
-    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, px, size};
     use loom_core::CapabilitySet;
 
     fn remote_node(id: u64, url: &str, state: WorkerConnectionState) -> WorkerNodeEntry {
@@ -5094,8 +5094,8 @@ mod worker_failure_tests {
 #[cfg(test)]
 mod provider_mode_tests {
     use super::*;
-    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use gpui_kit::{Context, TestAppContext, Window, div, prelude::*, px, size};
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{TestAppContext, px, size};
 
     #[gpui_kit::test]
     fn agent_modes_and_provider_selection(cx: &mut TestAppContext) {
