@@ -135,13 +135,15 @@ enum SettingsSection {
     Providers,
     Workers,
     Appearance,
+    About,
 }
 
-const SETTINGS_SECTIONS: [(SettingsSection, &str); 4] = [
+const SETTINGS_SECTIONS: [(SettingsSection, &str); 5] = [
     (SettingsSection::Agents, "Agents"),
     (SettingsSection::Providers, "Providers"),
     (SettingsSection::Workers, "Workers"),
     (SettingsSection::Appearance, "Appearance"),
+    (SettingsSection::About, "About"),
 ];
 
 /// The active inline completion in the composer, derived from the text before
@@ -180,7 +182,7 @@ const COMMANDS: &[CommandSpec] = &[
         name: "review",
         title: "Toggle review panel",
         description: "Show the changed files and diffs",
-        shortcut: Some("⌘B"),
+        shortcut: Some("B"),
     },
     CommandSpec {
         name: "stop",
@@ -198,7 +200,7 @@ const COMMANDS: &[CommandSpec] = &[
         name: "settings",
         title: "Settings",
         description: "Themes, workers, and preferences",
-        shortcut: Some("⌘,"),
+        shortcut: Some(","),
     },
     CommandSpec {
         name: "help",
@@ -207,6 +209,38 @@ const COMMANDS: &[CommandSpec] = &[
         shortcut: None,
     },
 ];
+
+/// Renders a command shortcut with the platform's primary modifier so the UI
+/// does not show the macOS symbol on other operating systems.
+pub(crate) fn command_shortcut_label(shortcut: &str) -> String {
+    if shortcut == "esc" {
+        return "esc".to_owned();
+    }
+    if cfg!(target_os = "macos") {
+        format!("⌘{shortcut}")
+    } else {
+        format!("Ctrl+{shortcut}")
+    }
+}
+
+/// The command palette shortcut label for the current platform.
+pub(crate) fn command_palette_shortcut_label() -> String {
+    if cfg!(target_os = "macos") {
+        "⌘⇧P".to_owned()
+    } else {
+        "Ctrl+Shift+P".to_owned()
+    }
+}
+
+/// The command palette icon: the macOS command glyph only on macOS, since it is
+/// meaningless elsewhere.
+pub(crate) fn command_palette_icon() -> AssetIconName {
+    if cfg!(target_os = "macos") {
+        AssetIconName::Command
+    } else {
+        AssetIconName::Search
+    }
+}
 
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::{
@@ -412,6 +446,9 @@ pub(crate) struct LoomView {
     pub(crate) session_task_cache: BTreeMap<AgentSessionId, String>,
     pub(crate) optimistic_messages: Vec<String>,
     pub(crate) sending_message: bool,
+    /// The latest operational status or backend error, shown as a dismissible
+    /// banner above the composer rather than inside the conversation.
+    pub(crate) status_banner: Option<SystemNote>,
     pub(crate) models: Vec<ModelId>,
     default_models: Vec<ModelId>,
     node_model_catalogs: BTreeMap<String, Vec<ModelId>>,
@@ -432,8 +469,6 @@ pub(crate) struct LoomView {
     agent_mode_select_subscription: Option<Subscription>,
     pub(crate) settings_open: bool,
     settings_section: SettingsSection,
-    pub(crate) providers_open: bool,
-    pub(crate) about_open: bool,
     pub(crate) providers: Vec<ProviderSummary>,
     providers_node_id: Option<String>,
     provider_api_key_inputs: BTreeMap<loom_model::ProviderId, Entity<InputState>>,
@@ -441,6 +476,9 @@ pub(crate) struct LoomView {
     pub(crate) theme_choice: ThemeChoice,
     font_scale_percent: u16,
     appearance_subscription: Option<Subscription>,
+    /// App-wide keystroke interceptor for shortcuts that must work regardless
+    /// of which element (if any) holds focus.
+    shortcut_interceptor: Option<Subscription>,
     pub(crate) after_sequence: Option<EventSequence>,
     event_stream_epoch: Option<String>,
     pub(crate) timeline: Vec<TimelineItem>,
@@ -1199,6 +1237,7 @@ impl LoomView {
             session_task_cache: BTreeMap::new(),
             optimistic_messages: Vec::new(),
             sending_message: false,
+            status_banner: None,
             model: model.clone(),
             models: vec![model.clone()],
             default_models: vec![model.clone()],
@@ -1220,8 +1259,6 @@ impl LoomView {
             agent_mode_select_subscription: None,
             settings_open: false,
             settings_section: SettingsSection::Agents,
-            providers_open: false,
-            about_open: false,
             providers: Vec::new(),
             providers_node_id: None,
             provider_api_key_inputs: BTreeMap::new(),
@@ -1229,6 +1266,7 @@ impl LoomView {
             theme_choice: ThemeChoice::System,
             font_scale_percent: DEFAULT_FONT_SCALE_PERCENT,
             appearance_subscription: None,
+            shortcut_interceptor: None,
             after_sequence: None,
             event_stream_epoch: None,
             timeline: Vec::new(),

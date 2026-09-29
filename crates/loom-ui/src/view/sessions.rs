@@ -269,8 +269,7 @@ impl LoomView {
         self.github_login = None;
         self.source_dialog = None;
         self.settings_open = false;
-        self.providers_open = false;
-        self.about_open = false;
+        self.status_banner = None;
         self.review.open = false;
         self.project_child_review = None;
         let project_context = self.project_snapshot.clone().filter(|snapshot| {

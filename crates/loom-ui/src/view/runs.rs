@@ -2,6 +2,7 @@ use super::*;
 
 impl LoomView {
     pub(crate) fn send_message(&mut self, message: String, cx: &mut Context<Self>) {
+        self.status_banner = None;
         #[cfg(target_family = "wasm")]
         if self.browser_demo_mode {
             self.timeline.push(TimelineItem::User(message));

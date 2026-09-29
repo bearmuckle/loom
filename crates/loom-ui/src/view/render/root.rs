@@ -13,6 +13,30 @@ impl Render for LoomView {
             self.composer_focus_handle.focus(window, cx);
             self.select_theme(ThemeChoice::System, window, cx);
         }
+        if self.shortcut_interceptor.is_none() {
+            // Keystrokes are dispatched along the focus path, so a view-level
+            // handler stops working whenever focus is lost (for example after
+            // the command palette input is torn down). Intercept them globally
+            // so these shortcuts always fire.
+            let view = cx.entity().downgrade();
+            self.shortcut_interceptor = Some(cx.intercept_keystrokes(move |event, _window, cx| {
+                let modifiers = event.keystroke.modifiers;
+                if (modifiers.platform || modifiers.control)
+                    && modifiers.shift
+                    && event.keystroke.key.eq_ignore_ascii_case("p")
+                {
+                    let _ = view.update(cx, |view, cx| view.toggle_command_palette(cx));
+                    cx.stop_propagation();
+                } else if event.keystroke.key == "escape" {
+                    let _ = view.update(cx, |view, cx| {
+                        if view.command_palette_open {
+                            view.close_command_palette(cx);
+                            cx.stop_propagation();
+                        }
+                    });
+                }
+            }));
+        }
         if self.composer_input.is_none() {
             let input = cx.new(|cx| TextareaState::new(window, cx));
             input.update(cx, |state, cx| state.focus(window, cx));
@@ -120,7 +144,7 @@ impl Render for LoomView {
             ));
             self.rename_input_state = Some(input);
         }
-        if self.providers_open {
+        if self.settings_open && self.settings_section == SettingsSection::Providers {
             for provider in self
                 .providers
                 .iter()
@@ -214,8 +238,6 @@ impl Render for LoomView {
             self.review.open,
             self.sessions.len(),
             self.settings_open,
-            self.about_open,
-            self.providers_open,
             self.github_login.is_some(),
         );
         let panel_layout = h_resizable("loom-workspace-panels")
@@ -529,7 +551,10 @@ impl Render for LoomView {
                                 .text_color(rgb(0x64748b))
                                 .child("/ commands")
                                 .child("@ files")
-                                .child("⌘K command palette"),
+                                .child(format!(
+                                    "{} command palette",
+                                    command_palette_shortcut_label()
+                                )),
                         )
                         .child(
                             Button::new("start-first-session")
@@ -545,13 +570,6 @@ impl Render for LoomView {
             .when(self.settings_open, |element| {
                 element.child(self.render_settings_dialog(cx))
             })
-            .when(self.about_open, |element| {
-                element.child(self.render_about_dialog(cx))
-            })
-            .when(
-                self.providers_open && self.github_login.is_none(),
-                |element| element.child(self.render_providers_dialog(cx)),
-            )
             .when(self.github_login.is_some(), |element| {
                 element.child(self.render_github_login_dialog(cx))
             }),
@@ -576,16 +594,6 @@ impl Render for LoomView {
             // Initializes the per-frame selection registry before selectable
             // text participants prepaint and register themselves.
             .child(TextSelectionLayer)
-            .on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, _, cx| {
-                let modifiers = event.keystroke.modifiers;
-                if (modifiers.platform || modifiers.control) && event.keystroke.key == "k" {
-                    this.toggle_command_palette(cx);
-                    cx.stop_propagation();
-                } else if event.keystroke.key == "escape" && this.command_palette_open {
-                    this.close_command_palette(cx);
-                    cx.stop_propagation();
-                }
-            }))
             .when(self.source_dialog.is_some(), |element| {
                 element.child(self.render_source_dialog(cx))
             })
@@ -705,8 +713,6 @@ impl Render for LoomView {
                             && self.review.open
                             && !self.sessions.is_empty()
                             && !self.settings_open
-                            && !self.about_open
-                            && !self.providers_open
                             && self.github_login.is_none(),
                         |element| element.child(self.render_review(window, cx)),
                     ),

@@ -7,6 +7,7 @@ impl LoomView {
         };
         div()
             .id("rename-dialog")
+            .occlude()
             .absolute()
             .top(px(120.))
             .left(px(280.))
@@ -529,6 +530,7 @@ impl LoomView {
         };
         div()
             .id("github-login-dialog")
+            .occlude()
             .size_full()
             .absolute()
             .top(px(0.))
@@ -695,12 +697,24 @@ impl LoomView {
                         )),
                 )
                 .into_any_element(),
-            SettingsSection::Providers => div()
+            SettingsSection::Providers => {
+                let node_name = self
+                    .providers_node_id
+                    .as_ref()
+                    .and_then(|node_id| self.node_names.get(node_id))
+                    .map_or("this worker", String::as_str);
+                div()
                 .w_full()
                 .flex()
                 .flex_col()
                 .gap_2()
                 .child(settings_section_heading("PROVIDERS"))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child(format!("Configured on {node_name}")),
+                )
                 .child(
                     settings_card().child(
                         div()
@@ -792,7 +806,9 @@ impl LoomView {
                         true,
                     )),
                 )
-                .into_any_element(),
+                .child(self.render_api_key_providers(cx))
+                .into_any_element()
+            }
             SettingsSection::Workers => {
                 let mut card = settings_card();
                 if self.worker_nodes.is_empty() {
@@ -1035,10 +1051,44 @@ impl LoomView {
                         )),
                 )
                 .into_any_element(),
+            SettingsSection::About => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(settings_section_heading("ABOUT"))
+                .child(
+                    settings_card().child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_1()
+                            .px_4()
+                            .py_6()
+                            .child(div().text_lg().text_color(rgb(0xf3f4f6)).child("Loom"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child("Local agent"),
+                            )
+                            .child(
+                                div()
+                                    .mt_2()
+                                    .text_xs()
+                                    .text_color(rgb(0x64748b))
+                                    .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                            ),
+                    ),
+                )
+                .into_any_element(),
         };
 
         div()
             .id("settings-dialog")
+            .occlude()
             .size_full()
             .absolute()
             .top(px(0.))
@@ -1102,150 +1152,62 @@ impl LoomView {
             .into_any()
     }
 
-    pub(crate) fn render_about_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id("about-dialog")
-            .size_full()
-            .absolute()
-            .top(px(0.))
-            .left(px(0.))
-            .p_6()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x111318))
-            .text_color(rgb(0xe5e7eb))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0xf3f4f6))
-                            .child("About Loom"),
-                    )
-                    .child(
-                        div()
-                            .id("close-about")
-                            .w(px(28.))
-                            .h(px(28.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_lg()
-                            .bg(rgb(0x20242c))
-                            .hover(|style| style.bg(rgb(0x293244)))
-                            .text_color(rgb(0xb7c0d0))
-                            .cursor_pointer()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| LoomTooltip {
-                                    text: "Close about".into(),
-                                })
-                                .into()
-                            })
-                            .child(Icon::new(IconName::Close).size_4())
-                            .on_click(cx.listener(Self::close_about)),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_8()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_lg().text_color(rgb(0xf3f4f6)).child("Loom"))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0x8f98a6))
-                            .child("Local agent"),
-                    )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_xs()
-                            .text_color(rgb(0x64748b))
-                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
-                    ),
-            )
-            .into_any()
-    }
-
-    pub(crate) fn render_providers_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let node_name = self
-            .providers_node_id
-            .as_ref()
-            .and_then(|node_id| self.node_names.get(node_id))
-            .map_or("worker", String::as_str);
-        let github_provider = self
-            .providers
-            .iter()
-            .find(|provider| provider.kind == ProviderKind::GitHubCopilot);
+    fn render_api_key_providers(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let local_providers = self
             .providers
             .iter()
             .filter(|provider| provider.kind != ProviderKind::GitHubCopilot)
             .collect::<Vec<_>>();
-        let github_status = if self.github_connected {
-            "Connected"
-        } else {
-            "Not connected"
-        };
-        let github_models = github_provider.map_or(0, |provider| provider.models.len());
-
-        let mut local_body = div().flex().flex_col().gap_1();
+        let mut body = div().w_full().flex().flex_col().gap_2();
         if local_providers.is_empty() {
-            local_body = local_body.child(
-                div()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(0x171c25))
-                    .border_1()
-                    .border_color(rgb(0x293244))
-                    .text_sm()
-                    .text_color(rgb(0x8f98a6))
-                    .child("No other providers are configured."),
+            body = body.child(
+                settings_card().child(
+                    div()
+                        .px_4()
+                        .py_3()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child("No other providers are configured."),
+                ),
             );
         } else {
             for provider in local_providers {
                 let api_key_configurable = provider.api_key_configurable;
+                let configured = provider.credential_id.is_some();
                 let provider_id = provider.id.clone();
-                let mut provider_card = div()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(0x171c25))
-                    .border_1()
-                    .border_color(rgb(0x293244))
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(0xf3f4f6))
-                            .child(provider.display_name.clone()),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(rgb(0x8f98a6))
-                            .child(format!(
+                let mut card = settings_card().child(
+                    div()
+                        .px_4()
+                        .py_3()
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(rgb(0xf3f4f6))
+                                .child(provider.display_name.clone()),
+                        )
+                        // Keyless API providers advertise a seeded default model,
+                        // so only claim models once the provider is usable.
+                        .when(configured || !api_key_configurable, |element| {
+                            element.child(div().text_xs().text_color(rgb(0x8f98a6)).child(format!(
                                 "{} model{} available",
                                 provider.models.len(),
                                 if provider.models.len() == 1 { "" } else { "s" }
-                            )),
-                    )
-                    .child(div().mt_1().text_xs().text_color(rgb(0x8f98a6)).child(
-                        if provider.credential_id.is_some() {
-                            "API key configured".to_owned()
-                        } else {
-                            "API key not configured".to_owned()
-                        },
-                    ));
+                            )))
+                        })
+                        .when(api_key_configurable, |element| {
+                            element.child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                                if configured {
+                                    "API key configured".to_owned()
+                                } else {
+                                    "API key not configured".to_owned()
+                                },
+                            ))
+                        }),
+                );
                 if api_key_configurable {
                     if let Some(input) = self.provider_api_key_inputs.get(&provider.id) {
-                        provider_card = provider_card.child(
-                            div().mt_2().child(
+                        card = card.child(
+                            div().px_4().pb_3().child(
                                 KitInput::new(input)
                                     .id(format!("provider-api-key-input-{}", provider.id.as_str()))
                                     .small(),
@@ -1253,17 +1215,18 @@ impl LoomView {
                         );
                     }
                     if let Some(status) = self.provider_setup_status.get(&provider.id) {
-                        provider_card = provider_card.child(
+                        card = card.child(
                             div()
                                 .id(format!("provider-setup-status-{}", provider.id.as_str()))
-                                .mt_2()
+                                .px_4()
+                                .pb_2()
                                 .text_xs()
                                 .text_color(rgb(0x8f98a6))
                                 .child(status.clone()),
                         );
                     }
-                    provider_card = provider_card.child(
-                        div().mt_2().child(
+                    card = card.child(
+                        div().px_4().pb_3().child(
                             Button::new(format!("configure-api-key-{}", provider.id.as_str()))
                                 .label("Save API key")
                                 .small()
@@ -1281,10 +1244,11 @@ impl LoomView {
                             .providers_node_id
                             .clone()
                             .unwrap_or_else(|| self.default_backend_node_id.clone());
-                        provider_card = provider_card.child(
+                        card = card.child(
                             div()
                                 .id(format!("refresh-provider-models-{}", provider.id.as_str()))
-                                .mt_1()
+                                .mx_4()
+                                .mb_3()
                                 .px_2()
                                 .py_1()
                                 .rounded_sm()
@@ -1299,123 +1263,9 @@ impl LoomView {
                         );
                     }
                 }
-                local_body = local_body.child(provider_card);
+                body = body.child(card);
             }
         }
-
-        let github_card =
-            div()
-                .p_3()
-                .rounded_lg()
-                .bg(rgb(0x171c25))
-                .border_1()
-                .border_color(rgb(0x293244))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0xf3f4f6))
-                                .child("GitHub Copilot"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if self.github_connected {
-                                    rgb(0x9ad7bd)
-                                } else {
-                                    rgb(0xfef3c7)
-                                })
-                                .child(github_status),
-                        ),
-                )
-                .child(div().mt_1().text_xs().text_color(rgb(0x8f98a6)).child(
-                    if github_models == 0 {
-                        "Connect your GitHub account to use Copilot models.".to_owned()
-                    } else {
-                        format!(
-                            "{} model{} available",
-                            github_models,
-                            if github_models == 1 { "" } else { "s" }
-                        )
-                    },
-                ))
-                .child(
-                    div()
-                        .mt_2()
-                        .text_xs()
-                        .text_color(rgb(0x8f98a6))
-                        .child("Manage GitHub authentication in Settings. Connecting GitHub also adds this model provider."),
-                );
-
-        div()
-            .id("providers-dialog")
-            .size_full()
-            .absolute()
-            .top(px(0.))
-            .left(px(0.))
-            .p_6()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x111318))
-            .text_color(rgb(0xe5e7eb))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .child(div().text_sm().text_color(rgb(0xf3f4f6)).child("Providers"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x8f98a6))
-                                    .child(format!("Configured on {node_name}")),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("close-providers")
-                            .w(px(28.))
-                            .h(px(28.))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_lg()
-                            .bg(rgb(0x20242c))
-                            .hover(|style| style.bg(rgb(0x293244)))
-                            .text_color(rgb(0xb7c0d0))
-                            .cursor_pointer()
-                            .tooltip(|_, cx| {
-                                cx.new(|_| LoomTooltip {
-                                    text: "Close providers".into(),
-                                })
-                                .into()
-                            })
-                            .child(Icon::new(IconName::Close).size_4())
-                            .on_click(cx.listener(Self::close_providers)),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_5()
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child("GITHUB COPILOT"),
-            )
-            .child(div().mt_2().child(github_card))
-            .child(
-                div()
-                    .mt_5()
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child("LOCAL PROVIDER"),
-            )
-            .child(div().mt_2().child(local_body))
-            .into_any()
+        body.into_any_element()
     }
 }

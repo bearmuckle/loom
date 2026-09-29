@@ -213,7 +213,11 @@ impl LoomView {
                 )
                 .on_click(move |_, _, cx| {
                     click_view.update(cx, |this, cx| {
-                        this.select_session(click_session.clone(), cx);
+                        // Re-selecting the session already on screen would
+                        // reload and briefly blank the conversation.
+                        if this.active_session.id != click_session.id {
+                            this.select_session(click_session.clone(), cx);
+                        }
                     });
                 })
         })
@@ -346,7 +350,29 @@ impl LoomView {
                     .items_center()
                     .justify_between()
                     .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Projects"))
-                    .child(self.render_new_session_button(view, cx)),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(self.render_new_session_button(view, cx))
+                            .child(
+                                Button::new("settings-button")
+                                    .icon(Icon::new(IconName::Settings))
+                                    .ghost()
+                                    .small()
+                                    .accessibility_label("Settings")
+                                    .tooltip("Settings")
+                                    .on_click({
+                                        let view = view.clone();
+                                        move |_, _, cx| {
+                                            view.update(cx, |view, cx| {
+                                                view.open_settings_from_menu(cx);
+                                            });
+                                        }
+                                    }),
+                            ),
+                    ),
             )
             .when_some(self.session_filter_input.as_ref(), |element, input| {
                 element.child(KitInput::new(input).id("session-filter").small())
@@ -357,60 +383,6 @@ impl LoomView {
                     .id("session-list")
                     .overflow_y_scroll()
                     .child(self.render_session_list(cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_t_1()
-                    .border_color(rgb(0x30343f))
-                    .pt_2()
-                    .child(
-                        Button::new("account-menu")
-                            .icon(Icon::new(IconName::User))
-                            .ghost()
-                            .small()
-                            .accessibility_label("Account")
-                            .dropdown_menu({
-                                let view = view.clone();
-                                move |menu, _, _| {
-                                    let providers_view = view.clone();
-                                    let about_view = view.clone();
-                                    menu.item(PopupMenuItem::new("Providers").on_click(
-                                        move |_, _, cx| {
-                                            providers_view.update(cx, |view, cx| {
-                                                view.open_providers_from_menu(cx);
-                                            });
-                                        },
-                                    ))
-                                    .item(
-                                        PopupMenuItem::new("About Loom").on_click(
-                                            move |_, _, cx| {
-                                                about_view.update(cx, |view, cx| {
-                                                    view.open_about_from_menu(cx);
-                                                });
-                                            },
-                                        ),
-                                    )
-                                }
-                            }),
-                    )
-                    .child(
-                        Button::new("settings-button")
-                            .icon(Icon::new(IconName::Settings))
-                            .ghost()
-                            .small()
-                            .accessibility_label("Settings")
-                            .on_click({
-                                let view = view.clone();
-                                move |_, _, cx| {
-                                    view.update(cx, |view, cx| {
-                                        view.open_settings_from_menu(cx);
-                                    });
-                                }
-                            }),
-                    ),
             )
     }
 }

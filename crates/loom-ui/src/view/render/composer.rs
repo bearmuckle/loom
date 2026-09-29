@@ -59,6 +59,9 @@ impl LoomView {
             .bg(rgb(0x17191f))
             .border_t_1()
             .border_color(rgb(0x30343f))
+            .when_some(self.status_banner.clone(), |element, banner| {
+                element.child(self.render_status_banner(&banner, cx))
+            })
             .child(self.render_run_status())
             .when_some(self.context_inspection.as_ref(), |element, inspection| {
                 let budget = inspection.budget.effective_input_tokens.map_or_else(
@@ -180,11 +183,13 @@ impl LoomView {
                                     .child(self.render_model_picker(layout.phone))
                                     .child(
                                         Button::new("open-command-palette")
-                                            .icon(Icon::new(AssetIconName::Command))
-                                            .label("K")
+                                            .icon(Icon::new(command_palette_icon()))
                                             .ghost()
                                             .xsmall()
-                                            .tooltip("Open the command palette")
+                                            .tooltip(format!(
+                                                "Command palette ({})",
+                                                command_palette_shortcut_label()
+                                            ))
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.toggle_command_palette(cx);
                                             })),
@@ -221,6 +226,60 @@ impl LoomView {
             )
     }
 
+    /// A dismissible banner for the latest operational status or backend error.
+    /// Kept out of the conversation timeline so it does not read as a message.
+    fn render_status_banner(
+        &self,
+        note: &SystemNote,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let (surface, accent, text_color) = match note.tone {
+            SystemTone::Error => (ERROR_CARD_SURFACE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND),
+            SystemTone::Input => (0x241f3b, 0xc4b5fd, 0xe9d5ff),
+            SystemTone::Neutral => (0x191c22, 0x64748b, 0x94a3b8),
+        };
+        div()
+            .id("status-banner")
+            .test_support()
+            .w_full()
+            .mb_2()
+            .px_3()
+            .py_2()
+            .rounded_sm()
+            .bg(rgb(surface))
+            .text_color(rgb(text_color))
+            .flex()
+            .items_start()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .when_some(note.heading.clone(), |element, heading| {
+                        element.child(div().text_xs().text_color(rgb(accent)).child(heading))
+                    })
+                    .child(div().text_sm().child(note.text.clone()))
+                    .when(note.retryable, |element| {
+                        element.child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(accent))
+                                .child("This operation can be retried."),
+                        )
+                    }),
+            )
+            .child(
+                Button::new("dismiss-status-banner")
+                    .icon(Icon::new(IconName::Close))
+                    .ghost()
+                    .xsmall()
+                    .accessibility_label("Dismiss message")
+                    .on_click(cx.listener(|view, _, _, cx| view.dismiss_status_banner(cx))),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn render_command_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let query = self
             .command_palette_input
@@ -254,7 +313,12 @@ impl LoomView {
                             .child(command.title),
                     )
                     .when_some(command.shortcut, |element, shortcut| {
-                        element.child(div().text_xs().text_color(rgb(0x64748b)).child(shortcut))
+                        element.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x64748b))
+                                .child(command_shortcut_label(shortcut)),
+                        )
                     })
                     .on_click(move |_, _, cx| {
                         view.update(cx, |this, cx| {
@@ -267,6 +331,7 @@ impl LoomView {
             .collect::<Vec<_>>();
         div()
             .id("command-palette-backdrop")
+            .occlude()
             .absolute()
             .top(px(0.))
             .left(px(0.))
@@ -300,7 +365,7 @@ impl LoomView {
                             .border_b_1()
                             .border_color(rgb(0x293244))
                             .child(
-                                Icon::new(AssetIconName::Command)
+                                Icon::new(command_palette_icon())
                                     .size_4()
                                     .text_color(rgb(0x64748b)),
                             )

@@ -106,7 +106,10 @@ impl Render for TimelineView {
                                         .text_color(rgb(0x64748b))
                                         .child("/ commands")
                                         .child("@ files")
-                                        .child("⌘K palette"),
+                                        .child(format!(
+                                            "{} palette",
+                                            command_palette_shortcut_label()
+                                        )),
                                 ),
                         )
                 );
@@ -152,7 +155,10 @@ impl Render for TimelineView {
         .with_row_style(row_style)
         .with_jump_button_label("Jump to latest")
         .with_bottom_fade(gpui_kit::Hsla::from(rgb(0x111318)));
-        let content = if transcript_has_older || transcript_loading {
+        // Only surface paging once we know there is more history. The
+        // automatic first-page load on session select reuses `transcript_loading`
+        // but must not flash a "Loading older messages" control.
+        let content = if transcript_has_older {
             let parent_for_page = parent.clone();
             div()
                 .size_full()
