@@ -4430,7 +4430,6 @@ dependencies = [
  "loom-model",
  "loom-persistence",
  "loom-protocol",
- "loom-providers",
  "loom-server",
  "loom-vcs",
  "loom-workspace",

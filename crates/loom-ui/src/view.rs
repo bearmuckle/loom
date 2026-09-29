@@ -40,6 +40,10 @@ use loom_core::{
     CapabilitySet, ErrorCode, EventSequence, LoomError, RepositoryId, RunId, Timestamp, ToolCallId,
     WorkspaceId, WorkspaceRecord,
 };
+#[cfg(not(target_family = "wasm"))]
+use loom_local::GitHubDeviceCode;
+#[cfg(not(target_family = "wasm"))]
+use loom_model::GITHUB_COPILOT_DEFAULT_MODEL;
 use loom_model::{MessageRole, ModelId, ModelMessage, ProviderKind, ProviderSummary, ToolCall};
 #[cfg(target_family = "wasm")]
 use loom_protocol::GitHubCopilotLoginStatus;
@@ -52,7 +56,6 @@ use loom_protocol::{
     WorkspaceConfig, WorkspaceFeedEvent,
 };
 #[cfg(not(target_family = "wasm"))]
-use loom_providers::{GITHUB_COPILOT_DEFAULT_MODEL, GitHubCopilotAuthenticator, GitHubDeviceCode};
 #[cfg(not(target_family = "wasm"))]
 use loom_server::InProcessBackend;
 #[cfg(not(target_family = "wasm"))]

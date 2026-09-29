@@ -30,7 +30,6 @@ gpui-kit = { workspace = true, features = ["test-support"] }
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 env_logger.workspace = true
 open.workspace = true
-loom-providers.workspace = true
 loom-persistence.workspace = true
 loom-server.workspace = true
 loom-vcs.workspace = true

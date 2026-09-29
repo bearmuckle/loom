@@ -385,6 +385,19 @@ fn state_root() -> PathBuf {
         .unwrap_or_else(|| env::temp_dir().join("loom-state"))
 }
 
+/// Public device-code payload for a GitHub Copilot sign-in.
+pub use loom_providers::GitHubDeviceCode;
+
+/// Starts a GitHub Copilot device authorization flow.
+pub fn github_copilot_login_begin() -> Result<GitHubDeviceCode, LoomError> {
+    loom_providers::GitHubCopilotAuthenticator::default().begin()
+}
+
+/// Polls a device authorization until it yields an access token.
+pub fn github_copilot_login_poll(device: &GitHubDeviceCode) -> Result<String, LoomError> {
+    loom_providers::GitHubCopilotAuthenticator::default().poll(device)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

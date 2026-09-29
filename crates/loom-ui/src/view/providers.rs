@@ -58,7 +58,7 @@ impl LoomView {
 
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn start_github_login_flow(&mut self, cx: &mut Context<Self>) {
-        let task = cx.background_spawn(async { GitHubCopilotAuthenticator::default().begin() });
+        let task = cx.background_spawn(async { loom_local::github_copilot_login_begin() });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             view.update(cx, |view, cx| view.handle_github_device_code(result, cx))
@@ -211,7 +211,7 @@ impl LoomView {
         });
         cx.notify();
         let task =
-            cx.background_spawn(async move { GitHubCopilotAuthenticator::default().poll(&device) });
+            cx.background_spawn(async move { loom_local::github_copilot_login_poll(&device) });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             view.update(cx, |view, cx| view.finish_github_login(result, cx))
