@@ -8,57 +8,26 @@ refers to.
 
 ## Summary
 
-The remaining problem is execution quality. There is no completed milestone gate
-for task completion, tool latency, or recovery rate. Tool calls are still emitted
-and executed one at a time, and provider streaming is blocking. Workspace
-exploration is bounded: `search_text` supports regex, case-insensitive matching,
+The remaining problem is measurable execution quality. There is no completed
+milestone gate for task completion, tool latency, or recovery rate. Consecutive
+read-only tool calls now run concurrently and provider streaming uses an async
+client; workspace exploration is bounded: `search_text` supports regex, case-insensitive matching,
 and context lines; `list_files` supports depth, glob filtering, and entry
 limits; `glob` bounds file discovery; and oversized tool output keeps both ends
 with an explicit omitted-byte report.
 
 | ID | Severity | Area | Remaining finding |
 | --- | --- | --- | --- |
-| B2 | High | Agent, tools | Tool calls execute strictly sequentially |
 | B3 | Medium | Providers | Blocking provider IO limits scalability |
 | B5 | Medium | Project | No measurable task-completion quality gate |
 
 ## Findings
 
-### B2 - Tool calls execute strictly sequentially
-
-For the chat-completions path, the stream decoder accumulates tool calls and
-emits them only once the response body is fully read. It emits one call, waits
-for the callback to finish, then emits the next.
-
-The executor itself has a synchronous API,
-`ToolExecutor::execute(&self, call: &ToolCall) -> ToolResult`. An `execute_many`
-helper exists but is unused by the agent, and its lazy iterator spawns one worker
-and immediately joins it before spawning the next; it preserves request order
-but does not overlap execution.
-
-A model that requests five independent file reads in one turn gets five
-serialized operations. The round-trip count is correct — one model request per
-turn, not per tool — but wall-clock latency scales with the sum of tool times.
-
-Concurrency also needs a safety policy. Read-only operations can usually
-overlap; patches, commands, approvals, and operations whose inputs depend on a
-previous result must remain serialized. Preserving result order alone is not a
-sufficient correctness rule.
-
 ### B3 - Blocking provider IO limits scalability
 
-Every provider uses `ureq`, a blocking HTTP client, and the SSE loop is a
-blocking line iterator. This ties a run worker to a blocking provider call and
-makes cancellation, resource accounting, and many simultaneous sessions less
-efficient. It does not, by itself, prevent safe read-only tool concurrency: Loom
-already runs each agent run on a worker thread, and tools can use additional
-bounded worker threads.
-
-Async provider transport is therefore not a prerequisite for B2. It should
-follow measurements showing that blocked provider workers or connection
-scalability are material bottlenecks. `tokio` is already a workspace dependency
-used by `loom-server`, so an eventual async migration would fit the existing
-runtime model.
+This finding is resolved. Provider streaming, OAuth, device login, and health
+checks all use the async `reqwest`/`tokio` client (driven from synchronous
+workers with a runtime), and `ureq` has been removed from the workspace.
 
 ### B5 - No measurable task-completion quality gate
 
@@ -76,13 +45,10 @@ experience unchanged.
 
 These are ordered by user-visible benefit and confidence, not by layer:
 
-1. Add an agent-level batching implementation. Issue two deliberately slow
-   read-only calls in one model turn, prove they overlap while results retain
-   model order, and serialize writes, commands, approvals, and dependent calls.
-2. Add representative task fixtures and measure turns per task, time to first
+1. Add representative task fixtures and measure turns per task, time to first
    token, search latency, tool-error recovery rate, and successful completion.
-3. Consider an async provider client only if those measurements show blocked
-   provider workers or connection scalability are limiting factors.
+2. Revisit remaining per-connection scalability and cancellation behavior once
+   those measurements exist.
 
 A full rewrite is not indicated. The remaining work is concentrated in
 `loom-agent`, `loom-tools`, and provider execution. The existing protocol,

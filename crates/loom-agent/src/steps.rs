@@ -139,6 +139,11 @@ impl AgentRuntime {
             self.handle_stream_event(event, &mut ctx)
         });
         self.provider = Some(provider);
+        if !ctx.buffered_tools.is_empty() {
+            let buffered = std::mem::take(&mut ctx.buffered_tools);
+            let tool_events = self.flush_tool_calls(buffered);
+            ctx.events.extend(tool_events);
+        }
         let StepContext {
             events: step_events,
             published,
@@ -192,6 +197,100 @@ impl AgentRuntime {
             return Ok(StepOutcome::Blocked);
         }
         Ok(StepOutcome::Continue)
+    }
+
+    /// Executes the tool calls buffered during one model turn. Consecutive
+    /// read-only calls run concurrently; writes, commands, and other calls run
+    /// sequentially in model order. Results are always recorded in model order.
+    fn flush_tool_calls(&mut self, calls: Vec<ToolCall>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        let mut index = 0;
+        while index < calls.len() {
+            let is_read_only = self
+                .tools
+                .action_kind(&calls[index])
+                .is_some_and(|kind| kind == loom_core::ActionKind::Read);
+            if is_read_only {
+                let mut end = index;
+                while end < calls.len()
+                    && self
+                        .tools
+                        .action_kind(&calls[end])
+                        .is_some_and(|kind| kind == loom_core::ActionKind::Read)
+                {
+                    end += 1;
+                }
+                let batch = calls[index..end].to_vec();
+                self.execute_read_only_batch(&batch, &mut events);
+                index = end;
+            } else {
+                let (tool_events, _) = self.execute_tool(&calls[index]);
+                events.extend(tool_events);
+                index += 1;
+            }
+        }
+        if !calls.is_empty() {
+            self.last_failed_call = None;
+        }
+        events
+    }
+
+    fn execute_read_only_batch(&mut self, calls: &[ToolCall], events: &mut Vec<AgentEvent>) {
+        for call in calls {
+            events.push(AgentEvent::ToolCallStarted {
+                run_id: self.run.id,
+                call: call.clone(),
+            });
+        }
+        let tools = &self.tools;
+        let results = std::thread::scope(|scope| {
+            let handles = calls
+                .iter()
+                .map(|call| scope.spawn(|| tools.execute(call)))
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .zip(calls.iter())
+                .map(|(handle, call)| {
+                    handle.join().unwrap_or_else(|_| ToolResult {
+                        tool_call_id: call.id,
+                        name: call.name.clone(),
+                        success: false,
+                        output: "tool execution failed".to_owned(),
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        for result in &results {
+            self.record_tool_result(result, events);
+        }
+    }
+
+    fn record_tool_result(&mut self, result: &ToolResult, events: &mut Vec<AgentEvent>) {
+        if !result.output.is_empty() {
+            events.push(AgentEvent::ToolOutputChunk {
+                run_id: self.run.id,
+                tool_call_id: result.tool_call_id,
+                chunk: result.output.clone(),
+            });
+        }
+        events.push(AgentEvent::ToolCallCompleted {
+            run_id: self.run.id,
+            result: result.clone(),
+        });
+        let status = if result.success {
+            AgentActivityStatus::Completed
+        } else {
+            AgentActivityStatus::Failed
+        };
+        events.push(self.complete_tool_activity(result, status));
+        self.push_message(ModelMessage {
+            role: MessageRole::Tool,
+            content: result.output.clone(),
+            name: Some(result.name.clone()),
+            tool_call_id: Some(result.tool_call_id),
+            tool_calls: Vec::new(),
+        });
     }
 
     /// Applies one streamed model event to the run.
@@ -573,13 +672,10 @@ impl AgentRuntime {
                     });
                     return Ok(StreamFlow::Stop);
                 }
-                // Every remaining policy decision allows execution, so the call
-                // can run as soon as it arrives. The provider emits all tool
-                // calls for a completion before `Completed`, so a single model
-                // turn can run several tools instead of one per turn.
-                let (tool_events, _result) = self.execute_tool(&call);
-                self.last_failed_call = None;
-                ctx.events.extend(tool_events);
+                // Every remaining policy decision allows execution. Buffer the
+                // call so consecutive read-only calls in this model turn can run
+                // concurrently once the completion is fully received.
+                ctx.buffered_tools.push(call);
                 return Ok(StreamFlow::Continue);
             }
             ModelStreamEvent::Usage { usage } => {

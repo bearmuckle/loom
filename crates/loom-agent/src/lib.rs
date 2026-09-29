@@ -257,6 +257,7 @@ struct StepContext {
     completion_guarded: bool,
     finished: bool,
     activity_id: ActivityId,
+    buffered_tools: Vec<ToolCall>,
 }
 
 impl StepContext {
@@ -271,6 +272,7 @@ impl StepContext {
             completion_guarded: false,
             finished: false,
             activity_id,
+            buffered_tools: Vec::new(),
         }
     }
 }
@@ -2028,6 +2030,105 @@ mod tests {
             "Loom M1 deterministic demo\n"
         );
         assert!(runtime.usage().tool_calls >= 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_only_tool_calls_overlap_and_keep_model_order() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        };
+
+        use loom_model::{FinishReason, ModelStreamEvent, ToolDefinition};
+
+        struct SlowRead {
+            current: Arc<AtomicUsize>,
+            max: Arc<AtomicUsize>,
+        }
+
+        impl ToolExtension for SlowRead {
+            fn definitions(&self) -> Vec<ToolDefinition> {
+                Vec::new()
+            }
+
+            fn action_kind(&self, _call: &ToolCall) -> Option<loom_core::ActionKind> {
+                Some(loom_core::ActionKind::Read)
+            }
+
+            fn execute(&self, call: &ToolCall) -> ToolResult {
+                let current = self.current.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                self.max.fetch_max(current, AtomicOrdering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                let label = call
+                    .arguments
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                self.current.fetch_sub(1, AtomicOrdering::SeqCst);
+                ToolResult::success(call, format!("read {label}"))
+            }
+        }
+
+        let root = workspace();
+        let current = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
+        let tools = ToolExecutor::new(&root)
+            .unwrap()
+            .with_extension(Arc::new(SlowRead {
+                current: current.clone(),
+                max: max.clone(),
+            }));
+        let call = |label: &str| ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "slow_read".to_owned(),
+            arguments: serde_json::json!({ "label": label }),
+        };
+        let provider = DeterministicProvider {
+            descriptor: loom_providers::deterministic_descriptor(),
+            steps: vec![
+                vec![
+                    ModelStreamEvent::ToolCallDelta {
+                        call: call("first"),
+                    },
+                    ModelStreamEvent::ToolCallDelta {
+                        call: call("second"),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: FinishReason::ToolCall,
+                    },
+                ],
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "done".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: FinishReason::Stop,
+                    },
+                ],
+            ],
+            cursor: 0,
+        };
+        let task = AgentTask::new("read two things", ModelId::new("gpt-6-luna")).unwrap();
+        let mut runtime = AgentRuntime::new(AgentSessionId::new(), task, Box::new(provider), tools);
+
+        runtime.start().unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        assert!(
+            max.load(AtomicOrdering::SeqCst) >= 2,
+            "read-only tool calls should overlap"
+        );
+        let outputs = runtime
+            .export_state()
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            vec!["read first".to_owned(), "read second".to_owned()]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
