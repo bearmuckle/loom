@@ -5,8 +5,9 @@ use std::{
 };
 
 use git2::{
-    BranchType, Cred, DiffFormat, DiffOptions, FetchOptions, Oid, RemoteCallbacks, Repository,
-    Status, StatusOptions, WorktreeAddOptions, WorktreeLockStatus, WorktreePruneOptions,
+    BranchType, Cred, DiffFormat, DiffOptions, FetchOptions, Oid, PushOptions, RemoteCallbacks,
+    Repository, Status, StatusOptions, WorktreeAddOptions, WorktreeLockStatus,
+    WorktreePruneOptions,
     build::{CheckoutBuilder, RepoBuilder},
 };
 use loom_core::{ErrorCode, LoomError, Result, Timestamp};
@@ -287,6 +288,75 @@ impl GitService {
             .ok()
             .filter(|head| head.is_branch())
             .and_then(|head| head.shorthand().ok().map(str::to_owned)))
+    }
+
+    /// Returns the configured fetch URL for a remote, if the remote exists.
+    pub fn remote_url(&self, name: &str) -> Result<Option<String>> {
+        let repository = self.repository()?;
+        match repository.find_remote(name) {
+            Ok(remote) => remote
+                .url()
+                .map(|url| Some(url.to_owned()))
+                .map_err(|error| git_error("could not read Git remote URL", error)),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => Ok(None),
+            Err(error) => Err(git_error("could not read Git remote", error)),
+        }
+    }
+
+    /// Pushes a local branch to the `origin` remote using the supplied access
+    /// token.
+    ///
+    /// The branch must already exist and point at a commit. The push is a
+    /// fast-forward-only update; the remote rejects non-fast-forward updates.
+    /// The token is used only for this push and is never written to the
+    /// repository configuration.
+    pub fn push_branch_authenticated(&self, branch: &str, token: &str) -> Result<()> {
+        let refname = format!("refs/heads/{branch}");
+        if !git2::Reference::is_valid_name(&refname) {
+            return Err(LoomError::invalid_request(format!(
+                "'{branch}' is not a valid Git branch name"
+            )));
+        }
+        let repository = self.repository()?;
+        let branch_reference = repository
+            .find_branch(branch, BranchType::Local)
+            .map_err(|error| {
+                if error.code() == git2::ErrorCode::NotFound {
+                    LoomError::not_found("local Git branch", branch)
+                } else {
+                    git_error("could not look up local Git branch", error)
+                }
+            })?
+            .into_reference();
+        if branch_reference.target().is_none() {
+            return Err(LoomError::invalid_state(format!(
+                "local Git branch '{branch}' does not point to a commit"
+            )));
+        }
+        let mut remote = repository.find_remote("origin").map_err(|error| {
+            if error.code() == git2::ErrorCode::NotFound {
+                LoomError::not_found("Git remote", "origin")
+            } else {
+                git_error("could not look up the 'origin' Git remote", error)
+            }
+        })?;
+        let token = token.to_owned();
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.credentials(move |_url, username_from_url, _allowed_types| {
+            Cred::userpass_plaintext(username_from_url.unwrap_or("x-access-token"), &token)
+        });
+        callbacks.push_update_reference(|reference, status| match status {
+            Some(status) => Err(git2::Error::from_str(&format!(
+                "remote rejected updating {reference}: {status}"
+            ))),
+            None => Ok(()),
+        });
+        let mut push_options = PushOptions::new();
+        push_options.remote_callbacks(callbacks);
+        let refspec = format!("{refname}:{refname}");
+        remote
+            .push(&[refspec.as_str()], Some(&mut push_options))
+            .map_err(|error| git_error("could not push Git branch", error))
     }
 
     /// Fast-forwards the currently checked-out local branch to `target_commit`.
@@ -1110,6 +1180,45 @@ mod tests {
         assert!(!cloned.status().unwrap().clean);
         fs::remove_dir_all(destination).unwrap();
         fs::remove_dir_all(source_root).unwrap();
+    }
+
+    #[test]
+    fn pushing_a_branch_updates_the_origin_remote() {
+        let (git, root) = repository();
+        let bare =
+            std::env::temp_dir().join(format!("loom-git-bare-{}", loom_core::RepositoryId::new()));
+        Repository::init_bare(&bare).unwrap();
+        run(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        let branch = git.current_branch().unwrap().unwrap();
+        git.push_branch_authenticated(&branch, "test-token")
+            .unwrap();
+        let pushed = Repository::open_bare(&bare).unwrap();
+        assert!(
+            pushed
+                .find_reference(&format!("refs/heads/{branch}"))
+                .is_ok()
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
+    }
+
+    #[test]
+    fn pushing_rejects_invalid_or_missing_branches() {
+        let (git, root) = repository();
+        let bare =
+            std::env::temp_dir().join(format!("loom-git-bare-{}", loom_core::RepositoryId::new()));
+        Repository::init_bare(&bare).unwrap();
+        run(&root, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        assert!(
+            git.push_branch_authenticated("bad name", "test-token")
+                .is_err()
+        );
+        assert!(
+            git.push_branch_authenticated("does-not-exist", "test-token")
+                .is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(bare).unwrap();
     }
 
     #[test]

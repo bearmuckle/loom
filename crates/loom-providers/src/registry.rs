@@ -1,5 +1,9 @@
 use super::*;
 
+/// Non-secret credential-store entry recording whether the connected GitHub
+/// account may be used for writes and pull requests.
+const GITHUB_WRITE_ACCESS_CREDENTIAL_REF: &str = "github-write-access";
+
 #[derive(Clone)]
 pub struct ProviderRegistry {
     pub configurations: Arc<Mutex<BTreeMap<ProviderId, ProviderConfig>>>,
@@ -308,6 +312,23 @@ impl ProviderRegistry {
     pub fn github_account_token(&self) -> Result<String> {
         self.credentials
             .resolve(&CredentialRef::new(GITHUB_COPILOT_CREDENTIAL_REF))
+    }
+
+    /// Whether the connected GitHub account is authorized for writes and pull
+    /// requests. Disabled until the user opts in. Stored next to the GitHub
+    /// credential so the grant survives restarts.
+    pub fn github_write_access(&self) -> bool {
+        self.credentials
+            .resolve(&CredentialRef::new(GITHUB_WRITE_ACCESS_CREDENTIAL_REF))
+            .map(|value| value == "true")
+            .unwrap_or(false)
+    }
+
+    pub fn set_github_write_access(&self, enabled: bool) -> Result<()> {
+        self.credentials.store(
+            &CredentialRef::new(GITHUB_WRITE_ACCESS_CREDENTIAL_REF),
+            if enabled { "true" } else { "false" }.to_owned(),
+        )
     }
 
     pub fn add_model(&self, provider_id: &ProviderId, model: ModelDescriptor) -> Result<()> {

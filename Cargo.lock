@@ -4461,6 +4461,7 @@ dependencies = [
  "loom-core",
  "loom-model",
  "loom-protocol",
+ "loom-vcs",
  "loom-workspace",
  "regex",
  "reqwest",

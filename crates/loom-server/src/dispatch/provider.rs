@@ -46,6 +46,17 @@ impl InProcessConnection {
             ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { login_id }) => {
                 self.github_copilot_login_status(&login_id)
             }
+            ClientRequest::Provider(ProviderRequest::ConfigureGitHubWriteAccess { enabled }) => {
+                self.backend.providers.set_github_write_access(enabled)?;
+                Ok(ServerResponse::Provider(
+                    ProviderResponse::GitHubWriteAccess { enabled },
+                ))
+            }
+            ClientRequest::Provider(ProviderRequest::GetGitHubWriteAccess) => Ok(
+                ServerResponse::Provider(ProviderResponse::GitHubWriteAccess {
+                    enabled: self.backend.providers.github_write_access(),
+                }),
+            ),
             ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { provider_id }) => {
                 Ok(ServerResponse::Provider(ProviderResponse::Models {
                     models: self.backend.providers.discover_models(&provider_id)?,

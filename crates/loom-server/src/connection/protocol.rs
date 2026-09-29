@@ -730,6 +730,8 @@ impl InProcessConnection {
             | ClientRequest::Repository(RepositoryRequest::ListGitHubRepositories)
             | ClientRequest::Provider(ProviderRequest::StartGitHubCopilotLogin)
             | ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. })
+            | ClientRequest::Provider(ProviderRequest::ConfigureGitHubWriteAccess { .. })
+            | ClientRequest::Provider(ProviderRequest::GetGitHubWriteAccess)
             | ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { .. })
             | ClientRequest::Provider(ProviderRequest::GetProviderHealth { .. }) => {}
             ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })

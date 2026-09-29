@@ -130,6 +130,45 @@ fn api_key_provider_configuration_is_backend_scoped_and_recovers_without_persist
 }
 
 #[test]
+fn github_write_access_is_opt_in_and_round_trips() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    let default = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::GetGitHubWriteAccess,
+    )));
+    assert!(matches!(
+        default.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::GitHubWriteAccess { enabled: false }
+        ))
+    ));
+
+    let enabled = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ConfigureGitHubWriteAccess { enabled: true },
+    )));
+    assert!(matches!(
+        enabled.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::GitHubWriteAccess { enabled: true }
+        ))
+    ));
+    assert!(backend.provider_registry().github_write_access());
+
+    let disabled = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ConfigureGitHubWriteAccess { enabled: false },
+    )));
+    assert!(matches!(
+        disabled.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::GitHubWriteAccess { enabled: false }
+        ))
+    ));
+    assert!(!backend.provider_registry().github_write_access());
+}
+
+#[test]
 fn opening_a_backend_migrates_legacy_openai_keys_to_its_scoped_store() {
     let root = std::env::temp_dir().join(format!("loom-legacy-provider-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
