@@ -8,14 +8,17 @@ use gpui_kit::{App, Rgba, SharedString, WindowAppearance};
 pub(crate) const ERROR_CARD_SURFACE: u32 = 0x171c25;
 pub(crate) const ERROR_CARD_FOREGROUND: u32 = 0xe5e7eb;
 pub(crate) const ERROR_CARD_ACCENT: u32 = 0xfca5a5;
-const SUCCESS_SURFACE: u32 = 0x263d36;
-const DANGER_SURFACE: u32 = 0x452b36;
-const WARNING_SURFACE: u32 = 0x433a2d;
-const INFO_SURFACE: u32 = 0x392f4b;
-const SUCCESS_SURFACE_LATTE: u32 = 0xdcebd8;
-const DANGER_SURFACE_LATTE: u32 = 0xf5dce1;
-const WARNING_SURFACE_LATTE: u32 = 0xf6e8ce;
-const INFO_SURFACE_LATTE: u32 = 0xe9defa;
+
+/// Alpha-blends `tint` over `base`, used to derive tinted status surfaces from
+/// the active palette instead of hardcoding a second set of colors.
+fn blend(base: Rgba, tint: Rgba, amount: f32) -> Rgba {
+    Rgba {
+        r: base.r + (tint.r - base.r) * amount,
+        g: base.g + (tint.g - base.g) * amount,
+        b: base.b + (tint.b - base.b) * amount,
+        a: base.a,
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ThemePalette {
@@ -99,8 +102,14 @@ const fn legacy_color_role(value: u32) -> Option<ColorRole> {
 impl ThemePalette {
     fn from_theme(theme: &Theme) -> Self {
         let colors = &theme.colors;
+        let background: Rgba = colors.background.into();
+        let success: Rgba = colors.success.into();
+        let danger: Rgba = colors.danger.into();
+        let warning: Rgba = colors.warning.into();
+        let info: Rgba = colors.info.into();
+        let tint = if theme.is_dark() { 0.18 } else { 0.12 };
         Self {
-            background: colors.background.into(),
+            background,
             surface: colors.sidebar.into(),
             control: colors.secondary.into(),
             control_hover: colors.secondary_hover.into(),
@@ -112,30 +121,14 @@ impl ThemePalette {
             accent: colors.primary.into(),
             accent_foreground: colors.primary_foreground.into(),
             accent_hover: colors.primary_hover.into(),
-            success: colors.success.into(),
-            danger: colors.danger.into(),
-            warning: colors.warning.into(),
-            info: colors.info.into(),
-            success_surface: if theme.is_dark() {
-                gpui_kit::rgb(SUCCESS_SURFACE)
-            } else {
-                gpui_kit::rgb(SUCCESS_SURFACE_LATTE)
-            },
-            danger_surface: if theme.is_dark() {
-                gpui_kit::rgb(DANGER_SURFACE)
-            } else {
-                gpui_kit::rgb(DANGER_SURFACE_LATTE)
-            },
-            warning_surface: if theme.is_dark() {
-                gpui_kit::rgb(WARNING_SURFACE)
-            } else {
-                gpui_kit::rgb(WARNING_SURFACE_LATTE)
-            },
-            info_surface: if theme.is_dark() {
-                gpui_kit::rgb(INFO_SURFACE)
-            } else {
-                gpui_kit::rgb(INFO_SURFACE_LATTE)
-            },
+            success,
+            danger,
+            warning,
+            info,
+            success_surface: blend(background, success, tint),
+            danger_surface: blend(background, danger, tint),
+            warning_surface: blend(background, warning, tint),
+            info_surface: blend(background, info, tint),
         }
     }
 
@@ -172,198 +165,253 @@ impl ThemePalette {
     }
 }
 
-fn mocha_theme() -> Rc<ThemeConfig> {
-    let mut colors = ThemeConfigColors::default();
-    colors.accent = Some("#89b4fa".into());
-    colors.accent_foreground = Some("#1e1e2e".into());
-    colors.background = Some("#1e1e2e".into());
-    colors.border = Some("#313244".into());
-    colors.button = Some("#313244".into());
-    colors.button_active = Some("#45475a".into());
-    colors.button_foreground = Some("#cdd6f4".into());
-    colors.button_hover = Some("#45475a".into());
-    colors.button_danger = Some("#f38ba8".into());
-    colors.button_danger_active = Some("#eba0ac".into());
-    colors.button_danger_foreground = Some("#1e1e2e".into());
-    colors.button_danger_hover = Some("#eba0ac".into());
-    colors.button_info = Some("#cba6f7".into());
-    colors.button_info_active = Some("#b4befe".into());
-    colors.button_info_foreground = Some("#1e1e2e".into());
-    colors.button_info_hover = Some("#b4befe".into());
-    colors.button_primary = Some("#89b4fa".into());
-    colors.button_primary_active = Some("#74c7ec".into());
-    colors.button_primary_foreground = Some("#1e1e2e".into());
-    colors.button_primary_hover = Some("#b4befe".into());
-    colors.button_secondary = Some("#313244".into());
-    colors.button_secondary_active = Some("#45475a".into());
-    colors.button_secondary_foreground = Some("#cdd6f4".into());
-    colors.button_secondary_hover = Some("#45475a".into());
-    colors.button_success = Some("#a6e3a1".into());
-    colors.button_success_active = Some("#94e2d5".into());
-    colors.button_success_foreground = Some("#1e1e2e".into());
-    colors.button_success_hover = Some("#94e2d5".into());
-    colors.button_warning = Some("#f9e2af".into());
-    colors.button_warning_active = Some("#f5e0a7".into());
-    colors.button_warning_foreground = Some("#1e1e2e".into());
-    colors.button_warning_hover = Some("#f5e0a7".into());
-    colors.danger = Some("#f38ba8".into());
-    colors.danger_active = Some("#eba0ac".into());
-    colors.danger_foreground = Some("#1e1e2e".into());
-    colors.danger_hover = Some("#eba0ac".into());
-    colors.foreground = Some("#cdd6f4".into());
-    colors.info = Some("#cba6f7".into());
-    colors.info_active = Some("#b4befe".into());
-    colors.info_foreground = Some("#1e1e2e".into());
-    colors.info_hover = Some("#b4befe".into());
-    colors.input = Some("#45475a".into());
-    colors.link = Some("#89b4fa".into());
-    colors.link_active = Some("#b4befe".into());
-    colors.link_hover = Some("#74c7ec".into());
-    colors.list = Some("#1e1e2e".into());
-    colors.list_active = Some("#313244".into());
-    colors.list_active_border = Some("#89b4fa".into());
-    colors.list_hover = Some("#242436".into());
-    colors.muted = Some("#242436".into());
-    colors.muted_foreground = Some("#a6adc8".into());
-    colors.popover = Some("#181825".into());
-    colors.popover_foreground = Some("#cdd6f4".into());
-    colors.primary = Some("#89b4fa".into());
-    colors.primary_active = Some("#74c7ec".into());
-    colors.primary_foreground = Some("#1e1e2e".into());
-    colors.primary_hover = Some("#b4befe".into());
-    colors.ring = Some("#89b4fa".into());
-    colors.scrollbar = Some("#181825".into());
-    colors.scrollbar_thumb = Some("#45475a".into());
-    colors.scrollbar_thumb_hover = Some("#585b70".into());
-    colors.secondary = Some("#313244".into());
-    colors.secondary_active = Some("#45475a".into());
-    colors.secondary_foreground = Some("#cdd6f4".into());
-    colors.secondary_hover = Some("#45475a".into());
-    colors.selection = Some("#45475a".into());
-    colors.sidebar = Some("#181825".into());
-    colors.sidebar_accent = Some("#313244".into());
-    colors.sidebar_accent_foreground = Some("#cdd6f4".into());
-    colors.sidebar_border = Some("#313244".into());
-    colors.sidebar_foreground = Some("#cdd6f4".into());
-    colors.sidebar_primary = Some("#89b4fa".into());
-    colors.sidebar_primary_foreground = Some("#1e1e2e".into());
-    colors.success = Some("#a6e3a1".into());
-    colors.success_active = Some("#94e2d5".into());
-    colors.success_foreground = Some("#1e1e2e".into());
-    colors.success_hover = Some("#94e2d5".into());
-    colors.warning = Some("#f9e2af".into());
-    colors.warning_active = Some("#f5e0a7".into());
-    colors.warning_foreground = Some("#1e1e2e".into());
-    colors.warning_hover = Some("#f5e0a7".into());
-    colors.title_bar = Some("#181825".into());
-    colors.title_bar_border = Some("#313244".into());
-    colors.status_bar = Some("#181825".into());
-    colors.status_bar_border = Some("#313244".into());
-    colors.window_border = Some("#313244".into());
+/// A Catppuccin flavor: the 26 named palette colors plus the foreground used
+/// on filled accent surfaces.
+#[derive(Clone, Copy)]
+struct Catppuccin {
+    base: u32,
+    mantle: u32,
+    crust: u32,
+    surface0: u32,
+    surface1: u32,
+    surface2: u32,
+    overlay0: u32,
+    overlay1: u32,
+    overlay2: u32,
+    text: u32,
+    subtext1: u32,
+    subtext0: u32,
+    lavender: u32,
+    blue: u32,
+    sapphire: u32,
+    sky: u32,
+    teal: u32,
+    green: u32,
+    yellow: u32,
+    peach: u32,
+    maroon: u32,
+    red: u32,
+    mauve: u32,
+    pink: u32,
+    flamingo: u32,
+    rosewater: u32,
+    /// The foreground for filled accent buttons, which must contrast with the
+    /// saturated accent colors rather than the page background.
+    on_accent: u32,
+}
 
+/// Catppuccin Mocha (dark), the palette the dark theme is built from.
+const MOCHA: Catppuccin = Catppuccin {
+    base: 0x1e1e2e,
+    mantle: 0x181825,
+    crust: 0x11111b,
+    surface0: 0x313244,
+    surface1: 0x45475a,
+    surface2: 0x585b70,
+    overlay0: 0x6c7086,
+    overlay1: 0x7f849c,
+    overlay2: 0x9399b2,
+    text: 0xcdd6f4,
+    subtext1: 0xbac2de,
+    subtext0: 0xa6adc8,
+    lavender: 0xb4befe,
+    blue: 0x89b4fa,
+    sapphire: 0x74c7ec,
+    sky: 0x89dceb,
+    teal: 0x94e2d5,
+    green: 0xa6e3a1,
+    yellow: 0xf9e2af,
+    peach: 0xfab387,
+    maroon: 0xeba0ac,
+    red: 0xf38ba8,
+    mauve: 0xcba6f7,
+    pink: 0xf5c2e7,
+    flamingo: 0xf2cdcd,
+    rosewater: 0xf5e0dc,
+    on_accent: 0x1e1e2e,
+};
+
+/// Catppuccin Latte (light), the palette the light theme is built from.
+const LATTE: Catppuccin = Catppuccin {
+    base: 0xeff1f5,
+    mantle: 0xe6e9ef,
+    crust: 0xdce0e8,
+    surface0: 0xccd0da,
+    surface1: 0xbcc0cc,
+    surface2: 0xacb0be,
+    overlay0: 0x9ca0b0,
+    overlay1: 0x8c8fa1,
+    overlay2: 0x7c7f93,
+    text: 0x4c4f69,
+    subtext1: 0x5c5f77,
+    subtext0: 0x6c6f85,
+    lavender: 0x7287fd,
+    blue: 0x1e66f5,
+    sapphire: 0x209fb5,
+    sky: 0x04a5e5,
+    teal: 0x179299,
+    green: 0x40a02b,
+    yellow: 0xdf8e1d,
+    peach: 0xfe640b,
+    maroon: 0xe64553,
+    red: 0xd20f39,
+    mauve: 0x8839ef,
+    pink: 0xea76cb,
+    flamingo: 0xdd7878,
+    rosewater: 0xdc8a78,
+    on_accent: 0xeff1f5,
+};
+
+fn hex(value: u32) -> SharedString {
+    format!("#{value:06x}").into()
+}
+
+/// Builds a complete component theme from a Catppuccin flavor so both modes
+/// stay in sync and every role resolves to a canonical palette color.
+fn catppuccin_theme(name: &str, mode: ThemeMode, p: Catppuccin) -> Rc<ThemeConfig> {
+    let mut c = ThemeConfigColors::default();
+    // `accent` is gpui-component's neutral highlight fill (ghost-button hover,
+    // menu/list selection). The blue action color lives in `primary`/`ring`/
+    // `link`, so `accent` stays a surface color instead of painted blue.
+    c.accent = Some(hex(p.surface0));
+    c.accent_foreground = Some(hex(p.text));
+    c.accordion = Some(hex(p.surface0));
+    c.background = Some(hex(p.base));
+    c.border = Some(hex(p.surface0));
+    c.button = Some(hex(p.surface0));
+    c.button_active = Some(hex(p.surface1));
+    c.button_foreground = Some(hex(p.text));
+    c.button_hover = Some(hex(p.surface1));
+    c.button_danger = Some(hex(p.red));
+    c.button_danger_active = Some(hex(p.maroon));
+    c.button_danger_foreground = Some(hex(p.on_accent));
+    c.button_danger_hover = Some(hex(p.flamingo));
+    c.button_info = Some(hex(p.mauve));
+    c.button_info_active = Some(hex(p.lavender));
+    c.button_info_foreground = Some(hex(p.on_accent));
+    c.button_info_hover = Some(hex(p.pink));
+    c.button_primary = Some(hex(p.blue));
+    c.button_primary_active = Some(hex(p.sapphire));
+    c.button_primary_foreground = Some(hex(p.on_accent));
+    c.button_primary_hover = Some(hex(p.lavender));
+    c.button_secondary = Some(hex(p.surface0));
+    c.button_secondary_active = Some(hex(p.surface1));
+    c.button_secondary_foreground = Some(hex(p.text));
+    c.button_secondary_hover = Some(hex(p.surface1));
+    c.button_success = Some(hex(p.green));
+    c.button_success_active = Some(hex(p.teal));
+    c.button_success_foreground = Some(hex(p.on_accent));
+    c.button_success_hover = Some(hex(p.teal));
+    c.button_warning = Some(hex(p.yellow));
+    c.button_warning_active = Some(hex(p.peach));
+    c.button_warning_foreground = Some(hex(p.on_accent));
+    c.button_warning_hover = Some(hex(p.peach));
+    c.caret = Some(hex(p.blue));
+    c.chart_bullish = Some(hex(p.green));
+    c.chart_bearish = Some(hex(p.red));
+    c.chart_grid = Some(hex(p.surface1));
+    c.danger = Some(hex(p.red));
+    c.danger_active = Some(hex(p.maroon));
+    c.danger_foreground = Some(hex(p.on_accent));
+    c.danger_hover = Some(hex(p.flamingo));
+    c.description_list_label = Some(hex(p.subtext1));
+    c.description_list_label_foreground = Some(hex(p.text));
+    c.drag_border = Some(hex(p.blue));
+    c.drop_target = Some(hex(p.surface2));
+    c.foreground = Some(hex(p.text));
+    c.group_box = Some(hex(p.surface0));
+    c.group_box_foreground = Some(hex(p.text));
+    c.group_box_title_foreground = Some(hex(p.text));
+    c.info = Some(hex(p.mauve));
+    c.info_active = Some(hex(p.lavender));
+    c.info_foreground = Some(hex(p.on_accent));
+    c.info_hover = Some(hex(p.pink));
+    c.input = Some(hex(p.surface1));
+    c.link = Some(hex(p.blue));
+    c.link_active = Some(hex(p.sapphire));
+    c.link_hover = Some(hex(p.sky));
+    c.list = Some(hex(p.base));
+    // `list_active` is stronger than `list_hover` so the selected row reads
+    // clearly against the sidebar instead of matching a hovered row.
+    c.list_active = Some(hex(p.surface1));
+    c.list_active_border = Some(hex(p.blue));
+    c.list_even = Some(hex(p.mantle));
+    c.list_head = Some(hex(p.mantle));
+    c.list_hover = Some(hex(p.surface0));
+    c.muted = Some(hex(p.surface0));
+    c.muted_foreground = Some(hex(p.subtext0));
+    c.overlay = Some(hex(p.crust));
+    c.popover = Some(hex(p.mantle));
+    c.popover_foreground = Some(hex(p.text));
+    c.primary = Some(hex(p.blue));
+    c.primary_active = Some(hex(p.sapphire));
+    c.primary_foreground = Some(hex(p.on_accent));
+    c.primary_hover = Some(hex(p.lavender));
+    c.progress_bar = Some(hex(p.blue));
+    c.ring = Some(hex(p.blue));
+    c.scrollbar = Some(hex(p.mantle));
+    c.scrollbar_thumb = Some(hex(p.overlay0));
+    c.scrollbar_thumb_hover = Some(hex(p.overlay1));
+    c.secondary = Some(hex(p.surface0));
+    c.secondary_active = Some(hex(p.surface1));
+    c.secondary_foreground = Some(hex(p.text));
+    c.secondary_hover = Some(hex(p.surface1));
+    c.selection = Some(hex(p.surface1));
+    c.sidebar = Some(hex(p.mantle));
+    c.sidebar_accent = Some(hex(p.surface0));
+    c.sidebar_accent_foreground = Some(hex(p.text));
+    c.sidebar_border = Some(hex(p.surface0));
+    c.sidebar_foreground = Some(hex(p.text));
+    c.sidebar_primary = Some(hex(p.blue));
+    c.sidebar_primary_foreground = Some(hex(p.on_accent));
+    c.skeleton = Some(hex(p.surface0));
+    c.slider_bar = Some(hex(p.blue));
+    c.slider_thumb = Some(hex(p.rosewater));
+    c.status_bar = Some(hex(p.mantle));
+    c.status_bar_border = Some(hex(p.surface0));
+    c.success = Some(hex(p.green));
+    c.success_active = Some(hex(p.teal));
+    c.success_foreground = Some(hex(p.on_accent));
+    c.success_hover = Some(hex(p.teal));
+    c.switch = Some(hex(p.surface1));
+    c.switch_thumb = Some(hex(p.rosewater));
+    c.tab = Some(hex(p.mantle));
+    c.tab_active = Some(hex(p.surface0));
+    c.tab_active_foreground = Some(hex(p.text));
+    c.tab_bar = Some(hex(p.mantle));
+    c.tab_bar_segmented = Some(hex(p.surface0));
+    c.tab_foreground = Some(hex(p.subtext1));
+    c.table = Some(hex(p.base));
+    c.table_active = Some(hex(p.surface0));
+    c.table_active_border = Some(hex(p.blue));
+    c.table_even = Some(hex(p.mantle));
+    c.table_foot = Some(hex(p.mantle));
+    c.table_foot_foreground = Some(hex(p.text));
+    c.table_head = Some(hex(p.mantle));
+    c.table_head_foreground = Some(hex(p.text));
+    c.table_hover = Some(hex(p.surface0));
+    c.table_row_border = Some(hex(p.surface0));
+    c.title_bar = Some(hex(p.mantle));
+    c.title_bar_border = Some(hex(p.surface0));
+    c.warning = Some(hex(p.yellow));
+    c.warning_active = Some(hex(p.peach));
+    c.warning_foreground = Some(hex(p.on_accent));
+    c.warning_hover = Some(hex(p.peach));
+    c.window_border = Some(hex(p.overlay2));
     Rc::new(ThemeConfig {
-        name: "Loom Mocha".into(),
-        mode: ThemeMode::Dark,
-        colors,
+        name: name.into(),
+        mode,
+        colors: c,
         ..Default::default()
     })
 }
 
-fn latte_theme() -> Rc<ThemeConfig> {
-    let mut colors = ThemeConfigColors::default();
-    colors.accent = Some("#1e66f5".into());
-    colors.accent_foreground = Some("#ffffff".into());
-    colors.background = Some("#eff1f5".into());
-    colors.border = Some("#ccd0da".into());
-    colors.button = Some("#e6e9ef".into());
-    colors.button_active = Some("#bcc0cc".into());
-    colors.button_foreground = Some("#4c4f69".into());
-    colors.button_hover = Some("#ccd0da".into());
-    colors.button_danger = Some("#f5dce1".into());
-    colors.button_danger_active = Some("#edc8d0".into());
-    colors.button_danger_foreground = Some("#4c4f69".into());
-    colors.button_danger_hover = Some("#edc8d0".into());
-    colors.button_info = Some("#e9defa".into());
-    colors.button_info_active = Some("#dfcff7".into());
-    colors.button_info_foreground = Some("#4c4f69".into());
-    colors.button_info_hover = Some("#dfcff7".into());
-    colors.button_primary = Some("#1e66f5".into());
-    colors.button_primary_active = Some("#1e5fcc".into());
-    colors.button_primary_foreground = Some("#ffffff".into());
-    colors.button_primary_hover = Some("#1e5fcc".into());
-    colors.button_secondary = Some("#e6e9ef".into());
-    colors.button_secondary_active = Some("#bcc0cc".into());
-    colors.button_secondary_foreground = Some("#4c4f69".into());
-    colors.button_secondary_hover = Some("#ccd0da".into());
-    colors.button_success = Some("#dcebd8".into());
-    colors.button_success_active = Some("#c8dfc3".into());
-    colors.button_success_foreground = Some("#4c4f69".into());
-    colors.button_success_hover = Some("#c8dfc3".into());
-    colors.button_warning = Some("#f6e8ce".into());
-    colors.button_warning_active = Some("#efddb8".into());
-    colors.button_warning_foreground = Some("#4c4f69".into());
-    colors.button_warning_hover = Some("#efddb8".into());
-    colors.danger = Some("#b01234".into());
-    colors.danger_active = Some("#a70f30".into());
-    colors.danger_foreground = Some("#ffffff".into());
-    colors.danger_hover = Some("#b01234".into());
-    colors.foreground = Some("#4c4f69".into());
-    colors.info = Some("#7733d1".into());
-    colors.info_active = Some("#6d2fc1".into());
-    colors.info_foreground = Some("#ffffff".into());
-    colors.info_hover = Some("#7733d1".into());
-    colors.input = Some("#bcc0cc".into());
-    colors.link = Some("#1e66f5".into());
-    colors.link_active = Some("#1e5fcc".into());
-    colors.link_hover = Some("#7287fd".into());
-    colors.list = Some("#eff1f5".into());
-    colors.list_active = Some("#dce0e8".into());
-    colors.list_active_border = Some("#1e66f5".into());
-    colors.list_hover = Some("#e6e9ef".into());
-    colors.muted = Some("#e6e9ef".into());
-    colors.muted_foreground = Some("#6c6f85".into());
-    colors.popover = Some("#eff1f5".into());
-    colors.popover_foreground = Some("#4c4f69".into());
-    colors.primary = Some("#1e66f5".into());
-    colors.primary_active = Some("#1e5fcc".into());
-    colors.primary_foreground = Some("#ffffff".into());
-    colors.primary_hover = Some("#1e5fcc".into());
-    colors.ring = Some("#1e66f5".into());
-    colors.scrollbar = Some("#e6e9ef".into());
-    colors.scrollbar_thumb = Some("#bcc0cc".into());
-    colors.scrollbar_thumb_hover = Some("#acb0be".into());
-    colors.secondary = Some("#e6e9ef".into());
-    colors.secondary_active = Some("#bcc0cc".into());
-    colors.secondary_foreground = Some("#4c4f69".into());
-    colors.secondary_hover = Some("#ccd0da".into());
-    colors.selection = Some("#bcc0cc".into());
-    colors.sidebar = Some("#e6e9ef".into());
-    colors.sidebar_accent = Some("#dce0e8".into());
-    colors.sidebar_accent_foreground = Some("#4c4f69".into());
-    colors.sidebar_border = Some("#ccd0da".into());
-    colors.sidebar_foreground = Some("#4c4f69".into());
-    colors.sidebar_primary = Some("#1e66f5".into());
-    colors.sidebar_primary_foreground = Some("#ffffff".into());
-    colors.success = Some("#2c7025".into());
-    colors.success_active = Some("#24621e".into());
-    colors.success_foreground = Some("#ffffff".into());
-    colors.success_hover = Some("#327a2b".into());
-    colors.warning = Some("#8a5a00".into());
-    colors.warning_active = Some("#784e00".into());
-    colors.warning_foreground = Some("#ffffff".into());
-    colors.warning_hover = Some("#9a6700".into());
-    colors.title_bar = Some("#e6e9ef".into());
-    colors.title_bar_border = Some("#ccd0da".into());
-    colors.status_bar = Some("#e6e9ef".into());
-    colors.status_bar_border = Some("#ccd0da".into());
-    colors.window_border = Some("#ccd0da".into());
+fn mocha_theme() -> Rc<ThemeConfig> {
+    catppuccin_theme("Loom Mocha", ThemeMode::Dark, MOCHA)
+}
 
-    Rc::new(ThemeConfig {
-        name: "Loom Latte".into(),
-        mode: ThemeMode::Light,
-        colors,
-        ..Default::default()
-    })
+fn latte_theme() -> Rc<ThemeConfig> {
+    catppuccin_theme("Loom Latte", ThemeMode::Light, LATTE)
 }
 
 thread_local! {
@@ -432,74 +480,63 @@ pub(crate) fn change_color(kind: loom_protocol::WorkspaceChangeKind) -> Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DANGER_SURFACE, DANGER_SURFACE_LATTE, ERROR_CARD_ACCENT, ERROR_CARD_FOREGROUND,
-        ERROR_CARD_SURFACE, INFO_SURFACE, INFO_SURFACE_LATTE, SUCCESS_SURFACE,
-        SUCCESS_SURFACE_LATTE, WARNING_SURFACE, WARNING_SURFACE_LATTE, change_color, latte_theme,
-        legacy_color_role, mocha_theme,
-    };
-
-    fn luminance(value: f32) -> f32 {
-        if value <= 0.04045 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    }
-
-    fn contrast_ratio(foreground: u32, background: u32) -> f32 {
-        let foreground = gpui_kit::rgb(foreground);
-        let background = gpui_kit::rgb(background);
-        let luminance = |color: gpui_kit::Rgba| {
-            0.2126 * luminance(color.r) + 0.7152 * luminance(color.g) + 0.0722 * luminance(color.b)
-        };
-        let foreground = luminance(foreground);
-        let background = luminance(background);
-        let (lighter, darker) = if foreground > background {
-            (foreground, background)
-        } else {
-            (background, foreground)
-        };
-        (lighter + 0.05) / (darker + 0.05)
-    }
+    use super::{change_color, latte_theme, legacy_color_role, mocha_theme};
 
     #[test]
-    fn error_card_text_and_accent_have_readable_dark_surface_contrast() {
-        assert!(contrast_ratio(ERROR_CARD_FOREGROUND, ERROR_CARD_SURFACE) >= 4.5);
-        assert!(contrast_ratio(ERROR_CARD_ACCENT, ERROR_CARD_SURFACE) >= 4.5);
-    }
-
-    #[test]
-    fn status_colors_have_readable_contrast_on_tinted_surfaces() {
-        assert!(contrast_ratio(0xa6e3a1, SUCCESS_SURFACE) >= 4.5);
-        assert!(contrast_ratio(0xf38ba8, DANGER_SURFACE) >= 4.5);
-        assert!(contrast_ratio(0xf9e2af, WARNING_SURFACE) >= 4.5);
-        assert!(contrast_ratio(0xcba6f7, INFO_SURFACE) >= 4.5);
-        assert!(contrast_ratio(0x2c7025, SUCCESS_SURFACE_LATTE) >= 4.5);
-        assert!(contrast_ratio(0xb01234, DANGER_SURFACE_LATTE) >= 4.5);
-        assert!(contrast_ratio(0x8a5a00, WARNING_SURFACE_LATTE) >= 4.5);
-        assert!(contrast_ratio(0x7733d1, INFO_SURFACE_LATTE) >= 4.5);
-    }
-
-    #[test]
-    fn theme_configs_define_distinct_dark_and_light_palettes() {
+    fn theme_configs_define_canonical_catppuccin_palettes() {
         let mocha = mocha_theme();
         let latte = latte_theme();
         assert_eq!(mocha.name, "Loom Mocha");
         assert_eq!(mocha.mode, gpui_kit::component::ThemeMode::Dark);
         assert_eq!(latte.name, "Loom Latte");
         assert_eq!(latte.mode, gpui_kit::component::ThemeMode::Light);
+
+        // Mocha uses the dark flavor's base, text, and accent colors.
         assert_eq!(mocha.colors.background.as_deref(), Some("#1e1e2e"));
-        assert_eq!(latte.colors.background.as_deref(), Some("#eff1f5"));
+        assert_eq!(mocha.colors.sidebar.as_deref(), Some("#181825"));
+        assert_eq!(mocha.colors.border.as_deref(), Some("#313244"));
+        assert_eq!(mocha.colors.foreground.as_deref(), Some("#cdd6f4"));
         assert_eq!(mocha.colors.primary.as_deref(), Some("#89b4fa"));
-        assert_eq!(latte.colors.primary.as_deref(), Some("#1e66f5"));
         assert_eq!(mocha.colors.success.as_deref(), Some("#a6e3a1"));
-        assert_eq!(latte.colors.success.as_deref(), Some("#2c7025"));
+        assert_eq!(mocha.colors.danger.as_deref(), Some("#f38ba8"));
+        assert_eq!(mocha.colors.warning.as_deref(), Some("#f9e2af"));
+        assert_eq!(mocha.colors.info.as_deref(), Some("#cba6f7"));
+
+        // Latte uses the light flavor's base, text, and accent colors.
+        assert_eq!(latte.colors.background.as_deref(), Some("#eff1f5"));
+        assert_eq!(latte.colors.sidebar.as_deref(), Some("#e6e9ef"));
+        assert_eq!(latte.colors.border.as_deref(), Some("#ccd0da"));
+        assert_eq!(latte.colors.foreground.as_deref(), Some("#4c4f69"));
+        assert_eq!(latte.colors.primary.as_deref(), Some("#1e66f5"));
+        assert_eq!(latte.colors.success.as_deref(), Some("#40a02b"));
+        assert_eq!(latte.colors.danger.as_deref(), Some("#d20f39"));
+        assert_eq!(latte.colors.warning.as_deref(), Some("#df8e1d"));
+        assert_eq!(latte.colors.info.as_deref(), Some("#8839ef"));
+
+        for theme in [&mocha, &latte] {
+            // A selected row must not look identical to a hovered row.
+            assert_ne!(theme.colors.list_active, theme.colors.list_hover);
+            // `accent` is the neutral highlight fill; the blue action color
+            // lives in `primary`, so ghost hovers are not painted blue.
+            assert_ne!(theme.colors.accent, theme.colors.primary);
+        }
     }
 
     #[test]
     fn every_legacy_color_literal_used_by_the_view_is_mapped() {
-        let sources = [include_str!("view.rs"), include_str!("syntax.rs")];
+        let sources = [
+            include_str!("view.rs"),
+            include_str!("syntax.rs"),
+            include_str!("view/helpers.rs"),
+            include_str!("view/timeline.rs"),
+            include_str!("view/render/composer.rs"),
+            include_str!("view/render/dialogs.rs"),
+            include_str!("view/render/pickers.rs"),
+            include_str!("view/render/review.rs"),
+            include_str!("view/render/root.rs"),
+            include_str!("view/render/sidebar.rs"),
+            include_str!("view/render/tool.rs"),
+        ];
         for source in sources {
             let mut unmapped = Vec::new();
             let mut rest = source;
