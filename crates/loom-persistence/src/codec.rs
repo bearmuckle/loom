@@ -438,6 +438,10 @@ mod tests {
         for state in [
             AgentRunState::Planning,
             AgentRunState::Executing,
+            AgentRunState::AwaitingApproval,
+            AgentRunState::Paused,
+            AgentRunState::NeedsInput,
+            AgentRunState::Evaluating,
             AgentRunState::Completed,
             AgentRunState::Failed,
             AgentRunState::Cancelled,
@@ -446,9 +450,17 @@ mod tests {
         }
         for state in [
             AgentSessionState::Idle,
+            AgentSessionState::Queued,
+            AgentSessionState::Planning,
+            AgentSessionState::AwaitingApproval,
+            AgentSessionState::Paused,
             AgentSessionState::Executing,
+            AgentSessionState::Evaluating,
+            AgentSessionState::NeedsInput,
             AgentSessionState::Completed,
             AgentSessionState::Failed,
+            AgentSessionState::Cancelled,
+            AgentSessionState::Archived,
         ] {
             assert_eq!(
                 parse_session_state(session_state_name(state)).unwrap(),
@@ -474,6 +486,8 @@ mod tests {
             AgentActivityStatus::Started,
             AgentActivityStatus::Completed,
             AgentActivityStatus::Failed,
+            AgentActivityStatus::AwaitingApproval,
+            AgentActivityStatus::AwaitingInput,
             AgentActivityStatus::Cancelled,
         ] {
             assert_eq!(
@@ -484,7 +498,11 @@ mod tests {
         for state in [
             AgentToolAttemptState::Queued,
             AgentToolAttemptState::Running,
+            AgentToolAttemptState::AwaitingApproval,
+            AgentToolAttemptState::AwaitingInput,
             AgentToolAttemptState::Completed,
+            AgentToolAttemptState::Failed,
+            AgentToolAttemptState::Cancelled,
             AgentToolAttemptState::OutcomeUnknown,
         ] {
             assert_eq!(
@@ -503,6 +521,8 @@ mod tests {
         }
         for status in [
             AgentInteractionStatus::Pending,
+            AgentInteractionStatus::Approved,
+            AgentInteractionStatus::Rejected,
             AgentInteractionStatus::Answered,
             AgentInteractionStatus::Abandoned,
         ] {
