@@ -9,10 +9,13 @@ use std::{
 use axum::{
     Router,
     extract::{
-        Query, State,
+        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderMap, StatusCode,
+        header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL},
+    },
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -222,17 +225,29 @@ async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
+/// Subprotocol prefix used by browser clients that cannot set an
+/// `Authorization` header during the WebSocket handshake. The token travels in
+/// `Sec-WebSocket-Protocol`, never in the URL, so it cannot leak through
+/// request logs, referrers, or the address bar.
+const BEARER_SUBPROTOCOL_PREFIX: &str = "loom.bearer.";
+
 async fn websocket_handler(
-    upgrade: WebSocketUpgrade,
+    mut upgrade: WebSocketUpgrade,
     headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
     State(state): State<RemoteState>,
 ) -> Response {
-    let auth =
-        match request_token(&headers, &query).and_then(|token| state.auth.authenticate(token)) {
-            Ok(auth) => auth,
-            Err(error) => return auth_error_response(error),
-        };
+    let (token, subprotocol) = match request_auth(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_response(error),
+    };
+    let auth = match state.auth.authenticate(token) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_response(error),
+    };
+    if let Some(protocol) = subprotocol {
+        // Echo the selected subprotocol so the browser accepts the upgrade.
+        upgrade = upgrade.protocols([protocol.to_owned()]);
+    }
     upgrade
         .on_upgrade(move |socket| handle_socket(socket, state, auth))
         .into_response()
@@ -240,22 +255,32 @@ async fn websocket_handler(
 
 /// Resolves the bearer token for an incoming WebSocket upgrade.
 ///
-/// Browser `WebSocket` clients cannot set arbitrary request headers during
-/// the handshake, so in-browser clients authenticate with an `access_token`
-/// query parameter instead of the `Authorization` header native clients use.
-/// The header takes precedence when both are present.
-fn request_token<'a>(
-    headers: &'a HeaderMap,
-    query: &'a HashMap<String, String>,
-) -> Result<&'a str> {
-    match bearer_token(headers) {
-        Ok(token) => Ok(token),
-        Err(header_error) => query
-            .get("access_token")
-            .map(String::as_str)
-            .filter(|token| !token.is_empty())
-            .ok_or(header_error),
+/// Native clients send an `Authorization: Bearer` header. Browser `WebSocket`
+/// clients cannot set arbitrary handshake headers, so they carry the token in a
+/// `loom.bearer.<token>` subprotocol. The header takes precedence when both are
+/// present.
+fn request_auth(headers: &HeaderMap) -> Result<(&str, Option<&str>)> {
+    if let Ok(token) = bearer_token(headers) {
+        return Ok((token, None));
     }
+    if let Some(protocols) = headers
+        .get(SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+    {
+        for protocol in protocols.split(',') {
+            let protocol = protocol.trim();
+            if let Some(token) = protocol.strip_prefix(BEARER_SUBPROTOCOL_PREFIX)
+                && !token.is_empty()
+            {
+                return Ok((token, Some(protocol)));
+            }
+        }
+    }
+    Err(LoomError::new(
+        ErrorCode::AuthenticationRequired,
+        "authorization is required",
+        false,
+    ))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str> {
@@ -826,12 +851,15 @@ fn websocket_connect_error(error: TungsteniteError) -> LoomError {
 mod unit_tests {
     use super::{
         ConnectionControl, RemoteServer, RemoteServerConfig, WebSocketTransport,
-        auth_error_response, bearer_token, execute_request_with, process_text, request_token,
+        auth_error_response, bearer_token, execute_request_with, process_text, request_auth,
         try_send_response, websocket_connect_error,
     };
     use axum::{
         extract::ws::Message,
-        http::{HeaderMap, HeaderValue, header::AUTHORIZATION},
+        http::{
+            HeaderMap, HeaderValue,
+            header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL},
+        },
         response::IntoResponse,
     };
     use loom_core::{ErrorCode, ProtocolVersion, RequestId};
@@ -902,24 +930,29 @@ mod unit_tests {
     }
 
     #[test]
-    fn request_auth_prefers_a_valid_bearer_header_and_falls_back_to_query() {
+    fn request_auth_prefers_a_valid_bearer_header_over_a_subprotocol() {
         let mut headers = HeaderMap::new();
-        let query = HashMap::from([("access_token".to_owned(), "query-secret".to_owned())]);
-        assert_eq!(request_token(&headers, &query).unwrap(), "query-secret");
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("loom.bearer.subprotocol-secret"),
+        );
+        assert_eq!(
+            request_auth(&headers).unwrap(),
+            ("subprotocol-secret", Some("loom.bearer.subprotocol-secret"))
+        );
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_static("Bearer header-secret"),
         );
         assert_eq!(bearer_token(&headers).unwrap(), "header-secret");
-        assert_eq!(request_token(&headers, &query).unwrap(), "header-secret");
+        assert_eq!(request_auth(&headers).unwrap(), ("header-secret", None));
     }
 
     #[test]
-    fn request_auth_rejects_empty_query_and_malformed_or_non_bearer_headers() {
-        let mut headers = HeaderMap::new();
-        let empty_query = HashMap::from([("access_token".to_owned(), String::new())]);
+    fn request_auth_rejects_missing_empty_or_malformed_credentials() {
+        let headers = HeaderMap::new();
         assert_eq!(
-            request_token(&headers, &empty_query).unwrap_err().code,
+            request_auth(&headers).unwrap_err().code,
             ErrorCode::AuthenticationRequired
         );
         assert_eq!(
@@ -927,6 +960,7 @@ mod unit_tests {
             ErrorCode::AuthenticationRequired
         );
 
+        let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Basic abc"));
         assert_eq!(
             bearer_token(&headers).unwrap_err().code,
@@ -939,6 +973,16 @@ mod unit_tests {
         );
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
         assert_eq!(bearer_token(&headers).unwrap(), "");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("loom.bearer."),
+        );
+        assert_eq!(
+            request_auth(&headers).unwrap_err().code,
+            ErrorCode::AuthenticationRequired
+        );
     }
 
     #[test]

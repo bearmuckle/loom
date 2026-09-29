@@ -11,7 +11,6 @@ mod assets;
 #[cfg(target_family = "wasm")]
 mod browser;
 mod connection;
-#[cfg(not(target_family = "wasm"))]
 mod state;
 mod syntax;
 mod theme;
