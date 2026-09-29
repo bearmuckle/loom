@@ -609,11 +609,12 @@ impl LoomView {
                 let setup = match source {
                     None => Ok(()),
                     Some(SessionCreationSource::LocalDirectory(source)) => {
+                        let path = source_mount_path("sources", &source, &[]);
                         let response = backend
                             .submit(RequestEnvelope::new(ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory{
                                 session_id: snapshot.id,
                                 source,
-                                path: format!("sources/{}", uuid::Uuid::new_v4()),
+                                path,
                             })))
                             .wait()
                             .await;
@@ -624,12 +625,12 @@ impl LoomView {
                     }
                     Some(SessionCreationSource::GitHub(repository)) => {
                         log::info!("cloning GitHub repository {} into session {}", repository.full_name, snapshot.id);
-                        let repository_id = RepositoryId::new();
+                        let path = source_mount_path("repositories", &repository.full_name, &[]);
                         let response = backend
                             .submit(RequestEnvelope::new(ClientRequest::Repository(RepositoryRequest::AttachSessionRepository{
                                 session_id: snapshot.id,
                                 source: repository.clone_url,
-                                path: format!("repositories/{repository_id}"),
+                                path,
                                 revision: None,
                             })))
                             .wait()

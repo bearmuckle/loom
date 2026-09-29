@@ -91,9 +91,9 @@ mod display_helper_tests {
         command_line, command_purpose, commands_matching, completion_for_value, composer_height,
         format_bytes, format_duration, format_percentage, humanize_tool_output,
         is_redundant_completion_summary, relative_time, replace_command_token, replace_last_token,
-        rgb, run_state_color, run_state_label, session_is_active, session_status_pill, tool_detail,
-        tool_group_label, tool_group_status, tool_part_from_activity, tool_status, tool_title,
-        tool_title_for_activity,
+        rgb, run_state_color, run_state_label, session_is_active, session_status_pill,
+        source_mount_path, tool_detail, tool_group_label, tool_group_status,
+        tool_part_from_activity, tool_status, tool_title, tool_title_for_activity,
     };
     use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
     use loom_model::{ModelId, ToolCall};
@@ -122,6 +122,33 @@ mod display_helper_tests {
             name: name.to_owned(),
             arguments: json!({"path":"src/lib.rs"}),
         }
+    }
+
+    #[test]
+    fn source_mount_paths_are_readable_and_unique() {
+        assert_eq!(
+            source_mount_path("sources", "/home/me/My Project", &[]),
+            "sources/my-project"
+        );
+        assert_eq!(
+            source_mount_path("repositories", "owner/loom.git", &[]),
+            "repositories/loom"
+        );
+        assert_eq!(
+            source_mount_path("sources", "/tmp/repo/", &[]),
+            "sources/repo"
+        );
+        let existing = vec!["sources/repo".to_owned()];
+        assert_eq!(
+            source_mount_path("sources", "/tmp/repo", &existing),
+            "sources/repo-2"
+        );
+        let existing = vec!["sources/repo".to_owned(), "sources/repo-2".to_owned()];
+        assert_eq!(
+            source_mount_path("sources", "/tmp/repo", &existing),
+            "sources/repo-3"
+        );
+        assert_eq!(source_mount_path("sources", "///", &[]), "sources/source");
     }
 
     #[test]
