@@ -224,3 +224,214 @@ pub(crate) fn decode_content(connection: &Connection, hash: &[u8]) -> Result<Str
         )
     })
 }
+pub(crate) fn store_content(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8>> {
+    if content.len() > MAX_CONTENT_BYTES {
+        return Err(LoomError::invalid_request(
+            "persisted content exceeds the maximum supported size",
+        ));
+    }
+    let hash = Sha256::digest(content).to_vec();
+    let already_stored = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM content_objects WHERE hash=?1)",
+            [hash.as_slice()],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not check state content: {error}"), true)
+        })?;
+    if already_stored {
+        return Ok(hash);
+    }
+    let inline = (content.len() <= INLINE_CONTENT_BYTES)
+        .then(|| encode_inline_content(content))
+        .transpose()?;
+    transaction
+        .execute(
+            "INSERT INTO content_objects(hash, raw_size, inline_codec, inline_payload)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                hash,
+                content.len() as i64,
+                inline.as_ref().map(|(codec, _)| *codec),
+                inline.as_ref().map(|(_, payload)| payload.as_slice()),
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not store content metadata: {error}"), true)
+        })?;
+    if inline.is_some() {
+        return Ok(hash);
+    }
+    for (ordinal, part) in content.chunks(CONTENT_PART_BYTES).enumerate() {
+        let byte_offset = ordinal * CONTENT_PART_BYTES;
+        let part_hash = store_content_blob(transaction, part)?;
+        transaction
+            .execute(
+                "INSERT INTO content_parts(
+                    content_hash, ordinal, byte_offset, byte_length, blob_hash
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    hash,
+                    ordinal as i64,
+                    byte_offset as i64,
+                    part.len() as i64,
+                    part_hash
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not store content part reference: {error}"),
+                    true,
+                )
+            })?;
+    }
+    Ok(hash)
+}
+
+pub(crate) fn encode_inline_content(content: &[u8]) -> Result<(i64, Vec<u8>)> {
+    if content.len() >= 512 {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(content).map_err(|error| {
+            persistence_error(
+                format!("could not compress inline state content: {error}"),
+                false,
+            )
+        })?;
+        let compressed = encoder.finish().map_err(|error| {
+            persistence_error(
+                format!("could not compress inline state content: {error}"),
+                false,
+            )
+        })?;
+        if compressed.len().saturating_mul(100) <= content.len().saturating_mul(90) {
+            return Ok((1, compressed));
+        }
+    }
+    Ok((0, content.to_vec()))
+}
+
+pub(crate) fn store_content_blob(transaction: &Transaction<'_>, content: &[u8]) -> Result<Vec<u8>> {
+    debug_assert!(!content.is_empty() && content.len() <= CONTENT_PART_BYTES);
+    let hash = Sha256::digest(content).to_vec();
+    let (codec, payload) = if content.len() >= EXTERNAL_STRING_THRESHOLD {
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(content).map_err(|error| {
+            persistence_error(format!("could not compress state content: {error}"), false)
+        })?;
+        let compressed = encoder.finish().map_err(|error| {
+            persistence_error(format!("could not compress state content: {error}"), false)
+        })?;
+        if compressed.len().saturating_mul(100) <= content.len().saturating_mul(90) {
+            (1_i64, compressed)
+        } else {
+            (0_i64, content.to_vec())
+        }
+    } else {
+        (0_i64, content.to_vec())
+    };
+    transaction
+        .execute(
+            "INSERT INTO content_blobs(hash, raw_size, codec, payload) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(hash) DO NOTHING",
+            params![hash, content.len() as i64, codec, payload],
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not store state content part: {error}"), true)
+        })?;
+    Ok(hash)
+}
+
+pub(crate) fn collect_unused_content(
+    transaction: &Transaction<'_>,
+    candidate_limit: usize,
+) -> Result<()> {
+    let candidate_limit = i64::try_from(candidate_limit).map_err(|_| {
+        LoomError::invalid_request("content garbage-collection limit is out of range")
+    })?;
+    transaction
+        .execute(
+            "DELETE FROM content_objects
+             WHERE hash IN (
+                 SELECT hash FROM content_gc_candidates
+                 WHERE kind='object' ORDER BY hash LIMIT ?1
+             ) AND NOT EXISTS (
+                SELECT 1 FROM checkpoint_files
+                WHERE checkpoint_files.content_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_messages
+                WHERE run_messages.content_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_context_checkpoints
+                WHERE run_context_checkpoints.summary_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_activities
+                WHERE run_activities.data_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM run_tool_calls
+                WHERE run_tool_calls.arguments_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM runtime_configurations
+                WHERE runtime_configurations.system_instructions_hash=content_objects.hash
+                   OR runtime_configurations.repository_instructions_hash=content_objects.hash
+             ) AND NOT EXISTS (
+                SELECT 1 FROM filesystem_edits
+                WHERE filesystem_edits.before_hash=content_objects.hash
+             )",
+            [candidate_limit],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not collect unused content metadata: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM content_gc_candidates
+             WHERE kind='object' AND hash IN (
+                 SELECT hash FROM content_gc_candidates
+                 WHERE kind='object' ORDER BY hash LIMIT ?1
+             )",
+            [candidate_limit],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prune processed content candidates: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM content_blobs
+             WHERE hash IN (
+                 SELECT hash FROM content_gc_candidates
+                 WHERE kind='blob' ORDER BY hash LIMIT ?1
+             ) AND NOT EXISTS (
+                 SELECT 1 FROM content_parts WHERE content_parts.blob_hash=content_blobs.hash
+             )",
+            [candidate_limit],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not collect unused content parts: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute(
+            "DELETE FROM content_gc_candidates
+             WHERE kind='blob' AND hash IN (
+                 SELECT hash FROM content_gc_candidates
+                 WHERE kind='blob' ORDER BY hash LIMIT ?1
+             )",
+            [candidate_limit],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prune processed blob candidates: {error}"),
+                true,
+            )
+        })?;
+    Ok(())
+}

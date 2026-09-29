@@ -791,3 +791,236 @@ CREATE TABLE IF NOT EXISTS project_cancellation_cascade_members (
     FOREIGN KEY(task_id) REFERENCES delegated_tasks(task_id) ON DELETE CASCADE
 ) WITHOUT ROWID, STRICT;
 ";
+use super::*;
+
+/// Error raised when an incompatible database is opened without an explicit
+/// wipe. It tells the operator how to reset state instead of failing silently.
+pub fn incompatible_database_error(path: &Path, status: SchemaStatus) -> LoomError {
+    LoomError::new(
+        ErrorCode::MalformedPayload,
+        format!(
+            "persistence database '{}' uses {}; this build requires schema version \
+             {DATABASE_SCHEMA_VERSION} and does not migrate or import existing state. \
+             Re-run with state reset enabled (for example `--reset-state`) to wipe it, \
+             or point Loom at a different state path.",
+            path.display(),
+            status.description()
+        ),
+        false,
+    )
+}
+
+/// Inspects an on-disk database and, only when `wipe_if_incompatible` is true,
+/// wipes it so a fresh baseline can be created. Never wipes implicitly.
+pub fn prepare_database(path: &Path, wipe_if_incompatible: bool) -> Result<SchemaStatus> {
+    let status = FilePersistence::schema_status(path)?;
+    if status.is_compatible() || !wipe_if_incompatible {
+        return Ok(status);
+    }
+    FilePersistence::reset_database(path)?;
+    Ok(SchemaStatus::Absent)
+}
+
+/// The database file plus the SQLite sidecar files that must be removed
+/// together for a clean wipe.
+pub(crate) fn database_files(path: &Path) -> [PathBuf; 4] {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    let mut journal = path.as_os_str().to_os_string();
+    journal.push("-journal");
+    [
+        path.to_path_buf(),
+        PathBuf::from(wal),
+        PathBuf::from(shm),
+        PathBuf::from(journal),
+    ]
+}
+
+pub(crate) fn map_schema_version(version: u32) -> SchemaStatus {
+    if version == DATABASE_SCHEMA_VERSION {
+        SchemaStatus::Current
+    } else if version == 0 {
+        // A SQLite file that has not been initialized yet; `initialize_schema`
+        // decides whether it is empty or an unrecognized layout.
+        SchemaStatus::Absent
+    } else {
+        SchemaStatus::OtherVersion(version)
+    }
+}
+
+/// Reads `PRAGMA user_version` through a read-only connection. Returns `None`
+/// when the file cannot be opened read-only or is not a SQLite database.
+pub(crate) fn schema_status_via_read_only_sqlite(path: &Path) -> Option<SchemaStatus> {
+    let connection =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .ok()?;
+    Some(map_schema_version(version))
+}
+
+/// Reads the schema version from the SQLite file header without opening the
+/// database. Used when a read-only SQLite connection is unavailable.
+pub(crate) fn schema_status_from_header(path: &Path) -> Result<SchemaStatus> {
+    let mut header = [0u8; 100];
+    let mut file = fs::File::open(path).map_err(|error| {
+        persistence_error(
+            format!(
+                "could not read persistence database '{}': {error}",
+                path.display()
+            ),
+            true,
+        )
+    })?;
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Ok(SchemaStatus::Unrecognized);
+        }
+        Err(error) => {
+            return Err(persistence_error(
+                format!(
+                    "could not read persistence database '{}': {error}",
+                    path.display()
+                ),
+                true,
+            ));
+        }
+    }
+    if &header[..16] != b"SQLite format 3\0" {
+        return Ok(SchemaStatus::Unrecognized);
+    }
+    let version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
+    Ok(map_schema_version(version))
+}
+
+pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
+    let database_version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| {
+            persistence_error(
+                format!("could not inspect persistence schema: {error}"),
+                true,
+            )
+        })?;
+    if database_version == DATABASE_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    // Loom is pre-1.0: there is no migration ladder and no legacy import. A
+    // database that was not written at the current baseline is rejected
+    // unchanged and must be wiped by the operator.
+    if database_version != 0 {
+        return Err(unsupported_database_error(database_version));
+    }
+
+    // Inspect before changing persistent SQLite settings. Unsupported databases
+    // must not even have their journal mode changed; this release starts with a
+    // new database only.
+    let has_user_tables: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not inspect persistence database: {error}"),
+                true,
+            )
+        })?;
+    if has_user_tables {
+        return Err(unsupported_database_error(0));
+    }
+
+    connection
+        .execute_batch("PRAGMA journal_mode = WAL;")
+        .map_err(|error| {
+            persistence_error(
+                format!("could not initialize persistence database: {error}"),
+                true,
+            )
+        })?;
+
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not initialize persistence schema: {error}"),
+            true,
+        )
+    })?;
+    transaction
+        .execute_batch(DATABASE_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create persistence schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(PROJECT_TASK_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project task schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(PROJECT_WORKTREE_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project worktree schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project manager wait schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not create project cancellation recovery schema: {error}"),
+                true,
+            )
+        })?;
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record persistence schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit persistence schema: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
+pub(crate) fn unsupported_database_error(database_version: u32) -> LoomError {
+    let found = if database_version == 0 {
+        "an unrecognized format".to_owned()
+    } else {
+        format!("schema version {database_version}")
+    };
+    LoomError::new(
+        ErrorCode::MalformedPayload,
+        format!(
+            "persistence database uses {found}; this build requires schema version {DATABASE_SCHEMA_VERSION} and does not migrate or import existing state. Wipe the state database to start fresh."
+        ),
+        false,
+    )
+}
