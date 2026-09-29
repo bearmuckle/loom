@@ -277,6 +277,8 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::ManageCheckpoints,
         Capability::ReadVcsStatus,
         Capability::ReadVcsDiff,
+        Capability::ReadUsage,
+        Capability::InspectContext,
         Capability::ReadSessionTask,
         Capability::StartSessionTask,
         Capability::ControlSessionTask,
@@ -335,6 +337,8 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
         Capability::WriteSessionFilesystem,
         Capability::ReadVcsStatus,
         Capability::ReadVcsDiff,
+        Capability::ReadUsage,
+        Capability::InspectContext,
         Capability::ReadSessionTask,
         Capability::StartSessionTask,
         Capability::ControlSessionTask,
@@ -975,6 +979,13 @@ mod tests {
     #[test]
     fn current_client_contract_negotiates_transcript_paging() {
         assert!(negotiation_capabilities().contains(Capability::ReadAgentRunMessages));
+    }
+
+    #[test]
+    fn current_client_contract_negotiates_usage_and_context_inspection() {
+        let capabilities = negotiation_capabilities();
+        assert!(capabilities.contains(Capability::ReadUsage));
+        assert!(capabilities.contains(Capability::InspectContext));
     }
 
     #[test]
