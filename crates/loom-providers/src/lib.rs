@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fmt, fs,
-    io::{BufRead, BufReader, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,

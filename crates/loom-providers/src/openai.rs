@@ -1,3 +1,5 @@
+use futures_util::StreamExt;
+
 use super::*;
 
 pub struct OpenAiCompatibleProvider {
@@ -329,22 +331,82 @@ pub fn send_openai_request(
     if !responses_api {
         payload["stream_options"] = serde_json::json!({"include_usage": true});
     }
-    let request = configure_request(ureq::post(endpoint))
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not start the provider runtime: {error}"),
+                true,
+            )
+        })?;
+    runtime.block_on(send_openai_request_async(
+        endpoint,
+        authorization,
+        headers,
+        payload,
+        provider,
+        responses_api,
+        call_ids,
+        cancel,
+        sink,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_openai_request_async(
+    endpoint: &str,
+    authorization: &str,
+    headers: &[(&str, &str)],
+    payload: serde_json::Value,
+    provider: &str,
+    responses_api: bool,
+    call_ids: Option<&mut BTreeMap<String, ToolCallId>>,
+    cancel: &CancellationToken,
+    sink: &mut dyn ModelStreamSink,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(PROVIDER_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|error| normalize_transport_error(provider, &error.to_string()))?;
+    let mut request = client
+        .post(endpoint)
         .header("Content-Type", "application/json")
-        .header("Accept", "text/event-stream");
-    let request = if authorization.is_empty() {
-        request
-    } else {
-        request.header("Authorization", authorization)
-    };
-    let request = headers.iter().fold(request, |request, (name, value)| {
-        request.header(*name, *value)
-    });
+        .header("Accept", "text/event-stream")
+        .json(&payload);
+    if !authorization.is_empty() {
+        request = request.header("Authorization", authorization);
+    }
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
     cancel.check()?;
     let response = request
-        .send_json(payload)
-        .map_err(|error| normalize_provider_request_error(provider, error))?;
-    let mut response = ensure_success(provider, response)?;
+        .send()
+        .await
+        .map_err(|error| normalize_transport_error(provider, &error.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        let detail = detail
+            .replace("Bearer ", "****** ")
+            .replace("token ", "token [redacted] ")
+            .chars()
+            .take(512)
+            .collect::<String>();
+        if detail.trim().is_empty() {
+            return Err(normalize_provider_error(provider, status.as_u16()));
+        }
+        return Err(LoomError::new(
+            ErrorCode::ProviderInvalidResponse,
+            format!(
+                "{provider} rejected the request (HTTP {}): {detail}",
+                status.as_u16()
+            ),
+            false,
+        ));
+    }
     let event_stream = response
         .headers()
         .get("content-type")
@@ -353,8 +415,7 @@ pub fn send_openai_request(
     let mut own_call_ids = BTreeMap::new();
     let call_ids = call_ids.unwrap_or(&mut own_call_ids);
     if !event_stream {
-        let mut response = response;
-        let body: serde_json::Value = response.body_mut().read_json().map_err(|error| {
+        let body: serde_json::Value = response.json().await.map_err(|error| {
             LoomError::new(
                 ErrorCode::ProviderInvalidResponse,
                 format!("{provider} returned a response that was not valid JSON: {error}"),
@@ -374,36 +435,41 @@ pub fn send_openai_request(
         }
         return Ok(());
     }
-    let reader = BufReader::new(response.body_mut().as_reader());
     let mut decoder = if responses_api {
         StreamDecoder::responses(provider.to_owned())
     } else {
         StreamDecoder::chat_completions(provider.to_owned())
     };
-    for line in reader.lines() {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    'outer: while let Some(chunk) = stream.next().await {
         cancel.check()?;
-        let line = line.map_err(|error| {
-            normalize_transport_error(provider, &format!("event stream read failed: {error}"))
-        })?;
-        let Some(payload) = line.strip_prefix("data:") else {
-            continue;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() {
-            continue;
-        }
-        if payload == "[DONE]" {
-            break;
-        }
-        let chunk: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
-            LoomError::new(
-                ErrorCode::ProviderInvalidResponse,
-                format!("{provider} sent an event that was not valid JSON: {error}"),
-                false,
-            )
-        })?;
-        if decoder.accept(&chunk, call_ids, sink)? == StreamFlow::Stop {
-            return Ok(());
+        let chunk =
+            chunk.map_err(|error| normalize_transport_error(provider, &error.to_string()))?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(index) = buffer.find('\n') {
+            let line = buffer[..index].trim_end_matches('\r').to_owned();
+            buffer.drain(..=index);
+            let Some(payload) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload.is_empty() {
+                continue;
+            }
+            if payload == "[DONE]" {
+                break 'outer;
+            }
+            let chunk: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::ProviderInvalidResponse,
+                    format!("{provider} sent an event that was not valid JSON: {error}"),
+                    false,
+                )
+            })?;
+            if decoder.accept(&chunk, call_ids, sink)? == StreamFlow::Stop {
+                return Ok(());
+            }
         }
     }
     decoder.finish(sink)
