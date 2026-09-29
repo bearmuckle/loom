@@ -25,8 +25,12 @@ tool messages for the next model turn instead of failing the run.
 
 The remaining problem is execution quality. There is still no explicit
 milestone gate for task completion, tool latency, or recovery rate. Tool calls
-are still emitted and executed one at a time; provider streaming is blocking;
-and the current tool surface still lacks structured limits and diagnostics.
+are still emitted and executed one at a time, and provider streaming is
+blocking. Workspace exploration now exposes bounded, structured search and
+listing limits: `search_text` supports regex, case-insensitive matching, and
+context lines; `list_files` supports depth, glob filtering, and entry limits;
+`glob` bounds file discovery; and oversized tool output keeps both ends with an
+explicit omitted-byte report instead of a silent head-only cut.
 
 ## Resolved since the previous audit
 
@@ -47,11 +51,24 @@ This is the right recovery shape for a failing test, a bad patch context, a
 missing path, or an invalid tool argument. Provider failures, cancellation,
 limits, and an empty model stream remain genuine run-level failures.
 
+### B4 - Workspace tools retain bounded exact-search limitations
+
+This finding is resolved. `search_text` now supports a regex mode, configurable
+case sensitivity, context lines, and a structured `max_results` limit that
+reports when it stops early. `list_files` accepts `depth`, a `glob` filter, and
+a `max_entries` limit. A dedicated `glob` tool returns bounded, sorted paths.
+`apply_patch` accepts a batch of exact edits in one call. `run_command` accepts
+a timeout and returns stdout and stderr separately with the exit status.
+Overstated output is truncated in the middle with an explicit omitted-byte
+count, and `read_file` reports the total line count and how to continue a
+ranged read. Coverage lives in `crates/loom-tools/src/lib.rs`. `web_search` is
+unchanged: it still uses a bounded provider adapter and does not fetch
+arbitrary URLs or retrieve full page content.
+
 | ID | Severity | Area | Remaining finding |
 | --- | --- | --- | --- |
 | B2 | High | Agent, tools | Tool calls execute strictly sequentially |
 | B3 | Medium | Providers | Blocking provider IO limits scalability |
-| B4 | Medium | Tools | Workspace tools retain bounded exact-search limitations |
 | B5 | Medium | Project | No measurable task-completion quality gate |
 
 ## Findings
@@ -100,43 +117,6 @@ scalability are material bottlenecks. `tokio` is already a workspace dependency
 used by `loom-server`, so an eventual async migration would fit the existing
 runtime model.
 
-### B4 - Workspace tools retain bounded exact-search limitations
-
-`loom-tools` exposes eight tools, two of which
-(`propose_plan`, `ask_user`) are control tools handled by the runtime rather
-than workspace capabilities. The six workspace tools are `list_files`,
-`read_file`, `search_text`, `web_search`, `apply_patch`, and `run_command`.
-
-The follow-up implementation improved the surface:
-
-- `read_file` supports line ranges (`crates/loom-tools/src/lib.rs:165-189`).
-- `search_text` supports a glob filter (`:197-220`, `:418-420`).
-- File walks use the ripgrep `ignore` and `globset` crates for repository
-  ignore rules and glob matching (`:359-451`).
-- Output truncation preserves UTF-8 boundaries and has regression coverage
-  (`:463-468`, `:757-764`).
-- `web_search` uses a provider interface with a bounded HTML adapter, bounded
-  result counts and fields, optional hostname filtering, and structured
-  citation output. It is classified as a network action so the default policy
-  requires approval.
-
-The remaining limitations are:
-
-- `search_text` performs exact `line.contains(query)` matching
-  (`:421-437`); it has no regex mode, index, or structured match records.
-- `list_files` still walks the entire selected workspace without depth,
-  pagination, or a structured result limit.
-- `read_file` and other output paths retain a fixed 64 KiB output limit
-  (`:90`, `:463-468`), with only a textual truncation marker.
-- `web_search` defaults to a public server-rendered search endpoint and accepts
-  an operator-configured `LOOM_WEB_SEARCH_ENDPOINT`; it does not provide
-  arbitrary URL fetching or page content retrieval. HTML markup and bot
-  protection can change independently of Loom, so parser fixtures and explicit
-  provider errors are preferred over silent fallback.
-
-The practical effect is bounded but still lower-signal repository exploration
-than a full ripgrep-style search API.
-
 ### B5 - No measurable task-completion quality gate
 
 The project has a substantial and useful transport, persistence, provider, and
@@ -159,11 +139,9 @@ These are ordered by user-visible benefit and confidence, not by layer:
    deliberately slow read-only calls in one model turn, prove they overlap
    while results retain model order, and serialize writes, commands, approvals,
    and dependent calls.
-2. Add regex or indexed search, depth/pagination controls, and structured
-   result limits while retaining ranged reads.
-3. Add representative task fixtures and measure turns per task, time to first
+2. Add representative task fixtures and measure turns per task, time to first
    token, search latency, tool-error recovery rate, and successful completion.
-4. Consider an async provider client only if those measurements show blocked
+3. Consider an async provider client only if those measurements show blocked
    provider workers or connection scalability are limiting factors.
 
 A full rewrite is not indicated. The remaining work is concentrated in

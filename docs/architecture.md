@@ -87,7 +87,11 @@ Suggested backend boundaries:
   incompatible database is rejected and must be wiped; domain and protocol
   types remain provider-neutral.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
-  result normalization, and tool adapters.
+  result normalization, and tool adapters. Workspace exploration is bounded:
+  search supports literal or regex matching with context and a result cap,
+  listing supports depth/glob/entry limits, edits can batch exact replacements,
+  commands accept a timeout, and oversized output keeps both ends with an
+  explicit omitted-byte report.
 - `loom-workspace`: session-root file trees, file contents, watches, edits,
   snapshots, and repository-instruction discovery.
 - `loom-process`: commands, terminals, task supervision, output streaming, and
