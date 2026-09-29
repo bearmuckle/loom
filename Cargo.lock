@@ -4303,7 +4303,6 @@ dependencies = [
  "loom-core",
  "loom-model",
  "loom-protocol",
- "loom-providers",
  "loom-session",
  "rusqlite",
  "serde",

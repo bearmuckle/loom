@@ -16,10 +16,13 @@ use loom_core::{
     ProjectId, ProjectManagerWaitId, ProjectManagerWaitRecord, ProjectManagerWaitStatus,
     ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
     ProjectWorktreeStatus, RepositoryId, RequestId, Result, RunAttemptId, RunId, SessionLimits,
-    StepId, TaskContextReference, TaskId, Timestamp, ToolCallId, UsageSnapshot, WorkspaceId,
-    WorkspaceRecord,
+    SessionManagerState, StepId, TaskContextReference, TaskId, Timestamp, ToolCallId,
+    UsageSnapshot, WorkspaceId, WorkspaceManagerState, WorkspaceRecord,
 };
-use loom_model::{ModelId, ProviderHealth, ProviderId, ProviderUsageSummary};
+use loom_model::{
+    ModelId, ProviderConfig, ProviderHealth, ProviderId, ProviderUsageKey, ProviderUsageSummary,
+    UsageLedger,
+};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
@@ -30,8 +33,6 @@ use loom_protocol::{
     SessionRepository, ToolResult, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
     WorkspaceEventEnvelope, WorkspaceFeedEvent,
 };
-use loom_providers::{ProviderConfig, ProviderUsageKey, UsageLedger};
-use loom_session::{SessionManagerState, WorkspaceManagerState};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, types::Value as SqlValue};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;

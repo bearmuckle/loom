@@ -1,5 +1,15 @@
+use std::collections::BTreeMap;
+
 use crate::{AgentSessionId, EventSequence, Timestamp, WorkspaceId};
 use serde::{Deserialize, Serialize};
+
+/// Serializable snapshot of the session manager, owned by the neutral domain
+/// layer so storage does not depend on the session crate.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionManagerState {
+    pub sessions: BTreeMap<AgentSessionId, AgentSessionSnapshot>,
+    pub next_sequence: EventSequence,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
