@@ -213,7 +213,7 @@ pub enum ModelStreamEvent {
 mod tests {
     use super::{
         CompletionOptions, FinishReason, MessageRole, ModelCapabilities, ModelId, ModelMessage,
-        ModelStreamEvent, ProviderId, TokenUsage,
+        ModelStreamEvent, ProviderHealth, ProviderId, ProviderKind, ProviderSummary, TokenUsage,
     };
 
     #[test]
@@ -290,5 +290,28 @@ mod tests {
             }
         );
         assert_eq!(TokenUsage::default().cached_input_tokens, 0);
+    }
+
+    #[test]
+    fn only_official_api_providers_require_a_credential_to_be_usable() {
+        let summary = |kind, credential_id| ProviderSummary {
+            id: ProviderId::new("fixture"),
+            kind,
+            display_name: "Fixture".to_owned(),
+            models: Vec::new(),
+            credential_id,
+            api_key_configurable: false,
+            health: ProviderHealth::default(),
+        };
+
+        assert!(ProviderKind::DeepSeek.requires_credential());
+        assert!(ProviderKind::OpenAi.requires_credential());
+        assert!(!ProviderKind::OpenAiCompatible.requires_credential());
+        assert!(!ProviderKind::Ollama.requires_credential());
+
+        assert!(!summary(ProviderKind::DeepSeek, None).is_usable());
+        assert!(summary(ProviderKind::DeepSeek, Some("key".to_owned())).is_usable());
+        assert!(!summary(ProviderKind::OpenAi, None).is_usable());
+        assert!(summary(ProviderKind::Ollama, None).is_usable());
     }
 }

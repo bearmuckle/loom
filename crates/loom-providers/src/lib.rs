@@ -916,6 +916,54 @@ mod tests {
     }
 
     #[test]
+    fn unconfigured_official_api_providers_stay_out_of_the_model_catalog() {
+        let registry =
+            ProviderRegistry::configured(Arc::new(InMemoryCredentialStore::default())).unwrap();
+
+        let provider_ids = registry
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .map(|provider| provider.id)
+            .collect::<Vec<_>>();
+        assert!(
+            provider_ids
+                .iter()
+                .any(|id| id.as_str() == OPENAI_PROVIDER_ID),
+            "OpenAI must remain visible for API-key setup"
+        );
+        assert!(
+            provider_ids
+                .iter()
+                .any(|id| id.as_str() == DEEPSEEK_PROVIDER_ID),
+            "DeepSeek must remain visible for API-key setup"
+        );
+
+        let models = registry.list_models().unwrap();
+        assert!(
+            !models
+                .iter()
+                .any(|model| model.provider.as_str() == DEEPSEEK_PROVIDER_ID),
+            "DeepSeek seed models must not appear before a key is configured"
+        );
+
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(DEEPSEEK_PROVIDER_ID),
+                "deepseek-key".to_owned(),
+            )
+            .unwrap();
+        assert!(
+            registry
+                .list_models()
+                .unwrap()
+                .iter()
+                .any(|model| model.provider.as_str() == DEEPSEEK_PROVIDER_ID),
+            "DeepSeek models must appear once a key is configured"
+        );
+    }
+
+    #[test]
     fn openai_api_key_is_stored_by_the_worker_and_redacted_from_provider_summaries() {
         let credentials = Arc::new(InMemoryCredentialStore::default());
         let registry = ProviderRegistry::with_credentials(credentials.clone());

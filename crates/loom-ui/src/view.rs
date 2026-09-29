@@ -244,8 +244,8 @@ pub(crate) fn command_palette_icon() -> AssetIconName {
 
 #[cfg(not(target_family = "wasm"))]
 use crate::connection::{
-    list_models, list_provider_ids, negotiate, set_workspace_config, start_run, worker_node_status,
-    workspace_config,
+    list_models, list_usable_provider_ids, negotiate, set_workspace_config, start_run,
+    worker_node_status, workspace_config,
 };
 #[cfg(target_family = "wasm")]
 use crate::{
