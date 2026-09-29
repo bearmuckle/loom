@@ -29,6 +29,21 @@ impl LoomView {
             .gap_1()
             .p_2();
 
+        let filter = self
+            .review_filter_input
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_lowercase())
+            .unwrap_or_default();
+        let mut visible_repository_files = 0usize;
+        if let Some(input) = self.review_filter_input.as_ref() {
+            body = body.child(
+                div()
+                    .w_full()
+                    .pb_1()
+                    .child(KitInput::new(input).id("review-file-filter").small()),
+            );
+        }
+
         if self.project_child_review.is_none() && self.session_repositories.len() > 1 {
             body = body.child(section_heading("REPOSITORIES"));
             for (index, repository) in self.session_repositories.iter().enumerate() {
@@ -59,6 +74,12 @@ impl LoomView {
         }
 
         if let Some(status) = &self.review.vcs {
+            let matching = status
+                .files
+                .iter()
+                .filter(|file| filter.is_empty() || file.path.to_lowercase().contains(&filter))
+                .collect::<Vec<_>>();
+            visible_repository_files = matching.len();
             let (files, additions, deletions) = git_status_totals(status);
             body = body.child(
                 div()
@@ -98,7 +119,7 @@ impl LoomView {
                             ),
                     ),
             );
-            for (index, file) in status.files.iter().enumerate() {
+            for (index, file) in matching.iter().enumerate() {
                 let path = file.path.clone();
                 let project_child_review = self.project_child_review.is_some();
                 let staged = matches!(
@@ -203,9 +224,11 @@ impl LoomView {
                 .filter(|(_, change)| {
                     self.review.repositories_loaded
                         && !belongs_to_repository(&change.path, &self.session_repositories)
+                        && (filter.is_empty() || change.path.to_lowercase().contains(&filter))
                 })
                 .collect::<Vec<_>>()
         };
+        let visible_workspace_files = workspace_changes.len();
         if !workspace_changes.is_empty() {
             body = body.child(div().mt_2().child(section_heading("OTHER WORKSPACE FILES")));
         }
@@ -256,12 +279,26 @@ impl LoomView {
                 .is_none_or(|status| status.files.is_empty())
         {
             body = body.child(empty_note("No changed files"));
+        } else if visible_repository_files == 0 && visible_workspace_files == 0 {
+            body = body.child(empty_note("No files match the filter"));
         }
 
-        let parent = cx.entity();
+        let parent_for_rows = cx.entity();
         let diff_list = list(self.review.list_state.clone(), move |index, _window, cx| {
-            let view = parent.read(cx);
-            view.render_review_row(index).into_any()
+            let view = parent_for_rows.read(cx);
+            let is_hunk = matches!(view.review.rows.get(index), Some(ReviewRow::Hunk { .. }));
+            let row = view.render_review_row(index);
+            if is_hunk {
+                let parent = parent_for_rows.clone();
+                row.id(("review-hunk-toggle", index))
+                    .cursor_pointer()
+                    .on_click(move |_, _, cx| {
+                        parent.update(cx, |this, cx| this.toggle_review_hunk(index, cx));
+                    })
+                    .into_any()
+            } else {
+                row.into_any()
+            }
         })
         .size_full();
         let mut detail = div().flex_1().min_w(px(0.)).flex().flex_col();
@@ -386,6 +423,7 @@ impl LoomView {
                                     .ghost()
                                     .xsmall()
                                     .tooltip("Previous hunk")
+                                    .accessibility_label("Previous hunk")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.jump_review_hunk(false, cx)
                                     })),
@@ -396,6 +434,7 @@ impl LoomView {
                                     .ghost()
                                     .xsmall()
                                     .tooltip("Next hunk")
+                                    .accessibility_label("Next hunk")
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.jump_review_hunk(true, cx)
                                     })),
@@ -411,6 +450,7 @@ impl LoomView {
                             .ghost()
                             .xsmall()
                             .tooltip("Toggle line wrapping")
+                            .accessibility_label("Toggle line wrapping")
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_review_wrap(cx))),
                     )
                     .when(!patch_text.is_empty(), |header| {
@@ -420,6 +460,7 @@ impl LoomView {
                                 .ghost()
                                 .xsmall()
                                 .tooltip("Copy diff patch")
+                                .accessibility_label("Copy diff patch")
                                 .on_click({
                                     let patch_text = patch_text.clone();
                                     move |_, _, cx| {
@@ -462,6 +503,12 @@ impl LoomView {
                 if added > 0 || removed > 0 {
                     header.push_str(&format!("  +{added} −{removed}"));
                 }
+                let collapsed = self
+                    .review
+                    .hunk_rows
+                    .iter()
+                    .position(|candidate| *candidate == index)
+                    .is_some_and(|hunk| self.review.collapsed_hunks.contains(&hunk));
                 div()
                     .w_full()
                     .px_2()
@@ -470,7 +517,7 @@ impl LoomView {
                     .font_family(mono_font())
                     .text_xs()
                     .text_color(rgb(0x93c5fd))
-                    .child(header)
+                    .child(format!("{}  {header}", if collapsed { "▸" } else { "▾" }))
             }
             ReviewRow::Line(line) => {
                 let (marker, background, foreground) = match line.kind {
