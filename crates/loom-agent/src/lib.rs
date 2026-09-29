@@ -1977,4 +1977,57 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
     }
+
+    /// Acceptance fixture: a representative task must run to completion,
+    /// execute its tools in model order, and produce the expected workspace
+    /// change without recovery.
+    #[test]
+    fn acceptance_demo_task_completes_with_ordered_tool_calls() {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task = AgentTask::new(
+            "inspect, change, and validate the workspace",
+            ModelId::new("deterministic/demo"),
+        )
+        .unwrap();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(DeterministicProvider::demo()),
+            tools,
+        );
+
+        let mut events = runtime.start().unwrap();
+        let mut approved = Vec::new();
+        loop {
+            if let Some(AgentEvent::RunCompleted { snapshot }) = events
+                .iter()
+                .find(|event| matches!(event, AgentEvent::RunCompleted { .. }))
+            {
+                assert_eq!(snapshot.state, AgentRunState::Completed);
+                break;
+            }
+            if let Some(call) = events.iter().find_map(|event| match event {
+                AgentEvent::ToolApprovalRequired { call, .. } => Some(call.clone()),
+                _ => None,
+            }) {
+                approved.push(call.name.clone());
+                events = runtime.approve(call.id).unwrap();
+            } else {
+                events = runtime.advance().unwrap();
+            }
+        }
+
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        assert_eq!(
+            approved,
+            vec!["apply_patch".to_owned(), "run_command".to_owned()]
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("loom-m1-demo.txt")).unwrap(),
+            "Loom M1 deterministic demo\n"
+        );
+        assert!(runtime.usage().tool_calls >= 3);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
