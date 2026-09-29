@@ -42,9 +42,12 @@ browser support. `loom-ui` is organized into:
   `gpui-kit`'s window root, not by Loom.
 
 Native adapters (process arguments, workspace preparation, local credential
-storage, repository bootstrap, and backend state files) live in `loom-local`,
-not in the UI, so the UI stays protocol-oriented and the native and browser
-paths share the same client surface.
+storage, repository bootstrap, backend state files, the in-process/remote
+transport, and the GitHub Copilot device-login flow) live in `loom-local`, not
+in the UI. `loom-ui` therefore depends only on `loom-protocol` (plus
+`loom-core`/`loom-model` for protocol types and `loom-local` on native
+targets), so the native and browser paths share the same protocol client
+surface and neither links the backend implementation.
 
 Backend requests are submitted to a single connection worker thread and
 awaited on a background task, so no UI handler blocks on backend latency. The
