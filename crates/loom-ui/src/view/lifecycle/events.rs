@@ -375,7 +375,19 @@ impl LoomView {
                     retryable: false,
                 }));
             }
-            AgentEvent::RunUsage { .. } | AgentEvent::RunUsageUpdated { .. } => {}
+            AgentEvent::RunUsage { usage, .. } => {
+                let run = self
+                    .review
+                    .usage
+                    .run
+                    .get_or_insert_with(UsageSnapshot::default);
+                run.input_tokens = usage.input_tokens;
+                run.output_tokens = usage.output_tokens;
+                run.cached_input_tokens = usage.cached_input_tokens;
+            }
+            AgentEvent::RunUsageUpdated { usage, .. } => {
+                self.review.usage.run = Some(usage.clone());
+            }
             AgentEvent::RunLimitReached { status, .. } => {
                 self.record_status(format!("Limit reached: {:?}", status.exceeded));
             }

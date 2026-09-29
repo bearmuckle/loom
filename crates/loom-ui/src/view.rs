@@ -25,18 +25,19 @@ use gpui_kit::component::{
     resizable_panel,
     select::{SearchableVec, Select, SelectEvent, SelectState},
     switch::Switch,
+    tab::{Tab, TabBar},
     text::TextView,
     tree::{Tree as KitTree, TreeItem, TreeState},
 };
 use gpui_kit::{
     Animation, AnimationExt, App, ClickEvent, ClipboardItem, Context, Element, Entity, FocusHandle,
-    Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, StyledText, Subscription,
-    Window, WindowAppearance, WindowControlArea, div, list, prelude::*, px,
+    Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, Rgba, StyledText,
+    Subscription, Window, WindowAppearance, WindowControlArea, div, list, prelude::*, px,
 };
 use loom_core::{
     ActivityId, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, AgentSessionState,
     CapabilitySet, ErrorCode, EventSequence, LoomError, RepositoryId, RunId, Timestamp, ToolCallId,
-    WorkspaceId, WorkspaceRecord,
+    UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_local::GitHubDeviceCode;
@@ -47,15 +48,15 @@ use loom_model::{MessageRole, ModelId, ModelMessage, ProviderKind, ProviderSumma
 use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
-    AgentRunSnapshotProjection, AgentRunState, ClientRequest, ContextRequest, EventsRequest,
-    EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse, GitDiffLineKind,
-    GitFileStatusKind, GitHubRepository, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE,
-    ProjectChildControlAction, ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse,
-    RepositoryRequest, RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest,
-    RunResponse, ServerEvent, ServerResponse, SessionDirectory, SessionRepository, SessionRequest,
-    SessionResponse, TaskRequest, TerminalRequest, UsageRequest, WorkerNodeConfig,
-    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceFeedEvent, WorkspaceRequest,
-    WorkspaceResponse,
+    AgentRunSnapshotProjection, AgentRunState, ClientRequest, ContextRequest, ContextResponse,
+    EventsRequest, EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
+    GitDiffLineKind, GitFileStatusKind, GitHubRepository, GitRepositoryStatus,
+    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction, ProjectRequest, ProjectResponse,
+    ProviderRequest, ProviderResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope,
+    ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerResponse, SessionDirectory,
+    SessionRepository, SessionRequest, SessionResponse, TaskRequest, TerminalRequest, UsageRequest,
+    UsageResponse, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
+    WorkspaceEntryKind, WorkspaceFeedEvent, WorkspaceRequest, WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_family = "wasm"))]
@@ -66,10 +67,10 @@ use crate::{
     MAX_REVIEW_CHANGES, MAX_REVIEW_DIFF,
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
-        AgentMode, AssistantPart, AssistantTurn, EvidenceText, GitHubLoginKind, GitHubLoginState,
-        RenameDialogState, ReviewPanel, ReviewRow, ReviewState, SystemNote, SystemTone,
-        ThemeChoice, TimelineItem, ToolPart, ToolPartStatus, bounded, bounded_to,
-        finish_assistant_turn, push_assistant_evidence, push_assistant_reasoning,
+        AgentMode, AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind,
+        GitHubLoginState, InspectorTab, RenameDialogState, ReviewRow, ReviewState, SystemNote,
+        SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus, UsageState, bounded,
+        bounded_to, finish_assistant_turn, push_assistant_evidence, push_assistant_reasoning,
         push_assistant_text, session_state_for_run, session_title_from_task, upsert_tool_part,
     },
     syntax::{self, Language},

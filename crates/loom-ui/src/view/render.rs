@@ -2,8 +2,8 @@ use super::*;
 
 mod composer;
 mod dialogs;
+mod inspector;
 mod pickers;
-mod review;
 mod root;
 mod sidebar;
 mod tool;

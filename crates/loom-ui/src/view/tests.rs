@@ -586,6 +586,7 @@ mod loom_view_render_tests {
         SessionSourceDialogPurpose, SettingsSection, WorkerConnectionState, WorkerNodeEntry,
     };
     use crate::state::GitHubLoginState;
+    use crate::state::InspectorTab;
     use crate::state::RenameDialogState;
     use crate::state::ReviewRow;
     use crate::state::ThemeChoice;
@@ -597,7 +598,9 @@ mod loom_view_render_tests {
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use gpui_kit::{AppContext, TestAppContext, px, size};
     use loom_core::CapabilitySet;
+    use loom_core::UsageSnapshot;
     use loom_core::{ActivityId, AgentSessionId, ErrorCode, RunId, Timestamp, ToolCallId};
+    use loom_model::ProviderUsageSummary;
     use loom_model::{
         ModelCapabilities, ModelDescriptor, ModelId, ProviderHealth, ProviderKind, ProviderSummary,
         ToolCall,
@@ -605,12 +608,13 @@ mod loom_view_render_tests {
     use loom_protocol::ToolResult;
     use loom_protocol::{
         AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
-        ClientRequest, EventsResponse, FileActivityOperation, FilesystemRequest,
+        ClientRequest, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
+        ContextSummary, EventsResponse, FileActivityOperation, FilesystemRequest,
         FilesystemResponse, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
         GitFileStatusKind, GitHubRepository, GitRepositoryStatus, ProviderRequest, RequestEnvelope,
         RunRequest, RunResponse, ServerResponse, SessionFilesystemChange, SessionFilesystemFile,
         SessionRepository, SessionRequest, SessionResponse, WorkerNodeResources, WorkerNodeStatus,
-        WorkspaceChangeKind, WorkspaceRequest,
+        WorkspaceChangeKind, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRequest,
     };
     use std::collections::BTreeSet;
     use std::time::Duration;
@@ -2548,14 +2552,14 @@ mod loom_view_render_tests {
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.find("toggle-review-sidebar-close").visible());
-            window.click("toggle-review-sidebar-close", cx);
+            assert!(window.find("close-inspector").visible());
+            window.click("close-inspector", cx);
         })
         .unwrap();
         cx.run_until_parked();
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            assert!(window.try_find("toggle-review-sidebar-close").is_none());
+            assert!(window.try_find("close-inspector").is_none());
         })
         .unwrap();
     }
@@ -3242,6 +3246,182 @@ mod loom_view_render_tests {
                 kind: WorkspaceChangeKind::Modified,
                 revision: None,
             }];
+        });
+    }
+
+    #[gpui_kit::test]
+    fn inspector_renders_agent_context_and_files_tabs(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.tab = InspectorTab::Agent;
+            view.active_run = Some(loom_protocol::AgentRunSnapshot {
+                id: RunId::new(),
+                attempt_id: loom_core::RunAttemptId::new(),
+                control_revision: 0,
+                session_id: view.active_session.id,
+                task: "review the right pane".to_owned(),
+                model: ModelId::new("deterministic/demo"),
+                state: loom_protocol::AgentRunState::Executing,
+                started_at: Timestamp::from_unix_millis(1),
+                updated_at: Timestamp::from_unix_millis(2),
+                completed_at: None,
+                summary: None,
+                evidence: vec![loom_core::EvidenceLink {
+                    label: "pr".to_owned(),
+                    uri: "https://example.com/pr/1".to_owned(),
+                }],
+            });
+            view.review.usage.session = Some(UsageSnapshot {
+                input_tokens: 1_200,
+                output_tokens: 400,
+                cached_input_tokens: 100,
+                tool_calls: 3,
+                cost_micros: 12_500,
+                elapsed_ms: 65_000,
+            });
+            view.review.usage.session_provider = Some(ProviderUsageSummary {
+                requests: 2,
+                cost_micros: 12_500,
+                ..ProviderUsageSummary::default()
+            });
+            view.timeline = vec![
+                TimelineItem::Plan {
+                    steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
+                    completed: BTreeSet::from([0]),
+                    active: Some(1),
+                },
+                TimelineItem::Assistant(AssistantTurn {
+                    parts: vec![AssistantPart::Tool(Box::new(ToolPart {
+                        id: ToolCallId::new(),
+                        name: "read_file".to_owned(),
+                        title: "Read src/lib.rs".to_owned(),
+                        status: ToolPartStatus::Completed,
+                        detail: Some("src/lib.rs".to_owned()),
+                        output: Some("contents".to_owned()),
+                        elapsed_ms: Some(12),
+                        approval_pending: false,
+                    }))],
+                    streaming: false,
+                }),
+            ];
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.tab = InspectorTab::Context;
+            view.context_inspection = Some(ContextInspection {
+                items: vec![
+                    ContextItem {
+                        kind: ContextItemKind::Task,
+                        label: "Task".to_owned(),
+                        estimated_tokens: 10,
+                        included: true,
+                        omission_reason: None,
+                    },
+                    ContextItem {
+                        kind: ContextItemKind::Conversation,
+                        label: "Conversation".to_owned(),
+                        estimated_tokens: 90,
+                        included: false,
+                        omission_reason: Some("over budget".to_owned()),
+                    },
+                ],
+                total_tokens: 100,
+                included_tokens: 120,
+                omitted_tokens: 90,
+                budget: ContextBudget::new(Some(100), None, 50).unwrap(),
+                compacted: true,
+                summary: Some(ContextSummary {
+                    text: "Earlier turns were summarised.".to_owned(),
+                    source_message_count: 4,
+                    projection_version: 1,
+                    source_digest: "digest".to_owned(),
+                    created_at: Timestamp::from_unix_millis(3),
+                }),
+            });
+            view.review.usage.run = Some(UsageSnapshot {
+                input_tokens: 30,
+                output_tokens: 10,
+                ..UsageSnapshot::default()
+            });
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.tab = InspectorTab::Files;
+            view.review.files.loaded = true;
+            view.review.files.entries = vec![
+                WorkspaceEntry {
+                    path: "src".to_owned(),
+                    kind: WorkspaceEntryKind::Directory,
+                    size: 0,
+                    modified_at: None,
+                    revision: "dir".to_owned(),
+                },
+                WorkspaceEntry {
+                    path: "src/main.rs".to_owned(),
+                    kind: WorkspaceEntryKind::File,
+                    size: 42,
+                    modified_at: None,
+                    revision: "rev".to_owned(),
+                },
+            ];
+            view.review.files.selected_path = Some("src/main.rs".to_owned());
+            view.review.files.selected_file = Some(SessionFilesystemFile {
+                session_id: view.active_session.id,
+                path: "src/main.rs".to_owned(),
+                content: "fn main() {}\n".to_owned(),
+                revision: "rev".to_owned(),
+            });
+        });
+        render_scenario(cx, |view| {
+            view.review.open = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.review.repositories_loaded = true;
+            view.review.wrap_lines = true;
+            view.review.selected_path = Some("README.md".to_owned());
+            view.review.selected_file = Some(SessionFilesystemFile {
+                session_id: view.active_session.id,
+                path: "README.md".to_owned(),
+                content: "line one\nline two".to_owned(),
+                revision: "rev".to_owned(),
+            });
+        });
+    }
+
+    #[gpui_kit::test]
+    fn run_usage_events_update_inspector_usage(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let run_id = RunId::new();
+            view.consume_agent_event(&loom_protocol::AgentEvent::RunUsage {
+                run_id,
+                usage: loom_model::TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    cached_input_tokens: 10,
+                },
+            });
+            let run = view.review.usage.run.as_ref().unwrap();
+            assert_eq!(run.input_tokens, 100);
+            assert_eq!(run.output_tokens, 50);
+            view.consume_agent_event(&loom_protocol::AgentEvent::RunUsageUpdated {
+                run_id,
+                usage: UsageSnapshot {
+                    input_tokens: 200,
+                    output_tokens: 60,
+                    cached_input_tokens: 10,
+                    tool_calls: 2,
+                    cost_micros: 5_000,
+                    elapsed_ms: 1_000,
+                },
+            });
+            let run = view.review.usage.run.as_ref().unwrap();
+            assert_eq!(run.tool_calls, 2);
+            assert_eq!(run.cost_micros, 5_000);
         });
     }
 

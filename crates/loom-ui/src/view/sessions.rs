@@ -43,6 +43,8 @@ impl LoomView {
         self.review.changes.clear();
         self.review.vcs = None;
         self.review.repositories_loaded = false;
+        self.review.usage = UsageState::default();
+        self.review.files = FilesState::default();
     }
 
     /// Loads a session synchronously.
