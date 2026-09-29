@@ -363,6 +363,60 @@ async fn authorized_client_can_configure_api_key_provider_on_remote_worker() {
 }
 
 #[tokio::test]
+async fn authorized_client_can_configure_deepseek_provider_on_remote_worker() {
+    let providers = loom_providers::ProviderRegistry::configured(Arc::new(
+        loom_providers::InMemoryCredentialStore::default(),
+    ))
+    .unwrap();
+    let backend = InProcessBackend::with_provider_registry(providers);
+    let (_backend, _auth, token, server) = server_with_backend(backend).await;
+    let mut connection = WebSocketTransport::new(server.websocket_url(), token.token.clone())
+        .connect()
+        .await
+        .unwrap();
+    negotiate(&mut connection).await;
+
+    let secret = "remote-deepseek-key-must-stay-private";
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ConfigureApiKeyProvider {
+                provider_id: loom_model::ProviderId::new("deepseek"),
+                api_key: secret.to_owned(),
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::ProviderConfigured
+        ))
+    ));
+    assert!(!format!("{response:?}").contains(secret));
+
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::ListProviders,
+        )))
+        .await
+        .unwrap();
+    let Ok(ServerResponse::Provider(ProviderResponse::Providers { providers })) = response.result
+    else {
+        panic!("unexpected provider response: {:?}", response.result);
+    };
+    let provider = providers
+        .iter()
+        .find(|provider| provider.id.as_str() == "deepseek")
+        .expect("DeepSeek provider should be listed");
+    assert_eq!(provider.kind, loom_model::ProviderKind::DeepSeek);
+    assert_eq!(provider.display_name, "DeepSeek");
+    assert!(provider.api_key_configurable);
+    assert!(provider.credential_id.is_some());
+    assert!(!format!("{provider:?}").contains(secret));
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn provider_configuration_requires_its_dedicated_capability() {
     let (_backend, auth, _token, server) = server().await;
     let token = auth

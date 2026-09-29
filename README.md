@@ -98,7 +98,9 @@ build checks.
 Configure the official OpenAI provider by entering an API key for the selected
 worker in the Providers dialog. OpenAI models can then be discovered and
 selected for agent runs. The default model is `gpt-6-luna`; override it with
-`LOOM_OPENAI_MODEL`. For an OpenAI-compatible gateway, configure
+`LOOM_OPENAI_MODEL`. The official DeepSeek provider is configured the same way;
+its default model is `deepseek-flash`, overridable with `LOOM_DEEPSEEK_MODEL`.
+For an OpenAI-compatible gateway, configure
 `LOOM_OPENAI_ENDPOINT`, `LOOM_API_KEY`, and `LOOM_MODEL`. API keys entered in
 the dialog are stored in a credential file next
 to that backend's SQLite database, separately for each backend installation.

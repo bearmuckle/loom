@@ -790,6 +790,7 @@ fn model_catalog_from_descriptors(descriptors: Vec<loom_model::ModelDescriptor>)
 pub(crate) fn provider_name_for_id(provider_id: &str) -> String {
     match provider_id {
         "openai" => "OpenAI".to_owned(),
+        "deepseek" => "DeepSeek".to_owned(),
         "github-copilot" => "GitHub Copilot".to_owned(),
         "ollama" => "Ollama".to_owned(),
         "deterministic" => "Demo".to_owned(),
@@ -950,7 +951,7 @@ mod tests {
         ClientConnection, LoomError, create_session_in_workspace, create_workspace,
         describe_startup_connection_error, include_discovered_models, list_models,
         list_provider_ids, list_workspace_sessions, list_workspaces, negotiate,
-        negotiation_capabilities, redact_secret, register_workspace,
+        negotiation_capabilities, provider_name_for_id, redact_secret, register_workspace,
         remote_url_is_secure_for_secrets, set_workspace_config, unexpected_response,
         worker_node_status, workspace_config,
     };
@@ -978,6 +979,19 @@ mod tests {
             "ws://user:pass@localhost/ws"
         ));
         assert!(!remote_url_is_secure_for_secrets("wss:///ws"));
+    }
+
+    #[test]
+    fn provider_names_use_branded_labels_and_pretty_fallbacks() {
+        assert_eq!(provider_name_for_id("openai"), "OpenAI");
+        assert_eq!(provider_name_for_id("deepseek"), "DeepSeek");
+        assert_eq!(provider_name_for_id("github-copilot"), "GitHub Copilot");
+        assert_eq!(provider_name_for_id("ollama"), "Ollama");
+        assert_eq!(provider_name_for_id("deterministic"), "Demo");
+        assert_eq!(
+            provider_name_for_id("my_custom-provider"),
+            "My Custom Provider"
+        );
     }
 
     #[test]

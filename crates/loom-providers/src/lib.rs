@@ -15,7 +15,8 @@ use loom_model::{
     TokenUsage, ToolCall,
 };
 pub use loom_model::{
-    CredentialRef, CredentialReference, GITHUB_COPILOT_API_ENDPOINT, GITHUB_COPILOT_CREDENTIAL_REF,
+    CredentialRef, CredentialReference, DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL,
+    DEEPSEEK_PROVIDER_ID, GITHUB_COPILOT_API_ENDPOINT, GITHUB_COPILOT_CREDENTIAL_REF,
     GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID, ModelProvider, OPENAI_API_ENDPOINT,
     OPENAI_DEFAULT_MODEL, OPENAI_PROVIDER_ID, ProviderConfig, ProviderDescriptor, ProviderHealth,
     ProviderHealthState, ProviderKind, ProviderSummary, ProviderUsageKey, ProviderUsageRecord,
@@ -892,6 +893,20 @@ mod tests {
             openai.models[0].id.as_str(),
             std::env::var("LOOM_OPENAI_MODEL").unwrap_or_else(|_| OPENAI_DEFAULT_MODEL.to_owned())
         );
+        let deepseek = openai_registry
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id.as_str() == DEEPSEEK_PROVIDER_ID)
+            .expect("DeepSeek should be a distinct configured provider");
+        assert_eq!(deepseek.kind, ProviderKind::DeepSeek);
+        assert_eq!(deepseek.display_name, "DeepSeek");
+        assert!(deepseek.api_key_configurable);
+        assert_eq!(
+            deepseek.models[0].id.as_str(),
+            std::env::var("LOOM_DEEPSEEK_MODEL")
+                .unwrap_or_else(|_| DEEPSEEK_DEFAULT_MODEL.to_owned())
+        );
         let serialized = serde_json::to_string(&registry.list_providers().unwrap()).unwrap();
         assert!(!serialized.contains("Bearer"));
     }
@@ -1025,6 +1040,134 @@ mod tests {
             .stream_collected(&request, &CancellationToken::new())
             .unwrap();
         assert!(events.iter().any(|event| matches!(event, ModelStreamEvent::TextDelta { text } if text == "OpenAI fixture")));
+        server
+            .join()
+            .expect("fixture server panicked")
+            .expect("fixture server failed");
+    }
+
+    #[test]
+    fn deepseek_provider_defaults_use_the_official_endpoint_and_model() {
+        let config = ProviderConfig::deepseek(DEEPSEEK_DEFAULT_MODEL);
+        assert_eq!(config.kind, ProviderKind::DeepSeek);
+        assert_eq!(config.endpoint.as_deref(), Some(DEEPSEEK_API_ENDPOINT));
+        assert_eq!(config.display_name, "DeepSeek");
+        assert!(config.credential.is_none());
+        assert_eq!(config.models[0].id.as_str(), DEEPSEEK_DEFAULT_MODEL);
+        assert!(config.models[0].capabilities.tool_calling);
+    }
+
+    #[test]
+    fn configured_deepseek_provider_serves_a_model_request_with_its_api_key() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> std::result::Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request = read_request_headers(&mut stream)?;
+            if !request.starts_with("POST /chat/completions ")
+                || !request.contains("Bearer deepseek-request-key")
+            {
+                return Err(
+                    "DeepSeek completion request had an unexpected path or credential".to_owned(),
+                );
+            }
+            write_response(
+                &mut stream,
+                "application/json",
+                r#"{"choices":[{"message":{"content":"DeepSeek fixture"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#,
+            )
+        });
+        let registry =
+            ProviderRegistry::with_credentials(Arc::new(InMemoryCredentialStore::default()));
+        let mut config = ProviderConfig::deepseek("fixture-model");
+        config.endpoint = Some(format!("http://{address}/chat/completions"));
+        config.models[0].id = ModelId::new("fixture-model");
+        registry.register(config).unwrap();
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(DEEPSEEK_PROVIDER_ID),
+                "deepseek-request-key".to_owned(),
+            )
+            .unwrap();
+
+        let provider = registry
+            .list_providers()
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id.as_str() == DEEPSEEK_PROVIDER_ID)
+            .expect("DeepSeek provider should be listed");
+        assert_eq!(provider.kind, ProviderKind::DeepSeek);
+        assert_eq!(provider.display_name, "DeepSeek");
+        assert!(provider.api_key_configurable);
+        assert!(provider.credential_id.is_some());
+
+        let request = ModelRequest {
+            model: ModelId::new("fixture-model"),
+            messages: vec![ModelMessage::new(MessageRole::User, "hello")],
+            tools: Vec::new(),
+            options: Default::default(),
+        };
+        let mut provider = registry.create_provider(&request.model).unwrap();
+        let events = provider
+            .stream_collected(&request, &CancellationToken::new())
+            .unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, ModelStreamEvent::TextDelta { text } if text == "DeepSeek fixture")
+        ));
+        server
+            .join()
+            .expect("fixture server panicked")
+            .expect("fixture server failed");
+    }
+
+    #[test]
+    fn deepseek_model_discovery_lists_all_advertised_models() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || -> std::result::Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let request = read_request_headers(&mut stream)?;
+            if !request.starts_with("GET /models ")
+                || !request.contains("Bearer deepseek-discovery-key")
+            {
+                return Err(
+                    "DeepSeek model request had an unexpected path or credential".to_owned(),
+                );
+            }
+            write_response(
+                &mut stream,
+                "application/json",
+                r#"{"data":[{"id":"deepseek-flash"},{"id":"deepseek-v4-pro"}]}"#,
+            )
+        });
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let registry = ProviderRegistry::with_credentials(credentials);
+        let mut config = ProviderConfig::deepseek(DEEPSEEK_DEFAULT_MODEL);
+        config.endpoint = Some(format!("http://{address}/chat/completions"));
+        registry.register(config).unwrap();
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(DEEPSEEK_PROVIDER_ID),
+                "deepseek-discovery-key".to_owned(),
+            )
+            .unwrap();
+
+        let models = registry
+            .discover_models(&ProviderId::new(DEEPSEEK_PROVIDER_ID))
+            .unwrap();
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["deepseek-flash", "deepseek-v4-pro"]
+        );
+        assert_eq!(
+            models[0].context_window,
+            Some(1_000_000),
+            "configured limits should carry over to discovered models"
+        );
         server
             .join()
             .expect("fixture server panicked")

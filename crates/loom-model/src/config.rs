@@ -14,6 +14,9 @@ pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-6-luna";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
 pub const OPENAI_API_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 pub const OPENAI_DEFAULT_MODEL: &str = "gpt-6-luna";
+pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
+pub const DEEPSEEK_API_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
+pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-flash";
 pub const GITHUB_COPILOT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -108,6 +111,34 @@ impl ProviderConfig {
                     streaming: true,
                     tool_calling: true,
                     vision: true,
+                    json_mode: true,
+                },
+            }],
+            credential: None,
+            input_cost_micros_per_1k: 0,
+            output_cost_micros_per_1k: 0,
+        }
+    }
+
+    /// Official DeepSeek API, exposed separately from OpenAI-compatible gateways.
+    pub fn deepseek(model: impl Into<ModelId>) -> Self {
+        let id = ProviderId::new(DEEPSEEK_PROVIDER_ID);
+        Self {
+            id: id.clone(),
+            kind: ProviderKind::DeepSeek,
+            display_name: "DeepSeek".to_owned(),
+            endpoint: Some(DEEPSEEK_API_ENDPOINT.to_owned()),
+            models: vec![ModelDescriptor {
+                id: model.into(),
+                provider: id,
+                display_name: "DeepSeek model".to_owned(),
+                context_window: Some(1_000_000),
+                max_input_tokens: None,
+                max_output_tokens: None,
+                capabilities: ModelCapabilities {
+                    streaming: true,
+                    tool_calling: true,
+                    vision: false,
                     json_mode: true,
                 },
             }],
