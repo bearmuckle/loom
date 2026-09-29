@@ -193,44 +193,58 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         let session_id = self.active_session.id;
+        let existing_mounts = self
+            .session_directories
+            .iter()
+            .map(|directory| directory.path.clone())
+            .chain(
+                self.session_repositories
+                    .iter()
+                    .map(|repository| repository.path.clone()),
+            )
+            .collect::<Vec<_>>();
         match source {
-            SessionCreationSource::LocalDirectory(source) => self.dispatch(
-                cx,
-                ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
-                    session_id,
-                    source,
-                    path: format!("sources/{}", uuid::Uuid::new_v4()),
-                }),
-                |view, response, cx| match response.result {
-                    Ok(ServerResponse::Filesystem(
-                        FilesystemResponse::SessionDirectoryAttached {
-                            directory,
-                            repositories,
-                        },
-                    )) => {
-                        view.session_directories.push(directory);
-                        if let Some(repository) = repositories.first() {
-                            view.selected_repository_id = Some(repository.id);
+            SessionCreationSource::LocalDirectory(source) => {
+                let path = source_mount_path("sources", &source, &existing_mounts);
+                self.dispatch(
+                    cx,
+                    ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
+                        session_id,
+                        source,
+                        path,
+                    }),
+                    |view, response, cx| match response.result {
+                        Ok(ServerResponse::Filesystem(
+                            FilesystemResponse::SessionDirectoryAttached {
+                                directory,
+                                repositories,
+                            },
+                        )) => {
+                            view.session_directories.push(directory);
+                            if let Some(repository) = repositories.first() {
+                                view.selected_repository_id = Some(repository.id);
+                            }
+                            view.session_repositories.extend(repositories);
+                            view.refresh_review(cx);
+                            cx.notify();
                         }
-                        view.session_repositories.extend(repositories);
-                        view.refresh_review(cx);
-                        cx.notify();
-                    }
-                    Err(error) => view.record_backend_error("attach directory", error),
-                    Ok(response) => view.record_backend_error(
-                        "attach directory",
-                        unexpected_response("directory attachment", response),
-                    ),
-                },
-            ),
+                        Err(error) => view.record_backend_error("attach directory", error),
+                        Ok(response) => view.record_backend_error(
+                            "attach directory",
+                            unexpected_response("directory attachment", response),
+                        ),
+                    },
+                );
+            }
             SessionCreationSource::GitHub(repository) => {
-                let repository_id = RepositoryId::new();
+                let path =
+                    source_mount_path("repositories", &repository.full_name, &existing_mounts);
                 self.dispatch(
                     cx,
                     ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
                         session_id,
                         source: repository.clone_url,
-                        path: format!("repositories/{repository_id}"),
+                        path,
                         revision: None,
                     }),
                     move |view, response, cx| match response.result {

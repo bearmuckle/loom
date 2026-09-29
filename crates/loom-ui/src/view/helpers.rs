@@ -756,6 +756,45 @@ pub(crate) fn belongs_to_repository(path: &str, repositories: &[SessionRepositor
     })
 }
 
+/// A readable, filesystem-safe mount path for an attached source, so workspace
+/// listings show `sources/my-repo/...` instead of an opaque id. A numeric
+/// suffix is added when the name is already mounted.
+pub(crate) fn source_mount_path(prefix: &str, source: &str, existing: &[String]) -> String {
+    let name = source
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(".git");
+    let mut slug = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['-', '.'])
+        .to_ascii_lowercase();
+    if slug.is_empty() {
+        slug = "source".to_owned();
+    }
+    let base = format!("{prefix}/{slug}");
+    if !existing.iter().any(|path| path == &base) {
+        return base;
+    }
+    let mut counter = 2;
+    loop {
+        let candidate = format!("{base}-{counter}");
+        if !existing.iter().any(|path| path == &candidate) {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
 pub(crate) fn tool_element_id(index: usize, part_index: usize) -> u64 {
     ((index as u64) << 32) | part_index as u64
 }
