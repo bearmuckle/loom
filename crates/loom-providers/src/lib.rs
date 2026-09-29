@@ -17,11 +17,11 @@ use loom_model::{
 pub use loom_model::{
     CredentialRef, CredentialReference, DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL,
     DEEPSEEK_PROVIDER_ID, GITHUB_COPILOT_API_ENDPOINT, GITHUB_COPILOT_CREDENTIAL_REF,
-    GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID, ModelProvider, OPENAI_API_ENDPOINT,
-    OPENAI_DEFAULT_MODEL, OPENAI_PROVIDER_ID, ProviderConfig, ProviderDescriptor, ProviderHealth,
-    ProviderHealthState, ProviderKind, ProviderSummary, ProviderUsageKey, ProviderUsageRecord,
-    ProviderUsageSummary, UnavailableProvider, UsageLedger, deterministic_descriptor,
-    estimate_tokens, github_copilot_descriptor,
+    GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID, GITHUB_REPOSITORY_CREDENTIAL_REF,
+    ModelProvider, OPENAI_API_ENDPOINT, OPENAI_DEFAULT_MODEL, OPENAI_PROVIDER_ID, ProviderConfig,
+    ProviderDescriptor, ProviderHealth, ProviderHealthState, ProviderKind, ProviderSummary,
+    ProviderUsageKey, ProviderUsageRecord, ProviderUsageSummary, UnavailableProvider, UsageLedger,
+    deterministic_descriptor, estimate_tokens, github_copilot_descriptor,
 };
 use serde::Deserialize;
 
@@ -44,6 +44,10 @@ pub use registry::*;
 pub use response::*;
 
 const GITHUB_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+/// The GitHub CLI OAuth app's public client id. A device flow against it
+/// yields a repository-scoped user token for clone, push, and pull requests,
+/// unlike the Copilot app token, which is limited to Copilot model access.
+const GITHUB_REPOSITORY_OAUTH_CLIENT_ID: &str = "178c6fc778ccc68e1d6a";
 const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const GITHUB_ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
@@ -1322,6 +1326,44 @@ mod tests {
                 .any(|model| model.id.as_str() == "untrusted/saved-model")
         );
         assert_eq!(registry.list_providers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn github_repository_authenticator_uses_the_cli_app() {
+        let repository = GitHubCopilotAuthenticator::repository();
+        assert_eq!(repository.client_id, GITHUB_REPOSITORY_OAUTH_CLIENT_ID);
+        assert_eq!(
+            GitHubCopilotAuthenticator::default().client_id,
+            GITHUB_OAUTH_CLIENT_ID
+        );
+    }
+
+    #[test]
+    fn github_account_token_prefers_repository_access() {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let registry = ProviderRegistry::with_credentials(credentials);
+        registry
+            .configure_github_copilot("copilot-secret".to_owned())
+            .unwrap();
+        assert_eq!(registry.github_account_token().unwrap(), "copilot-secret");
+
+        registry
+            .configure_github_repository("repository-secret".to_owned())
+            .unwrap();
+        assert_eq!(
+            registry.github_repository_token().unwrap(),
+            "repository-secret"
+        );
+        assert_eq!(
+            registry.github_account_token().unwrap(),
+            "repository-secret"
+        );
+
+        assert!(
+            registry
+                .configure_github_repository("  ".to_owned())
+                .is_err()
+        );
     }
 
     #[test]

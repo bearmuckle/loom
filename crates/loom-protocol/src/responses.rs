@@ -220,6 +220,22 @@ pub enum ProviderResponse {
         status: GitHubCopilotLoginStatus,
     },
 
+    GitHubRepositoryLoginStarted {
+        login_id: String,
+        user_code: String,
+        verification_uri: String,
+        expires_in: u64,
+        interval: u64,
+    },
+
+    GitHubRepositoryLoginStatus {
+        status: GitHubCopilotLoginStatus,
+    },
+
+    GitHubRepositoryAccess {
+        connected: bool,
+    },
+
     GitHubWriteAccess {
         enabled: bool,
     },

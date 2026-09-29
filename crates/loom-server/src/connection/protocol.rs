@@ -1,5 +1,30 @@
 use super::*;
 
+/// Which GitHub credential a device-login flow is acquiring. Copilot access is
+/// used for model calls; repository access is used for clone, push, and pull
+/// requests, which the Copilot app token cannot perform.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GitHubLoginKind {
+    Copilot,
+    Repository,
+}
+
+impl GitHubLoginKind {
+    fn authenticator(self) -> GitHubCopilotAuthenticator {
+        match self {
+            Self::Copilot => GitHubCopilotAuthenticator::default(),
+            Self::Repository => GitHubCopilotAuthenticator::repository(),
+        }
+    }
+
+    fn thread_name(self) -> &'static str {
+        match self {
+            Self::Copilot => "github-copilot-login",
+            Self::Repository => "github-repository-login",
+        }
+    }
+}
+
 impl InProcessConnection {
     pub fn request(&self, request: RequestEnvelope) -> ResponseEnvelope {
         let request_id = request.request_id;
@@ -262,6 +287,14 @@ impl InProcessConnection {
     }
 
     pub(crate) fn start_github_copilot_login(&self) -> Result<ServerResponse> {
+        self.start_github_device_login(GitHubLoginKind::Copilot)
+    }
+
+    pub(crate) fn start_github_repository_login(&self) -> Result<ServerResponse> {
+        self.start_github_device_login(GitHubLoginKind::Repository)
+    }
+
+    fn start_github_device_login(&self, kind: GitHubLoginKind) -> Result<ServerResponse> {
         const MAX_PENDING_LOGINS: usize = 8;
         const COMPLETED_LOGIN_RETENTION: Duration = Duration::from_secs(300);
 
@@ -274,7 +307,7 @@ impl InProcessConnection {
             MAX_PENDING_LOGINS,
             now + Duration::from_secs(3600),
         )?;
-        let device = match GitHubCopilotAuthenticator::default().begin() {
+        let device = match kind.authenticator().begin() {
             Ok(device) => device,
             Err(error) => {
                 self.backend.credentials.remove(&login_id);
@@ -290,12 +323,20 @@ impl InProcessConnection {
         let device_for_poll = device.clone();
         let worker_login_id = login_id.clone();
         let spawn_result = thread::Builder::new()
-            .name("github-copilot-login".to_owned())
+            .name(kind.thread_name().to_owned())
             .spawn(move || {
-                let status = match GitHubCopilotAuthenticator::default()
+                let status = match kind
+                    .authenticator()
                     .poll(&device_for_poll)
                     .and_then(|token| {
-                        backend.providers.configure_github_copilot(token)?;
+                        match kind {
+                            GitHubLoginKind::Copilot => {
+                                backend.providers.configure_github_copilot(token)?;
+                            }
+                            GitHubLoginKind::Repository => {
+                                backend.providers.configure_github_repository(token)?;
+                            }
+                        }
                         backend.persist_state()
                     }) {
                     Ok(()) => GitHubCopilotLoginStatus::Configured,
@@ -309,27 +350,47 @@ impl InProcessConnection {
             self.backend.credentials.remove(&login_id);
             return Err(LoomError::new(
                 ErrorCode::Internal,
-                format!("could not start GitHub Copilot sign-in: {error}"),
+                format!("could not start GitHub sign-in: {error}"),
                 false,
             ));
         }
 
-        Ok(ServerResponse::Provider(
-            ProviderResponse::GitHubCopilotLoginStarted {
+        Ok(ServerResponse::Provider(match kind {
+            GitHubLoginKind::Copilot => ProviderResponse::GitHubCopilotLoginStarted {
                 login_id,
                 user_code: device.user_code,
                 verification_uri: device.verification_uri,
                 expires_in: device.expires_in,
                 interval: device.interval,
             },
-        ))
+            GitHubLoginKind::Repository => ProviderResponse::GitHubRepositoryLoginStarted {
+                login_id,
+                user_code: device.user_code,
+                verification_uri: device.verification_uri,
+                expires_in: device.expires_in,
+                interval: device.interval,
+            },
+        }))
     }
 
     pub(crate) fn github_copilot_login_status(&self, login_id: &str) -> Result<ServerResponse> {
+        self.github_device_login_status(GitHubLoginKind::Copilot, login_id)
+    }
+
+    pub(crate) fn github_repository_login_status(&self, login_id: &str) -> Result<ServerResponse> {
+        self.github_device_login_status(GitHubLoginKind::Repository, login_id)
+    }
+
+    fn github_device_login_status(
+        &self,
+        kind: GitHubLoginKind,
+        login_id: &str,
+    ) -> Result<ServerResponse> {
         let status = self.backend.credentials.status(login_id, Instant::now())?;
-        Ok(ServerResponse::Provider(
-            ProviderResponse::GitHubCopilotLoginStatus { status },
-        ))
+        Ok(ServerResponse::Provider(match kind {
+            GitHubLoginKind::Copilot => ProviderResponse::GitHubCopilotLoginStatus { status },
+            GitHubLoginKind::Repository => ProviderResponse::GitHubRepositoryLoginStatus { status },
+        }))
     }
 
     pub(crate) fn authorize_request(&self, request: &ClientRequest) -> Result<()> {
@@ -730,12 +791,16 @@ impl InProcessConnection {
             | ClientRequest::Repository(RepositoryRequest::ListGitHubRepositories)
             | ClientRequest::Provider(ProviderRequest::StartGitHubCopilotLogin)
             | ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { .. })
+            | ClientRequest::Provider(ProviderRequest::StartGitHubRepositoryLogin)
+            | ClientRequest::Provider(ProviderRequest::GetGitHubRepositoryLoginStatus { .. })
             | ClientRequest::Provider(ProviderRequest::ConfigureGitHubWriteAccess { .. })
             | ClientRequest::Provider(ProviderRequest::GetGitHubWriteAccess)
+            | ClientRequest::Provider(ProviderRequest::GetGitHubRepositoryAccess)
             | ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { .. })
             | ClientRequest::Provider(ProviderRequest::GetProviderHealth { .. }) => {}
             ClientRequest::Provider(ProviderRequest::ConfigureGitHubCopilot { .. })
-            | ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. }) => {}
+            | ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider { .. })
+            | ClientRequest::Provider(ProviderRequest::ConfigureGitHubRepository { .. }) => {}
         }
 
         if let ClientRequest::Repository(RepositoryRequest::AttachSessionRepository {
@@ -832,5 +897,30 @@ impl InProcessConnection {
                 true,
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_login_kinds_select_their_authenticators() {
+        assert_eq!(
+            GitHubLoginKind::Copilot.authenticator().client_id,
+            loom_providers::GitHubCopilotAuthenticator::default().client_id
+        );
+        assert_ne!(
+            GitHubLoginKind::Repository.authenticator().client_id,
+            GitHubLoginKind::Copilot.authenticator().client_id
+        );
+        assert_eq!(
+            GitHubLoginKind::Copilot.thread_name(),
+            "github-copilot-login"
+        );
+        assert_eq!(
+            GitHubLoginKind::Repository.thread_name(),
+            "github-repository-login"
+        );
     }
 }

@@ -803,11 +803,50 @@ impl LoomView {
                 )
                 .child(
                     settings_card().child(settings_row(
+                        "GitHub repository access",
+                        "Authorize clone, push, and pull requests through the GitHub CLI app on the worker",
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if self.github_repository_connected {
+                                        rgb(0x9ad7bd)
+                                    } else {
+                                        rgb(0xfef3c7)
+                                    })
+                                    .child(if self.github_repository_connected {
+                                        "Authorized"
+                                    } else {
+                                        "Not authorized"
+                                    }),
+                            )
+                            .when(
+                                !self.github_repository_connected && self.login_enabled,
+                                |element| {
+                                    element.child(
+                                        Button::new("connect-github-repository")
+                                            .label("Authorize")
+                                            .small()
+                                            .on_click(
+                                                cx.listener(Self::authorize_github_repository),
+                                            ),
+                                    )
+                                },
+                            ),
+                        true,
+                        phone,
+                    )),
+                )
+                .child(
+                    settings_card().child(settings_row(
                         "Allow GitHub writes and pull requests",
                         "Let the agent push branches and open pull requests with the connected account",
                         Switch::new("github-write-access-toggle")
                             .checked(self.github_write_access)
-                            .disabled(!self.github_connected)
+                            .disabled(!self.github_repository_connected)
                             .accessibility_label("Allow GitHub writes and pull requests")
                             .on_change({
                                 let view = cx.entity();

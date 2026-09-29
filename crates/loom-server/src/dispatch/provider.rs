@@ -25,6 +25,16 @@ impl InProcessConnection {
                     ProviderResponse::ProviderConfigured,
                 ))
             }
+            ClientRequest::Provider(ProviderRequest::ConfigureGitHubRepository {
+                access_token,
+            }) => {
+                self.backend
+                    .providers
+                    .configure_github_repository(access_token)?;
+                Ok(ServerResponse::Provider(
+                    ProviderResponse::ProviderConfigured,
+                ))
+            }
             ClientRequest::Provider(ProviderRequest::ConfigureApiKeyProvider {
                 provider_id,
                 api_key,
@@ -46,6 +56,12 @@ impl InProcessConnection {
             ClientRequest::Provider(ProviderRequest::GetGitHubCopilotLoginStatus { login_id }) => {
                 self.github_copilot_login_status(&login_id)
             }
+            ClientRequest::Provider(ProviderRequest::StartGitHubRepositoryLogin) => {
+                self.start_github_repository_login()
+            }
+            ClientRequest::Provider(ProviderRequest::GetGitHubRepositoryLoginStatus {
+                login_id,
+            }) => self.github_repository_login_status(&login_id),
             ClientRequest::Provider(ProviderRequest::ConfigureGitHubWriteAccess { enabled }) => {
                 self.backend.providers.set_github_write_access(enabled)?;
                 Ok(ServerResponse::Provider(
@@ -55,6 +71,11 @@ impl InProcessConnection {
             ClientRequest::Provider(ProviderRequest::GetGitHubWriteAccess) => Ok(
                 ServerResponse::Provider(ProviderResponse::GitHubWriteAccess {
                     enabled: self.backend.providers.github_write_access(),
+                }),
+            ),
+            ClientRequest::Provider(ProviderRequest::GetGitHubRepositoryAccess) => Ok(
+                ServerResponse::Provider(ProviderResponse::GitHubRepositoryAccess {
+                    connected: self.backend.providers.github_repository_token().is_ok(),
                 }),
             ),
             ClientRequest::Provider(ProviderRequest::DiscoverProviderModels { provider_id }) => {

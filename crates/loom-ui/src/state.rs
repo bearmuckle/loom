@@ -144,6 +144,31 @@ pub(crate) enum GitHubLoginState {
     Error(String),
 }
 
+/// Which GitHub credential the active device-login flow is acquiring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitHubLoginKind {
+    /// Copilot model access, obtained from the Copilot app.
+    Copilot,
+    /// Repository access for clone, push, and pull requests, obtained from the
+    /// GitHub CLI OAuth app.
+    Repository,
+}
+
+impl GitHubLoginKind {
+    /// The error shown when the worker connection is not secure enough to send
+    /// a GitHub token over it.
+    pub(crate) fn secure_connection_message(self) -> &'static str {
+        match self {
+            Self::Copilot => {
+                "GitHub Copilot sign-in requires a secure worker connection (wss:// or loopback ws://)."
+            }
+            Self::Repository => {
+                "GitHub repository sign-in requires a secure worker connection (wss:// or loopback ws://)."
+            }
+        }
+    }
+}
+
 impl Default for ReviewState {
     fn default() -> Self {
         Self {

@@ -114,6 +114,95 @@ fn browser_copilot_login_round_trips_without_access_tokens() {
 }
 
 #[test]
+fn browser_repository_login_round_trips_without_access_tokens() {
+    let request = RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::StartGitHubRepositoryLogin,
+    ));
+    assert_eq!(
+        request.request.required_capability(),
+        Some(Capability::ConfigureProviders)
+    );
+    assert_eq!(
+        decode_request(&encode_request(&request).unwrap()).unwrap(),
+        request
+    );
+
+    let response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::Provider(ProviderResponse::GitHubRepositoryLoginStarted {
+            login_id: "login-2".to_owned(),
+            user_code: "IJKL-MNOP".to_owned(),
+            verification_uri: "https://github.com/login/device".to_owned(),
+            expires_in: 900,
+            interval: 5,
+        }),
+    );
+    assert_eq!(
+        decode_response(&encode_response(&response).unwrap()).unwrap(),
+        response
+    );
+
+    let status_request = RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::GetGitHubRepositoryLoginStatus {
+            login_id: "login-2".to_owned(),
+        },
+    ));
+    assert_eq!(
+        status_request.request.required_capability(),
+        Some(Capability::ConfigureProviders)
+    );
+    assert_eq!(
+        decode_request(&encode_request(&status_request).unwrap()).unwrap(),
+        status_request
+    );
+    let status_response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::Provider(ProviderResponse::GitHubRepositoryLoginStatus {
+            status: GitHubCopilotLoginStatus::Configured,
+        }),
+    );
+    assert_eq!(
+        decode_response(&encode_response(&status_response).unwrap()).unwrap(),
+        status_response
+    );
+
+    let access_request = RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::GetGitHubRepositoryAccess,
+    ));
+    assert_eq!(
+        access_request.request.required_capability(),
+        Some(Capability::ListProviders)
+    );
+    assert_eq!(
+        decode_request(&encode_request(&access_request).unwrap()).unwrap(),
+        access_request
+    );
+    let access_response = ResponseEnvelope::success(
+        loom_core::RequestId::new(),
+        ServerResponse::Provider(ProviderResponse::GitHubRepositoryAccess { connected: true }),
+    );
+    assert_eq!(
+        decode_response(&encode_response(&access_response).unwrap()).unwrap(),
+        access_response
+    );
+
+    let configure = RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ConfigureGitHubRepository {
+            access_token: "gho_secret".to_owned(),
+        },
+    ));
+    assert_eq!(
+        configure.request.required_capability(),
+        Some(Capability::ConfigureProviders)
+    );
+    assert!(configure.request.is_retryable_mutation());
+    assert_eq!(
+        decode_request(&encode_request(&configure).unwrap()).unwrap(),
+        configure
+    );
+}
+
+#[test]
 fn workspace_config_defaults_the_pulse_threshold_for_older_saved_configs() {
     let old_config: WorkspaceConfig =
         serde_json::from_str(r#"{"revision":7,"worker_nodes":[]}"#).unwrap();

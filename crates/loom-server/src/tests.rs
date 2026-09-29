@@ -169,6 +169,107 @@ fn github_write_access_is_opt_in_and_round_trips() {
 }
 
 #[test]
+fn github_repository_access_configures_the_account_token() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    let before = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::GetGitHubRepositoryAccess,
+    )));
+    assert!(matches!(
+        before.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::GitHubRepositoryAccess { connected: false }
+        ))
+    ));
+
+    let configured = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::ConfigureGitHubRepository {
+            access_token: "gho_repository_secret".to_owned(),
+        },
+    )));
+    assert!(matches!(
+        configured.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::ProviderConfigured
+        ))
+    ));
+    assert_eq!(
+        backend
+            .provider_registry()
+            .github_repository_token()
+            .unwrap(),
+        "gho_repository_secret"
+    );
+    assert_eq!(
+        backend.provider_registry().github_account_token().unwrap(),
+        "gho_repository_secret"
+    );
+
+    let after = connection.request(RequestEnvelope::new(ClientRequest::Provider(
+        ProviderRequest::GetGitHubRepositoryAccess,
+    )));
+    assert!(matches!(
+        after.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::GitHubRepositoryAccess { connected: true }
+        ))
+    ));
+}
+
+#[test]
+fn github_repository_login_status_reports_progress() {
+    let backend = InProcessBackend::new();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+
+    let now = std::time::Instant::now();
+    backend
+        .credentials
+        .begin_pending(
+            "repository-login".to_owned(),
+            now,
+            Duration::from_secs(300),
+            8,
+            now + Duration::from_secs(600),
+        )
+        .unwrap();
+
+    let status_request = |login_id: &str| {
+        connection.request(RequestEnvelope::new(ClientRequest::Provider(
+            ProviderRequest::GetGitHubRepositoryLoginStatus {
+                login_id: login_id.to_owned(),
+            },
+        )))
+    };
+    let pending = status_request("repository-login");
+    assert!(matches!(
+        pending.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::GitHubRepositoryLoginStatus {
+                status: GitHubCopilotLoginStatus::Pending
+            }
+        ))
+    ));
+
+    backend
+        .credentials
+        .finish("repository-login", GitHubCopilotLoginStatus::Configured);
+    let configured = status_request("repository-login");
+    assert!(matches!(
+        configured.result,
+        Ok(ServerResponse::Provider(
+            ProviderResponse::GitHubRepositoryLoginStatus {
+                status: GitHubCopilotLoginStatus::Configured
+            }
+        ))
+    ));
+
+    assert!(status_request("missing-login").result.is_err());
+}
+
+#[test]
 fn opening_a_backend_migrates_legacy_openai_keys_to_its_scoped_store() {
     let root = std::env::temp_dir().join(format!("loom-legacy-provider-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();

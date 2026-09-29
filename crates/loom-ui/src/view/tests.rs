@@ -1645,6 +1645,31 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
+    fn github_repository_login_finishes_by_configuring_repository_access(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            view.github_login_kind = crate::state::GitHubLoginKind::Repository;
+            view.finish_github_login(Ok("gho_repo_token".to_owned()), cx);
+            view
+        });
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window.root::<LoomView>().unwrap().unwrap();
+            view.update(cx, |view, cx| {
+                assert!(view.github_repository_connected);
+                assert!(matches!(view.github_login, Some(GitHubLoginState::Success)));
+                view.refresh_github_repository_access(view.default_backend_node_id.clone(), cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn worker_connection_rejects_empty_credentialed_and_duplicate_inputs(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
@@ -4958,7 +4983,7 @@ mod provider_control_tests {
             let mut view = LoomView::new_for_test(cx.focus_handle());
             crate::connection::negotiate(&view.connection).unwrap();
             assert!(!view.github_write_access);
-            view.github_connected = true;
+            view.github_repository_connected = true;
             view.settings_open = true;
             view.settings_section = SettingsSection::Providers;
             view
@@ -4986,6 +5011,79 @@ mod provider_control_tests {
             view.update(cx, |view, cx| {
                 assert!(!view.github_write_access);
                 view.refresh_github_write_access("missing-node".to_owned(), cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[test]
+    fn github_login_kind_secure_messages_differ() {
+        assert!(
+            crate::state::GitHubLoginKind::Copilot
+                .secure_connection_message()
+                .contains("Copilot")
+        );
+        assert!(
+            crate::state::GitHubLoginKind::Repository
+                .secure_connection_message()
+                .contains("repository")
+        );
+    }
+
+    #[gpui_kit::test]
+    fn begin_github_login_clears_finished_states(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.github_login = Some(GitHubLoginState::Success);
+            view.begin_github_login(crate::state::GitHubLoginKind::Repository, cx);
+            assert!(view.github_login.is_none());
+            view.github_login = Some(GitHubLoginState::Error("failed".to_owned()));
+            view.begin_github_login(crate::state::GitHubLoginKind::Copilot, cx);
+            assert!(view.github_login.is_none());
+            view
+        });
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn github_repository_access_row_renders_when_disconnected(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            view.login_enabled = true;
+            view.github_repository_connected = false;
+            view.settings_open = true;
+            view.settings_section = SettingsSection::Providers;
+            view
+        });
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn github_copilot_login_finishes_by_registering_the_provider(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            view.github_login_kind = crate::state::GitHubLoginKind::Copilot;
+            view.finish_github_login(Ok("ghu_copilot_token".to_owned()), cx);
+            view
+        });
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window.root::<LoomView>().unwrap().unwrap();
+            view.update(cx, |view, _| {
+                assert!(view.github_connected);
+                assert!(matches!(view.github_login, Some(GitHubLoginState::Success)));
             });
         })
         .unwrap();
