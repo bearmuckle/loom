@@ -896,6 +896,31 @@ pub(crate) fn schema_status_from_header(path: &Path) -> Result<SchemaStatus> {
     Ok(map_schema_version(version))
 }
 
+/// A single schema migration, applied in ascending order. Each step is
+/// committed with its version recorded in `PRAGMA user_version`.
+struct Migration {
+    version: u32,
+    description: &'static str,
+    apply: fn(&Transaction<'_>) -> rusqlite::Result<()>,
+}
+
+/// The ordered schema migration ladder. New schema changes append a step with
+/// the next version instead of editing the baseline.
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    description: "baseline typed catalog, runs, filesystem, and feed schema",
+    apply: apply_baseline,
+}];
+
+fn apply_baseline(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(DATABASE_SCHEMA)?;
+    transaction.execute_batch(PROJECT_TASK_SCHEMA)?;
+    transaction.execute_batch(PROJECT_WORKTREE_SCHEMA)?;
+    transaction.execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)?;
+    transaction.execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)?;
+    Ok(())
+}
+
 pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
     let database_version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -908,34 +933,33 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
     if database_version == DATABASE_SCHEMA_VERSION {
         return Ok(());
     }
-
-    // Loom is pre-1.0: there is no migration ladder and no legacy import. A
-    // database that was not written at the current baseline is rejected
-    // unchanged and must be wiped by the operator.
-    if database_version != 0 {
+    if database_version > DATABASE_SCHEMA_VERSION {
+        // A database written by a newer build cannot be downgraded.
         return Err(unsupported_database_error(database_version));
     }
 
-    // Inspect before changing persistent SQLite settings. Unsupported databases
-    // must not even have their journal mode changed; this release starts with a
-    // new database only.
-    let has_user_tables: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-            )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| {
-            persistence_error(
-                format!("could not inspect persistence database: {error}"),
-                true,
+    if database_version == 0 {
+        // A fresh SQLite file is initialized in place. A non-empty file that
+        // lacks a recorded version is an unrecognized layout, not a migration
+        // source, so it is rejected rather than overwritten.
+        let has_user_tables: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                )",
+                [],
+                |row| row.get(0),
             )
-        })?;
-    if has_user_tables {
-        return Err(unsupported_database_error(0));
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not inspect persistence database: {error}"),
+                    true,
+                )
+            })?;
+        if has_user_tables {
+            return Err(unsupported_database_error(0));
+        }
     }
 
     connection
@@ -953,54 +977,31 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
             true,
         )
     })?;
-    transaction
-        .execute_batch(DATABASE_SCHEMA)
-        .map_err(|error| {
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > database_version)
+    {
+        (migration.apply)(&transaction).map_err(|error| {
             persistence_error(
-                format!("could not create persistence schema: {error}"),
+                format!(
+                    "could not apply persistence migration {} ({}): {error}",
+                    migration.version, migration.description
+                ),
                 true,
             )
         })?;
-    transaction
-        .execute_batch(PROJECT_TASK_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project task schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(PROJECT_WORKTREE_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project worktree schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(PROJECT_MANAGER_WAIT_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project manager wait schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .execute_batch(PROJECT_CANCELLATION_CASCADE_SCHEMA)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not create project cancellation recovery schema: {error}"),
-                true,
-            )
-        })?;
-    transaction
-        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
-        .map_err(|error| {
-            persistence_error(
-                format!("could not record persistence schema version: {error}"),
-                true,
-            )
-        })?;
+        transaction
+            .pragma_update(None, "user_version", migration.version)
+            .map_err(|error| {
+                persistence_error(
+                    format!(
+                        "could not record persistence schema version {}: {error}",
+                        migration.version
+                    ),
+                    true,
+                )
+            })?;
+    }
     transaction.commit().map_err(|error| {
         persistence_error(
             format!("could not commit persistence schema: {error}"),
@@ -1019,7 +1020,7 @@ pub(crate) fn unsupported_database_error(database_version: u32) -> LoomError {
     LoomError::new(
         ErrorCode::MalformedPayload,
         format!(
-            "persistence database uses {found}; this build requires schema version {DATABASE_SCHEMA_VERSION} and does not migrate or import existing state. Wipe the state database to start fresh."
+            "persistence database uses {found}; this build supports schema version {DATABASE_SCHEMA_VERSION} and has no migration path from it. Wipe the state database to start fresh."
         ),
         false,
     )
