@@ -84,21 +84,22 @@ Suggested backend boundaries:
 - `loom-model`: provider-independent model requests, streamed responses,
   tool-call normalization, token accounting, and model capabilities.
 - `loom-providers`: adapters for hosted APIs, OpenAI-compatible endpoints,
-  local model servers, authentication, rate limits, and provider health.
+  local model servers, authentication, rate limits, and provider health. HTTP
+  and streaming use an async `reqwest`/`tokio` client driven from synchronous
+  workers with a runtime.
 - `loom-context`: context inspection and assembly, repository/system
   instructions, summaries, compaction, and explicit token budgets.
 - `loom-persistence`: typed, indexed SQLite state storage used by the
-  in-process backend, split into per-aggregate modules (sessions, runs,
-  messages, filesystem, projects, catalog, feed, blobs). Durable state is
-  written in per-mutation transactions, and large immutable payloads live in a
-  content-addressed store inside SQLite. Schema changes are applied through an
-  ordered `MIGRATIONS` ladder that records each step in `PRAGMA user_version`;
-  a database from an unknown or newer version is still rejected rather than
-  overwritten. The composition root holds storage behind the `Persistence`
-  trait (`Arc<dyn Persistence>`), and `FilePersistence::in_memory()` shares the
-  same schema, repository, and migration code path as the file-backed store.
-  The crate depends only on neutral domain crates (`loom-core`/`loom-model`)
-  and the protocol contract, never on `loom-session`/`loom-providers`.
+  in-process backend, split into per-aggregate repository traits (catalog,
+  session, run, filesystem, feed, project) behind a `Persistence` supertrait.
+  Durable state is written in per-mutation transactions, and large immutable
+  payloads live in a content-addressed store inside SQLite. It uses a single
+  baseline schema (currently version 2); a database written by any other
+  revision is rejected unchanged and must be wiped. `FilePersistence` and
+  `FilePersistence::in_memory()` share the same schema, repository, and
+  serialization code path. The crate depends only on neutral domain crates
+  (`loom-core`/`loom-model`) and the protocol contract, never on
+  `loom-session`/`loom-providers`.
 - `loom-tools`: typed tool definitions, permission checks, execution policies,
   result normalization, and tool adapters. Workspace exploration is bounded:
   search supports literal or regex matching with context and a result cap,
