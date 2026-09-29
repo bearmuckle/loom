@@ -285,6 +285,19 @@ This first increment is implemented on branch `ui/review-pane-improvements`:
 - **Spend.** `GetSessionUsage` / `GetRunUsage` are fetched on tab view and pane
   open, and `RunUsage` / `RunUsageUpdated` events update the run snapshot live.
 
-Deferred to later slices: diff syntax highlighting and word-level highlights,
-side-by-side mode, collapsible hunks/expand-context, the Changes filter input,
-a deep file tree, and keyboard navigation.
+Diff rendering polish is implemented on branch `ui/inspector-diff-polish`:
+
+- **Syntax highlighting.** Diff lines are highlighted with the per-path
+  language, layered over the added/removed backgrounds.
+- **Intra-line emphasis.** Adjacent removed/added lines share a common
+  prefix/suffix and the differing span is highlighted with a stronger
+  background.
+- **Hunk headers.** Each `@@` header also reports the hunk's added/removed
+  counts.
+- **Copy patch.** The detail header reconstructs a unified patch (with hunk
+  headers) and copies it.
+
+This trades per-line text selection for highlighting; the diff can still be
+copied whole via "copy patch". Deferred to later slices: side-by-side mode,
+collapsible hunks/expand-context, the Changes filter input, a deep file tree,
+and keyboard navigation.
