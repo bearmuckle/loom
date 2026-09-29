@@ -9,6 +9,8 @@ gpui_kit::assets::icon_assets!(
     [
         // Loom controls and timeline.
         ArrowDown,
+        ArrowUp,
+        BotMessageSquare,
         Brain,
         Check,
         Clock,

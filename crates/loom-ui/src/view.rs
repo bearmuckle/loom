@@ -26,13 +26,14 @@ use gpui_kit::component::{
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     resizable_panel,
     select::{SearchableVec, Select, SelectEvent, SelectState},
+    switch::Switch,
     text::TextView,
     tree::{Tree as KitTree, TreeItem, TreeState},
 };
 use gpui_kit::{
     Animation, AnimationExt, App, ClickEvent, ClipboardItem, Context, Element, Entity, FocusHandle,
-    Focusable, HighlightStyle, MouseButton, Pixels, Render, StyledText, Subscription, Window,
-    WindowAppearance, WindowControlArea, div, list, prelude::*, px,
+    Focusable, FontWeight, HighlightStyle, MouseButton, Pixels, Render, StyledText, Subscription,
+    Window, WindowAppearance, WindowControlArea, div, list, prelude::*, px,
 };
 use loom_core::{
     ActivityId, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, AgentSessionState,
@@ -152,6 +153,22 @@ enum CompletionKind {
     Command,
     File,
 }
+
+/// The active pane in the settings dialog's section navigation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsSection {
+    Agents,
+    Providers,
+    Workers,
+    Appearance,
+}
+
+const SETTINGS_SECTIONS: [(SettingsSection, &str); 4] = [
+    (SettingsSection::Agents, "Agents"),
+    (SettingsSection::Providers, "Providers"),
+    (SettingsSection::Workers, "Workers"),
+    (SettingsSection::Appearance, "Appearance"),
+];
 
 /// The active inline completion in the composer, derived from the text before
 /// the cursor. Slash commands and `@` file references share one popup.
@@ -724,7 +741,8 @@ fn timeline_items_from_messages(
                         arguments: serde_json::Value::Null,
                     };
                     let mut part = tool_part_from_call(&call, ToolPartStatus::Completed);
-                    part.output = Some(bounded(&message.content));
+                    part.output =
+                        Some(bounded(&humanize_tool_output(&call.name, &message.content)));
                     upsert_tool_part(&mut timeline, part);
                 }
                 MessageRole::System => {}
@@ -937,16 +955,21 @@ fn model_choice_labels(
     models: &[ModelId],
     provider_names: Option<&BTreeMap<ModelId, String>>,
 ) -> BTreeMap<String, ModelId> {
-    models
-        .iter()
-        .map(|model| {
-            let provider = provider_names
-                .and_then(|names| names.get(model))
-                .map(String::as_str)
-                .unwrap_or("Provider");
-            (format!("{provider} · {}", model.as_str()), model.clone())
-        })
-        .collect()
+    let mut labels = BTreeMap::new();
+    for model in models {
+        let provider = provider_names
+            .and_then(|names| names.get(model))
+            .map(String::as_str)
+            .unwrap_or("Provider");
+        let short = model.as_str().to_owned();
+        let label = if labels.contains_key(&short) {
+            format!("{provider} · {short}")
+        } else {
+            short
+        };
+        labels.insert(label, model.clone());
+    }
+    labels
 }
 
 /// Opens a URL in a new tab/window. Natively this shells out to the OS's
@@ -979,23 +1002,6 @@ fn format_duration(elapsed_ms: u64) -> String {
             elapsed_ms / 60_000,
             (elapsed_ms % 60_000) / 1_000
         )
-    }
-}
-
-fn session_state_label(state: AgentSessionState) -> &'static str {
-    match state {
-        AgentSessionState::Idle => "Ready",
-        AgentSessionState::Queued => "Queued",
-        AgentSessionState::Planning => "Planning",
-        AgentSessionState::AwaitingApproval => "Needs approval",
-        AgentSessionState::Paused => "Paused",
-        AgentSessionState::Executing => "Working",
-        AgentSessionState::Evaluating => "Reviewing",
-        AgentSessionState::NeedsInput => "Needs your input",
-        AgentSessionState::Completed => "Complete",
-        AgentSessionState::Failed => "Something went wrong",
-        AgentSessionState::Cancelled => "Cancelled",
-        AgentSessionState::Archived => "Archived",
     }
 }
 
@@ -1101,7 +1107,7 @@ fn render_timeline_text(id: String, text: String, color: u32) -> gpui_kit::AnyEl
         TextView::markdown(id, text)
             .style(
                 gpui_kit::component::text::TextViewStyle::default().inline_code(HighlightStyle {
-                    background_color: Some(rgb(0x1b1d24).into()),
+                    background_color: Some(rgb(0x1b1d24).alpha(0.).into()),
                     ..Default::default()
                 }),
             )
@@ -1322,7 +1328,8 @@ fn humanize_tool_output(name: &str, output: &str) -> String {
             let status = string_field(&value, "status").unwrap_or_else(|| "created".to_owned());
             let mut summary = format!("Created sub-agent \"{child}\" · {status}");
             if let Some(task_id) = string_field(&value, "task_id") {
-                summary.push_str(&format!("\ntask {task_id}"));
+                let short = task_id.chars().take(8).collect::<String>();
+                summary.push_str(&format!("\ntask {short}"));
             }
             summary
         }
@@ -1336,11 +1343,16 @@ fn humanize_tool_output(name: &str, output: &str) -> String {
                 .and_then(serde_json::Value::as_array)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let mut summary = format!(
-                "return-ready: {ready}\n{} child{} returned",
+            let mut summary = if ready {
+                "All selected children are return-ready".to_owned()
+            } else {
+                "Selected children are not ready yet".to_owned()
+            };
+            summary.push_str(&format!(
+                "\n{} child{}:",
                 children.len(),
                 if children.len() == 1 { "" } else { "ren" }
-            );
+            ));
             for child in children {
                 let name =
                     string_field(child, "child_name").unwrap_or_else(|| "sub-agent".to_owned());
@@ -2008,6 +2020,7 @@ pub(crate) struct LoomView {
     agent_mode_select: Option<Entity<ModelSelectState>>,
     agent_mode_select_subscription: Option<Subscription>,
     pub(crate) settings_open: bool,
+    settings_section: SettingsSection,
     pub(crate) providers_open: bool,
     pub(crate) about_open: bool,
     pub(crate) providers: Vec<ProviderSummary>,
@@ -2176,6 +2189,199 @@ fn find_session_tree_item<'a>(items: &'a [TreeItem], session_id: &str) -> Option
     None
 }
 
+/// The total number of descendant sessions below a project tree node.
+fn session_tree_descendant_count(node: &SessionTreeNode) -> usize {
+    node.children.len()
+        + node
+            .children
+            .iter()
+            .map(session_tree_descendant_count)
+            .sum::<usize>()
+}
+
+/// Whether a project node or any of its descendants matches the lowercased
+/// filter. Projects are kept whole, so a child match keeps its root.
+fn session_tree_matches(node: &SessionTreeNode, filter: &str) -> bool {
+    node.label.to_lowercase().contains(filter)
+        || node
+            .children
+            .iter()
+            .any(|child| session_tree_matches(child, filter))
+}
+
+/// Keep every project whose root or any descendant matches the filter.
+fn filter_session_tree(tree: Vec<SessionTreeNode>, filter: &str) -> Vec<SessionTreeNode> {
+    tree.into_iter()
+        .filter(|node| session_tree_matches(node, filter))
+        .collect()
+}
+
+/// A compact status label with theme-resolved foreground and background colors
+/// for a project child row.
+struct SessionStatusPill {
+    label: &'static str,
+    foreground: u32,
+    background: u32,
+}
+
+impl SessionStatusPill {
+    const fn new(label: &'static str, foreground: u32, background: u32) -> Self {
+        Self {
+            label,
+            foreground,
+            background,
+        }
+    }
+}
+
+/// Map a delegated task's lifecycle state to a child row pill. Falls back to
+/// the session state for agents that have no durable task record.
+fn session_status_pill(
+    state: AgentSessionState,
+    task: Option<loom_core::DelegatedTaskStatus>,
+) -> SessionStatusPill {
+    use loom_core::DelegatedTaskStatus as Task;
+    if let Some(task) = task {
+        return match task {
+            Task::Queued => SessionStatusPill::new("Queued", 0xb7c0d0, 0x20242c),
+            Task::Running => SessionStatusPill::new("Running", 0x93c5fd, 0x263b58),
+            Task::Blocked => SessionStatusPill::new("Blocked", 0xfcd34d, 0x493b1a),
+            Task::Completed => SessionStatusPill::new("Done", 0x86efac, 0x24543d),
+            Task::Failed => SessionStatusPill::new("Failed", 0xfca5a5, 0x542936),
+            Task::Cancelled => SessionStatusPill::new("Cancelled", 0xb7c0d0, 0x20242c),
+        };
+    }
+    match state {
+        AgentSessionState::Idle | AgentSessionState::Archived => {
+            SessionStatusPill::new("Ready", 0xb7c0d0, 0x20242c)
+        }
+        AgentSessionState::Queued => SessionStatusPill::new("Queued", 0xb7c0d0, 0x20242c),
+        AgentSessionState::Planning => SessionStatusPill::new("Planning", 0x93c5fd, 0x263b58),
+        AgentSessionState::Executing => SessionStatusPill::new("Working", 0x93c5fd, 0x263b58),
+        AgentSessionState::Evaluating => SessionStatusPill::new("Reviewing", 0x93c5fd, 0x263b58),
+        AgentSessionState::AwaitingApproval => {
+            SessionStatusPill::new("Approval", 0xfcd34d, 0x493b1a)
+        }
+        AgentSessionState::NeedsInput => SessionStatusPill::new("Input", 0xfcd34d, 0x493b1a),
+        AgentSessionState::Paused => SessionStatusPill::new("Paused", 0xb7c0d0, 0x20242c),
+        AgentSessionState::Completed => SessionStatusPill::new("Done", 0x86efac, 0x24543d),
+        AgentSessionState::Failed => SessionStatusPill::new("Failed", 0xfca5a5, 0x542936),
+        AgentSessionState::Cancelled => SessionStatusPill::new("Cancelled", 0xb7c0d0, 0x20242c),
+    }
+}
+
+/// A small uppercase section heading inside a settings pane.
+fn settings_section_heading(label: &str) -> impl IntoElement {
+    div()
+        .text_xs()
+        .text_color(rgb(0x93c5fd))
+        .child(label.to_owned())
+}
+
+/// The rounded surface that groups related settings rows.
+fn settings_card() -> gpui_kit::Div {
+    div()
+        .w_full()
+        .rounded_lg()
+        .bg(rgb(0x171c25))
+        .border_1()
+        .border_color(rgb(0x293244))
+        .overflow_hidden()
+}
+
+/// One settings row: title and description on the left, a single control on the
+/// right. `first` suppresses the divider on the first row of a card.
+fn settings_row(
+    label: &str,
+    description: &str,
+    control: impl IntoElement,
+    first: bool,
+) -> impl IntoElement {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap_4()
+        .px_4()
+        .py_3()
+        .when(!first, |element| {
+            element.border_t_1().border_color(rgb(0x242833))
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .child(div().text_sm().child(label.to_owned()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x8f98a6))
+                        .child(description.to_owned()),
+                ),
+        )
+        .child(div().flex_shrink_0().child(control))
+}
+
+/// A `- value +` control used by numeric settings rows.
+fn settings_stepper(
+    decrease: impl IntoElement,
+    value: String,
+    increase: impl IntoElement,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(decrease)
+        .child(div().w(px(52.)).text_center().text_sm().child(value))
+        .child(increase)
+}
+
+/// The settings dialog's section navigation.
+fn settings_nav(section: SettingsSection, cx: &mut Context<LoomView>) -> impl IntoElement {
+    div()
+        .flex_shrink_0()
+        .w(px(180.))
+        .h_full()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .p_3()
+        .border_r_1()
+        .border_color(rgb(0x242833))
+        .children(
+            SETTINGS_SECTIONS
+                .into_iter()
+                .enumerate()
+                .map(|(index, (candidate, label))| {
+                    let selected = candidate == section;
+                    div()
+                        .id(("settings-section", index))
+                        .test_support()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(if selected {
+                            rgb(0x293244)
+                        } else {
+                            rgb(0x111318)
+                        })
+                        .text_color(if selected {
+                            rgb(0xe5e7eb)
+                        } else {
+                            rgb(0xb7c0d0)
+                        })
+                        .hover(|style| style.bg(rgb(0x20242c)))
+                        .child(label)
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.settings_section = candidate;
+                            cx.notify();
+                        }))
+                }),
+        )
+}
+
 #[cfg(test)]
 fn project_session_list_projection(
     sessions: &[AgentSessionSnapshot],
@@ -2254,11 +2460,6 @@ fn project_session_list_projection_for_project(
         .filter(|agent| agent.session_id != project.root_session_id)
         .map(|agent| (agent.session_id, agent))
         .collect::<BTreeMap<_, _>>();
-    let tasks_by_target = project
-        .tasks
-        .iter()
-        .map(|task| (task.target_session_id, task))
-        .collect::<BTreeMap<_, _>>();
     let mut agents_by_parent =
         BTreeMap::<AgentSessionId, Vec<&loom_core::ProjectAgentRecord>>::new();
     for agent in project
@@ -2277,39 +2478,9 @@ fn project_session_list_projection_for_project(
         agents_by_parent.entry(parent_id).or_default().push(agent);
     }
 
-    fn agent_label(
-        session: &AgentSessionSnapshot,
-        agent: &loom_core::ProjectAgentRecord,
-        task: Option<&loom_core::DelegatedTaskRecord>,
-    ) -> String {
-        let task_state = task.map_or_else(
-            || session_state_label(agent.state),
-            |task| project_task_status_label(task.status),
-        );
-        let task_summary = agent
-            .task_summary
-            .as_deref()
-            .map(|summary| format!(" — {summary}"))
-            .unwrap_or_default();
-        format!("↳ {} · {task_state}{task_summary}", session.name)
-    }
-
-    fn project_task_status_label(status: loom_core::DelegatedTaskStatus) -> &'static str {
-        match status {
-            loom_core::DelegatedTaskStatus::Queued => "queued",
-            loom_core::DelegatedTaskStatus::Running => "running",
-            loom_core::DelegatedTaskStatus::Blocked => "blocked",
-            loom_core::DelegatedTaskStatus::Completed => "completed",
-            loom_core::DelegatedTaskStatus::Failed => "failed",
-            loom_core::DelegatedTaskStatus::Cancelled => "cancelled",
-        }
-    }
-
     fn build_agent_node(
         session_id: AgentSessionId,
         sessions_by_id: &BTreeMap<AgentSessionId, &AgentSessionSnapshot>,
-        agents_by_id: &BTreeMap<AgentSessionId, &loom_core::ProjectAgentRecord>,
-        tasks_by_target: &BTreeMap<AgentSessionId, &loom_core::DelegatedTaskRecord>,
         agents_by_parent: &BTreeMap<AgentSessionId, Vec<&loom_core::ProjectAgentRecord>>,
         visited: &mut BTreeSet<AgentSessionId>,
     ) -> Option<SessionTreeNode> {
@@ -2317,28 +2488,17 @@ fn project_session_list_projection_for_project(
             return None;
         }
         let session = sessions_by_id.get(&session_id)?;
-        let label = agents_by_id.get(&session_id).map_or_else(
-            || session.name.clone(),
-            |agent| agent_label(session, agent, tasks_by_target.get(&session_id).copied()),
-        );
         let children = agents_by_parent
             .get(&session_id)
             .into_iter()
             .flatten()
             .filter_map(|agent| {
-                build_agent_node(
-                    agent.session_id,
-                    sessions_by_id,
-                    agents_by_id,
-                    tasks_by_target,
-                    agents_by_parent,
-                    visited,
-                )
+                build_agent_node(agent.session_id, sessions_by_id, agents_by_parent, visited)
             })
             .collect();
         Some(SessionTreeNode {
             session_id,
-            label,
+            label: session.name.clone(),
             children,
         })
     }
@@ -2361,8 +2521,6 @@ fn project_session_list_projection_for_project(
             build_agent_node(
                 agent.session_id,
                 &sessions_by_id,
-                &agents_by_id,
-                &tasks_by_target,
                 &agents_by_parent,
                 &mut visited,
             )
@@ -2374,8 +2532,6 @@ fn project_session_list_projection_for_project(
         if let Some(node) = build_agent_node(
             agent.session_id,
             &sessions_by_id,
-            &agents_by_id,
-            &tasks_by_target,
             &agents_by_parent,
             &mut visited,
         ) {
@@ -2834,6 +2990,7 @@ impl LoomView {
             agent_mode_select: None,
             agent_mode_select_subscription: None,
             settings_open: false,
+            settings_section: SettingsSection::Agents,
             providers_open: false,
             about_open: false,
             providers: Vec::new(),
@@ -3243,6 +3400,7 @@ impl LoomView {
             agent_mode_select: None,
             agent_mode_select_subscription: None,
             settings_open: false,
+            settings_section: SettingsSection::Agents,
             providers_open: false,
             about_open: false,
             providers: Vec::new(),
@@ -3434,6 +3592,7 @@ impl LoomView {
             agent_mode_select: None,
             agent_mode_select_subscription: None,
             settings_open: options.is_configured(),
+            settings_section: SettingsSection::Agents,
             providers_open: false,
             about_open: false,
             providers: Vec::new(),
@@ -3686,6 +3845,7 @@ impl LoomView {
             agent_mode_select: None,
             agent_mode_select_subscription: None,
             settings_open: false,
+            settings_section: SettingsSection::Agents,
             providers_open: false,
             about_open: false,
             providers: Vec::new(),
@@ -5399,7 +5559,8 @@ impl LoomView {
                     arguments: serde_json::Value::Null,
                 };
                 let mut part = tool_part_from_call(&call, status);
-                part.output = (!result.output.is_empty()).then(|| bounded(&result.output));
+                part.output = (!result.output.is_empty())
+                    .then(|| bounded(&humanize_tool_output(&result.name, &result.output)));
                 upsert_tool_part(&mut self.timeline, part);
             }
             AgentEvent::ActivityRecorded { activity, .. } => {
@@ -9280,15 +9441,7 @@ impl LoomView {
             .unwrap_or_default()
             .trim()
             .to_lowercase();
-        let visible_sessions = if filter.is_empty() {
-            self.sessions.clone()
-        } else {
-            self.sessions
-                .iter()
-                .filter(|session| session.name.to_lowercase().contains(&filter))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
+        let sessions = self.sessions.clone();
         let mut tree_projects = self.project_tree_snapshots.iter().collect::<Vec<_>>();
         if let Some(active_project) = self.project_snapshot.as_ref()
             && !tree_projects
@@ -9298,11 +9451,25 @@ impl LoomView {
             tree_projects.push(active_project);
         }
         let projection = project_session_list_projection_for_projects(
-            &visible_sessions,
+            &sessions,
             self.active_session.id,
             tree_projects,
         );
-        let tree_nodes = projection.tree;
+        let tree_nodes = if filter.is_empty() {
+            projection.tree
+        } else {
+            filter_session_tree(projection.tree, &filter)
+        };
+        let session_tasks = self
+            .project_tree_snapshots
+            .iter()
+            .flat_map(|project| project.tasks.iter())
+            .map(|task| (task.target_session_id, task.status))
+            .collect::<BTreeMap<_, _>>();
+        let descendant_counts = tree_nodes
+            .iter()
+            .map(|node| (node.session_id, session_tree_descendant_count(node)))
+            .collect::<BTreeMap<_, _>>();
         let tree_items = tree_nodes.iter().map(session_tree_item).collect::<Vec<_>>();
         let selected_session_id = self.active_session.id.to_string();
         let selected_item = find_session_tree_item(&tree_items, &selected_session_id);
@@ -9327,7 +9494,6 @@ impl LoomView {
             tree
         };
 
-        let sessions = visible_sessions.clone();
         let view = cx.entity();
         let menu_sessions = sessions.clone();
         let menu_view = view.clone();
@@ -9342,21 +9508,49 @@ impl LoomView {
                 return ListItem::new(("session-tree-root", index));
             };
             let label = entry.item().label.to_string();
-            let depth = entry.depth() as f32;
+            let depth = entry.depth();
+            let is_root = entry.is_root();
             let tree_indicator = if entry.is_folder() {
                 if entry.is_expanded() { "⌄" } else { "›" }
             } else {
                 " "
             };
-            let active_session_id = view.read(app).active_session.id;
-            let node_indicator = view
-                .read(app)
-                .render_session_node_indicator(session.id, index);
-            let running = session_is_active(session.state) && session.id != active_session_id;
-            let updated = relative_time(
-                session.updated_at.as_unix_millis(),
-                Timestamp::now().as_unix_millis(),
-            );
+            let node_indicator = is_root.then(|| {
+                view.read(app)
+                    .render_session_node_indicator(session.id, index)
+            });
+            let updated = is_root.then(|| {
+                relative_time(
+                    session.updated_at.as_unix_millis(),
+                    Timestamp::now().as_unix_millis(),
+                )
+            });
+            let descendant_count = descendant_counts.get(&session.id).copied().unwrap_or(0);
+            let count_badge =
+                (is_root && descendant_count > 0).then(|| descendant_count.to_string());
+            let root_active = is_root && session_is_active(session.state);
+            let pill = (!is_root).then(|| {
+                session_status_pill(session.state, session_tasks.get(&session.id).copied())
+            });
+            let icon = if is_root {
+                if entry.is_folder() {
+                    AssetIconName::Workflow
+                } else {
+                    AssetIconName::MessageSquare
+                }
+            } else {
+                AssetIconName::BotMessageSquare
+            };
+            let icon_color = if is_root || selected {
+                rgb(0x93c5fd)
+            } else {
+                rgb(0x8f98a6)
+            };
+            let label_color = if is_root {
+                rgb(0xe5e7eb)
+            } else {
+                rgb(0xb7c0d0)
+            };
             let click_view = view.clone();
             let click_session = session.clone();
             ListItem::new(("session-tree-root", index))
@@ -9366,7 +9560,7 @@ impl LoomView {
                 .text_size(gpui_kit::rems(0.8125))
                 .child(
                     div()
-                        .pl(px(depth * 12.))
+                        .pl(px(depth as f32 * 14.))
                         .w_full()
                         .flex()
                         .items_center()
@@ -9377,34 +9571,62 @@ impl LoomView {
                                 .text_color(rgb(0x8f98a6))
                                 .child(tree_indicator),
                         )
-                        .child(
-                            Icon::new(AssetIconName::MessagesSquare)
-                                .size_4()
-                                .text_color(if selected {
-                                    rgb(0x93c5fd)
-                                } else {
-                                    rgb(0x8f98a6)
-                                }),
-                        )
-                        .child(div().flex_1().min_w(px(0.)).truncate().child(label))
-                        .when(running, |element| {
-                            element.child(
-                                div()
-                                    .w(px(6.))
-                                    .h(px(6.))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .bg(rgb(0x60a5fa)),
-                            )
-                        })
+                        .child(Icon::new(icon).size_4().text_color(icon_color))
                         .child(
                             div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(rgb(0x64748b))
-                                .child(updated),
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_color(label_color)
+                                .when(is_root, |element| element.font_weight(FontWeight::SEMIBOLD))
+                                .child(label),
                         )
-                        .child(node_indicator),
+                        .when_some(count_badge, |element, count| {
+                            element.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px(px(6.))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(if root_active {
+                                        rgb(0x2563eb)
+                                    } else {
+                                        rgb(0x30343f)
+                                    })
+                                    .text_xs()
+                                    .text_color(if root_active {
+                                        rgb(0x93c5fd)
+                                    } else {
+                                        rgb(0x64748b)
+                                    })
+                                    .child(count),
+                            )
+                        })
+                        .when_some(updated, |element, updated| {
+                            element.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(rgb(0x64748b))
+                                    .child(updated),
+                            )
+                        })
+                        .when_some(pill, |element, pill| {
+                            element.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px(px(7.))
+                                    .py(px(1.))
+                                    .rounded_full()
+                                    .bg(rgb(pill.background))
+                                    .text_xs()
+                                    .text_color(rgb(pill.foreground))
+                                    .child(pill.label),
+                            )
+                        })
+                        .when_some(node_indicator, |element, indicator| {
+                            element.child(indicator)
+                        }),
                 )
                 .on_click(move |_, _, cx| {
                     click_view.update(cx, |this, cx| {
@@ -9502,35 +9724,48 @@ impl LoomView {
     }
 
     pub(crate) fn render_model_picker(&self, phone: bool) -> impl IntoElement {
-        let mut picker = div()
-            .flex_1()
-            .min_w(if phone { px(100.) } else { px(120.) })
-            .w_full();
+        let mut picker = div().flex().items_center();
         if let Some(state) = &self.model_select {
             picker = picker.child(
-                Select::new(state)
-                    .id("session-model-select")
-                    .w_full()
-                    .menu_width(px(320.))
-                    .small()
-                    .accessibility_label("Model for this session")
-                    .placeholder("No model is configured")
-                    .search_placeholder("Search models"),
+                div()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .hover(|style| style.bg(rgb(0x293244)))
+                    .child(
+                        Select::new(state)
+                            .id("session-model-select")
+                            .max_w(if phone { px(150.) } else { px(220.) })
+                            .menu_width(px(320.))
+                            .small()
+                            .appearance(false)
+                            .accessibility_label("Model for this session")
+                            .placeholder("No model is configured")
+                            .search_placeholder("Search models"),
+                    ),
             );
         }
         picker
     }
 
     pub(crate) fn render_agent_mode_picker(&self, phone: bool) -> impl IntoElement {
-        let mut picker = div().w(if phone { px(110.) } else { px(140.) });
+        let mut picker = div().flex().items_center();
         if let Some(state) = &self.agent_mode_select {
             picker = picker.child(
-                Select::new(state)
-                    .id("agent-mode-select")
-                    .w_full()
-                    .small()
-                    .accessibility_label("Agent mode")
-                    .placeholder("Select agent mode"),
+                div()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .hover(|style| style.bg(rgb(0x293244)))
+                    .child(
+                        Select::new(state)
+                            .id("agent-mode-select")
+                            .max_w(if phone { px(110.) } else { px(140.) })
+                            .small()
+                            .appearance(false)
+                            .accessibility_label("Agent mode")
+                            .placeholder("Select agent mode"),
+                    ),
             );
         }
         picker
@@ -10807,88 +11042,77 @@ impl LoomView {
                 div()
                     .id("composer-input-box")
                     .w_full()
-                    .min_h(px(46.))
-                    .p_3()
                     .rounded_lg()
                     .bg(rgb(0x10141b))
                     .border_1()
                     .border_color(rgb(0x3b4555))
                     .text_color(rgb(0xe5e7eb))
                     .child(
-                        Textarea::new(composer)
-                            .aria_label(placeholder)
-                            .h(px(height))
-                            .appearance(false)
-                            .bordered(false),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .relative()
-                            .items_center()
-                            .gap_1()
-                            .child(self.render_agent_mode_picker(layout.phone))
-                            .child(self.render_model_picker(layout.phone)),
+                        div().p_3().child(
+                            Textarea::new(composer)
+                                .aria_label(placeholder)
+                                .h(px(height))
+                                .appearance(false)
+                                .bordered(false),
+                        ),
                     )
                     .child(
                         div()
+                            .px_3()
+                            .py_2()
                             .flex()
-                            .items_center()
+                            .flex_wrap()
                             .gap_2()
-                            .when(self.run_can_interrupt(), |element| {
-                                element.child(
-                                    Button::new("interrupt-run")
-                                        .label("Stop")
-                                        .danger()
-                                        .small()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.interrupt_active_run(cx);
-                                        })),
-                                )
-                            })
+                            .items_center()
+                            .justify_between()
+                            .border_t_1()
+                            .border_color(rgb(0x20242c))
                             .child(
-                                Button::new("send-message")
-                                    .label("Send")
-                                    .primary()
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.submit_composer(cx);
-                                    })),
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(self.render_agent_mode_picker(layout.phone))
+                                    .child(self.render_model_picker(layout.phone))
+                                    .child(
+                                        Button::new("open-command-palette")
+                                            .icon(Icon::new(AssetIconName::Command))
+                                            .label("K")
+                                            .ghost()
+                                            .xsmall()
+                                            .tooltip("Open the command palette")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_command_palette(cx);
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .when(self.run_can_interrupt(), |element| {
+                                        element.child(
+                                            Button::new("interrupt-run")
+                                                .label("Stop")
+                                                .danger()
+                                                .small()
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.interrupt_active_run(cx);
+                                                })),
+                                        )
+                                    })
+                                    .child(
+                                        Button::new("send-message")
+                                            .icon(Icon::new(AssetIconName::ArrowUp))
+                                            .primary()
+                                            .small()
+                                            .tooltip("Send (↵)")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.submit_composer(cx);
+                                            })),
+                                    ),
                             ),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_3()
-                    .text_xs()
-                    .text_color(rgb(0x64748b))
-                    .child("↵ send")
-                    .child("⇧↵ newline")
-                    .child("/ commands")
-                    .child("@ files")
-                    .child(
-                        Button::new("open-command-palette")
-                            .icon(Icon::new(AssetIconName::Command))
-                            .label("K")
-                            .ghost()
-                            .xsmall()
-                            .tooltip("Open the command palette")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_command_palette(cx);
-                            })),
                     ),
             )
     }
@@ -11632,7 +11856,7 @@ impl LoomView {
     }
 
     pub(crate) fn render_settings_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = self.default_model_select.as_ref().map_or_else(
+        let default_model_body = self.default_model_select.as_ref().map_or_else(
             || div().into_any_element(),
             |state| {
                 Select::new(state)
@@ -11645,15 +11869,439 @@ impl LoomView {
                     .into_any_element()
             },
         );
+
+        let section = self.settings_section;
+        let content: gpui_kit::AnyElement = match section {
+            SettingsSection::Agents => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(settings_section_heading("AGENTS"))
+                .child(
+                    settings_card()
+                        .child(settings_row(
+                            "Auto-approve non-destructive actions",
+                            "In Agent and Edit, writes, commands, and network won't prompt",
+                            Switch::new("session-auto-approve-toggle")
+                                .checked(self.auto_approve_actions)
+                                .disabled(
+                                    !self.is_connected()
+                                        || self.approval_settings_request_in_flight,
+                                )
+                                .accessibility_label("Auto-approve non-destructive actions")
+                                .on_change({
+                                    let view = cx.entity();
+                                    move |_checked, _window, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.toggle_auto_approve_actions(cx);
+                                        });
+                                    }
+                                }),
+                            true,
+                        ))
+                        .child(settings_row(
+                            "Default model for new sessions",
+                            "Used when a session has no model of its own",
+                            div().w(px(320.)).child(default_model_body),
+                            false,
+                        ))
+                        .child(settings_row(
+                            "Session indicator pulse threshold",
+                            "Pulse when CPU usage is above this value",
+                            settings_stepper(
+                                Button::new("cpu-pulse-threshold-decrease")
+                                    .label("-")
+                                    .small()
+                                    .disabled(
+                                        !self.is_connected()
+                                            || self.workspace_config.cpu_pulse_threshold_percent
+                                                == 0,
+                                    )
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.adjust_cpu_pulse_threshold(-1, cx);
+                                    })),
+                                format!(
+                                    "{}%",
+                                    self.workspace_config.cpu_pulse_threshold_percent.min(100)
+                                ),
+                                Button::new("cpu-pulse-threshold-increase")
+                                    .label("+")
+                                    .small()
+                                    .disabled(
+                                        !self.is_connected()
+                                            || self.workspace_config.cpu_pulse_threshold_percent
+                                                >= 100,
+                                    )
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.adjust_cpu_pulse_threshold(1, cx);
+                                    })),
+                            ),
+                            false,
+                        ))
+                        .child(settings_row(
+                            "Parallel project agents",
+                            "Maximum delegated agents running at once",
+                            settings_stepper(
+                                Button::new("project-agent-concurrency-decrease")
+                                    .label("-")
+                                    .small()
+                                    .disabled(
+                                        !self.is_connected()
+                                            || self.workspace_config.project_agent_concurrency
+                                                <= loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY,
+                                    )
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.adjust_project_agent_concurrency(-1, cx);
+                                    })),
+                                self.workspace_config.project_agent_concurrency.to_string(),
+                                Button::new("project-agent-concurrency-increase")
+                                    .label("+")
+                                    .small()
+                                    .disabled(
+                                        !self.is_connected()
+                                            || self.workspace_config.project_agent_concurrency
+                                                >= loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY,
+                                    )
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.adjust_project_agent_concurrency(1, cx);
+                                    })),
+                            ),
+                            false,
+                        )),
+                )
+                .into_any_element(),
+            SettingsSection::Providers => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(settings_section_heading("PROVIDERS"))
+                .child(
+                    settings_card().child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_start()
+                            .gap_3()
+                            .px_4()
+                            .py_3()
+                            .child(
+                                div()
+                                    .w(px(30.))
+                                    .h(px(30.))
+                                    .flex_shrink_0()
+                                    .rounded_md()
+                                    .bg(rgb(0x20242c))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        Icon::new(AssetIconName::Globe)
+                                            .size_4()
+                                            .text_color(rgb(0x93c5fd)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .child(div().text_sm().child("GitHub"))
+                                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
+                                        "Browse and clone repositories, and add GitHub \
+                                                 Copilot as a model provider.",
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_3()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(if self.github_connected {
+                                                rgb(0x9ad7bd)
+                                            } else {
+                                                rgb(0xfef3c7)
+                                            })
+                                            .child(if self.github_connected {
+                                                "Connected"
+                                            } else {
+                                                "Not connected"
+                                            }),
+                                    )
+                                    .when(
+                                        !self.github_connected && self.login_enabled,
+                                        |element| {
+                                            element.child(
+                                                Button::new("connect-github-account")
+                                                    .label("Connect GitHub")
+                                                    .small()
+                                                    .on_click(
+                                                        cx.listener(Self::toggle_github_login),
+                                                    ),
+                                            )
+                                        },
+                                    ),
+                            ),
+                    ),
+                )
+                .into_any_element(),
+            SettingsSection::Workers => {
+                let mut card = settings_card();
+                if self.worker_nodes.is_empty() {
+                    card = card.child(
+                        div()
+                            .px_4()
+                            .py_3()
+                            .text_xs()
+                            .text_color(rgb(0x8f98a6))
+                            .child("No worker connected. Add one below to load your sessions."),
+                    );
+                }
+                card = card.children(self.worker_nodes.iter().enumerate().map(|(index, node)| {
+                    let id = node.id;
+                    let status = &node.status;
+                    let node_id = status.node_id.clone();
+                    let resources = &status.resources;
+                    let connection_label = match node.connection_state {
+                        WorkerConnectionState::Disconnected => "not connected",
+                        WorkerConnectionState::Connecting => "connecting",
+                        WorkerConnectionState::Connected if status.online => "connected · online",
+                        WorkerConnectionState::Connected => "connected · offline",
+                        WorkerConnectionState::Failed => "connection failed",
+                    };
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .py_3()
+                        .when(index > 0, |element| {
+                            element.border_t_1().border_color(rgb(0x242833))
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(div().text_sm().text_color(rgb(0xe5e7eb)).child(format!(
+                                    "{} · {}",
+                                    worker_node_display_name(node),
+                                    connection_label,
+                                )))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(0x8f98a6))
+                                        .child(format_worker_node_resources(resources)),
+                                )
+                                .when_some(node.connection_detail.as_deref(), |element, detail| {
+                                    element.child(
+                                        div()
+                                            .mt_1()
+                                            .text_xs()
+                                            .text_color(
+                                                if node.connection_state
+                                                    == WorkerConnectionState::Failed
+                                                {
+                                                    rgb(0xfca5a5)
+                                                } else {
+                                                    rgb(0xfcd34d)
+                                                },
+                                            )
+                                            .child(detail.to_owned()),
+                                    )
+                                }),
+                        )
+                        .when(!node.is_local, |element| {
+                            element.child(
+                                Button::new(format!("remove-worker-node-{id}"))
+                                    .label("Remove")
+                                    .small()
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.remove_worker_node(id, cx)
+                                    })),
+                            )
+                        })
+                        .when(
+                            !node.is_local && self.node_backends.contains_key(&node_id),
+                            |element| {
+                                element.child(
+                                    Button::new(format!("worker-node-providers-{id}"))
+                                        .label("Providers")
+                                        .small()
+                                        .on_click(cx.listener(move |view, _, _, cx| {
+                                            view.open_providers_for_node(node_id.clone(), cx)
+                                        })),
+                                )
+                            },
+                        )
+                }));
+
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(settings_section_heading("WORKERS"))
+                    .when_some(self.browser_startup_error.as_deref(), |element, error| {
+                        element.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0xfca5a5))
+                                .child(error.to_owned()),
+                        )
+                    })
+                    .child(card)
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div().flex_1().child(
+                                    KitInput::new(self.node_input_state.as_ref().expect(
+                                        "worker connection input initialized before rendering",
+                                    ))
+                                    .id("worker-node-connection-input")
+                                    .small(),
+                                ),
+                            )
+                            .child(
+                                Button::new("connect-worker-node")
+                                    .label("Connect")
+                                    .small()
+                                    .on_click(
+                                        cx.listener(|view, _, _, cx| view.connect_worker_node(cx)),
+                                    ),
+                            ),
+                    )
+                    .child(div().text_xs().text_color(rgb(0x64748b)).child(
+                        "Use: ws://host:port/ws token · URLs are shared; access tokens are not",
+                    ))
+                    .into_any_element()
+            }
+            SettingsSection::Appearance => div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(settings_section_heading("APPEARANCE"))
+                .child(
+                    settings_card()
+                        .child(settings_row(
+                            "Theme",
+                            "Follow the system or choose a palette",
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .p_1()
+                                .rounded_md()
+                                .bg(rgb(0x20242c))
+                                .children(ThemeChoice::ALL.into_iter().enumerate().map(
+                                    |(index, choice)| {
+                                        let selected = choice == self.theme_choice;
+                                        div()
+                                            .id(("theme-choice", index))
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .bg(if selected {
+                                                rgb(0x263b58)
+                                            } else {
+                                                rgb(0x20242c)
+                                            })
+                                            .text_xs()
+                                            .text_color(if selected {
+                                                rgb(0xe5e7eb)
+                                            } else {
+                                                rgb(0xb7c0d0)
+                                            })
+                                            .child(choice.label())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.select_theme(choice, window, cx);
+                                            }))
+                                    },
+                                )),
+                            true,
+                        ))
+                        .child(settings_row(
+                            "Font size",
+                            "Relative to the system display scale",
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Button::new("font-scale-decrease")
+                                        .label("−")
+                                        .small()
+                                        .disabled(self.font_scale_percent <= MIN_FONT_SCALE_PERCENT)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.adjust_font_scale(
+                                                -FONT_SCALE_STEP_PERCENT,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(52.))
+                                        .text_center()
+                                        .text_sm()
+                                        .child(format!("{}%", self.font_scale_percent)),
+                                )
+                                .child(
+                                    Button::new("font-scale-increase")
+                                        .label("+")
+                                        .small()
+                                        .disabled(self.font_scale_percent >= MAX_FONT_SCALE_PERCENT)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.adjust_font_scale(
+                                                FONT_SCALE_STEP_PERCENT,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    Button::new("font-scale-reset")
+                                        .label("Reset")
+                                        .ghost()
+                                        .small()
+                                        .disabled(
+                                            self.font_scale_percent == DEFAULT_FONT_SCALE_PERCENT,
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.set_font_scale_percent(
+                                                DEFAULT_FONT_SCALE_PERCENT,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                ),
+                            false,
+                        )),
+                )
+                .into_any_element(),
+        };
+
         div()
             .id("settings-dialog")
             .size_full()
             .absolute()
             .top(px(0.))
             .left(px(0.))
-            .p_6()
             .flex()
             .flex_col()
+            .overflow_hidden()
             .bg(rgb(0x111318))
             .text_color(rgb(0xe5e7eb))
             .child(
@@ -11661,6 +12309,10 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .px_6()
+                    .py_4()
+                    .border_b_1()
+                    .border_color(rgb(0x242833))
                     .child(div().text_sm().text_color(rgb(0xf3f4f6)).child("Settings"))
                     .child(
                         div()
@@ -11688,440 +12340,19 @@ impl LoomView {
             )
             .child(
                 div()
-                    .mt_3()
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child("SESSION SETTINGS"),
-            )
-            .child(
-                div()
-                    .mt_2()
+                    .flex_1()
+                    .min_h(px(0.))
                     .flex()
-                    .items_center()
-                    .justify_between()
+                    .child(settings_nav(section, cx))
                     .child(
                         div()
+                            .id("settings-content")
                             .flex_1()
-                            .child("Auto-approve non-destructive actions")
-                            .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
-                                "In Agent and Edit, writes, commands, and network won't prompt",
-                            )),
-                    )
-                    .child(
-                        Button::new("session-auto-approve-toggle")
-                            .label(if self.auto_approve_actions {
-                                "On"
-                            } else {
-                                "Off"
-                            })
-                            .small()
-                            .disabled(
-                                !self.is_connected() || self.approval_settings_request_in_flight,
-                            )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.toggle_auto_approve_actions(cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_sm()
-                            .child("Default model for new sessions"),
-                    )
-                    .child(body),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child("Session indicator pulse threshold")
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x8f98a6))
-                                    .child("Pulse when CPU usage is above this value"),
-                            ),
-                    )
-                    .child(
-                        Button::new("cpu-pulse-threshold-decrease")
-                            .label("-")
-                            .small()
-                            .disabled(
-                                !self.is_connected()
-                                    || self.workspace_config.cpu_pulse_threshold_percent == 0,
-                            )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.adjust_cpu_pulse_threshold(-1, cx);
-                            })),
-                    )
-                    .child(div().w(px(44.)).text_center().text_sm().child(format!(
-                        "{}%",
-                        self.workspace_config.cpu_pulse_threshold_percent.min(100)
-                    )))
-                    .child(
-                        Button::new("cpu-pulse-threshold-increase")
-                            .label("+")
-                            .small()
-                            .disabled(
-                                !self.is_connected()
-                                    || self.workspace_config.cpu_pulse_threshold_percent >= 100,
-                            )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.adjust_cpu_pulse_threshold(1, cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child("Parallel project agents")
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x8f98a6))
-                                    .child("Maximum delegated agents running at once"),
-                            ),
-                    )
-                    .child(
-                        Button::new("project-agent-concurrency-decrease")
-                            .label("-")
-                            .small()
-                            .disabled(
-                                !self.is_connected()
-                                    || self.workspace_config.project_agent_concurrency
-                                        <= loom_protocol::MIN_PROJECT_AGENT_CONCURRENCY,
-                            )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.adjust_project_agent_concurrency(-1, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .w(px(44.))
-                            .text_center()
-                            .text_sm()
-                            .child(self.workspace_config.project_agent_concurrency.to_string()),
-                    )
-                    .child(
-                        Button::new("project-agent-concurrency-increase")
-                            .label("+")
-                            .small()
-                            .disabled(
-                                !self.is_connected()
-                                    || self.workspace_config.project_agent_concurrency
-                                        >= loom_protocol::MAX_PROJECT_AGENT_CONCURRENCY,
-                            )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.adjust_project_agent_concurrency(1, cx);
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_5()
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child("GITHUB ACCOUNT"),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(rgb(0x171c25))
-                    .border_1()
-                    .border_color(rgb(0x293244))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(div().text_sm().child("GitHub"))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if self.github_connected {
-                                        rgb(0x9ad7bd)
-                                    } else {
-                                        rgb(0xfef3c7)
-                                    })
-                                    .child(if self.github_connected {
-                                        "Connected"
-                                    } else {
-                                        "Not connected"
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .mt_1()
-                            .text_xs()
-                            .text_color(rgb(0x8f98a6))
-                            .child("Connect GitHub to browse and clone repositories. This also adds GitHub Copilot as a model provider. GitHub access includes read and write permissions for repositories you can access."),
-                    )
-                    .when(!self.github_connected && self.login_enabled, |card| {
-                        card.child(
-                            Button::new("connect-github-account")
-                                .label("Connect GitHub")
-                                .small()
-                                .on_click(cx.listener(Self::toggle_github_login)),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .mt_4()
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child("WORKER NODES"),
-            )
-            .when_some(self.browser_startup_error.as_deref(), |element, error| {
-                element.child(
-                    div()
-                        .mt_2()
-                        .text_xs()
-                        .text_color(rgb(0xfca5a5))
-                        .child(error.to_owned()),
-                )
-            })
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .when(self.worker_nodes.is_empty(), |element| {
-                        element.child(
-                            div()
-                                .p_2()
-                                .rounded_lg()
-                                .bg(rgb(0x171c25))
-                                .border_1()
-                                .border_color(rgb(0x293244))
-                                .text_xs()
-                                .text_color(rgb(0x8f98a6))
-                                .child(
-                                    "No worker connected. Add one below to load your sessions.",
-                                ),
-                        )
-                    })
-                    .children(self.worker_nodes.iter().map(|node| {
-                        let id = node.id;
-                        let status = &node.status;
-                        let node_id = status.node_id.clone();
-                        let resources = &status.resources;
-                        let connection_label = match node.connection_state {
-                            WorkerConnectionState::Disconnected => "not connected",
-                            WorkerConnectionState::Connecting => "connecting",
-                            WorkerConnectionState::Connected if status.online => {
-                                "connected · online"
-                            }
-                            WorkerConnectionState::Connected => "connected · offline",
-                            WorkerConnectionState::Failed => "connection failed",
-                        };
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .p_2()
-                                    .rounded_lg()
-                                    .bg(rgb(0x171c25))
-                                    .border_1()
-                                    .border_color(rgb(0x293244))
-                                    .text_xs()
-                                    .child(div().text_color(rgb(0xe5e7eb)).child(format!(
-                                        "{} · {} · {}",
-                                        worker_node_display_name(node),
-                                        connection_label,
-                                        format_worker_node_resources(resources),
-                                    )))
-                                    .when_some(
-                                        node.connection_detail.as_deref(),
-                                        |element, detail| {
-                                            element.child(
-                                                div()
-                                                    .mt_1()
-                                                    .text_xs()
-                                                    .text_color(
-                                                        if node.connection_state
-                                                            == WorkerConnectionState::Failed
-                                                        {
-                                                            rgb(0xfca5a5)
-                                                        } else {
-                                                            rgb(0xfcd34d)
-                                                        },
-                                                    )
-                                                    .child(detail.to_owned()),
-                                            )
-                                        },
-                                    ),
-                            )
-                            .when(!node.is_local, |element| {
-                                element.child(
-                                    Button::new(format!("remove-worker-node-{id}"))
-                                        .label("Remove")
-                                        .small()
-                                        .on_click(cx.listener(move |view, _, _, cx| {
-                                            view.remove_worker_node(id, cx)
-                                        })),
-                                )
-                            })
-                            .when(
-                                !node.is_local && self.node_backends.contains_key(&node_id),
-                                |element| {
-                                    element.child(
-                                        Button::new(format!("worker-node-providers-{id}"))
-                                            .label("Providers")
-                                            .small()
-                                            .on_click(cx.listener(move |view, _, _, cx| {
-                                                view.open_providers_for_node(node_id.clone(), cx)
-                                            })),
-                                    )
-                                },
-                            )
-                    })),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        KitInput::new(
-                            self.node_input_state
-                                .as_ref()
-                                .expect("worker connection input initialized before rendering"),
-                        )
-                        .id("worker-node-connection-input")
-                        .small(),
-                    )
-                    .child(
-                        Button::new("connect-worker-node")
-                            .label("Connect")
-                            .small()
-                            .on_click(cx.listener(|view, _, _, cx| view.connect_worker_node(cx))),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_1()
-                    .text_xs()
-                    .text_color(rgb(0x64748b))
-                    .child("Use: ws://host:port/ws token · URLs are shared; access tokens are not"),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .text_xs()
-                    .text_color(rgb(0x93c5fd))
-                    .child("THEME"),
-            )
-            .child(
-                div().mt_2().flex().flex_wrap().gap_1().children(
-                    ThemeChoice::ALL
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, choice)| {
-                            let selected = choice == self.theme_choice;
-                            div()
-                                .id(("theme-choice", index))
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(if selected {
-                                    rgb(0x293244)
-                                } else {
-                                    rgb(0x20242c)
-                                })
-                                .text_xs()
-                                .text_color(if selected {
-                                    rgb(0xf3f4f6)
-                                } else {
-                                    rgb(0xb7c0d0)
-                                })
-                                .cursor_pointer()
-                                .child(choice.label())
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.select_theme(choice, window, cx);
-                                }))
-                    }),
-                ),
-            )
-            .child(
-                div()
-                    .mt_3()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child("Font size")
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x8f98a6))
-                                    .child("Relative to the system display scale"),
-                            ),
-                    )
-                    .child(
-                        Button::new("font-scale-decrease")
-                            .label("−")
-                            .small()
-                            .disabled(self.font_scale_percent <= MIN_FONT_SCALE_PERCENT)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.adjust_font_scale(-FONT_SCALE_STEP_PERCENT, window, cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .w(px(48.))
-                            .text_center()
-                            .text_sm()
-                            .child(format!("{}%", self.font_scale_percent)),
-                    )
-                    .child(
-                        Button::new("font-scale-increase")
-                            .label("+")
-                            .small()
-                            .disabled(self.font_scale_percent >= MAX_FONT_SCALE_PERCENT)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.adjust_font_scale(FONT_SCALE_STEP_PERCENT, window, cx);
-                            })),
-                    )
-                    .child(
-                        Button::new("font-scale-reset")
-                            .label("Reset")
-                            .small()
-                            .disabled(self.font_scale_percent == DEFAULT_FONT_SCALE_PERCENT)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.set_font_scale_percent(
-                                    DEFAULT_FONT_SCALE_PERCENT,
-                                    window,
-                                    cx,
-                                );
-                            })),
+                            .min_w(px(0.))
+                            .h_full()
+                            .p_6()
+                            .overflow_y_scroll()
+                            .child(content),
                     ),
             )
             .into_any()
@@ -12802,7 +13033,7 @@ impl Render for LoomView {
             self.command_palette_input = None;
         }
         if self.session_filter_input.is_none() {
-            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter sessions…"));
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter projects…"));
             self.input_subscriptions
                 .push(cx.subscribe(&input, |_, _, event: &InputEvent, cx| {
                     if matches!(event, InputEvent::Change) {
@@ -13548,7 +13779,7 @@ mod display_helper_tests {
         command_purpose, commands_matching, completion_for_value, composer_height, format_bytes,
         format_duration, format_percentage, humanize_tool_output, is_redundant_completion_summary,
         relative_time, replace_command_token, replace_last_token, rgb, run_state_color,
-        run_state_label, session_is_active, session_state_label, tool_detail, tool_group_label,
+        run_state_label, session_is_active, session_status_pill, tool_detail, tool_group_label,
         tool_part_from_activity, tool_status, tool_title, tool_title_for_activity,
     };
     use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
@@ -13636,18 +13867,18 @@ mod display_helper_tests {
             (AgentSessionState::Idle, "Ready"),
             (AgentSessionState::Queued, "Queued"),
             (AgentSessionState::Planning, "Planning"),
-            (AgentSessionState::AwaitingApproval, "Needs approval"),
+            (AgentSessionState::AwaitingApproval, "Approval"),
             (AgentSessionState::Paused, "Paused"),
             (AgentSessionState::Executing, "Working"),
             (AgentSessionState::Evaluating, "Reviewing"),
-            (AgentSessionState::NeedsInput, "Needs your input"),
-            (AgentSessionState::Completed, "Complete"),
-            (AgentSessionState::Failed, "Something went wrong"),
+            (AgentSessionState::NeedsInput, "Input"),
+            (AgentSessionState::Completed, "Done"),
+            (AgentSessionState::Failed, "Failed"),
             (AgentSessionState::Cancelled, "Cancelled"),
-            (AgentSessionState::Archived, "Archived"),
+            (AgentSessionState::Archived, "Ready"),
         ];
         for (state, label) in session_states {
-            assert_eq!(session_state_label(state), label);
+            assert_eq!(session_status_pill(state, None).label, label);
         }
         assert_eq!(run_state_label(None), "Ready");
         for (state, label) in [
@@ -13835,7 +14066,7 @@ mod display_helper_tests {
             "wait_for_project_children",
             r#"{"return_ready":true,"children":[{"child_name":"five-second-sleep","status":"completed","code_change":false}]}"#,
         );
-        assert!(wait_output.contains("return-ready: true"));
+        assert!(wait_output.contains("All selected children are return-ready"));
         assert!(wait_output.contains("five-second-sleep: completed"));
 
         assert_eq!(
@@ -14000,8 +14231,8 @@ mod session_header_render_tests {
 #[cfg(test)]
 mod loom_view_render_tests {
     use super::{
-        LoomView, SessionSourceChoice, SessionSourceDialog, SessionSourceDialogPurpose,
-        WorkerConnectionState, WorkerNodeEntry,
+        LoomView, SETTINGS_SECTIONS, SessionSourceChoice, SessionSourceDialog,
+        SessionSourceDialogPurpose, WorkerConnectionState, WorkerNodeEntry,
     };
     use crate::state::GitHubLoginState;
     use crate::state::RenameDialogState;
@@ -14642,6 +14873,32 @@ mod loom_view_render_tests {
         render_scenario(cx, |view| view.settings_open = true);
         render_scenario(cx, |view| view.about_open = true);
         render_scenario(cx, |view| view.providers_open = true);
+    }
+
+    #[gpui_kit::test]
+    fn settings_section_navigation_renders_every_pane(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            LoomView::new_for_test(cx.focus_handle())
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("settings-button", cx);
+            window.render_frame(cx);
+            for index in 0..SETTINGS_SECTIONS.len() {
+                window
+                    .within("settings-dialog")
+                    .click(("settings-section", index), cx);
+                window.render_frame(cx);
+                assert!(
+                    window
+                        .within("settings-dialog")
+                        .find(("settings-section", index))
+                        .visible()
+                );
+            }
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
@@ -16592,19 +16849,20 @@ mod responsive_layout_tests {
 mod worker_node_tests {
     use super::{
         ACTIVE_BACKEND_NODE_ENTRY_ID, SessionNodeIndicatorState, SessionSourceChoice,
-        SessionSourceDialogPurpose, WorkerConnectionStage, WorkerConnectionState, WorkerNodeEntry,
-        adjusted_cpu_pulse_threshold, adjusted_project_agent_concurrency, assigned_node_id,
-        connection_placeholder, format_percentage, format_session_resource_percentages,
-        format_worker_node_resources, initial_worker_nodes, local_source_available,
-        mark_worker_connection_failed, merge_node_sessions, next_severe_load_streak,
-        order_session_nodes, project_child_control_actions, project_session_list_projection,
-        project_session_list_projection_for_projects, project_snapshot_has_unloaded_agent_sessions,
-        remove_worker_node_entry, safe_worker_url_label, session_id_for_request,
-        session_list_projection, session_node_indicator_state, session_node_pulse,
-        session_owner_status, source_choice_is_allowed, source_dialog_initial_state,
-        transition_worker_connection_to_connecting, update_worker_node_status,
-        validate_model_for_node, worker_connection_failure_detail, worker_node_display_name,
-        worker_node_name_for_id, worker_url_embeds_credential,
+        SessionSourceDialogPurpose, SessionTreeNode, WorkerConnectionStage, WorkerConnectionState,
+        WorkerNodeEntry, adjusted_cpu_pulse_threshold, adjusted_project_agent_concurrency,
+        assigned_node_id, connection_placeholder, filter_session_tree, format_percentage,
+        format_session_resource_percentages, format_worker_node_resources, initial_worker_nodes,
+        local_source_available, mark_worker_connection_failed, merge_node_sessions,
+        next_severe_load_streak, order_session_nodes, project_child_control_actions,
+        project_session_list_projection, project_session_list_projection_for_projects,
+        project_snapshot_has_unloaded_agent_sessions, remove_worker_node_entry,
+        safe_worker_url_label, session_id_for_request, session_list_projection,
+        session_node_indicator_state, session_node_pulse, session_owner_status,
+        session_status_pill, session_tree_descendant_count, source_choice_is_allowed,
+        source_dialog_initial_state, transition_worker_connection_to_connecting,
+        update_worker_node_status, validate_model_for_node, worker_connection_failure_detail,
+        worker_node_display_name, worker_node_name_for_id, worker_url_embeds_credential,
     };
     use loom_core::{
         AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, EventSequence,
@@ -17031,14 +17289,8 @@ mod worker_node_tests {
             projection.entries,
             vec![
                 (root_id, "Project".to_owned()),
-                (
-                    child_id,
-                    "↳ Researcher · blocked — Review protocol changes".to_owned()
-                ),
-                (
-                    grandchild_id,
-                    "↳ Analyst · queued — Check one detail".to_owned()
-                ),
+                (child_id, "Researcher".to_owned()),
+                (grandchild_id, "Analyst".to_owned()),
                 (other_id, "Other session".to_owned()),
             ]
         );
@@ -17079,6 +17331,76 @@ mod worker_node_tests {
             grandchild_id
         );
         assert_eq!(switched_project_projection.tree[1].session_id, other_id);
+    }
+
+    #[test]
+    fn project_filter_keeps_matching_projects_whole_and_matches_descendants() {
+        let root_id = AgentSessionId::new();
+        let child_id = AgentSessionId::new();
+        let grandchild_id = AgentSessionId::new();
+        let other_id = AgentSessionId::new();
+        let tree = vec![
+            SessionTreeNode {
+                session_id: root_id,
+                label: "My API refactor".to_owned(),
+                children: vec![SessionTreeNode {
+                    session_id: child_id,
+                    label: "Add auth tests".to_owned(),
+                    children: vec![SessionTreeNode {
+                        session_id: grandchild_id,
+                        label: "Fix token refresh".to_owned(),
+                        children: Vec::new(),
+                    }],
+                }],
+            },
+            SessionTreeNode {
+                session_id: other_id,
+                label: "Docs cleanup".to_owned(),
+                children: Vec::new(),
+            },
+        ];
+        assert_eq!(session_tree_descendant_count(&tree[0]), 2);
+        assert_eq!(session_tree_descendant_count(&tree[1]), 0);
+
+        let root_match = filter_session_tree(tree.clone(), "api");
+        assert_eq!(root_match.len(), 1);
+        assert_eq!(root_match[0].session_id, root_id);
+
+        // A descendant match keeps the whole project and its path.
+        let child_match = filter_session_tree(tree.clone(), "auth");
+        assert_eq!(child_match.len(), 1);
+        assert_eq!(child_match[0].session_id, root_id);
+        assert_eq!(child_match[0].children.len(), 1);
+        assert_eq!(child_match[0].children[0].session_id, child_id);
+
+        assert!(filter_session_tree(tree.clone(), "missing").is_empty());
+
+        let other_match = filter_session_tree(tree, "docs");
+        assert_eq!(other_match.len(), 1);
+        assert_eq!(other_match[0].session_id, other_id);
+    }
+
+    #[test]
+    fn task_status_pills_cover_every_delegated_task_state() {
+        use loom_core::DelegatedTaskStatus as Task;
+        for (task, label) in [
+            (Task::Queued, "Queued"),
+            (Task::Running, "Running"),
+            (Task::Blocked, "Blocked"),
+            (Task::Completed, "Done"),
+            (Task::Failed, "Failed"),
+            (Task::Cancelled, "Cancelled"),
+        ] {
+            assert_eq!(
+                session_status_pill(AgentSessionState::Executing, Some(task)).label,
+                label
+            );
+        }
+        // A durable task takes precedence over the session state.
+        assert_eq!(
+            session_status_pill(AgentSessionState::Executing, Some(Task::Blocked)).label,
+            "Blocked"
+        );
     }
 
     #[test]
@@ -17864,6 +18186,25 @@ mod transcript_paging_tests {
             AssistantPart::Tool(part) if part.output.as_deref() == Some("tool output")
         ));
         assert!(matches!(&timeline[2], TimelineItem::User(follow_up) if follow_up == "follow-up"));
+    }
+
+    #[test]
+    fn restored_project_tool_output_is_humanized() {
+        let mut tool = ModelMessage::new(
+            MessageRole::Tool,
+            r#"{"task_id":"6ee93097-078a-4ad1-86b7-d2cd8d0d3226","child_session_id":"158c02af","status":"running","child_name":"five-second-sleep"}"#,
+        );
+        tool.name = Some("delegate_project_task".to_owned());
+        let timeline = timeline_items_from_messages(vec![(0, 0, tool)], Vec::new());
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected assistant turn");
+        };
+        let AssistantPart::Tool(part) = &turn.parts[0] else {
+            panic!("expected tool part");
+        };
+        let output = part.output.as_deref().unwrap();
+        assert!(output.contains("Created sub-agent \"five-second-sleep\" · running"));
+        assert!(!output.contains("child_session_id"));
     }
 
     #[test]
