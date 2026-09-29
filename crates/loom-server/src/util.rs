@@ -1180,10 +1180,28 @@ mod tests {
             checked_session_relative_path("a/b.txt").unwrap(),
             PathBuf::from("a/b.txt")
         );
-        assert!(checked_session_relative_path("").is_err());
-        assert!(checked_session_relative_path("..").is_err());
-        assert!(checked_session_relative_path("/etc/passwd").is_err());
-        assert!(checked_session_relative_path("a\\b").is_err());
+        for rejected in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "a/../../escape",
+            "/etc/passwd",
+            "a\\b",
+            "//server/share",
+            "a/..",
+        ] {
+            assert!(
+                checked_session_relative_path(rejected).is_err(),
+                "{rejected:?} should be rejected"
+            );
+        }
+        for accepted in ["a", "a/b.txt", "a/b/c/d/e", "file.with.dots"] {
+            assert!(
+                checked_session_relative_path(accepted).is_ok(),
+                "{accepted:?} should be accepted"
+            );
+        }
     }
 
     #[test]
