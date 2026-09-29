@@ -1224,16 +1224,16 @@ mod loom_view_render_tests {
                     new_lines: 1,
                 },
                 ReviewRow::Line(GitDiffLine {
-                    kind: GitDiffLineKind::Added,
-                    old_line: None,
-                    new_line: Some(1),
-                    content: "added".to_owned(),
-                }),
-                ReviewRow::Line(GitDiffLine {
                     kind: GitDiffLineKind::Removed,
                     old_line: Some(1),
                     new_line: None,
                     content: "removed".to_owned(),
+                }),
+                ReviewRow::Line(GitDiffLine {
+                    kind: GitDiffLineKind::Added,
+                    old_line: None,
+                    new_line: Some(1),
+                    content: "added".to_owned(),
                 }),
                 ReviewRow::Line(GitDiffLine {
                     kind: GitDiffLineKind::Context,
