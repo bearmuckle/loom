@@ -1602,3 +1602,112 @@ pub(crate) fn initial_worker_nodes(
     }
     nodes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use loom_protocol::WorkspaceChangeKind;
+
+    #[test]
+    fn relative_time_buckets() {
+        let now = 1_000_000_000u64;
+        assert_eq!(relative_time(now, now), "just now");
+        assert_eq!(relative_time(now - 60_000, now), "1m ago");
+        assert_eq!(relative_time(now - 120_000, now), "2m ago");
+        assert_eq!(relative_time(now - 3_600_000, now), "1h ago");
+        assert_eq!(relative_time(now - 86_400_000, now), "1d ago");
+        assert_eq!(relative_time(now - 604_800_000, now), "1w ago");
+    }
+
+    #[test]
+    fn sizing_and_formatting_helpers() {
+        assert_eq!(composer_height(""), 28.0);
+        assert_eq!(composer_height("a\nb"), 48.0);
+        assert_eq!(format_bytes(None), "n/a");
+        assert_eq!(format_bytes(Some(1024)), "1.0 KiB");
+        assert_eq!(format_bytes(Some(1 << 20)), "1.0 MiB");
+        assert_eq!(format_bytes(Some(1 << 30)), "1.0 GiB");
+        assert_eq!(format_percentage(None), "n/a");
+        assert_eq!(format_percentage(Some(50)), "50%");
+        assert_eq!(format_percentage(Some(101)), "n/a");
+        assert_eq!(format_duration(500), "500ms");
+        assert_eq!(format_duration(1_500), "1.5s");
+        assert_eq!(format_duration(65_000), "1m 5s");
+    }
+
+    #[test]
+    fn labels_and_pulse_adjustments() {
+        assert_eq!(run_state_label(None), "Ready");
+        assert_eq!(run_state_label(Some(AgentRunState::Executing)), "Working");
+        assert_eq!(run_state_label(Some(AgentRunState::Completed)), "Complete");
+        assert_eq!(change_kind_label(WorkspaceChangeKind::Created), "New");
+        assert_eq!(change_kind_label(WorkspaceChangeKind::Deleted), "Removed");
+        assert_eq!(change_kind_label(WorkspaceChangeKind::Modified), "Updated");
+        assert_eq!(adjusted_cpu_pulse_threshold(50, 100), 100);
+        assert_eq!(adjusted_cpu_pulse_threshold(10, -100), 0);
+    }
+
+    #[test]
+    fn composer_token_replacement() {
+        assert_eq!(replace_command_token("/old rest", "new"), "/new rest");
+        assert_eq!(replace_command_token("/old", "new"), "/new ");
+        assert_eq!(replace_last_token("hello wo", "world"), "hello world");
+        assert_eq!(replace_last_token("", "world"), "world");
+    }
+
+    #[test]
+    fn tool_helpers() {
+        assert_eq!(tool_element_id(1, 2), (1u64 << 32) | 2);
+        assert_eq!(tool_group_label("read_file", 3), "Read 3 files");
+        assert_eq!(tool_group_label("unknown", 2), "unknown × 2");
+        assert_eq!(reasoning_preview("  a   b  "), "a b");
+        let long = "x".repeat(120);
+        assert!(reasoning_preview(&long).ends_with('…'));
+        assert_eq!(compact_activity_text("abcdef", 3), "abc…");
+        assert_eq!(compact_activity_text("ab", 3), "ab");
+    }
+
+    #[test]
+    fn command_formatting() {
+        assert_eq!(command_line("cargo", &["test".to_owned()]), "cargo test");
+        assert_eq!(
+            command_line("echo", &["hello world".to_owned()]),
+            "echo 'hello world'"
+        );
+        assert_eq!(command_purpose("cargo", &["test".to_owned()]), "Run tests");
+        assert_eq!(
+            command_purpose("git", &["status".to_owned()]),
+            "Inspect repository changes"
+        );
+        assert_eq!(
+            command_purpose("sh", &["-c".to_owned(), "cargo test".to_owned()]),
+            "Run tests"
+        );
+        assert!(command_purpose("mystery", &["sub".to_owned()]).starts_with("Run mystery"));
+        assert!(is_redundant_completion_summary("Completed task: x"));
+        assert!(!is_redundant_completion_summary("Did x"));
+    }
+
+    #[test]
+    fn worker_url_safety() {
+        assert_eq!(
+            safe_worker_url_label("wss://user:pass@host/ws?token=x"),
+            "wss://host/ws"
+        );
+        assert!(worker_url_embeds_credential("wss://user:pass@host/ws"));
+        assert!(worker_url_embeds_credential(
+            "wss://host/ws?access_token=secret"
+        ));
+        assert!(!worker_url_embeds_credential("wss://host/ws"));
+        assert!(!worker_url_embeds_credential("wss://host/ws?keep=1"));
+    }
+
+    #[test]
+    fn json_field_extraction() {
+        let value = serde_json::json!({ "a": "x", "b": 2 });
+        assert_eq!(string_field(&value, "a"), Some("x".to_owned()));
+        assert_eq!(string_field(&value, "b"), None);
+        assert_eq!(string_argument(&value, "a"), Some("x".to_owned()));
+        assert_eq!(string_argument(&value, "missing"), None);
+    }
+}
