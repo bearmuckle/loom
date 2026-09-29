@@ -8,6 +8,7 @@
 
 #[cfg(any(target_family = "wasm", test))]
 mod assets;
+mod backend_host;
 #[cfg(target_family = "wasm")]
 mod browser;
 mod connection;
