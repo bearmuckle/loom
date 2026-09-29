@@ -1832,3 +1832,1811 @@ impl FilePersistence {
         })
     }
 }
+pub(crate) fn save_run_runtime_config_rows(
+    transaction: &Transaction<'_>,
+    configs: &BTreeMap<RunId, DurableRunRuntimeConfig>,
+) -> Result<()> {
+    for (run_id, config) in configs {
+        let context_inspection = config
+            .context_inspection
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not encode run context inspection: {error}"),
+                    false,
+                )
+            })?;
+        let project_grants =
+            serde_json::to_string(&RunProjectGrants::of(config)).map_err(|error| {
+                persistence_error(
+                    format!("could not encode run project grants: {error}"),
+                    false,
+                )
+            })?;
+        if config
+            .system_instructions
+            .as_ref()
+            .is_some_and(|value| value.len() > MAX_RUN_RUNTIME_CONFIG_BYTES)
+            || config
+                .repository_instructions
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_RUN_RUNTIME_CONFIG_BYTES)
+            || context_inspection
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_RUN_RUNTIME_CONFIG_BYTES)
+            || project_grants.len() > MAX_RUN_RUNTIME_CONFIG_BYTES
+        {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "run runtime configuration exceeds its maximum supported size",
+                false,
+            ));
+        }
+        let system_instructions_hash = config
+            .system_instructions
+            .as_deref()
+            .map(|value| store_content(transaction, value.as_bytes()))
+            .transpose()?;
+        let repository_instructions_hash = config
+            .repository_instructions
+            .as_deref()
+            .map(|value| store_content(transaction, value.as_bytes()))
+            .transpose()?;
+        let limits = &config.limits;
+        let context = &config.context_options;
+        let max_duration_ms = encode_optional_counter(limits.max_duration_ms, "max duration")?;
+        let max_input_tokens =
+            encode_optional_counter(limits.max_input_tokens, "max input tokens")?;
+        let max_output_tokens =
+            encode_optional_counter(limits.max_output_tokens, "max output tokens")?;
+        let max_tool_calls = encode_optional_counter(limits.max_tool_calls, "max tool calls")?;
+        let max_cost_micros = encode_optional_counter(limits.max_cost_micros, "max cost")?;
+        let context_window = encode_optional_counter(context.context_window, "context window")?;
+        let context_max_input_tokens =
+            encode_optional_counter(context.max_input_tokens, "context max input tokens")?;
+        let context_reserved_output_tokens = encode_optional_counter(
+            context.reserved_output_tokens,
+            "context reserved output tokens",
+        )?;
+        let input_cost_micros_per_1k =
+            encode_counter(config.input_cost_micros_per_1k, "input cost rate")?;
+        let output_cost_micros_per_1k =
+            encode_counter(config.output_cost_micros_per_1k, "output cost rate")?;
+        let policy_decisions = [
+            encode_policy_decision(config.approval_policy.read),
+            encode_policy_decision(config.approval_policy.write),
+            encode_policy_decision(config.approval_policy.command),
+            encode_policy_decision(config.approval_policy.network),
+            encode_policy_decision(config.approval_policy.destructive),
+        ];
+        let config_identity = serde_json::to_vec(&(
+            system_instructions_hash.as_deref(),
+            repository_instructions_hash.as_deref(),
+            policy_decisions,
+            [
+                max_duration_ms,
+                max_input_tokens,
+                max_output_tokens,
+                max_tool_calls,
+                max_cost_micros,
+            ],
+            [
+                context_window,
+                context_max_input_tokens,
+                context_reserved_output_tokens,
+            ],
+            config
+                .checkpoint_id
+                .map(|id| id.as_uuid().as_bytes().to_vec()),
+            input_cost_micros_per_1k,
+            output_cost_micros_per_1k,
+        ))
+        .map_err(|error| {
+            persistence_error(
+                format!("could not encode run runtime configuration identity: {error}"),
+                false,
+            )
+        })?;
+        let configuration_hash = Sha256::digest(config_identity).to_vec();
+        transaction
+            .execute(
+                "INSERT INTO runtime_configurations(
+                    configuration_hash, system_instructions_hash, repository_instructions_hash,
+                    policy_read, policy_write, policy_command, policy_network,
+                    policy_destructive, max_duration_ms, max_input_tokens,
+                    max_output_tokens, max_tool_calls, max_cost_micros,
+                    context_window, context_max_input_tokens,
+                    context_reserved_output_tokens, checkpoint_id,
+                    input_cost_micros_per_1k, output_cost_micros_per_1k
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                 )
+                 ON CONFLICT(configuration_hash) DO NOTHING",
+                params![
+                    configuration_hash,
+                    system_instructions_hash,
+                    repository_instructions_hash,
+                    policy_decisions[0],
+                    policy_decisions[1],
+                    policy_decisions[2],
+                    policy_decisions[3],
+                    policy_decisions[4],
+                    max_duration_ms,
+                    max_input_tokens,
+                    max_output_tokens,
+                    max_tool_calls,
+                    max_cost_micros,
+                    context_window,
+                    context_max_input_tokens,
+                    context_reserved_output_tokens,
+                    config
+                        .checkpoint_id
+                        .map(|id| id.as_uuid().as_bytes().to_vec()),
+                    input_cost_micros_per_1k,
+                    output_cost_micros_per_1k,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save run runtime profile for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO run_runtime_config(
+                    run_id, configuration_hash, context_inspection, project_grants
+                 ) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    configuration_hash=excluded.configuration_hash,
+                    context_inspection=excluded.context_inspection,
+                    project_grants=excluded.project_grants
+                 WHERE run_runtime_config.configuration_hash IS NOT excluded.configuration_hash
+                    OR run_runtime_config.context_inspection IS NOT excluded.context_inspection
+                    OR run_runtime_config.project_grants IS NOT excluded.project_grants",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    configuration_hash,
+                    context_inspection,
+                    project_grants,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not attach runtime profile to run {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+}
+
+pub(crate) fn save_run_summary_rows(
+    transaction: &Transaction<'_>,
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    for (run_id, summary) in summaries {
+        if summary.snapshot.id != *run_id {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run summary key does not match its run id",
+                false,
+            ));
+        }
+        if summary.snapshot.task.len() > 1024 * 1024
+            || summary.snapshot.model.as_str().len() > 256
+            || summary
+                .snapshot
+                .summary
+                .as_ref()
+                .is_some_and(|summary| summary.len() > 1024 * 1024)
+        {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "run summary exceeds its maximum supported size",
+                false,
+            ));
+        }
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let session_id_bytes = summary.snapshot.session_id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "INSERT INTO run_summaries(
+                    run_id, session_id, attempt_id, control_revision, state, started_at, updated_at,
+                    completed_at, task, model, summary,
+                    input_tokens, output_tokens, cached_input_tokens, tool_calls, cost_micros, elapsed_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    attempt_id=excluded.attempt_id,
+                    control_revision=excluded.control_revision,
+                    state=excluded.state,
+                    started_at=excluded.started_at,
+                    updated_at=excluded.updated_at,
+                    completed_at=excluded.completed_at,
+                    task=excluded.task,
+                    model=excluded.model,
+                    summary=excluded.summary,
+                    input_tokens=excluded.input_tokens,
+                    output_tokens=excluded.output_tokens,
+                    cached_input_tokens=excluded.cached_input_tokens,
+                    tool_calls=excluded.tool_calls,
+                    cost_micros=excluded.cost_micros,
+                    elapsed_ms=excluded.elapsed_ms
+                 WHERE run_summaries.session_id IS NOT excluded.session_id
+                    OR run_summaries.attempt_id IS NOT excluded.attempt_id
+                    OR run_summaries.control_revision IS NOT excluded.control_revision
+                    OR run_summaries.state IS NOT excluded.state
+                    OR run_summaries.started_at IS NOT excluded.started_at
+                    OR run_summaries.updated_at IS NOT excluded.updated_at
+                    OR run_summaries.completed_at IS NOT excluded.completed_at
+                    OR run_summaries.task IS NOT excluded.task
+                    OR run_summaries.model IS NOT excluded.model
+                    OR run_summaries.summary IS NOT excluded.summary
+                    OR run_summaries.input_tokens IS NOT excluded.input_tokens
+                    OR run_summaries.output_tokens IS NOT excluded.output_tokens
+                    OR run_summaries.cached_input_tokens IS NOT excluded.cached_input_tokens
+                    OR run_summaries.tool_calls IS NOT excluded.tool_calls
+                    OR run_summaries.cost_micros IS NOT excluded.cost_micros
+                    OR run_summaries.elapsed_ms IS NOT excluded.elapsed_ms",
+                params![
+                    run_id_bytes.as_slice(),
+                    session_id_bytes.as_slice(),
+                    summary.snapshot.attempt_id.as_uuid().as_bytes().as_slice(),
+                    encode_counter(summary.snapshot.control_revision, "run control revision")?,
+                    run_state_name(summary.snapshot.state),
+                    encode_timestamp(summary.snapshot.started_at)?,
+                    encode_timestamp(summary.snapshot.updated_at)?,
+                    summary
+                        .snapshot
+                        .completed_at
+                        .map(encode_timestamp)
+                        .transpose()?,
+                    summary.snapshot.task,
+                    summary.snapshot.model.as_str(),
+                    summary.snapshot.summary,
+                    encode_counter(summary.usage.input_tokens, "input token count")?,
+                    encode_counter(summary.usage.output_tokens, "output token count")?,
+                    encode_counter(summary.usage.cached_input_tokens, "cached input token count")?,
+                    encode_counter(summary.usage.tool_calls, "tool call count")?,
+                    encode_counter(summary.usage.cost_micros, "cost")?,
+                    encode_counter(summary.usage.elapsed_ms, "elapsed time")?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save run summary {run_id}: {error}"),
+                    true,
+                )
+            })?;
+        save_run_evidence_rows(
+            transaction,
+            *run_id,
+            summary.snapshot.session_id,
+            &summary.snapshot.evidence,
+        )?;
+    }
+    save_run_interaction_rows(transaction, summaries)?;
+    Ok(())
+}
+
+pub(crate) fn save_run_evidence_rows(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    session_id: AgentSessionId,
+    evidence: &[loom_core::EvidenceLink],
+) -> Result<()> {
+    for (ordinal, link) in evidence.iter().enumerate() {
+        if link.label.len() > 16_384 || link.uri.len() > 16_384 {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "run evidence field exceeds its maximum supported size",
+                false,
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO run_evidence(run_id, session_id, ordinal, label, uri)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(run_id, ordinal) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    label=excluded.label,
+                    uri=excluded.uri
+                 WHERE run_evidence.session_id IS NOT excluded.session_id
+                    OR run_evidence.label IS NOT excluded.label
+                    OR run_evidence.uri IS NOT excluded.uri",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    session_id.as_uuid().as_bytes().as_slice(),
+                    i64::try_from(ordinal).map_err(|_| {
+                        LoomError::new(ErrorCode::Persistence, "too many evidence links", false)
+                    })?,
+                    link.label,
+                    link.uri,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save evidence for run {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM run_evidence WHERE run_id=?1 AND ordinal >= ?2",
+            params![
+                run_id.as_uuid().as_bytes().as_slice(),
+                i64::try_from(evidence.len()).map_err(|_| {
+                    LoomError::new(ErrorCode::Persistence, "too many evidence links", false)
+                })?,
+            ],
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("could not prune evidence for run {run_id}: {error}"),
+                true,
+            )
+        })?;
+    Ok(())
+}
+
+pub(crate) fn load_run_evidence_rows(
+    connection: &Connection,
+    run_ids: impl Iterator<Item = RunId>,
+) -> Result<BTreeMap<RunId, Vec<loom_core::EvidenceLink>>> {
+    let run_ids = run_ids.collect::<Vec<_>>();
+    let mut evidence = BTreeMap::<RunId, Vec<loom_core::EvidenceLink>>::new();
+    for chunk in run_ids.chunks(500) {
+        let placeholders = (1..=chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT run_id, label, uri FROM run_evidence
+             WHERE run_id IN ({placeholders}) ORDER BY run_id, ordinal"
+        );
+        let values = chunk
+            .iter()
+            .map(|run_id| rusqlite::types::Value::Blob(run_id.as_uuid().as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        let mut statement = connection.prepare(&sql).map_err(|error| {
+            persistence_error(format!("could not prepare run evidence: {error}"), true)
+        })?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    loom_core::EvidenceLink {
+                        label: row.get(1)?,
+                        uri: row.get(2)?,
+                    },
+                ))
+            })
+            .map_err(|error| {
+                persistence_error(format!("could not read run evidence: {error}"), true)
+            })?;
+        for row in rows {
+            let (run_id, link) = row.map_err(|error| {
+                persistence_error(format!("could not read run evidence: {error}"), true)
+            })?;
+            let run_id = RunId::from_uuid(decode_uuid(&run_id, "evidence run id")?);
+            evidence.entry(run_id).or_default().push(link);
+        }
+    }
+    Ok(evidence)
+}
+
+pub(crate) fn save_run_context_checkpoint_rows(
+    transaction: &Transaction<'_>,
+    checkpoints: &BTreeMap<RunId, Option<DurableRunContextCheckpoint>>,
+) -> Result<()> {
+    for (run_id, checkpoint) in checkpoints {
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let Some(checkpoint) = checkpoint else {
+            transaction
+                .execute(
+                    "DELETE FROM run_context_checkpoints WHERE run_id=?1",
+                    [run_id_bytes.as_slice()],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not clear run context checkpoint: {error}"),
+                        true,
+                    )
+                })?;
+            continue;
+        };
+        if checkpoint.summary.text.len() > MAX_CONTENT_BYTES
+            || checkpoint.summary.source_digest.len() > 64
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run context checkpoint metadata is invalid",
+                false,
+            ));
+        }
+        let session_id: Vec<u8> = transaction
+            .query_row(
+                "SELECT session_id FROM run_summaries WHERE run_id=?1",
+                [run_id_bytes.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("run {run_id} has no summary for its context checkpoint: {error}"),
+                    true,
+                )
+            })?;
+        if session_id.as_slice() != checkpoint.session_id.as_uuid().as_bytes() {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run context checkpoint belongs to a different session",
+                false,
+            ));
+        }
+        let summary_hash = store_content(transaction, checkpoint.summary.text.as_bytes())?;
+        let source_count = encode_counter(
+            checkpoint.summary.source_message_count as u64,
+            "context message count",
+        )?;
+        let projection_version = i64::from(checkpoint.summary.projection_version);
+        let created_at = encode_timestamp(checkpoint.summary.created_at)?;
+        transaction
+            .execute(
+                "INSERT INTO run_context_checkpoints(
+                    run_id, session_id, summary_hash, source_message_count,
+                    projection_version, source_digest, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    summary_hash=excluded.summary_hash,
+                    source_message_count=excluded.source_message_count,
+                    projection_version=excluded.projection_version,
+                    source_digest=excluded.source_digest,
+                    created_at=excluded.created_at
+                 WHERE run_context_checkpoints.session_id IS NOT excluded.session_id
+                    OR run_context_checkpoints.summary_hash IS NOT excluded.summary_hash
+                    OR run_context_checkpoints.source_message_count IS NOT excluded.source_message_count
+                    OR run_context_checkpoints.projection_version IS NOT excluded.projection_version
+                    OR run_context_checkpoints.source_digest IS NOT excluded.source_digest
+                    OR run_context_checkpoints.created_at IS NOT excluded.created_at",
+                params![
+                    run_id_bytes.as_slice(),
+                    session_id,
+                    summary_hash,
+                    source_count,
+                    projection_version,
+                    checkpoint.summary.source_digest,
+                    created_at,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save run context checkpoint: {error}"), true)
+            })?;
+    }
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)?;
+    Ok(())
+}
+
+pub(crate) fn save_run_plan_rows(
+    transaction: &Transaction<'_>,
+    plans: &BTreeMap<RunId, AgentPlan>,
+    summaries: Option<&BTreeMap<RunId, DurableRunSummary>>,
+) -> Result<()> {
+    for (run_id, plan) in plans {
+        let session_id = summaries
+            .and_then(|summaries| summaries.get(run_id))
+            .map(|summary| summary.snapshot.session_id)
+            .ok_or_else(|| {
+                LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    format!("run plan {run_id} has no matching run summary"),
+                    false,
+                )
+            })?;
+        for (ordinal, step) in plan.steps.iter().enumerate() {
+            if step.id.len() > 256 || step.description.len() > 16_384 {
+                return Err(LoomError::new(
+                    ErrorCode::Persistence,
+                    "run plan step exceeds its maximum supported size",
+                    false,
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO run_plan_steps(run_id, session_id, ordinal, step_id, description)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(run_id, ordinal) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        step_id=excluded.step_id,
+                        description=excluded.description
+                     WHERE run_plan_steps.session_id IS NOT excluded.session_id
+                        OR run_plan_steps.step_id IS NOT excluded.step_id
+                        OR run_plan_steps.description IS NOT excluded.description",
+                    params![
+                        run_id.as_uuid().as_bytes().as_slice(),
+                        session_id.as_uuid().as_bytes().as_slice(),
+                        i64::try_from(ordinal).map_err(|_| {
+                            LoomError::new(ErrorCode::Persistence, "too many plan steps", false)
+                        })?,
+                        step.id,
+                        step.description,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save plan for run {run_id}: {error}"),
+                        true,
+                    )
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_plan_steps WHERE run_id=?1 AND ordinal >= ?2",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    i64::try_from(plan.steps.len()).map_err(|_| {
+                        LoomError::new(ErrorCode::Persistence, "too many plan steps", false)
+                    })?,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune plan for run {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn save_run_execution_state_rows(
+    transaction: &Transaction<'_>,
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    for (run_id, summary) in summaries {
+        let Some(execution) = summary.execution_state.as_ref() else {
+            continue;
+        };
+        if execution.run_id != *run_id
+            || execution.session_id != summary.snapshot.session_id
+            || execution.attempt_id != summary.snapshot.attempt_id
+            || execution.control_revision != summary.snapshot.control_revision
+            || execution.state != summary.snapshot.state
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run execution identity and revision do not match its summary",
+                false,
+            ));
+        }
+        if execution
+            .pending_input
+            .as_ref()
+            .is_some_and(|input| input.len() > 65_536)
+            || (execution.pending_tool_execution.is_some()
+                && !matches!(
+                    execution.state,
+                    AgentRunState::Executing | AgentRunState::Evaluating
+                ))
+            || (execution.pending_approval.is_some()
+                && !matches!(
+                    execution.state,
+                    AgentRunState::AwaitingApproval | AgentRunState::Paused
+                ))
+            || (execution.pending_input.is_some()
+                && !matches!(
+                    execution.state,
+                    AgentRunState::NeedsInput | AgentRunState::Paused
+                ))
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                format!(
+                    "pending execution intent does not match run state {:?} (tool={}, approval={}, input={})",
+                    execution.state,
+                    execution.pending_tool_execution.is_some(),
+                    execution.pending_approval.is_some(),
+                    execution.pending_input.is_some()
+                ),
+                false,
+            ));
+        }
+        let encode_tool_call = |call: &Option<loom_model::ToolCall>| -> Result<Option<String>> {
+            call.as_ref()
+                .map(|call| {
+                    serde_json::to_string(call).map_err(|error| {
+                        persistence_error(
+                            format!("could not encode execution tool call: {error}"),
+                            false,
+                        )
+                    })
+                })
+                .transpose()
+        };
+        let pending_tool_execution = encode_tool_call(&execution.pending_tool_execution)?;
+        let pending_approval = encode_tool_call(&execution.pending_approval)?;
+        let last_failed_call = encode_tool_call(&execution.last_failed_call)?;
+        let pending_project_join = execution
+            .pending_project_join
+            .as_ref()
+            .map(|continuation| {
+                serde_json::to_string(continuation).map_err(|error| {
+                    persistence_error(
+                        format!("could not encode project join continuation: {error}"),
+                        false,
+                    )
+                })
+            })
+            .transpose()?;
+        if [
+            pending_tool_execution.as_ref(),
+            pending_approval.as_ref(),
+            last_failed_call.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|call| call.len() > 1_048_576)
+            || pending_project_join
+                .as_ref()
+                .is_some_and(|continuation| continuation.len() > 1_048_576)
+        {
+            return Err(LoomError::new(
+                ErrorCode::Persistence,
+                "execution continuation exceeds the maximum supported size",
+                false,
+            ));
+        }
+        let control_revision = i64::try_from(execution.control_revision).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "execution control revision is out of range",
+                false,
+            )
+        })?;
+        let step_index = i64::from(execution.step_index);
+        let provider_cursor = i64::try_from(execution.provider_cursor).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "provider cursor is out of range",
+                false,
+            )
+        })?;
+        let next_message_id = i64::try_from(execution.next_message_id).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "next message id is out of range",
+                false,
+            )
+        })?;
+        let active_message_id = execution
+            .active_message_id
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "active message id is out of range",
+                    false,
+                )
+            })?;
+        let last_project_message_sequence = i64::try_from(execution.last_project_message_sequence)
+            .map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "project message cursor is out of range",
+                    false,
+                )
+            })?;
+        let step_id = execution.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
+        transaction
+            .execute(
+                "INSERT INTO run_execution_state(
+                    run_id, session_id, attempt_id, control_revision, state, step_id, step_index,
+                    provider_cursor, next_message_id, active_message_id,
+                    last_project_message_sequence, pending_tool_execution, pending_approval,
+                    pending_input, last_failed_call, pending_project_join
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 ON CONFLICT(run_id) DO UPDATE SET
+                    session_id=excluded.session_id,
+                    attempt_id=excluded.attempt_id,
+                    control_revision=excluded.control_revision,
+                    state=excluded.state,
+                    step_id=excluded.step_id,
+                    step_index=excluded.step_index,
+                    provider_cursor=excluded.provider_cursor,
+                    next_message_id=excluded.next_message_id,
+                    active_message_id=excluded.active_message_id,
+                    last_project_message_sequence=excluded.last_project_message_sequence,
+                    pending_tool_execution=excluded.pending_tool_execution,
+                    pending_approval=excluded.pending_approval,
+                    pending_input=excluded.pending_input,
+                    last_failed_call=excluded.last_failed_call,
+                    pending_project_join=excluded.pending_project_join
+                 WHERE run_execution_state.session_id IS NOT excluded.session_id
+                    OR run_execution_state.attempt_id IS NOT excluded.attempt_id
+                    OR run_execution_state.control_revision IS NOT excluded.control_revision
+                    OR run_execution_state.state IS NOT excluded.state
+                    OR run_execution_state.step_id IS NOT excluded.step_id
+                    OR run_execution_state.step_index IS NOT excluded.step_index
+                    OR run_execution_state.provider_cursor IS NOT excluded.provider_cursor
+                    OR run_execution_state.next_message_id IS NOT excluded.next_message_id
+                    OR run_execution_state.active_message_id IS NOT excluded.active_message_id
+                    OR run_execution_state.last_project_message_sequence IS NOT excluded.last_project_message_sequence
+                    OR run_execution_state.pending_tool_execution IS NOT excluded.pending_tool_execution
+                    OR run_execution_state.pending_approval IS NOT excluded.pending_approval
+                    OR run_execution_state.pending_input IS NOT excluded.pending_input
+                    OR run_execution_state.last_failed_call IS NOT excluded.last_failed_call
+                    OR run_execution_state.pending_project_join IS NOT excluded.pending_project_join",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    execution.session_id.as_uuid().as_bytes().as_slice(),
+                    execution.attempt_id.as_uuid().as_bytes().as_slice(),
+                    control_revision,
+                    run_state_name(execution.state),
+                    step_id,
+                    step_index,
+                    provider_cursor,
+                    next_message_id,
+                    active_message_id,
+                    last_project_message_sequence,
+                    pending_tool_execution,
+                    pending_approval,
+                    execution.pending_input,
+                    last_failed_call,
+                    pending_project_join,
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not save run execution state for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn save_run_attempt_rows(
+    transaction: &Transaction<'_>,
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_attempts (
+                run_id BLOB NOT NULL, attempt_id BLOB NOT NULL,
+                PRIMARY KEY(run_id, attempt_id)
+             ) WITHOUT ROWID, STRICT;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run attempts: {error}"), true)
+        })?;
+    for (run_id, summary) in summaries {
+        let Some(attempts) = summary.attempts.as_ref() else {
+            continue;
+        };
+        let session_id = summary.snapshot.session_id;
+        let current_attempt = attempts.iter().find(|attempt| {
+            attempt.id == summary.snapshot.attempt_id
+                && attempt.run_id == *run_id
+                && attempt.session_id == session_id
+                && attempt.state == summary.snapshot.state
+        });
+        let latest_number = attempts.iter().map(|attempt| attempt.number).max();
+        if current_attempt.is_none()
+            || current_attempt.map(|attempt| attempt.number) != latest_number
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "run attempt history does not contain the current attempt as its latest record",
+                false,
+            ));
+        }
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        transaction
+            .execute(
+                "DELETE FROM _loom_wanted_run_attempts WHERE run_id=?1",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not reset staged attempts for run {run_id}: {error}"),
+                    true,
+                )
+            })?;
+        let mut seen_ids = BTreeSet::new();
+        let mut seen_numbers = BTreeSet::new();
+        for attempt in attempts {
+            if attempt.run_id != *run_id
+                || attempt.session_id != session_id
+                || attempt.number == 0
+                || !seen_ids.insert(attempt.id)
+                || !seen_numbers.insert(attempt.number)
+                || attempt
+                    .completed_at
+                    .is_some_and(|completed| completed < attempt.started_at)
+                || (matches!(
+                    attempt.state,
+                    AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+                ) != attempt.completed_at.is_some())
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "run attempt ownership, identity, state, or timestamps are invalid",
+                    false,
+                ));
+            }
+            let attempt_id = attempt.id.as_uuid().as_bytes();
+            let attempt_number = i64::from(attempt.number);
+            let checkpoint_id = attempt
+                .checkpoint_id
+                .map(|id| id.as_uuid().as_bytes().to_vec());
+            transaction
+                .execute(
+                    "INSERT INTO _loom_wanted_run_attempts(run_id, attempt_id)
+                     VALUES (?1, ?2)",
+                    params![run_id_bytes.as_slice(), attempt_id.as_slice()],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not stage run attempt {}: {error}", attempt.id),
+                        true,
+                    )
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO run_attempts(
+                        run_id, session_id, attempt_id, attempt_number, state,
+                        checkpoint_id, started_at, completed_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(run_id, attempt_id) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        attempt_number=excluded.attempt_number,
+                        state=excluded.state,
+                        checkpoint_id=excluded.checkpoint_id,
+                        started_at=excluded.started_at,
+                        completed_at=excluded.completed_at
+                     WHERE run_attempts.session_id IS NOT excluded.session_id
+                        OR run_attempts.attempt_number IS NOT excluded.attempt_number
+                        OR run_attempts.state IS NOT excluded.state
+                        OR run_attempts.checkpoint_id IS NOT excluded.checkpoint_id
+                        OR run_attempts.started_at IS NOT excluded.started_at
+                        OR run_attempts.completed_at IS NOT excluded.completed_at",
+                    params![
+                        run_id_bytes.as_slice(),
+                        session_id.as_uuid().as_bytes().as_slice(),
+                        attempt_id.as_slice(),
+                        attempt_number,
+                        run_state_name(attempt.state),
+                        checkpoint_id,
+                        encode_timestamp(attempt.started_at)?,
+                        attempt.completed_at.map(encode_timestamp).transpose()?,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save run attempt {}: {error}", attempt.id),
+                        true,
+                    )
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_attempts
+                 WHERE run_id=?1 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_attempts wanted
+                    WHERE wanted.run_id=run_attempts.run_id
+                      AND wanted.attempt_id=run_attempts.attempt_id
+                 )",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune run attempts for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn save_run_interaction_rows(
+    transaction: &Transaction<'_>,
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_interactions (
+                interaction_id BLOB PRIMARY KEY NOT NULL
+             ) WITHOUT ROWID, STRICT;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run interactions: {error}"), true)
+        })?;
+    for (run_id, summary) in summaries {
+        let Some(interactions) = summary.interactions.as_ref() else {
+            continue;
+        };
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let session_id = summary.snapshot.session_id;
+        transaction
+            .execute("DELETE FROM _loom_wanted_run_interactions", [])
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not reset staged interactions: {error}"),
+                    true,
+                )
+            })?;
+        let mut seen_ids = BTreeSet::new();
+        let mut seen_revisions = BTreeSet::new();
+        for interaction in interactions {
+            if interaction.run_id != *run_id
+                || interaction.session_id != session_id
+                || !seen_ids.insert(interaction.id)
+                || !seen_revisions.insert((interaction.attempt_id, interaction.control_revision))
+                || interaction.prompt.len() > 65_536
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "run interaction ownership, identity, revision, or prompt is invalid",
+                    false,
+                ));
+            }
+            let interaction_id = interaction.id.as_uuid().as_bytes();
+            let attempt_id = interaction.attempt_id.as_uuid().as_bytes();
+            let tool_call_id = interaction
+                .tool_call_id
+                .map(|id| id.as_uuid().as_bytes().to_vec());
+            let control_revision = i64::try_from(interaction.control_revision).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "run interaction revision is out of range",
+                    false,
+                )
+            })?;
+            let decision = interaction.decision.map(approval_decision_name);
+            transaction
+                .execute(
+                    "INSERT INTO _loom_wanted_run_interactions(interaction_id) VALUES (?1)",
+                    [interaction_id.as_slice()],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not stage interaction {}: {error}", interaction.id),
+                        true,
+                    )
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO run_interactions(
+                        run_id, session_id, interaction_id, attempt_id, control_revision,
+                        kind, status, tool_call_id, prompt, decision, created_at, resolved_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(run_id, interaction_id) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        attempt_id=excluded.attempt_id,
+                        control_revision=excluded.control_revision,
+                        kind=excluded.kind,
+                        status=excluded.status,
+                        tool_call_id=excluded.tool_call_id,
+                        prompt=excluded.prompt,
+                        decision=excluded.decision,
+                        created_at=excluded.created_at,
+                        resolved_at=excluded.resolved_at
+                     WHERE run_interactions.session_id IS NOT excluded.session_id
+                        OR run_interactions.attempt_id IS NOT excluded.attempt_id
+                        OR run_interactions.control_revision IS NOT excluded.control_revision
+                        OR run_interactions.kind IS NOT excluded.kind
+                        OR run_interactions.status IS NOT excluded.status
+                        OR run_interactions.tool_call_id IS NOT excluded.tool_call_id
+                        OR run_interactions.prompt IS NOT excluded.prompt
+                        OR run_interactions.decision IS NOT excluded.decision
+                        OR run_interactions.created_at IS NOT excluded.created_at
+                        OR run_interactions.resolved_at IS NOT excluded.resolved_at",
+                    params![
+                        run_id_bytes.as_slice(),
+                        session_id.as_uuid().as_bytes().as_slice(),
+                        interaction_id.as_slice(),
+                        attempt_id.as_slice(),
+                        control_revision,
+                        interaction_kind_name(interaction.kind),
+                        interaction_status_name(interaction.status),
+                        tool_call_id,
+                        interaction.prompt.as_str(),
+                        decision,
+                        encode_timestamp(interaction.created_at)?,
+                        interaction.resolved_at.map(encode_timestamp).transpose()?,
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save interaction {}: {error}", interaction.id),
+                        true,
+                    )
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_interactions
+                 WHERE run_id=?1 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_interactions wanted
+                    WHERE wanted.interaction_id=run_interactions.interaction_id
+                 )",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune run interactions for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn save_run_activity_rows(
+    transaction: &Transaction<'_>,
+    activities_by_run: &DurableRunActivities,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_activities (
+                run_id BLOB NOT NULL, activity_id BLOB NOT NULL,
+                PRIMARY KEY(run_id, activity_id)
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_run_activities;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run activities: {error}"), true)
+        })?;
+    for (run_id, activities) in activities_by_run {
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let session_id: Vec<u8> = transaction
+            .query_row(
+                "SELECT session_id FROM run_summaries WHERE run_id=?1",
+                [run_id_bytes.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("run {run_id} has no durable summary for its activities: {error}"),
+                    true,
+                )
+            })?;
+        let mut seen = BTreeSet::new();
+        for (ordinal, activity) in activities.iter().enumerate() {
+            if activity.run_id != *run_id || !seen.insert(activity.id) {
+                return Err(LoomError::invalid_request(
+                    "run activity keys must be unique and match their owning run",
+                ));
+            }
+            if activity.kind != activity_data_kind(&activity.data) {
+                return Err(LoomError::invalid_request(
+                    "run activity kind does not match its data",
+                ));
+            }
+            let ordinal = i64::try_from(ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "run has too many activity records",
+                    false,
+                )
+            })?;
+            let timeline_ordinal = i64::try_from(activity.timeline_ordinal).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "activity timeline ordinal exceeds SQLite's integer range",
+                    false,
+                )
+            })?;
+            let activity_id = activity.id.as_uuid().as_bytes().to_vec();
+            let existing_ordinal: Option<i64> = transaction
+                .query_row(
+                    "SELECT ordinal FROM run_activities
+                     WHERE run_id=?1 AND activity_id=?2",
+                    params![run_id_bytes.as_slice(), activity_id.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    persistence_error(format!("could not read activity position: {error}"), true)
+                })?;
+            if existing_ordinal.is_some_and(|existing| existing != ordinal) {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted activity order cannot be changed",
+                    false,
+                ));
+            }
+            let occupant: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT activity_id FROM run_activities WHERE run_id=?1 AND ordinal=?2",
+                    params![run_id_bytes.as_slice(), ordinal],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    persistence_error(format!("could not verify activity order: {error}"), true)
+                })?;
+            if occupant
+                .as_ref()
+                .is_some_and(|existing| existing.as_slice() != activity_id.as_slice())
+            {
+                return Err(LoomError::new(
+                    ErrorCode::MalformedPayload,
+                    "persisted activity order cannot be changed",
+                    false,
+                ));
+            }
+
+            let normalized_data = normalize_activity_tool_data(&activity.data);
+            let data = serde_json::to_vec(&normalized_data).map_err(|error| {
+                LoomError::new(
+                    ErrorCode::Internal,
+                    format!("could not encode run activity data: {error}"),
+                    false,
+                )
+            })?;
+            let data_hash = store_content(transaction, &data)?;
+            let parent_activity_id = activity
+                .parent_id
+                .map(|id| id.as_uuid().as_bytes().to_vec());
+            let step_id = activity.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
+            let tool_call_id = activity_data_tool_call_id(&activity.data)
+                .map(|id| id.as_uuid().as_bytes().to_vec());
+            let started_at = i64::try_from(activity.started_at.as_unix_millis())
+                .map_err(|_| LoomError::invalid_request("activity start time is out of range"))?;
+            let completed_at = activity
+                .completed_at
+                .map(|time| {
+                    i64::try_from(time.as_unix_millis()).map_err(|_| {
+                        LoomError::invalid_request("activity end time is out of range")
+                    })
+                })
+                .transpose()?;
+            let elapsed_ms = activity
+                .elapsed_ms
+                .map(|elapsed| {
+                    i64::try_from(elapsed).map_err(|_| {
+                        LoomError::invalid_request("activity duration is out of range")
+                    })
+                })
+                .transpose()?;
+            transaction
+                .execute(
+                    "INSERT INTO run_activities(
+                        run_id, session_id, activity_id, ordinal, timeline_ordinal, parent_activity_id,
+                        step_id, tool_call_id, kind, status, started_at, completed_at,
+                        elapsed_ms, data_hash
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                     ON CONFLICT(run_id, activity_id) DO UPDATE SET
+                        session_id=excluded.session_id,
+                        ordinal=excluded.ordinal,
+                        timeline_ordinal=excluded.timeline_ordinal,
+                        parent_activity_id=excluded.parent_activity_id,
+                        step_id=excluded.step_id,
+                        tool_call_id=excluded.tool_call_id,
+                        kind=excluded.kind,
+                        status=excluded.status,
+                        started_at=excluded.started_at,
+                        completed_at=excluded.completed_at,
+                        elapsed_ms=excluded.elapsed_ms,
+                        data_hash=excluded.data_hash
+                     WHERE run_activities.session_id IS NOT excluded.session_id
+                        OR run_activities.ordinal IS NOT excluded.ordinal
+                        OR run_activities.timeline_ordinal IS NOT excluded.timeline_ordinal
+                        OR run_activities.parent_activity_id IS NOT excluded.parent_activity_id
+                        OR run_activities.step_id IS NOT excluded.step_id
+                        OR run_activities.tool_call_id IS NOT excluded.tool_call_id
+                        OR run_activities.kind IS NOT excluded.kind
+                        OR run_activities.status IS NOT excluded.status
+                        OR run_activities.started_at IS NOT excluded.started_at
+                        OR run_activities.completed_at IS NOT excluded.completed_at
+                        OR run_activities.elapsed_ms IS NOT excluded.elapsed_ms
+                        OR run_activities.data_hash IS NOT excluded.data_hash",
+                    params![
+                        run_id_bytes.as_slice(),
+                        session_id.as_slice(),
+                        activity_id.as_slice(),
+                        ordinal,
+                        timeline_ordinal,
+                        parent_activity_id.as_deref(),
+                        step_id.as_deref(),
+                        tool_call_id.as_deref(),
+                        activity_kind_name(activity.kind),
+                        activity_status_name(activity.status),
+                        started_at,
+                        completed_at,
+                        elapsed_ms,
+                        data_hash
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not save run activity: {error}"), true)
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO _loom_wanted_run_activities(run_id, activity_id)
+                     VALUES (?1, ?2)",
+                    params![run_id_bytes.as_slice(), activity_id.as_slice()],
+                )
+                .map_err(|error| {
+                    persistence_error(format!("could not stage run activity: {error}"), true)
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_activities
+                 WHERE run_id=?1 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_activities wanted
+                    WHERE wanted.run_id=run_activities.run_id
+                      AND wanted.activity_id=run_activities.activity_id
+                 )",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not prune run activities: {error}"), true)
+            })?;
+    }
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+}
+
+/// Persist only worker-reported activity changes. Existing activity ordinals
+/// are recovered by stable ID; new activities receive the next ordinal. This
+/// path deliberately does not stage or prune the run's complete activity set.
+pub(crate) fn save_run_activity_deltas(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    activities: &[AgentActivityRecord],
+    summaries: &BTreeMap<RunId, DurableRunSummary>,
+) -> Result<()> {
+    let run_id_bytes = run_id.as_uuid().as_bytes();
+    let session_id: Vec<u8> = transaction
+        .query_row(
+            "SELECT session_id FROM run_summaries WHERE run_id=?1",
+            [run_id_bytes.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(|error| {
+            persistence_error(
+                format!("run {run_id} has no durable summary for activity changes: {error}"),
+                true,
+            )
+        })?;
+    let mut seen = BTreeSet::new();
+    for activity in activities {
+        if activity.run_id != run_id || !seen.insert(activity.id) {
+            return Err(LoomError::invalid_request(
+                "activity deltas must have unique IDs matching their run",
+            ));
+        }
+        if activity.kind != activity_data_kind(&activity.data) {
+            return Err(LoomError::invalid_request(
+                "run activity kind does not match its data",
+            ));
+        }
+        let activity_id = activity.id.as_uuid().as_bytes();
+        let existing: Option<i64> = transaction
+            .query_row(
+                "SELECT ordinal FROM run_activities WHERE run_id=?1 AND activity_id=?2",
+                params![run_id_bytes.as_slice(), activity_id.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                persistence_error(format!("could not read activity ordinal: {error}"), true)
+            })?;
+        let ordinal = if let Some(ordinal) = existing {
+            ordinal
+        } else {
+            transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM run_activities WHERE run_id=?1",
+                    [run_id_bytes.as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not allocate activity ordinal: {error}"),
+                        true,
+                    )
+                })?
+        };
+        let timeline_ordinal = i64::try_from(activity.timeline_ordinal).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "activity timeline ordinal exceeds SQLite's integer range",
+                false,
+            )
+        })?;
+        let normalized_data = normalize_activity_tool_data(&activity.data);
+        let data = serde_json::to_vec(&normalized_data).map_err(|error| {
+            LoomError::new(
+                ErrorCode::Internal,
+                format!("could not encode run activity data: {error}"),
+                false,
+            )
+        })?;
+        let data_hash = store_content(transaction, &data)?;
+        let parent_activity_id = activity
+            .parent_id
+            .map(|id| id.as_uuid().as_bytes().to_vec());
+        let step_id = activity.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
+        let tool_call_id =
+            activity_data_tool_call_id(&activity.data).map(|id| id.as_uuid().as_bytes().to_vec());
+        let started_at = i64::try_from(activity.started_at.as_unix_millis())
+            .map_err(|_| LoomError::invalid_request("activity start time is out of range"))?;
+        let completed_at = activity
+            .completed_at
+            .map(|time| {
+                i64::try_from(time.as_unix_millis())
+                    .map_err(|_| LoomError::invalid_request("activity end time is out of range"))
+            })
+            .transpose()?;
+        let elapsed_ms = activity
+            .elapsed_ms
+            .map(|elapsed| {
+                i64::try_from(elapsed)
+                    .map_err(|_| LoomError::invalid_request("activity duration is out of range"))
+            })
+            .transpose()?;
+        transaction.execute(
+            "INSERT INTO run_activities(
+                run_id, session_id, activity_id, ordinal, timeline_ordinal, parent_activity_id,
+                step_id, tool_call_id, kind, status, started_at, completed_at,
+                elapsed_ms, data_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+             ON CONFLICT(run_id, activity_id) DO UPDATE SET
+                parent_activity_id=excluded.parent_activity_id, step_id=excluded.step_id,
+                tool_call_id=excluded.tool_call_id, kind=excluded.kind, status=excluded.status,
+                started_at=excluded.started_at, completed_at=excluded.completed_at,
+                elapsed_ms=excluded.elapsed_ms, data_hash=excluded.data_hash
+             WHERE run_activities.parent_activity_id IS NOT excluded.parent_activity_id
+                OR run_activities.step_id IS NOT excluded.step_id
+                OR run_activities.tool_call_id IS NOT excluded.tool_call_id
+                OR run_activities.kind IS NOT excluded.kind OR run_activities.status IS NOT excluded.status
+                OR run_activities.started_at IS NOT excluded.started_at
+                OR run_activities.completed_at IS NOT excluded.completed_at
+                OR run_activities.elapsed_ms IS NOT excluded.elapsed_ms
+                OR run_activities.data_hash IS NOT excluded.data_hash",
+            params![run_id_bytes.as_slice(), session_id.as_slice(), activity_id, ordinal,
+                timeline_ordinal,
+                parent_activity_id.as_deref(), step_id.as_deref(), tool_call_id.as_deref(),
+                activity_kind_name(activity.kind), activity_status_name(activity.status),
+                started_at, completed_at, elapsed_ms, data_hash],
+        ).map_err(|error| persistence_error(format!("could not save activity delta: {error}"), true))?;
+        if let Some((call, result)) = activity_tool_data(&activity.data) {
+            save_run_tool_activity_delta(
+                transaction,
+                run_id,
+                &session_id,
+                activity,
+                call,
+                result,
+                summaries
+                    .get(&run_id)
+                    .and_then(|summary| summary.execution_state.as_ref()),
+            )?;
+        }
+    }
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+}
+
+pub(crate) fn save_run_tool_activity_delta(
+    transaction: &Transaction<'_>,
+    run_id: RunId,
+    session_id: &[u8],
+    activity: &AgentActivityRecord,
+    call: &loom_model::ToolCall,
+    result: Option<&ToolResult>,
+    execution: Option<&AgentExecutionStateRecord>,
+) -> Result<()> {
+    let run_id_bytes = run_id.as_uuid().as_bytes();
+    let arguments = serde_json::to_vec(&call.arguments).map_err(|error| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            format!("could not encode tool-call arguments: {error}"),
+            false,
+        )
+    })?;
+    if call.name.len() > 4096 || arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+        return Err(LoomError::invalid_request(
+            "tool-call data exceeds the maximum supported size",
+        ));
+    }
+    let arguments_hash = store_content(transaction, &arguments)?;
+    let created_at = encode_timestamp(activity.started_at)?;
+    let call_id = call.id.as_uuid().as_bytes();
+    let existing: Option<(Vec<u8>, String, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT session_id, name, arguments_hash FROM run_tool_calls
+             WHERE run_id=?1 AND tool_call_id=?2",
+            params![run_id_bytes.as_slice(), call_id.as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|error| {
+            persistence_error(format!("could not read logical tool call: {error}"), true)
+        })?;
+    if let Some((stored_session, stored_name, stored_hash)) = existing {
+        if stored_session != session_id || stored_name != call.name || stored_hash != arguments_hash
+        {
+            return Err(LoomError::new(
+                ErrorCode::MalformedPayload,
+                "persisted logical tool call is immutable",
+                false,
+            ));
+        }
+    } else {
+        transaction
+            .execute(
+                "INSERT INTO run_tool_calls(run_id,session_id,tool_call_id,name,arguments_hash,created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    run_id_bytes.as_slice(),
+                    session_id,
+                    call_id.as_slice(),
+                    call.name,
+                    arguments_hash,
+                    created_at
+                ],
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not save logical tool call: {error}"), true)
+            })?;
+    }
+    let state = tool_attempt_state_for(activity, call, execution);
+    let started_at = encode_timestamp(activity.started_at)?;
+    let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
+    upsert_stored_attempt(
+        transaction,
+        run_id_bytes.as_slice(),
+        call.id,
+        activity.id,
+        state,
+        started_at,
+        completed_at,
+        result.cloned(),
+    )
+}
+
+pub(crate) fn tool_attempt_state_for(
+    activity: &AgentActivityRecord,
+    call: &loom_model::ToolCall,
+    execution: Option<&AgentExecutionStateRecord>,
+) -> AgentToolAttemptState {
+    match activity.status {
+        AgentActivityStatus::Started
+            if execution
+                .and_then(|execution| execution.pending_tool_execution.as_ref())
+                .is_some_and(|pending| pending.id == call.id) =>
+        {
+            AgentToolAttemptState::Queued
+        }
+        AgentActivityStatus::Started
+            if execution
+                .and_then(|execution| execution.last_failed_call.as_ref())
+                .is_some_and(|failed| failed.id == call.id) =>
+        {
+            AgentToolAttemptState::OutcomeUnknown
+        }
+        AgentActivityStatus::Started => AgentToolAttemptState::Running,
+        AgentActivityStatus::Completed => AgentToolAttemptState::Completed,
+        AgentActivityStatus::Failed => AgentToolAttemptState::Failed,
+        AgentActivityStatus::AwaitingApproval => AgentToolAttemptState::AwaitingApproval,
+        AgentActivityStatus::AwaitingInput => AgentToolAttemptState::AwaitingInput,
+        AgentActivityStatus::Cancelled => AgentToolAttemptState::Cancelled,
+    }
+}
+
+pub(crate) fn activity_tool_data(
+    data: &AgentActivityData,
+) -> Option<(&loom_model::ToolCall, Option<&ToolResult>)> {
+    match data {
+        AgentActivityData::ModelTurn { .. } => None,
+        AgentActivityData::ToolCall { call, result }
+        | AgentActivityData::File { call, result, .. }
+        | AgentActivityData::Search { call, result, .. }
+        | AgentActivityData::Command { call, result, .. } => Some((call, result.as_ref())),
+    }
+}
+
+pub(crate) fn normalize_activity_tool_data(data: &AgentActivityData) -> AgentActivityData {
+    let normalize_call = |call: &loom_model::ToolCall| loom_model::ToolCall {
+        id: call.id,
+        name: call.name.clone(),
+        arguments: Value::Null,
+    };
+    match data {
+        AgentActivityData::ModelTurn { model } => AgentActivityData::ModelTurn {
+            model: model.clone(),
+        },
+        AgentActivityData::ToolCall { call, .. } => AgentActivityData::ToolCall {
+            call: normalize_call(call),
+            result: None,
+        },
+        AgentActivityData::File {
+            call,
+            operation,
+            path,
+            ..
+        } => AgentActivityData::File {
+            call: normalize_call(call),
+            operation: *operation,
+            path: path.clone(),
+            result: None,
+        },
+        AgentActivityData::Search {
+            call, query, path, ..
+        } => AgentActivityData::Search {
+            call: normalize_call(call),
+            query: query.clone(),
+            path: path.clone(),
+            result: None,
+        },
+        AgentActivityData::Command {
+            call,
+            command,
+            args,
+            cwd,
+            ..
+        } => AgentActivityData::Command {
+            call: normalize_call(call),
+            command: command.clone(),
+            args: args.clone(),
+            cwd: cwd.clone(),
+            result: None,
+        },
+    }
+}
+
+pub(crate) fn restore_activity_tool_data(
+    data: AgentActivityData,
+    activity_id: ActivityId,
+    calls: &BTreeMap<loom_core::ToolCallId, loom_model::ToolCall>,
+    attempts: &BTreeMap<ActivityId, Option<ToolResult>>,
+) -> Result<AgentActivityData> {
+    let Some((stored_call, _)) = activity_tool_data(&data) else {
+        return Ok(data);
+    };
+    let call = calls.get(&stored_call.id).cloned().ok_or_else(|| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted tool activity has no logical tool-call row",
+            false,
+        )
+    })?;
+    let result = attempts.get(&activity_id).cloned().ok_or_else(|| {
+        LoomError::new(
+            ErrorCode::MalformedPayload,
+            "persisted tool activity has no tool-attempt row",
+            false,
+        )
+    })?;
+    Ok(match data {
+        AgentActivityData::ModelTurn { model } => AgentActivityData::ModelTurn { model },
+        AgentActivityData::ToolCall { .. } => AgentActivityData::ToolCall { call, result },
+        AgentActivityData::File {
+            operation, path, ..
+        } => AgentActivityData::File {
+            call,
+            operation,
+            path,
+            result,
+        },
+        AgentActivityData::Search { query, path, .. } => AgentActivityData::Search {
+            call,
+            query,
+            path,
+            result,
+        },
+        AgentActivityData::Command {
+            command, args, cwd, ..
+        } => AgentActivityData::Command {
+            call,
+            command,
+            args,
+            cwd,
+            result,
+        },
+    })
+}
+
+pub(crate) fn save_run_tool_rows(
+    transaction: &Transaction<'_>,
+    activities_by_run: &DurableRunActivities,
+    summaries: Option<&BTreeMap<RunId, DurableRunSummary>>,
+) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _loom_wanted_run_tool_calls (
+                run_id BLOB NOT NULL, tool_call_id BLOB NOT NULL,
+                PRIMARY KEY(run_id, tool_call_id)
+             ) WITHOUT ROWID, STRICT;
+             DELETE FROM _loom_wanted_run_tool_calls;",
+        )
+        .map_err(|error| {
+            persistence_error(format!("could not stage run tool rows: {error}"), true)
+        })?;
+    for (run_id, activities) in activities_by_run {
+        let run_id_bytes = run_id.as_uuid().as_bytes();
+        let session_id: Vec<u8> = transaction
+            .query_row(
+                "SELECT session_id FROM run_summaries WHERE run_id=?1",
+                [run_id_bytes.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("run {run_id} has no durable summary for its tool rows: {error}"),
+                    true,
+                )
+            })?;
+        let execution = summaries
+            .and_then(|summaries| summaries.get(run_id))
+            .and_then(|summary| summary.execution_state.as_ref());
+        let mut logical_calls =
+            BTreeMap::<loom_core::ToolCallId, (&loom_model::ToolCall, Timestamp)>::new();
+        let mut attempts_by_call = BTreeMap::<loom_core::ToolCallId, Vec<StoredToolAttempt>>::new();
+        for activity in activities {
+            if activity.run_id != *run_id {
+                return Err(LoomError::invalid_request(
+                    "run tool activity must match its owning run",
+                ));
+            }
+            let Some((call, result)) = activity_tool_data(&activity.data) else {
+                continue;
+            };
+            if let Some((existing, _)) = logical_calls.get(&call.id) {
+                if existing.name != call.name || existing.arguments != call.arguments {
+                    return Err(LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "a logical tool call changed its name or arguments",
+                        false,
+                    ));
+                }
+            } else {
+                logical_calls.insert(call.id, (call, activity.started_at));
+                let arguments = serde_json::to_vec(&call.arguments).map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        format!("could not encode tool-call arguments: {error}"),
+                        false,
+                    )
+                })?;
+                if arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+                    return Err(LoomError::new(
+                        ErrorCode::Persistence,
+                        "tool-call arguments exceed the maximum supported size",
+                        false,
+                    ));
+                }
+                let arguments_hash = store_content(transaction, &arguments)?;
+                let created_at = encode_timestamp(activity.started_at)?;
+                let existing: Option<(Vec<u8>, String, Vec<u8>)> = transaction
+                    .query_row(
+                        "SELECT session_id, name, arguments_hash FROM run_tool_calls
+                         WHERE run_id=?1 AND tool_call_id=?2",
+                        params![
+                            run_id_bytes.as_slice(),
+                            call.id.as_uuid().as_bytes().as_slice()
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not read logical tool call: {error}"),
+                            true,
+                        )
+                    })?;
+                if let Some((stored_session, stored_name, stored_arguments_hash)) = existing {
+                    if stored_session != session_id
+                        || stored_name != call.name
+                        || stored_arguments_hash != arguments_hash
+                    {
+                        return Err(LoomError::new(
+                            ErrorCode::MalformedPayload,
+                            "persisted logical tool call is immutable",
+                            false,
+                        ));
+                    }
+                } else {
+                    transaction
+                        .execute(
+                            "INSERT INTO run_tool_calls(
+                                run_id, session_id, tool_call_id, name, arguments_hash, created_at
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![
+                                run_id_bytes.as_slice(),
+                                session_id.as_slice(),
+                                call.id.as_uuid().as_bytes().as_slice(),
+                                call.name.as_str(),
+                                arguments_hash,
+                                created_at,
+                            ],
+                        )
+                        .map_err(|error| {
+                            persistence_error(
+                                format!("could not save logical tool call {}: {error}", call.id),
+                                true,
+                            )
+                        })?;
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO _loom_wanted_run_tool_calls(run_id, tool_call_id)
+                         VALUES (?1, ?2)",
+                        params![
+                            run_id_bytes.as_slice(),
+                            call.id.as_uuid().as_bytes().as_slice()
+                        ],
+                    )
+                    .map_err(|error| {
+                        persistence_error(format!("could not stage tool call: {error}"), true)
+                    })?;
+            }
+            let state = tool_attempt_state_for(activity, call, execution);
+            let started_at = encode_timestamp(activity.started_at)?;
+            let completed_at = activity.completed_at.map(encode_timestamp).transpose()?;
+            let attempts = attempts_by_call.entry(call.id).or_default();
+            let attempt_number = u32::try_from(attempts.len() + 1).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "tool call has too many execution attempts",
+                    false,
+                )
+            })?;
+            attempts.push(StoredToolAttempt {
+                activity_id: encode_hash_hex(activity.id.as_uuid().as_bytes()),
+                attempt_number,
+                state: tool_attempt_state_name(state).to_owned(),
+                started_at,
+                completed_at,
+                result: result.cloned(),
+            });
+        }
+        for (call_id, attempts) in &attempts_by_call {
+            let payload = serde_json::to_string(attempts).map_err(|error| {
+                persistence_error(format!("could not encode tool attempts: {error}"), false)
+            })?;
+            transaction
+                .execute(
+                    "UPDATE run_tool_calls SET attempts=?3
+                     WHERE run_id=?1 AND tool_call_id=?2",
+                    params![
+                        run_id_bytes.as_slice(),
+                        call_id.as_uuid().as_bytes().as_slice(),
+                        payload
+                    ],
+                )
+                .map_err(|error| {
+                    persistence_error(
+                        format!("could not save tool attempts for {call_id}: {error}"),
+                        true,
+                    )
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM run_tool_calls
+                 WHERE run_id=?1 AND NOT EXISTS (
+                    SELECT 1 FROM _loom_wanted_run_tool_calls wanted
+                    WHERE wanted.run_id=run_tool_calls.run_id
+                      AND wanted.tool_call_id=run_tool_calls.tool_call_id
+                 )",
+                [run_id_bytes.as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune tool calls for {run_id}: {error}"),
+                    true,
+                )
+            })?;
+    }
+    collect_unused_content(transaction, MAX_CONTENT_GC_CANDIDATES_PER_WRITE)
+}
