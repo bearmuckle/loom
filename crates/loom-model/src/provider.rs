@@ -224,6 +224,8 @@ pub enum ProviderKind {
     Deterministic,
     OpenAi,
     OpenAiCompatible,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
     Ollama,
     GitHubCopilot,
 }

@@ -81,7 +81,7 @@ impl ProviderRegistry {
         for config in configs {
             if !matches!(
                 config.kind,
-                ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+                ProviderKind::OpenAi | ProviderKind::OpenAiCompatible | ProviderKind::DeepSeek
             ) {
                 continue;
             }
@@ -119,6 +119,9 @@ impl ProviderRegistry {
         let model =
             std::env::var("LOOM_OPENAI_MODEL").unwrap_or_else(|_| OPENAI_DEFAULT_MODEL.to_owned());
         registry.register(ProviderConfig::openai(model))?;
+        let deepseek_model = std::env::var("LOOM_DEEPSEEK_MODEL")
+            .unwrap_or_else(|_| DEEPSEEK_DEFAULT_MODEL.to_owned());
+        registry.register(ProviderConfig::deepseek(deepseek_model))?;
         registry.register(ProviderConfig::github_copilot(CredentialRef::new(
             GITHUB_COPILOT_CREDENTIAL_REF,
         )))?;
@@ -278,7 +281,7 @@ impl ProviderRegistry {
             .ok_or_else(|| LoomError::not_found("provider", provider_id.as_str()))?;
         if !matches!(
             config.kind,
-            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+            ProviderKind::OpenAi | ProviderKind::OpenAiCompatible | ProviderKind::DeepSeek
         ) {
             return Err(LoomError::invalid_request(
                 "API keys can only be configured for API-key providers",
@@ -354,7 +357,7 @@ impl ProviderRegistry {
                     .map(|reference| reference.as_str().to_owned()),
                 api_key_configurable: matches!(
                     config.kind,
-                    ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+                    ProviderKind::OpenAi | ProviderKind::OpenAiCompatible | ProviderKind::DeepSeek
                 ),
                 health: health.get(&config.id).cloned().unwrap_or_default(),
             })
@@ -638,6 +641,18 @@ impl ProviderRegistry {
                 })?;
                 Box::new(OllamaProvider::with_descriptor(endpoint, descriptor))
             }
+            ProviderKind::DeepSeek => {
+                let endpoint = config.endpoint.as_deref().unwrap_or(DEEPSEEK_API_ENDPOINT);
+                let secret = config
+                    .credential
+                    .as_ref()
+                    .map(|reference| self.resolve_credential(reference))
+                    .transpose()?
+                    .unwrap_or_default();
+                Box::new(OpenAiCompatibleProvider::with_descriptor(
+                    endpoint, secret, descriptor,
+                ))
+            }
             ProviderKind::GitHubCopilot => Box::new(
                 self.create_github_copilot_provider(&config)?
                     .with_model_descriptor(descriptor),
@@ -736,7 +751,9 @@ impl ProviderRegistry {
                 if config.kind != ProviderKind::GitHubCopilot
                     && (!matches!(
                         config.kind,
-                        ProviderKind::OpenAi | ProviderKind::OpenAiCompatible
+                        ProviderKind::OpenAi
+                            | ProviderKind::OpenAiCompatible
+                            | ProviderKind::DeepSeek
                     ) || config.credential.is_none())
                 {
                     continue;
