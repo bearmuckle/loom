@@ -1307,6 +1307,34 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_github_access_updates_the_advertised_tools() {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task =
+            AgentTask::new("open a pull request", ModelId::new("deterministic/demo")).unwrap();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(DeterministicProvider::demo()),
+            tools,
+        );
+        let advertises_push = |runtime: &AgentRuntime| {
+            runtime
+                .model_request()
+                .unwrap()
+                .0
+                .tools
+                .iter()
+                .any(|tool| tool.name == "github_push_branch")
+        };
+        assert!(!advertises_push(&runtime));
+
+        runtime.set_github_access(Some("test-token".to_owned()), true);
+        assert!(advertises_push(&runtime));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn retries_a_failed_patch_after_the_workspace_is_fixed() {
         let root = workspace();
         fs::write(root.join("loom-m1-demo.txt"), "existing\n").unwrap();

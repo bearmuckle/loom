@@ -359,6 +359,13 @@ impl ToolExecutor {
         self
     }
 
+    /// Refreshes the GitHub token and write grant on an already-built executor
+    /// so a settings change takes effect for the next agent step.
+    pub fn set_github_access(&mut self, token: Option<String>, write_access: bool) {
+        self.github_token = token.filter(|token| !token.trim().is_empty());
+        self.github_write_enabled = write_access;
+    }
+
     pub fn with_extension(mut self, extension: Arc<dyn ToolExtension>) -> Self {
         self.extension = Some(extension);
         self
@@ -2608,6 +2615,34 @@ mod tests {
                 .iter()
                 .any(|definition| definition.name == "github_create_pull_request")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn set_github_access_refreshes_an_existing_executor() {
+        let root = workspace();
+        let mut executor = ToolExecutor::new(&root).unwrap();
+        let advertised = |executor: &ToolExecutor| {
+            executor
+                .definitions()
+                .iter()
+                .any(|definition| definition.name == "github_push_branch")
+        };
+        assert!(!advertised(&executor));
+        let refused = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+        assert!(!refused.success);
+        assert!(refused.output.contains("write access is disabled"));
+
+        executor.set_github_access(Some("test-token".to_owned()), true);
+        assert!(advertised(&executor));
+        let refreshed = executor.execute(&call(
+            "github_push_branch",
+            serde_json::json!({"repository": "owner/name"}),
+        ));
+        assert!(!refreshed.output.contains("write access is disabled"));
         fs::remove_dir_all(root).unwrap();
     }
 
