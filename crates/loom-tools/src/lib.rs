@@ -2375,3 +2375,80 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn domain_normalization_and_filtering() {
+        assert_eq!(
+            normalize_domains(vec![
+                " Example.COM ".to_owned(),
+                "example.com".to_owned(),
+                "a.b.".to_owned(),
+            ])
+            .unwrap(),
+            vec!["example.com".to_owned(), "a.b".to_owned()]
+        );
+        assert!(normalize_domains(vec!["bad/domain".to_owned()]).is_err());
+        assert!(normalize_domains(vec!["with space".to_owned()]).is_err());
+        assert!(normalize_domains(vec!["".to_owned()]).is_err());
+        assert!(domain_is_allowed(
+            "https://sub.example.com/x",
+            &["example.com".to_owned()]
+        ));
+        assert!(!domain_is_allowed(
+            "https://evil.test",
+            &["example.com".to_owned()]
+        ));
+        assert!(domain_is_allowed("not a url", &[]));
+        assert!(!domain_is_allowed("not a url", &["example.com".to_owned()]));
+    }
+
+    #[test]
+    fn search_url_normalization() {
+        assert_eq!(
+            normalize_search_url("https://example.com/x"),
+            Some("https://example.com/x".to_owned())
+        );
+        assert!(normalize_search_url("//example.com/x").is_some());
+        assert!(normalize_search_url("javascript:alert(1)").is_none());
+        assert_eq!(
+            normalize_search_url("https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com"),
+            Some("https://example.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn truncation_helpers_preserve_boundaries() {
+        assert_eq!(truncate_text("abc", 10), "abc");
+        assert_eq!(truncate_text("abcdef", 3), "abc...");
+        assert_eq!(floor_char_boundary("héllo", 2), 1);
+        assert_eq!(ceil_char_boundary("héllo", 2), 3);
+        assert_eq!(floor_char_boundary("abc", 100), 3);
+        assert_eq!(ceil_char_boundary("abc", 100), 3);
+        let middle = truncate_middle(&"x".repeat(1000), 100);
+        assert!(middle.len() <= 100);
+        assert!(middle.contains("bytes omitted"));
+    }
+
+    #[test]
+    fn limit_glob_and_repository_validation() {
+        assert_eq!(parse_limit(None, 5, 10, "x").unwrap(), 5);
+        assert_eq!(parse_limit(Some(3), 5, 10, "x").unwrap(), 3);
+        assert!(parse_limit(Some(0), 5, 10, "x").is_err());
+        assert!(parse_limit(Some(11), 5, 10, "x").is_err());
+        assert!(compile_glob(Some("*.rs")).unwrap().is_some());
+        assert!(compile_glob(Some("[")).is_err());
+        assert!(compile_glob(None).unwrap().is_none());
+        assert!(valid_github_repository("owner/name"));
+        assert!(valid_github_repository("owner/na-me_1.2"));
+        assert!(!valid_github_repository("owner"));
+        assert!(!valid_github_repository("owner/"));
+        assert!(!valid_github_repository("owner/name/extra"));
+        assert!(!valid_github_repository("ow ner/name"));
+        assert_eq!(entry_depth("a", "a"), 0);
+        assert_eq!(entry_depth("a/b/c", "a"), 2);
+    }
+}
