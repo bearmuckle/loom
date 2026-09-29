@@ -964,6 +964,17 @@ fn await_settled_run(
     connection: &InProcessConnection,
     run_id: loom_core::RunId,
 ) -> loom_agent::AgentRunSnapshot {
+    // Wait on the run handle's idle condition instead of polling: the worker
+    // signals `idle` when it stops running, so this wakes as soon as the run
+    // settles rather than after an arbitrary sleep.
+    if let Some(handle) = connection
+        .backend
+        .runs()
+        .ok()
+        .and_then(|runs| runs.get(&run_id).cloned())
+    {
+        let _ = handle.wait_until_idle_for(Duration::from_secs(10));
+    }
     let mut last_snapshot = None;
     for _ in 0..1_000 {
         let response = connection.request(RequestEnvelope::new(ClientRequest::Run(
@@ -980,7 +991,7 @@ fn await_settled_run(
         ) {
             return snapshot;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     let failure = connection
         .backend
@@ -1006,7 +1017,7 @@ fn await_project_manager_wait_status(
         if wait.status == expected_status {
             return wait;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     panic!(
         "project manager wait {wait_id} did not reach {expected_status:?}; last status: {last_status:?}"
@@ -2622,7 +2633,7 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
             terminal_done = true;
             break;
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(2));
     }
     assert!(terminal_done);
 
@@ -2674,7 +2685,7 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
             task_done = true;
             break;
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(2));
     }
     assert!(task_done);
     let listed = connection.request(RequestEnvelope::new(ClientRequest::Task(
@@ -3340,7 +3351,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
                 _ => None,
             });
             approval.or_else(|| {
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(Duration::from_millis(1));
                 None
             })
         })
@@ -3368,7 +3379,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         if usage.input_tokens > 0 {
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
         usage = match connection
             .request(RequestEnvelope::new(ClientRequest::Usage(
                 UsageRequest::GetRunUsage { run_id },
@@ -3470,7 +3481,7 @@ fn persistent_backend_recovers_transcript_workspace_and_pending_approval() {
         {
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].id, before_retry.attempt_id);
@@ -4119,7 +4130,7 @@ fn m5_workspace_context_vcs_and_task_evidence_are_authoritative() {
             fs::remove_dir_all(root).unwrap();
             return;
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(2));
     }
     panic!("task evidence fixture did not finish");
 }
@@ -5589,7 +5600,7 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
             Instant::now() < deadline,
             "manager should complete after its child is integrated; status={status:?}"
         );
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
 
     let root_review = connection.request(RequestEnvelope::new(ClientRequest::Project(
@@ -6909,7 +6920,7 @@ fn durable_manager_wait_releases_workspace_slot_and_resumes_once() {
             manager_task.status,
             grandchild_task.status
         );
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     };
     assert_eq!(
         manager_task_after_park.status,
@@ -7098,7 +7109,7 @@ fn durable_manager_wait_releases_workspace_slot_and_resumes_once() {
             Instant::now() < deadline,
             "completed sibling run should release its delegated task slot; status={status:?}"
         );
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
 
     model.respond_with_text(
@@ -7318,7 +7329,7 @@ fn durable_manager_wait_recovers_after_restart_and_resumes_once() {
             sibling_task.status,
             grandchild_task.status
         );
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     };
     assert_eq!(
         manager_task_after_park.status,
@@ -7770,7 +7781,7 @@ fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_f
                 ))
                 .collect::<Vec<_>>()
         );
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     };
     assert_eq!(manager_after_wait.state, AgentRunState::Paused);
 
@@ -7801,7 +7812,7 @@ fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_f
             Instant::now() < deadline,
             "manager should park with only its prerequisite admitted; manager={manager_status:?}, prerequisite={prerequisite_status:?}, dependent={dependent_status:?}"
         );
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     let wait = persistence
         .list_project_manager_waits_by_child(dependent_task.task_id)
@@ -7864,7 +7875,7 @@ fn dependency_failure_blocks_child_and_releases_manager_wait_once(prerequisite_f
             Instant::now() < prerequisite_deadline,
             "prerequisite should become {prerequisite_status:?}, got {status:?}"
         );
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     if let Some(stream) = prerequisite_stream {
         stream.join().unwrap();
@@ -9027,7 +9038,7 @@ impl ScriptedOpenAiEndpoint {
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
+                        thread::sleep(Duration::from_millis(1));
                     }
                     Err(_) => break,
                 }
@@ -9308,7 +9319,7 @@ fn streamed_message_fragments_batch_until_the_time_threshold() {
         if handle.message_fragments.lock().unwrap().pending_bytes == "first".len() {
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(
         handle.message_fragments.lock().unwrap().pending_bytes,
@@ -9325,7 +9336,7 @@ fn streamed_message_fragments_batch_until_the_time_threshold() {
             .all(|message| message.content != "first")
     );
 
-    thread::sleep(MESSAGE_FRAGMENT_BATCH_INTERVAL + Duration::from_millis(10));
+    thread::sleep(MESSAGE_FRAGMENT_BATCH_INTERVAL + Duration::from_millis(2));
     let mut flushed_prefix = None;
     for _ in 0..200 {
         flushed_prefix = backend
@@ -9340,7 +9351,7 @@ fn streamed_message_fragments_batch_until_the_time_threshold() {
         if flushed_prefix.as_deref() == Some("first") {
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(flushed_prefix.as_deref(), Some("first"));
 
@@ -9360,7 +9371,7 @@ fn streamed_message_fragments_batch_until_the_time_threshold() {
         if persisted_content.as_deref() == Some("firstsecond") {
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(persisted_content.as_deref(), Some("firstsecond"));
     assert_eq!(handle.message_fragments.lock().unwrap().pending_bytes, 0);
@@ -9444,7 +9455,7 @@ fn streamed_message_fragments_flush_at_the_byte_threshold_without_splitting_utf8
         if persisted_content.as_deref() == Some(content.as_str()) {
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(persisted_content.as_deref(), Some(content.as_str()));
 
@@ -9538,7 +9549,7 @@ fn a_running_model_call_can_be_interrupted_without_blocking_the_request() {
             streamed = true;
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(1));
     }
     assert!(
         streamed,
