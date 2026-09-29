@@ -62,6 +62,7 @@ mod dispatch;
 mod remote;
 mod services;
 
+use services::credential::CredentialService;
 #[cfg(test)]
 use services::idempotency::{
     IDEMPOTENCY_RETENTION, LEGACY_IDEMPOTENCY_RETENTION, trim_idempotency_cache,
@@ -1804,11 +1805,6 @@ struct StartRunInput {
     options: AgentRuntimeOptions,
 }
 
-struct GitHubCopilotLoginRecord {
-    status: GitHubCopilotLoginStatus,
-    expires_at: Instant,
-}
-
 pub struct InProcessBackend {
     node_id: String,
     node_name: String,
@@ -1834,7 +1830,7 @@ pub struct InProcessBackend {
     resource_monitor: Mutex<ResourceMonitor>,
     supported_capabilities: CapabilitySet,
     providers: ProviderRegistry,
-    github_copilot_logins: Mutex<BTreeMap<String, GitHubCopilotLoginRecord>>,
+    credentials: CredentialService,
     persistence: Option<FilePersistence>,
     session_root_base: PathBuf,
     idempotency_store: IdempotencyStore,
@@ -3237,7 +3233,7 @@ impl InProcessBackend {
             resource_monitor: Mutex::new(ResourceMonitor::default()),
             supported_capabilities: CapabilitySet::new(supported_capabilities),
             providers,
-            github_copilot_logins: Mutex::new(BTreeMap::new()),
+            credentials: CredentialService::new(),
             persistence,
             session_root_base,
             idempotency_store: IdempotencyStore::new(),
@@ -6881,53 +6877,24 @@ impl InProcessConnection {
 
         let now = Instant::now();
         let login_id = uuid::Uuid::new_v4().to_string();
-        {
-            let mut logins = self
-                .backend
-                .github_copilot_logins
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            logins.retain(|_, login| login.expires_at + COMPLETED_LOGIN_RETENTION > now);
-            if logins
-                .values()
-                .filter(|login| matches!(login.status, GitHubCopilotLoginStatus::Pending))
-                .count()
-                >= MAX_PENDING_LOGINS
-            {
-                return Err(LoomError::new(
-                    ErrorCode::Conflict,
-                    "too many GitHub Copilot sign-ins are already pending on this worker",
-                    true,
-                ));
-            }
-            logins.insert(
-                login_id.clone(),
-                GitHubCopilotLoginRecord {
-                    status: GitHubCopilotLoginStatus::Pending,
-                    expires_at: now + Duration::from_secs(3600),
-                },
-            );
-        }
+        self.backend.credentials.begin_pending(
+            login_id.clone(),
+            now,
+            COMPLETED_LOGIN_RETENTION,
+            MAX_PENDING_LOGINS,
+            now + Duration::from_secs(3600),
+        )?;
         let device = match GitHubCopilotAuthenticator::default().begin() {
             Ok(device) => device,
             Err(error) => {
-                self.backend
-                    .github_copilot_logins
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&login_id);
+                self.backend.credentials.remove(&login_id);
                 return Err(error);
             }
         };
-        if let Some(login) = self
-            .backend
-            .github_copilot_logins
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(&login_id)
-        {
-            login.expires_at = now + Duration::from_secs(device.expires_in.min(3600));
-        }
+        self.backend.credentials.set_expires_at(
+            &login_id,
+            now + Duration::from_secs(device.expires_in.min(3600)),
+        );
 
         let backend = self.backend.clone();
         let device_for_poll = device.clone();
@@ -6946,22 +6913,10 @@ impl InProcessConnection {
                         message: error.message,
                     },
                 };
-                let mut logins = backend
-                    .github_copilot_logins
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                if let Some(login) = logins.get_mut(&worker_login_id)
-                    && matches!(login.status, GitHubCopilotLoginStatus::Pending)
-                {
-                    login.status = status;
-                }
+                backend.credentials.finish(&worker_login_id, status);
             });
         if let Err(error) = spawn_result {
-            self.backend
-                .github_copilot_logins
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&login_id);
+            self.backend.credentials.remove(&login_id);
             return Err(LoomError::new(
                 ErrorCode::Internal,
                 format!("could not start GitHub Copilot sign-in: {error}"),
@@ -6979,24 +6934,8 @@ impl InProcessConnection {
     }
 
     fn github_copilot_login_status(&self, login_id: &str) -> Result<ServerResponse> {
-        let mut logins = self
-            .backend
-            .github_copilot_logins
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let login = logins
-            .get_mut(login_id)
-            .ok_or_else(|| LoomError::not_found("GitHub Copilot sign-in", login_id))?;
-        if matches!(login.status, GitHubCopilotLoginStatus::Pending)
-            && Instant::now() >= login.expires_at
-        {
-            login.status = GitHubCopilotLoginStatus::Failed {
-                message: "GitHub device authorization expired".to_owned(),
-            };
-        }
-        Ok(ServerResponse::GitHubCopilotLoginStatus {
-            status: login.status.clone(),
-        })
+        let status = self.backend.credentials.status(login_id, Instant::now())?;
+        Ok(ServerResponse::GitHubCopilotLoginStatus { status })
     }
 
     fn create_project_child(
