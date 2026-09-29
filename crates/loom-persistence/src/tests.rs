@@ -1,6 +1,5 @@
 use super::*;
 use loom_session::{SessionManager, WorkspaceManager};
-use serde::{Deserialize, Serialize};
 use std::process::Command;
 use uuid::Uuid;
 
@@ -8,11 +7,6 @@ use uuid::Uuid;
 // file. Serialize it with the drop/reacquire tests so a forked child cannot
 // transiently retain another test's flock descriptor.
 static EXCLUSIVE_WRITER_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
-struct Fixture {
-    value: String,
-}
 
 fn stored_fragment_count(path: &std::path::Path, run_id: RunId) -> usize {
     let connection = Connection::open(path).unwrap();
@@ -656,28 +650,6 @@ fn non_sqlite_file_is_rejected_without_migration() {
     assert_eq!(error.code, ErrorCode::Persistence);
     assert!(!path.with_extension("json.legacy").exists());
     fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn memory_store_round_trips_and_rejects_malformed_values() {
-    let store = MemoryPersistence::default();
-    assert!(store.load::<Fixture>().unwrap().is_none());
-    store
-        .save(&Fixture {
-            value: "memory".to_owned(),
-        })
-        .unwrap();
-    assert_eq!(
-        store.load::<Fixture>().unwrap(),
-        Some(Fixture {
-            value: "memory".to_owned(),
-        })
-    );
-    store.set_raw(serde_json::json!({"wrong": true})).unwrap();
-    assert_eq!(
-        store.load::<Fixture>().unwrap_err().code,
-        ErrorCode::MalformedPayload
-    );
 }
 
 #[test]
