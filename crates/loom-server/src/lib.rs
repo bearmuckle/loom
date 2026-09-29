@@ -65,7 +65,7 @@ use sysinfo::System;
 mod auth;
 mod backend;
 
-use backend::RunService;
+use backend::{RunService, SessionService, WorkspaceService};
 mod connection;
 mod dispatch;
 mod event_journal;
@@ -256,8 +256,8 @@ struct StartRunInput {
 pub struct InProcessBackend {
     node_id: String,
     node_name: String,
-    sessions: Mutex<SessionManager>,
-    workspace_records: Mutex<loom_session::WorkspaceManager>,
+    session_service: SessionService,
+    workspace_service: WorkspaceService,
     run_service: RunService,
     journal: Mutex<EventJournal>,
     last_feed_pruned_sequence: AtomicU64,
@@ -269,9 +269,6 @@ pub struct InProcessBackend {
         Mutex<BTreeMap<AgentSessionId, BTreeMap<RepositoryId, SessionRepository>>>,
     session_vcs: Mutex<BTreeMap<(AgentSessionId, RepositoryId), GitService>>,
     session_task_supervisors: Mutex<BTreeMap<AgentSessionId, TaskSupervisor>>,
-    session_policies: Mutex<BTreeMap<AgentSessionId, ApprovalPolicy>>,
-    auto_approve_actions: Mutex<BTreeMap<AgentSessionId, bool>>,
-    workspace_configs: Mutex<BTreeMap<WorkspaceId, WorkspaceConfig>>,
     session_terminals: Mutex<BTreeMap<loom_core::TerminalId, AgentSessionId>>,
     terminals: TerminalManager,
     resource_monitor: Mutex<ResourceMonitor>,

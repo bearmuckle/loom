@@ -34,25 +34,13 @@ impl InProcessBackend {
     }
 
     pub(crate) fn sessions(&self) -> Result<MutexGuard<'_, SessionManager>> {
-        self.sessions.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session manager lock was poisoned",
-                true,
-            )
-        })
+        self.session_service.sessions()
     }
 
     pub(crate) fn workspace_records(
         &self,
     ) -> Result<MutexGuard<'_, loom_session::WorkspaceManager>> {
-        self.workspace_records.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "workspace record manager lock was poisoned",
-                true,
-            )
-        })
+        self.workspace_service.records()
     }
 
     pub(crate) fn session_filesystems(
@@ -149,37 +137,19 @@ impl InProcessBackend {
     pub(crate) fn session_policies(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, ApprovalPolicy>>> {
-        self.session_policies.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session approval policy lock was poisoned",
-                true,
-            )
-        })
+        self.session_service.policies()
     }
 
     pub(crate) fn auto_approve_actions(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, bool>>> {
-        self.auto_approve_actions.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "session approval settings lock was poisoned",
-                true,
-            )
-        })
+        self.session_service.auto_approve_actions()
     }
 
     pub(crate) fn workspace_configs(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<WorkspaceId, WorkspaceConfig>>> {
-        self.workspace_configs.lock().map_err(|_| {
-            LoomError::new(
-                ErrorCode::Internal,
-                "workspace config lock was poisoned",
-                true,
-            )
-        })
+        self.workspace_service.configs()
     }
 
     pub(crate) fn resource_monitor(&self) -> Result<MutexGuard<'_, ResourceMonitor>> {
