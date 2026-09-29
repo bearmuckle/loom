@@ -18,7 +18,6 @@ gpui-kit.workspace = true
 loom-core.workspace = true
 loom-model.workspace = true
 loom-protocol.workspace = true
-loom-workspace.workspace = true
 futures-channel.workspace = true
 log.workspace = true
 serde_json.workspace = true

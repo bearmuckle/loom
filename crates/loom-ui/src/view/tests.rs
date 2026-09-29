@@ -207,9 +207,9 @@ mod display_helper_tests {
             assert_eq!(run_state_label(Some(state)), label);
         }
         for (kind, label) in [
-            (loom_workspace::WorkspaceChangeKind::Created, "New"),
-            (loom_workspace::WorkspaceChangeKind::Deleted, "Removed"),
-            (loom_workspace::WorkspaceChangeKind::Modified, "Updated"),
+            (loom_protocol::WorkspaceChangeKind::Created, "New"),
+            (loom_protocol::WorkspaceChangeKind::Deleted, "Removed"),
+            (loom_protocol::WorkspaceChangeKind::Modified, "Updated"),
         ] {
             assert_eq!(change_kind_label(kind), label);
         }
@@ -2619,7 +2619,7 @@ mod loom_view_render_tests {
             let edit = view.connection.request(RequestEnvelope::new(
                 ClientRequest::ApplySessionFilesystemEdit {
                     session_id: session.id,
-                    edit: loom_workspace::WorkspaceEdit {
+                    edit: loom_protocol::WorkspaceEdit {
                         path: "repo/README.md".to_owned(),
                         old_text: "before".to_owned(),
                         new_text: "after".to_owned(),

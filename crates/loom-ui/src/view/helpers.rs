@@ -707,11 +707,11 @@ pub(crate) fn run_state_label(state: Option<AgentRunState>) -> &'static str {
     }
 }
 
-pub(crate) fn change_kind_label(kind: loom_workspace::WorkspaceChangeKind) -> &'static str {
+pub(crate) fn change_kind_label(kind: loom_protocol::WorkspaceChangeKind) -> &'static str {
     match kind {
-        loom_workspace::WorkspaceChangeKind::Created => "New",
-        loom_workspace::WorkspaceChangeKind::Deleted => "Removed",
-        loom_workspace::WorkspaceChangeKind::Modified => "Updated",
+        loom_protocol::WorkspaceChangeKind::Created => "New",
+        loom_protocol::WorkspaceChangeKind::Deleted => "Removed",
+        loom_protocol::WorkspaceChangeKind::Modified => "Updated",
     }
 }
 

@@ -4432,7 +4432,6 @@ dependencies = [
  "loom-model",
  "loom-protocol",
  "loom-server",
- "loom-workspace",
  "open",
  "serde_json",
  "tokio",
