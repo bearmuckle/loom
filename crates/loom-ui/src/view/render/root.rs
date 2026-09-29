@@ -595,7 +595,7 @@ impl Render for LoomView {
             // text participants prepaint and register themselves.
             .child(TextSelectionLayer)
             .when(self.source_dialog.is_some(), |element| {
-                element.child(self.render_source_dialog(cx))
+                element.child(self.render_source_dialog(layout, cx))
             })
             .child(
                 div()

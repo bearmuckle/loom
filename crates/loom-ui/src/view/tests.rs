@@ -1363,6 +1363,67 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
+    fn phone_source_dialog_stacks_choices_and_keeps_actions_visible(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(390.), px(520.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = LoomView::new_for_test(cx.focus_handle());
+                view.source_dialog = Some(SessionSourceDialog {
+                    purpose: SessionSourceDialogPurpose::StartSession,
+                    choice: SessionSourceChoice::GitHub,
+                    local_directory_available: true,
+                    filter_subscription: None,
+                    repositories: (0..40)
+                        .map(|index| GitHubRepository {
+                            full_name: format!("owner/repository-{index}"),
+                            description: Some("example repository".to_owned()),
+                            clone_url: format!("https://github.com/owner/repository-{index}.git"),
+                            private: false,
+                            default_branch: "main".to_owned(),
+                        })
+                        .collect(),
+                    selected_repository: None,
+                    repositories_loading: false,
+                    error: None,
+                });
+                view
+            });
+            gpui_kit::component::Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            let viewport = window.viewport_size();
+            let empty = window.find("source-empty");
+            let local = window.find("source-local-directory");
+            let github = window.find("source-github");
+            assert!(empty.visible() && local.visible() && github.visible());
+            // The three source choices stack vertically on a phone-width window
+            // instead of overflowing the dialog's right edge.
+            assert!(empty.bounds().bottom() <= local.bounds().top());
+            assert!(local.bounds().bottom() <= github.bounds().top());
+            for id in [
+                "source-empty",
+                "source-local-directory",
+                "source-github",
+                "cancel-session-source",
+                "confirm-session-source",
+            ] {
+                let bounds = window.find(id).bounds();
+                assert!(
+                    bounds.right() <= viewport.width,
+                    "{id} ran off the right edge: {bounds:?}"
+                );
+            }
+            // The actions stay pinned and reachable even though the repository
+            // list inside the scrollable body is longer than the window.
+            assert!(window.find("cancel-session-source").visible());
+            assert!(window.find("confirm-session-source").visible());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn session_source_and_review_actions_cover_empty_invalid_and_missing_states(
         cx: &mut TestAppContext,
     ) {

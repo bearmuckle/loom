@@ -89,10 +89,15 @@ impl LoomView {
             .into_any()
     }
 
-    pub(crate) fn render_source_dialog(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_source_dialog(
+        &self,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let Some(dialog) = &self.source_dialog else {
             return div().into_any();
         };
+        let phone = layout.phone;
         let is_start = dialog.purpose == SessionSourceDialogPurpose::StartSession;
         let selected_repo = dialog.selected_repository.as_deref();
         let repository_query = self
@@ -154,7 +159,7 @@ impl LoomView {
             );
         }
 
-        let mut dialog_body = div().mt_3();
+        let mut dialog_body = div();
         if dialog.choice == SessionSourceChoice::LocalDirectory {
             dialog_body = dialog_body
                 .child(div().text_xs().text_color(rgb(0x8f98a6)).child(
@@ -282,6 +287,47 @@ impl LoomView {
             );
         }
 
+        let mut source_choices = ButtonGroup::new("session-source-choices")
+            .outline()
+            .small()
+            .when(phone, |group| {
+                group.w_full().layout(gpui_kit::Axis::Vertical)
+            });
+        if is_start {
+            source_choices = source_choices.child(
+                Button::new("source-empty")
+                    .label("Empty project")
+                    .small()
+                    .when(phone, |button| button.w_full())
+                    .selected(dialog.choice == SessionSourceChoice::Empty)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.choose_source(SessionSourceChoice::Empty, cx)
+                    })),
+            );
+        }
+        if dialog.local_directory_available {
+            source_choices = source_choices.child(
+                Button::new("source-local-directory")
+                    .label("Local folder")
+                    .small()
+                    .when(phone, |button| button.w_full())
+                    .selected(dialog.choice == SessionSourceChoice::LocalDirectory)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.choose_source(SessionSourceChoice::LocalDirectory, cx)
+                    })),
+            );
+        }
+        source_choices = source_choices.child(
+            Button::new("source-github")
+                .label("GitHub repository")
+                .small()
+                .when(phone, |button| button.w_full())
+                .selected(dialog.choice == SessionSourceChoice::GitHub)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.choose_source(SessionSourceChoice::GitHub, cx)
+                })),
+        );
+
         Dialog::new(cx)
             .title(if is_start {
                 "New project"
@@ -295,12 +341,13 @@ impl LoomView {
             .keyboard(false)
             .overlay_closable(false)
             .w(px(560.))
-            .max_h(px(600.))
             .text_color(rgb(0xe5e7eb))
             .child(
                 div()
                     .w_full()
-                    .overflow_y_scrollbar()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
                     .child(
                         div()
                             .text_xs()
@@ -311,84 +358,36 @@ impl LoomView {
                                 "Choose a repository or folder to add to the active session."
                             }),
                     )
+                    .child(source_choices)
+                    .child(dialog_body),
+            )
+            .footer(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap_1()
                     .child(
-                        div()
-                            .mt_3()
-                            .flex()
-                            .gap_1()
-                            .when(is_start, |row| {
-                                row.child(
-                                    Button::new("source-empty")
-                                        .label("Empty project")
-                                        .small()
-                                        .when(
-                                            dialog.choice == SessionSourceChoice::Empty,
-                                            |button| button.primary(),
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.choose_source(SessionSourceChoice::Empty, cx)
-                                        })),
-                                )
-                            })
-                            .when(dialog.local_directory_available, |row| {
-                                row.child(
-                                    Button::new("source-local-directory")
-                                        .label("Local folder")
-                                        .small()
-                                        .when(
-                                            dialog.choice == SessionSourceChoice::LocalDirectory,
-                                            |button| button.primary(),
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.choose_source(
-                                                SessionSourceChoice::LocalDirectory,
-                                                cx,
-                                            )
-                                        })),
-                                )
-                            })
-                            .child(
-                                Button::new("source-github")
-                                    .label("GitHub repository")
-                                    .small()
-                                    .when(dialog.choice == SessionSourceChoice::GitHub, |button| {
-                                        button.primary()
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.choose_source(SessionSourceChoice::GitHub, cx)
-                                    })),
-                            ),
+                        Button::new("cancel-session-source")
+                            .label("Cancel")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.source_dialog = None;
+                                cx.notify();
+                            })),
                     )
-                    .child(dialog_body)
                     .child(
-                        div()
-                            .mt_3()
-                            .flex()
-                            .justify_end()
-                            .gap_1()
-                            .child(
-                                Button::new("cancel-session-source")
-                                    .label("Cancel")
-                                    .small()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.source_dialog = None;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("confirm-session-source")
-                                    .label(if is_start {
-                                        "Create project"
-                                    } else {
-                                        "Add to session"
-                                    })
-                                    .small()
-                                    .primary()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.confirm_source_dialog(cx);
-                                        cx.notify();
-                                    })),
-                            ),
+                        Button::new("confirm-session-source")
+                            .label(if is_start {
+                                "Create project"
+                            } else {
+                                "Add to session"
+                            })
+                            .small()
+                            .primary()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_source_dialog(cx);
+                                cx.notify();
+                            })),
                     ),
             )
             .into_any_element()
