@@ -28,8 +28,10 @@ goal the property a project owns, distinct from the concrete task a run is
 given. This document gives that existing product noun a persisted, user-editable
 form and a command.
 
-This document is a plan only. It contains no implementation. Delivery is split
-into independently reviewable slices; see [Delivery slices](#delivery-slices).
+This document is a plan only. It contains no implementation. The work can be
+delivered as a single change or, when that is more convenient, in iterations.
+The [delivery iterations](#delivery-iterations) below are a suggested sequence,
+not a required decomposition.
 
 ## Problem
 
@@ -235,28 +237,30 @@ multi-client, and restart-safe, matching Loom’s state model.
 steering message such as `Session goal updated: <text>`. The enqueued message is
 what steers the run; the persisted goal is what future runs inherit.
 
-## Delivery slices
+## Delivery iterations
 
-Each slice should be independently reviewable and land with tests.
+The iterations below are a suggested sequence, not a required decomposition.
+The work can be delivered as one change or as any subset; each delivered change
+should land with tests.
 
-- **Slice 1 — Durable session goal (backend + protocol).** `SetSessionGoal`
+- **Iteration 1 — Durable session goal (backend + protocol).** `SetSessionGoal`
   request/response, projection field, `session_settings.goal`, schema bump,
   load/save/fork, server dispatch and projection. No UI.
-- **Slice 2 — Goal applied to runs.** Read the session goal at run start and
+- **Iteration 2 — Goal applied to runs.** Read the session goal at run start and
   fold it into the effective system instructions. Tests prove a new run sees
   the goal and recovery replays it.
-- **Slice 3 — `/goal` command and display.** Command spec, set/show/clear
+- **Iteration 3 — `/goal` command and display.** Command spec, set/show/clear
   handling, view state, clickable `gpui-kit` composer chip, and `/help` text.
-- **Slice 4 — Durable steering queue (#125).** Runtime queue, enqueue
+- **Iteration 4 — Durable steering queue (#125).** Runtime queue, enqueue
   semantics, worker drain, events, snapshot tracking, terminal behavior.
-- **Slice 5 — Wire `/goal` to a busy run and surface queued state.** Depends on
-  slice 4.
+- **Iteration 5 — Wire `/goal` to a busy run and surface queued state.** Depends
+  on iteration 4.
 
-Slices 1–3 deliver the core value without touching the run loop; slice 4 can
-land independently and unblocks issue #125. If a fast partial fix for #125 is
-wanted first, a client-only queue in the UI is possible, but it is not durable
-and not shared across clients, so the backend queue in slice 4 remains the
-target.
+Iterations 1–3 deliver the core value without touching the run loop; iteration 4
+can land independently and unblocks issue #125. If a fast partial fix for #125
+is wanted first, a client-only queue in the UI is possible, but it is not
+durable and not shared across clients, so the backend queue in iteration 4
+remains the target.
 
 ## Decisions
 
