@@ -234,6 +234,7 @@ impl AgentRuntime {
             activities,
             interactions: state.interactions,
             denied_tool_calls: BTreeSet::new(),
+            output_truncation_retries: 0,
             control: RunControl::new(),
             observer: None,
             flush_offset: 0,

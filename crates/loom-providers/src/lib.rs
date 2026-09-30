@@ -16,12 +16,13 @@ use loom_model::{
 };
 pub use loom_model::{
     CredentialRef, CredentialReference, DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL,
-    DEEPSEEK_PROVIDER_ID, GITHUB_COPILOT_API_ENDPOINT, GITHUB_COPILOT_CREDENTIAL_REF,
-    GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID, GITHUB_REPOSITORY_CREDENTIAL_REF,
-    ModelProvider, OPENAI_API_ENDPOINT, OPENAI_DEFAULT_MODEL, OPENAI_PROVIDER_ID, ProviderConfig,
-    ProviderDescriptor, ProviderHealth, ProviderHealthState, ProviderKind, ProviderSummary,
-    ProviderUsageKey, ProviderUsageRecord, ProviderUsageSummary, UnavailableProvider, UsageLedger,
-    deterministic_descriptor, estimate_tokens, github_copilot_descriptor,
+    DEEPSEEK_MAX_OUTPUT_TOKENS, DEEPSEEK_PROVIDER_ID, GITHUB_COPILOT_API_ENDPOINT,
+    GITHUB_COPILOT_CREDENTIAL_REF, GITHUB_COPILOT_DEFAULT_MODEL, GITHUB_COPILOT_PROVIDER_ID,
+    GITHUB_REPOSITORY_CREDENTIAL_REF, ModelProvider, OPENAI_API_ENDPOINT, OPENAI_DEFAULT_MODEL,
+    OPENAI_PROVIDER_ID, ProviderConfig, ProviderDescriptor, ProviderHealth, ProviderHealthState,
+    ProviderKind, ProviderSummary, ProviderUsageKey, ProviderUsageRecord, ProviderUsageSummary,
+    UnavailableProvider, UsageLedger, deterministic_descriptor, estimate_tokens,
+    github_copilot_descriptor,
 };
 use serde::Deserialize;
 
@@ -1106,7 +1107,41 @@ mod tests {
         assert_eq!(config.display_name, "DeepSeek");
         assert!(config.credential.is_none());
         assert_eq!(config.models[0].id.as_str(), DEEPSEEK_DEFAULT_MODEL);
+        assert_eq!(
+            config.models[0].max_output_tokens,
+            Some(DEEPSEEK_MAX_OUTPUT_TOKENS)
+        );
         assert!(config.models[0].capabilities.tool_calling);
+    }
+
+    #[test]
+    fn restore_configs_backfills_missing_model_output_limits() {
+        let credentials = Arc::new(InMemoryCredentialStore::default());
+        let registry = ProviderRegistry::with_credentials(credentials);
+        registry
+            .register(ProviderConfig::deepseek(DEEPSEEK_DEFAULT_MODEL))
+            .unwrap();
+        registry
+            .configure_api_key_provider(
+                &ProviderId::new(DEEPSEEK_PROVIDER_ID),
+                "deepseek-key".to_owned(),
+            )
+            .unwrap();
+
+        // Simulate a configuration persisted before the provider advertised its
+        // maximum output tokens.
+        let mut configs = registry.export_configs().unwrap();
+        for config in &mut configs {
+            for model in &mut config.models {
+                model.max_output_tokens = None;
+            }
+        }
+        registry.restore_configs(configs).unwrap();
+
+        let restored = registry
+            .describe_model(&ModelId::new(DEEPSEEK_DEFAULT_MODEL))
+            .unwrap();
+        assert_eq!(restored.max_output_tokens, Some(DEEPSEEK_MAX_OUTPUT_TOKENS));
     }
 
     #[test]
