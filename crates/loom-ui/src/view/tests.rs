@@ -367,8 +367,61 @@ mod display_helper_tests {
         assert_eq!(tool_detail(&call), None);
         call.arguments = json!({});
         assert_eq!(tool_detail(&call), None);
+        // A plain path is already in the title, so no detail is needed.
+        call.arguments = json!({"path": "src"});
+        assert_eq!(tool_detail(&call), None);
+        call.arguments = json!({"path": "src", "depth": 2, "glob": "**/*.rs"});
+        assert_eq!(tool_detail(&call).as_deref(), Some("glob **/*.rs, depth 2"));
+        // Unknown/extension tools still fall back to their JSON arguments.
+        call.name = "mystery_tool".to_owned();
         call.arguments = json!({"path": "src"});
         assert_eq!(tool_detail(&call).as_deref(), Some("{\"path\":\"src\"}"));
+    }
+
+    #[test]
+    fn core_tools_get_readable_details_instead_of_json() {
+        let mut call = call("read_file");
+        call.arguments = json!({"path": "src/lib.rs"});
+        assert_eq!(tool_detail(&call), None);
+        call.arguments = json!({"path": "src/lib.rs", "line_start": 10, "line_end": 20});
+        assert_eq!(tool_detail(&call).as_deref(), Some("Lines 10–20"));
+
+        call.name = "search_text".to_owned();
+        call.arguments =
+            json!({"query": "needle", "path": "src", "glob": "**/*.rs", "regex": true});
+        assert_eq!(
+            tool_detail(&call).as_deref(),
+            Some("in src, glob **/*.rs, regex")
+        );
+
+        call.name = "web_search".to_owned();
+        call.arguments = json!({"query": "rust", "domains": ["doc.rust-lang.org"]});
+        assert_eq!(
+            tool_detail(&call).as_deref(),
+            Some("Domains: doc.rust-lang.org")
+        );
+
+        call.name = "propose_plan".to_owned();
+        call.arguments = json!({"steps": ["Do a", "Do b"]});
+        assert_eq!(tool_detail(&call).as_deref(), Some("1. Do a\n2. Do b"));
+
+        call.name = "ask_user".to_owned();
+        call.arguments = json!({"prompt": "Which one?"});
+        assert_eq!(tool_detail(&call).as_deref(), Some("Which one?"));
+
+        call.name = "apply_patch".to_owned();
+        call.arguments = json!({
+            "path": "src/lib.rs",
+            "edits": [{"old_text": "a", "new_text": "b"}, {"old_text": "c", "new_text": "d"}],
+        });
+        assert_eq!(tool_detail(&call).as_deref(), Some("2 edits"));
+
+        call.name = "run_command".to_owned();
+        call.arguments = json!({"command": "cargo", "args": ["test"], "cwd": "repo"});
+        assert_eq!(
+            tool_detail(&call).as_deref(),
+            Some("cargo test\nDirectory: repo")
+        );
     }
 
     #[test]
@@ -420,7 +473,76 @@ mod display_helper_tests {
         assert_eq!(tool_group_label("read_file", 4), "Read 4 files");
         assert_eq!(tool_group_label("run_command", 3), "Ran 3 commands");
         assert_eq!(tool_group_label("search_text", 5), "Searched 5 times");
+        assert_eq!(
+            tool_group_label("delegate_project_task", 3),
+            "Delegated 3 sub-agents"
+        );
+        assert_eq!(
+            tool_group_label("review_project_child", 2),
+            "Reviewed 2 sub-agents"
+        );
+        assert_eq!(tool_group_label("ask_user", 2), "Asked the user 2 times");
         assert_eq!(tool_group_label("mystery_tool", 2), "mystery_tool × 2");
+    }
+
+    #[test]
+    fn glob_tool_gets_a_readable_title_and_no_json_detail() {
+        let mut call = call("glob");
+        call.arguments = json!({"pattern": "**/*.rs", "path": "crates", "max_entries": 1000});
+        assert_eq!(
+            tool_title("glob", &call.arguments),
+            "Find \"**/*.rs\" in crates"
+        );
+        assert_eq!(tool_detail(&call), None);
+
+        call.arguments = json!({"pattern": "**/*.rs"});
+        assert_eq!(tool_title("glob", &call.arguments), "Find \"**/*.rs\"");
+        assert_eq!(tool_detail(&call), None);
+
+        assert_eq!(tool_title("glob", &json!({})), "Find files");
+        assert_eq!(tool_group_label("glob", 2), "Matched 2 globs");
+    }
+
+    #[test]
+    fn github_tools_get_readable_titles_and_no_json_detail() {
+        let mut call = call("github_list_pull_requests");
+        call.arguments = json!({"repository": "owner/name", "state": "all"});
+        assert_eq!(
+            tool_title("github_list_pull_requests", &call.arguments),
+            "List pull requests in owner/name"
+        );
+        assert_eq!(tool_detail(&call), None);
+
+        call.arguments = json!({"repository": "owner/name", "number": 42});
+        assert_eq!(
+            tool_title("github_get_pull_request", &call.arguments),
+            "Read owner/name#42"
+        );
+        assert_eq!(tool_detail(&call), None);
+
+        call.arguments =
+            json!({"repository": "owner/name", "title": "Fix", "head": "fix", "base": "main"});
+        assert_eq!(
+            tool_title("github_create_pull_request", &call.arguments),
+            "Open fix → main in owner/name"
+        );
+        assert_eq!(tool_detail(&call), None);
+
+        call.arguments = json!({"repository": "owner/name", "branch": "fix"});
+        assert_eq!(
+            tool_title("github_push_branch", &call.arguments),
+            "Push fix to owner/name"
+        );
+        assert_eq!(tool_detail(&call), None);
+
+        assert_eq!(
+            tool_title("github_get_pull_request", &json!({})),
+            "Read pull request"
+        );
+        assert_eq!(
+            tool_group_label("github_create_pull_request", 2),
+            "Opened 2 pull requests"
+        );
     }
 
     fn grouped_part(status: ToolPartStatus) -> ToolPart {
