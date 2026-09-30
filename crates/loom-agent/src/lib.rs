@@ -39,6 +39,9 @@ use activity::*;
 
 const CONTEXT_PROJECTION_VERSION: u32 = 1;
 const MAX_INTERACTION_PROMPT_BYTES: usize = 65_536;
+/// How many times a single output-token truncation is resumed before the run
+/// gives up. Each resume costs a model turn, so keep it small.
+const MAX_OUTPUT_TRUNCATION_RETRIES: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentTask {
@@ -258,6 +261,9 @@ struct StepContext {
     saw_tool_call: bool,
     completed: bool,
     completion_guarded: bool,
+    /// Set when a length-truncated turn was resumed, so the run makes another
+    /// model request instead of ending after the completed step.
+    continue_after_truncation: bool,
     finished: bool,
     activity_id: ActivityId,
     buffered_tools: Vec<ToolCall>,
@@ -273,6 +279,7 @@ impl StepContext {
             saw_tool_call: false,
             completed: false,
             completion_guarded: false,
+            continue_after_truncation: false,
             finished: false,
             activity_id,
             buffered_tools: Vec::new(),
@@ -313,6 +320,10 @@ pub struct AgentRuntime {
     /// Signatures of tool calls the user rejected this run. Re-requesting one is
     /// answered without prompting again so a rejection cannot loop.
     denied_tool_calls: BTreeSet<String>,
+    /// Consecutive `FinishReason::Length` continuations for this run. Reset by a
+    /// step that produces a tool call or a normal completion so the bound only
+    /// applies to a single truncated turn.
+    output_truncation_retries: u32,
     control: RunControl,
     observer: Option<AgentEventObserver>,
     flush_offset: usize,
@@ -499,6 +510,83 @@ mod tests {
 
         fn reset(&mut self) {
             self.cursor = 0;
+        }
+    }
+
+    struct TruncatingProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+    }
+
+    impl ModelProvider for TruncatingProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                vec![
+                    ModelStreamEvent::ReasoningDelta {
+                        text: "weighing the options".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Length,
+                    },
+                ]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "Concise final answer.".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
+    struct AlwaysTruncatingProvider {
+        descriptor: loom_model::ModelDescriptor,
+        calls: Arc<Mutex<u8>>,
+    }
+
+    impl ModelProvider for AlwaysTruncatingProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            _cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            *self.calls.lock().unwrap() += 1;
+            sink.emit(ModelStreamEvent::ReasoningDelta {
+                text: "still thinking".to_owned(),
+            })?;
+            sink.emit(ModelStreamEvent::Completed {
+                reason: loom_model::FinishReason::Length,
+            })?;
+            Ok(())
         }
     }
 
@@ -1982,6 +2070,89 @@ mod tests {
         assert_eq!(runtime.messages.last().unwrap().content, "partial answer");
         assert_eq!(runtime.usage.output_tokens, 3);
         assert_eq!(*calls.lock().unwrap(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn truncating_descriptor() -> loom_model::ModelDescriptor {
+        loom_model::ModelDescriptor {
+            id: ModelId::new("truncating/demo"),
+            provider: loom_model::ProviderId::new("truncating"),
+            display_name: "Truncating test model".to_owned(),
+            context_window: Some(8_192),
+            max_input_tokens: None,
+            max_output_tokens: Some(4_096),
+            capabilities: loom_model::ModelCapabilities {
+                streaming: true,
+                tool_calling: false,
+                vision: false,
+                json_mode: false,
+            },
+        }
+    }
+
+    #[test]
+    fn length_truncated_turn_resumes_and_completes() {
+        let root = workspace();
+        let descriptor = truncating_descriptor();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("Finish after truncation", descriptor.id.clone()).unwrap(),
+            Box::new(TruncatingProvider {
+                descriptor,
+                cursor: 0,
+            }),
+            ToolExecutor::new(&root).unwrap(),
+        );
+
+        let events = runtime.start().unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::RunCompleted { snapshot }
+                if snapshot.state == AgentRunState::Completed
+        )));
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        assert!(runtime.messages().iter().any(|message| {
+            message.name.as_deref() == Some("loom_output_limit_continuation")
+                && message.role == MessageRole::User
+        }));
+        assert!(runtime.messages().iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.reasoning_content.as_deref() == Some("weighing the options")
+        }));
+        assert!(runtime.messages().iter().any(|message| {
+            message.role == MessageRole::Assistant && message.content == "Concise final answer."
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_length_truncation_fails_with_a_clear_message() {
+        let root = workspace();
+        let calls = Arc::new(Mutex::new(0));
+        let descriptor = truncating_descriptor();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("Never finish", descriptor.id.clone()).unwrap(),
+            Box::new(AlwaysTruncatingProvider {
+                descriptor,
+                calls: Arc::clone(&calls),
+            }),
+            ToolExecutor::new(&root).unwrap(),
+        );
+
+        runtime.start().unwrap();
+
+        assert_eq!(runtime.snapshot().state, AgentRunState::Failed);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            u8::try_from(MAX_OUTPUT_TRUNCATION_RETRIES + 1).unwrap()
+        );
+        let summary = runtime.snapshot().summary.unwrap_or_default();
+        assert!(
+            summary.contains("output token limit"),
+            "unexpected summary: {summary}"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

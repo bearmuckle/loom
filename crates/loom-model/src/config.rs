@@ -18,6 +18,10 @@ pub const OPENAI_DEFAULT_MODEL: &str = "gpt-6-luna";
 pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
 pub const DEEPSEEK_API_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-flash";
+/// DeepSeek's Chat Completions API caps `max_tokens` at 8,192. Advertise it so
+/// context budgeting reserves usable output room instead of the conservative
+/// unknown-model fallback, which is too small for thinking models.
+pub const DEEPSEEK_MAX_OUTPUT_TOKENS: u32 = 8_192;
 pub const GITHUB_COPILOT_API_ENDPOINT: &str = "https://api.githubcopilot.com";
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -135,7 +139,7 @@ impl ProviderConfig {
                 display_name: "DeepSeek model".to_owned(),
                 context_window: Some(1_000_000),
                 max_input_tokens: None,
-                max_output_tokens: None,
+                max_output_tokens: Some(DEEPSEEK_MAX_OUTPUT_TOKENS),
                 capabilities: ModelCapabilities {
                     streaming: true,
                     tool_calling: true,

@@ -834,6 +834,14 @@ impl ProviderRegistry {
             }
             if config.kind == ProviderKind::GitHubCopilot {
                 config.models = vec![github_copilot_descriptor()];
+            } else if let Some(current) = existing.get(&config.id)
+                && current.kind == config.kind
+            {
+                // Persisted configurations can predate a built-in descriptor
+                // gaining a limit (for example a provider's maximum output
+                // tokens). Fill only the missing values so an existing install
+                // picks up the corrected cap without discarding user choices.
+                fill_missing_model_limits(&mut config, current);
             }
             self.register(config)?;
         }
@@ -992,5 +1000,24 @@ impl ModelProvider for AccountingProvider {
 
     fn reset(&mut self) {
         self.inner.reset();
+    }
+}
+
+/// Fill limits the persisted configuration never recorded from the built-in
+/// provider descriptor. Only `None` values are replaced, so an existing install
+/// picks up newly advertised caps (such as a provider's maximum output tokens)
+/// without discarding explicit user choices.
+fn fill_missing_model_limits(config: &mut ProviderConfig, known: &ProviderConfig) {
+    for model in &mut config.models {
+        let Some(descriptor) = known
+            .models
+            .iter()
+            .find(|candidate| candidate.id == model.id)
+        else {
+            continue;
+        };
+        model.context_window = model.context_window.or(descriptor.context_window);
+        model.max_input_tokens = model.max_input_tokens.or(descriptor.max_input_tokens);
+        model.max_output_tokens = model.max_output_tokens.or(descriptor.max_output_tokens);
     }
 }

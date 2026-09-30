@@ -204,6 +204,12 @@ arguments are preserved. If required context or the latest exchange still cannot
 fit, the run reports a context-limit error. Compaction uses the active provider's
 token estimator; these counts remain estimates, not server-side token guarantees.
 
+When a provider ends a turn because it reached the model's output-token limit
+without requesting a tool, the runtime keeps the partial response and resumes
+with a bounded continuation prompt instead of failing the run. If the model
+keeps reaching the limit, the run fails with an explicit output-token error
+after a small number of attempts.
+
 The runtime persists the summary and its history boundary across recovery,
 retaining the full transcript separately. The UI shows estimated input usage and
 output reserve, and records compaction in the timeline. Excerpts preserve the

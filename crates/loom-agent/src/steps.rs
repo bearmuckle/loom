@@ -145,6 +145,7 @@ impl AgentRuntime {
             saw_tool_call,
             completed,
             completion_guarded,
+            continue_after_truncation,
             finished,
             buffered_tools,
             ..
@@ -193,7 +194,7 @@ impl AgentRuntime {
             return Ok(StepOutcome::Blocked);
         }
         if completed && !saw_tool_call {
-            if completion_guarded {
+            if completion_guarded || continue_after_truncation {
                 return Ok(StepOutcome::Continue);
             }
             return Ok(StepOutcome::Blocked);
@@ -360,6 +361,7 @@ impl AgentRuntime {
                 }
                 self.usage.add_tool_call();
                 self.append_assistant_tool_call(call.clone());
+                self.output_truncation_retries = 0;
                 ctx.events.push(AgentEvent::RunUsageUpdated {
                     run_id: self.run.id,
                     usage: self.usage.clone(),
@@ -735,6 +737,7 @@ impl AgentRuntime {
                 });
                 if !ctx.saw_tool_call {
                     if matches!(reason, loom_model::FinishReason::Stop) {
+                        self.output_truncation_retries = 0;
                         if let Some(blocker) = self.tools.completion_blocker() {
                             self.active_message_id = None;
                             self.push_message(ModelMessage {
@@ -751,6 +754,36 @@ impl AgentRuntime {
                         }
                     } else if matches!(reason, loom_model::FinishReason::Cancelled) {
                         ctx.events.extend(self.finish_cancelled());
+                    } else if matches!(reason, loom_model::FinishReason::Length) {
+                        if self.output_truncation_retries >= MAX_OUTPUT_TRUNCATION_RETRIES {
+                            ctx.events.extend(self.finish_failed(
+                                "the model kept reaching the output token limit without finishing",
+                            ));
+                        } else {
+                            self.output_truncation_retries =
+                                self.output_truncation_retries.saturating_add(1);
+                            self.active_message_id = None;
+                            self.push_message(ModelMessage {
+                                role: MessageRole::User,
+                                content:
+                                    "Your previous response was cut off because it reached the \
+                                     output token limit. Continue from where it stopped, keep the \
+                                     answer concise, and prefer a tool call or a short summary."
+                                        .to_owned(),
+                                name: Some("loom_output_limit_continuation".to_owned()),
+                                tool_call_id: None,
+                                tool_calls: Vec::new(),
+                                reasoning_content: None,
+                            });
+                            ctx.continue_after_truncation = true;
+                            log::warn!(
+                                "model output was truncated by the output token limit (run {}, \
+                                 continuation {} of {})",
+                                self.run.id,
+                                self.output_truncation_retries,
+                                MAX_OUTPUT_TRUNCATION_RETRIES,
+                            );
+                        }
                     } else if let loom_model::FinishReason::ErrorWithMessage { message } = reason {
                         ctx.events.extend(self.finish_failed(message));
                     } else if matches!(reason, loom_model::FinishReason::Error) {
