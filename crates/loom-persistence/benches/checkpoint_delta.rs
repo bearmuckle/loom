@@ -268,6 +268,7 @@ fn message(index: usize, content: impl Into<String>) -> DurableRunMessage {
         name: None,
         tool_call_id: None,
         tool_calls: Vec::new(),
+        reasoning_content: None,
     }
 }
 

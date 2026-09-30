@@ -202,6 +202,7 @@ impl AgentRuntime {
             name: Some(result.name.clone()),
             tool_call_id: Some(tool_call_id),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         });
         events.extend(self.set_state(AgentRunState::Executing));
         Ok(RunProgress::running(events))

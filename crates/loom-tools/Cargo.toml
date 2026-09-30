@@ -20,3 +20,6 @@ scraper.workspace = true
 reqwest.workspace = true
 tokio.workspace = true
 url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

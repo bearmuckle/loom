@@ -235,6 +235,7 @@ pub(crate) fn repair_tool_transcript(
                         name: Some(call.name.clone()),
                         tool_call_id: Some(call.id),
                         tool_calls: Vec::new(),
+                        reasoning_content: None,
                     }),
             );
         }

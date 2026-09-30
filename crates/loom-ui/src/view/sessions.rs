@@ -223,13 +223,17 @@ impl LoomView {
         );
     }
 
-    pub(crate) fn archive_active(&mut self, cx: &mut Context<Self>) {
+    /// Archives `session_id`. The target is explicit so a menu action cannot
+    /// archive the previously active session if selection fails.
+    pub(crate) fn archive_session(&mut self, session_id: AgentSessionId, cx: &mut Context<Self>) {
         if self.archive_request_in_flight {
+            log::info!(
+                "[loom-ui] ignoring archive request for {session_id}: another archive is already in flight"
+            );
             return;
         }
         self.archive_request_in_flight = true;
         self.record_status("Archiving session...");
-        let session_id = self.active_session.id;
         self.dispatch(
             cx,
             ClientRequest::Session(SessionRequest::ArchiveAgentSession { session_id }),
@@ -239,21 +243,41 @@ impl LoomView {
                     Ok(ServerResponse::Session(SessionResponse::AgentSessionArchived(
                         snapshot,
                     ))) => {
+                        log::info!("[loom-ui] archived session {}", snapshot.id);
+                        let was_active = view.active_session.id == snapshot.id;
                         view.sessions.retain(|session| session.id != snapshot.id);
                         view.session_node_ids.remove(&snapshot.id);
-                        if let Some(session) = view.sessions.first().cloned() {
-                            view.select_session(session, cx);
+                        if was_active {
+                            if let Some(session) = view.sessions.first().cloned() {
+                                view.select_session(session, cx);
+                            } else {
+                                view.activate_session(empty_session_snapshot(view.workspace_id));
+                                view.review.open = false;
+                                cx.notify();
+                            }
                         } else {
-                            view.activate_session(empty_session_snapshot(view.workspace_id));
-                            view.review.open = false;
+                            view.status_banner = None;
+                            view.update_session_list();
                             cx.notify();
                         }
                     }
-                    Err(error) => view.record_backend_error("archive session", error),
-                    Ok(response) => view.record_backend_error(
-                        "archive session",
-                        unexpected_response("session archive", response),
-                    ),
+                    Err(error) => {
+                        log::warn!(
+                            "[loom-ui] archive session {session_id} failed: {:?}: {}",
+                            error.code,
+                            error.message
+                        );
+                        view.record_backend_error("archive session", error)
+                    }
+                    Ok(response) => {
+                        log::warn!(
+                            "[loom-ui] archive session {session_id} returned an unexpected response"
+                        );
+                        view.record_backend_error(
+                            "archive session",
+                            unexpected_response("session archive", response),
+                        )
+                    }
                 }
             },
         );

@@ -485,8 +485,7 @@ impl LoomView {
             }))
             .item(PopupMenuItem::new(archive_label).on_click(move |_, _, cx| {
                 archive_view.update(cx, |view, cx| {
-                    view.select_session(archive_session.clone(), cx);
-                    view.archive_active(cx);
+                    view.archive_session(archive_session.id, cx);
                 });
             }));
         if let Some(project) = menu_project.as_ref()

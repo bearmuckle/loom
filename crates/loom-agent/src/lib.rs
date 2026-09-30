@@ -343,6 +343,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             tool_calls: vec![call.clone()],
+            reasoning_content: None,
         };
         let source_output = ModelMessage {
             role: MessageRole::Tool,
@@ -350,6 +351,7 @@ mod tests {
             name: Some(call.name.clone()),
             tool_call_id: Some(call.id),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         };
         let repaired = repair_tool_transcript(
             vec![
@@ -360,6 +362,7 @@ mod tests {
                     name: None,
                     tool_call_id: Some(loom_core::ToolCallId::new()),
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 },
             ],
             &[source_output],
@@ -1797,6 +1800,7 @@ mod tests {
             name: None,
             tool_call_id: None,
             tool_calls: vec![missing_output_call],
+            reasoning_content: None,
         });
         for i in 0..30 {
             runtime.messages.push(ModelMessage::new(
@@ -2157,6 +2161,238 @@ mod tests {
             outputs,
             vec!["read first".to_owned(), "read second".to_owned()]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_reasoning_is_stored_and_replayed_on_assistant_tool_calls() {
+        use std::sync::Mutex;
+
+        use loom_model::{FinishReason, ModelStreamEvent};
+
+        struct ReasoningEchoProvider {
+            descriptor: loom_model::ModelDescriptor,
+            cursor: usize,
+            replayed: Arc<Mutex<Option<String>>>,
+        }
+
+        impl ModelProvider for ReasoningEchoProvider {
+            fn descriptor(&self) -> &loom_model::ModelDescriptor {
+                &self.descriptor
+            }
+
+            fn stream(
+                &mut self,
+                request: &ModelRequest,
+                _cancel: &CancellationToken,
+                sink: &mut dyn loom_model::ModelStreamSink,
+            ) -> Result<()> {
+                if self.cursor == 0 {
+                    sink.emit(ModelStreamEvent::ReasoningDelta {
+                        text: "checked the workspace".to_owned(),
+                    })?;
+                    sink.emit(ModelStreamEvent::ToolCallDelta {
+                        call: ToolCall {
+                            id: loom_core::ToolCallId::new(),
+                            name: "read_file".to_owned(),
+                            arguments: serde_json::json!({"path": "notes.txt"}),
+                        },
+                    })?;
+                    sink.emit(ModelStreamEvent::Completed {
+                        reason: FinishReason::ToolCall,
+                    })?;
+                } else {
+                    let replayed = request
+                        .messages
+                        .iter()
+                        .find(|message| {
+                            message.role == MessageRole::Assistant && !message.tool_calls.is_empty()
+                        })
+                        .and_then(|message| message.reasoning_content.clone());
+                    *self.replayed.lock().unwrap() = replayed;
+                    sink.emit(ModelStreamEvent::TextDelta {
+                        text: "all done".to_owned(),
+                    })?;
+                    sink.emit(ModelStreamEvent::Completed {
+                        reason: FinishReason::Stop,
+                    })?;
+                }
+                self.cursor = self.cursor.saturating_add(1);
+                Ok(())
+            }
+
+            fn reset(&mut self) {
+                self.cursor = 0;
+            }
+        }
+
+        let root = workspace();
+        fs::write(root.join("notes.txt"), "some notes\n").unwrap();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task = AgentTask::new("read notes", ModelId::new("reasoning/demo")).unwrap();
+        let replayed = Arc::new(Mutex::new(None));
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            task,
+            Box::new(ReasoningEchoProvider {
+                descriptor: loom_model::ModelDescriptor {
+                    id: ModelId::new("reasoning/demo"),
+                    provider: loom_model::ProviderId::new("reasoning"),
+                    display_name: "Reasoning test provider".to_owned(),
+                    context_window: Some(8_192),
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    capabilities: loom_model::ModelCapabilities {
+                        streaming: true,
+                        tool_calling: true,
+                        vision: false,
+                        json_mode: false,
+                    },
+                },
+                cursor: 0,
+                replayed: replayed.clone(),
+            }),
+            tools,
+        );
+
+        runtime.start().unwrap();
+        assert_eq!(
+            *replayed.lock().unwrap(),
+            Some("checked the workspace".to_owned()),
+            "reasoning must be replayed on the assistant tool-call turn"
+        );
+        assert!(runtime.export_state().messages.iter().any(|message| {
+            message.role == MessageRole::Assistant
+                && message.reasoning_content.as_deref() == Some("checked the workspace")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_running_tool_is_published_as_executing_before_it_completes() {
+        use std::sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering as AtomicOrdering},
+        };
+        use std::time::{Duration, Instant};
+
+        use loom_model::{FinishReason, ModelStreamEvent, ToolDefinition};
+
+        struct BlockingRead {
+            entered: Arc<AtomicBool>,
+            release: Arc<AtomicBool>,
+        }
+
+        impl ToolExtension for BlockingRead {
+            fn definitions(&self) -> Vec<ToolDefinition> {
+                Vec::new()
+            }
+
+            fn action_kind(&self, _call: &ToolCall) -> Option<loom_core::ActionKind> {
+                Some(loom_core::ActionKind::Read)
+            }
+
+            fn execute(&self, call: &ToolCall) -> ToolResult {
+                if call.name == "blocking_read" {
+                    self.entered.store(true, AtomicOrdering::SeqCst);
+                    while !self.release.load(AtomicOrdering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                ToolResult::success(call, format!("ran {}", call.name))
+            }
+        }
+
+        let root = workspace();
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let tools = ToolExecutor::new(&root)
+            .unwrap()
+            .with_extension(Arc::new(BlockingRead {
+                entered: entered.clone(),
+                release: release.clone(),
+            }));
+        let call = |name: &str| ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: name.to_owned(),
+            arguments: serde_json::json!({}),
+        };
+        let blocking = call("blocking_read");
+        // The first step settles a tool result, so the next model turn would
+        // otherwise leave the run in the evaluating state while tools execute.
+        let provider = DeterministicProvider {
+            descriptor: loom_providers::deterministic_descriptor(),
+            steps: vec![
+                vec![
+                    ModelStreamEvent::ToolCallDelta {
+                        call: call("fast_read"),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: FinishReason::ToolCall,
+                    },
+                ],
+                vec![
+                    ModelStreamEvent::ToolCallDelta {
+                        call: blocking.clone(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: FinishReason::ToolCall,
+                    },
+                ],
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "done".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: FinishReason::Stop,
+                    },
+                ],
+            ],
+            cursor: 0,
+        };
+        let task = AgentTask::new("run a blocking tool", ModelId::new("gpt-6-luna")).unwrap();
+        let mut runtime = AgentRuntime::new(AgentSessionId::new(), task, Box::new(provider), tools);
+
+        let published: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let collected = published.clone();
+        runtime.set_event_observer(Arc::new(move |event: &AgentEvent| {
+            collected.lock().unwrap().push(event.clone());
+        }));
+
+        let worker = std::thread::spawn(move || runtime.start());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !entered.load(AtomicOrdering::SeqCst) {
+            assert!(Instant::now() < deadline, "the blocking tool never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let events = published.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolCallStarted { call, .. } if call.id == blocking.id
+            )),
+            "a running tool must be published as started before it completes"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolCallCompleted { result, .. } if result.tool_call_id == blocking.id
+            )),
+            "the tool must not be reported complete while it is still running"
+        );
+        assert_eq!(
+            events.iter().rev().find_map(|event| match event {
+                AgentEvent::RunStateChanged { state, .. } => Some(*state),
+                _ => None,
+            }),
+            Some(AgentRunState::Executing),
+            "the run must report executing while a tool is running"
+        );
+
+        release.store(true, AtomicOrdering::SeqCst);
+        worker.join().unwrap().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

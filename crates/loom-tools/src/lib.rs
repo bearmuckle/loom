@@ -174,6 +174,22 @@ const MAX_COMMAND_TIMEOUT_MS: u64 = 600_000;
 /// Poll interval while waiting for a child process to exit.
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Terminates a command that exceeded its timeout. On Unix the command runs in
+/// its own process group, so the whole tree is killed; otherwise only the
+/// direct child is killed. Killing only the direct child can leave grandchildren
+/// holding the stdout/stderr pipes open, which would block the reader threads.
+fn terminate_command(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // Safety: the child is the leader of its own process group, so the
+        // negative pid targets only the command and its descendants.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
 const GITHUB_NOT_CONNECTED: &str =
     "GitHub is not connected; connect a GitHub account in Loom settings";
 const GITHUB_WRITE_DISABLED: &str =
@@ -863,11 +879,22 @@ impl ToolExecutor {
         cwd: &Path,
         timeout_ms: u64,
     ) -> std::result::Result<CommandOutput, String> {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .current_dir(cwd)
+            // Commands must never block waiting for terminal input.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Run the command in its own process group so a timeout can terminate
+        // the whole tree instead of only the direct child.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut child = command
             .spawn()
             .map_err(|error| format!("could not start '{program}': {error}"))?;
         let cap = self.max_output_bytes.max(1);
@@ -889,7 +916,7 @@ impl ToolExecutor {
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
+                        terminate_command(&mut child);
                         let _ = child.wait();
                         break;
                     }
@@ -2553,6 +2580,30 @@ mod tests {
         ));
         assert!(!timed_out.success);
         assert!(timed_out.output.contains("timed out"));
+
+        // A background grandchild must not survive the timeout and keep the
+        // command's pipes open, which would block the output readers forever.
+        let grouped = executor.execute(&call(
+            "run_command",
+            serde_json::json!({
+                "command": "sh",
+                "args": ["-c", "sleep 30 & wait"],
+                "timeout_ms": 200
+            }),
+        ));
+        assert!(!grouped.success);
+        assert!(grouped.output.contains("timed out"));
+
+        // stdin is closed so a command cannot block waiting for terminal input.
+        let no_stdin = executor.execute(&call(
+            "run_command",
+            serde_json::json!({
+                "command": "sh",
+                "args": ["-c", "read line; echo done"]
+            }),
+        ));
+        assert!(no_stdin.success);
+        assert!(no_stdin.output.contains("done"));
 
         let invalid = executor.execute(&call(
             "run_command",

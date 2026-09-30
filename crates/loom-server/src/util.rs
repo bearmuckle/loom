@@ -544,6 +544,7 @@ pub(crate) fn durable_run_messages_from_runtime(
             name: message.name.clone(),
             tool_call_id: message.tool_call_id,
             tool_calls: message.tool_calls.clone(),
+            reasoning_content: message.reasoning_content.clone(),
         })
         .collect())
 }
@@ -557,6 +558,7 @@ pub(crate) fn persisted_run_messages(messages: Vec<DurableRunMessage>) -> Vec<Mo
             name: message.name,
             tool_call_id: message.tool_call_id,
             tool_calls: message.tool_calls,
+            reasoning_content: message.reasoning_content,
         })
         .collect()
 }

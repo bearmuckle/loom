@@ -37,9 +37,11 @@ use loom_local::UiOptions;
 
 #[cfg(not(target_family = "wasm"))]
 fn init_logging() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("loom_ui=info"))
-        .format_timestamp_millis()
-        .init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("loom_ui=info,loom_server=info"),
+    )
+    .format_timestamp_millis()
+    .init();
 }
 
 #[cfg(target_family = "wasm")]

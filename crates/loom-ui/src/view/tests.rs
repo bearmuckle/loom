@@ -5423,7 +5423,8 @@ mod session_run_action_tests {
             view.begin_session_rename(session.clone(), false, window, cx);
             assert!(view.rename_dialog.is_some());
             view.confirm_rename(cx);
-            view.archive_active(cx);
+            let archive_id = view.active_session.id;
+            view.archive_session(archive_id, cx);
             view.select_session_repository(loom_core::RepositoryId::new(), cx);
             view.detach_session_repository(loom_core::RepositoryId::new(), cx);
             view.detach_session_directory("dir".to_owned(), cx);
@@ -5837,6 +5838,7 @@ mod transcript_action_tests {
                             name: None,
                             tool_call_id: None,
                             tool_calls: Vec::new(),
+                            reasoning_content: None,
                         },
                     ),
                     (
@@ -5848,6 +5850,7 @@ mod transcript_action_tests {
                             name: None,
                             tool_call_id: None,
                             tool_calls: Vec::new(),
+                            reasoning_content: None,
                         },
                     ),
                 ],

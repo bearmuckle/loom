@@ -398,7 +398,11 @@ impl InProcessBackend {
     }
 
     pub(crate) fn latch_on_persistence_error<T>(&self, result: Result<T>) -> Result<T> {
-        if result.is_err() {
+        if let Err(error) = &result {
+            log::error!(
+                "[loom-server] persistence failed; entering fail-stop and refusing further writes: {}",
+                error.message
+            );
             self.persistence_failed.store(true, Ordering::SeqCst);
         }
         result
@@ -638,7 +642,11 @@ impl InProcessBackend {
             filesystem_records: Some(&filesystem_records),
             feed: Some(&feed),
         });
-        if result.is_err() {
+        if let Err(error) = &result {
+            log::error!(
+                "[loom-server] durable state save failed; entering fail-stop: {}",
+                error.message
+            );
             self.persistence_failed.store(true, Ordering::SeqCst);
         }
         if result.is_ok() {

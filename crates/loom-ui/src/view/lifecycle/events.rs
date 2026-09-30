@@ -129,14 +129,34 @@ impl LoomView {
                 self.update_session_list();
             }
             ServerEvent::AgentSessionForked { .. } => {}
-            ServerEvent::AgentSessionRenamed { name, .. } => {
-                self.active_session.name = name.clone();
-                self.update_session_list();
+            ServerEvent::AgentSessionRenamed { session_id, name } => {
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == *session_id)
+                {
+                    session.name = name.clone();
+                }
+                if self.active_session.id == *session_id {
+                    self.active_session.name = name.clone();
+                    self.update_session_list();
+                }
             }
-            ServerEvent::AgentSessionArchived { .. } => {
-                self.session_state = AgentSessionState::Archived;
-                self.active_session.state = AgentSessionState::Archived;
-                self.update_session_list();
+            ServerEvent::AgentSessionArchived { session_id } => {
+                // The event can refer to a descendant archived as part of a
+                // project cascade, so only apply it to the session it names.
+                if let Some(session) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.id == *session_id)
+                {
+                    session.state = AgentSessionState::Archived;
+                }
+                if self.active_session.id == *session_id {
+                    self.session_state = AgentSessionState::Archived;
+                    self.active_session.state = AgentSessionState::Archived;
+                    self.update_session_list();
+                }
             }
             ServerEvent::Agent { event } => self.consume_agent_event(event),
             ServerEvent::SessionFilesystemChanged { change } => {

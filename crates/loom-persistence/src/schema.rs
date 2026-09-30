@@ -246,6 +246,8 @@ CREATE TABLE IF NOT EXISTS run_messages (
     -- payloads on the message row, so a transcript message is one row.
     tool_calls TEXT NOT NULL DEFAULT '[]'
         CHECK(length(CAST(tool_calls AS BLOB)) <= 16777216),
+    -- Provider reasoning echoed back on assistant turns (DeepSeek thinking mode).
+    reasoning_content TEXT,
     fragments TEXT NOT NULL DEFAULT '[]'
         CHECK(length(CAST(fragments AS BLOB)) <= 1048576),
     PRIMARY KEY(run_id, ordinal),
@@ -845,6 +847,8 @@ pub(crate) fn map_schema_version(version: u32) -> SchemaStatus {
         // A SQLite file that has not been initialized yet; `initialize_schema`
         // decides whether it is empty or an unrecognized layout.
         SchemaStatus::Absent
+    } else if (DATABASE_MIN_MIGRATABLE_VERSION..DATABASE_SCHEMA_VERSION).contains(&version) {
+        SchemaStatus::Migratable(version)
     } else {
         SchemaStatus::OtherVersion(version)
     }
@@ -896,6 +900,51 @@ pub(crate) fn schema_status_from_header(path: &Path) -> Result<SchemaStatus> {
     Ok(map_schema_version(version))
 }
 
+/// Upgrades an older supported schema in place without discarding state. Steps
+/// are added only for changes we choose not to wipe for and may be removed
+/// again before 1.0, so keep them small and self-contained.
+fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
+    let transaction = connection.unchecked_transaction().map_err(|error| {
+        persistence_error(
+            format!("could not start persistence schema migration: {error}"),
+            true,
+        )
+    })?;
+    let mut version = from_version;
+    while version < DATABASE_SCHEMA_VERSION {
+        match version {
+            // v3 adds provider reasoning to the persisted transcript.
+            2 => {
+                transaction
+                    .execute_batch("ALTER TABLE run_messages ADD COLUMN reasoning_content TEXT;")
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not migrate persistence schema to v3: {error}"),
+                            true,
+                        )
+                    })?;
+                version = 3;
+            }
+            other => return Err(unsupported_database_error(other)),
+        }
+    }
+    transaction
+        .pragma_update(None, "user_version", DATABASE_SCHEMA_VERSION)
+        .map_err(|error| {
+            persistence_error(
+                format!("could not record migrated schema version: {error}"),
+                true,
+            )
+        })?;
+    transaction.commit().map_err(|error| {
+        persistence_error(
+            format!("could not commit persistence schema migration: {error}"),
+            true,
+        )
+    })?;
+    Ok(())
+}
+
 pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
     let database_version: u32 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -909,8 +958,13 @@ pub(crate) fn initialize_schema(connection: &Connection) -> Result<()> {
         return Ok(());
     }
 
-    // Loom is pre-1.0 and uses a single baseline schema. A database written by
-    // any other revision is rejected unchanged and must be wiped.
+    // Upgrade an older supported baseline in place instead of wiping state.
+    if (DATABASE_MIN_MIGRATABLE_VERSION..DATABASE_SCHEMA_VERSION).contains(&database_version) {
+        return migrate_schema(connection, database_version);
+    }
+
+    // A database written by an unknown or newer revision is rejected unchanged
+    // and must be wiped.
     if database_version != 0 {
         return Err(unsupported_database_error(database_version));
     }

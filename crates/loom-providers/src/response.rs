@@ -17,6 +17,11 @@ pub fn message_json(message: &ModelMessage) -> serde_json::Value {
     if let Some(tool_call_id) = message.tool_call_id {
         value["tool_call_id"] = serde_json::json!(tool_call_id.to_string());
     }
+    if message.role == MessageRole::Assistant
+        && let Some(reasoning) = &message.reasoning_content
+    {
+        value["reasoning_content"] = serde_json::json!(reasoning);
+    }
     if !message.tool_calls.is_empty() {
         value["tool_calls"] = serde_json::Value::Array(
             message
@@ -58,6 +63,15 @@ pub fn normalize_openai_response(body: &serde_json::Value) -> Result<Vec<ModelSt
         )
     })?;
     let mut events = Vec::new();
+    if let Some(reasoning) = message
+        .get("reasoning_content")
+        .and_then(serde_json::Value::as_str)
+        && !reasoning.is_empty()
+    {
+        events.push(ModelStreamEvent::ReasoningDelta {
+            text: reasoning.to_owned(),
+        });
+    }
     if let Some(content) = message.get("content").and_then(serde_json::Value::as_str)
         && !content.is_empty()
     {
@@ -152,4 +166,31 @@ pub fn normalize_openai_response(body: &serde_json::Value) -> Result<Vec<ModelSt
     };
     events.push(ModelStreamEvent::Completed { reason });
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_reasoning_is_sent_back_for_thinking_providers() {
+        let mut message = ModelMessage::new(MessageRole::Assistant, "");
+        message.tool_calls = vec![ToolCall {
+            id: ToolCallId::new(),
+            name: "search".to_owned(),
+            arguments: serde_json::json!({"q": "loom"}),
+        }];
+        message.reasoning_content = Some("first I searched".to_owned());
+        let value = message_json(&message);
+        assert_eq!(value["reasoning_content"], "first I searched");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "search");
+
+        // Reasoning is only replayed on assistant turns that actually have it.
+        let mut user = ModelMessage::new(MessageRole::User, "hi");
+        user.reasoning_content = Some("ignored".to_owned());
+        assert!(message_json(&user).get("reasoning_content").is_none());
+
+        let assistant = ModelMessage::new(MessageRole::Assistant, "done");
+        assert!(message_json(&assistant).get("reasoning_content").is_none());
+    }
 }

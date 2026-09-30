@@ -63,14 +63,16 @@ pub use schema::*;
 
 /// Baseline schema version for the current typed model.
 ///
-/// Loom is pre-1.0 and deliberately has **no migration ladder**: this constant
-/// is the only supported layout. A database written by any other Loom revision
-/// is rejected and must be wiped by the operator. When the model changes, bump
-/// this value and adjust [`DATABASE_SCHEMA`] (and the companion schema
-/// fragments) in place; do not reintroduce incremental migrations or legacy
-/// import paths. New optional state should prefer a versioned JSON payload
-/// column over a new column that would need its own migration.
-const DATABASE_SCHEMA_VERSION: u32 = 2;
+/// Loom is pre-1.0. Most schema changes are handled by wiping the state
+/// database, and any upgrade step kept here is evaluated case by case and may
+/// be dropped again before 1.0. When a step exists, [`migrate_schema`] upgrades
+/// older supported versions in place; versions newer than this build, or with
+/// no registered step, are rejected and must be wiped by the operator. New
+/// optional state should prefer a versioned JSON payload column over a new
+/// column where the payload column already exists.
+const DATABASE_SCHEMA_VERSION: u32 = 3;
+/// Oldest schema version that the migration ladder can upgrade in place.
+const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;
 const MAX_CONTENT_BYTES: usize = 512 * 1024 * 1024;
 const INLINE_CONTENT_BYTES: usize = 4096;
@@ -286,6 +288,9 @@ pub struct DurableRunMessage {
     pub name: Option<String>,
     pub tool_call_id: Option<loom_core::ToolCallId>,
     pub tool_calls: Vec<loom_model::ToolCall>,
+    /// Provider reasoning that must be echoed back on assistant turns
+    /// (for example DeepSeek thinking mode).
+    pub reasoning_content: Option<String>,
 }
 
 /// A normal worker checkpoint writes only the mutable transcript tail. A retry
@@ -306,6 +311,8 @@ pub struct DurableRunMessageHeader {
     pub name: Option<String>,
     pub tool_call_id: Option<loom_core::ToolCallId>,
     pub tool_calls: Vec<loom_model::ToolCall>,
+    /// Provider reasoning retained on the assistant turn for replay.
+    pub reasoning_content: Option<String>,
 }
 
 pub type DurableRunActivities = BTreeMap<RunId, Vec<AgentActivityRecord>>;
@@ -388,15 +395,15 @@ pub struct DurableStateWrite<'a> {
 }
 
 /// Compatibility of an on-disk Loom state database with the current build.
-///
-/// Loom is pre-1.0 and has no migration ladder, so a database that is not at
-/// the current baseline must be wiped by the operator before it can be opened.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchemaStatus {
     /// No state database exists yet; opening creates the baseline schema.
     Absent,
     /// The database is at the current baseline schema version.
     Current,
+    /// The database is at an older version that the migration ladder can
+    /// upgrade in place when it is opened.
+    Migratable(u32),
     /// The database was written at an unknown or newer schema version.
     OtherVersion(u32),
     /// The file exists but is not a recognizable SQLite database.
@@ -406,7 +413,7 @@ pub enum SchemaStatus {
 impl SchemaStatus {
     /// Whether the database can be opened without wiping it.
     pub fn is_compatible(self) -> bool {
-        matches!(self, Self::Absent | Self::Current)
+        matches!(self, Self::Absent | Self::Current | Self::Migratable(_))
     }
 
     /// Short description used in prompts and error messages.
@@ -414,6 +421,9 @@ impl SchemaStatus {
         match self {
             Self::Absent => "no existing database".to_owned(),
             Self::Current => format!("schema version {DATABASE_SCHEMA_VERSION}"),
+            Self::Migratable(version) => {
+                format!("schema version {version} (will be upgraded on open)")
+            }
             Self::OtherVersion(version) => format!("schema version {version}"),
             Self::Unrecognized => "an unrecognized format".to_owned(),
         }
