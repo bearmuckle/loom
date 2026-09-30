@@ -247,6 +247,28 @@ pub(crate) fn repair_tool_transcript(
     repaired
 }
 
+/// Thinking-mode providers that see tools require `reasoning_content` on every
+/// assistant turn of a follow-up request, even a turn that produced none and
+/// even when the value is empty (DeepSeek returns an empty string roughly half
+/// the time). Once a conversation shows reasoning, fill the missing turns so the
+/// provider accepts the request instead of rejecting it with an HTTP 400.
+pub(crate) fn echo_reasoning_on_assistant_turns(messages: &mut [ModelMessage], has_tools: bool) {
+    if !has_tools {
+        return;
+    }
+    let reasoning_seen = messages.iter().any(|message| {
+        message.role == MessageRole::Assistant && message.reasoning_content.is_some()
+    });
+    if !reasoning_seen {
+        return;
+    }
+    for message in messages.iter_mut() {
+        if message.role == MessageRole::Assistant && message.reasoning_content.is_none() {
+            message.reasoning_content = Some(String::new());
+        }
+    }
+}
+
 /// Sends the events that the observer has not seen yet and advances `cursor`.
 pub(crate) fn publish_events(
     observer: Option<&(dyn Fn(&AgentEvent) + Send + Sync)>,

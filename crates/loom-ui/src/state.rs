@@ -507,6 +507,19 @@ pub(crate) fn upsert_tool_part(timeline: &mut Vec<TimelineItem>, part: ToolPart)
     }
 }
 
+/// Whether a tool block for `id` is already present in the timeline.
+pub(crate) fn has_tool_part(timeline: &[TimelineItem], id: ToolCallId) -> bool {
+    timeline.iter().any(|item| {
+        matches!(
+            item,
+            TimelineItem::Assistant(turn)
+                if turn.parts.iter().any(
+                    |part| matches!(part, AssistantPart::Tool(tool) if tool.id == id)
+                )
+        )
+    })
+}
+
 fn merge_tool_part(target: &mut ToolPart, update: ToolPart) {
     if !update.title.is_empty() {
         target.title = update.title;

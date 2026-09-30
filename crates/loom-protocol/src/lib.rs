@@ -39,7 +39,7 @@ pub use process::{
     TaskStatus, TerminalEvent, TerminalEventRecord, TerminalSnapshot, TerminalStatus,
     TerminalStream,
 };
-pub use tool::ToolResult;
+pub use tool::{ToolResult, ToolResultKind, tool_result_kind};
 pub use vcs::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
     GitFileStatusKind, GitRepositoryStatus,
@@ -131,6 +131,9 @@ pub struct AgentRunMessageHeader {
     pub name: Option<String>,
     pub tool_call_id: Option<loom_core::ToolCallId>,
     pub tool_calls: Vec<ToolCall>,
+    /// Provider reasoning kept for display after a reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1066,6 +1069,7 @@ mod run_message_protocol_tests {
                     name: None,
                     tool_call_id: None,
                     tool_calls: Vec::new(),
+                    reasoning_content: Some("checked".to_owned()),
                 }],
             }),
         );

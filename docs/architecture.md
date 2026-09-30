@@ -232,8 +232,9 @@ must support:
   models during a user-visible action.
 
 The UI may render a conversational transcript, but the backend event stream
-is authoritative. Internal provider reasoning must not be exposed as a
-requirement of the protocol; providers return user-visible messages,
+is authoritative. Internal provider reasoning is optional display metadata: it
+may be carried to the client so a reloaded transcript shows it, but it is never
+a requirement of the protocol, and providers return user-visible messages,
 structured tool calls, and status metadata.
 
 ## Model provider abstraction

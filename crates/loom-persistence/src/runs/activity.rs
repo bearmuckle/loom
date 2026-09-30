@@ -719,7 +719,7 @@ pub(crate) fn save_run_tool_rows(
                 state: tool_attempt_state_name(state).to_owned(),
                 started_at,
                 completed_at,
-                result: result.cloned(),
+                result: compact_stored_result(result.cloned()),
             });
         }
         for (call_id, attempts) in &attempts_by_call {

@@ -148,6 +148,7 @@ impl InProcessConnection {
                             name: message.name,
                             tool_call_id: message.tool_call_id,
                             tool_calls: message.tool_calls,
+                            reasoning_content: message.reasoning_content,
                         })
                         .collect()
                 });
@@ -196,6 +197,7 @@ impl InProcessConnection {
                     name: message.name.clone(),
                     tool_call_id: message.tool_call_id,
                     tool_calls: message.tool_calls.clone(),
+                    reasoning_content: message.reasoning_content.clone(),
                 })
             })
             .collect()
@@ -236,6 +238,9 @@ impl InProcessConnection {
                 };
                 let (content, content_truncated) =
                     bounded_transcript_content(&content, header.content_bytes);
+                let reasoning_content = header.reasoning_content.map(|reasoning| {
+                    bounded_review_text(&reasoning, MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES as usize)
+                });
                 Ok(AgentRunTranscriptMessage {
                     ordinal: header.ordinal,
                     timeline_ordinal: header.timeline_ordinal,
@@ -245,9 +250,7 @@ impl InProcessConnection {
                         name: header.name,
                         tool_call_id: header.tool_call_id,
                         tool_calls: header.tool_calls,
-                        // The transcript page is for display only; resumed runs
-                        // reload reasoning through `persisted_run_messages`.
-                        reasoning_content: None,
+                        reasoning_content,
                     },
                     content_truncated,
                 })
