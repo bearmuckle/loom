@@ -406,12 +406,13 @@ impl InProcessConnection {
         input.options.input_cost_micros_per_1k = input_cost_micros_per_1k;
         input.options.output_cost_micros_per_1k = output_cost_micros_per_1k;
         let workspace = self.session_filesystem(session.id)?;
-        if input.repository_instructions.is_none() {
-            let instructions = workspace.instruction_text()?;
-            if !instructions.trim().is_empty() {
-                input.repository_instructions = Some(instructions);
-            }
-        }
+        // Append the workspace's instruction files (AGENTS.md and similar) even
+        // when the client supplied its own repository instructions, instead of
+        // letting the client text shadow them.
+        input.repository_instructions = merge_repository_instructions(
+            input.repository_instructions.take(),
+            &workspace.instruction_text()?,
+        );
         input.options.project_delegation_enabled = false;
         input.options.project_messaging_enabled = false;
         input.options.project_branch_messaging_enabled = false;

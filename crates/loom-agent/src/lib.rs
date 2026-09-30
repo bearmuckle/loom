@@ -1985,6 +1985,49 @@ mod tests {
     }
 
     #[test]
+    fn request_system_instructions_include_builtin_tool_guidance() {
+        let all = loom_tools::tool_definitions();
+        let guidance_only =
+            super::steps::system_instructions_with_tool_guidance(None, &all).expect("guidance");
+        assert!(guidance_only.contains("search_text"));
+        assert!(guidance_only.contains("propose_plan"));
+        assert!(guidance_only.contains("ask_user"));
+
+        let combined =
+            super::steps::system_instructions_with_tool_guidance(Some("Be concise."), &all)
+                .expect("combined");
+        assert!(combined.starts_with("Be concise."));
+        assert!(combined.contains("search_text"));
+
+        assert_eq!(
+            super::steps::system_instructions_with_tool_guidance(Some("Be concise."), &[]),
+            Some("Be concise.".to_owned())
+        );
+        assert_eq!(
+            super::steps::system_instructions_with_tool_guidance(None, &[]),
+            None
+        );
+        assert_eq!(
+            super::steps::system_instructions_with_tool_guidance(Some("   "), &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn model_request_includes_builtin_tool_guidance() {
+        let root = workspace();
+        let runtime = context_runtime(&root);
+        let (request, _) = runtime.model_request().unwrap();
+        assert!(request.tools.iter().any(|tool| tool.name == "search_text"));
+        assert!(request.messages.iter().any(|message| {
+            message.role == MessageRole::System
+                && message.content.contains("search_text")
+                && message.content.contains("run_command")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn tool_schema_tokens_are_charged_once_and_output_reserve_is_sent() {
         let root = workspace();
         let mut runtime = context_runtime(&root);

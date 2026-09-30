@@ -563,6 +563,24 @@ pub(crate) fn persisted_run_messages(messages: Vec<DurableRunMessage>) -> Vec<Mo
         .collect()
 }
 
+/// Combines client-supplied repository instructions with the workspace's own
+/// instruction files (AGENTS.md and similar). Client text is preserved and the
+/// workspace files are appended, so a client default can no longer shadow the
+/// repository's instructions.
+pub(crate) fn merge_repository_instructions(
+    client: Option<String>,
+    workspace: &str,
+) -> Option<String> {
+    let workspace = workspace.trim();
+    if workspace.is_empty() {
+        return client.filter(|text| !text.trim().is_empty());
+    }
+    Some(match client.filter(|text| !text.trim().is_empty()) {
+        Some(client) => format!("{client}\n\n{workspace}"),
+        None => workspace.to_owned(),
+    })
+}
+
 pub(crate) fn hydrate_run_context_checkpoint(
     persistence: &dyn Persistence,
     run_id: loom_core::RunId,
@@ -1372,5 +1390,26 @@ mod tests {
         assert_eq!(total.cached_input_tokens, 4);
         assert_eq!(total.cost_micros, 14);
         assert_eq!(total.tool_calls, 6);
+    }
+
+    #[test]
+    fn repository_instructions_merge_instead_of_shadowing() {
+        assert_eq!(
+            merge_repository_instructions(Some("Client text.".to_owned()), "## AGENTS.md\nRules"),
+            Some("Client text.\n\n## AGENTS.md\nRules".to_owned())
+        );
+        assert_eq!(
+            merge_repository_instructions(None, "## AGENTS.md\nRules"),
+            Some("## AGENTS.md\nRules".to_owned())
+        );
+        assert_eq!(
+            merge_repository_instructions(Some("Client text.".to_owned()), "   "),
+            Some("Client text.".to_owned())
+        );
+        assert_eq!(
+            merge_repository_instructions(Some("  ".to_owned()), "Rules"),
+            Some("Rules".to_owned())
+        );
+        assert_eq!(merge_repository_instructions(None, "\n"), None);
     }
 }

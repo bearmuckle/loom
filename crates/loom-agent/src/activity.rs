@@ -145,6 +145,10 @@ pub(crate) fn activity_contains_call(
 
 pub(crate) fn initial_messages(task: &AgentTask) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
+    // Part of the stored transcript prefix. `model_request` rebuilds the
+    // request from `task` and injects the authoritative, capability-aware
+    // built-in tool guidance (`loom_tools::tool_guidance`), so this message is
+    // never sent on its own; keep its shape stable for persisted runs.
     messages.push(ModelMessage::new(
         MessageRole::System,
         "Use propose_plan for an ordered plan before workspace changes, and use ask_user when information from the user is required to continue.",
