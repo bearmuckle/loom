@@ -172,9 +172,10 @@ The following runtime changes are implemented:
 - **Reasoning.** `ModelStreamEvent::ReasoningDelta` and
   `AgentEvent::ReasoningDelta` carry optional provider reasoning summaries.
   Chat-completions encoders parse `reasoning_content`/`reasoning`; the
-  Responses encoder parses reasoning summary text. Reasoning is presentation
-  only and is never stored in the provider transcript, so providers that do
-  not emit it are unaffected.
+  Responses encoder parses reasoning summary text. Reasoning is kept on the
+  assistant turn and echoed back to chat-completions providers that require it
+  (DeepSeek thinking mode), including across persistence and resume; providers
+  that do not emit or accept it are unaffected.
 
 Parallel execution of independent calls and incremental suppression of
 duplicate denials across restarts remain open.

@@ -42,6 +42,20 @@ impl InProcessConnection {
 
     pub(crate) fn archive_session(&self, session_id: AgentSessionId) -> Result<ServerResponse> {
         let session = self.backend.sessions()?.get(session_id)?;
+        if session.state == AgentSessionState::Archived {
+            log::warn!("[loom-server] refusing to archive session {session_id}: already archived");
+            return Err(LoomError::invalid_state(
+                "agent session is already archived",
+            ));
+        }
+        if self.backend.persistence.is_none() {
+            // Without persistence there is no project snapshot, so a project
+            // root is archived as a plain session and its children are not
+            // cascaded.
+            log::debug!(
+                "[loom-server] archiving session {session_id} without persistence; project cascade is unavailable"
+            );
+        }
         let project = self
             .backend
             .persistence
@@ -50,36 +64,68 @@ impl InProcessConnection {
             .transpose()?
             .flatten()
             .filter(|project| project.root_session_id == session_id);
-        if let Some(project) = &project {
-            let unfinished_task = project.tasks.iter().any(|task| {
-                !matches!(
-                    task.status,
-                    loom_core::DelegatedTaskStatus::Completed
-                        | loom_core::DelegatedTaskStatus::Failed
-                        | loom_core::DelegatedTaskStatus::Cancelled
-                )
-            });
-            let unfinished_child = project.agents.iter().any(|agent| {
-                agent.session_id != session_id
-                    && matches!(
-                        agent.state,
-                        AgentSessionState::Queued
-                            | AgentSessionState::Planning
-                            | AgentSessionState::AwaitingApproval
-                            | AgentSessionState::Paused
-                            | AgentSessionState::Executing
-                            | AgentSessionState::Evaluating
-                            | AgentSessionState::NeedsInput
+        // Resolve the descendant sessions and validate every one of them with
+        // its live state before mutating any, so a rejected child cannot leave
+        // a partially archived project tree behind.
+        let descendants = if let Some(project) = &project {
+            let unfinished_tasks = project
+                .tasks
+                .iter()
+                .filter(|task| {
+                    !matches!(
+                        task.status,
+                        loom_core::DelegatedTaskStatus::Completed
+                            | loom_core::DelegatedTaskStatus::Failed
+                            | loom_core::DelegatedTaskStatus::Cancelled
                     )
-            });
-            if unfinished_task || unfinished_child {
+                })
+                .map(|task| format!("{} ({:?})", task.child_name, task.status))
+                .collect::<Vec<_>>();
+            let mut descendants = Vec::new();
+            let mut active_children = Vec::new();
+            for agent in &project.agents {
+                if agent.session_id == session_id {
+                    continue;
+                }
+                let state = self.backend.sessions()?.get(agent.session_id)?.state;
+                if state == AgentSessionState::Archived {
+                    continue;
+                }
+                if matches!(
+                    state,
+                    AgentSessionState::Queued
+                        | AgentSessionState::Planning
+                        | AgentSessionState::AwaitingApproval
+                        | AgentSessionState::Paused
+                        | AgentSessionState::Executing
+                        | AgentSessionState::Evaluating
+                        | AgentSessionState::NeedsInput
+                ) {
+                    active_children.push(format!("{} ({state:?})", agent.session_id));
+                } else {
+                    descendants.push((agent.session_id, agent.depth));
+                }
+            }
+            if !unfinished_tasks.is_empty() || !active_children.is_empty() {
+                log::warn!(
+                    "[loom-server] refusing to archive project root {session_id}: unfinished child tasks {unfinished_tasks:?}, active child sessions {active_children:?}"
+                );
                 return Err(LoomError::new(
                     ErrorCode::InvalidState,
                     "finish or cancel every child task before archiving this project",
                     false,
                 ));
             }
-        }
+            descendants.sort_by_key(|(_, depth)| std::cmp::Reverse(*depth));
+            log::info!(
+                "[loom-server] archiving project root {session_id} with {} descendant session(s)",
+                descendants.len()
+            );
+            descendants
+        } else {
+            log::info!("[loom-server] archiving session {session_id}");
+            Vec::new()
+        };
         if matches!(
             session.state,
             AgentSessionState::Queued
@@ -105,30 +151,53 @@ impl InProcessConnection {
                 .max_by_key(|(_, snapshot)| snapshot.updated_at)
                 .map(|(run_id, _)| run_id)
                 .ok_or_else(|| {
+                    log::warn!(
+                        "[loom-server] session {session_id} is {:?} but has no active run to stop before archiving",
+                        session.state
+                    );
                     LoomError::invalid_state(
                         "running agent sessions must be stopped before archiving",
                     )
                 })?;
-            self.stop_run(run_id, RunStop::Interrupt)?;
-        }
-
-        if let Some(project) = project {
-            let mut descendants = project
-                .agents
-                .into_iter()
-                .filter(|agent| {
-                    agent.session_id != session_id && agent.state != AgentSessionState::Archived
-                })
-                .collect::<Vec<_>>();
-            descendants.sort_by_key(|agent| std::cmp::Reverse(agent.depth));
-            for agent in descendants {
-                let (_, record) = self.backend.sessions()?.archive(agent.session_id)?;
-                self.backend.journal()?.append_session(record);
+            log::info!("[loom-server] stopping run {run_id} before archiving session {session_id}");
+            if let Err(error) = self.stop_run(run_id, RunStop::Interrupt) {
+                log::warn!(
+                    "[loom-server] failed to stop run {run_id} before archiving session {session_id}: {}",
+                    error.message
+                );
+                return Err(error);
             }
         }
 
-        let (snapshot, record) = self.backend.sessions()?.archive(session_id)?;
+        for (child_id, depth) in descendants {
+            log::info!(
+                "[loom-server] archiving descendant session {child_id} (depth {depth}) of project root {session_id}"
+            );
+            let (_, record) = self
+                .backend
+                .sessions()?
+                .archive(child_id)
+                .inspect_err(|error| {
+                    log::warn!(
+                        "[loom-server] failed to archive descendant session {child_id} of project root {session_id}: {}",
+                        error.message
+                    );
+                })?;
+            self.backend.journal()?.append_session(record);
+        }
+
+        let (snapshot, record) =
+            self.backend
+                .sessions()?
+                .archive(session_id)
+                .inspect_err(|error| {
+                    log::warn!(
+                        "[loom-server] failed to archive session {session_id}: {}",
+                        error.message
+                    );
+                })?;
         self.backend.journal()?.append_session(record);
+        log::info!("[loom-server] archived session {session_id}");
         Ok(ServerResponse::Session(
             SessionResponse::AgentSessionArchived(snapshot),
         ))

@@ -4299,6 +4299,7 @@ dependencies = [
 name = "loom-cli"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "loom-agent",
  "loom-core",
  "loom-model",
@@ -4452,6 +4453,7 @@ name = "loom-tools"
 version = "0.1.0"
 dependencies = [
  "globset",
+ "libc",
  "loom-core",
  "loom-model",
  "loom-protocol",

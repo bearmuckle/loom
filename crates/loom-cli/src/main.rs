@@ -39,11 +39,21 @@ const MAX_IDLE_EVENT_POLLS: u32 = 1_500;
 /// database is wiped only when the operator asked for it (`--reset-state`) or
 /// explicitly confirms the interactive prompt; otherwise the error is returned.
 fn ensure_state_database(path: &Path, reset_requested: bool) -> Result<(), LoomError> {
+    ensure_state_database_with(path, reset_requested, confirm_state_wipe)
+}
+
+/// The decision logic for [`ensure_state_database`] with the interactive
+/// confirmation injected, so it can be exercised without a terminal.
+fn ensure_state_database_with(
+    path: &Path,
+    reset_requested: bool,
+    confirm: impl FnOnce(&Path, loom_persistence::SchemaStatus) -> Result<bool, LoomError>,
+) -> Result<(), LoomError> {
     let status = loom_persistence::FilePersistence::schema_status(path)?;
     if status.is_compatible() {
         return Ok(());
     }
-    let wipe = reset_requested || confirm_state_wipe(path, status)?;
+    let wipe = reset_requested || confirm(path, status)?;
     if !wipe {
         return Err(loom_persistence::incompatible_database_error(path, status));
     }
@@ -76,7 +86,18 @@ fn confirm_state_wipe(
     ))
 }
 
+/// Initializes the `log` facade so server and agent diagnostics are visible when
+/// running the native CLI, including `serve`.
+fn init_logging() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("loom_server=info,loom_agent=info"),
+    )
+    .format_timestamp_millis()
+    .init();
+}
+
 fn main() -> Result<(), LoomError> {
+    init_logging();
     let Some(options) = parse_args(env::args().skip(1))? else {
         return Ok(());
     };
@@ -1432,7 +1453,7 @@ const fn run_state_name(state: AgentRunState) -> &'static str {
 mod tests {
     use super::{
         CliOptions, create_session, create_workspace, demonstrate_m2_services,
-        demonstrate_m3_recovery, ensure_state_database, negotiate, parse_args, run_m4_demo,
+        demonstrate_m3_recovery, ensure_state_database_with, negotiate, parse_args, run_m4_demo,
         start_run, stream_run,
     };
     use loom_core::{AgentSessionState, RunId};
@@ -1628,12 +1649,18 @@ mod tests {
         header[60..64].copy_from_slice(&40u32.to_be_bytes());
         std::fs::write(&path, header).unwrap();
 
-        // Without an explicit reset the incompatible database is preserved.
-        assert!(ensure_state_database(&path, false).is_err());
+        // Declining the interactive prompt preserves the incompatible database.
+        assert!(ensure_state_database_with(&path, false, |_, _| Ok(false)).is_err());
         assert!(path.exists());
 
-        // An explicit reset wipes it so a fresh baseline can be created.
-        ensure_state_database(&path, true).unwrap();
+        // Confirming the prompt wipes it so a fresh baseline can be created.
+        ensure_state_database_with(&path, false, |_, _| Ok(true)).unwrap();
+        assert!(!path.exists());
+
+        // An explicit reset wipes it without ever prompting.
+        std::fs::write(&path, header).unwrap();
+        ensure_state_database_with(&path, true, |_, _| panic!("--reset-state must not prompt"))
+            .unwrap();
         assert!(!path.exists());
         std::fs::remove_file(&path).ok();
     }

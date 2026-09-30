@@ -176,6 +176,7 @@ fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
                 name: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
             DurableRunMessage {
                 timeline_ordinal: 2,
@@ -184,6 +185,7 @@ fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
                 name: Some("old header".to_owned()),
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
         ],
     )]);
@@ -307,6 +309,7 @@ fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
                 name: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
             DurableRunMessage {
                 timeline_ordinal: 6,
@@ -315,6 +318,7 @@ fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
                 name: Some("streaming".to_owned()),
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
         ],
     };
@@ -414,6 +418,7 @@ fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
             name: Some("new header".to_owned()),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            reasoning_content: None,
         }],
     };
     let empty_feed = DurableFeedState {
@@ -993,6 +998,65 @@ fn baseline_schema_folds_transcript_and_tool_state_into_parent_rows() {
 
     drop(connection);
     drop(store);
+    fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn opens_and_migrates_an_older_schema_in_place() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-migrate-{}.db", Uuid::new_v4()));
+    let run_id = RunId::new();
+    {
+        let connection = Connection::open(&path).unwrap();
+        // Minimal v2 layout: `run_messages` without the v3 reasoning column.
+        connection
+            .execute_batch(
+                "CREATE TABLE run_messages (
+                    run_id BLOB NOT NULL,
+                    session_id BLOB NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    timeline_ordinal INTEGER NOT NULL DEFAULT 0,
+                    role TEXT NOT NULL,
+                    content_hash BLOB,
+                    name TEXT,
+                    tool_call_id BLOB,
+                    tool_calls TEXT NOT NULL DEFAULT '[]',
+                    fragments TEXT NOT NULL DEFAULT '[]',
+                    PRIMARY KEY(run_id, ordinal)
+                ) WITHOUT ROWID, STRICT;
+                PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO run_messages(
+                    run_id, session_id, ordinal, timeline_ordinal, role, tool_calls, fragments)
+                 VALUES (?1, ?2, 0, 0, 'assistant', '[]', '[]')",
+                params![run_id.as_uuid().as_bytes().as_slice(), [0u8; 16].as_slice()],
+            )
+            .unwrap();
+    }
+
+    let store = FilePersistence::open(&path).unwrap();
+    let messages = store.load_run_messages(run_id).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].reasoning_content, None);
+    drop(store);
+
+    let connection = Connection::open(&path).unwrap();
+    let version: u32 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, DATABASE_SCHEMA_VERSION);
+    let has_column: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('run_messages')
+             WHERE name='reasoning_content')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(has_column, "migration adds the reasoning_content column");
+    drop(connection);
     fs::remove_file(path).unwrap();
 }
 
@@ -1869,6 +1933,7 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
                 name: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
             DurableRunMessage {
                 timeline_ordinal: 0,
@@ -1881,6 +1946,7 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
                     name: "inspect".to_owned(),
                     arguments: serde_json::json!({"path": "src/main.rs"}),
                 }],
+                reasoning_content: Some("step-by-step".to_owned()),
             },
         ],
     )]);
@@ -2270,6 +2336,10 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
     assert_eq!(
         newest_page[0].tool_calls,
         run_messages[&run_id][1].tool_calls
+    );
+    assert_eq!(
+        newest_page[0].reasoning_content.as_deref(),
+        Some("step-by-step")
     );
     assert_eq!(
         persistence.list_filesystem_sessions().unwrap(),
@@ -2696,6 +2766,7 @@ fn streamed_messages_are_append_only_and_paged_by_keyset() {
                 name: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
             DurableRunMessage {
                 timeline_ordinal: 0,
@@ -2704,6 +2775,7 @@ fn streamed_messages_are_append_only_and_paged_by_keyset() {
                 name: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
             DurableRunMessage {
                 timeline_ordinal: 0,
@@ -2712,6 +2784,7 @@ fn streamed_messages_are_append_only_and_paged_by_keyset() {
                 name: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
             DurableRunMessage {
                 timeline_ordinal: 0,
@@ -2720,6 +2793,7 @@ fn streamed_messages_are_append_only_and_paged_by_keyset() {
                 name: None,
                 tool_call_id: None,
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
         ],
     )]);

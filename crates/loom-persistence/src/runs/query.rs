@@ -867,7 +867,7 @@ impl FilePersistence {
         let mut statement = connection
             .prepare(
                 "SELECT ordinal, timeline_ordinal, role, content_hash, name, tool_call_id,
-                        tool_calls
+                        tool_calls, reasoning_content
                       FROM run_messages WHERE run_id=?1 ORDER BY ordinal",
             )
             .map_err(|error| {
@@ -883,16 +883,25 @@ impl FilePersistence {
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<Vec<u8>>>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|error| {
                 persistence_error(format!("could not read run messages: {error}"), true)
             })?;
         rows.map(|row| {
-            let (ordinal, timeline_ordinal, role, content_hash, name, tool_call_id, tool_calls) =
-                row.map_err(|error| {
-                    persistence_error(format!("could not read run message: {error}"), true)
-                })?;
+            let (
+                ordinal,
+                timeline_ordinal,
+                role,
+                content_hash,
+                name,
+                tool_call_id,
+                tool_calls,
+                reasoning_content,
+            ) = row.map_err(|error| {
+                persistence_error(format!("could not read run message: {error}"), true)
+            })?;
             let role = parse_message_role(&role)?;
             let ordinal = u64::try_from(ordinal).map_err(|_| {
                 LoomError::new(
@@ -951,6 +960,7 @@ impl FilePersistence {
                 name,
                 tool_call_id,
                 tool_calls,
+                reasoning_content,
             })
         })
         .collect()
@@ -1283,7 +1293,8 @@ impl FilePersistence {
                             (SELECT raw_size FROM content_objects WHERE hash=m.content_hash),
                             0
                         ),
-                        m.name, m.tool_call_id, m.tool_calls, m.fragments
+                        m.name, m.tool_call_id, m.tool_calls, m.fragments,
+                        m.reasoning_content
                  FROM run_messages m
                  WHERE m.run_id=?1 AND (?2 IS NULL OR m.ordinal < ?2)
                  ORDER BY m.ordinal DESC LIMIT ?3",
@@ -1308,6 +1319,7 @@ impl FilePersistence {
                         row.get::<_, Option<Vec<u8>>>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
@@ -1324,6 +1336,7 @@ impl FilePersistence {
                 tool_call_id,
                 tool_calls,
                 fragments,
+                reasoning_content,
             ) = row.map_err(|error| {
                 persistence_error(format!("could not read run message header: {error}"), true)
             })?;
@@ -1365,6 +1378,7 @@ impl FilePersistence {
                 name,
                 tool_call_id: decode_optional_tool_call_id(tool_call_id)?,
                 tool_calls,
+                reasoning_content,
             })
         })
         .collect()

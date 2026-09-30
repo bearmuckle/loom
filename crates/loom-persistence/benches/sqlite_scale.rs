@@ -166,6 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     name: None,
                     tool_call_id: None,
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 },
                 DurableRunMessage {
                     timeline_ordinal: 0,
@@ -176,6 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     name: None,
                     tool_call_id: None,
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 },
                 DurableRunMessage {
                     timeline_ordinal: 0,
@@ -184,6 +186,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     name: Some("run_tests".to_owned()),
                     tool_call_id: None,
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 },
                 DurableRunMessage {
                     timeline_ordinal: 0,
@@ -195,6 +198,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     name: None,
                     tool_call_id: None,
                     tool_calls: Vec::new(),
+                    reasoning_content: None,
                 },
             ],
         );

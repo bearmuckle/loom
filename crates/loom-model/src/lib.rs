@@ -125,6 +125,10 @@ pub struct ModelMessage {
     pub tool_call_id: Option<ToolCallId>,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
+    /// Provider reasoning that must be echoed back on assistant turns
+    /// (e.g. DeepSeek thinking mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 impl ModelMessage {
@@ -135,6 +139,7 @@ impl ModelMessage {
             name: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
+            reasoning_content: None,
         }
     }
 }

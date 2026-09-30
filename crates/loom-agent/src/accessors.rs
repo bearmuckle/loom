@@ -293,6 +293,7 @@ impl AgentRuntime {
             name: Some(result.name),
             tool_call_id: Some(result.tool_call_id),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         });
         self.last_failed_call = None;
         let continues = matches!(

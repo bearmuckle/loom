@@ -45,8 +45,8 @@ impl AgentRuntime {
                 return Ok(StepOutcome::Blocked);
             }
             self.pending_tool_execution = None;
-            let (tool_events, _result) = self.execute_tool(&call);
-            events.extend(tool_events);
+            events.extend(self.set_state(AgentRunState::Executing));
+            self.execute_tool(&call, events);
             self.last_failed_call = None;
             return Ok(StepOutcome::Continue);
         }
@@ -139,11 +139,6 @@ impl AgentRuntime {
             self.handle_stream_event(event, &mut ctx)
         });
         self.provider = Some(provider);
-        if !ctx.buffered_tools.is_empty() {
-            let buffered = std::mem::take(&mut ctx.buffered_tools);
-            let tool_events = self.flush_tool_calls(buffered);
-            ctx.events.extend(tool_events);
-        }
         let StepContext {
             events: step_events,
             published,
@@ -151,10 +146,17 @@ impl AgentRuntime {
             completed,
             completion_guarded,
             finished,
+            buffered_tools,
             ..
         } = ctx;
         events.extend(step_events);
         self.flush_offset = base.saturating_add(published);
+        if !buffered_tools.is_empty() {
+            // Tool execution is its own phase: report it as executing instead
+            // of leaving the run in the evaluating state set for the model turn.
+            events.extend(self.set_state(AgentRunState::Executing));
+            self.flush_tool_calls(buffered_tools, events);
+        }
         let model_status = match &stream_result {
             Err(_) if self.control.is_stopping() => AgentActivityStatus::Cancelled,
             Err(_) => AgentActivityStatus::Failed,
@@ -202,8 +204,7 @@ impl AgentRuntime {
     /// Executes the tool calls buffered during one model turn. Consecutive
     /// read-only calls run concurrently; writes, commands, and other calls run
     /// sequentially in model order. Results are always recorded in model order.
-    fn flush_tool_calls(&mut self, calls: Vec<ToolCall>) -> Vec<AgentEvent> {
-        let mut events = Vec::new();
+    fn flush_tool_calls(&mut self, calls: Vec<ToolCall>, events: &mut Vec<AgentEvent>) {
         let mut index = 0;
         while index < calls.len() {
             let is_read_only = self
@@ -221,18 +222,16 @@ impl AgentRuntime {
                     end += 1;
                 }
                 let batch = calls[index..end].to_vec();
-                self.execute_read_only_batch(&batch, &mut events);
+                self.execute_read_only_batch(&batch, events);
                 index = end;
             } else {
-                let (tool_events, _) = self.execute_tool(&calls[index]);
-                events.extend(tool_events);
+                let _ = self.execute_tool(&calls[index], events);
                 index += 1;
             }
         }
         if !calls.is_empty() {
             self.last_failed_call = None;
         }
-        events
     }
 
     fn execute_read_only_batch(&mut self, calls: &[ToolCall], events: &mut Vec<AgentEvent>) {
@@ -242,6 +241,8 @@ impl AgentRuntime {
                 call: call.clone(),
             });
         }
+        // Publish the starts before executing so blocked reads report as running.
+        self.flush_prefix(events);
         let tools = &self.tools;
         let results = std::thread::scope(|scope| {
             let handles = calls
@@ -263,6 +264,7 @@ impl AgentRuntime {
         });
         for result in &results {
             self.record_tool_result(result, events);
+            self.flush_prefix(events);
         }
     }
 
@@ -290,6 +292,7 @@ impl AgentRuntime {
             name: Some(result.name.clone()),
             tool_call_id: Some(result.tool_call_id),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         });
     }
 
@@ -326,9 +329,7 @@ impl AgentRuntime {
             }
             ModelStreamEvent::ReasoningDelta { text } => {
                 if !text.is_empty() {
-                    // Reasoning is surfaced to clients but never stored in the
-                    // provider transcript, so it cannot become a protocol
-                    // requirement for providers that do not emit it.
+                    self.append_assistant_reasoning(&text);
                     let message_id = self.assistant_message_id();
                     ctx.events.push(AgentEvent::ReasoningDelta {
                         run_id: self.run.id,
@@ -390,6 +391,7 @@ impl AgentRuntime {
                         name: Some(result.name.clone()),
                         tool_call_id: Some(result.tool_call_id),
                         tool_calls: Vec::new(),
+                        reasoning_content: None,
                     });
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
@@ -437,6 +439,7 @@ impl AgentRuntime {
                         name: Some(result.name),
                         tool_call_id: Some(result.tool_call_id),
                         tool_calls: Vec::new(),
+                        reasoning_content: None,
                     });
                     return Ok(StreamFlow::Stop);
                 }
@@ -464,6 +467,7 @@ impl AgentRuntime {
                             name: Some(result.name),
                             tool_call_id: Some(call.id),
                             tool_calls: Vec::new(),
+                            reasoning_content: None,
                         });
                         return Ok(StreamFlow::Continue);
                     }
@@ -546,6 +550,7 @@ impl AgentRuntime {
                             name: Some(call.name.clone()),
                             tool_call_id: Some(call.id),
                             tool_calls: Vec::new(),
+                            reasoning_content: None,
                         });
                         return Ok(StreamFlow::Stop);
                     }
@@ -569,6 +574,7 @@ impl AgentRuntime {
                         name: Some(result.name.clone()),
                         tool_call_id: Some(result.tool_call_id),
                         tool_calls: Vec::new(),
+                        reasoning_content: None,
                     });
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
@@ -618,6 +624,7 @@ impl AgentRuntime {
                             name: Some(call.name.clone()),
                             tool_call_id: Some(call.id),
                             tool_calls: Vec::new(),
+                            reasoning_content: None,
                         });
                         return Ok(StreamFlow::Stop);
                     };
@@ -636,6 +643,7 @@ impl AgentRuntime {
                         name: Some(call.name.clone()),
                         tool_call_id: Some(call.id),
                         tool_calls: Vec::new(),
+                        reasoning_content: None,
                     });
                     self.step_id = None;
                     self.step_index = self.step_index.saturating_add(1);
@@ -734,6 +742,7 @@ impl AgentRuntime {
                                 name: Some("loom_project_completion_guard".to_owned()),
                                 tool_call_id: None,
                                 tool_calls: Vec::new(),
+                                reasoning_content: None,
                             });
                             ctx.completion_guarded = true;
                         } else {

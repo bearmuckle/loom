@@ -19,6 +19,22 @@ impl AgentRuntime {
         self.push_message(ModelMessage::new(MessageRole::Assistant, text));
     }
 
+    /// Keeps provider reasoning on the assistant turn so providers that require
+    /// it to be echoed back (DeepSeek thinking mode) accept the next request.
+    pub(crate) fn append_assistant_reasoning(&mut self, text: &str) {
+        if let Some(last) = self.messages.last_mut()
+            && last.role == MessageRole::Assistant
+        {
+            last.reasoning_content
+                .get_or_insert_with(String::new)
+                .push_str(text);
+            return;
+        }
+        let mut message = ModelMessage::new(MessageRole::Assistant, "");
+        message.reasoning_content = Some(text.to_owned());
+        self.push_message(message);
+    }
+
     pub(crate) fn append_assistant_tool_call(&mut self, call: ToolCall) {
         if let Some(last) = self.messages.last_mut()
             && last.role == MessageRole::Assistant
@@ -32,6 +48,7 @@ impl AgentRuntime {
             name: None,
             tool_call_id: None,
             tool_calls: vec![call],
+            reasoning_content: None,
         });
     }
 

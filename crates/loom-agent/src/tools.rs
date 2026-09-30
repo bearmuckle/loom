@@ -7,11 +7,18 @@ impl AgentRuntime {
         self.tools.set_github_access(token, write_access);
     }
 
-    pub(crate) fn execute_tool(&mut self, call: &ToolCall) -> (Vec<AgentEvent>, ToolResult) {
-        let mut events = vec![AgentEvent::ToolCallStarted {
+    pub(crate) fn execute_tool(
+        &mut self,
+        call: &ToolCall,
+        events: &mut Vec<AgentEvent>,
+    ) -> ToolResult {
+        events.push(AgentEvent::ToolCallStarted {
             run_id: self.run.id,
             call: call.clone(),
-        }];
+        });
+        // Publish the start before running the tool so a long or blocked command
+        // is reported as running instead of queued.
+        self.flush_prefix(events);
         let result = self.tools.execute(call);
         if !result.output.is_empty() {
             events.push(AgentEvent::ToolOutputChunk {
@@ -38,8 +45,10 @@ impl AgentRuntime {
             name: Some(result.name.clone()),
             tool_call_id: Some(result.tool_call_id),
             tool_calls: Vec::new(),
+            reasoning_content: None,
         });
-        (events, result)
+        self.flush_prefix(events);
+        result
     }
 
     pub(crate) fn start_activity(&mut self, mut activity: AgentActivityRecord) -> AgentEvent {

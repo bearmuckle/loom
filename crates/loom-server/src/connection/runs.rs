@@ -245,6 +245,9 @@ impl InProcessConnection {
                         name: header.name,
                         tool_call_id: header.tool_call_id,
                         tool_calls: header.tool_calls,
+                        // The transcript page is for display only; resumed runs
+                        // reload reasoning through `persisted_run_messages`.
+                        reasoning_content: None,
                     },
                     content_truncated,
                 })

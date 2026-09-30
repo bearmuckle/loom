@@ -562,6 +562,7 @@ mod tests {
                 name: None,
                 tool_call_id: None,
                 tool_calls: vec![call.clone()],
+                reasoning_content: None,
             },
             ModelMessage {
                 role: MessageRole::Tool,
@@ -569,6 +570,7 @@ mod tests {
                 name: Some(call.name),
                 tool_call_id: Some(call.id),
                 tool_calls: Vec::new(),
+                reasoning_content: None,
             },
         ]
     }

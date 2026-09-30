@@ -508,20 +508,22 @@ pub(crate) fn save_run_message_rows(
             transaction
                 .execute(
                     "INSERT INTO run_messages(run_id, session_id, ordinal, timeline_ordinal,
-                    role, content_hash, name, tool_call_id, tool_calls)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    role, content_hash, name, tool_call_id, tool_calls, reasoning_content)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                  ON CONFLICT(run_id, ordinal) DO UPDATE SET
                     session_id=excluded.session_id,
                     timeline_ordinal=excluded.timeline_ordinal, role=excluded.role,
                     content_hash=excluded.content_hash, name=excluded.name,
-                    tool_call_id=excluded.tool_call_id, tool_calls=excluded.tool_calls
+                    tool_call_id=excluded.tool_call_id, tool_calls=excluded.tool_calls,
+                    reasoning_content=excluded.reasoning_content
                  WHERE run_messages.session_id IS NOT excluded.session_id
                     OR run_messages.timeline_ordinal IS NOT excluded.timeline_ordinal
                     OR run_messages.role IS NOT excluded.role
                     OR run_messages.content_hash IS NOT excluded.content_hash
                     OR run_messages.name IS NOT excluded.name
                     OR run_messages.tool_call_id IS NOT excluded.tool_call_id
-                    OR run_messages.tool_calls IS NOT excluded.tool_calls",
+                    OR run_messages.tool_calls IS NOT excluded.tool_calls
+                    OR run_messages.reasoning_content IS NOT excluded.reasoning_content",
                     params![
                         run_id_bytes.as_slice(),
                         session_id,
@@ -531,7 +533,8 @@ pub(crate) fn save_run_message_rows(
                         content_hash,
                         message.name,
                         tool_call_id,
-                        tool_calls
+                        tool_calls,
+                        message.reasoning_content
                     ],
                 )
                 .map_err(|error| {

@@ -832,11 +832,12 @@ impl LoomView {
                 }
                 Err(error) => ResponseEnvelope::failure(request_id, error),
             };
-            view.update(cx, |view, cx| {
+            if let Err(error) = view.update(cx, |view, cx| {
                 apply(view, response, cx);
                 cx.notify();
-            })
-            .ok();
+            }) {
+                log::warn!("[loom-ui] applying a backend response failed: {error}");
+            }
         })
         .detach();
     }
@@ -869,11 +870,12 @@ impl LoomView {
                 }
                 Err(error) => ResponseEnvelope::failure(request_id, error),
             };
-            view.update(cx, |view, cx| {
+            if let Err(error) = view.update(cx, |view, cx| {
                 apply(view, response, cx);
                 cx.notify();
-            })
-            .ok();
+            }) {
+                log::warn!("[loom-ui] applying a backend response failed: {error}");
+            }
         })
         .detach();
     }
