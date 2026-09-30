@@ -1,5 +1,23 @@
 use super::*;
 
+/// User-supplied system instructions with the server-owned built-in tool
+/// guidance appended. The guidance is derived from the tools actually
+/// advertised this step, so it stays consistent with the request without being
+/// persisted or duplicated into the stored transcript prefix.
+pub(crate) fn system_instructions_with_tool_guidance(
+    system_instructions: Option<&str>,
+    tools: &[loom_model::ToolDefinition],
+) -> Option<String> {
+    let system_instructions = system_instructions.filter(|text| !text.trim().is_empty());
+    match (system_instructions, loom_tools::tool_guidance(tools)) {
+        (Some(system_instructions), Some(guidance)) => {
+            Some(format!("{system_instructions}\n\n{guidance}"))
+        }
+        (Some(system_instructions), None) => Some(system_instructions.to_owned()),
+        (None, guidance) => guidance,
+    }
+}
+
 impl AgentRuntime {
     /// Drives the run until it finishes or needs a human.
     pub(crate) fn advance(&mut self) -> Result<Vec<AgentEvent>> {
@@ -913,6 +931,10 @@ impl AgentRuntime {
         } else {
             Vec::new()
         };
+        let system_instructions = system_instructions_with_tool_guidance(
+            self.task.system_instructions.as_deref(),
+            &tools,
+        );
         let completion = CompletionOptions {
             max_output_tokens: Some(reserve as u32),
             ..Default::default()
@@ -934,7 +956,7 @@ impl AgentRuntime {
         };
         let assembly = ContextAssembler::assemble_with_counter(
             &ContextInput {
-                system_instructions: self.task.system_instructions.clone(),
+                system_instructions,
                 repository_instructions: self.task.repository_instructions.clone(),
                 task: self.task.task.clone(),
                 conversation: conversation[boundary..].to_vec(),
