@@ -955,7 +955,7 @@ pub(crate) fn render_patch_block(
 pub(crate) fn tool_output_language(part: &ToolPart) -> Language {
     match part.name.as_str() {
         "run_command" => Language::Bash,
-        "search_text" | "web_search" => Language::Text,
+        "glob" | "search_text" | "web_search" => Language::Text,
         _ => {
             let hint = part.detail.as_deref().unwrap_or(&part.title);
             let language = Language::from_path(hint);
@@ -974,7 +974,12 @@ pub(crate) fn tool_icon(name: &str) -> AssetIconName {
         "read_file" => AssetIconName::FileText,
         "write_file" | "apply_patch" => AssetIconName::Pencil,
         "list_files" => AssetIconName::FolderOpen,
+        "glob" => AssetIconName::FolderOpen,
         "search_text" => AssetIconName::Search,
+        "github_list_pull_requests" => AssetIconName::List,
+        "github_get_pull_request" => AssetIconName::GitBranch,
+        "github_create_pull_request" => AssetIconName::GitMerge,
+        "github_push_branch" => AssetIconName::ArrowUp,
         "web_search" => AssetIconName::Globe,
         "run_command" => AssetIconName::SquareTerminal,
         "propose_plan" => AssetIconName::ListChecks,
@@ -997,10 +1002,27 @@ pub(crate) fn tool_group_label(name: &str, count: usize) -> String {
         "read_file" => format!("Read {count} files"),
         "write_file" | "apply_patch" => format!("Edited {count} files"),
         "list_files" => format!("Listed {count} directories"),
+        "glob" => format!("Matched {count} globs"),
         "search_text" => format!("Searched {count} times"),
+        "github_list_pull_requests" => format!("Listed pull requests {count} times"),
+        "github_get_pull_request" => format!("Read {count} pull requests"),
+        "github_create_pull_request" => format!("Opened {count} pull requests"),
+        "github_push_branch" => format!("Pushed {count} branches"),
         "run_command" => format!("Ran {count} commands"),
         "web_search" => format!("Searched the web {count} times"),
         "propose_plan" => format!("Proposed {count} plans"),
+        "ask_user" => format!("Asked the user {count} times"),
+        "delegate_project_task" => format!("Delegated {count} sub-agents"),
+        "delegate_project_code_task" => format!("Delegated {count} code sub-agents"),
+        "wait_for_project_children" => format!("Waited on sub-agents {count} times"),
+        "control_project_child" => format!("Controlled sub-agents {count} times"),
+        "send_project_agent_message" => format!("Messaged sub-agents {count} times"),
+        "list_project_message_recipients" => {
+            format!("Listed message recipients {count} times")
+        }
+        "list_project_children" => format!("Listed sub-agents {count} times"),
+        "review_project_child" => format!("Reviewed {count} sub-agents"),
+        "integrate_project_child" => format!("Integrated {count} sub-agents"),
         other => format!("{other} × {count}"),
     }
 }
@@ -1049,8 +1071,9 @@ pub(crate) fn render_tool_output(
 
 /// The structured arguments shown under a tool block. Returns `None` for the
 /// argument shapes that carry no information (`null` or an empty object) so the
-/// transcript never renders a bare `null`. Project-agent tools get a readable
-/// summary instead of their raw JSON arguments.
+/// transcript never renders a bare `null`. Known tools get a readable summary
+/// instead of their raw JSON arguments; only unknown/extension tools fall back
+/// to serialized JSON.
 pub(crate) fn tool_detail(call: &loom_model::ToolCall) -> Option<String> {
     match call.name.as_str() {
         "delegate_project_task" | "delegate_project_code_task" => {
@@ -1096,6 +1119,133 @@ pub(crate) fn tool_detail(call: &loom_model::ToolCall) -> Option<String> {
         | "integrate_project_child"
         | "list_project_children"
         | "list_project_message_recipients" => None,
+        // Core tools summarize their arguments instead of dumping raw JSON, and
+        // omit the detail when the title already carries the same information.
+        "read_file" => {
+            let start = call
+                .arguments
+                .get("line_start")
+                .and_then(serde_json::Value::as_u64);
+            let end = call
+                .arguments
+                .get("line_end")
+                .and_then(serde_json::Value::as_u64);
+            match (start, end) {
+                (Some(start), Some(end)) => Some(format!("Lines {start}–{end}")),
+                (Some(start), None) => Some(format!("From line {start}")),
+                (None, Some(end)) => Some(format!("Through line {end}")),
+                (None, None) => None,
+            }
+        }
+        "list_files" => {
+            let mut parts = Vec::new();
+            if let Some(glob) = string_argument(&call.arguments, "glob") {
+                parts.push(format!("glob {glob}"));
+            }
+            if let Some(depth) = call
+                .arguments
+                .get("depth")
+                .and_then(serde_json::Value::as_u64)
+            {
+                parts.push(format!("depth {depth}"));
+            }
+            (!parts.is_empty()).then(|| parts.join(", "))
+        }
+        "search_text" => {
+            let mut parts = Vec::new();
+            if let Some(path) = string_argument(&call.arguments, "path") {
+                parts.push(format!("in {path}"));
+            }
+            if let Some(glob) = string_argument(&call.arguments, "glob") {
+                parts.push(format!("glob {glob}"));
+            }
+            if call
+                .arguments
+                .get("regex")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                parts.push("regex".to_owned());
+            }
+            if call
+                .arguments
+                .get("case_sensitive")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                parts.push("case-sensitive".to_owned());
+            }
+            (!parts.is_empty()).then(|| parts.join(", "))
+        }
+        "web_search" => {
+            let domains = call
+                .arguments
+                .get("domains")
+                .and_then(serde_json::Value::as_array)
+                .map(|domains| {
+                    domains
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            (!domains.is_empty()).then(|| format!("Domains: {domains}"))
+        }
+        "propose_plan" => {
+            let steps = call
+                .arguments
+                .get("steps")
+                .and_then(serde_json::Value::as_array)?;
+            if steps.is_empty() {
+                return None;
+            }
+            let detail = steps
+                .iter()
+                .enumerate()
+                .map(|(index, step)| {
+                    format!("{}. {}", index + 1, step.as_str().unwrap_or_default())
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            Some(bounded_to(&detail, 600))
+        }
+        "ask_user" => string_argument(&call.arguments, "prompt")
+            .map(|prompt| bounded_to(prompt.trim(), 600))
+            .filter(|prompt| !prompt.is_empty()),
+        "apply_patch" => {
+            let edits = call
+                .arguments
+                .get("edits")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            (edits > 0).then(|| format!("{edits} edit{}", if edits == 1 { "" } else { "s" }))
+        }
+        "run_command" => {
+            let command = string_argument(&call.arguments, "command")?;
+            let args = call
+                .arguments
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|args| {
+                    args.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut detail = command_line(&command, &args);
+            if let Some(cwd) = string_argument(&call.arguments, "cwd") {
+                detail.push_str(&format!("\nDirectory: {cwd}"));
+            }
+            Some(detail)
+        }
+        // These arguments are already summarized in the title.
+        "glob"
+        | "github_list_pull_requests"
+        | "github_get_pull_request"
+        | "github_create_pull_request"
+        | "github_push_branch" => None,
         _ => match &call.arguments {
             serde_json::Value::Null => None,
             serde_json::Value::Object(map) if map.is_empty() => None,
@@ -1197,6 +1347,16 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
         "read_file" => path().map_or_else(|| "Read file".to_owned(), |p| format!("Read {p}")),
         "write_file" => path().map_or_else(|| "Edit file".to_owned(), |p| format!("Edit {p}")),
         "list_files" => path().map_or_else(|| "List files".to_owned(), |p| format!("List {p}")),
+        "glob" => {
+            let Some(pattern) = string_argument(arguments, "pattern") else {
+                return "Find files".to_owned();
+            };
+            let pattern = compact_activity_text(&pattern, 40);
+            string_argument(arguments, "path").map_or_else(
+                || format!("Find \"{pattern}\""),
+                |path| format!("Find \"{pattern}\" in {path}"),
+            )
+        }
         "search_text" => string_argument(arguments, "query").map_or_else(
             || "Search text".to_owned(),
             |query| format!("Search \"{}\"", compact_activity_text(&query, 40)),
@@ -1257,6 +1417,39 @@ pub(crate) fn tool_title(name: &str, arguments: &serde_json::Value) -> String {
         "list_project_children" => "List sub-agents".to_owned(),
         "review_project_child" => "Review sub-agent".to_owned(),
         "integrate_project_child" => "Integrate sub-agent".to_owned(),
+        "github_list_pull_requests" => string_argument(arguments, "repository").map_or_else(
+            || "List pull requests".to_owned(),
+            |repository| format!("List pull requests in {repository}"),
+        ),
+        "github_get_pull_request" => {
+            let repository = string_argument(arguments, "repository");
+            let number = arguments.get("number").and_then(serde_json::Value::as_u64);
+            match (repository, number) {
+                (Some(repository), Some(number)) => format!("Read {repository}#{number}"),
+                (Some(repository), None) => format!("Read pull request in {repository}"),
+                _ => "Read pull request".to_owned(),
+            }
+        }
+        "github_create_pull_request" => match (
+            string_argument(arguments, "repository"),
+            string_argument(arguments, "head"),
+            string_argument(arguments, "base"),
+        ) {
+            (Some(repository), Some(head), Some(base)) => {
+                format!("Open {head} → {base} in {repository}")
+            }
+            (Some(repository), _, _) => format!("Open pull request in {repository}"),
+            _ => "Open pull request".to_owned(),
+        },
+        "github_push_branch" => match (
+            string_argument(arguments, "repository"),
+            string_argument(arguments, "branch"),
+        ) {
+            (Some(repository), Some(branch)) => format!("Push {branch} to {repository}"),
+            (Some(repository), None) => format!("Push branch to {repository}"),
+            (None, Some(branch)) => format!("Push {branch}"),
+            (None, None) => "Push branch".to_owned(),
+        },
         other => other.to_owned(),
     }
 }
