@@ -348,8 +348,11 @@ impl AgentRuntime {
                 }
             }
             ModelStreamEvent::ReasoningDelta { text } => {
+                // Record the field even when empty so a thinking-mode provider
+                // sees it echoed back on the next request; only surface non-empty
+                // reasoning to the transcript.
+                self.append_assistant_reasoning(&text);
                 if !text.is_empty() {
-                    self.append_assistant_reasoning(&text);
                     let message_id = self.assistant_message_id();
                     ctx.events.push(AgentEvent::ReasoningDelta {
                         run_id: self.run.id,
@@ -979,9 +982,11 @@ impl AgentRuntime {
                 })
             },
         )?;
+        let mut messages = assembly.messages;
+        echo_reasoning_on_assistant_turns(&mut messages, !tools.is_empty());
         let request = ModelRequest {
             model: self.task.model.clone(),
-            messages: assembly.messages,
+            messages,
             tools,
             options: completion,
         };

@@ -2105,6 +2105,179 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
+    fn action_only_tools_hide_their_result_body(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let read_id = ToolCallId::new();
+        let command_id = ToolCallId::new();
+        let failed_command_id = ToolCallId::new();
+        let search_id = ToolCallId::new();
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+                parts: vec![
+                    AssistantPart::Tool(Box::new(ToolPart {
+                        id: read_id,
+                        name: "read_file".to_owned(),
+                        title: "Read src/lib.rs".to_owned(),
+                        status: ToolPartStatus::Completed,
+                        detail: Some("src/lib.rs".to_owned()),
+                        output: Some("fn main() {}".to_owned()),
+                        elapsed_ms: Some(4),
+                        approval_pending: false,
+                    })),
+                    AssistantPart::Tool(Box::new(ToolPart {
+                        id: command_id,
+                        name: "run_command".to_owned(),
+                        title: "Run tests".to_owned(),
+                        status: ToolPartStatus::Completed,
+                        detail: Some("cargo test".to_owned()),
+                        output: Some("test result: ok".to_owned()),
+                        elapsed_ms: Some(8),
+                        approval_pending: false,
+                    })),
+                    AssistantPart::Tool(Box::new(ToolPart {
+                        id: failed_command_id,
+                        name: "run_command".to_owned(),
+                        title: "Run tests".to_owned(),
+                        status: ToolPartStatus::Failed,
+                        detail: Some("cargo test".to_owned()),
+                        output: Some("test result: FAILED".to_owned()),
+                        elapsed_ms: Some(9),
+                        approval_pending: false,
+                    })),
+                    AssistantPart::Tool(Box::new(ToolPart {
+                        id: search_id,
+                        name: "web_search".to_owned(),
+                        title: "Web search \"needle\"".to_owned(),
+                        status: ToolPartStatus::Completed,
+                        detail: None,
+                        output: Some(r#"{"results":[]}"#.to_owned()),
+                        elapsed_ms: Some(3),
+                        approval_pending: false,
+                    })),
+                ],
+                streaming: false,
+            })];
+            view.expanded_tools.insert(read_id);
+            view.expanded_tools.insert(command_id);
+            view.expanded_tools.insert(failed_command_id);
+            view.expanded_tools.insert(search_id);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find(("copy-tool-output", 0u64)).is_none(),
+                "a successful read shows a pointer, not its contents"
+            );
+            assert!(
+                window.try_find(("copy-tool-output", 1u64)).is_none(),
+                "a successful command shows its command, not its stdout"
+            );
+            assert!(
+                window.try_find(("copy-tool-output", 2u64)).is_none(),
+                "a failed command keeps its error but not a copyable body"
+            );
+            assert!(
+                window.try_find(("copy-tool-output", 3u64)).is_some(),
+                "a web result exists nowhere else and stays visible"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn bodyless_tools_have_no_disclosure_and_failures_start_collapsed(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let read_id = ToolCallId::new();
+        let failed_read_id = ToolCallId::new();
+        let search_id = ToolCallId::new();
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+                parts: vec![
+                    // A successful read with no range has nothing to reveal.
+                    AssistantPart::Tool(Box::new(ToolPart {
+                        id: read_id,
+                        name: "read_file".to_owned(),
+                        title: "Read src/lib.rs".to_owned(),
+                        status: ToolPartStatus::Completed,
+                        detail: None,
+                        output: Some("fn main() {}".to_owned()),
+                        elapsed_ms: Some(4),
+                        approval_pending: false,
+                    })),
+                    // A failed read is the same: the row reports the failure and
+                    // the agent decides whether it matters.
+                    AssistantPart::Tool(Box::new(ToolPart {
+                        id: failed_read_id,
+                        name: "read_file".to_owned(),
+                        title: "Read missing.rs".to_owned(),
+                        status: ToolPartStatus::Failed,
+                        detail: None,
+                        output: Some("No such file or directory".to_owned()),
+                        elapsed_ms: Some(2),
+                        approval_pending: false,
+                    })),
+                    // A successful result that exists nowhere else is shown, but
+                    // starts collapsed.
+                    AssistantPart::Tool(Box::new(ToolPart {
+                        id: search_id,
+                        name: "web_search".to_owned(),
+                        title: "Web search \"needle\"".to_owned(),
+                        status: ToolPartStatus::Completed,
+                        detail: None,
+                        output: Some(r#"{"results":[]}"#.to_owned()),
+                        elapsed_ms: Some(3),
+                        approval_pending: false,
+                    })),
+                ],
+                streaming: false,
+            })];
+            view
+        });
+        cx.update_window(handle.into(), |view, window, cx| {
+            let view = view.downcast::<LoomView>().unwrap();
+            window.render_frame(cx);
+            window.click(("tool-header", 0u64), cx);
+            window.click(("tool-header", 1u64), cx);
+            window.render_frame(cx);
+            view.update(cx, |view, _| {
+                assert!(
+                    !view.expanded_tools.contains(&read_id),
+                    "a tool with nothing to reveal has no disclosure to toggle"
+                );
+                assert!(
+                    !view.expanded_tools.contains(&failed_read_id),
+                    "a failed tool has nothing to reveal; the agent reports it"
+                );
+                assert!(
+                    !view.expanded_tools.contains(&search_id),
+                    "a settled result starts collapsed"
+                );
+            });
+            assert!(window.try_find(("copy-tool-output", 2u64)).is_none());
+
+            // A result with a body can be opened and closed again.
+            window.click(("tool-header", 2u64), cx);
+            window.render_frame(cx);
+            view.update(cx, |view, _| {
+                assert!(view.expanded_tools.contains(&search_id))
+            });
+            assert!(window.try_find(("copy-tool-output", 2u64)).is_some());
+            window.click(("tool-header", 2u64), cx);
+            window.render_frame(cx);
+            view.update(cx, |view, _| {
+                assert!(!view.expanded_tools.contains(&search_id))
+            });
+            assert!(window.try_find(("copy-tool-output", 2u64)).is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn context_events_update_usage_and_only_record_compaction(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         cx.update(|cx| {
@@ -5156,16 +5329,16 @@ mod transcript_paging_tests {
     use super::{
         TimelineItem, project_message_transcript_content,
         remove_project_message_context_duplicates, timeline_items_from_messages,
-        unseen_transcript_messages,
+        tool_display_title, unseen_transcript_messages,
     };
     use crate::state::AssistantPart;
     use loom_core::{
         ActivityId, AgentMessageId, AgentMessageKind, AgentMessageRecord, ProjectId, RunId,
-        Timestamp,
+        Timestamp, ToolCallId,
     };
     use loom_model::{MessageRole, ModelId, ModelMessage};
     use loom_protocol::{
-        AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+        AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, ToolResult,
     };
     use std::collections::BTreeSet;
     #[test]
@@ -5382,6 +5555,76 @@ mod transcript_paging_tests {
         assert!(messages.iter().any(|(_, _, message)| {
             message.role == MessageRole::User && message.content == "load only a transcript page"
         }));
+    }
+
+    #[test]
+    fn restored_search_keeps_its_query_and_hit_count() {
+        let call = loom_model::ToolCall {
+            id: ToolCallId::new(),
+            name: "search_text".to_owned(),
+            arguments: serde_json::json!({"query": "SampleCount"}),
+        };
+        let body = "src/lib.rs:12:let count = SampleCount::new();\nsrc/main.rs:4:SampleCount\n";
+        let activity = AgentActivityRecord {
+            id: ActivityId::new(),
+            run_id: RunId::new(),
+            timeline_ordinal: 0,
+            parent_id: None,
+            step_id: None,
+            kind: AgentActivityKind::Search,
+            status: AgentActivityStatus::Completed,
+            started_at: Timestamp::from_unix_millis(1),
+            completed_at: None,
+            elapsed_ms: None,
+            data: AgentActivityData::Search {
+                call: call.clone(),
+                query: "SampleCount".to_owned(),
+                path: None,
+                result: Some(ToolResult::success(&call, body.to_owned())),
+            },
+        };
+        let mut tool = ModelMessage::new(MessageRole::Tool, body);
+        tool.name = Some("search_text".to_owned());
+        tool.tool_call_id = Some(call.id);
+
+        // The activity lands before the result message, and the message carries
+        // no arguments; the activity title must survive.
+        let timeline = timeline_items_from_messages(vec![(1, 1, tool)], vec![activity]);
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected assistant turn");
+        };
+        let AssistantPart::Tool(part) = &turn.parts[0] else {
+            panic!("expected tool part");
+        };
+        assert_eq!(part.title, "Search \"SampleCount\"");
+        assert_eq!(part.name, "search_text");
+        assert_eq!(tool_display_title(part), "Search \"SampleCount\" · 2 hits");
+    }
+
+    #[test]
+    fn restored_assistant_reasoning_is_shown_above_its_text() {
+        let mut message = ModelMessage::new(MessageRole::Assistant, "the answer");
+        message.reasoning_content = Some("weighed the options".to_owned());
+        let timeline = timeline_items_from_messages(vec![(0, 0, message)], Vec::new());
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected assistant turn");
+        };
+        assert_eq!(
+            turn.parts,
+            vec![
+                AssistantPart::Reasoning("weighed the options".to_owned()),
+                AssistantPart::Text("the answer".to_owned()),
+            ]
+        );
+
+        // An empty reasoning field is not a visible part.
+        let mut empty = ModelMessage::new(MessageRole::Assistant, "plain");
+        empty.reasoning_content = Some(String::new());
+        let timeline = timeline_items_from_messages(vec![(0, 0, empty)], Vec::new());
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected assistant turn");
+        };
+        assert_eq!(turn.parts, vec![AssistantPart::Text("plain".to_owned())]);
     }
 }
 

@@ -577,18 +577,18 @@ impl StreamDecoder {
                 }
             }
         }
+        // A reasoning field must be preserved even when empty: DeepSeek rejects a
+        // request whose assistant turn omitted the `reasoning_content` it
+        // returned, and it sometimes returns it as an empty string.
         if let Some(text) = delta
             .get("reasoning_content")
             .and_then(serde_json::Value::as_str)
-            && !text.is_empty()
         {
             return sink.emit(ModelStreamEvent::ReasoningDelta {
                 text: text.to_owned(),
             });
         }
-        if let Some(text) = delta.get("reasoning").and_then(serde_json::Value::as_str)
-            && !text.is_empty()
-        {
+        if let Some(text) = delta.get("reasoning").and_then(serde_json::Value::as_str) {
             return sink.emit(ModelStreamEvent::ReasoningDelta {
                 text: text.to_owned(),
             });

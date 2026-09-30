@@ -63,10 +63,11 @@ pub fn normalize_openai_response(body: &serde_json::Value) -> Result<Vec<ModelSt
         )
     })?;
     let mut events = Vec::new();
+    // Keep the reasoning field even when empty: a thinking-mode provider rejects
+    // a follow-up request that drops the `reasoning_content` it returned.
     if let Some(reasoning) = message
         .get("reasoning_content")
         .and_then(serde_json::Value::as_str)
-        && !reasoning.is_empty()
     {
         events.push(ModelStreamEvent::ReasoningDelta {
             text: reasoning.to_owned(),
@@ -192,5 +193,29 @@ mod tests {
 
         let assistant = ModelMessage::new(MessageRole::Assistant, "done");
         assert!(message_json(&assistant).get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn empty_reasoning_is_preserved_and_replayed() {
+        // A provider that returns an empty reasoning string still requires it to
+        // be echoed back; dropping the empty field triggers a 400.
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": ""
+                }
+            }]
+        });
+        let events = normalize_openai_response(&body).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ModelStreamEvent::ReasoningDelta { text } if text.is_empty()
+        )));
+
+        let mut assistant = ModelMessage::new(MessageRole::Assistant, "");
+        assistant.reasoning_content = Some(String::new());
+        assert_eq!(message_json(&assistant)["reasoning_content"], "");
     }
 }

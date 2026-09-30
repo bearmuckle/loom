@@ -31,7 +31,7 @@ use loom_protocol::{
     ApprovalDecision, Checkpoint, CheckpointFile, ContextAssemblyOptions, ContextInspection,
     ContextSummary, ServerEventEnvelope, SessionDirectory, SessionFilesystemChange,
     SessionRepository, ToolResult, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
-    WorkspaceEventEnvelope, WorkspaceFeedEvent,
+    WorkspaceEventEnvelope, WorkspaceFeedEvent, tool_result_kind,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params, types::Value as SqlValue};
 use serde::{Serialize, de::DeserializeOwned};

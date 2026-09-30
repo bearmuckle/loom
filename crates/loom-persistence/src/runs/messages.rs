@@ -20,6 +20,22 @@ pub(crate) struct StoredToolAttempt {
     pub(crate) result: Option<ToolResult>,
 }
 
+/// Trims a result before it is stored on an execution attempt. The attempt row
+/// exists to present a tool call, never to feed the model, which reads the full
+/// output from the transcript message instead. Only a successful result that
+/// exists nowhere else is worth presenting; every other result keeps just its
+/// success flag and name so the record does not hold a second, undeduplicated
+/// copy. Failed output is dropped too: whether a failure matters is the agent's
+/// judgement, reported in its answer.
+pub(crate) fn compact_stored_result(result: Option<ToolResult>) -> Option<ToolResult> {
+    result.map(|mut result| {
+        if !(result.success && tool_result_kind(&result.name).keeps_body()) {
+            result.output.clear();
+        }
+        result
+    })
+}
+
 pub(crate) fn decode_stored_attempts(payload: &str) -> Result<Vec<StoredToolAttempt>> {
     serde_json::from_str(payload).map_err(|error| {
         LoomError::new(
@@ -68,7 +84,7 @@ pub(crate) fn upsert_stored_attempt(
         slot.state = tool_attempt_state_name(state).to_owned();
         slot.started_at = started_at;
         slot.completed_at = completed_at;
-        slot.result = result;
+        slot.result = compact_stored_result(result);
     } else {
         let attempt_number = attempts
             .iter()
@@ -89,7 +105,7 @@ pub(crate) fn upsert_stored_attempt(
             state: tool_attempt_state_name(state).to_owned(),
             started_at,
             completed_at,
-            result,
+            result: compact_stored_result(result),
         });
         attempts.sort_by_key(|attempt| attempt.attempt_number);
     }

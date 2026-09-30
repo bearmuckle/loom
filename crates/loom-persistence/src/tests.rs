@@ -146,8 +146,8 @@ fn run_checkpoint_is_scoped_and_rolls_back_session_and_run_with_feed_failure() {
     ]);
     let activity_call = loom_model::ToolCall {
         id: loom_core::ToolCallId::new(),
-        name: "read_file".to_owned(),
-        arguments: serde_json::json!({"path": "src/lib.rs"}),
+        name: "web_search".to_owned(),
+        arguments: serde_json::json!({"query": "needle"}),
     };
     let initial_activity = AgentActivityRecord {
         id: ActivityId::new(),
@@ -1937,8 +1937,8 @@ fn session_and_workspace_settings_are_bounded_indexed_and_atomic() {
     )]);
     let activity_call = loom_model::ToolCall {
         id: loom_core::ToolCallId::new(),
-        name: "read_file".to_owned(),
-        arguments: serde_json::json!({"path": "src/main.rs"}),
+        name: "web_search".to_owned(),
+        arguments: serde_json::json!({"query": "needle"}),
     };
     let activity = AgentActivityRecord {
         id: ActivityId::new(),
@@ -4517,4 +4517,51 @@ fn persistence_trait_object_forwards_read_paths_on_an_empty_store() {
     let _ = store.prune_expired_idempotency_records(Timestamp::now());
     let _ = store.load_agent_message_by_request(RequestId::new());
     let _ = store.release_exclusive_writer();
+}
+
+#[test]
+fn action_only_results_are_not_duplicated_onto_attempts() {
+    let call = |name: &str| loom_model::ToolCall {
+        id: loom_core::ToolCallId::new(),
+        name: name.to_owned(),
+        arguments: serde_json::Value::Null,
+    };
+
+    let read = ToolResult::success(&call("read_file"), "fn main() {}".to_owned());
+    let stored = compact_stored_result(Some(read)).unwrap();
+    assert!(stored.success);
+    assert_eq!(stored.name, "read_file");
+    assert!(
+        stored.output.is_empty(),
+        "file contents must not be stored a second time on the attempt"
+    );
+
+    let command = ToolResult::success(&call("run_command"), "stdout: ok".to_owned());
+    let stored = compact_stored_result(Some(command)).unwrap();
+    assert!(
+        stored.output.is_empty(),
+        "a successful command keeps its row, not its stdout"
+    );
+
+    // Only a successful result that exists nowhere else is kept.
+    let search = ToolResult::success(&call("web_search"), r#"{"results":[]}"#.to_owned());
+    assert_eq!(
+        compact_stored_result(Some(search.clone())).unwrap(),
+        search,
+        "a successful result that exists nowhere else is kept in full"
+    );
+
+    let failure = ToolResult::failure(&call("run_command"), "exit status: 1");
+    let stored = compact_stored_result(Some(failure)).unwrap();
+    assert!(!stored.success);
+    assert!(stored.output.is_empty());
+
+    let content_failure = ToolResult::failure(&call("web_search"), "request failed");
+    let stored = compact_stored_result(Some(content_failure)).unwrap();
+    assert!(
+        stored.output.is_empty(),
+        "a failure is trimmed too; the agent reports whether it matters"
+    );
+
+    assert!(compact_stored_result(None).is_none());
 }

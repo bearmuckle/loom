@@ -163,8 +163,10 @@ impl LoomView {
         };
         let status_label = status.label();
         let key = tool_element_id(index, first_part_index);
-        let expanded = matches!(status, ToolPartStatus::Failed | ToolPartStatus::Running)
-            || self.expanded_tool_groups.contains(&key);
+        // A running group stays open so progress is visible; a failed group and a
+        // settled group collapse like any other entry and can be reopened.
+        let expanded =
+            matches!(status, ToolPartStatus::Running) || self.expanded_tool_groups.contains(&key);
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let label = tool_group_label(&first.name, tools.len());
@@ -287,16 +289,18 @@ impl LoomView {
             ToolPartStatus::Queued | ToolPartStatus::Cancelled => rgb(0x94a3b8),
         };
         let duration = part.elapsed_ms.map(format_duration);
-        // Active, failed, and approval-gated work stays open; finished successes
-        // collapse so the transcript stays scannable.
-        let expanded = self.expanded_tools.contains(&part.id)
-            || matches!(
-                part.status,
-                ToolPartStatus::Running
-                    | ToolPartStatus::AwaitingApproval
-                    | ToolPartStatus::AwaitingInput
-                    | ToolPartStatus::Failed
-            );
+        // Active and approval-gated work stays open; finished successes collapse
+        // so the transcript stays scannable. A failure is collapsed too, and a
+        // block with nothing to reveal has no disclosure control at all.
+        let expandable = tool_has_body(part);
+        let expanded = expandable
+            && (self.expanded_tools.contains(&part.id)
+                || matches!(
+                    part.status,
+                    ToolPartStatus::Running
+                        | ToolPartStatus::AwaitingApproval
+                        | ToolPartStatus::AwaitingInput
+                ));
         let call_id = part.id;
         let parent_for_toggle = parent.clone();
         let awaiting = part.status == ToolPartStatus::AwaitingApproval
@@ -321,7 +325,9 @@ impl LoomView {
                     .w_full()
                     .accessibility_label(format!("{}: {}", part.title, part.status.label()))
                     .on_click(move |_, _, cx| {
-                        parent_for_toggle.update(cx, |this, cx| this.toggle_tool(call_id, cx));
+                        if expandable {
+                            parent_for_toggle.update(cx, |this, cx| this.toggle_tool(call_id, cx));
+                        }
                     })
                     .child(
                         div()
@@ -336,11 +342,19 @@ impl LoomView {
                                     .flex_shrink_0()
                                     .text_color(status_color),
                             )
-                            .child(div().text_color(rgb(0x64748b)).child(if expanded {
-                                "⌄"
-                            } else {
-                                "›"
-                            }))
+                            .child(
+                                div()
+                                    .w(px(10.))
+                                    .flex_shrink_0()
+                                    .text_color(rgb(0x64748b))
+                                    .child(if !expandable {
+                                        ""
+                                    } else if expanded {
+                                        "⌄"
+                                    } else {
+                                        "›"
+                                    }),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -348,7 +362,7 @@ impl LoomView {
                                     .truncate()
                                     .font_family(mono_font())
                                     .text_color(rgb(0xdbeafe))
-                                    .child(part.title.clone()),
+                                    .child(tool_display_title(part)),
                             )
                             .when_some(patch_summary, |element, summary| {
                                 element.child(
@@ -365,7 +379,7 @@ impl LoomView {
                     ),
             );
         if expanded {
-            if let Some(detail) = &part.detail {
+            if let Some(detail) = tool_display_detail(part) {
                 block = block.child(
                     div()
                         .ml(px(20.))
@@ -373,10 +387,11 @@ impl LoomView {
                         .font_family(mono_font())
                         .text_size(gpui_kit::rems(mono_size() / BASE_FONT_SIZE))
                         .text_color(rgb(0x94a3b8))
-                        .child(detail.clone()),
+                        .child(detail),
                 );
             }
-            if part.output.is_some() {
+            if tool_shows_output(part) {
+                let output = part.output.as_deref().unwrap_or_default();
                 let output_id = tool_element_id(index, part_index);
                 block = block.child(
                     div()
@@ -409,7 +424,7 @@ impl LoomView {
                                         .accessibility_label("Copy tool output")
                                         .tooltip("Copy output")
                                         .on_click({
-                                            let output = part.output.clone().unwrap_or_default();
+                                            let output = output.to_owned();
                                             move |_, _, cx| {
                                                 cx.write_to_clipboard(ClipboardItem::new_string(
                                                     output.clone(),

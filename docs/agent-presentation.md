@@ -175,7 +175,12 @@ The following runtime changes are implemented:
   Responses encoder parses reasoning summary text. Reasoning is kept on the
   assistant turn and echoed back to chat-completions providers that require it
   (DeepSeek thinking mode), including across persistence and resume; providers
-  that do not emit or accept it are unaffected.
+  that do not emit or accept it are unaffected. A thinking-mode provider returns
+  an empty `reasoning_content` about half the time; the empty field is preserved
+  and echoed rather than dropped, because omitting it makes the provider reject
+  the next request with HTTP 400. Reasoning is also carried to the client in
+  transcript pages so a reloaded transcript shows it, but it stays optional
+  display metadata.
 
 Parallel execution of independent calls and incremental suppression of
 duplicate denials across restarts remain open.
@@ -195,7 +200,19 @@ The projection and rendering code lives under `crates/loom-ui/src/view` and
 - **Code legibility.** Tool results render in the theme's monospace family with
   lightweight syntax highlighting for the common transcript languages.
   Unified diffs are detected and rendered with added/removed/hunk colors inline
-  in the tool block, and the review panel's diff lines are monospace.
+  in the tool block, and the review panel's diff lines are monospace. Results
+  that only restate the workspace—`read_file`, `search_text`, `glob`, and
+  `list_files`—render as a pointer rather than a body: the action already names
+  the file or query, so the contents stay behind the file viewers. A search
+  goes one step further and shows its query with the number of hits on the tool
+  row, so the outcome is readable without expanding it and without rendering the
+  matching lines. A command renders as its own command line, cut to one line.
+  A result that exists nowhere else—`web_search`, `apply_patch`, GitHub, review,
+  and project state—is shown; everything else is not. Failed output is never
+  shown for any tool: the row reports the failed status, and whether a failure
+  matters for the user is the agent's judgement, reported in its answer. A block
+  that would reveal nothing when expanded offers no disclosure control, and a
+  settled result starts collapsed.
 - **Progress feedback.** A single status line above the composer carries an
   animated spinner, the run state, elapsed time, and the `esc to interrupt`
   hint. Run state is no longer repeated in the session header.

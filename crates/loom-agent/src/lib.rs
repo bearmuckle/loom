@@ -2591,6 +2591,7 @@ mod tests {
 
         struct ReasoningEchoProvider {
             descriptor: loom_model::ModelDescriptor,
+            reasoning: String,
             cursor: usize,
             replayed: Arc<Mutex<Option<String>>>,
         }
@@ -2608,7 +2609,7 @@ mod tests {
             ) -> Result<()> {
                 if self.cursor == 0 {
                     sink.emit(ModelStreamEvent::ReasoningDelta {
-                        text: "checked the workspace".to_owned(),
+                        text: self.reasoning.clone(),
                     })?;
                     sink.emit(ModelStreamEvent::ToolCallDelta {
                         call: ToolCall {
@@ -2645,46 +2646,84 @@ mod tests {
             }
         }
 
-        let root = workspace();
-        fs::write(root.join("notes.txt"), "some notes\n").unwrap();
-        let tools = ToolExecutor::new(&root).unwrap();
-        let task = AgentTask::new("read notes", ModelId::new("reasoning/demo")).unwrap();
-        let replayed = Arc::new(Mutex::new(None));
-        let mut runtime = AgentRuntime::new(
-            AgentSessionId::new(),
-            task,
-            Box::new(ReasoningEchoProvider {
-                descriptor: loom_model::ModelDescriptor {
-                    id: ModelId::new("reasoning/demo"),
-                    provider: loom_model::ProviderId::new("reasoning"),
-                    display_name: "Reasoning test provider".to_owned(),
-                    context_window: Some(8_192),
-                    max_input_tokens: None,
-                    max_output_tokens: None,
-                    capabilities: loom_model::ModelCapabilities {
-                        streaming: true,
-                        tool_calling: true,
-                        vision: false,
-                        json_mode: false,
+        // DeepSeek returns an empty reasoning string about half the time; both
+        // forms must be stored and echoed back on the tool-call turn.
+        for reasoning in ["checked the workspace", ""] {
+            let root = workspace();
+            fs::write(root.join("notes.txt"), "some notes\n").unwrap();
+            let tools = ToolExecutor::new(&root).unwrap();
+            let task = AgentTask::new("read notes", ModelId::new("reasoning/demo")).unwrap();
+            let replayed = Arc::new(Mutex::new(None));
+            let mut runtime = AgentRuntime::new(
+                AgentSessionId::new(),
+                task,
+                Box::new(ReasoningEchoProvider {
+                    descriptor: loom_model::ModelDescriptor {
+                        id: ModelId::new("reasoning/demo"),
+                        provider: loom_model::ProviderId::new("reasoning"),
+                        display_name: "Reasoning test provider".to_owned(),
+                        context_window: Some(8_192),
+                        max_input_tokens: None,
+                        max_output_tokens: None,
+                        capabilities: loom_model::ModelCapabilities {
+                            streaming: true,
+                            tool_calling: true,
+                            vision: false,
+                            json_mode: false,
+                        },
                     },
-                },
-                cursor: 0,
-                replayed: replayed.clone(),
-            }),
-            tools,
+                    reasoning: reasoning.to_owned(),
+                    cursor: 0,
+                    replayed: replayed.clone(),
+                }),
+                tools,
+            );
+
+            runtime.start().unwrap();
+            assert_eq!(
+                *replayed.lock().unwrap(),
+                Some(reasoning.to_owned()),
+                "reasoning {reasoning:?} must be replayed on the assistant tool-call turn"
+            );
+            assert!(runtime.export_state().messages.iter().any(|message| {
+                message.role == MessageRole::Assistant
+                    && message.reasoning_content.as_deref() == Some(reasoning)
+            }));
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn thinking_mode_echoes_reasoning_on_every_assistant_turn() {
+        let assistant = |reasoning: Option<&str>| {
+            let mut message = ModelMessage::new(MessageRole::Assistant, "text");
+            message.reasoning_content = reasoning.map(str::to_owned);
+            message
+        };
+
+        let mut messages = vec![
+            ModelMessage::new(MessageRole::User, "task"),
+            assistant(Some("checked")),
+            ModelMessage::new(MessageRole::Tool, "result"),
+            assistant(None),
+        ];
+        echo_reasoning_on_assistant_turns(&mut messages, true);
+        assert_eq!(messages[1].reasoning_content.as_deref(), Some("checked"));
+        assert_eq!(
+            messages[3].reasoning_content.as_deref(),
+            Some(""),
+            "a turn without reasoning still echoes an empty field when tools are present"
         );
 
-        runtime.start().unwrap();
-        assert_eq!(
-            *replayed.lock().unwrap(),
-            Some("checked the workspace".to_owned()),
-            "reasoning must be replayed on the assistant tool-call turn"
-        );
-        assert!(runtime.export_state().messages.iter().any(|message| {
-            message.role == MessageRole::Assistant
-                && message.reasoning_content.as_deref() == Some("checked the workspace")
-        }));
-        fs::remove_dir_all(root).unwrap();
+        // Without tools, or before any reasoning has been seen, nothing changes.
+        let mut without_tools = messages.clone();
+        without_tools[3].reasoning_content = None;
+        echo_reasoning_on_assistant_turns(&mut without_tools, false);
+        assert_eq!(without_tools[3].reasoning_content, None);
+
+        let mut without_reasoning = vec![assistant(None)];
+        echo_reasoning_on_assistant_turns(&mut without_reasoning, true);
+        assert_eq!(without_reasoning[0].reasoning_content, None);
     }
 
     #[test]

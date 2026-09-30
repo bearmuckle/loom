@@ -389,24 +389,59 @@ pub(crate) fn timeline_items_from_messages(
                 }
                 MessageRole::User => timeline.push(TimelineItem::User(message.content)),
                 MessageRole::Assistant => {
-                    if !message.content.is_empty() {
-                        let appended = match timeline.last_mut() {
-                            Some(TimelineItem::Assistant(turn)) => match turn.parts.last_mut() {
-                                Some(AssistantPart::Text(existing)) => {
-                                    if !existing.is_empty() {
-                                        existing.push_str("\n\n");
-                                    }
-                                    existing.push_str(&message.content);
-                                    true
-                                }
-                                _ => false,
-                            },
-                            _ => false,
-                        };
-                        if !appended {
+                    let reasoning = message
+                        .reasoning_content
+                        .as_deref()
+                        .filter(|reasoning| !reasoning.is_empty());
+                    let has_content = !message.content.is_empty();
+                    if reasoning.is_some() || has_content {
+                        // Merge into the trailing assistant turn while it is an
+                        // open text/reasoning run; a tool call or another role
+                        // starts a new turn.
+                        let merges = matches!(
+                            timeline.last(),
+                            Some(TimelineItem::Assistant(turn))
+                                if matches!(
+                                    turn.parts.last(),
+                                    None | Some(AssistantPart::Reasoning(_))
+                                        | Some(AssistantPart::Text(_))
+                                )
+                        );
+                        if !merges && reasoning.is_none() {
+                            // A restored text-only turn uses the standard shape
+                            // so consecutive plain text still reads as one turn.
                             timeline.push(TimelineItem::Assistant(AssistantTurn::text(
                                 message.content.clone(),
                             )));
+                        } else {
+                            if !merges {
+                                timeline.push(TimelineItem::Assistant(AssistantTurn::default()));
+                            }
+                            if let Some(TimelineItem::Assistant(turn)) = timeline.last_mut() {
+                                if let Some(reasoning) = reasoning {
+                                    match turn.parts.last_mut() {
+                                        Some(AssistantPart::Reasoning(existing)) => {
+                                            existing.push_str(reasoning);
+                                        }
+                                        _ => turn
+                                            .parts
+                                            .push(AssistantPart::Reasoning(reasoning.to_owned())),
+                                    }
+                                }
+                                if has_content {
+                                    match turn.parts.last_mut() {
+                                        Some(AssistantPart::Text(existing)) => {
+                                            if !existing.is_empty() {
+                                                existing.push_str("\n\n");
+                                            }
+                                            existing.push_str(&message.content);
+                                        }
+                                        _ => turn
+                                            .parts
+                                            .push(AssistantPart::Text(message.content.clone())),
+                                    }
+                                }
+                            }
                         }
                     }
                     for call in &message.tool_calls {
@@ -423,6 +458,14 @@ pub(crate) fn timeline_items_from_messages(
                         arguments: serde_json::Value::Null,
                     };
                     let mut part = tool_part_from_call(&call, ToolPartStatus::Completed);
+                    // A transcript message records only the result, never the
+                    // call arguments, so any title it produces is a fallback.
+                    // When the activity already described the call, keep that
+                    // richer description instead of the argument-less one.
+                    if has_tool_part(&timeline, call.id) {
+                        part.title.clear();
+                        part.detail = None;
+                    }
                     part.output =
                         Some(bounded(&humanize_tool_output(&call.name, &message.content)));
                     upsert_tool_part(&mut timeline, part);
@@ -1329,6 +1372,115 @@ pub(crate) fn humanize_tool_output(name: &str, output: &str) -> String {
     }
 }
 
+/// The detail lines shown under a tool block. A command's own line is already
+/// the row title, so only its extra lines (a working directory) remain.
+pub(crate) fn tool_display_detail(part: &ToolPart) -> Option<String> {
+    let detail = part.detail.as_deref()?;
+    if part.name != "run_command" {
+        return Some(detail.to_owned());
+    }
+    let rest = detail.split_once('\n').map_or("", |(_, rest)| rest);
+    (!rest.trim().is_empty()).then(|| rest.to_owned())
+}
+
+/// Whether expanding a tool block would reveal anything. A block whose result is
+/// only the action already shown on the row has nothing to expand, so it offers
+/// no disclosure control.
+/// Whether a successful result that exists nowhere else is shown. Failed output
+/// is never shown: the row reports the failed status, and whether the failure
+/// matters is the agent's judgement, reported in its answer.
+pub(crate) fn tool_shows_output(part: &ToolPart) -> bool {
+    part.status != ToolPartStatus::Failed
+        && part
+            .output
+            .as_deref()
+            .is_some_and(|output| !output.is_empty())
+        && loom_protocol::tool_result_kind(&part.name).keeps_body()
+}
+
+/// Whether expanding a tool block would reveal anything. A block whose result is
+/// only the action already shown on the row has nothing to expand, so it offers
+/// no disclosure control.
+pub(crate) fn tool_has_body(part: &ToolPart) -> bool {
+    tool_display_detail(part).is_some() || tool_shows_output(part)
+}
+
+/// A long command is cut to keep the tool row on one line.
+const COMMAND_TITLE_LIMIT: usize = 80;
+
+/// The single-line label shown for a tool block. A search is summarized as the
+/// query plus how many hits it found, and a command as the command itself,
+/// because the bare action does not say whether anything matched or which
+/// program ran.
+pub(crate) fn tool_display_title(part: &ToolPart) -> String {
+    match part.name.as_str() {
+        "search_text" => search_display_title(part),
+        "run_command" => command_display_title(part),
+        _ => part.title.clone(),
+    }
+}
+
+fn search_display_title(part: &ToolPart) -> String {
+    let Some(query) = search_query(part) else {
+        return part.title.clone();
+    };
+    let Some(output) = part.output.as_deref() else {
+        return format!("Search \"{query}\"");
+    };
+    match search_hit_count(output) {
+        0 => format!("Search \"{query}\" · no hits"),
+        1 => format!("Search \"{query}\" · 1 hit"),
+        hits => format!("Search \"{query}\" · {hits} hits"),
+    }
+}
+
+/// Shows the command on one line; the full command and working directory stay in
+/// the expanded detail.
+fn command_display_title(part: &ToolPart) -> String {
+    let command = part
+        .detail
+        .as_deref()
+        .and_then(|detail| detail.lines().next())
+        .map(str::trim)
+        .filter(|command| !command.is_empty());
+    match command {
+        Some(command) => compact_activity_text(command, COMMAND_TITLE_LIMIT),
+        None => part.title.clone(),
+    }
+}
+
+/// Recovers the search query from a tool block. The title carries it when the
+/// call arguments are known; after a restore the query survives in the detail
+/// line instead.
+fn search_query(part: &ToolPart) -> Option<String> {
+    let from_quoted = |text: &str| {
+        let rest = text.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        Some(rest[..end].to_owned())
+    };
+    if let Some(rest) = part.title.strip_prefix("Search ")
+        && let Some(query) = from_quoted(rest)
+    {
+        return Some(query);
+    }
+    part.detail.as_deref().and_then(from_quoted)
+}
+
+/// Counts the matching lines in a `search_text` result. Matches render as
+/// `path:line:content`; context lines use `-` in place of the colons.
+pub(crate) fn search_hit_count(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| {
+            let Some((_path, rest)) = line.split_once(':') else {
+                return false;
+            };
+            let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+            digits > 0 && rest[digits..].starts_with(':')
+        })
+        .count()
+}
+
 pub(crate) fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(str::to_owned)
 }
@@ -1514,11 +1666,12 @@ pub(crate) fn tool_part_from_activity(activity: &AgentActivityRecord) -> Option<
         | AgentActivityData::Command { call, .. } => call,
     };
     let detail = match &activity.data {
-        AgentActivityData::ToolCall { .. } => tool_detail(call),
-        AgentActivityData::File { path, .. } => {
-            Some(path.clone().unwrap_or_else(|| ".".to_owned()))
-        }
-        AgentActivityData::Search { query, .. } => Some(format!("\"{}\"", bounded_to(query, 120))),
+        // These activity shapes carry the call, which already summarizes the
+        // arguments; the title names the target, so the detail adds whatever the
+        // title omits (a line range, a glob, a depth) and nothing more.
+        AgentActivityData::ToolCall { .. }
+        | AgentActivityData::File { .. }
+        | AgentActivityData::Search { .. } => tool_detail(call),
         AgentActivityData::Command {
             command, args, cwd, ..
         } => {
@@ -1960,6 +2113,167 @@ mod tests {
         assert!(reasoning_preview(&long).ends_with('…'));
         assert_eq!(compact_activity_text("abcdef", 3), "abc…");
         assert_eq!(compact_activity_text("ab", 3), "ab");
+    }
+
+    #[test]
+    fn search_hits_are_counted_and_shown_without_expanding() {
+        let output =
+            "src/lib.rs:12:let needle = 1;\nsrc/lib.rs-13-context\nsrc/main.rs:4:needle()\n";
+        assert_eq!(search_hit_count(output), 2);
+        // Context lines and content containing colons are not matches.
+        assert_eq!(search_hit_count("src/lib.rs-13-let x: u32\n"), 0);
+        assert_eq!(search_hit_count(""), 0);
+
+        let part = |title: &str, detail: Option<&str>, output: Option<&str>| ToolPart {
+            id: ToolCallId::new(),
+            name: "search_text".to_owned(),
+            title: title.to_owned(),
+            status: ToolPartStatus::Completed,
+            detail: detail.map(str::to_owned),
+            output: output.map(str::to_owned),
+            elapsed_ms: None,
+            approval_pending: false,
+        };
+
+        assert_eq!(
+            tool_display_title(&part("Search \"needle\"", None, Some(output))),
+            "Search \"needle\" · 2 hits"
+        );
+        // A restored title is generic; the query survives in the detail line.
+        assert_eq!(
+            tool_display_title(&part("Search text", Some("\"needle\""), Some(output))),
+            "Search \"needle\" · 2 hits"
+        );
+        assert_eq!(
+            tool_display_title(&part("Search \"needle\"", None, Some(""))),
+            "Search \"needle\" · no hits"
+        );
+        // Without a result body the query still shows, with no count to invent.
+        assert_eq!(
+            tool_display_title(&part("Search \"needle\"", None, None)),
+            "Search \"needle\""
+        );
+        // A query-less search has nothing to summarize and keeps its title.
+        assert_eq!(
+            tool_display_title(&part("Search text", None, None)),
+            "Search text"
+        );
+    }
+
+    #[test]
+    fn command_display_is_one_truncated_line() {
+        let part = |detail: Option<&str>| ToolPart {
+            id: ToolCallId::new(),
+            name: "run_command".to_owned(),
+            title: "Run tests".to_owned(),
+            status: ToolPartStatus::Completed,
+            detail: detail.map(str::to_owned),
+            output: Some("test result: ok".to_owned()),
+            elapsed_ms: None,
+            approval_pending: false,
+        };
+
+        assert_eq!(
+            tool_display_title(&part(Some("cargo test --workspace\nDirectory: repo"))),
+            "cargo test --workspace"
+        );
+        // Long commands are cut to keep the row on one line.
+        let long = format!("mytool {}", "x".repeat(200));
+        let title = tool_display_title(&part(Some(&long)));
+        assert!(title.ends_with('…'));
+        assert_eq!(title.chars().count(), COMMAND_TITLE_LIMIT + 1);
+        // Without a command line the human title is the fallback.
+        assert_eq!(tool_display_title(&part(None)), "Run tests");
+        // The command is the row title, so expansion only adds the rest.
+        assert_eq!(
+            tool_display_detail(&part(Some("cargo test --workspace\nDirectory: repo"))).as_deref(),
+            Some("Directory: repo")
+        );
+        assert_eq!(tool_display_detail(&part(Some("cargo test"))), None);
+        // Other tools keep their detail untouched.
+        let read = ToolPart {
+            id: ToolCallId::new(),
+            name: "read_file".to_owned(),
+            title: "Read src/lib.rs".to_owned(),
+            status: ToolPartStatus::Completed,
+            detail: Some("Lines 10–20".to_owned()),
+            output: None,
+            elapsed_ms: None,
+            approval_pending: false,
+        };
+        assert_eq!(tool_display_detail(&read).as_deref(), Some("Lines 10–20"));
+    }
+
+    #[test]
+    fn only_tools_with_something_to_reveal_offer_a_disclosure() {
+        let part =
+            |name: &str, status: ToolPartStatus, detail: Option<&str>, output: Option<&str>| {
+                ToolPart {
+                    id: ToolCallId::new(),
+                    name: name.to_owned(),
+                    title: "row".to_owned(),
+                    status,
+                    detail: detail.map(str::to_owned),
+                    output: output.map(str::to_owned),
+                    elapsed_ms: None,
+                    approval_pending: false,
+                }
+            };
+
+        // A successful read hides its output and has no range: nothing to expand.
+        assert!(!tool_has_body(&part(
+            "read_file",
+            ToolPartStatus::Completed,
+            None,
+            Some("fn main() {}")
+        )));
+        // A range is worth expanding.
+        assert!(tool_has_body(&part(
+            "read_file",
+            ToolPartStatus::Completed,
+            Some("Lines 1–2"),
+            Some("fn main() {}")
+        )));
+        // A failure is never shown, even for a result that exists nowhere else;
+        // the row reports the failed status and the agent reports the detail.
+        assert!(!tool_has_body(&part(
+            "read_file",
+            ToolPartStatus::Failed,
+            None,
+            Some("No such file or directory")
+        )));
+        assert!(!tool_has_body(&part(
+            "web_search",
+            ToolPartStatus::Failed,
+            None,
+            Some("request failed")
+        )));
+        // A command without a working directory is only its own row title.
+        assert!(!tool_has_body(&part(
+            "run_command",
+            ToolPartStatus::Completed,
+            Some("cargo test"),
+            Some("test result: ok")
+        )));
+        assert!(tool_has_body(&part(
+            "run_command",
+            ToolPartStatus::Completed,
+            Some("cargo test\nDirectory: repo"),
+            Some("test result: ok")
+        )));
+        // A result that exists nowhere else is always kept.
+        assert!(tool_has_body(&part(
+            "web_search",
+            ToolPartStatus::Completed,
+            None,
+            Some(r#"{"results":[]}"#)
+        )));
+        assert!(!tool_has_body(&part(
+            "web_search",
+            ToolPartStatus::Completed,
+            None,
+            Some("")
+        )));
     }
 
     #[test]

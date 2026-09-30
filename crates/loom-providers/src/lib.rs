@@ -489,6 +489,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_reasoning_is_surfaced_so_it_can_be_echoed_back() {
+        // DeepSeek reasoning models return an empty reasoning_content about half
+        // the time. The field must still be recorded, because a follow-up
+        // request that omits it is rejected with HTTP 400.
+        for field in ["reasoning_content", "reasoning"] {
+            let mut decoder = StreamDecoder::chat_completions("fixture".to_owned());
+            let mut sink = CollectingSink::default();
+            decoder
+                .accept(
+                    &serde_json::json!({"choices":[{"delta":{field:""}}]}),
+                    &mut BTreeMap::new(),
+                    &mut sink,
+                )
+                .unwrap();
+            assert!(sink.events.iter().any(|event| matches!(
+                event,
+                ModelStreamEvent::ReasoningDelta { text } if text.is_empty()
+            )));
+        }
+    }
+
+    #[test]
     fn discovery_limits_are_per_model_and_validate_advertised_values() {
         assert_eq!(
             discovered_context_window(&serde_json::json!({"context_length": 8192})),

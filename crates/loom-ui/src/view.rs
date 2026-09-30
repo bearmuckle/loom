@@ -70,8 +70,9 @@ use crate::{
         AgentMode, AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind,
         GitHubLoginState, InspectorTab, RenameDialogState, ReviewRow, ReviewState, SystemNote,
         SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus, UsageState, bounded,
-        bounded_to, finish_assistant_turn, push_assistant_evidence, push_assistant_reasoning,
-        push_assistant_text, session_state_for_run, session_title_from_task, upsert_tool_part,
+        bounded_to, finish_assistant_turn, has_tool_part, push_assistant_evidence,
+        push_assistant_reasoning, push_assistant_text, session_state_for_run,
+        session_title_from_task, upsert_tool_part,
     },
     syntax::{self, Language},
     theme::{
