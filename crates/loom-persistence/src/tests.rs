@@ -647,6 +647,31 @@ fn exclusive_writer_lock_is_enforced_across_processes() {
 }
 
 #[test]
+fn queued_run_directions_validate_and_read_lazily() {
+    let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
+    let store = FilePersistence::open(&path).unwrap();
+    let run_id = RunId::new();
+    let session_id = AgentSessionId::new();
+    assert!(store.list_run_directions(run_id, 0, 8).unwrap().is_empty());
+    assert_eq!(
+        store
+            .enqueue_run_direction(run_id, session_id, "   ", Timestamp::now())
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    assert_eq!(
+        store
+            .enqueue_run_direction(run_id, session_id, &"x".repeat(65_537), Timestamp::now())
+            .unwrap_err()
+            .code,
+        ErrorCode::InvalidRequest
+    );
+    drop(store);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn non_sqlite_file_is_rejected_without_migration() {
     let path = std::env::temp_dir().join(format!("loom-persistence-{}.db", Uuid::new_v4()));
     fs::write(&path, b"{not json").unwrap();
@@ -1007,7 +1032,8 @@ fn opens_and_migrates_an_older_schema_in_place() {
     let run_id = RunId::new();
     {
         let connection = Connection::open(&path).unwrap();
-        // Minimal v2 layout: `run_messages` without the v3 reasoning column.
+        // Minimal v2 layout: `run_messages` without the v3 reasoning column,
+        // plus the run tables the v4 direction queue migration touches.
         connection
             .execute_batch(
                 "CREATE TABLE run_messages (
@@ -1022,6 +1048,14 @@ fn opens_and_migrates_an_older_schema_in_place() {
                     tool_calls TEXT NOT NULL DEFAULT '[]',
                     fragments TEXT NOT NULL DEFAULT '[]',
                     PRIMARY KEY(run_id, ordinal)
+                ) WITHOUT ROWID, STRICT;
+                CREATE TABLE run_summaries (
+                    run_id BLOB NOT NULL,
+                    session_id BLOB NOT NULL,
+                    PRIMARY KEY(run_id, session_id)
+                ) WITHOUT ROWID, STRICT;
+                CREATE TABLE run_execution_state (
+                    run_id BLOB PRIMARY KEY NOT NULL
                 ) WITHOUT ROWID, STRICT;
                 PRAGMA user_version = 2;",
             )
@@ -3245,6 +3279,7 @@ fn run_interactions_round_trip_and_commit_atomically_with_the_feed() {
         next_message_id: 2,
         active_message_id: None,
         last_project_message_sequence: 7,
+        last_queued_direction_sequence: 0,
         pending_tool_execution: None,
         pending_project_join: None,
         pending_approval: None,
@@ -3680,6 +3715,7 @@ fn tool_attempt_state_storage_tracks_activity_outcomes_and_intents() {
             next_message_id: 0,
             active_message_id: None,
             last_project_message_sequence: 0,
+            last_queued_direction_sequence: 0,
             pending_tool_execution: Some(queued_call.clone()),
             pending_project_join: None,
             pending_approval: None,

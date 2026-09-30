@@ -94,6 +94,10 @@ impl AgentRuntime {
         self.last_project_message_sequence
     }
 
+    pub fn last_queued_direction_sequence(&self) -> u64 {
+        self.last_queued_direction_sequence
+    }
+
     /// Sets the durable inbox cursor before a new run begins in this session.
     pub fn set_project_message_cursor(&mut self, sequence: u64) {
         self.last_project_message_sequence = self.last_project_message_sequence.max(sequence);
@@ -111,7 +115,12 @@ impl AgentRuntime {
             || self.pending_input.is_some()
             || !matches!(
                 self.run.state,
-                AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+                AgentRunState::Planning
+                    | AgentRunState::Executing
+                    | AgentRunState::Evaluating
+                    | AgentRunState::Completed
+                    | AgentRunState::Failed
+                    | AgentRunState::Cancelled
             )
         {
             return Ok(false);
@@ -138,6 +147,77 @@ impl AgentRuntime {
         model_message.name = Some("loom_project_message".to_owned());
         self.push_message(model_message);
         self.last_project_message_sequence = message.project_sequence;
+        Ok(true)
+    }
+
+    /// Appends a system-generated project notification turn.
+    ///
+    /// Used to wake a manager that finished its turn when a child finished
+    /// without sending its own result. The message is framed like a project
+    /// message so it is treated as collaborator input, not a user instruction.
+    pub fn notify_project_child_finished(&mut self, body: String) -> Result<()> {
+        let mut message = ModelMessage::new(MessageRole::User, body);
+        message.name = Some("loom_project_message".to_owned());
+        self.push_message(message);
+        Ok(())
+    }
+
+    /// Delivers one user direction that was queued while the run was executing.
+    ///
+    /// A direction is applied only at a safe model-turn boundary. It answers a
+    /// pending input prompt when one is open, and otherwise is appended as a
+    /// user turn. Returns `true` when the direction was delivered (or was
+    /// already delivered) and the cursor advanced; `false` when the run is
+    /// blocked on an interaction or continuation and must stay queued.
+    pub fn deliver_queued_direction(&mut self, sequence: u64, message: &str) -> Result<bool> {
+        if sequence <= self.last_queued_direction_sequence {
+            return Ok(true);
+        }
+        if self.pending_tool_execution.is_some()
+            || self.pending_project_join.is_some()
+            || self.pending_approval.is_some()
+            || matches!(
+                self.run.state,
+                AgentRunState::Completed | AgentRunState::Failed | AgentRunState::Cancelled
+            )
+        {
+            return Ok(false);
+        }
+        let attempt_id = self.run.attempt_id;
+        let control_revision = self.run.control_revision;
+        let mut interaction_id = None;
+        if self.pending_input.is_some() {
+            let pending = self.pending_interaction_id(
+                loom_protocol::AgentInteractionKind::UserInput,
+                attempt_id,
+                control_revision,
+                None,
+            )?;
+            interaction_id = Some(pending);
+            let revision = self.next_control_revision()?;
+            self.resolve_interaction(
+                pending,
+                loom_protocol::AgentInteractionStatus::Answered,
+                None,
+            )?;
+            self.run.control_revision = revision;
+            self.pending_input = None;
+        }
+        self.push_message(ModelMessage::new(MessageRole::User, message.to_owned()));
+        self.last_queued_direction_sequence = sequence;
+        self.last_failed_call = None;
+        self.run.completed_at = None;
+        self.run.summary = None;
+        self.active_message_id = None;
+        let mut events = vec![AgentEvent::UserMessage {
+            run_id: self.run.id,
+            attempt_id: self.run.attempt_id,
+            control_revision: self.run.control_revision,
+            interaction_id,
+            text: message.to_owned(),
+        }];
+        events.extend(self.set_state(AgentRunState::Executing));
+        self.publish(Ok(events))?;
         Ok(true)
     }
 
@@ -211,6 +291,33 @@ impl AgentRuntime {
         }];
         events.extend(self.set_state(AgentRunState::Paused));
         Ok(events)
+    }
+
+    /// Abandons a parked project join so a newer user direction can be handled.
+    ///
+    /// The original deferred tool call receives a bounded failure result and the
+    /// continuation is cleared, so the owner can abandon the durable wait and
+    /// resume the run without replaying an uncertain external tool effect.
+    /// Returns no events when no join is parked.
+    pub fn abandon_project_join(&mut self, reason: impl Into<String>) -> Result<Vec<AgentEvent>> {
+        let result = self.abandon_project_join_inner(reason.into());
+        self.publish(result)
+    }
+
+    pub(crate) fn abandon_project_join_inner(&mut self, reason: String) -> Result<Vec<AgentEvent>> {
+        let Some(continuation) = self.pending_project_join.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let wait_id = continuation.wait_id.clone();
+        let call = continuation.call.clone();
+        let result = ToolResult {
+            tool_call_id: call.id,
+            name: call.name,
+            success: true,
+            output: format!("Project child wait was superseded: {reason}"),
+        };
+        let progress = self.complete_project_join_inner(&wait_id, result)?;
+        Ok(progress.events)
     }
 
     /// Completes a previously parked project join exactly once.

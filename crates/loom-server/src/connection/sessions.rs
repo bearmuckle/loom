@@ -136,7 +136,7 @@ impl InProcessConnection {
                 | AgentSessionState::Evaluating
                 | AgentSessionState::NeedsInput
         ) {
-            let run_id = self
+            let registered_run = self
                 .backend
                 .runs()?
                 .iter()
@@ -149,23 +149,69 @@ impl InProcessConnection {
                     )
                 })
                 .max_by_key(|(_, snapshot)| snapshot.updated_at)
-                .map(|(run_id, _)| run_id)
-                .ok_or_else(|| {
+                .map(|(run_id, _)| run_id);
+            // A run deferred by restore has no in-memory handle. Resolve the
+            // persisted latest run so it can still be stopped.
+            let latest_run = self
+                .backend
+                .persistence
+                .as_ref()
+                .map(|persistence| persistence.load_latest_run_summary_for_session(session_id))
+                .transpose()?
+                .flatten();
+            let run_id = registered_run.or_else(|| {
+                latest_run
+                    .as_ref()
+                    .filter(|summary| {
+                        !matches!(
+                            summary.snapshot.state,
+                            AgentRunState::Completed
+                                | AgentRunState::Failed
+                                | AgentRunState::Cancelled
+                        )
+                    })
+                    .map(|summary| summary.snapshot.id)
+            });
+            match run_id {
+                Some(run_id) => {
+                    log::info!(
+                        "[loom-server] stopping run {run_id} before archiving session {session_id}"
+                    );
+                    // Restore a deferred run on demand so it can be interrupted.
+                    if let Err(error) = self.run_handle(run_id) {
+                        log::warn!(
+                            "[loom-server] failed to restore run {run_id} before archiving session {session_id}: {}",
+                            error.message
+                        );
+                        return Err(error);
+                    }
+                    if let Err(error) = self.stop_run(run_id, RunStop::Interrupt) {
+                        log::warn!(
+                            "[loom-server] failed to stop run {run_id} before archiving session {session_id}: {}",
+                            error.message
+                        );
+                        return Err(error);
+                    }
+                }
+                None => {
+                    // No non-terminal run exists; the persisted session state is
+                    // stale (for example left active by an earlier crash).
+                    // Reconcile it to the latest run's terminal state, or Idle,
+                    // so archiving can proceed.
+                    let stopped_state = latest_run
+                        .as_ref()
+                        .map(|summary| session_state_for_run_state(summary.snapshot.state))
+                        .unwrap_or(AgentSessionState::Idle);
                     log::warn!(
-                        "[loom-server] session {session_id} is {:?} but has no active run to stop before archiving",
+                        "[loom-server] session {session_id} was {:?} with no active run; resetting to {stopped_state:?} before archiving",
                         session.state
                     );
-                    LoomError::invalid_state(
-                        "running agent sessions must be stopped before archiving",
-                    )
-                })?;
-            log::info!("[loom-server] stopping run {run_id} before archiving session {session_id}");
-            if let Err(error) = self.stop_run(run_id, RunStop::Interrupt) {
-                log::warn!(
-                    "[loom-server] failed to stop run {run_id} before archiving session {session_id}: {}",
-                    error.message
-                );
-                return Err(error);
+                    let (_, record) = self
+                        .backend
+                        .sessions()?
+                        .transition(session_id, stopped_state)?;
+                    self.backend.journal()?.append_session(record);
+                }
             }
         }
 

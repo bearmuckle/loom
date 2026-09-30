@@ -27,7 +27,8 @@ impl InProcessBackend {
             return Ok(());
         }
         self.update_project_task_for_session_state(session_id, session_state)?;
-        self.reconcile_project_tasks_and_resume_queued(false)
+        self.reconcile_project_tasks_and_resume_queued(false)?;
+        self.notify_parent_of_child_activity(session_id)
     }
 
     /// Observer installed on every runtime so events are journaled as they are
@@ -105,18 +106,23 @@ impl InProcessBackend {
                             .runtime
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
-                        match deliver_project_agent_messages(persistence, &mut runtime) {
-                            Ok(delivered) => {
-                                if delivered {
-                                    handle.refresh(&runtime);
+                        let project = deliver_project_agent_messages(persistence, &mut runtime);
+                        let directions = deliver_queued_run_directions(persistence, &mut runtime);
+                        let mut delivered = false;
+                        for result in [project, directions] {
+                            match result {
+                                Ok(true) => delivered = true,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    handle.record_failure(error);
+                                    break;
                                 }
-                                delivered
-                            }
-                            Err(error) => {
-                                handle.record_failure(error);
-                                false
                             }
                         }
+                        if delivered {
+                            handle.refresh(&runtime);
+                        }
+                        delivered
                     } else {
                         false
                     };
@@ -164,6 +170,43 @@ impl InProcessBackend {
                                 break;
                             }
                             if !progress.continues {
+                                // A direction queued as the run stopped (for
+                                // example while it was asking for input) is
+                                // delivered here so it is not stranded until
+                                // an unrelated resume.
+                                let delivered = if let Some(persistence) =
+                                    backend.persistence.as_ref()
+                                {
+                                    let mut runtime = handle
+                                        .runtime
+                                        .lock()
+                                        .unwrap_or_else(PoisonError::into_inner);
+                                    match deliver_queued_run_directions(persistence, &mut runtime) {
+                                        Ok(delivered) => {
+                                            if delivered {
+                                                handle.refresh(&runtime);
+                                            }
+                                            delivered
+                                        }
+                                        Err(error) => {
+                                            handle.record_failure(error);
+                                            false
+                                        }
+                                    }
+                                } else {
+                                    false
+                                };
+                                if delivered {
+                                    if let Err(error) = backend.persist_run_checkpoint(&handle) {
+                                        handle.record_failure(error);
+                                        break;
+                                    }
+                                    if let Err(error) = backend.after_run_checkpoint(&handle) {
+                                        handle.record_failure(error);
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 break;
                             }
                         }

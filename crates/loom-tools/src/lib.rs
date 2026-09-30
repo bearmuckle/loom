@@ -11,7 +11,7 @@ use std::{
 
 use globset::Glob;
 use loom_core::{ActionKind, AgentSessionId, ApprovalPolicy, PolicyEvaluation, Result};
-use loom_model::{ToolCall, ToolDefinition};
+use loom_model::{CancellationToken, ToolCall, ToolDefinition};
 pub use loom_protocol::ToolResult;
 use loom_vcs::GitService;
 use loom_workspace::{Workspace, WorkspaceEdit};
@@ -468,6 +468,15 @@ impl ToolExecutor {
     }
 
     pub fn execute(&self, call: &ToolCall) -> ToolResult {
+        self.execute_with_cancel(call, &CancellationToken::new())
+    }
+
+    /// Executes a tool, allowing a caller to cancel long-running process tools.
+    ///
+    /// Only tools that spawn external commands observe the token; other tools
+    /// run to completion. A cancelled command is terminated together with its
+    /// process group and reported as a failed result.
+    pub fn execute_with_cancel(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolResult {
         let Some(kind) = ToolKind::from_name(&call.name) else {
             return self
                 .extension
@@ -490,7 +499,7 @@ impl ToolExecutor {
                 "control tool is handled by the agent runtime and cannot be executed directly",
             ),
             ToolKind::ApplyPatch => self.apply_patch(call),
-            ToolKind::RunCommand => self.run_command(call),
+            ToolKind::RunCommand => self.run_command(call, cancel),
             ToolKind::GitHubListPullRequests => self.github_list_pull_requests(call),
             ToolKind::GitHubGetPullRequest => self.github_get_pull_request(call),
             ToolKind::GitHubCreatePullRequest => self.github_create_pull_request(call),
@@ -834,7 +843,7 @@ impl ToolExecutor {
         }
     }
 
-    fn run_command(&self, call: &ToolCall) -> ToolResult {
+    fn run_command(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolResult {
         let arguments: RunCommandArguments = match parse_arguments(call) {
             Ok(arguments) => arguments,
             Err(error) => return ToolResult::failure(call, error),
@@ -859,11 +868,16 @@ impl ToolExecutor {
             Ok(cwd) => cwd,
             Err(error) => return ToolResult::failure(call, error),
         };
-        let output =
-            match self.execute_command(&arguments.command, &arguments.args, &cwd, timeout_ms) {
-                Ok(output) => output,
-                Err(error) => return ToolResult::failure(call, error),
-            };
+        let output = match self.execute_command(
+            &arguments.command,
+            &arguments.args,
+            &cwd,
+            timeout_ms,
+            cancel,
+        ) {
+            Ok(output) => output,
+            Err(error) => return ToolResult::failure(call, error),
+        };
         let text = self.limit_output(output.render());
         if output.success() {
             ToolResult::success(call, text)
@@ -878,6 +892,7 @@ impl ToolExecutor {
         args: &[String],
         cwd: &Path,
         timeout_ms: u64,
+        cancel: &CancellationToken,
     ) -> std::result::Result<CommandOutput, String> {
         let mut command = Command::new(program);
         command
@@ -908,7 +923,16 @@ impl ToolExecutor {
             .map(|stderr| thread::spawn(move || read_capped(stderr, cap)));
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let mut status = None;
+        let mut cancelled = false;
         loop {
+            // A user interrupt or pause cancels the token; terminate the whole
+            // process group promptly so a blocking command never pins the run.
+            if cancel.is_cancelled() {
+                cancelled = true;
+                terminate_command(&mut child);
+                let _ = child.wait();
+                break;
+            }
             match child.try_wait() {
                 Ok(Some(exit)) => {
                     status = Some(exit);
@@ -931,6 +955,9 @@ impl ToolExecutor {
         let (stderr, stderr_truncated) = stderr_reader.map_or((Vec::new(), false), |reader| {
             reader.join().unwrap_or_default()
         });
+        if cancelled {
+            return Err("command was cancelled".to_owned());
+        }
         Ok(CommandOutput {
             status,
             stdout,
@@ -2611,6 +2638,35 @@ mod tests {
         ));
         assert!(!invalid.success);
         assert!(invalid.output.contains("timeout_ms must be between"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_observes_cancellation() {
+        let root = workspace();
+        let executor = ToolExecutor::new(&root).unwrap();
+        let token = CancellationToken::new();
+        let canceller = token.clone();
+        let worker = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            canceller.cancel();
+        });
+        let started = Instant::now();
+        let result = executor.execute_with_cancel(
+            &call(
+                "run_command",
+                serde_json::json!({"command": "sleep", "args": ["30"], "timeout_ms": 30_000}),
+            ),
+            &token,
+        );
+        worker.join().unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("cancelled"));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a cancelled command must terminate promptly instead of running to its timeout"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

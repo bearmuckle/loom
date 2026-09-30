@@ -633,6 +633,27 @@ pub(crate) fn deliver_project_agent_messages(
     Ok(delivered)
 }
 
+/// Delivers user directions queued while the run was executing at the next
+/// safe model-turn boundary. Mirrors project-agent inbox delivery: the cursor
+/// advances with the transcript checkpoint, so a crash redelivers rather than
+/// dropping a direction.
+pub(crate) fn deliver_queued_run_directions(
+    persistence: &dyn Persistence,
+    runtime: &mut AgentRuntime,
+) -> Result<bool> {
+    let run_id = runtime.run_id();
+    let directions =
+        persistence.list_run_directions(run_id, runtime.last_queued_direction_sequence(), 32)?;
+    let mut delivered = false;
+    for (sequence, body) in directions {
+        if !runtime.deliver_queued_direction(sequence, &body)? {
+            break;
+        }
+        delivered = true;
+    }
+    Ok(delivered)
+}
+
 pub(crate) fn project_member_branch_messaging_enabled(
     persistence: &dyn Persistence,
     root_session_id: AgentSessionId,
@@ -678,6 +699,7 @@ pub(crate) fn execution_state_from_runtime(
         next_message_id: state.next_message_id,
         active_message_id: state.active_message_id,
         last_project_message_sequence: state.last_project_message_sequence,
+        last_queued_direction_sequence: state.last_queued_direction_sequence,
         pending_tool_execution: state.pending_tool_execution.clone(),
         pending_project_join: state.pending_project_join.clone(),
         pending_approval: state.pending_approval.clone(),
@@ -718,6 +740,7 @@ pub(crate) fn runtime_state_from_durable_config(
         messages: Vec::new(),
         message_timeline_ordinals: Vec::new(),
         last_project_message_sequence: 0,
+        last_queued_direction_sequence: 0,
         attempts: Vec::new(),
         pending_approval: None,
         pending_tool_execution: None,
@@ -767,6 +790,7 @@ pub(crate) fn hydrate_runtime_execution_state(
     state.next_message_id = execution.next_message_id;
     state.active_message_id = execution.active_message_id;
     state.last_project_message_sequence = execution.last_project_message_sequence;
+    state.last_queued_direction_sequence = execution.last_queued_direction_sequence;
     state.pending_tool_execution = execution.pending_tool_execution;
     state.pending_project_join = execution.pending_project_join;
     state.pending_approval = execution.pending_approval;

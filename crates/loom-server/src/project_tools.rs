@@ -307,17 +307,10 @@ impl ToolExtension for ProjectAgentTools {
             .iter()
             .filter(|task| task.requester_session_id == self.session_id)
         {
-            if !matches!(
-                task.status,
-                loom_core::DelegatedTaskStatus::Completed
-                    | loom_core::DelegatedTaskStatus::Failed
-                    | loom_core::DelegatedTaskStatus::Cancelled
-            ) {
-                return Some(format!(
-                    "direct child task {} ({}) is still {:?}; wait for all active children before reporting completion",
-                    task.task_id, task.child_name, task.status
-                ));
-            }
+            // Active children no longer block a manager from ending its turn:
+            // the manager may reply to the user and be woken when the child
+            // reports back. Only unreviewed or unintegrated code results keep
+            // the guard, because silently abandoning them risks losing work.
             if task.code_change && task.status == loom_core::DelegatedTaskStatus::Completed {
                 match persistence.load_project_worktree_by_task(task.task_id) {
                     Ok(Some(worktree)) => {

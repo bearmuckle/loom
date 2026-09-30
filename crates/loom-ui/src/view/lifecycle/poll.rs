@@ -119,6 +119,15 @@ impl LoomView {
                 } else if view.project_messages_stale {
                     view.refresh_project_messages(cx);
                 }
+                // A manager that ended its turn while children still run is
+                // woken by the server. Keep consuming the root session's events
+                // alongside the project feed so that wake becomes visible.
+                if view.project_root_is_active()
+                    && view.project_has_live_children()
+                    && !view.run_is_active()
+                {
+                    view.poll_run_once(cx);
+                }
                 view.schedule_project_poll(cx);
             },
         );

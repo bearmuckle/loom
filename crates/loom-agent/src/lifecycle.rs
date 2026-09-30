@@ -69,6 +69,7 @@ impl AgentRuntime {
             message_timeline_ordinals,
             next_timeline_ordinal,
             last_project_message_sequence: 0,
+            last_queued_direction_sequence: 0,
             pending_approval: None,
             pending_tool_execution: None,
             pending_project_join: None,

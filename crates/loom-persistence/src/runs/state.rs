@@ -700,15 +700,24 @@ pub(crate) fn save_run_execution_state_rows(
                     false,
                 )
             })?;
+        let last_queued_direction_sequence =
+            i64::try_from(execution.last_queued_direction_sequence).map_err(|_| {
+                LoomError::new(
+                    ErrorCode::Persistence,
+                    "queued direction cursor is out of range",
+                    false,
+                )
+            })?;
         let step_id = execution.step_id.map(|id| id.as_uuid().as_bytes().to_vec());
         transaction
             .execute(
                 "INSERT INTO run_execution_state(
                     run_id, session_id, attempt_id, control_revision, state, step_id, step_index,
                     provider_cursor, next_message_id, active_message_id,
-                    last_project_message_sequence, pending_tool_execution, pending_approval,
+                    last_project_message_sequence, last_queued_direction_sequence,
+                    pending_tool_execution, pending_approval,
                     pending_input, last_failed_call, pending_project_join
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                  ON CONFLICT(run_id) DO UPDATE SET
                     session_id=excluded.session_id,
                     attempt_id=excluded.attempt_id,
@@ -720,6 +729,7 @@ pub(crate) fn save_run_execution_state_rows(
                     next_message_id=excluded.next_message_id,
                     active_message_id=excluded.active_message_id,
                     last_project_message_sequence=excluded.last_project_message_sequence,
+                    last_queued_direction_sequence=excluded.last_queued_direction_sequence,
                     pending_tool_execution=excluded.pending_tool_execution,
                     pending_approval=excluded.pending_approval,
                     pending_input=excluded.pending_input,
@@ -735,6 +745,7 @@ pub(crate) fn save_run_execution_state_rows(
                     OR run_execution_state.next_message_id IS NOT excluded.next_message_id
                     OR run_execution_state.active_message_id IS NOT excluded.active_message_id
                     OR run_execution_state.last_project_message_sequence IS NOT excluded.last_project_message_sequence
+                    OR run_execution_state.last_queued_direction_sequence IS NOT excluded.last_queued_direction_sequence
                     OR run_execution_state.pending_tool_execution IS NOT excluded.pending_tool_execution
                     OR run_execution_state.pending_approval IS NOT excluded.pending_approval
                     OR run_execution_state.pending_input IS NOT excluded.pending_input
@@ -752,6 +763,7 @@ pub(crate) fn save_run_execution_state_rows(
                     next_message_id,
                     active_message_id,
                     last_project_message_sequence,
+                    last_queued_direction_sequence,
                     pending_tool_execution,
                     pending_approval,
                     execution.pending_input,

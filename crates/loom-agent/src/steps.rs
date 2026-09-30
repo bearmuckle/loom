@@ -244,10 +244,11 @@ impl AgentRuntime {
         // Publish the starts before executing so blocked reads report as running.
         self.flush_prefix(events);
         let tools = &self.tools;
+        let cancel = self.control.stream_token();
         let results = std::thread::scope(|scope| {
             let handles = calls
                 .iter()
-                .map(|call| scope.spawn(|| tools.execute(call)))
+                .map(|call| scope.spawn(|| tools.execute_with_cancel(call, &cancel)))
                 .collect::<Vec<_>>();
             handles
                 .into_iter()

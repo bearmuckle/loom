@@ -663,7 +663,7 @@ impl LoomView {
             row = row.child(Spinner::new().small().color(color.into()));
         }
         if let Some(state) = self.run_state {
-            let label = if state == AgentRunState::Paused && self.project_has_live_children() {
+            let label = if self.project_has_live_children() && !self.run_is_active() {
                 "Waiting for sub-agents".to_owned()
             } else {
                 run_state_label(Some(state)).to_owned()

@@ -986,6 +986,69 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
+    fn archiving_a_project_removes_descendant_sessions_from_the_tree(cx: &mut TestAppContext) {
+        // Build the view without opening a window so the project poll (which
+        // would run while a live project is rendered) never starts.
+        let view = cx.new(|cx| {
+            let mut view = nested_project_view(cx.focus_handle());
+            let root_id = view.project_snapshot.as_ref().unwrap().root_session_id;
+            assert_eq!(view.sessions.len(), 3);
+            let removed_active = view.forget_archived_session(root_id);
+            assert!(removed_active, "the active root session should be removed");
+            assert!(
+                view.sessions.is_empty(),
+                "archived descendants must leave the session list"
+            );
+            assert!(view.project_snapshot.is_none());
+            view
+        });
+        let _ = view;
+    }
+
+    #[gpui_kit::test]
+    fn archiving_a_child_removes_only_that_session(cx: &mut TestAppContext) {
+        let view = cx.new(|cx| {
+            let mut view = nested_project_view(cx.focus_handle());
+            let child_id = view
+                .project_snapshot
+                .as_ref()
+                .unwrap()
+                .agents
+                .iter()
+                .find(|agent| agent.depth == 3)
+                .expect("nested project has a depth-three agent")
+                .session_id;
+            let removed_active = view.forget_archived_session(child_id);
+            assert!(
+                !removed_active,
+                "the active session is the root, not the child"
+            );
+            assert_eq!(view.sessions.len(), 2);
+            let project = view.project_snapshot.as_ref().unwrap();
+            assert!(
+                project
+                    .agents
+                    .iter()
+                    .all(|agent| agent.session_id != child_id)
+            );
+            assert!(
+                project
+                    .tasks
+                    .iter()
+                    .all(|task| task.target_session_id != child_id)
+            );
+            assert!(
+                project
+                    .worktrees
+                    .iter()
+                    .all(|worktree| worktree.child_session_id != child_id)
+            );
+            view
+        });
+        let _ = view;
+    }
+
+    #[gpui_kit::test]
     fn project_session_popup_menu_dispatches_child_control_review_and_integration(
         cx: &mut TestAppContext,
     ) {

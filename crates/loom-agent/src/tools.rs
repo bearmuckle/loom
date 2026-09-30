@@ -19,7 +19,8 @@ impl AgentRuntime {
         // Publish the start before running the tool so a long or blocked command
         // is reported as running instead of queued.
         self.flush_prefix(events);
-        let result = self.tools.execute(call);
+        let cancel = self.control.stream_token();
+        let result = self.tools.execute_with_cancel(call, &cancel);
         if !result.output.is_empty() {
             events.push(AgentEvent::ToolOutputChunk {
                 run_id: self.run.id,

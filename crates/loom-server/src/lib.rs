@@ -237,6 +237,10 @@ enum RunStop {
 
 /// How long a control request waits for a running step to honour it.
 const CONTROL_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long shutdown waits for each run to settle before proceeding without
+/// joining it. A cancelled command terminates immediately; only a step that
+/// cannot observe cancellation (for example a blocked HTTP read) lingers.
+const SHUTDOWN_SETTLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an operation that needs exclusive runtime access waits for a step
 /// that is already finishing. A run that is genuinely busy is reported as a
 /// retryable conflict instead.

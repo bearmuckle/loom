@@ -64,6 +64,9 @@ pub struct AgentExecutionStateRecord {
     pub active_message_id: Option<u64>,
     #[serde(default)]
     pub last_project_message_sequence: u64,
+    /// Delivery cursor for user directions queued while the run was executing.
+    #[serde(default)]
+    pub last_queued_direction_sequence: u64,
     pub pending_tool_execution: Option<ToolCall>,
     #[serde(default)]
     pub pending_project_join: Option<ProjectJoinContinuation>,
