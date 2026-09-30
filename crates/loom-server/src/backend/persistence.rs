@@ -697,31 +697,50 @@ impl InProcessBackend {
             .cloned()
             .collect::<Vec<Arc<RunHandle>>>();
         for handle in handles {
+            let mut settled = true;
             if handle.is_running() {
                 handle.control.request_pause();
-                handle.wait_until_idle()?;
-                if let Some(error) = handle.take_failure() {
-                    return Err(error);
-                }
-                if handle.control.is_stopping() {
-                    let state = handle.state().run.state;
-                    // Only active runs need to be parked. Awaiting approval and
-                    // waiting for input are already durable, resumable stops and
-                    // must not be downgraded to Paused by shutdown.
-                    if matches!(
-                        state,
-                        AgentRunState::Planning
-                            | AgentRunState::Executing
-                            | AgentRunState::Evaluating
-                    ) {
-                        let mut runtime = handle.try_runtime()?;
-                        runtime.pause()?;
-                        handle.refresh(&runtime);
+                match handle.wait_until_idle_for(SHUTDOWN_SETTLE_TIMEOUT) {
+                    Ok(()) => {
+                        if let Some(error) = handle.take_failure() {
+                            return Err(error);
+                        }
+                        if handle.control.is_stopping() {
+                            let state = handle.state().run.state;
+                            // Only active runs need to be parked. Awaiting
+                            // approval and waiting for input are already durable,
+                            // resumable stops and must not be downgraded to Paused
+                            // by shutdown.
+                            if matches!(
+                                state,
+                                AgentRunState::Planning
+                                    | AgentRunState::Executing
+                                    | AgentRunState::Evaluating
+                            ) {
+                                let mut runtime = handle.try_runtime()?;
+                                runtime.pause()?;
+                                handle.refresh(&runtime);
+                            }
+                            handle.control.clear_request();
+                        }
                     }
-                    handle.control.clear_request();
+                    Err(error) => {
+                        // The worker is still inside a tool that did not observe
+                        // the pause (a non-cancellable extension). Do not block
+                        // process exit on it; the tool's own timeout bounds how
+                        // long the thread can linger.
+                        log::warn!(
+                            "run {} did not stop during shutdown: {}",
+                            handle.run_id,
+                            error.message
+                        );
+                        settled = false;
+                    }
                 }
             }
-            handle.join_worker()?;
+            if settled {
+                handle.join_worker()?;
+            }
         }
         // A fail-stopped backend must not write more state, but shutdown still
         // has to release database ownership so a restart can reopen it.

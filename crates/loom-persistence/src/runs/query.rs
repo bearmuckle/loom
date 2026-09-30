@@ -617,7 +617,7 @@ impl FilePersistence {
             .query_row(
                 "SELECT session_id, attempt_id, control_revision, state, step_id, step_index,
                         provider_cursor, next_message_id, active_message_id,
-                        last_project_message_sequence,
+                        last_project_message_sequence, last_queued_direction_sequence,
                         pending_tool_execution, pending_approval, pending_input, last_failed_call,
                         pending_project_join
                  FROM run_execution_state WHERE run_id=?1",
@@ -634,11 +634,12 @@ impl FilePersistence {
                         row.get::<_, i64>(7)?,
                         row.get::<_, Option<i64>>(8)?,
                         row.get::<_, i64>(9)?,
-                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, i64>(10)?,
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
                         row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<String>>(15)?,
                     ))
                 },
             )
@@ -657,6 +658,7 @@ impl FilePersistence {
             next_message_id,
             active_message_id,
             last_project_message_sequence,
+            last_queued_direction_sequence,
             pending_tool_execution,
             pending_approval,
             pending_input,
@@ -752,12 +754,161 @@ impl FilePersistence {
                     )
                 },
             )?,
+            last_queued_direction_sequence: u64::try_from(last_queued_direction_sequence).map_err(
+                |_| {
+                    LoomError::new(
+                        ErrorCode::MalformedPayload,
+                        "persisted queued direction cursor is negative",
+                        false,
+                    )
+                },
+            )?,
             pending_tool_execution: decode_tool_call(pending_tool_execution)?,
             pending_project_join,
             pending_approval: decode_tool_call(pending_approval)?,
             pending_input,
             last_failed_call: decode_tool_call(last_failed_call)?,
         }))
+    }
+
+    /// Appends a user direction to the durable per-run queue.
+    ///
+    /// Directions are delivered by the run worker at the next safe model-turn
+    /// boundary, mirroring project-agent inbox delivery. Returns the assigned
+    /// monotonic sequence.
+    pub fn enqueue_run_direction(
+        &self,
+        run_id: RunId,
+        session_id: AgentSessionId,
+        body: &str,
+        created_at: Timestamp,
+    ) -> Result<u64> {
+        if body.trim().is_empty() || body.len() > 65_536 {
+            return Err(LoomError::invalid_request(
+                "queued direction must contain 1 to 65536 bytes",
+            ));
+        }
+        let created_at = encode_timestamp(created_at)?;
+        let connection = self.connection_for_write()?;
+        let transaction = connection.unchecked_transaction().map_err(|error| {
+            persistence_error(
+                format!("could not begin queued direction transaction: {error}"),
+                true,
+            )
+        })?;
+        // Drop rows the run has already delivered, keeping only the undelivered
+        // tail. The persisted cursor advances with the transcript checkpoint, so
+        // a crash before that checkpoint leaves the row in place for redelivery.
+        transaction
+            .execute(
+                "DELETE FROM run_queued_directions
+                 WHERE run_id=?1 AND sequence <= COALESCE(
+                     (SELECT last_queued_direction_sequence
+                      FROM run_execution_state WHERE run_id=?1), 0)",
+                [run_id.as_uuid().as_bytes().as_slice()],
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prune delivered run directions: {error}"),
+                    true,
+                )
+            })?;
+        let sequence = transaction
+            .query_row(
+                "INSERT INTO run_queued_directions(run_id, session_id, sequence, body, created_at)
+                 SELECT ?1, ?2,
+                        MAX(
+                            COALESCE((SELECT last_queued_direction_sequence
+                                      FROM run_execution_state WHERE run_id=?1), 0),
+                            COALESCE((SELECT MAX(sequence)
+                                      FROM run_queued_directions WHERE run_id=?1), 0)
+                        ) + 1,
+                        ?3, ?4
+                 RETURNING sequence",
+                params![
+                    run_id.as_uuid().as_bytes().as_slice(),
+                    session_id.as_uuid().as_bytes().as_slice(),
+                    body,
+                    created_at,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not enqueue run direction: {error}"), true)
+            })?;
+        transaction.commit().map_err(|error| {
+            persistence_error(format!("could not commit queued direction: {error}"), true)
+        })?;
+        u64::try_from(sequence).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "queued direction sequence is out of range",
+                false,
+            )
+        })
+    }
+
+    /// Lists durable queued directions after `after`, oldest first.
+    pub fn list_run_directions(
+        &self,
+        run_id: RunId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, String)>> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let after = i64::try_from(after).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "queued direction cursor is out of range",
+                false,
+            )
+        })?;
+        let limit = i64::try_from(limit).map_err(|_| {
+            LoomError::new(
+                ErrorCode::Persistence,
+                "queued direction limit is out of range",
+                false,
+            )
+        })?;
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, body FROM run_queued_directions
+                 WHERE run_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
+            )
+            .map_err(|error| {
+                persistence_error(
+                    format!("could not prepare queued direction query: {error}"),
+                    true,
+                )
+            })?;
+        let rows = statement
+            .query_map(
+                params![run_id.as_uuid().as_bytes().as_slice(), after, limit],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|error| {
+                persistence_error(format!("could not read queued directions: {error}"), true)
+            })?;
+        let mut directions = Vec::new();
+        for row in rows {
+            let (sequence, body) = row.map_err(|error| {
+                persistence_error(format!("could not read queued direction: {error}"), true)
+            })?;
+            directions.push((
+                u64::try_from(sequence).map_err(|_| {
+                    LoomError::new(
+                        ErrorCode::Persistence,
+                        "queued direction sequence is negative",
+                        false,
+                    )
+                })?,
+                body,
+            ));
+        }
+        Ok(directions)
     }
 
     /// Loads a run's approval and input interaction history independently of

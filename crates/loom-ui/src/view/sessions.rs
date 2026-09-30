@@ -244,9 +244,7 @@ impl LoomView {
                         snapshot,
                     ))) => {
                         log::info!("[loom-ui] archived session {}", snapshot.id);
-                        let was_active = view.active_session.id == snapshot.id;
-                        view.sessions.retain(|session| session.id != snapshot.id);
-                        view.session_node_ids.remove(&snapshot.id);
+                        let was_active = view.forget_archived_session(snapshot.id);
                         if was_active {
                             if let Some(session) = view.sessions.first().cloned() {
                                 view.select_session(session, cx);
@@ -281,6 +279,71 @@ impl LoomView {
                 }
             },
         );
+    }
+
+    /// Forgets an archived session and, when a whole project was archived, every
+    /// descendant the backend cascaded. Returns whether the active session was
+    /// among the removed sessions.
+    pub(crate) fn forget_archived_session(&mut self, archived_id: AgentSessionId) -> bool {
+        let mut removed = BTreeSet::new();
+        removed.insert(archived_id);
+        for project in self
+            .project_tree_snapshots
+            .iter()
+            .chain(self.project_snapshot.iter())
+        {
+            if project.root_session_id == archived_id {
+                for agent in &project.agents {
+                    removed.insert(agent.session_id);
+                }
+            }
+        }
+        self.sessions
+            .retain(|session| !removed.contains(&session.id));
+        for session_id in &removed {
+            self.session_node_ids.remove(session_id);
+            self.session_task_cache.remove(session_id);
+            self.session_models.remove(session_id);
+            self.session_auto_approve_actions.remove(session_id);
+            self.project_message_cursors.remove(session_id);
+        }
+        // Drop the archived sessions from every cached project snapshot so the
+        // tree view stops rendering them without waiting for a refresh.
+        let prune = |project: &mut loom_core::ProjectSnapshot| {
+            project
+                .agents
+                .retain(|agent| !removed.contains(&agent.session_id));
+            project
+                .tasks
+                .retain(|task| !removed.contains(&task.target_session_id));
+            project
+                .worktrees
+                .retain(|worktree| !removed.contains(&worktree.child_session_id));
+        };
+        self.project_tree_snapshots.retain_mut(|project| {
+            if removed.contains(&project.root_session_id) {
+                return false;
+            }
+            prune(project);
+            true
+        });
+        let project_root_removed = self
+            .project_snapshot
+            .as_ref()
+            .is_some_and(|project| removed.contains(&project.root_session_id));
+        if project_root_removed {
+            self.project_snapshot = None;
+            self.project_snapshot_stale = false;
+            self.project_messages_stale = false;
+            self.project_feed_after_sequence = None;
+            self.project_poll_scheduled = false;
+            self.project_messages.clear();
+            self.project_message_cursors.clear();
+            self.rebuild_project_message_timeline();
+        } else if let Some(project) = self.project_snapshot.as_mut() {
+            prune(project);
+        }
+        removed.contains(&self.active_session.id)
     }
 
     pub(crate) fn select_session(&mut self, session: AgentSessionSnapshot, cx: &mut Context<Self>) {

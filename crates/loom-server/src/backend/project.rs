@@ -135,6 +135,59 @@ impl InProcessBackend {
         Ok(())
     }
 
+    /// Notifies a child task's parent that the child has produced something.
+    ///
+    /// Any durable inbox messages are delivered first. When a child finishes
+    /// without having sent its own report, a project notification turn is added
+    /// so the parent is never left uninformed. The parent is woken if its run is
+    /// idle, so background children genuinely wake the manager instead of
+    /// requiring it to hold a wait open.
+    pub(crate) fn notify_parent_of_child_activity(
+        self: &Arc<Self>,
+        child_session_id: AgentSessionId,
+    ) -> Result<()> {
+        let Some(persistence) = self.persistence.as_ref() else {
+            return Ok(());
+        };
+        let Some(task) = persistence.load_delegated_task_for_target(child_session_id)? else {
+            return Ok(());
+        };
+        let notification = if matches!(
+            task.status,
+            loom_core::DelegatedTaskStatus::Completed
+                | loom_core::DelegatedTaskStatus::Failed
+                | loom_core::DelegatedTaskStatus::Cancelled
+        ) {
+            let has_message = persistence
+                .list_agent_messages(task.project_id, task.requester_session_id, 0, 256)?
+                .iter()
+                .any(|message| {
+                    message.task_id == Some(task.task_id)
+                        && message.sender_session_id == child_session_id
+                });
+            (!has_message).then(|| {
+                format!(
+                    "[Project notification] Direct child task '{}' finished with status {:?}. Review its result.",
+                    task.child_name, task.status
+                )
+            })
+        } else {
+            None
+        };
+        let connection = self.connect();
+        if let Err(error) =
+            connection.wake_project_recipient(task.requester_session_id, notification)
+        {
+            log::debug!(
+                "could not wake parent {} for child {}: {}",
+                task.requester_session_id,
+                child_session_id,
+                error.message
+            );
+        }
+        Ok(())
+    }
+
     pub(crate) fn project_agent_tools(
         &self,
         session_id: AgentSessionId,

@@ -70,7 +70,7 @@ pub use schema::*;
 /// no registered step, are rejected and must be wiped by the operator. New
 /// optional state should prefer a versioned JSON payload column over a new
 /// column where the payload column already exists.
-const DATABASE_SCHEMA_VERSION: u32 = 3;
+const DATABASE_SCHEMA_VERSION: u32 = 4;
 /// Oldest schema version that the migration ladder can upgrade in place.
 const DATABASE_MIN_MIGRATABLE_VERSION: u32 = 2;
 const EXTERNAL_STRING_THRESHOLD: usize = 4096;

@@ -163,6 +163,19 @@ pub trait RunRepository: Send + Sync {
         run_id: RunId,
     ) -> Result<Option<DurableRunContextCheckpoint>>;
     fn load_run_execution_state(&self, run_id: RunId) -> Result<Option<AgentExecutionStateRecord>>;
+    fn enqueue_run_direction(
+        &self,
+        run_id: RunId,
+        session_id: AgentSessionId,
+        body: &str,
+        created_at: Timestamp,
+    ) -> Result<u64>;
+    fn list_run_directions(
+        &self,
+        run_id: RunId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, String)>>;
     fn load_run_interactions(&self, run_id: RunId) -> Result<Vec<AgentInteractionRecord>>;
     fn load_run_message_content_range(
         &self,
@@ -238,6 +251,23 @@ impl RunRepository for FilePersistence {
     }
     fn load_run_execution_state(&self, run_id: RunId) -> Result<Option<AgentExecutionStateRecord>> {
         FilePersistence::load_run_execution_state(self, run_id)
+    }
+    fn enqueue_run_direction(
+        &self,
+        run_id: RunId,
+        session_id: AgentSessionId,
+        body: &str,
+        created_at: Timestamp,
+    ) -> Result<u64> {
+        FilePersistence::enqueue_run_direction(self, run_id, session_id, body, created_at)
+    }
+    fn list_run_directions(
+        &self,
+        run_id: RunId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, String)>> {
+        FilePersistence::list_run_directions(self, run_id, after, limit)
     }
     fn load_run_interactions(&self, run_id: RunId) -> Result<Vec<AgentInteractionRecord>> {
         FilePersistence::load_run_interactions(self, run_id)
@@ -339,6 +369,23 @@ impl<T: RunRepository + ?Sized> RunRepository for Arc<T> {
     }
     fn load_run_execution_state(&self, run_id: RunId) -> Result<Option<AgentExecutionStateRecord>> {
         (**self).load_run_execution_state(run_id)
+    }
+    fn enqueue_run_direction(
+        &self,
+        run_id: RunId,
+        session_id: AgentSessionId,
+        body: &str,
+        created_at: Timestamp,
+    ) -> Result<u64> {
+        (**self).enqueue_run_direction(run_id, session_id, body, created_at)
+    }
+    fn list_run_directions(
+        &self,
+        run_id: RunId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, String)>> {
+        (**self).list_run_directions(run_id, after, limit)
     }
     fn load_run_interactions(&self, run_id: RunId) -> Result<Vec<AgentInteractionRecord>> {
         (**self).load_run_interactions(run_id)

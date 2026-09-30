@@ -93,6 +93,9 @@ pub struct AgentRuntimeState {
     pub message_timeline_ordinals: Vec<u64>,
     #[serde(default)]
     pub last_project_message_sequence: u64,
+    /// Delivery cursor for user directions queued while the run was executing.
+    #[serde(default)]
+    pub last_queued_direction_sequence: u64,
     #[serde(default)]
     pub attempts: Vec<loom_protocol::AgentRunAttemptRecord>,
     pub pending_approval: Option<ToolCall>,
@@ -289,6 +292,7 @@ pub struct AgentRuntime {
     message_timeline_ordinals: Vec<u64>,
     next_timeline_ordinal: u64,
     last_project_message_sequence: u64,
+    last_queued_direction_sequence: u64,
     pending_approval: Option<PendingApproval>,
     pending_tool_execution: Option<ToolCall>,
     pending_project_join: Option<ProjectJoinContinuation>,
@@ -1106,6 +1110,207 @@ mod tests {
         assert_eq!(delivered.role, MessageRole::User);
         assert_eq!(delivered.name.as_deref(), Some("loom_project_message"));
         assert!(delivered.content.contains("compatibility review"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn queued_user_directions_deliver_at_a_safe_boundary() {
+        let root = workspace();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("run", ModelId::new("deterministic/demo")).unwrap(),
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        runtime.begin().unwrap();
+        runtime.request_input("Which archive behavior?").unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::NeedsInput);
+
+        assert!(
+            runtime
+                .deliver_queued_direction(1, "Use the first option")
+                .unwrap()
+        );
+        assert_eq!(runtime.snapshot().state, AgentRunState::Executing);
+        assert!(runtime.pending_input().is_none());
+        assert!(runtime.messages().iter().any(|message| {
+            message.role == MessageRole::User && message.content == "Use the first option"
+        }));
+        assert_eq!(runtime.last_queued_direction_sequence(), 1);
+        // Re-delivering the same sequence is a no-op.
+        assert!(
+            runtime
+                .deliver_queued_direction(1, "Use the first option")
+                .unwrap()
+        );
+
+        // A direction cannot be applied while an interaction is pending.
+        runtime.pending_approval = Some(PendingApproval {
+            call: ToolCall {
+                id: loom_core::ToolCallId::new(),
+                name: "apply_patch".to_owned(),
+                arguments: serde_json::json!({}),
+            },
+        });
+        assert!(!runtime.deliver_queued_direction(2, "later").unwrap());
+        assert_eq!(runtime.last_queued_direction_sequence(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    struct SleepCommandProvider {
+        descriptor: loom_model::ModelDescriptor,
+        cursor: usize,
+    }
+
+    #[cfg(unix)]
+    impl ModelProvider for SleepCommandProvider {
+        fn descriptor(&self) -> &loom_model::ModelDescriptor {
+            &self.descriptor
+        }
+
+        fn stream(
+            &mut self,
+            _request: &ModelRequest,
+            cancel: &CancellationToken,
+            sink: &mut dyn loom_model::ModelStreamSink,
+        ) -> Result<()> {
+            let events = if self.cursor == 0 {
+                vec![
+                    ModelStreamEvent::ToolCallDelta {
+                        call: ToolCall {
+                            id: loom_core::ToolCallId::new(),
+                            name: "run_command".to_owned(),
+                            arguments: serde_json::json!({
+                                "command": "sleep",
+                                "args": ["30"],
+                                "timeout_ms": 30_000
+                            }),
+                        },
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::ToolCall,
+                    },
+                ]
+            } else {
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "done".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: loom_model::FinishReason::Stop,
+                    },
+                ]
+            };
+            self.cursor = self.cursor.saturating_add(1);
+            for event in events {
+                cancel.check()?;
+                if sink.emit(event)? == StreamFlow::Stop {
+                    break;
+                }
+            }
+            Ok(())
+        }
+
+        fn reset(&mut self) {
+            self.cursor = 0;
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupting_a_run_terminates_a_running_command() {
+        let root = workspace();
+        let tools = ToolExecutor::new(&root).unwrap();
+        let task = AgentTask::new("sleep", ModelId::new("sleep/demo")).unwrap();
+        let mut runtime = AgentRuntime::new_with_policy(
+            AgentSessionId::new(),
+            task,
+            Box::new(SleepCommandProvider {
+                descriptor: loom_model::ModelDescriptor {
+                    id: ModelId::new("sleep/demo"),
+                    provider: loom_model::ProviderId::new("sleep"),
+                    display_name: "Sleeping test provider".to_owned(),
+                    context_window: Some(8_192),
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    capabilities: loom_model::ModelCapabilities {
+                        streaming: true,
+                        tool_calling: true,
+                        vision: false,
+                        json_mode: false,
+                    },
+                },
+                cursor: 0,
+            }),
+            tools,
+            loom_core::ApprovalPolicy::auto_approve(),
+        );
+        let started_tool = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&started_tool);
+        runtime.set_event_observer(Arc::new(move |event: &AgentEvent| {
+            if let AgentEvent::ToolCallStarted { call, .. } = event
+                && call.name == "run_command"
+            {
+                observed.store(true, Ordering::SeqCst);
+            }
+        }));
+        let control = runtime.control();
+        let started = std::time::Instant::now();
+        let worker = std::thread::spawn(move || {
+            let _ = runtime.start();
+            runtime
+        });
+        while !started_tool.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        control.request_interrupt();
+        let runtime = worker.join().unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::Cancelled);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "an interrupt must terminate the running command promptly"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn abandoning_a_parked_project_join_completes_the_original_tool_call() {
+        let root = workspace();
+        let mut runtime = AgentRuntime::new(
+            AgentSessionId::new(),
+            AgentTask::new("wait for a child", ModelId::new("deterministic/demo")).unwrap(),
+            Box::new(DeterministicProvider::demo()),
+            ToolExecutor::new(&root).unwrap(),
+        );
+        runtime.begin().unwrap();
+        let call = ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "wait_for_project_children".to_owned(),
+            arguments: serde_json::json!({"task_ids": []}),
+        };
+        runtime.pending_tool_execution = Some(call.clone());
+        runtime
+            .park_pending_project_join("call-0001", call.clone())
+            .unwrap();
+        assert!(runtime.pending_project_join().is_some());
+        assert_eq!(runtime.snapshot().state, AgentRunState::Paused);
+
+        let events = runtime
+            .abandon_project_join("the user sent a new direction")
+            .unwrap();
+
+        assert!(runtime.pending_project_join().is_none());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolCallCompleted { result, .. }
+                if result.tool_call_id == call.id && result.success
+        )));
+        assert!(runtime.messages().iter().any(|message| {
+            message.role == MessageRole::Tool
+                && message.tool_call_id == Some(call.id)
+                && message.content.contains("superseded")
+        }));
         fs::remove_dir_all(root).unwrap();
     }
 

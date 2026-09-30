@@ -66,9 +66,7 @@ impl InProcessConnection {
                 attempt_id,
                 expected_control_revision,
                 message,
-            }) => self.continue_run(run_id, |run| {
-                run.message_entry_at_revision(message, attempt_id, expected_control_revision)
-            }),
+            }) => self.send_agent_message(run_id, attempt_id, expected_control_revision, message),
             ClientRequest::Run(RunRequest::InterruptAgentRun { run_id }) => {
                 self.stop_run(run_id, RunStop::Interrupt)
             }

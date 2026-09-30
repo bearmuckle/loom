@@ -10,6 +10,7 @@ impl AgentRuntime {
             messages: self.messages.clone(),
             message_timeline_ordinals: self.message_timeline_ordinals.clone(),
             last_project_message_sequence: self.last_project_message_sequence,
+            last_queued_direction_sequence: self.last_queued_direction_sequence,
             attempts: self.attempts.clone(),
             pending_approval: self
                 .pending_approval
@@ -214,6 +215,7 @@ impl AgentRuntime {
             message_timeline_ordinals,
             next_timeline_ordinal,
             last_project_message_sequence: state.last_project_message_sequence,
+            last_queued_direction_sequence: state.last_queued_direction_sequence,
             pending_approval: state.pending_approval.map(|call| PendingApproval { call }),
             pending_tool_execution: state.pending_tool_execution,
             pending_project_join: state.pending_project_join,

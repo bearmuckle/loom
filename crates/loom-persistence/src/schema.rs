@@ -177,6 +177,7 @@ CREATE TABLE IF NOT EXISTS run_execution_state (
     next_message_id INTEGER NOT NULL CHECK(next_message_id >= 0),
     active_message_id INTEGER CHECK(active_message_id IS NULL OR active_message_id >= 0),
     last_project_message_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_project_message_sequence >= 0),
+    last_queued_direction_sequence INTEGER NOT NULL DEFAULT 0 CHECK(last_queued_direction_sequence >= 0),
     pending_tool_execution TEXT CHECK(
         pending_tool_execution IS NULL OR length(pending_tool_execution) <= 1048576
     ),
@@ -270,6 +271,16 @@ CREATE INDEX IF NOT EXISTS run_context_checkpoints_by_session
     ON run_context_checkpoints(session_id, run_id);
 CREATE INDEX IF NOT EXISTS run_messages_by_session
     ON run_messages(session_id, run_id, ordinal);
+CREATE TABLE IF NOT EXISTS run_queued_directions (
+    run_id BLOB NOT NULL,
+    session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+    sequence INTEGER NOT NULL CHECK(sequence >= 0),
+    body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 65536),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    PRIMARY KEY(run_id, sequence),
+    FOREIGN KEY(run_id, session_id)
+        REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
+) WITHOUT ROWID, STRICT;
 CREATE TABLE IF NOT EXISTS run_activities (
     run_id BLOB NOT NULL,
     session_id BLOB NOT NULL CHECK(length(session_id) = 16),
@@ -924,6 +935,33 @@ fn migrate_schema(connection: &Connection, from_version: u32) -> Result<()> {
                         )
                     })?;
                 version = 3;
+            }
+            // v4 adds the delivery cursor and store for user directions queued
+            // while a run is executing.
+            3 => {
+                transaction
+                    .execute_batch(
+                        "ALTER TABLE run_execution_state
+                             ADD COLUMN last_queued_direction_sequence INTEGER NOT NULL DEFAULT 0
+                             CHECK(last_queued_direction_sequence >= 0);
+                         CREATE TABLE IF NOT EXISTS run_queued_directions (
+                             run_id BLOB NOT NULL,
+                             session_id BLOB NOT NULL CHECK(length(session_id) = 16),
+                             sequence INTEGER NOT NULL CHECK(sequence >= 0),
+                             body TEXT NOT NULL CHECK(length(CAST(body AS BLOB)) <= 65536),
+                             created_at INTEGER NOT NULL CHECK(created_at >= 0),
+                             PRIMARY KEY(run_id, sequence),
+                             FOREIGN KEY(run_id, session_id)
+                                 REFERENCES run_summaries(run_id, session_id) ON DELETE CASCADE
+                         ) WITHOUT ROWID, STRICT;",
+                    )
+                    .map_err(|error| {
+                        persistence_error(
+                            format!("could not migrate persistence schema to v4: {error}"),
+                            true,
+                        )
+                    })?;
+                version = 4;
             }
             other => return Err(unsupported_database_error(other)),
         }

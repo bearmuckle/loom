@@ -6889,6 +6889,794 @@ fn project_child_control_covers_lifecycle_and_parent_grants() {
 }
 
 #[test]
+fn user_direction_reaches_a_parked_project_manager() {
+    let temp = std::env::temp_dir().join(format!(
+        "loom-project-manager-direction-e2e-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let persistence_path = temp.join("state.sqlite");
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_endpoint = model.endpoint.clone();
+    let model_id = ModelId::new("fixture/project-manager-direction");
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+        &persistence_path,
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Project manager direction e2e".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    assert!(matches!(
+        connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::SetWorkspaceConfigForWorkspace {
+                    workspace_id: workspace.id,
+                    config: WorkspaceConfig {
+                        project_agent_concurrency: 1,
+                        ..WorkspaceConfig::default()
+                    },
+                }
+            ),))
+            .result,
+        Ok(ServerResponse::Workspace(
+            WorkspaceResponse::WorkspaceConfigUpdated
+        ))
+    ));
+
+    let root_run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Coordinate a bounded investigation with a sub-agent.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+
+    // Turn one delegates a non-code child.
+    let root_delegate = model.next_for_manager();
+    assert!(request_has_tool(
+        &root_delegate.request,
+        "delegate_project_task"
+    ));
+    model.respond_with_tool(
+        root_delegate,
+        "delegate_project_task",
+        serde_json::json!({
+            "child_name": "investigator",
+            "intent": "Complete a short investigation and report the finding.",
+            "model_id": model_id,
+        }),
+    );
+
+    // Turn two parks the manager on the child.
+    let root_wait = model.next_for_manager();
+    assert!(request_has_tool(
+        &root_wait.request,
+        "wait_for_project_children"
+    ));
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let persistence = backend.persistence.as_ref().unwrap();
+    let child_task = persistence
+        .list_project_tasks(project_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.child_name == "investigator")
+        .expect("root delegation should create the investigator task");
+    model.respond_with_tool(
+        root_wait,
+        "wait_for_project_children",
+        serde_json::json!({ "task_ids": [child_task.task_id] }),
+    );
+
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::Paused
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while persistence
+        .load_delegated_task(child_task.task_id)
+        .unwrap()
+        .unwrap()
+        .status
+        != loom_core::DelegatedTaskStatus::Running
+    {
+        assert!(
+            Instant::now() < deadline,
+            "parking the manager should release its slot and admit the child"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let wait = persistence
+        .list_project_manager_waits_by_child(child_task.task_id)
+        .unwrap()
+        .into_iter()
+        .find(|wait| wait.manager_session_id == root)
+        .expect("parked manager wait should be durable");
+    assert_eq!(wait.status, loom_core::ProjectManagerWaitStatus::Waiting);
+
+    let parked = await_settled_run(&connection, root_run_id);
+    assert_eq!(parked.state, AgentRunState::Paused);
+
+    // A user direction must reach the parked manager instead of being rejected.
+    connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::SendAgentMessage {
+                run_id: root_run_id,
+                attempt_id: parked.attempt_id,
+                expected_control_revision: parked.control_revision,
+                message: "Change of plan: summarize what you have so far.".to_owned(),
+            },
+        )))
+        .result
+        .unwrap();
+
+    let redirected = model.next_for_manager();
+    let messages = redirected.request["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Change of plan"))
+        }),
+        "the manager should see the new user direction"
+    );
+    assert!(
+        messages.iter().any(|message| {
+            message["role"] == "tool"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("superseded"))
+        }),
+        "the superseded wait should be reported back to the manager"
+    );
+    model.respond_with_tool(
+        redirected,
+        "ask_user",
+        serde_json::json!({"prompt": "Which summary format should I use?"}),
+    );
+
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::NeedsInput
+    );
+    await_project_manager_wait_status(
+        persistence,
+        wait.wait_id,
+        loom_core::ProjectManagerWaitStatus::Abandoned,
+    );
+
+    // The child continues independently and can still finish.
+    let child_run_id = persistence
+        .load_latest_run_summary_for_session(child_task.target_session_id)
+        .unwrap()
+        .expect("admitted child should have a durable run")
+        .snapshot
+        .id;
+    let child_turn = model.next_for_child();
+    model.respond_with_text(child_turn, "Investigation complete.");
+    assert_eq!(
+        await_settled_run(&connection, child_run_id).state,
+        AgentRunState::Completed
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    drop(model);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn user_direction_queues_while_the_run_is_executing() {
+    let temp = std::env::temp_dir().join(format!(
+        "loom-active-direction-e2e-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let persistence_path = temp.join("state.sqlite");
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_endpoint = model.endpoint.clone();
+    let model_id = ModelId::new("fixture/active-direction");
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+        &persistence_path,
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Active direction e2e".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let root_run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Summarize the repository layout.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+
+    // The first model request is in flight, so the run is executing. A queued
+    // direction must not error.
+    let active_turn = model.next_for_manager();
+    let snapshot = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::GetAgentRun {
+                run_id: root_run_id,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRun(snapshot)) => snapshot,
+        response => panic!("unexpected active run response: {response:?}"),
+    };
+    assert!(matches!(
+        snapshot.state,
+        AgentRunState::Planning | AgentRunState::Executing | AgentRunState::Evaluating
+    ));
+    connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::SendAgentMessage {
+                run_id: root_run_id,
+                attempt_id: snapshot.attempt_id,
+                expected_control_revision: snapshot.control_revision,
+                message: "Focus on the crates directory.".to_owned(),
+            },
+        )))
+        .result
+        .unwrap();
+
+    // This step runs a read tool, then the worker delivers the queued direction
+    // before issuing the next model request.
+    model.respond_with_tool(active_turn, "list_files", serde_json::json!({}));
+    let redirected = model.next_for_manager();
+    let messages = redirected.request["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().any(|message| {
+            message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Focus on the crates directory"))
+        }),
+        "the queued direction should be delivered on the next model turn"
+    );
+    model.respond_with_text(redirected, "Repository layout summarized.");
+
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::Completed
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    drop(model);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn child_completion_wakes_a_finished_manager() {
+    let temp = std::env::temp_dir().join(format!("loom-child-wake-e2e-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&temp).unwrap();
+    let persistence_path = temp.join("state.sqlite");
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_endpoint = model.endpoint.clone();
+    let model_id = ModelId::new("fixture/child-wake");
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+        &persistence_path,
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Child wake e2e".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let root_run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Delegate a bounded task and continue with me meanwhile.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let persistence = backend.persistence.as_ref().unwrap();
+
+    // Turn one delegates a non-code child.
+    let root_delegate = model.next_for_manager();
+    assert!(request_has_tool(
+        &root_delegate.request,
+        "delegate_project_task"
+    ));
+    model.respond_with_tool(
+        root_delegate,
+        "delegate_project_task",
+        serde_json::json!({
+            "child_name": "worker",
+            "intent": "Do a short piece of work.",
+            "model_id": model_id,
+        }),
+    );
+
+    // Turn two replies to the user and ends the turn. An active child no longer
+    // blocks completion, which is what makes "continue here" work.
+    let root_reply = model.next_for_manager();
+    model.respond_with_text(root_reply, "Delegated. Continuing with you now.");
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::Completed
+    );
+
+    let child_task = persistence
+        .list_project_tasks(project_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.child_name == "worker")
+        .expect("delegation should create the worker task");
+    assert_eq!(child_task.status, loom_core::DelegatedTaskStatus::Running);
+    let child_run_id = persistence
+        .load_latest_run_summary_for_session(child_task.target_session_id)
+        .unwrap()
+        .expect("child should have a durable run")
+        .snapshot
+        .id;
+
+    // The child finishes without sending its own result; the server synthesizes
+    // a durable result and wakes the finished manager.
+    let child_turn = model.next_for_child();
+    model.respond_with_text(child_turn, "Child work complete.");
+    assert_eq!(
+        await_settled_run(&connection, child_run_id).state,
+        AgentRunState::Completed
+    );
+
+    let woken = model.next_for_manager();
+    let messages = woken.request["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().any(|message| {
+            message["name"] == "loom_project_message"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("worker") && content.contains("Completed")
+                })
+        }),
+        "the woken manager should see the child result"
+    );
+    model.respond_with_text(woken, "Thanks, I have the child result.");
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::Completed
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    drop(model);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelling_a_child_running_a_sleep_command_stops_promptly() {
+    let temp = std::env::temp_dir().join(format!(
+        "loom-child-sleep-cancel-e2e-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&temp).unwrap();
+    let persistence_path = temp.join("state.sqlite");
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_endpoint = model.endpoint.clone();
+    let model_id = ModelId::new("fixture/child-sleep-cancel");
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+        &persistence_path,
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Child sleep cancel e2e".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let root_run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Delegate a long sleep task.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let persistence = backend.persistence.as_ref().unwrap();
+
+    let root_delegate = model.next_for_manager();
+    assert!(request_has_tool(
+        &root_delegate.request,
+        "delegate_project_task"
+    ));
+    model.respond_with_tool(
+        root_delegate,
+        "delegate_project_task",
+        serde_json::json!({
+            "child_name": "sleeper",
+            "intent": "Run a long sleep command.",
+            "model_id": model_id,
+        }),
+    );
+
+    // The child's first model request only arrives once its task, session, and
+    // run exist, so wait for it before looking the task up.
+    let child_turn = model.next_for_child();
+    let child_task = persistence
+        .list_project_tasks(project_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.child_name == "sleeper")
+        .expect("delegation should create the sleeper task");
+    let child_run_id = persistence
+        .load_latest_run_summary_for_session(child_task.target_session_id)
+        .unwrap()
+        .expect("child should have a durable run")
+        .snapshot
+        .id;
+
+    model.respond_with_tool(
+        child_turn,
+        "run_command",
+        serde_json::json!({"command": "sleep", "args": ["30"], "timeout_ms": 30_000}),
+    );
+
+    // Wait until the child is actually blocked inside the command. The activity
+    // is in the live run handle because the step has not checkpointed yet.
+    let child_handle = connection
+        .backend
+        .runs()
+        .unwrap()
+        .get(&child_run_id)
+        .cloned()
+        .expect("child run should be registered");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let running = child_handle.state().activities.iter().any(|activity| {
+            activity.status == loom_protocol::AgentActivityStatus::Started
+                && matches!(
+                    &activity.data,
+                    loom_protocol::AgentActivityData::Command { command, .. }
+                        if command == "sleep"
+                )
+        });
+        if running {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child should start its sleep command; state={:?}",
+            child_handle.snapshot().state,
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let started = Instant::now();
+    let response = connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::ControlProjectChild {
+                project_id,
+                manager_session_id: root,
+                task_id: child_task.task_id,
+                action: ProjectChildControlAction::Cancel,
+            },
+        )))
+        .result
+        .unwrap();
+    assert!(matches!(
+        response,
+        ServerResponse::Project(ProjectResponse::ProjectChildControlled { .. })
+    ));
+    assert_eq!(
+        await_settled_run(&connection, child_run_id).state,
+        AgentRunState::Cancelled
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "cancelling a child must terminate its running command promptly"
+    );
+
+    // Finish the manager's pending turn so teardown does not wait on a held
+    // model request.
+    let root_followup = model.next_for_manager();
+    model.respond_with_text(root_followup, "The sleeper was cancelled.");
+    let _ = await_settled_run(&connection, root_run_id);
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    drop(model);
+    fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn archiving_a_session_with_a_deferred_run_stops_it() {
+    let persistence =
+        std::env::temp_dir().join(format!("loom-deferred-archive-{}.db", uuid::Uuid::new_v4()));
+    let (session_id, run_id) = {
+        let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+        let connection = backend.connect();
+        negotiate_m3(&connection);
+        let workspace = match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateWorkspace {
+                    name: "Deferred archive".to_owned(),
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+            response => panic!("unexpected workspace response: {response:?}"),
+        };
+        let session_id = match connection
+            .request(RequestEnvelope::new(ClientRequest::Workspace(
+                WorkspaceRequest::CreateAgentSessionInWorkspace {
+                    workspace_id: workspace.id,
+                    name: "deferred".to_owned(),
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+            response => panic!("unexpected session response: {response:?}"),
+        };
+        // Require approval so the run parks in a non-terminal state that is
+        // deferred on restore.
+        assert!(
+            connection
+                .request(RequestEnvelope::new(ClientRequest::Session(
+                    SessionRequest::SetSessionApprovalPolicy {
+                        session_id,
+                        policy: ApprovalPolicy::default(),
+                        auto_approve_actions: Some(false),
+                    },
+                )))
+                .result
+                .is_ok()
+        );
+        let run_id = match connection
+            .request(RequestEnvelope::new(ClientRequest::Run(
+                RunRequest::StartSessionAgentRun {
+                    session_id,
+                    task: "create a demo file".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    system_instructions: None,
+                    repository_instructions: None,
+                },
+            )))
+            .result
+            .unwrap()
+        {
+            ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+            response => panic!("unexpected run response: {response:?}"),
+        };
+        await_settled_run(&connection, run_id);
+        backend.flush().unwrap();
+        backend.shutdown().unwrap();
+        (session_id, run_id)
+    };
+    let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+    assert!(
+        backend.runs().unwrap().is_empty(),
+        "a non-terminal run is deferred on restore, so no handle is registered"
+    );
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ArchiveAgentSession { session_id },
+    )));
+    assert!(matches!(
+        archived.result,
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionArchived(_)
+        ))
+    ));
+    assert_eq!(
+        backend
+            .persistence
+            .as_ref()
+            .unwrap()
+            .load_run_summary(run_id)
+            .unwrap()
+            .unwrap()
+            .snapshot
+            .state,
+        AgentRunState::Cancelled,
+        "the deferred run must be stopped before the session is archived"
+    );
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_file(&persistence);
+}
+
+#[test]
+fn archiving_a_session_with_a_stale_active_state_recovers() {
+    let persistence =
+        std::env::temp_dir().join(format!("loom-stale-archive-{}.db", uuid::Uuid::new_v4()));
+    let backend = InProcessBackend::new_persistent(&persistence).unwrap();
+    let connection = backend.connect();
+    negotiate_m3(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Stale archive".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let session_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "stale".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    // Simulate a session left active by an earlier crash: the state says
+    // Executing but there is no run at all.
+    connection
+        .backend
+        .sessions()
+        .unwrap()
+        .transition(session_id, AgentSessionState::Executing)
+        .unwrap();
+    let archived = connection.request(RequestEnvelope::new(ClientRequest::Session(
+        SessionRequest::ArchiveAgentSession { session_id },
+    )));
+    assert!(matches!(
+        archived.result,
+        Ok(ServerResponse::Session(
+            SessionResponse::AgentSessionArchived(_)
+        ))
+    ));
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    let _ = fs::remove_file(&persistence);
+}
+
+#[test]
 fn durable_manager_wait_releases_workspace_slot_and_resumes_once() {
     let temp = std::env::temp_dir().join(format!(
         "loom-project-manager-wait-e2e-{}",

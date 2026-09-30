@@ -298,6 +298,31 @@ impl AgentRuntime {
         Ok(RunProgress::blocked(events))
     }
 
+    /// Resumes a non-running run so newly delivered project messages can be
+    /// processed. Terminal runs restart, paused runs resume, and a run blocked
+    /// on an interaction stays blocked.
+    pub fn resume_for_project_inbox(&mut self) -> Result<RunProgress> {
+        if self.pending_project_join.is_some() {
+            return Err(LoomError::new(
+                ErrorCode::InvalidState,
+                "project join is still pending",
+                false,
+            ));
+        }
+        let events = if self.pending_approval.is_some() {
+            self.set_state(AgentRunState::AwaitingApproval)
+        } else if self.pending_input.is_some() {
+            self.set_state(AgentRunState::NeedsInput)
+        } else {
+            self.run.completed_at = None;
+            self.run.summary = None;
+            self.run.updated_at = Timestamp::now();
+            self.set_state(AgentRunState::Executing)
+        };
+        let continues = self.pending_approval.is_none() && self.pending_input.is_none();
+        self.publish_progress(Ok(RunProgress { events, continues }))
+    }
+
     pub fn send_message(&mut self, message: impl Into<String>) -> Result<Vec<AgentEvent>> {
         let result = self.send_message_inner(message);
         self.publish(result)
@@ -645,6 +670,7 @@ impl AgentRuntime {
         });
         self.messages = initial_messages(&self.task);
         self.message_timeline_ordinals.clear();
+        self.last_queued_direction_sequence = 0;
         for _ in 0..self.messages.len() {
             let ordinal = self.allocate_timeline_ordinal();
             self.message_timeline_ordinals.push(ordinal);
