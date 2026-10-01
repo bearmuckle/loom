@@ -586,6 +586,9 @@ impl Render for LoomView {
             })
             .when(self.github_login.is_some(), |element| {
                 element.child(self.render_github_login_dialog(cx))
+            })
+            .when(self.source_dialog.is_some(), |element| {
+                element.child(self.render_source_dialog(layout, cx))
             }),
             ),
                 resizable_panel()
@@ -608,9 +611,6 @@ impl Render for LoomView {
             // Initializes the per-frame selection registry before selectable
             // text participants prepaint and register themselves.
             .child(TextSelectionLayer)
-            .when(self.source_dialog.is_some(), |element| {
-                element.child(self.render_source_dialog(layout, cx))
-            })
             .child(
                 div()
                     .h(px(30.))
