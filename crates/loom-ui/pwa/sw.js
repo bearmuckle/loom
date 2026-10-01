@@ -5,7 +5,9 @@
 // Android and desktop. It also keeps a copy of the app shell so an installed
 // Loom can start while offline. Fresh builds always win when the network is
 // reachable.
-const CACHE = "loom-v1";
+// Bump this whenever the app shell changes so already-registered clients drop
+// their stale cache on the next activation.
+const CACHE = "loom-v2";
 const SHELL = [
   "./",
   "./loom-client.js",

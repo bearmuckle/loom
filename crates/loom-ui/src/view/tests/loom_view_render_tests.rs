@@ -375,6 +375,39 @@ fn nested_project_tree_selects_grandchild_session_by_click(cx: &mut TestAppConte
 }
 
 #[gpui_kit::test]
+fn phone_drawer_selects_session_and_closes_the_drawer(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let rendered_view = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let rendered_view_for_window = rendered_view.clone();
+    let handle = cx.open_window(size(px(390.), px(844.)), move |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = nested_project_view(cx.focus_handle());
+            view.session_drawer_open = true;
+            view
+        });
+        *rendered_view_for_window.borrow_mut() = Some(view.clone());
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    let view = rendered_view.borrow().as_ref().unwrap().clone();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("mobile-session-drawer").visible());
+        window.click(("session-tree-root", 2usize), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).active_session.name, "Worker");
+        assert!(
+            window.try_find("mobile-session-drawer").is_none(),
+            "selecting a session should close the phone drawer"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn archiving_a_project_removes_descendant_sessions_from_the_tree(cx: &mut TestAppContext) {
     // Build the view without opening a window so the project poll (which
     // would run while a live project is rendered) never starts.
@@ -2791,9 +2824,10 @@ fn phone_drawer_and_review_sidebar_controls_toggle_panels(cx: &mut TestAppContex
         let drawer = window.find("mobile-session-drawer");
         assert!(drawer.visible());
         let drawer_width = drawer.bounds().size.width;
-        assert!(
-            drawer_width <= px(300.),
-            "phone drawer should not fill the whole width: {drawer_width:?}"
+        assert_eq!(
+            drawer_width,
+            window.bounds().size.width,
+            "phone drawer should fill the screen"
         );
         let row = window
             .within("mobile-session-drawer")
@@ -2831,6 +2865,30 @@ fn phone_drawer_and_review_sidebar_controls_toggle_panels(cx: &mut TestAppContex
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(window.try_find("close-inspector").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn phone_session_drawer_close_button_dismisses_the_drawer(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(844.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.session_drawer_open = true;
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("mobile-session-drawer").visible());
+        assert!(window.find("close-session-drawer").visible());
+        window.click("close-session-drawer", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("mobile-session-drawer").is_none());
     })
     .unwrap();
 }

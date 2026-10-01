@@ -1,6 +1,6 @@
 use super::{
     COMPACT_REVIEW_WIDTH, COMPACT_SIDEBAR_WIDTH, FULL_REVIEW_WIDTH, FULL_SIDEBAR_WIDTH,
-    PHONE_SIDEBAR_WIDTH, PHONE_TOUCH_TARGET, responsive_layout, review_panel_is_visible,
+    PHONE_TOUCH_TARGET, responsive_layout, review_panel_is_visible,
 };
 use gpui_kit::px;
 
@@ -22,10 +22,10 @@ fn wide_windows_keep_full_navigation_panels() {
 }
 
 #[test]
-fn phone_windows_show_single_column_and_full_width_review() {
+fn phone_windows_show_single_column_and_full_width_panels() {
     let layout = responsive_layout(px(390.));
     assert!(layout.phone);
-    assert_eq!(layout.sidebar_width, PHONE_SIDEBAR_WIDTH);
+    assert_eq!(layout.sidebar_width, px(390.));
     assert_eq!(layout.review_width, px(390.));
 }
 

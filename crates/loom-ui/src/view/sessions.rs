@@ -350,6 +350,7 @@ impl LoomView {
         self.status_banner = None;
         self.review.open = false;
         self.project_child_review = None;
+        self.session_drawer_open = false;
         let project_context = self.project_snapshot.clone().filter(|snapshot| {
             snapshot
                 .agents

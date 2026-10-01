@@ -4,11 +4,10 @@ pub(crate) fn responsive_layout(width: Pixels) -> ResponsiveLayout {
     if width < PHONE_LAYOUT_WIDTH {
         ResponsiveLayout {
             phone: true,
-            sidebar_width: if width < PHONE_SIDEBAR_WIDTH {
-                width
-            } else {
-                PHONE_SIDEBAR_WIDTH
-            },
+            // The phone session drawer is the primary navigation surface, so it
+            // fills the screen instead of leaving a sliver of the timeline
+            // visible behind it.
+            sidebar_width: width,
             review_width: width,
         }
     } else if width < COMPACT_LAYOUT_WIDTH {
@@ -53,7 +52,7 @@ impl ResponsiveLayout {
     /// The font size for navigation list labels.
     pub(crate) fn nav_row_font_size(self) -> gpui_kit::Rems {
         if self.phone {
-            gpui_kit::rems(16. / BASE_FONT_SIZE)
+            gpui_kit::rems(14. / BASE_FONT_SIZE)
         } else {
             gpui_kit::rems(0.8125)
         }
