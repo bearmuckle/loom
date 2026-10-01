@@ -29,13 +29,29 @@ pub(crate) fn should_prune_worker_feed(
         || accumulated_bytes.saturating_add(pending_bytes) >= FEED_PRUNE_AFTER_NEW_BYTES
 }
 
+/// Repositories fetched per page when listing the account's repositories.
+const GITHUB_REPOSITORY_PAGE_SIZE: usize = 100;
+/// Safety cap so a huge account cannot make the picker page forever.
+const GITHUB_REPOSITORY_MAX_PAGES: usize = 100;
+/// Maximum number of matches returned to the picker.
+const GITHUB_REPOSITORY_MAX_RESULTS: usize = 50;
+
 pub(crate) fn search_github_repositories(
     token: &str,
     query: &str,
 ) -> Result<Vec<GitHubRepository>> {
-    search_github_repositories_at(token, query, "https://api.github.com/search/repositories")
+    search_github_repositories_at(token, query, "https://api.github.com/user/repos")
 }
 
+/// Lists the repositories the authenticated account can access and keeps the
+/// ones matching `query`.
+///
+/// GitHub's global `/search/repositories` endpoint searches public repositories
+/// across all of GitHub, which is not what the source picker wants. The
+/// `/user/repos` endpoint instead returns exactly the repositories the account
+/// can access: owned, collaborator, and organization-member repositories,
+/// including private ones. Those pages are filtered locally, so the picker only
+/// ever offers repositories the account can clone.
 pub(crate) fn search_github_repositories_at(
     token: &str,
     query: &str,
@@ -47,6 +63,7 @@ pub(crate) fn search_github_repositories_at(
             "GitHub repository search requires at least {GITHUB_REPOSITORY_QUERY_MIN_CHARS} characters"
         )));
     }
+    let needle = github_search_needle(query);
     run_github_async(async {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -58,101 +75,145 @@ pub(crate) fn search_github_repositories_at(
                     true,
                 )
             })?;
-        let mut url = url::Url::parse(endpoint).map_err(|error| {
-            LoomError::new(
-                ErrorCode::Internal,
-                format!("could not build the GitHub search URL: {error}"),
-                false,
-            )
-        })?;
-        url.query_pairs_mut()
-            .append_pair("q", &github_search_query(query))
-            .append_pair("per_page", "50");
-        let response = client
-            .get(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("Authorization", format!("Bearer {token}"))
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("User-Agent", "Loom")
-            .send()
-            .await
-            .map_err(|error| {
+        let mut matches = Vec::new();
+        for page in 1..=GITHUB_REPOSITORY_MAX_PAGES {
+            let mut url = url::Url::parse(endpoint).map_err(|error| {
                 LoomError::new(
-                    ErrorCode::ProviderAuthentication,
-                    format!("could not search GitHub repositories: {error}"),
-                    true,
+                    ErrorCode::Internal,
+                    format!("could not build the GitHub repository URL: {error}"),
+                    false,
                 )
             })?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(LoomError::new(
-                ErrorCode::ProviderAuthentication,
-                format!(
-                    "could not search GitHub repositories (HTTP {})",
-                    status.as_u16()
-                ),
-                true,
-            ));
+            url.query_pairs_mut()
+                .append_pair("per_page", &GITHUB_REPOSITORY_PAGE_SIZE.to_string())
+                .append_pair("sort", "updated")
+                .append_pair("direction", "desc")
+                .append_pair("affiliation", "owner,collaborator,organization_member")
+                .append_pair("page", &page.to_string());
+            let response = client
+                .get(url)
+                .header("Accept", "application/vnd.github+json")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "Loom")
+                .send()
+                .await
+                .map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::ProviderAuthentication,
+                        format!("could not list GitHub repositories: {error}"),
+                        true,
+                    )
+                })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(LoomError::new(
+                    ErrorCode::ProviderAuthentication,
+                    format!(
+                        "could not list GitHub repositories (HTTP {})",
+                        status.as_u16()
+                    ),
+                    true,
+                ));
+            }
+            let page_repositories: Vec<GitHubApiRepository> =
+                response.json().await.map_err(|error| {
+                    LoomError::new(
+                        ErrorCode::ProviderInvalidResponse,
+                        format!("GitHub returned an invalid repository list: {error}"),
+                        false,
+                    )
+                })?;
+            let page_len = page_repositories.len();
+            matches.extend(page_repositories.into_iter().filter_map(|repository| {
+                github_repository_rank(&repository, &needle).map(|rank| (rank, repository))
+            }));
+            if page_len < GITHUB_REPOSITORY_PAGE_SIZE {
+                break;
+            }
         }
-        let payload: GitHubSearchResponse = response.json().await.map_err(|error| {
-            LoomError::new(
-                ErrorCode::ProviderInvalidResponse,
-                format!("GitHub returned an invalid repository search: {error}"),
-                false,
-            )
-        })?;
-        let mut repositories = payload
-            .items
+        // Best match first: a name match outranks a description match, and
+        // ties fall back to an alphabetical order for a stable picker.
+        matches.sort_by(|(left_rank, left), (right_rank, right)| {
+            left_rank
+                .cmp(right_rank)
+                .then_with(|| {
+                    left.full_name
+                        .to_lowercase()
+                        .cmp(&right.full_name.to_lowercase())
+                })
+                .then_with(|| left.full_name.cmp(&right.full_name))
+        });
+        let mut seen = std::collections::HashSet::new();
+        matches.retain(|(_, repository)| seen.insert(repository.full_name.clone()));
+        matches.truncate(GITHUB_REPOSITORY_MAX_RESULTS);
+        Ok(matches
             .into_iter()
-            .map(|repository| GitHubRepository {
+            .map(|(_, repository)| GitHubRepository {
                 full_name: repository.full_name,
                 description: repository.description,
                 clone_url: repository.clone_url,
                 private: repository.private,
                 default_branch: repository.default_branch,
             })
-            .collect::<Vec<_>>();
-        // Keep GitHub's best-match order so an exact name stays at the top
-        // instead of being buried by an alphabetical re-sort.
-        let mut seen = std::collections::HashSet::new();
-        repositories.retain(|repository| seen.insert(repository.full_name.clone()));
-        Ok(repositories)
+            .collect())
     })
 }
 
-/// Builds the GitHub search expression for a picker query.
+/// Normalizes a picker query for local matching.
 ///
-/// A plain term searches repository names and descriptions. GitHub's name
-/// search does not match the owner and does not understand `owner/name`, so
-/// `owner/name` (or a pasted GitHub URL) is turned into an owner-scoped search
-/// instead of returning nothing.
-pub(crate) fn github_search_query(query: &str) -> String {
+/// A pasted GitHub URL (or an `owner/name` reference) is reduced to the
+/// `owner/name` portion so it matches a repository `full_name`, including when
+/// the URL points at a subdirectory or ends in `.git`.
+pub(crate) fn github_search_needle(query: &str) -> String {
     let query = query.trim();
-    let reference = [
+    for prefix in [
         "https://github.com/",
         "http://github.com/",
         "github.com/",
         "git@github.com:",
-    ]
-    .iter()
-    .find_map(|prefix| query.strip_prefix(prefix))
-    .unwrap_or(query);
-    if let Some((owner, rest)) = reference.split_once('/') {
-        let name = rest.split('/').next().unwrap_or_default();
-        let name = name.strip_suffix(".git").unwrap_or(name);
-        let valid = |part: &str| {
-            part.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        };
-        if !owner.is_empty() && valid(owner) && valid(name) {
-            return if name.is_empty() {
-                format!("user:{owner}")
-            } else {
-                format!("{name} in:name user:{owner}")
+    ] {
+        if let Some(reference) = query.strip_prefix(prefix) {
+            let mut parts = reference.split(['/', '?', '#']);
+            let owner = parts.next().unwrap_or_default();
+            let name = parts.next().unwrap_or_default().trim_end_matches(".git");
+            return match (owner.is_empty(), name.is_empty()) {
+                (true, _) => query.to_lowercase(),
+                (false, true) => format!("{owner}/").to_lowercase(),
+                (false, false) => format!("{owner}/{name}").to_lowercase(),
             };
         }
     }
-    format!("{query} in:name,description")
+    query.trim_end_matches(".git").to_lowercase()
+}
+
+/// Returns how well `repository` matches an already-normalized `needle`, where
+/// a lower rank is a better match. `None` means the repository does not match.
+///
+/// A name match always outranks a description match so typing a repository name
+/// surfaces that repository before others that merely mention the term.
+pub(crate) fn github_repository_rank(repository: &GitHubApiRepository, needle: &str) -> Option<u8> {
+    let full_name = repository.full_name.to_lowercase();
+    let name = full_name.rsplit('/').next().unwrap_or(full_name.as_str());
+    if full_name == needle {
+        Some(0)
+    } else if name == needle {
+        Some(1)
+    } else if name.starts_with(needle) {
+        Some(2)
+    } else if name.contains(needle) {
+        Some(3)
+    } else if full_name.contains(needle) {
+        Some(4)
+    } else if repository
+        .description
+        .as_deref()
+        .is_some_and(|description| description.to_lowercase().contains(needle))
+    {
+        Some(5)
+    } else {
+        None
+    }
 }
 
 fn run_github_async<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {

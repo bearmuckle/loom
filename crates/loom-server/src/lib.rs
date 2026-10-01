@@ -105,11 +105,6 @@ struct GitHubApiRepository {
     default_branch: String,
 }
 
-#[derive(Deserialize)]
-struct GitHubSearchResponse {
-    items: Vec<GitHubApiRepository>,
-}
-
 pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};
 pub use remote::{
     RemoteServer, RemoteServerConfig, RunningRemoteServer, WebSocketConnection, WebSocketTransport,
