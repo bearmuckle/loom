@@ -738,6 +738,178 @@ pub(crate) fn open_external_url(url: &str) -> Result<(), std::io::Error> {
     }
 }
 
+/// The canonical repository URL. Every other project link is derived from it
+/// so a moved repository only needs one edit.
+pub(crate) const LOOM_REPOSITORY_URL: &str = "https://github.com/bearmuckle/loom";
+
+/// One external link row in the About pane. The absolute URL is derived from
+/// [`LOOM_REPOSITORY_URL`] plus a relative `path`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AboutLink {
+    /// Stable test-support id for the row's "Open" control.
+    pub(crate) id: &'static str,
+    /// The visible label.
+    pub(crate) label: &'static str,
+    /// Repository-relative path, empty for the repository root.
+    path: &'static str,
+}
+
+impl AboutLink {
+    /// The absolute URL, derived from [`LOOM_REPOSITORY_URL`].
+    pub(crate) fn url(&self) -> String {
+        format!("{LOOM_REPOSITORY_URL}{}", self.path)
+    }
+}
+
+/// The external links shown in the About pane, in display order.
+pub(crate) fn about_links() -> [AboutLink; 4] {
+    [
+        AboutLink {
+            id: "about-link-docs",
+            label: "Documentation",
+            path: "/tree/main/docs",
+        },
+        AboutLink {
+            id: "about-link-source",
+            label: "Source",
+            path: "",
+        },
+        AboutLink {
+            id: "about-link-releases",
+            label: "Releases",
+            path: "/releases",
+        },
+        AboutLink {
+            id: "about-link-security",
+            label: "Report a security issue",
+            path: "/security/advisories/new",
+        },
+    ]
+}
+
+/// Where the client routes requests, derived from the same state the rest of
+/// the view uses so the About subtitle never asserts "local" for a remote or
+/// demo backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AboutBackend {
+    /// Native in-process backend, no network endpoint.
+    Local,
+    /// Deterministic demo provider.
+    Demo,
+    /// Native `--remote` WebSocket backend.
+    Remote,
+    /// Browser client, which always talks to a remote worker.
+    Browser,
+}
+
+pub(crate) fn about_backend(demo: bool, browser: bool, endpoint: Option<&str>) -> AboutBackend {
+    if demo {
+        AboutBackend::Demo
+    } else if browser {
+        AboutBackend::Browser
+    } else if endpoint.is_some() {
+        AboutBackend::Remote
+    } else {
+        AboutBackend::Local
+    }
+}
+
+/// The one-line About subtitle describing where requests are routed.
+pub(crate) fn about_backend_label(demo: bool, browser: bool, endpoint: Option<&str>) -> String {
+    let target = || {
+        endpoint
+            .map(endpoint_label)
+            .unwrap_or_else(|| "not connected".to_owned())
+    };
+    match about_backend(demo, browser, endpoint) {
+        AboutBackend::Local => "Local · in-process backend".to_owned(),
+        AboutBackend::Demo => "Demo · deterministic provider".to_owned(),
+        AboutBackend::Remote => format!("Remote · {}", target()),
+        AboutBackend::Browser => format!("Browser · {}", target()),
+    }
+}
+
+/// The endpoint's host and port with the scheme, any userinfo, the path, the
+/// query, and the fragment stripped, so credentials or tokens are never shown.
+pub(crate) fn endpoint_host(url: &str) -> String {
+    let trimmed = url.trim();
+    let authority = match trimmed.split_once("://") {
+        Some((_, rest)) => rest,
+        None => trimmed,
+    };
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host.is_empty() {
+        return trimmed.to_owned();
+    }
+    host.to_owned()
+}
+
+/// The endpoint's scheme, host, and port, with userinfo, path, and query
+/// removed. This is the form shown in the About subtitle.
+pub(crate) fn endpoint_label(url: &str) -> String {
+    let trimmed = url.trim();
+    let host = endpoint_host(trimmed);
+    match trimmed.split_once("://") {
+        Some((scheme, _)) if !scheme.is_empty() && !host.is_empty() => {
+            format!("{scheme}://{host}")
+        }
+        _ => host,
+    }
+}
+
+/// The revision stamped by `build.rs`, or the literal `unknown` when none was
+/// available at build time.
+pub(crate) fn about_git_revision() -> &'static str {
+    option_env!("LOOM_GIT_REVISION").unwrap_or("unknown")
+}
+
+/// The Version row: the crate version, plus the revision when one was stamped.
+pub(crate) fn about_version_label(version: &str, revision: &str) -> String {
+    let revision = revision.trim();
+    if revision.is_empty() || revision == "unknown" {
+        version.to_owned()
+    } else {
+        format!("{version} · {revision}")
+    }
+}
+
+/// The Platform row: the target OS and architecture, plus the runtime kind.
+pub(crate) fn about_platform_label(os: &str, arch: &str, browser: bool) -> String {
+    let runtime = if browser { "browser" } else { "native" };
+    format!("{os} {arch} · {runtime}")
+}
+
+/// The rendered Protocol row: the client and server versions, plus whether
+/// they differ.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AboutProtocol {
+    pub(crate) text: String,
+    pub(crate) mismatch: bool,
+}
+
+/// Formats the client and (optionally negotiated) server protocol versions.
+pub(crate) fn about_protocol(
+    client: ProtocolVersion,
+    server: Option<ProtocolVersion>,
+) -> AboutProtocol {
+    match server {
+        Some(server) => AboutProtocol {
+            text: format!(
+                "client {}.{} · server {}.{}",
+                client.major, client.minor, server.major, server.minor
+            ),
+            mismatch: server != client,
+        },
+        None => AboutProtocol {
+            text: format!("client {}.{} · server unknown", client.major, client.minor),
+            mismatch: false,
+        },
+    }
+}
+
 pub(crate) fn format_duration(elapsed_ms: u64) -> String {
     if elapsed_ms < 1_000 {
         format!("{elapsed_ms}ms")

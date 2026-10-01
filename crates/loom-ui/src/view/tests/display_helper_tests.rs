@@ -1,14 +1,16 @@
 use super::{
-    AgentActivityData, AgentActivityRecord, AgentActivityStatus, CompletionKind,
-    FileActivityOperation, ToolPart, ToolPartStatus, activity_output, change_kind_label,
-    command_line, command_purpose, commands_matching, completion_for_value, composer_height,
-    format_bytes, format_duration, format_percentage, humanize_tool_output,
+    AboutBackend, AboutLink, AgentActivityData, AgentActivityRecord, AgentActivityStatus,
+    CompletionKind, FileActivityOperation, LOOM_REPOSITORY_URL, ToolPart, ToolPartStatus,
+    about_backend, about_backend_label, about_git_revision, about_links, about_platform_label,
+    about_protocol, about_version_label, activity_output, change_kind_label, command_line,
+    command_purpose, commands_matching, completion_for_value, composer_height, endpoint_host,
+    endpoint_label, format_bytes, format_duration, format_percentage, humanize_tool_output,
     is_redundant_completion_summary, relative_time, replace_command_token, replace_last_token, rgb,
     run_state_color, run_state_label, session_is_active, session_status_pill, source_mount_path,
     tool_detail, tool_failure_count, tool_group_label, tool_group_status, tool_part_from_activity,
     tool_status, tool_title, tool_title_for_activity, tool_usage_label, tool_usage_summary,
 };
-use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
+use loom_core::{ActivityId, AgentSessionState, ProtocolVersion, RunId, Timestamp};
 use loom_model::{ModelId, ToolCall};
 use loom_protocol::{AgentActivityKind, AgentRunState, ToolResult};
 use serde_json::json;
@@ -604,4 +606,125 @@ fn run_state_colors_and_activity_classification_are_distinct() {
     assert!(session_is_active(AgentSessionState::NeedsInput));
     assert!(!session_is_active(AgentSessionState::Idle));
     assert!(!session_is_active(AgentSessionState::Archived));
+}
+
+#[test]
+fn about_backend_labels_describe_every_route() {
+    assert_eq!(about_backend(false, false, None), AboutBackend::Local);
+    assert_eq!(
+        about_backend(false, false, Some("ws://worker.example:8443/ws")),
+        AboutBackend::Remote
+    );
+    assert_eq!(about_backend(true, false, None), AboutBackend::Demo);
+    assert_eq!(
+        about_backend(false, true, Some("wss://worker.example:8443/ws")),
+        AboutBackend::Browser
+    );
+    // A demo workspace wins over any configured endpoint because nothing real
+    // is connected in that mode.
+    assert_eq!(
+        about_backend(true, true, Some("wss://worker.example:8443/ws")),
+        AboutBackend::Demo
+    );
+
+    assert_eq!(
+        about_backend_label(false, false, None),
+        "Local · in-process backend"
+    );
+    assert_eq!(
+        about_backend_label(false, false, Some("ws://worker.example:8443/ws")),
+        "Remote · ws://worker.example:8443"
+    );
+    assert_eq!(
+        about_backend_label(true, false, None),
+        "Demo · deterministic provider"
+    );
+    assert_eq!(
+        about_backend_label(false, true, Some("wss://worker.example:8443/ws")),
+        "Browser · wss://worker.example:8443"
+    );
+    assert_eq!(
+        about_backend_label(false, true, None),
+        "Browser · not connected"
+    );
+}
+
+#[test]
+fn endpoint_labels_strip_credentials_paths_and_queries() {
+    let url = "wss://user:secret@worker.example:8443/ws?token=hidden";
+    assert_eq!(endpoint_host(url), "worker.example:8443");
+    assert_eq!(endpoint_label(url), "wss://worker.example:8443");
+    assert!(!endpoint_label(url).contains("secret"));
+    assert!(!endpoint_label(url).contains("hidden"));
+
+    assert_eq!(
+        endpoint_host("worker.example:8443/ws"),
+        "worker.example:8443"
+    );
+    assert_eq!(endpoint_label("worker.example:8443"), "worker.example:8443");
+    assert_eq!(endpoint_host("ws://[::1]:8443/ws"), "[::1]:8443");
+    assert_eq!(endpoint_label("ws://[::1]:8443/ws"), "ws://[::1]:8443");
+    assert_eq!(endpoint_host("  ws://host:1234/  "), "host:1234");
+    assert_eq!(endpoint_host(""), "");
+    assert_eq!(endpoint_label(""), "");
+}
+
+#[test]
+fn version_and_platform_labels_handle_missing_build_metadata() {
+    assert_eq!(about_version_label("0.1.0", "a1b2c3d"), "0.1.0 · a1b2c3d");
+    assert_eq!(about_version_label("0.1.0", "unknown"), "0.1.0");
+    assert_eq!(about_version_label("0.1.0", ""), "0.1.0");
+    assert_eq!(about_version_label("0.1.0", "   "), "0.1.0");
+    assert_eq!(
+        about_platform_label("linux", "x86_64", false),
+        "linux x86_64 · native"
+    );
+    assert_eq!(
+        about_platform_label("macos", "aarch64", true),
+        "macos aarch64 · browser"
+    );
+    assert!(!about_git_revision().is_empty());
+}
+
+#[test]
+fn protocol_labels_report_matches_mismatches_and_unknown_servers() {
+    let client = ProtocolVersion::new(11, 1);
+
+    let matched = about_protocol(client, Some(ProtocolVersion::new(11, 1)));
+    assert_eq!(matched.text, "client 11.1 · server 11.1");
+    assert!(!matched.mismatch);
+
+    let older = about_protocol(client, Some(ProtocolVersion::new(11, 0)));
+    assert_eq!(older.text, "client 11.1 · server 11.0");
+    assert!(older.mismatch);
+
+    let unknown = about_protocol(client, None);
+    assert_eq!(unknown.text, "client 11.1 · server unknown");
+    assert!(!unknown.mismatch);
+}
+
+#[test]
+fn about_link_urls_are_derived_from_the_repository_constant() {
+    let links = about_links();
+    let urls = links.iter().map(AboutLink::url).collect::<Vec<_>>();
+    assert_eq!(
+        urls,
+        vec![
+            "https://github.com/bearmuckle/loom/tree/main/docs",
+            "https://github.com/bearmuckle/loom",
+            "https://github.com/bearmuckle/loom/releases",
+            "https://github.com/bearmuckle/loom/security/advisories/new",
+        ]
+    );
+    assert!(urls.iter().all(|url| url.starts_with(LOOM_REPOSITORY_URL)));
+    let ids = links.iter().map(|link| link.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids,
+        vec![
+            "about-link-docs",
+            "about-link-source",
+            "about-link-releases",
+            "about-link-security",
+        ]
+    );
 }

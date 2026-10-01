@@ -60,3 +60,24 @@ fn settings_sections_and_dialogs_render(cx: &mut TestAppContext) {
         view.github_login = Some(GitHubLoginState::Success);
     });
 }
+
+#[gpui_kit::test]
+fn about_command_opens_the_about_section_and_help_lists_it(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.run_command("about", None, cx);
+        assert!(view.settings_open);
+        assert_eq!(view.settings_section, SettingsSection::About);
+
+        view.run_command("help", None, cx);
+        let help = view
+            .status_banner
+            .as_ref()
+            .expect("help sets a status note");
+        assert!(help.text.contains("/about"));
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
+        .unwrap();
+}

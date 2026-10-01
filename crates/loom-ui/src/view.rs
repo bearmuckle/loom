@@ -36,8 +36,8 @@ use gpui_kit::{
 };
 use loom_core::{
     ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
-    EventSequence, LoomError, RepositoryId, RunId, Timestamp, ToolCallId, UsageSnapshot,
-    WorkspaceId, WorkspaceRecord,
+    EventSequence, LoomError, ProtocolVersion, RepositoryId, RunId, Timestamp, ToolCallId,
+    UsageSnapshot, WorkspaceId, WorkspaceRecord,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_local::GitHubDeviceCode;
@@ -48,15 +48,16 @@ use loom_model::{MessageRole, ModelId, ModelMessage, ProviderKind, ProviderSumma
 use loom_protocol::GitHubCopilotLoginStatus;
 use loom_protocol::{
     AgentActivityData, AgentActivityRecord, AgentActivityStatus, AgentEvent, AgentRunSnapshot,
-    AgentRunSnapshotProjection, AgentRunState, ClientRequest, ContextRequest, ContextResponse,
-    EventsRequest, EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
-    GitDiffLineKind, GitFileStatusKind, GitHubRepository, GitRepositoryStatus,
-    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction, ProjectRequest, ProjectResponse,
-    ProviderRequest, ProviderResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope,
-    ResponseEnvelope, RunRequest, RunResponse, ServerEvent, ServerResponse, SessionDirectory,
-    SessionRepository, SessionRequest, SessionResponse, TaskRequest, TerminalRequest, UsageRequest,
-    UsageResponse, WorkerNodeConfig, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
-    WorkspaceEntryKind, WorkspaceFeedEvent, WorkspaceRequest, WorkspaceResponse,
+    AgentRunSnapshotProjection, AgentRunState, CURRENT_PROTOCOL_VERSION, ClientRequest,
+    ContextRequest, ContextResponse, EventsRequest, EventsResponse, FileActivityOperation,
+    FilesystemRequest, FilesystemResponse, GitDiffLineKind, GitFileStatusKind, GitHubRepository,
+    GitRepositoryStatus, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectChildControlAction,
+    ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse, RepositoryRequest,
+    RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
+    ServerResponse, SessionDirectory, SessionRepository, SessionRequest, SessionResponse,
+    TaskRequest, TerminalRequest, UsageRequest, UsageResponse, WorkerNodeConfig,
+    WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceEntryKind, WorkspaceFeedEvent,
+    WorkspaceRequest, WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 #[cfg(not(target_family = "wasm"))]
@@ -203,6 +204,12 @@ const COMMANDS: &[CommandSpec] = &[
         title: "Settings",
         description: "Themes, workers, and preferences",
         shortcut: Some(","),
+    },
+    CommandSpec {
+        name: "about",
+        title: "About Loom",
+        description: "Build version, platform, and project links",
+        shortcut: None,
     },
     CommandSpec {
         name: "help",
@@ -401,6 +408,17 @@ pub(crate) struct LoomView {
     pub(crate) connection: ClientConnection,
     #[cfg(not(target_family = "wasm"))]
     owned_backend: Option<loom_local::OwnedBackend>,
+    /// The negotiated protocol version of the active backend, or `None` when no
+    /// negotiation result is retained (for example a disconnected browser view).
+    server_protocol_version: Option<ProtocolVersion>,
+    /// The active backend's endpoint URL: `Some` for a native `--remote` or a
+    /// browser client, `None` for the in-process and demo backends. Only the URL
+    /// is stored; the access token is never part of view state.
+    backend_endpoint: Option<String>,
+    /// Whether this view is the browser client. A plain field rather than `cfg!`
+    /// so the About pane can render and be tested in the browser configuration
+    /// on native builds too.
+    browser_client: bool,
     /// Used for every request made once the view is interactive.
     pub(crate) backend: BackendWorker,
     /// The startup backend remains the default for workspace requests and new sessions.
@@ -794,6 +812,17 @@ fn settings_row(
                 ),
         )
         .child(control)
+}
+
+/// A read-only value shown on the right of an About row, with a stable
+/// test-support id so render tests can find it.
+fn about_value(id: &'static str, text: String, color: Rgba) -> impl IntoElement {
+    div()
+        .id(id)
+        .test_support()
+        .text_sm()
+        .text_color(color)
+        .child(text)
 }
 
 /// A `- value +` control used by numeric settings rows.
@@ -1260,6 +1289,9 @@ impl LoomView {
             connection,
             #[cfg(not(target_family = "wasm"))]
             owned_backend: None,
+            server_protocol_version: None,
+            backend_endpoint: None,
+            browser_client: false,
             default_backend_node_id: node_id.clone(),
             node_backends,
             node_names: BTreeMap::new(),
