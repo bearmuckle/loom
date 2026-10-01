@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Loom mockup — multi-user support (#25)</title>
+<style>
+  /* Palette: Catppuccin Mocha, the dark theme from crates/loom-ui/src/theme.rs. */
+  :root {
+    --base:#1e1e2e; --mantle:#181825; --crust:#11111b;
+    --surface0:#313244; --surface1:#45475a; --surface2:#585b70;
+    --overlay0:#6c7086; --overlay1:#7f849c; --overlay2:#9399b2;
+    --text:#cdd6f4; --subtext1:#bac2de; --subtext0:#a6adc8;
+    --lavender:#b4befe; --blue:#89b4fa; --sapphire:#74c7ec; --sky:#89dceb;
+    --teal:#94e2d5; --green:#a6e3a1; --yellow:#f9e2af; --peach:#fab387;
+    --maroon:#eba0ac; --red:#f38ba8; --mauve:#cba6f7; --pink:#f5c2e7;
+    --on-accent:#1e1e2e;
+    /* Tinted status surfaces derived the way theme.rs blends base with a role. */
+    --success-surface:#364243; --danger-surface:#443244;
+    --warning-surface:#454145; --info-surface:#3d3652;
+    --page:#0f0f18;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; background:var(--page); color:var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased; }
+  body { padding:22px 22px 60px; }
+  .mono { font-family: "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace; }
+
+  /* ---------- page chrome ---------- */
+  .page-head { max-width:1200px; margin:0 auto 18px; }
+  .page-head h1 { font-size:22px; margin:0 0 6px; font-weight:650; letter-spacing:-.01em; }
+  .page-head p { margin:0; color:var(--subtext0); font-size:14px; line-height:1.5; max-width:900px; }
+  .page-head a { color:var(--blue); text-decoration:none; }
+  .page-head a:hover { text-decoration:underline; }
+  .scenes-nav { max-width:1200px; margin:18px auto; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  .scene-tab { border:1px solid var(--surface1); background:var(--mantle); color:var(--subtext1);
+    padding:7px 13px; border-radius:8px; font-size:13px; cursor:pointer; }
+  .scene-tab:hover { background:var(--surface0); }
+  .scene-tab.active { background:var(--surface0); border-color:var(--blue); color:var(--text); }
+  .zoom { margin-left:auto; display:flex; gap:6px; align-items:center; color:var(--subtext0); font-size:12px; }
+  .zoom button { border:1px solid var(--surface1); background:var(--mantle); color:var(--subtext1);
+    border-radius:6px; padding:4px 9px; font-size:12px; cursor:pointer; }
+  .zoom button:hover { background:var(--surface0); }
+  .stage-wrap { max-width:fit-content; margin:0 auto; }
+  .stage { transform-origin: top left; }
+
+  .scene-title { max-width:1200px; margin:0 auto 10px; display:flex; align-items:baseline; gap:12px; }
+  .scene-title h2 { font-size:15px; margin:0; font-weight:620; }
+  .scene-title span { color:var(--subtext0); font-size:13px; }
+
+  /* ---------- app window ---------- */
+  .window { position:relative; width:1360px; height:840px; background:var(--base);
+    border:1px solid var(--surface1); border-radius:10px; overflow:hidden;
+    box-shadow: 0 24px 60px rgba(0,0,0,.55); font-size:13.5px; }
+  .titlebar { height:30px; padding:0 12px; background:var(--surface0); display:flex; align-items:center;
+    gap:8px; font-size:11px; color:var(--subtext0); }
+  .titlebar .brand { color:var(--subtext0); }
+  .titlebar .dim { color:var(--overlay0); }
+  .body { display:flex; height:calc(100% - 30px); }
+
+  /* sidebar */
+  .sidebar { width:250px; flex:none; background:var(--mantle); padding:8px; display:flex; flex-direction:column;
+    gap:8px; border-right:1px solid var(--surface0); }
+  .side-head { display:flex; align-items:center; justify-content:space-between; font-size:11px; color:var(--subtext0); }
+  .side-head .tools { display:flex; gap:4px; }
+  .iconbtn { width:22px; height:22px; border-radius:6px; display:grid; place-items:center; color:var(--subtext0); cursor:pointer; }
+  .iconbtn:hover { background:var(--surface0); }
+  .filter { background:var(--base); border:1px solid var(--surface1); border-radius:7px; padding:5px 8px;
+    color:var(--overlay0); font-size:12px; }
+  .tree { flex:1; overflow:hidden; display:flex; flex-direction:column; gap:1px; font-size:13px; }
+  .trow { display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:6px; color:var(--subtext1); }
+  .trow.root { color:var(--text); font-weight:600; }
+  .trow.active { background:var(--surface1); color:var(--text); }
+  .trow .grow { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .trow.child { padding-left:30px; color:var(--subtext1); }
+  .trow.child .grow { font-weight:400; }
+  .count { font-size:11px; padding:0 6px; border:1px solid var(--surface1); border-radius:99px; color:var(--overlay0); }
+  .branch-dot { width:8px; height:8px; border-radius:99px; flex:none; }
+  .side-note { border-top:1px solid var(--surface0); padding-top:8px; color:var(--overlay0); font-size:11px; line-height:1.5; }
+  .chip { display:inline-flex; align-items:center; gap:4px; font-size:11px; padding:1px 6px; border-radius:99px;
+    background:var(--surface0); color:var(--subtext0); white-space:nowrap; }
+  .chip.mauve { background:rgba(203,166,247,.16); color:var(--mauve); }
+  .chip.blue  { background:rgba(137,180,250,.16); color:var(--blue); }
+  .chip.green { background:rgba(166,227,161,.16); color:var(--green); }
+  .chip.yellow{ background:rgba(249,226,175,.16); color:var(--yellow); }
+  .chip.lock  { background:var(--surface0); color:var(--overlay1); }
+
+  /* center */
+  .center { flex:1; min-width:0; display:flex; flex-direction:column; background:var(--base); }
+  .session-header { flex:none; padding:8px 12px; background:var(--surface); display:flex; align-items:center;
+    justify-content:space-between; gap:12px; border-bottom:1px solid var(--surface0); }
+  .session-header .meta { color:var(--subtext0); font-size:11px; margin-top:2px; }
+  .session-header .title { font-size:13.5px; color:var(--text); }
+  .header-actions { display:flex; align-items:center; gap:8px; }
+  .presence { display:flex; align-items:center; gap:8px; padding:2px 8px 2px 2px; border-radius:99px; background:var(--base);
+    border:1px solid var(--surface0); }
+  .presence .label { color:var(--subtext0); font-size:12px; }
+  .avatars { display:flex; }
+  .avatar { position:relative; width:22px; height:22px; border-radius:99px; display:grid; place-items:center;
+    font-size:10.5px; font-weight:700; color:var(--on-accent); border:2px solid var(--base); margin-left:-7px; }
+  .avatar:first-child { margin-left:0; }
+  .avatar .dot { position:absolute; right:-1px; bottom:-1px; width:8px; height:8px; border-radius:99px;
+    border:2px solid var(--base); }
+  .dot.online { background:var(--green); } .dot.away { background:var(--yellow); } .dot.offline { background:var(--overlay0); }
+  .av-bjorn{background:var(--blue)} .av-sam{background:var(--teal)} .av-nadia{background:var(--mauve)} .av-lea{background:var(--overlay0)}
+
+  .transcript { flex:1; min-height:0; overflow:hidden; padding:12px 0; display:flex; flex-direction:column; gap:2px; }
+  .plan { margin:0 12px 10px; background:var(--mantle); border:1px solid var(--surface1); border-radius:8px; padding:8px 12px;
+    display:flex; flex-direction:column; gap:8px; }
+  .plan .prow { display:flex; align-items:center; gap:8px; font-size:11.5px; }
+  .plan .prow .pname { color:var(--blue); } .plan .prow .pcount { color:var(--subtext0); }
+  .plan .steps { display:flex; flex-direction:column; gap:4px; font-size:12.5px; }
+  .plan .step { display:flex; gap:8px; align-items:flex-start; color:var(--subtext0); }
+  .plan .step.done { color:var(--green); } .plan .step.active { color:var(--text); }
+  .plan .step .mark { width:14px; flex:none; }
+  .bar { width:3px; height:13px; border-radius:99px; display:inline-block; }
+  .bar.user { background:var(--blue); } .bar.agent { background:var(--green); } .bar.peer { background:var(--mauve); }
+  .msg { padding:8px 12px; }
+  .msg.peer { margin:2px 12px; padding:5px 12px; border-left:2px solid rgba(203,166,247,.45); }
+  .mhead { display:flex; align-items:center; gap:8px; font-size:11.5px; }
+  .who.user { color:var(--blue); } .who.agent { color:var(--green); } .who.peer { color:var(--mauve); }
+  .target { color:var(--overlay1); } .time { color:var(--overlay0); }
+  .mtext { margin-top:4px; color:var(--text); line-height:1.5; }
+  .mtext.peer { color:var(--subtext1); }
+  .pill { font-size:10.5px; padding:1px 7px; border-radius:99px; font-weight:600; }
+  .pill.owner { background:rgba(137,180,250,.16); color:var(--blue); }
+  .pill.participant { background:var(--surface0); color:var(--subtext0); }
+  .pill.observer { background:rgba(249,226,175,.16); color:var(--yellow); }
+  .tip { position:absolute; z-index:15; width:300px; background:var(--crust); border:1px solid var(--surface1);
+    border-radius:8px; padding:8px 10px; font-size:11.5px; line-height:1.5; color:var(--subtext1);
+    box-shadow:0 12px 28px rgba(0,0,0,.55); }
+  .tip .th { color:var(--text); font-weight:600; margin-bottom:3px; }
+  .tip.right::after { content:""; position:absolute; right:-6px; top:14px; border-top:6px solid transparent;
+    border-bottom:6px solid transparent; border-left:6px solid var(--crust); }
+  .tool { margin:2px 12px; padding-left:8px; border-left:2px solid var(--surface1); display:flex; flex-direction:column; gap:4px; }
+  .tool-head { display:flex; align-items:center; gap:8px; font-size:11.5px; }
+  .tool-head .caret { color:var(--overlay0); width:10px; }
+  .tool-title { color:#dbeafe; } .tool-arg { color:var(--overlay0); }
+  .spacer { flex:1; }
+  .status { color:var(--green); } .status.warn { color:var(--yellow); } .status.run { color:var(--blue); }
+  .status.muted { color:var(--overlay1); }
+  .tool-actions { display:flex; align-items:center; gap:8px; padding-left:18px; font-size:11.5px; color:var(--subtext0); }
+  .btn { border:none; border-radius:6px; padding:3px 10px; font-size:12px; cursor:pointer; background:var(--surface0); color:var(--text); }
+  .btn:hover { background:var(--surface1); }
+  .btn.primary { background:var(--blue); color:var(--on-accent); }
+  .btn.success { background:var(--green); color:var(--on-accent); }
+  .btn.danger { background:var(--red); color:var(--on-accent); }
+  .btn.ghost { background:transparent; }
+  .btn.ghost:hover { background:var(--surface0); }
+  .btn[disabled] { opacity:.45; cursor:not-allowed; }
+  .note { margin:2px 12px; border-radius:6px; padding:8px 12px; font-size:12px; line-height:1.45; }
+  .note.info { background:var(--info-surface); color:var(--subtext1); }
+  .note.error { background:var(--danger-surface); color:var(--text); }
+  .note.warn { background:var(--warning-surface); color:var(--text); }
+  .note .h { font-size:11px; margin-bottom:2px; }
+  .note.info .h { color:var(--mauve); } .note.warn .h { color:var(--yellow); } .note.error .h { color:var(--red); }
+
+  /* composer */
+  .composer { flex:none; padding:12px; background:var(--mantle); border-top:1px solid var(--surface0); }
+  .runstatus { display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:11.5px; }
+  .runstatus .spin { width:12px; height:12px; border-radius:99px; border:2px solid var(--surface1); border-top-color:var(--blue); }
+  .runstatus .st { color:var(--blue); } .runstatus .el { color:var(--overlay0); font-size:11px; }
+  .inputbox { border:1px solid var(--surface1); border-radius:8px; background:var(--base); overflow:hidden; }
+  .inputbox .typed { padding:12px; color:var(--text); min-height:52px; }
+  .inputbox .placeholder { padding:12px; color:var(--overlay0); min-height:52px; }
+  .composer-foot { padding:8px 12px; border-top:1px solid var(--surface0); display:flex; align-items:center;
+    gap:8px; flex-wrap:wrap; }
+  .select { display:inline-flex; align-items:center; gap:6px; padding:3px 8px; border-radius:6px; color:var(--subtext1); font-size:12px; cursor:pointer; }
+  .select:hover { background:var(--surface1); }
+  .select.mono { font-family:"SF Mono",Menlo,Consolas,monospace; font-size:11.5px; color:var(--subtext0); }
+  .seg { display:inline-flex; border:1px solid var(--surface1); border-radius:7px; overflow:hidden; }
+  .seg button { border:none; background:transparent; color:var(--subtext0); font-size:12px; padding:3px 11px; cursor:pointer; }
+  .seg button.on { background:var(--surface0); color:var(--text); }
+  .seg-label { color:var(--overlay0); font-size:11.5px; }
+  .cred { display:inline-flex; align-items:center; gap:6px; font-size:11.5px; color:var(--subtext0);
+    border:1px solid var(--surface0); border-radius:99px; padding:2px 9px; }
+  .cred .acct { color:var(--blue); }
+  .send { width:26px; height:26px; border-radius:7px; background:var(--blue); color:var(--on-accent);
+    display:grid; place-items:center; font-size:14px; cursor:pointer; }
+
+  /* inspector */
+  .inspector { width:520px; flex:none; background:var(--mantle); border-left:1px solid var(--surface0); display:flex; flex-direction:column; }
+  .insp-head { padding:8px 8px 0; display:flex; flex-direction:column; gap:8px; border-bottom:1px solid var(--surface1); }
+  .insp-title { display:flex; align-items:center; justify-content:space-between; }
+  .insp-title .t { color:var(--blue); font-size:11px; }
+  .insp-title .right { display:flex; align-items:center; gap:10px; color:var(--subtext0); font-size:11px; }
+  .tabs { display:flex; gap:16px; font-size:12.5px; color:var(--subtext1); }
+  .tabs .tab { padding:4px 0 8px; border-bottom:2px solid transparent; cursor:pointer; }
+  .tabs .tab.active { color:var(--text); border-bottom-color:var(--blue); }
+  .tabs .tab .bang { color:var(--subtext0); font-size:11px; margin-left:5px; }
+  .insp-body { flex:1; overflow:hidden; padding:12px; display:flex; flex-direction:column; gap:12px; }
+  .card { background:var(--surface0); border:1px solid var(--surface1); border-radius:8px; overflow:hidden; }
+  .card .ch { padding:8px 12px; border-bottom:1px solid var(--surface1); color:var(--blue); font-size:11.5px; }
+  .card .cb { padding:12px; display:flex; flex-direction:column; gap:8px; }
+  .kv { display:flex; gap:12px; font-size:12.5px; }
+  .kv .k { width:104px; flex:none; color:var(--subtext0); font-size:11.5px; }
+  .kv .v { flex:1; color:var(--text); min-width:0; }
+  .person { display:flex; align-items:center; gap:10px; }
+  .person .pname { flex:1; min-width:0; }
+  .person .pname .n { color:var(--text); }
+  .person .pname .h { color:var(--overlay0); font-size:11px; }
+  .person .meta { color:var(--overlay0); font-size:11px; text-align:right; white-space:nowrap; }
+
+  /* dialogs / overlays */
+  .overlay { position:absolute; inset:0; background:var(--base); display:flex; flex-direction:column; }
+  .overlay-head { display:flex; align-items:center; justify-content:space-between; padding:14px 20px;
+    border-bottom:1px solid var(--surface0); }
+  .overlay-head .title { font-size:13.5px; color:var(--text); }
+  .overlay-body { flex:1; display:flex; min-height:0; }
+  .ov-nav { width:220px; flex:none; border-right:1px solid var(--surface0); padding:12px; display:flex; flex-direction:column; gap:2px; }
+  .ov-nav .item { padding:7px 10px; border-radius:7px; color:var(--subtext1); font-size:13px; cursor:pointer; }
+  .ov-nav .item:hover { background:var(--surface0); }
+  .ov-nav .item.active { background:var(--surface0); color:var(--text); }
+  .ov-content { flex:1; overflow:hidden; padding:20px; display:flex; flex-direction:column; gap:12px; }
+  .sec-h { color:var(--blue); font-size:11.5px; letter-spacing:.02em; }
+  .sec-sub { color:var(--subtext0); font-size:12px; }
+  .row-line { display:flex; align-items:center; gap:10px; padding:10px 14px; }
+  .row-line + .row-line { border-top:1px solid var(--surface0); }
+  .row-line .grow { flex:1; min-width:0; }
+  .inp { background:var(--base); border:1px solid var(--surface1); border-radius:7px; padding:7px 10px;
+    color:var(--overlay0); font-size:12.5px; }
+  .inp.grow { flex:1; }
+  .radio { width:14px; height:14px; border-radius:99px; border:2px solid var(--surface2); flex:none; display:inline-block; }
+  .radio.on { border-color:var(--blue); box-shadow: inset 0 0 0 3px var(--base); background:var(--blue); }
+  .dialog { width:560px; background:var(--mantle); border:1px solid var(--surface1); border-radius:10px;
+    box-shadow:0 20px 50px rgba(0,0,0,.5); overflow:hidden; }
+  .dialog .dh { padding:14px 16px; border-bottom:1px solid var(--surface0); display:flex; align-items:center; justify-content:space-between; }
+  .dialog .dh .t { font-size:13.5px; }
+  .dialog .db { padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .dialog .df { padding:12px 16px; border-top:1px solid var(--surface0); display:flex; justify-content:flex-end; gap:8px; }
+  .dialog-host { position:absolute; inset:0; background:rgba(17,17,27,.68); display:flex; align-items:flex-start;
+    justify-content:center; padding-top:64px; gap:20px; }
+
+  /* annotations */
+  .anno { position:absolute; z-index:20; width:19px; height:19px; border-radius:99px; background:var(--peach);
+    color:var(--on-accent); font-size:11px; font-weight:800; display:grid; place-items:center; cursor:default;
+    box-shadow:0 0 0 2px rgba(30,30,46,.9), 0 3px 8px rgba(0,0,0,.4); }
+  .legend { max-width:1200px; margin:16px auto 0; display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr));
+    gap:6px 22px; font-size:12.5px; color:var(--subtext1); }
+  .legend li { line-height:1.45; }
+  .legend b { color:var(--text); font-weight:600; }
+  .legend .n { display:inline-block; width:17px; height:17px; border-radius:99px; background:var(--peach);
+    color:var(--on-accent); font-size:10.5px; font-weight:800; text-align:center; line-height:17px; margin-right:6px; }
+  .scene { display:none; }
+  .scene.active { display:block; }
+  .map { max-width:1200px; margin:26px auto 0; border-top:1px solid var(--surface0); padding-top:18px; }
+  .map h3 { font-size:14px; margin:0 0 8px; }
+  .map table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  .map th, .map td { text-align:left; vertical-align:top; padding:7px 10px; border-bottom:1px solid var(--surface0); }
+  .map th { color:var(--blue); font-weight:600; font-size:11.5px; }
+  .map td:first-child { color:var(--subtext0); width:230px; }
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <h1>Loom mockup — Multi user support</h1>
+  <p>
+    How <a href="https://github.com/bearmuckle/loom/issues/25">bearmuckle/loom#25</a> could surface in the
+    existing GPUI client. Layout, spacing, and colors follow the current interface
+    (<span class="mono">crates/loom-ui</span>, Catppuccin Mocha: base <span class="mono">#1e1e2e</span>,
+    panels <span class="mono">#181825</span>, accent <span class="mono">#89b4fa</span>). Numbered markers are
+    explained under each screen.
+  </p>
+</div>
+
+<div class="scenes-nav">
+  <button class="scene-tab active" data-scene="owner">1 · Shared session — owner</button>
+  <button class="scene-tab" data-scene="participant">2 · Shared session — participant</button>
+  <button class="scene-tab" data-scene="people">3 · People &amp; access</button>
+  <button class="scene-tab" data-scene="access">4 · Credentials &amp; repositories</button>
+  <button class="scene-tab" data-scene="observer">5 · Observer — awaiting approval</button>
+  <div class="zoom">
+    <span>zoom</span>
+    <button data-zoom="0.5">50%</button>
+    <button data-zoom="0.75">75%</button>
+    <button data-zoom="1">100%</button>
+    <button data-zoom="fit">Fit</button>
+  </div>
+</div>
+
+<!-- ============================ SCENE 1: OWNER ============================ -->
+<section class="scene active" id="scene-owner">
+  <div class="scene-title"><h2>Shared session — owner view</h2><span>Björn owns the session and its run credential; approved participants act without asking.</span></div>
+  <div class="stage-wrap"><div class="stage">
+  <div class="window">
+    <i class="anno" style="top:106px;left:212px">1</i>
+    <i class="anno" style="top:43px;left:736px">2</i>
+    <i class="anno" style="top:246px;left:810px">3</i>
+    <i class="anno" style="top:428px;left:810px">4</i>
+    <i class="anno" style="top:492px;left:810px">5</i>
+    <i class="anno" style="top:536px;left:810px">6</i>
+    <i class="anno" style="top:760px;left:418px">7</i>
+    <i class="anno" style="top:226px;left:1266px">8</i>
+    <i class="anno" style="top:176px;left:815px">9</i>
+    <div class="tip right" style="top:176px;left:522px">
+      <div class="th">Participant · approved once</div>
+      Can chat, direct the agent, answer questions, and approve tool actions. No per-action owner approval.
+    </div>
+
+    <div class="titlebar"><span class="brand">Loom</span><span class="dim">Local</span></div>
+    <div class="body">
+      <!-- sidebar -->
+      <aside class="sidebar">
+        <div class="side-head"><span>Projects</span>
+          <span class="tools"><span class="iconbtn mono">+</span><span class="iconbtn mono">⚙</span></span>
+        </div>
+        <div class="filter">Filter projects…</div>
+        <div class="tree">
+          <div class="trow root"><span class="mono" style="color:var(--overlay0)">⌄</span> <span class="branch-dot" style="background:var(--blue)"></span>
+            <span class="grow">Multi-user auth model</span>
+            <span class="chip blue">Shared</span>
+            <span class="count">3</span>
+          </div>
+          <div class="trow child active"><span class="mono" style="color:var(--blue)">◆</span><span class="grow">Presence roster &amp; contact</span><span class="chip blue">Working</span></div>
+          <div class="trow child"><span class="mono" style="color:var(--overlay0)">◆</span><span class="grow">Credential scoping</span><span class="chip">Ready</span></div>
+          <div class="trow child"><span class="mono" style="color:var(--overlay0)">◆</span><span class="grow">Revocation tests</span><span class="chip">Ready</span></div>
+          <div class="trow root" style="margin-top:6px"><span class="mono" style="color:var(--overlay0)">›</span> <span class="branch-dot" style="background:var(--subtext0)"></span>
+            <span class="grow">Loom local backend</span><span class="dim" style="color:var(--overlay0);font-size:11px">2d</span>
+          </div>
+        </div>
+        <div class="side-note">Sessions show a <b style="color:var(--subtext0)">Shared</b> badge and the participants currently connected.</div>
+      </aside>
+
+      <!-- center -->
+      <main class="center">
+        <header class="session-header">
+          <div>
+            <div class="title">Presence roster &amp; contact</div>
+            <div class="meta">feature/multi-user · modified · 3 sources</div>
+          </div>
+          <div class="header-actions">
+            <span class="iconbtn mono" title="Session sources">≡</span>
+            <div class="presence">
+              <div class="avatars">
+                <span class="avatar av-bjorn">BH<span class="dot online"></span></span>
+                <span class="avatar av-sam">SR<span class="dot online"></span></span>
+                <span class="avatar av-nadia">NO<span class="dot away"></span></span>
+              </div>
+              <span class="label">3 here</span>
+            </div>
+            <span class="btn ghost" style="color:var(--subtext1);border:1px solid var(--surface0)">People</span>
+            <span class="iconbtn mono" title="Toggle side panel">▥</span>
+          </div>
+        </header>
+
+        <div class="transcript">
+          <div class="plan">
+            <div class="prow"><span class="pname">Plan</span><span class="pcount">2 / 5</span><span class="spacer"></span><span class="mono" style="color:var(--overlay0)">⌃</span></div>
+            <div style="height:4px;border-radius:99px;background:var(--surface1);overflow:hidden"><div style="height:100%;width:40%;background:var(--blue);border-radius:99px"></div></div>
+            <div class="steps">
+              <div class="step done"><span class="mark">✓</span><span>Add participant identity to the protocol</span></div>
+              <div class="step done"><span class="mark">✓</span><span>Aggregate presence across a participant's connections</span></div>
+              <div class="step active"><span class="mark">▸</span><span>Explicit composer recipient (agent vs. people)</span></div>
+              <div class="step"><span class="mark">○</span><span>Enforce owner-only run controls</span></div>
+              <div class="step"><span class="mark">○</span><span>Revocation stops an active subscription</span></div>
+            </div>
+          </div>
+
+          <div class="msg">
+            <div class="mhead"><span class="bar user"></span><span class="who user">Björn Harrtell</span><span class="pill owner" title="Owner: manages access, the run credential, repositories, and run controls.">Owner</span><span class="target">→ Agent</span><span class="time">12:04</span></div>
+            <div class="mtext">Add the participant roster and make the composer recipient explicit. Keep peer chat out of model context.</div>
+          </div>
+
+          <div class="msg">
+            <div class="mhead"><span class="bar agent"></span><span class="who agent">Agent</span><span class="time">12:05</span></div>
+            <div class="mtext">I'll aggregate one roster entry per participant across connections, then add a recipient selector to the composer. Starting with the protocol events.</div>
+          </div>
+          <div class="tool">
+            <div class="tool-head"><span class="mono" style="color:var(--green)">🛠</span><span class="caret">›</span><span class="tool-title mono">4 tools · edit_file ×2, read_file, run_test</span><span class="spacer"></span><span class="status">Completed</span><span class="time mono">8s</span></div>
+          </div>
+
+          <div class="msg peer">
+            <div class="mhead"><span class="bar peer"></span><span class="who peer">Sam Rivera</span><span class="pill participant" title="Participant (approved once by the owner): chat, direct the agent, answer questions, and approve tool actions. No per-action owner approval.">Participant</span><span class="target">→ People</span><span class="chip mauve">Peer chat · not sent to the agent</span><span class="time">12:06</span></div>
+            <div class="mtext peer">I can own the stale-connection timeout test once the roster lands. Ping me when presence is in.</div>
+          </div>
+
+          <div class="tool">
+            <div class="tool-head"><span class="mono" style="color:var(--yellow)">▸_</span><span class="caret">›</span><span class="tool-title mono">run_terminal</span><span class="tool-arg mono">cargo test -p loom-server presence</span><span class="spacer"></span><span class="status warn">Awaiting approval</span></div>
+            <div class="tool-actions">
+              <button class="btn success">Approve</button><button class="btn danger">Reject</button>
+              <span>Any approved participant can decide.</span>
+            </div>
+          </div>
+
+          <div class="note info">
+            <div class="h">Direction conflict · run rev 42</div>
+            Björn Harrtell paused the run before Sam Rivera's resume arrived. The resume was rejected with a conflict; the run stays paused for everyone.
+          </div>
+
+          <div class="msg">
+            <div class="mhead"><span class="bar user"></span><span class="who user">Sam Rivera</span><span class="pill participant" title="Participant (approved once by the owner): chat, direct the agent, answer questions, and approve tool actions. No per-action owner approval.">Participant</span><span class="target">→ Agent</span><span class="time">12:08</span></div>
+            <div class="mtext">Please also cover the case where a participant reconnects mid-run.</div>
+          </div>
+        </div>
+
+        <div class="composer">
+          <div class="runstatus"><span class="spin"></span><span class="st">Working</span><span class="el mono">1m 24s</span><span class="spacer"></span><span class="el">esc to interrupt</span></div>
+          <div class="inputbox">
+            <div class="placeholder">Send follow-up direction…</div>
+            <div class="composer-foot">
+              <span class="seg-label">To</span>
+              <span class="seg"><button class="on">Agent</button><button>People</button></span>
+              <span class="select">Edit ▾</span>
+              <span class="select mono">Claude Sonnet 4.5 ▾</span>
+              <span class="cred"><span class="acct">◉</span> Björn's GitHub Copilot</span>
+              <span class="spacer"></span>
+              <button class="btn danger">Stop</button>
+              <span class="send">↑</span>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <!-- inspector -->
+      <aside class="inspector">
+        <div class="insp-head">
+          <div class="insp-title"><span class="t">People</span><span class="right"><span>3 participants</span><span class="btn ghost">Close</span></span></div>
+          <div class="tabs">
+            <span class="tab">Changes <span class="bang">2</span></span>
+            <span class="tab">Agent <span class="bang">2/5</span></span>
+            <span class="tab">Context</span>
+            <span class="tab">Files</span>
+            <span class="tab active">People</span>
+          </div>
+        </div>
+        <div class="insp-body">
+          <div class="card">
+            <div class="ch">Participants</div>
+            <div class="cb" style="gap:10px">
+              <div class="person">
+                <span class="avatar av-bjorn" style="border-color:var(--surface0)">BH<span class="dot online"></span></span>
+                <div class="pname"><div class="n">Björn Harrtell <span class="pill owner" title="Owner: manages access, the run credential, repositories, and run controls.">Owner</span></div><div class="h">@bjornharrtell · 2 connections</div></div>
+                <div class="meta">online</div>
+              </div>
+              <div class="person">
+                <span class="avatar av-sam" style="border-color:var(--surface0)">SR<span class="dot online"></span></span>
+                <div class="pname"><div class="n">Sam Rivera <span class="pill participant" title="Participant (approved once by the owner): chat, direct the agent, answer questions, and approve tool actions. No per-action owner approval.">Participant</span></div><div class="h">@sam-rivera · 1 connection</div></div>
+                <div class="meta">online</div>
+                <button class="btn ghost" style="color:var(--red)">Remove</button>
+              </div>
+              <div class="person">
+                <span class="avatar av-nadia" style="border-color:var(--surface0)">NO<span class="dot online"></span></span>
+                <div class="pname"><div class="n">Nadia Okafor <span class="pill observer" title="Observer (read-only): view the session, roster, history, and run state until the owner approves you to participant.">Observer</span></div><div class="h">@nadia-okafor · awaiting approval</div></div>
+                <button class="btn primary">Approve</button>
+                <button class="btn ghost" style="color:var(--red)">Remove</button>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="ch">Run credential</div>
+            <div class="cb">
+              <div class="kv"><span class="k">Provider</span><span class="v">GitHub Copilot</span></div>
+              <div class="kv"><span class="k">Credential</span><span class="v">Björn's GitHub Copilot · v3</span></div>
+              <div class="kv"><span class="k">Pinned run</span><span class="v mono" style="font-size:11.5px">r-8841</span></div>
+              <div class="sec-sub">Secret stays on this worker. Clients and session events receive provider and credential label only.</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="ch">Repository access</div>
+            <div class="cb">
+              <div class="kv"><span class="k">Attached</span><span class="v mono" style="font-size:11.5px">bearmuckle/loom</span></div>
+              <div class="sec-sub">Owner controls browsing and attaching. Participants use this session checkout.</div>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+  </div></div>
+  <ul class="legend">
+    <li><span class="n">1</span><b>Shared badge.</b> Projects that multiple people can open are marked in the existing session tree.</li>
+    <li><span class="n">2</span><b>Presence group.</b> Avatars aggregate one entry per participant across their connections, with a live count.</li>
+    <li><span class="n">3</span><b>Attributed direction.</b> The old "You" label becomes the authenticated participant and role; the arrow names the recipient.</li>
+    <li><span class="n">4</span><b>Peer chat.</b> A distinct card that persists in history but never enters model context or continues the run.</li>
+    <li><span class="n">5</span><b>Shared approval.</b> Any approved participant can approve or reject tool actions; an observer cannot.</li>
+    <li><span class="n">6</span><b>Conflict outcome.</b> Concurrent controls get an explicit accepted/conflict result tied to the run revision.</li>
+    <li><span class="n">7</span><b>Explicit recipient + credential.</b> The composer states whether a message goes to the agent or to people, and shows whose credential funds the run.</li>
+    <li><span class="n">8</span><b>Observer approval.</b> A person with access starts read-only; the owner promotes them once, after which they act without asking.</li>
+    <li><span class="n">9</span><b>Policy on the role tag.</b> The access policy moved out of a persistent inspector card into a tooltip on the role tag; the full matrix stays in People &amp; access.</li>
+  </ul>
+</section>
+
+<!-- ======================= SCENE 2: PARTICIPANT ======================= -->
+<section class="scene" id="scene-participant">
+  <div class="scene-title"><h2>Shared session — participant view</h2><span>Sam is an approved participant; only run controls stay owner-only.</span></div>
+  <div class="stage-wrap"><div class="stage">
+  <div class="window">
+    <i class="anno" style="top:96px;left:810px">1</i>
+    <i class="anno" style="top:150px;left:810px">2</i>
+    <i class="anno" style="top:352px;left:810px">3</i>
+    <i class="anno" style="top:306px;left:810px">4</i>
+    <i class="anno" style="top:760px;left:418px">5</i>
+    <i class="anno" style="top:282px;left:1328px">6</i>
+
+    <div class="titlebar"><span class="brand">Loom</span><span class="dim">Local</span></div>
+    <div class="body">
+      <aside class="sidebar">
+        <div class="side-head"><span>Projects</span>
+          <span class="tools"><span class="iconbtn mono">+</span><span class="iconbtn mono">⚙</span></span>
+        </div>
+        <div class="filter">Filter projects…</div>
+        <div class="tree">
+          <div class="trow root"><span class="mono" style="color:var(--overlay0)">⌄</span> <span class="branch-dot" style="background:var(--blue)"></span>
+            <span class="grow">Multi-user auth model</span><span class="chip blue">Shared</span><span class="count">3</span></div>
+          <div class="trow child active"><span class="mono" style="color:var(--blue)">◆</span><span class="grow">Presence roster &amp; contact</span><span class="chip blue">Working</span></div>
+          <div class="trow child"><span class="mono" style="color:var(--overlay0)">◆</span><span class="grow">Credential scoping</span><span class="chip">Ready</span></div>
+          <div class="trow child"><span class="mono" style="color:var(--overlay0)">◆</span><span class="grow">Revocation tests</span><span class="chip">Ready</span></div>
+          <div class="trow root" style="margin-top:6px"><span class="mono" style="color:var(--overlay0)">›</span> <span class="branch-dot" style="background:var(--subtext0)"></span>
+            <span class="grow">Loom local backend</span><span class="dim" style="color:var(--overlay0);font-size:11px">2d</span></div>
+        </div>
+        <div class="side-note">Only sessions Sam has been granted appear here. Access alone does not expose the owner's repositories.</div>
+      </aside>
+
+      <main class="center">
+        <header class="session-header">
+          <div>
+            <div class="title">Presence roster &amp; contact</div>
+            <div class="meta">feature/multi-user · modified · owned by Björn Harrtell</div>
+          </div>
+          <div class="header-actions">
+            <span class="iconbtn mono">≡</span>
+            <div class="presence">
+              <div class="avatars">
+                <span class="avatar av-bjorn">BH<span class="dot online"></span></span>
+                <span class="avatar av-sam">SR<span class="dot online"></span></span>
+                <span class="avatar av-nadia">NO<span class="dot away"></span></span>
+              </div>
+              <span class="label">3 here</span>
+            </div>
+            <span class="btn ghost" style="color:var(--subtext1);border:1px solid var(--surface0)">People</span>
+            <span class="iconbtn mono">▥</span>
+          </div>
+        </header>
+
+        <div class="transcript">
+          <div class="note warn">
+            <div class="h">Shared session · you are an approved participant</div>
+            The owner approved you once. You can chat, direct the agent, and approve tool actions without asking again. Björn Harrtell still controls pause, resume, and interrupt.
+          </div>
+          <div class="msg">
+            <div class="mhead"><span class="bar user"></span><span class="who user">Björn Harrtell</span><span class="pill owner" title="Owner: manages access, the run credential, repositories, and run controls.">Owner</span><span class="target">→ Agent</span><span class="time">12:04</span></div>
+            <div class="mtext">Add the participant roster and make the composer recipient explicit. Keep peer chat out of model context.</div>
+          </div>
+          <div class="msg">
+            <div class="mhead"><span class="bar agent"></span><span class="who agent">Agent</span><span class="time">12:05</span></div>
+            <div class="mtext">I'll aggregate one roster entry per participant across connections, then add a recipient selector to the composer.</div>
+          </div>
+          <div class="msg peer">
+            <div class="mhead"><span class="bar peer"></span><span class="who peer">Sam Rivera</span><span class="pill participant">You</span><span class="target">→ People</span><span class="chip mauve">Peer chat · not sent to the agent</span><span class="time">12:06</span></div>
+            <div class="mtext peer">I can own the stale-connection timeout test once the roster lands.</div>
+          </div>
+          <div class="tool">
+            <div class="tool-head"><span class="mono" style="color:var(--yellow)">▸_</span><span class="caret">›</span><span class="tool-title mono">run_terminal</span><span class="tool-arg mono">cargo test -p loom-server presence</span><span class="spacer"></span><span class="status warn">Awaiting approval</span></div>
+            <div class="tool-actions"><button class="btn success">Approve</button><button class="btn danger">Reject</button><span>You can approve or reject tool actions.</span></div>
+          </div>
+          <div class="msg">
+            <div class="mhead"><span class="bar user"></span><span class="who user">Sam Rivera</span><span class="pill participant">You</span><span class="target">→ Agent</span><span class="time">12:08</span></div>
+            <div class="mtext">Please also cover the case where a participant reconnects mid-run.</div>
+          </div>
+        </div>
+
+        <div class="composer">
+          <div class="runstatus"><span class="spin"></span><span class="st">Working</span><span class="el mono">1m 24s</span><span class="spacer"></span><span class="el">owner can interrupt</span></div>
+          <div class="inputbox">
+            <div class="placeholder">Send follow-up direction…</div>
+            <div class="composer-foot">
+              <span class="seg-label">To</span>
+              <span class="seg"><button class="on">Agent</button><button>People</button></span>
+              <span class="select" style="opacity:.5">Edit ▾</span>
+              <span class="select mono" style="opacity:.5">Claude Sonnet 4.5</span>
+              <span class="cred"><span class="acct">◉</span> via Björn's GitHub Copilot</span>
+              <span class="spacer"></span>
+              <button class="btn ghost" disabled>Stop</button>
+              <span class="send">↑</span>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <aside class="inspector">
+        <div class="insp-head">
+          <div class="insp-title"><span class="t">People</span><span class="right"><span>3 participants</span><span class="btn ghost">Close</span></span></div>
+          <div class="tabs">
+            <span class="tab">Changes <span class="bang">2</span></span>
+            <span class="tab">Agent <span class="bang">2/5</span></span>
+            <span class="tab">Context</span>
+            <span class="tab">Files</span>
+            <span class="tab active">People</span>
+          </div>
+        </div>
+        <div class="insp-body">
+          <div class="card">
+            <div class="ch">Participants</div>
+            <div class="cb" style="gap:10px">
+              <div class="person">
+                <span class="avatar av-bjorn" style="border-color:var(--surface0)">BH<span class="dot online"></span></span>
+                <div class="pname"><div class="n">Björn Harrtell <span class="pill owner" title="Owner: manages access, the run credential, repositories, and run controls.">Owner</span></div><div class="h">@bjornharrtell</div></div>
+                <div class="meta">online</div>
+              </div>
+              <div class="person">
+                <span class="avatar av-sam" style="border-color:var(--surface0)">SR<span class="dot online"></span></span>
+                <div class="pname"><div class="n">Sam Rivera <span class="pill participant">You</span></div><div class="h">@sam-rivera</div></div>
+                <div class="meta">online</div>
+              </div>
+              <div class="person">
+                <span class="avatar av-nadia" style="border-color:var(--surface0)">NO<span class="dot offline"></span></span>
+                <div class="pname"><div class="n">Nadia Okafor <span class="pill observer" title="Observer (read-only): view the session, roster, history, and run state until the owner approves you to participant.">Observer</span></div><div class="h">@nadia-okafor · awaiting owner approval</div></div>
+                <div class="meta">online</div>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="ch">Run credential</div>
+            <div class="cb">
+              <div class="kv"><span class="k">Provider</span><span class="v">GitHub Copilot</span></div>
+              <div class="kv"><span class="k">Supplied by</span><span class="v">Björn Harrtell (owner)</span></div>
+              <div class="kv"><span class="k">Pinned run</span><span class="v mono" style="font-size:11.5px">r-8841</span></div>
+              <div class="sec-sub">Read-only. Sam can direct the agent but never sees or selects the secret.</div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="ch">Repository access</div>
+            <div class="cb">
+              <div class="sec-sub">Participants cannot browse the owner's repositories or attach a private repository. Ask an owner to attach one; you can then use the session checkout.</div>
+              <button class="btn ghost" disabled style="align-self:flex-start">Attach repository</button>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+  </div></div>
+  <ul class="legend">
+    <li><span class="n">1</span><b>Role context.</b> The session header names the owner and the client states the viewer's role.</li>
+    <li><span class="n">2</span><b>Same roster, same history.</b> Both clients see identical attributed messages, presence, and run state.</li>
+    <li><span class="n">3</span><b>Shared approval.</b> As an approved participant, Sam can approve or reject the tool row; an observer could only watch it.</li>
+    <li><span class="n">4</span><b>Participants can still direct.</b> Sam's follow-up is attributed and sent under the pinned credential.</li>
+    <li><span class="n">5</span><b>Controls disabled, not hidden.</b> Model and mode are read-only and Stop is owner-only.</li>
+    <li><span class="n">6</span><b>Credential metadata only.</b> The inspector shows provider and owner, never the token; repos stay owner-only.</li>
+  </ul>
+</section>
+
+<!-- ============================ SCENE 3: PEOPLE ============================ -->
+<section class="scene" id="scene-people">
+  <div class="scene-title"><h2>People &amp; access</h2><span>Owner grants access as observer, then approves people to participant.</span></div>
+  <div class="stage-wrap"><div class="stage">
+  <div class="window">
+    <i class="anno" style="top:128px;left:1325px">1</i>
+    <i class="anno" style="top:314px;left:1325px">2</i>
+    <i class="anno" style="top:454px;left:1325px">3</i>
+    <i class="anno" style="top:573px;left:1325px">4</i>
+    <i class="anno" style="top:663px;left:1325px">5</i>
+    <div class="titlebar"><span class="brand">Loom</span><span class="dim">Local</span></div>
+    <div class="overlay">
+      <div class="overlay-head"><span class="title">Settings</span><span class="iconbtn mono" style="background:var(--surface0)">✕</span></div>
+      <div class="overlay-body">
+        <div class="ov-nav">
+          <div class="item active">Session access</div>
+          <div class="item">Credentials</div>
+          <div class="item">Repository access</div>
+          <div class="item">Agents</div>
+          <div class="item">Workers</div>
+          <div class="item">Appearance</div>
+        </div>
+        <div class="ov-content">
+          <div class="sec-h">SESSION ACCESS</div>
+          <div class="sec-sub">Multi-user auth model · owner Björn Harrtell</div>
+
+          <div class="card">
+            <div class="ch">Participants</div>
+            <div style="display:flex;flex-direction:column">
+              <div class="row-line">
+                <span class="avatar av-bjorn" style="border-color:var(--surface0)">BH<span class="dot online"></span></span>
+                <div class="grow"><div>Björn Harrtell <span class="pill owner" title="Owner: manages access, the run credential, repositories, and run controls.">Owner</span></div><div style="color:var(--overlay0);font-size:11px">@bjornharrtell · online · 2 connections</div></div>
+                <span class="chip lock">Owner cannot be removed</span>
+              </div>
+              <div class="row-line">
+                <span class="avatar av-sam" style="border-color:var(--surface0)">SR<span class="dot online"></span></span>
+                <div class="grow"><div>Sam Rivera</div><div style="color:var(--overlay0);font-size:11px">@sam-rivera · online · 1 connection</div></div>
+                <span class="select">Participant ▾</span>
+                <button class="btn ghost" style="color:var(--red)">Remove</button>
+              </div>
+              <div class="row-line">
+                <span class="avatar av-nadia" style="border-color:var(--surface0)">NO<span class="dot online"></span></span>
+                <div class="grow"><div>Nadia Okafor <span class="pill observer" title="Observer (read-only): view the session, roster, history, and run state until the owner approves you to participant.">Observer</span></div><div style="color:var(--overlay0);font-size:11px">@nadia-okafor · online · awaiting approval</div></div>
+                <button class="btn primary">Approve as participant</button>
+                <span class="select">Observer ▾</span>
+                <button class="btn ghost" style="color:var(--red)">Remove</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="ch">Privilege levels</div>
+            <div class="cb" style="gap:10px">
+              <div class="person" style="align-items:flex-start">
+                <span class="pill observer" style="margin-top:2px">Observer</span>
+                <div class="grow" style="color:var(--subtext1);font-size:12.5px;line-height:1.4">Read-only: sees the session, roster, history, and run state. The default for anyone with access until the owner approves them.</div>
+              </div>
+              <div class="person" style="align-items:flex-start">
+                <span class="pill participant" style="margin-top:2px">Participant</span>
+                <div class="grow" style="color:var(--subtext1);font-size:12.5px;line-height:1.4">Approved by the owner once, then acts without asking: peer chat, agent direction, answers to agent questions, and tool approvals.</div>
+              </div>
+              <div class="person" style="align-items:flex-start">
+                <span class="pill owner" style="margin-top:2px">Owner</span>
+                <div class="grow" style="color:var(--subtext1);font-size:12.5px;line-height:1.4">Approves observers, controls pause/resume/interrupt, carries the run credential, manages repositories and access.</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="ch">Add participant</div>
+            <div class="cb">
+              <div style="display:flex;gap:8px;align-items:center">
+                <div class="inp grow">GitHub handle or email…</div>
+                <span class="select">Observer ▾</span>
+                <button class="btn primary">Grant access</button>
+              </div>
+              <div class="sec-sub">New people join as observers. The owner approves them to participant once; access binds to a stable participant ID and survives backend restart.</div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="ch">Pending</div>
+            <div class="row-line">
+              <span class="avatar av-lea" style="border-color:var(--surface0)">LK</span>
+              <div class="grow"><div>Lea Kim</div><div style="color:var(--overlay0);font-size:11px">Invitation sent 2h ago</div></div>
+              <button class="btn ghost">Resend</button>
+              <button class="btn ghost" style="color:var(--red)">Revoke</button>
+            </div>
+          </div>
+
+          <div class="note info" style="margin:0">
+            <div class="h">Revocation</div>
+            Revoking a participant stops their requests and live event delivery, including on an already connected client. It does not revoke the run's provider credential or affect other participants.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  </div></div>
+  <ul class="legend">
+    <li><span class="n">1</span><b>Tiered access.</b> Anyone granted access starts as an observer (read-only) until the owner approves them to participant.</li>
+    <li><span class="n">2</span><b>Approval is the only gate.</b> After approval a participant chats, directs the agent, and approves tool actions without asking again.</li>
+    <li><span class="n">3</span><b>New people join as observers.</b> Granting access defaults to the read-only tier; promotion is a separate owner action.</li>
+    <li><span class="n">4</span><b>Invitations stay pending.</b> Before a person connects there is no participant at all.</li>
+    <li><span class="n">5</span><b>Revocation is scoped.</b> It cuts the participant's live delivery without touching the credential or the run.</li>
+  </ul>
+</section>
+
+<!-- ============================ SCENE 4: ACCESS ============================ -->
+<section class="scene" id="scene-access">
+  <div class="scene-title"><h2>Credential &amp; repositories</h2><span>The owner carries one credential for the whole run; everyone assisting works under it.</span></div>
+  <div class="stage-wrap"><div class="stage">
+  <div class="window">
+    <i class="anno" style="top:122px;left:556px">1</i>
+    <i class="anno" style="top:250px;left:556px">2</i>
+    <i class="anno" style="top:366px;left:556px">3</i>
+    <i class="anno" style="top:162px;left:1140px">4</i>
+    <i class="anno" style="top:345px;left:1140px">5</i>
+    <div class="titlebar"><span class="brand">Loom</span><span class="dim">Local</span></div>
+    <div style="position:absolute;inset:30px 0 0 0;background:var(--base);padding:24px;display:flex;gap:20px;align-items:flex-start">
+      <div class="dialog">
+        <div class="dh"><span class="t">Session credential</span><span class="chip lock">Owner only</span></div>
+        <div class="db">
+          <div class="card" style="background:var(--surface0)">
+            <div class="cb">
+              <div class="kv"><span class="k">Current run</span><span class="v mono" style="font-size:11.5px">r-8841</span></div>
+              <div class="kv"><span class="k">Provider</span><span class="v">GitHub Copilot</span></div>
+              <div class="kv"><span class="k">Funded by</span><span class="v">Björn Harrtell (owner) · covers everyone in the session</span></div>
+              <div class="sec-sub">One credential for the whole run, pinned for its lifetime. The secret stays on this worker; clients and events see the label only.</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center">
+            <button class="btn">Change credential…</button>
+            <span class="sec-sub">Applies to the next run. Owner only.</span>
+          </div>
+          <div class="note warn" style="margin:0">
+            <div class="h">Another sign-in cannot take over</div>
+            Assistants never bring their own model credential. A new sign-in creates a version and is ignored while a run is active.
+          </div>
+          <div class="note error" style="margin:0">
+            <div class="h">Provider authentication failed</div>
+            If the owner's credential is missing or revoked, the run stops with a recovery error rather than falling back to another account.
+          </div>
+        </div>
+        <div class="df"><button class="btn ghost">Cancel</button><button class="btn primary">Save</button></div>
+      </div>
+
+      <div class="dialog">
+        <div class="dh"><span class="t">Attach repository</span><span class="chip lock">Owner only</span></div>
+        <div class="db">
+          <div class="inp">Filter by repository name or description…</div>
+          <div class="row-line" style="border:1px solid var(--surface1);border-radius:8px;background:var(--surface0)">
+            <div class="grow"><div class="mono" style="font-size:12.5px">bearmuckle/loom</div><div style="color:var(--overlay0);font-size:11px">Attached to this session</div></div>
+            <span class="chip green">Attached</span>
+          </div>
+          <div class="row-line" style="border:1px solid var(--surface1);border-radius:8px">
+            <div class="grow"><div class="mono" style="font-size:12.5px">bearmuckle/loom-web</div><div style="color:var(--overlay0);font-size:11px">Go · 128 MB</div></div>
+            <button class="btn">Attach</button>
+          </div>
+          <div class="row-line" style="border:1px solid var(--surface1);border-radius:8px">
+            <div class="grow"><div class="mono" style="font-size:12.5px">contoso/private-service</div><div style="color:var(--overlay0);font-size:11px">Private · owner credential</div></div>
+            <button class="btn">Attach</button>
+          </div>
+          <div class="note info" style="margin:0">
+            <div class="h">Participants see a different panel</div>
+            They cannot browse this list or attach a private repository. Sessions they can access expose only the attached checkout.
+          </div>
+        </div>
+        <div class="df"><button class="btn ghost">Cancel</button><button class="btn primary">Attach selected</button></div>
+      </div>
+    </div>
+  </div>
+  </div></div>
+  <ul class="legend">
+    <li><span class="n">1</span><b>One credential per run.</b> The owner carries it for the whole run; everyone assisting uses it without ever receiving the secret.</li>
+    <li><span class="n">2</span><b>Owner-only change.</b> Changing the credential applies to the next run; an active run keeps the one it started with.</li>
+    <li><span class="n">3</span><b>Explicit recovery.</b> Missing or revoked credentials surface an authentication error rather than another account.</li>
+    <li><span class="n">4</span><b>Repository access is separate.</b> Only the owner browses or attaches, even when model and repo share one GitHub token.</li>
+    <li><span class="n">5</span><b>People assisting reuse the checkout.</b> Session access grants the attached working tree, not the owner's full repository list.</li>
+  </ul>
+</section>
+
+<!-- ======================= SCENE 5: OBSERVER ======================= -->
+<section class="scene" id="scene-observer">
+  <div class="scene-title"><h2>Observer — awaiting owner approval</h2><span>Nadia has access but stays read-only until Björn approves her to participant.</span></div>
+  <div class="stage-wrap"><div class="stage">
+  <div class="window">
+    <i class="anno" style="top:96px;left:810px">1</i>
+    <i class="anno" style="top:176px;left:810px">2</i>
+    <i class="anno" style="top:792px;left:418px">3</i>
+    <i class="anno" style="top:226px;left:1336px">4</i>
+    <div class="titlebar"><span class="brand">Loom</span><span class="dim">Local</span></div>
+    <div class="body">
+      <aside class="sidebar">
+        <div class="side-head"><span>Projects</span>
+          <span class="tools"><span class="iconbtn mono">+</span><span class="iconbtn mono">⚙</span></span>
+        </div>
+        <div class="filter">Filter projects…</div>
+        <div class="tree">
+          <div class="trow root"><span class="mono" style="color:var(--overlay0)">⌄</span> <span class="branch-dot" style="background:var(--blue)"></span>
+            <span class="grow">Multi-user auth model</span><span class="chip blue">Shared</span><span class="count">3</span></div>
+          <div class="trow child active"><span class="mono" style="color:var(--blue)">◆</span><span class="grow">Presence roster &amp; contact</span><span class="chip blue">Working</span></div>
+          <div class="trow child"><span class="mono" style="color:var(--overlay0)">◆</span><span class="grow">Credential scoping</span><span class="chip">Ready</span></div>
+          <div class="trow child"><span class="mono" style="color:var(--overlay0)">◆</span><span class="grow">Revocation tests</span><span class="chip">Ready</span></div>
+          <div class="trow root" style="margin-top:6px"><span class="mono" style="color:var(--overlay0)">›</span> <span class="branch-dot" style="background:var(--subtext0)"></span>
+            <span class="grow">Loom local backend</span><span class="dim" style="color:var(--overlay0);font-size:11px">2d</span></div>
+        </div>
+        <div class="side-note">Nadia can open this shared session and watch, but the composer stays read-only until the owner approves her.</div>
+      </aside>
+
+      <main class="center">
+        <header class="session-header">
+          <div>
+            <div class="title">Presence roster &amp; contact</div>
+            <div class="meta">feature/multi-user · read-only · owned by Björn Harrtell</div>
+          </div>
+          <div class="header-actions">
+            <span class="iconbtn mono">≡</span>
+            <div class="presence">
+              <div class="avatars">
+                <span class="avatar av-bjorn">BH<span class="dot online"></span></span>
+                <span class="avatar av-sam">SR<span class="dot online"></span></span>
+                <span class="avatar av-nadia">NO<span class="dot online"></span></span>
+              </div>
+              <span class="label">3 here</span>
+            </div>
+            <span class="btn ghost" style="color:var(--subtext1);border:1px solid var(--surface0)">People</span>
+            <span class="iconbtn mono">▥</span>
+          </div>
+        </header>
+
+        <div class="transcript">
+          <div class="note info">
+            <div class="h">Observer · read-only</div>
+            You can watch this session. Björn Harrtell must approve you before you can chat, direct the agent, or answer questions.
+          </div>
+          <div class="msg">
+            <div class="mhead"><span class="bar user"></span><span class="who user">Björn Harrtell</span><span class="pill owner" title="Owner: manages access, the run credential, repositories, and run controls.">Owner</span><span class="target">→ Agent</span><span class="time">12:04</span></div>
+            <div class="mtext">Add the participant roster and make the composer recipient explicit. Keep peer chat out of model context.</div>
+          </div>
+          <div class="msg">
+            <div class="mhead"><span class="bar agent"></span><span class="who agent">Agent</span><span class="time">12:05</span></div>
+            <div class="mtext">I'll aggregate one roster entry per participant across connections, then add a recipient selector to the composer.</div>
+          </div>
+          <div class="msg peer">
+            <div class="mhead"><span class="bar peer"></span><span class="who peer">Sam Rivera</span><span class="pill participant" title="Participant (approved once by the owner): chat, direct the agent, answer questions, and approve tool actions. No per-action owner approval.">Participant</span><span class="target">→ People</span><span class="chip mauve">Peer chat · not sent to the agent</span><span class="time">12:06</span></div>
+            <div class="mtext peer">I can own the stale-connection timeout test once the roster lands.</div>
+          </div>
+          <div class="msg">
+            <div class="mhead"><span class="bar user"></span><span class="who user">Sam Rivera</span><span class="pill participant" title="Participant (approved once by the owner): chat, direct the agent, answer questions, and approve tool actions. No per-action owner approval.">Participant</span><span class="target">→ Agent</span><span class="time">12:08</span></div>
+            <div class="mtext">Please also cover the case where a participant reconnects mid-run.</div>
+          </div>
+        </div>
+
+        <div class="composer">
+          <div class="runstatus"><span class="spin"></span><span class="st">Working</span><span class="el mono">1m 24s</span><span class="spacer"></span><span class="el">read-only</span></div>
+          <div class="inputbox">
+            <div class="placeholder">Waiting for owner approval…</div>
+            <div class="composer-foot">
+              <span class="seg-label">To</span>
+              <span class="seg" style="opacity:.45"><button>Agent</button><button>People</button></span>
+              <span class="cred"><span class="acct">◉</span> via Björn's GitHub Copilot</span>
+              <span class="spacer"></span>
+              <button class="btn ghost">Ask owner to approve</button>
+              <span class="send" style="opacity:.35">↑</span>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <aside class="inspector">
+        <div class="insp-head">
+          <div class="insp-title"><span class="t">People</span><span class="right"><span>3 participants</span><span class="btn ghost">Close</span></span></div>
+          <div class="tabs">
+            <span class="tab">Changes <span class="bang">2</span></span>
+            <span class="tab">Agent <span class="bang">2/5</span></span>
+            <span class="tab">Context</span>
+            <span class="tab">Files</span>
+            <span class="tab active">People</span>
+          </div>
+        </div>
+        <div class="insp-body">
+          <div class="card">
+            <div class="ch">Participants</div>
+            <div class="cb" style="gap:10px">
+              <div class="person">
+                <span class="avatar av-bjorn" style="border-color:var(--surface0)">BH<span class="dot online"></span></span>
+                <div class="pname"><div class="n">Björn Harrtell <span class="pill owner" title="Owner: manages access, the run credential, repositories, and run controls.">Owner</span></div><div class="h">@bjornharrtell</div></div>
+                <div class="meta">online</div>
+              </div>
+              <div class="person">
+                <span class="avatar av-sam" style="border-color:var(--surface0)">SR<span class="dot online"></span></span>
+                <div class="pname"><div class="n">Sam Rivera <span class="pill participant" title="Participant (approved once by the owner): chat, direct the agent, answer questions, and approve tool actions. No per-action owner approval.">Participant</span></div><div class="h">@sam-rivera</div></div>
+                <div class="meta">online</div>
+              </div>
+              <div class="person">
+                <span class="avatar av-nadia" style="border-color:var(--surface0)">NO<span class="dot online"></span></span>
+                <div class="pname"><div class="n">Nadia Okafor <span class="pill observer" title="Observer (read-only): view the session, roster, history, and run state until the owner approves you to participant.">Observer</span> <span class="pill participant">You</span></div><div class="h">@nadia-okafor · awaiting owner approval</div></div>
+                <div class="meta">read-only</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+  </div></div>
+  <ul class="legend">
+    <li><span class="n">1</span><b>Observer banner.</b> The reason for the read-only state is stated up front, not hidden behind disabled controls.</li>
+    <li><span class="n">2</span><b>History is read-only, not hidden.</b> An observer sees the same attributed transcript and run state as participants.</li>
+    <li><span class="n">3</span><b>No per-message path.</b> The composer, recipient selector, and send are inert until approval; there is a single "Ask owner to approve" action.</li>
+    <li><span class="n">4</span><b>Observer tier in the roster.</b> The pending state is visible to everyone; only the owner gets the Approve control.</li>
+  </ul>
+</section>
+
+
+<div class="map">
+  <h3>How the mockup maps to the issue</h3>
+  <table>
+    <thead><tr><th>Issue area</th><th>Where it appears</th></tr></thead>
+    <tbody>
+      <tr><td>Stable identity &amp; roster</td><td>Presence group in the session header and the Participants card (scenes 1–3, 5); one entry per person across connections.</td></tr>
+      <tr><td>Differentiated privileges</td><td>Observer → participant → owner tiers: read-only observer default, one-time owner approval, then participants act without asking (scenes 1, 3, 5).</td></tr>
+      <tr><td>Roles</td><td>Role pills with the access policy as a tooltip, disabled Stop and model pickers for non-owners, and the tiered model in People &amp; access.</td></tr>
+      <tr><td>Credential ownership</td><td>Credential chip in the composer, single-credential cards in the inspector, and the owner-carry change flow in scene 4.</td></tr>
+      <tr><td>Messaging &amp; presence</td><td>Attributed direction vs. peer chat in the transcript, explicit "To: Agent / People" selector, conflict note.</td></tr>
+      <tr><td>Grant / revoke access</td><td>Session access settings in scene 3, including observer promotion and the revocation scope note.</td></tr>
+      <tr><td>Repository separation</td><td>Owner-only attach dialog and read-only repo card for non-owners in scenes 2, 4, and 5.</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+  const stage = document.querySelectorAll('.stage');
+  const tabs = document.querySelectorAll('.scene-tab');
+  const scenes = document.querySelectorAll('.scene');
+  const wrap = document.querySelectorAll('.stage-wrap');
+  let manual = null;
+
+  function fit() {
+    stage.forEach(function (s) {
+      const available = document.documentElement.clientWidth - 44;
+      const scale = Math.min(1, available / 1360);
+      s.style.transform = 'scale(' + (manual === null ? scale : manual) + ')';
+      const wrapEl = s.parentElement;
+      wrapEl.style.height = (840 * (manual === null ? scale : manual)) + 'px';
+      wrapEl.style.width = (1360 * (manual === null ? scale : manual)) + 'px';
+    });
+  }
+
+  tabs.forEach(function (tab) {
+    tab.addEventListener('click', function () {
+      tabs.forEach(function (t) { t.classList.remove('active'); });
+      tab.classList.add('active');
+      const id = 'scene-' + tab.dataset.scene;
+      scenes.forEach(function (s) { s.classList.toggle('active', s.id === id); });
+      fit();
+    });
+  });
+
+  document.querySelectorAll('[data-zoom]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      const v = b.dataset.zoom;
+      manual = v === 'fit' ? null : parseFloat(v);
+      fit();
+    });
+  });
+
+  window.addEventListener('resize', fit);
+  fit();
+</script>
+</body>
+</html>
