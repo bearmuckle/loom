@@ -127,81 +127,138 @@ fn filesystem_change_response_detects_pruned_client_cursors() {
 }
 
 #[test]
-fn github_repository_search_maps_records_in_relevance_order_and_dedups() {
+fn github_repository_search_filters_accessible_repositories_by_rank() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
-        let items = vec![
-            github_repository_json("owner/zeta"),
-            github_repository_json("owner/alpha"),
-            github_repository_json("owner/alpha"),
-        ];
-        respond_http(
-            stream,
-            "200 OK",
-            &serde_json::json!({ "items": items }).to_string(),
-        );
+        // `GET /user/repos` returns a bare array rather than a search wrapper.
+        let repositories = serde_json::json!([
+            github_repository_json("zed/loom"),
+            github_repository_json("aaa/loom"),
+            github_repository_json("owner/loom-extra"),
+            github_repository_json("owner/preloom"),
+            github_repository_json("loom-owner/thing"),
+            serde_json::json!({
+                "full_name": "acme/tools",
+                "description": "Loom build tool",
+                "clone_url": "https://github.com/acme/tools.git",
+                "private": false,
+                "default_branch": "main"
+            }),
+            github_repository_json("acme/unrelated"),
+            github_repository_json("zed/loom"),
+        ]);
+        respond_http(stream, "200 OK", &repositories.to_string());
     });
 
     let repositories = search_github_repositories_at(
         "fixture-token",
         "loom",
-        &format!("http://{address}/search/repositories"),
+        &format!("http://{address}/user/repos"),
     )
     .unwrap();
     server.join().unwrap();
 
-    // GitHub's ranking is preserved (not re-sorted alphabetically) and
-    // duplicates are dropped.
-    assert_eq!(repositories.len(), 2);
-    assert_eq!(repositories.first().unwrap().full_name, "owner/zeta");
-    assert_eq!(repositories.last().unwrap().full_name, "owner/alpha");
+    // Exact names first, then prefix, substring, owner, and finally a
+    // description-only match. Duplicates are dropped.
+    let names = repositories
+        .iter()
+        .map(|repository| repository.full_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "aaa/loom",
+            "zed/loom",
+            "owner/loom-extra",
+            "owner/preloom",
+            "loom-owner/thing",
+            "acme/tools",
+        ]
+    );
     assert_eq!(
         repositories.first().unwrap().clone_url,
-        "https://github.com/owner/zeta.git"
+        "https://github.com/aaa/loom.git"
     );
     assert_eq!(repositories.first().unwrap().default_branch, "main");
 }
 
 #[test]
-fn github_search_query_scopes_owner_and_name_references() {
-    use crate::util::github_search_query;
+fn github_search_needle_normalizes_references_and_urls() {
+    use crate::util::github_search_needle;
 
-    assert_eq!(github_search_query("loom"), "loom in:name,description");
+    assert_eq!(github_search_needle("loom"), "loom");
+    assert_eq!(github_search_needle("  Loom  "), "loom");
     assert_eq!(
-        github_search_query("flatgeobuf/flatgeobuf"),
-        "flatgeobuf in:name user:flatgeobuf"
+        github_search_needle("flatgeobuf/flatgeobuf"),
+        "flatgeobuf/flatgeobuf"
     );
     assert_eq!(
-        github_search_query("flatgeobuf/flat"),
-        "flat in:name user:flatgeobuf"
-    );
-    assert_eq!(github_search_query("flatgeobuf/"), "user:flatgeobuf");
-    assert_eq!(
-        github_search_query("https://github.com/flatgeobuf/flatgeobuf.git"),
-        "flatgeobuf in:name user:flatgeobuf"
+        github_search_needle("https://github.com/flatgeobuf/flatgeobuf.git"),
+        "flatgeobuf/flatgeobuf"
     );
     assert_eq!(
-        github_search_query("git@github.com:flatgeobuf/flatgeobuf"),
-        "flatgeobuf in:name user:flatgeobuf"
+        github_search_needle("https://github.com/flatgeobuf/flatgeobuf/tree/main"),
+        "flatgeobuf/flatgeobuf"
     );
-    // Not an owner/name reference: fall back to the plain search.
     assert_eq!(
-        github_search_query("some words/with spaces"),
-        "some words/with spaces in:name,description"
+        github_search_needle("git@github.com:flatgeobuf/flatgeobuf.git"),
+        "flatgeobuf/flatgeobuf"
+    );
+    assert_eq!(github_search_needle("flatgeobuf/"), "flatgeobuf/");
+}
+
+#[test]
+fn github_repository_rank_prefers_name_over_description() {
+    use crate::util::github_repository_rank;
+
+    let repository = |full_name: &str, description: Option<&str>| crate::GitHubApiRepository {
+        full_name: full_name.to_owned(),
+        description: description.map(str::to_owned),
+        clone_url: format!("https://github.com/{full_name}.git"),
+        private: false,
+        default_branch: "main".to_owned(),
+    };
+
+    // An exact `owner/name` outranks a bare name, which outranks a prefix, a
+    // substring, an owner match, and finally a description-only match.
+    assert_eq!(
+        github_repository_rank(&repository("owner/loom", None), "owner/loom"),
+        Some(0)
+    );
+    assert_eq!(
+        github_repository_rank(&repository("owner/loom", None), "loom"),
+        Some(1)
+    );
+    assert_eq!(
+        github_repository_rank(&repository("owner/loom-extra", None), "loom"),
+        Some(2)
+    );
+    assert_eq!(
+        github_repository_rank(&repository("owner/preloom", None), "loom"),
+        Some(3)
+    );
+    assert_eq!(
+        github_repository_rank(&repository("loom/other", None), "loom"),
+        Some(4)
+    );
+    assert_eq!(
+        github_repository_rank(&repository("owner/other", Some("Loom tool")), "loom"),
+        Some(5)
+    );
+    assert_eq!(
+        github_repository_rank(&repository("owner/other", Some("Unrelated")), "loom"),
+        None
     );
 }
 
 #[test]
 fn github_repository_search_requires_two_characters_before_any_request() {
     for query in ["", " ", "a"] {
-        let error = search_github_repositories_at(
-            "fixture-token",
-            query,
-            "http://127.0.0.1:1/search/repositories",
-        )
-        .unwrap_err();
+        let error =
+            search_github_repositories_at("fixture-token", query, "http://127.0.0.1:1/user/repos")
+                .unwrap_err();
         assert_eq!(error.code, ErrorCode::InvalidRequest);
     }
 }
@@ -326,12 +383,9 @@ fn attach_can_reuse_a_cached_github_clone_without_the_network() {
 
 #[test]
 fn github_repository_search_reports_transport_failures() {
-    let error = search_github_repositories_at(
-        "fixture-token",
-        "loom",
-        "http://127.0.0.1:1/search/repositories",
-    )
-    .unwrap_err();
+    let error =
+        search_github_repositories_at("fixture-token", "loom", "http://127.0.0.1:1/user/repos")
+            .unwrap_err();
     assert_eq!(error.code, ErrorCode::ProviderAuthentication);
     assert!(error.retryable);
 }
@@ -347,7 +401,7 @@ fn github_repository_search_normalizes_transport_and_payload_errors() {
         respond_http(unauthorized, "401 Unauthorized", "{}");
     });
 
-    let endpoint = format!("http://{address}/search/repositories");
+    let endpoint = format!("http://{address}/user/repos");
     let malformed = search_github_repositories_at("fixture-token", "loom", &endpoint).unwrap_err();
     assert_eq!(malformed.code, ErrorCode::ProviderInvalidResponse);
     let unauthorized =

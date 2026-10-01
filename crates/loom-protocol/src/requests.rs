@@ -78,8 +78,9 @@ pub enum RepositoryRequest {
     },
 
     /// Search repositories the authenticated GitHub account can access. The
-    /// query must contain at least two characters; the GitHub API performs the
-    /// filtering.
+    /// query must contain at least two characters; the worker fetches the
+    /// account's owned, collaborator, and organization-member repositories and
+    /// filters them locally.
     SearchGitHubRepositories {
         query: String,
     },

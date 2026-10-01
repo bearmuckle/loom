@@ -73,8 +73,9 @@ pub struct GitHubRepository {
 }
 
 /// Minimum number of characters a GitHub repository search query must contain
-/// before the API is asked to filter results. Enforced by both the client and
-/// the worker so a short or empty query never triggers an unfiltered search.
+/// before the worker fetches the account's repositories. Enforced by both the
+/// client and the worker so a short or empty query never triggers an unfiltered
+/// listing.
 pub const GITHUB_REPOSITORY_QUERY_MIN_CHARS: usize = 2;
 
 /// A GitHub repository that a worker node has already cloned and cached.
