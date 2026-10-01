@@ -20,7 +20,6 @@ impl InProcessConnection {
             .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
         if task.project_id != project_id
             || task.requester_session_id != manager_session_id
-            || !task.code_change
             || !project.agents.iter().any(|agent| {
                 agent.session_id == task.target_session_id
                     && agent.parent_session_id == Some(manager_session_id)
@@ -167,8 +166,11 @@ impl InProcessConnection {
                 false,
             ));
         }
-        let (_task, mut worktree) =
+        let (task, mut worktree) =
             self.load_project_child_worktree(project_id, manager_session_id, task_id)?;
+        if !task.code_change {
+            return Err(LoomError::not_found("project child code task", task_id));
+        }
         if matches!(
             worktree.status,
             ProjectWorktreeStatus::CleanupPending | ProjectWorktreeStatus::Removed
@@ -223,6 +225,9 @@ impl InProcessConnection {
         })?;
         let (task, mut worktree) =
             self.load_project_child_worktree(project_id, manager_session_id, task_id)?;
+        if !task.code_change {
+            return Err(LoomError::not_found("project child code task", task_id));
+        }
         if task.status != loom_core::DelegatedTaskStatus::Completed {
             return Err(LoomError::invalid_state(
                 "a project child can be integrated only after its task completes",
