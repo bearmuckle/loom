@@ -54,7 +54,6 @@ Transcript
   Turn::Assistant { parts: Vec<Part>, streaming: bool }
   Turn::System { text }          // status, errors, needs-input
   Turn::Plan { steps, completed, active }
-  Turn::ChildMessage { ... }     // project message, de-emphasized
 
 Part
   Text { markdown, streaming }
@@ -114,9 +113,11 @@ it rather than stacking.
 ### Evidence and project messages
 
 Evidence entries become actionable (open the link) when they look like URLs.
-Project message cards are visually de-emphasized: a single compact header line
-with sender, kind, and sequence, and no heavy border/background, so they read as
-context rather than interruptions.
+Inter-agent project messages are orchestration traffic and stay out of the
+transcript entirely: the receiving agent decides whether the user needs to act
+on anything and presents that decision itself, so raw child results, progress,
+and directions are never rendered. A hidden project message still ends the
+agent turn around it, so the reply that follows reads as its own entry.
 
 ### Composer
 
@@ -134,7 +135,6 @@ are discoverable without keyboard knowledge.
 | Tool output | `ToolOutputChunk` / activity result |
 | `Turn::Plan` | `AgentPlan` + `StepStarted`/`StepCompleted` |
 | Approval | `ToolApprovalRequired` / `ToolApprovalDecided` |
-| `Turn::ChildMessage` | `AgentMessageRecord` |
 | `Turn::System` | `Status`, `Error`, `NeedsInput` items |
 
 The existing `TimelineItem` enum stays as the wire-facing accumulator during
@@ -190,7 +190,8 @@ duplicate denials across restarts remain open.
 The projection and rendering changes above are implemented in `loom-ui`:
 message-part assistant turns, unified tool blocks, collapsed status chrome,
 streaming cursor, composer send/stop, actionable evidence, single-run plans,
-de-emphasized project messages, and an opt-in collapsed reasoning disclosure
+project messages kept out of the transcript, and an opt-in collapsed reasoning
+disclosure
 (hidden by default; enabled under Settings → Appearance).
 
 ## Presentation polish

@@ -370,14 +370,8 @@ impl LoomView {
             self.transcript_messages
                 .insert(ordinal, (timeline_ordinal, message));
         }
-        self.timeline.retain(|item| {
-            !matches!(
-                item,
-                TimelineItem::User(_)
-                    | TimelineItem::Assistant(_)
-                    | TimelineItem::ProjectMessageContext(_)
-            )
-        });
+        self.timeline
+            .retain(|item| !matches!(item, TimelineItem::User(_) | TimelineItem::Assistant(_)));
         let ordered_items = timeline_items_from_messages(
             self.transcript_messages
                 .iter()
@@ -390,7 +384,6 @@ impl LoomView {
         let insertion_index = self.transcript_insertion_index();
         self.timeline
             .splice(insertion_index..insertion_index, ordered_items);
-        self.rebuild_project_message_timeline();
         self.transcript_before_ordinal = next_before;
         self.transcript_has_older = has_older;
         self.ensure_session_task_message(self.active_session.id);

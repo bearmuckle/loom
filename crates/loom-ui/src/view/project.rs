@@ -1,24 +1,6 @@
 use super::*;
 
 impl LoomView {
-    pub(crate) fn rebuild_project_message_timeline(&mut self) {
-        self.timeline
-            .retain(|item| !matches!(item, TimelineItem::ProjectMessage(_)));
-        if self
-            .project_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.root_session_id == self.active_session.id)
-        {
-            remove_project_message_context_duplicates(&mut self.timeline, &self.project_messages);
-            self.timeline.extend(
-                self.project_messages
-                    .iter()
-                    .cloned()
-                    .map(TimelineItem::ProjectMessage),
-            );
-        }
-    }
-
     pub(crate) fn refresh_active_project_snapshot(&mut self, cx: &mut Context<Self>) {
         let session_id = self.active_session.id;
         let backend = match self.backend_for_session(session_id) {
@@ -49,13 +31,9 @@ impl LoomView {
                             .retain(|known| known.project_id != snapshot.project_id);
                         view.project_tree_snapshots.push(snapshot.clone());
                         view.project_snapshot = Some(snapshot);
-                        view.project_messages_stale = true;
                     }
                     Err(error) if error.code == ErrorCode::NotFound => {
                         view.project_snapshot = None;
-                        view.project_messages.clear();
-                        view.project_message_cursors.clear();
-                        view.rebuild_project_message_timeline();
                     }
                     Err(error) => {
                         view.record_backend_error("load project snapshot", error);
@@ -68,134 +46,7 @@ impl LoomView {
                 if reload_sessions {
                     view.reload_sessions(cx);
                 }
-                view.refresh_project_messages(cx);
                 view.schedule_project_poll(cx);
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    pub(crate) fn refresh_project_messages(&mut self, cx: &mut Context<Self>) {
-        if self.project_messages_loading || !self.project_messages_stale {
-            return;
-        }
-        let Some(project) = self
-            .project_snapshot
-            .as_ref()
-            .filter(|snapshot| snapshot.root_session_id == self.active_session.id)
-        else {
-            return;
-        };
-        let project_id = project.project_id;
-        let mut recipients = project
-            .agents
-            .iter()
-            .map(|agent| agent.session_id)
-            .collect::<Vec<_>>();
-        recipients.push(project.root_session_id);
-        recipients.sort();
-        recipients.dedup();
-        if recipients.len() <= 1 {
-            self.project_messages.clear();
-            self.project_message_cursors.clear();
-            self.project_messages_stale = false;
-            self.rebuild_project_message_timeline();
-            return;
-        }
-        let backend = match self.backend_for_session(self.active_session.id) {
-            Ok(backend) => backend,
-            Err(error) => {
-                self.record_backend_error("load project messages", error);
-                return;
-            }
-        };
-        let mut cursors = self.project_message_cursors.clone();
-        let generation = self.project_message_generation;
-        self.project_messages_stale = false;
-        self.project_messages_loading = true;
-        cx.spawn(async move |view, cx| {
-            let mut messages = Vec::new();
-            let mut first_failure = None;
-            for session_id in recipients {
-                let mut cursor = cursors.get(&session_id).copied();
-                loop {
-                    let request = backend.submit(RequestEnvelope::new(ClientRequest::Project(
-                        ProjectRequest::ListProjectAgentMessages {
-                            project_id,
-                            session_id,
-                            after_project_sequence: cursor,
-                            limit: 512,
-                        },
-                    )));
-                    let response = cx
-                        .background_spawn(async move { request.wait().await })
-                        .await;
-                    match response.result {
-                        Ok(ServerResponse::Project(ProjectResponse::ProjectAgentMessages {
-                            messages: page,
-                            next_after_project_sequence,
-                        })) => {
-                            if let Some(last) = page.last() {
-                                cursor = Some(last.project_sequence);
-                                cursors.insert(session_id, last.project_sequence);
-                            }
-                            messages.extend(page);
-                            if let Some(next) = next_after_project_sequence {
-                                cursor = Some(next);
-                                cursors.insert(session_id, next);
-                                continue;
-                            }
-                            break;
-                        }
-                        Err(error) => {
-                            if first_failure.is_none() {
-                                first_failure = Some(error);
-                            }
-                            break;
-                        }
-                        Ok(response) => {
-                            if first_failure.is_none() {
-                                first_failure =
-                                    Some(unexpected_response("project messages", response));
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            view.update(cx, |view, cx| {
-                if view.project_message_generation != generation
-                    || !view
-                        .project_snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| view.active_session.id == snapshot.root_session_id)
-                {
-                    return;
-                }
-                view.project_messages_loading = false;
-                view.project_message_cursors = cursors;
-                for message in messages {
-                    if !view
-                        .project_messages
-                        .iter()
-                        .any(|existing| existing.message_id == message.message_id)
-                    {
-                        view.project_messages.push(message);
-                    }
-                }
-                view.project_messages
-                    .sort_by_key(|message| message.project_sequence);
-                view.rebuild_project_message_timeline();
-                let had_failure = first_failure.is_some();
-                if let Some(error) = first_failure {
-                    view.project_messages_stale = true;
-                    view.record_backend_error("load project messages", error);
-                }
-                if !had_failure && view.project_messages_stale {
-                    view.refresh_project_messages(cx);
-                }
                 cx.notify();
             })
             .ok();

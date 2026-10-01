@@ -121,9 +121,7 @@ impl LoomView {
             | ServerEvent::ProjectAgentUpdated { .. } => {
                 self.project_snapshot_stale = true;
             }
-            ServerEvent::ProjectAgentMessageAccepted { .. } => {
-                self.project_messages_stale = true;
-            }
+            ServerEvent::ProjectAgentMessageAccepted { .. } => {}
             ServerEvent::AgentSessionCreated { snapshot } => {
                 self.active_session = snapshot.clone();
                 self.session_state = snapshot.state;

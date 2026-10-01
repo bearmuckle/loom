@@ -87,7 +87,6 @@ impl LoomView {
                             .any(|event| is_project_workspace_event(event, project_id, &member_ids))
                         {
                             view.project_snapshot_stale = true;
-                            view.project_messages_stale = true;
                         }
                     }
                     Ok(ServerResponse::Events(EventsResponse::WorkspaceEventsSnapshot {
@@ -100,7 +99,6 @@ impl LoomView {
                         view.project_feed_epoch = stream_epoch;
                         view.project_feed_after_sequence = Some(latest_sequence);
                         view.project_snapshot_stale = true;
-                        view.project_messages_stale = true;
                         if events
                             .iter()
                             .any(|event| is_project_workspace_event(event, project_id, &member_ids))
@@ -116,8 +114,6 @@ impl LoomView {
                 }
                 if view.project_snapshot_stale {
                     view.refresh_active_project_snapshot(cx);
-                } else if view.project_messages_stale {
-                    view.refresh_project_messages(cx);
                 }
                 // A manager that ended its turn while children still run is
                 // woken by the server. Keep consuming the root session's events
@@ -179,9 +175,6 @@ impl LoomView {
                 }
                 if view.project_snapshot_stale {
                     view.refresh_active_project_snapshot(cx);
-                }
-                if view.project_messages_stale {
-                    view.refresh_project_messages(cx);
                 }
                 view.run_poll_scheduled = false;
                 view.schedule_run_poll(cx);

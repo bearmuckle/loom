@@ -7,8 +7,7 @@ use std::collections::BTreeSet;
 
 use gpui_kit::{ListAlignment, ListState, px};
 use loom_core::{
-    AgentMessageRecord, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ToolCallId,
-    UsageSnapshot,
+    AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ToolCallId, UsageSnapshot,
 };
 use loom_model::ProviderUsageSummary;
 use loom_protocol::{
@@ -302,8 +301,6 @@ pub(crate) enum TimelineItem {
     User(String),
     Assistant(AssistantTurn),
     System(SystemNote),
-    ProjectMessage(AgentMessageRecord),
-    ProjectMessageContext(String),
 }
 
 /// Live progress for the active run's plan.
