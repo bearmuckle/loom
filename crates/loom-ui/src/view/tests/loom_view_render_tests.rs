@@ -274,7 +274,7 @@ fn connection_bootstrap_creates_and_attaches_a_local_workspace_session(cx: &mut 
         let local_backend = loom_local::OwnedBackend::new();
         let connection = super::ClientConnection::InProcess(Box::new(local_backend.connect()));
         let connection_after_teardown = connection.clone();
-        crate::connection::negotiate(&connection).unwrap();
+        let negotiation = crate::connection::negotiate(&connection).unwrap();
         let mut view = LoomView::initialize_from_connection(
             &options,
             connection,
@@ -283,6 +283,8 @@ fn connection_bootstrap_creates_and_attaches_a_local_workspace_session(cx: &mut 
             None,
             cx.focus_handle(),
             false,
+            Some(negotiation.protocol_version),
+            None,
         )
         .unwrap();
         view.owned_backend = Some(local_backend);
@@ -763,6 +765,74 @@ fn settings_about_and_providers_panes_render(cx: &mut TestAppContext) {
         view.settings_open = true;
         view.settings_section = SettingsSection::Providers;
     });
+}
+
+#[gpui_kit::test]
+fn settings_about_pane_renders_every_backend_mode_and_a_phone_layout(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let open_about = |view: &mut LoomView| {
+        view.settings_open = true;
+        view.settings_section = SettingsSection::About;
+    };
+    // Local in-process backend.
+    render_scenario(cx, open_about);
+    // Deterministic demo backend.
+    render_scenario(cx, |view| {
+        open_about(view);
+        view.demo_workspace = true;
+        view.server_protocol_version = Some(loom_protocol::CURRENT_PROTOCOL_VERSION);
+    });
+    // Native `--remote` backend, with a matching server protocol.
+    render_scenario(cx, |view| {
+        open_about(view);
+        view.backend_endpoint = Some("wss://worker.example:8443/ws".to_owned());
+        view.server_protocol_version = Some(loom_protocol::CURRENT_PROTOCOL_VERSION);
+    });
+    // Browser client, with a server protocol that differs from the client's so
+    // the warning tone path is exercised.
+    render_scenario(cx, |view| {
+        open_about(view);
+        view.browser_client = true;
+        view.backend_endpoint = Some("wss://worker.example:8443/ws?token=hidden".to_owned());
+        view.server_protocol_version = Some(loom_core::ProtocolVersion::new(11, 0));
+    });
+    // Phone layout stacks every control below its label.
+    render_scenario_at(cx, size(px(460.), px(820.)), open_about);
+}
+
+#[gpui_kit::test]
+fn settings_about_pane_exposes_stable_test_ids(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.settings_open = true;
+            view.settings_section = SettingsSection::About;
+            view.backend_endpoint = Some("wss://worker.example:8443/ws?token=hidden".to_owned());
+            view.server_protocol_version = Some(loom_core::ProtocolVersion::new(11, 1));
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        for id in [
+            "about-subtitle",
+            "about-version",
+            "about-platform",
+            "about-protocol",
+            "about-link-docs",
+            "about-link-source",
+            "about-link-releases",
+            "about-link-security",
+        ] {
+            assert!(
+                window.within("settings-dialog").find(id).visible(),
+                "expected {id} to be visible in the About pane"
+            );
+        }
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

@@ -42,7 +42,7 @@ impl LoomView {
     ) {
         match name {
             "" | "help" => self.record_status(
-                "Commands: /new, /repo, /review, /stop, /providers, /settings, /help",
+                "Commands: /new, /repo, /review, /stop, /providers, /settings, /about, /help",
             ),
             "new" => self.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx),
             "repo" | "repository" => {
@@ -58,6 +58,7 @@ impl LoomView {
             }
             "providers" => self.open_providers_from_menu(cx),
             "settings" => self.open_settings_from_menu(cx),
+            "about" => self.open_about_from_menu(cx),
             "model" => match argument {
                 Some(model) => {
                     self.record_status(format!("Use the model picker to switch to '{model}'."))

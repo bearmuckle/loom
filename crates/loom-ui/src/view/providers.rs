@@ -937,6 +937,13 @@ impl LoomView {
         self.open_settings_from_menu(cx);
     }
 
+    /// Opens the About settings pane from the command palette or `/about`.
+    pub(crate) fn open_about_from_menu(&mut self, cx: &mut Context<Self>) {
+        self.settings_section = SettingsSection::About;
+        self.settings_open = true;
+        cx.notify();
+    }
+
     /// Opens the Providers settings pane scoped to a specific worker node.
     pub(crate) fn open_providers_for_node(&mut self, node_id: String, cx: &mut Context<Self>) {
         self.github_login = None;

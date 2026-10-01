@@ -22,10 +22,10 @@ use loom_model::{ModelId, ProviderSummary};
 #[cfg(not(target_family = "wasm"))]
 use loom_protocol::AgentRunSnapshot;
 use loom_protocol::{
-    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, ProviderRequest,
-    ProviderResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope, ResponseEnvelope,
-    ServerResponse, SessionRepository, SessionResponse, WorkerNodeStatus, WorkspaceConfig,
-    WorkspaceRequest, WorkspaceResponse,
+    CURRENT_PROTOCOL_VERSION, ClientRequest, ControlRequest, ControlResponse, NegotiationResult,
+    ProviderRequest, ProviderResponse, RepositoryRequest, RepositoryResponse, RequestEnvelope,
+    ResponseEnvelope, ServerResponse, SessionRepository, SessionResponse, WorkerNodeStatus,
+    WorkspaceConfig, WorkspaceRequest, WorkspaceResponse,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_protocol::{RunRequest, RunResponse};
@@ -295,7 +295,7 @@ pub(crate) fn negotiation_capabilities() -> CapabilitySet {
 }
 
 #[cfg(not(target_family = "wasm"))]
-pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> {
+pub(crate) fn negotiate(connection: &ClientConnection) -> Result<NegotiationResult, LoomError> {
     let response = connection.request_with_timeout(
         RequestEnvelope::new(ClientRequest::Control(ControlRequest::Negotiate {
             client_version: CURRENT_PROTOCOL_VERSION,
@@ -304,7 +304,7 @@ pub(crate) fn negotiate(connection: &ClientConnection) -> Result<(), LoomError> 
         Duration::from_secs(15),
     );
     match response.result? {
-        ServerResponse::Control(ControlResponse::Negotiated(_)) => Ok(()),
+        ServerResponse::Control(ControlResponse::Negotiated(result)) => Ok(result),
         response => Err(unexpected_response("negotiation", response)),
     }
 }
@@ -503,7 +503,9 @@ pub(crate) async fn set_workspace_config_async(
 }
 
 #[cfg(target_family = "wasm")]
-pub(crate) async fn negotiate_async(connection: &ClientConnection) -> Result<(), LoomError> {
+pub(crate) async fn negotiate_async(
+    connection: &ClientConnection,
+) -> Result<NegotiationResult, LoomError> {
     let response = request_with_timeout(
         connection,
         RequestEnvelope::new(ClientRequest::Control(ControlRequest::Negotiate {
@@ -513,7 +515,7 @@ pub(crate) async fn negotiate_async(connection: &ClientConnection) -> Result<(),
     )
     .await?;
     match response.result? {
-        ServerResponse::Control(ControlResponse::Negotiated(_)) => Ok(()),
+        ServerResponse::Control(ControlResponse::Negotiated(result)) => Ok(result),
         response => Err(unexpected_response("negotiation", response)),
     }
 }

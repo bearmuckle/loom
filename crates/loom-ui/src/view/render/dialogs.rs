@@ -1152,39 +1152,109 @@ impl LoomView {
                         )),
                 )
                 .into_any_element(),
-            SettingsSection::About => div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(settings_section_heading("ABOUT"))
-                .child(
-                    settings_card().child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .items_center()
-                            .gap_1()
-                            .px_4()
-                            .py_6()
-                            .child(div().text_lg().text_color(rgb(0xf3f4f6)).child("Loom"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(rgb(0x8f98a6))
-                                    .child("Local agent"),
-                            )
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .text_xs()
-                                    .text_color(rgb(0x64748b))
-                                    .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
-                            ),
-                    ),
-                )
-                .into_any_element(),
+            SettingsSection::About => {
+                let subtitle = about_backend_label(
+                    self.demo_workspace,
+                    self.browser_client,
+                    self.backend_endpoint.as_deref(),
+                );
+                let version = about_version_label(env!("CARGO_PKG_VERSION"), about_git_revision());
+                let platform = about_platform_label(
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    self.browser_client,
+                );
+                let protocol =
+                    about_protocol(CURRENT_PROTOCOL_VERSION, self.server_protocol_version);
+                let protocol_color = if protocol.mismatch {
+                    rgb(0xfcd34d)
+                } else {
+                    rgb(0xb7c0d0)
+                };
+
+                let mut links_card = settings_card();
+                for (index, link) in about_links().into_iter().enumerate() {
+                    let url = link.url();
+                    let open_url = url.clone();
+                    let label = link.label;
+                    links_card = links_card.child(settings_row(
+                        label,
+                        url.as_str(),
+                        Button::new(link.id)
+                            .label("Open")
+                            .ghost()
+                            .small()
+                            .accessibility_label(format!("Open {label}"))
+                            .tooltip(format!("Open {label}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Err(error) = open_external_url(&open_url) {
+                                    this.record_status(format!(
+                                        "Could not open {label} ({open_url}): {error}. The URL is shown above and can be copied."
+                                    ));
+                                }
+                                cx.notify();
+                            })),
+                        index == 0,
+                        phone,
+                    ));
+                }
+
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(settings_section_heading("ABOUT"))
+                    .child(
+                        settings_card().child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_1()
+                                .px_4()
+                                .py_6()
+                                .child(div().text_lg().text_color(rgb(0xf3f4f6)).child("Loom"))
+                                .child(
+                                    div()
+                                        .id("about-subtitle")
+                                        .test_support()
+                                        .text_sm()
+                                        .text_color(rgb(0x8f98a6))
+                                        .child(subtitle),
+                                ),
+                        ),
+                    )
+                    .child(settings_section_heading("THIS BUILD"))
+                    .child(
+                        settings_card()
+                            .child(settings_row(
+                                "Version",
+                                "",
+                                about_value("about-version", version, rgb(0xb7c0d0)),
+                                true,
+                                phone,
+                            ))
+                            .child(settings_row(
+                                "Platform",
+                                "",
+                                about_value("about-platform", platform, rgb(0xb7c0d0)),
+                                false,
+                                phone,
+                            ))
+                            .child(settings_row(
+                                "Protocol",
+                                "",
+                                about_value("about-protocol", protocol.text, protocol_color),
+                                false,
+                                phone,
+                            )),
+                    )
+                    .child(settings_section_heading("LINKS"))
+                    .child(links_card)
+                    .into_any_element()
+            }
         };
 
         div()

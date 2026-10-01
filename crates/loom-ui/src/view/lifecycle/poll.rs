@@ -334,7 +334,7 @@ impl LoomView {
                         };
                         let connection = ClientConnection::remote(candidate_url.clone(), token)
                             .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
-                        if let Err(error) = negotiate(&connection) {
+                        if let Err(error) = negotiate(&connection).map(|_| ()) {
                             let cleanup_failed = connection.close().is_err();
                             return Err((
                                 WorkerConnectionStage::Negotiation,

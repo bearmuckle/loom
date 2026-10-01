@@ -8,6 +8,7 @@ impl LoomView {
     ) -> Result<Self, LoomError> {
         info!("bootstrapping backend connection");
         let mut remote_cleanup_guard = None;
+        let mut server_protocol_version = None;
         let (connection, workspace_root, demo_workspace, owned_backend) = if let Some(remote_url) =
             &options.remote
         {
@@ -23,7 +24,7 @@ impl LoomView {
             let connection = ClientConnection::remote(remote_url.clone(), token.to_owned())?;
             remote_cleanup_guard = Some(ConnectionCleanupGuard::new(connection.clone()));
             info!("remote transport connected; negotiating protocol");
-            negotiate(&connection)?;
+            server_protocol_version = Some(negotiate(&connection)?.protocol_version);
             let workspace_root = options
                 .project
                 .clone()
@@ -77,8 +78,9 @@ impl LoomView {
         };
         if options.remote.is_none() {
             info!("negotiating protocol");
-            negotiate(&connection)?;
+            server_protocol_version = Some(negotiate(&connection)?.protocol_version);
         }
+        let backend_endpoint = options.remote.clone();
         let mut view = Self::initialize_from_connection(
             options,
             connection,
@@ -87,11 +89,17 @@ impl LoomView {
             remote_cleanup_guard,
             focus_handle,
             true,
+            server_protocol_version,
+            backend_endpoint,
         )?;
         view.owned_backend = owned_backend;
         Ok(view)
     }
 
+    /// The bootstrap constructor threads the negotiated backend metadata into
+    /// the view alongside the transport details, so it takes one argument per
+    /// startup concern rather than a bag struct.
+    #[allow(clippy::too_many_arguments)]
     #[cfg(not(target_family = "wasm"))]
     pub(crate) fn initialize_from_connection(
         options: &UiOptions,
@@ -101,6 +109,8 @@ impl LoomView {
         mut remote_cleanup_guard: Option<ConnectionCleanupGuard>,
         focus_handle: FocusHandle,
         discover_models: bool,
+        server_protocol_version: Option<ProtocolVersion>,
+        backend_endpoint: Option<String>,
     ) -> Result<Self, LoomError> {
         let node_status = worker_node_status(&connection)?;
         let default_backend_node_id = node_status.node_id.clone();
@@ -216,6 +226,9 @@ impl LoomView {
             connection: connection.clone(),
             #[cfg(not(target_family = "wasm"))]
             owned_backend: None,
+            server_protocol_version,
+            backend_endpoint,
+            browser_client: false,
             default_backend_node_id: default_backend_node_id.clone(),
             node_backends,
             node_names,
@@ -403,6 +416,9 @@ impl LoomView {
             browser_demo_mode: demo_mode,
             backend,
             connection,
+            server_protocol_version: None,
+            backend_endpoint: (!options.remote().is_empty()).then(|| options.remote().to_owned()),
+            browser_client: true,
             default_backend_node_id: String::new(),
             node_backends: BTreeMap::new(),
             node_names: BTreeMap::new(),
@@ -586,7 +602,7 @@ impl LoomView {
         }
         let connection = ClientConnection::browser(options.remote(), options.token())?;
         let mut cleanup_guard = ConnectionCleanupGuard::new(connection.clone());
-        negotiate_async(&connection).await?;
+        let negotiation = negotiate_async(&connection).await?;
         let node_status = worker_node_status_async(&connection).await?;
         let default_backend_node_id = node_status.node_id.clone();
         let mut workspaces = list_workspaces_async(&connection).await?;
@@ -674,6 +690,9 @@ impl LoomView {
             browser_demo_mode: false,
             backend,
             connection: connection.clone(),
+            server_protocol_version: Some(negotiation.protocol_version),
+            backend_endpoint: (!options.remote().is_empty()).then(|| options.remote().to_owned()),
+            browser_client: true,
             default_backend_node_id: default_backend_node_id.clone(),
             node_backends,
             node_names,
@@ -968,7 +987,7 @@ impl LoomView {
                     let connection =
                         ClientConnection::remote(connect_url, token.clone())
                         .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
-                    if let Err(error) = negotiate(&connection) {
+                    if let Err(error) = negotiate(&connection).map(|_| ()) {
                         let cleanup_failed = connection.close().is_err();
                         return Err((
                             WorkerConnectionStage::Negotiation,
@@ -1119,7 +1138,7 @@ impl LoomView {
             let result = async {
                 let connection = ClientConnection::browser(&url, &token)
                     .map_err(|error| (WorkerConnectionStage::Transport, error, false))?;
-                if let Err(error) = negotiate_async(&connection).await {
+                if let Err(error) = negotiate_async(&connection).await.map(|_| ()) {
                     let cleanup_failed = connection.close().is_err();
                     return Err((
                         WorkerConnectionStage::Negotiation,
