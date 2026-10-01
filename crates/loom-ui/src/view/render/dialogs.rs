@@ -286,29 +286,33 @@ impl LoomView {
                     )
                 });
         } else if dialog.choice == SessionSourceChoice::GitHub {
-            let mut github_body = div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x7f8b9c))
-                        .child("ON THIS NODE"),
-                )
-                .when(!self.cloned_repositories.is_empty(), |row| {
-                    row.child(
+            // A column: the heading row, cloned repositories, search field and
+            // results stack vertically instead of sharing one row.
+            let mut github_body = div().w_full().flex().flex_col().child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
                         div()
-                            .rounded_sm()
-                            .px_2()
-                            .bg(rgb(0x10291f))
-                            .border_1()
-                            .border_color(rgb(0x1f6b4d))
                             .text_xs()
-                            .text_color(rgb(0x34d399))
-                            .child(format!("{} clones", self.cloned_repositories.len())),
+                            .text_color(rgb(0x7f8b9c))
+                            .child("ON THIS NODE"),
                     )
-                });
+                    .when(!self.cloned_repositories.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .rounded_sm()
+                                .px_2()
+                                .bg(rgb(0x10291f))
+                                .border_1()
+                                .border_color(rgb(0x1f6b4d))
+                                .text_xs()
+                                .text_color(rgb(0x34d399))
+                                .child(format!("{} clones", self.cloned_repositories.len())),
+                        )
+                    }),
+            );
             github_body = if self.cloned_repositories_loading && self.cloned_repositories.is_empty()
             {
                 github_body.child(

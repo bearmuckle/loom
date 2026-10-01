@@ -1065,6 +1065,39 @@ fn phone_source_dialog_stacks_choices_and_keeps_actions_visible(cx: &mut TestApp
 }
 
 #[gpui_kit::test]
+fn github_source_body_stacks_vertically(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.source_dialog = Some(SessionSourceDialog {
+                purpose: SessionSourceDialogPurpose::StartSession,
+                choice: SessionSourceChoice::GitHub,
+                local_directory_available: false,
+                filter_subscription: None,
+                repositories: Vec::new(),
+                selected_repository: None,
+                repositories_loading: false,
+                error: None,
+            });
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        // The search field sits on its own row below the choices and spans the
+        // form, rather than being squeezed into a row with the headings.
+        let choices = window.find("source-github").bounds();
+        let filter = window.find("github-repository-filter").bounds();
+        assert!(filter.top() >= choices.bottom());
+        assert!(filter.size.width >= px(400.), "{filter:?}");
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn desktop_source_dialog_renders_as_a_pane(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
