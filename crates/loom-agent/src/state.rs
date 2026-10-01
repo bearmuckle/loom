@@ -238,6 +238,7 @@ impl AgentRuntime {
             control: RunControl::new(),
             observer: None,
             flush_offset: 0,
+            read_pool: pool::shared_read_pool(),
         })
     }
 }

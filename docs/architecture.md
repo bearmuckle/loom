@@ -80,7 +80,8 @@ Suggested backend boundaries:
   state, forks, handoff, and lifecycle.
 - `loom-agent`: agent loop, planning, tool-call dispatch, interruption,
   retries, checkpoints, context compaction, limits, pause/resume, and
-  completion.
+  completion. Consecutive read-only tool calls overlap on a process-wide,
+  bounded worker pool instead of a fresh thread per call.
 - `loom-model`: provider-independent model requests, streamed responses,
   tool-call normalization, token accounting, and model capabilities.
 - `loom-providers`: adapters for hosted APIs, OpenAI-compatible endpoints,
@@ -217,9 +218,11 @@ must support:
 - Streaming model output and tool calls without requiring the frontend to
   remain connected.
 - Explicit stop, pause, resume, retry, and continue-after-feedback commands.
-  A run executes on a backend-owned worker and holds its runtime lock only for
-  the duration of one step, so control requests are serviceable while a model
-  call is open.
+  Runs execute on a bounded Tokio-backed executor: a semaphore caps how many
+  run workers execute at once and how long a fresh run may wait for a slot, so
+  a burst of runs cannot consume an unbounded number of OS threads. A run holds
+  its runtime lock only for the duration of one step, so control requests are
+  serviceable while a model call is open.
 - Parallel child tasks with bounded concurrency and clear parent ownership.
 - Project coordination across durable child sessions, with explicit depth,
   message, permission, recovery, and integration rules as defined in the

@@ -83,26 +83,32 @@ impl InProcessBackend {
         })
     }
 
-    /// Drives a registered run on its own worker so the request handler returns
-    /// as soon as the run is registered.
+    /// Drives a registered run on the bounded run executor so the request
+    /// handler returns as soon as the run is registered. A run no longer owns a
+    /// dedicated OS thread: at most `DEFAULT_MAX_CONCURRENT_RUNS` runs execute
+    /// at once and excess runs wait for a slot.
     pub(crate) fn spawn_run_worker(self: &Arc<Self>, handle: Arc<RunHandle>) -> Result<()> {
         handle.join_worker()?;
         handle.set_running(true);
         let backend = Arc::clone(self);
-        let worker_handle = Arc::clone(&handle);
+        let task_handle = Arc::clone(&handle);
+        let reject_handle = Arc::clone(&handle);
         let run_id = handle.run_id;
-        let worker = thread::Builder::new()
-            .name(format!("loom-run-{run_id}"))
-            .spawn(move || {
+        let worker = self.run_executor.spawn_bounded(
+            format!("loom-run-{run_id}"),
+            move || {
                 let fragment_flusher = backend.persistence.clone().map(|persistence| {
-                    let handle = Arc::downgrade(&handle);
-                    thread::spawn(move || {
-                        RunHandle::flush_message_fragments_until_stopped(handle, persistence)
-                    })
+                    let handle = Arc::downgrade(&task_handle);
+                    backend.run_executor.spawn_blocking(
+                        format!("loom-run-{run_id}-fragments"),
+                        move || {
+                            RunHandle::flush_message_fragments_until_stopped(handle, persistence)
+                        },
+                    )
                 });
                 loop {
                     let delivered = if let Some(persistence) = backend.persistence.as_ref() {
-                        let mut runtime = handle
+                        let mut runtime = task_handle
                             .runtime
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
@@ -114,27 +120,27 @@ impl InProcessBackend {
                                 Ok(true) => delivered = true,
                                 Ok(false) => {}
                                 Err(error) => {
-                                    handle.record_failure(error);
+                                    task_handle.record_failure(error);
                                     break;
                                 }
                             }
                         }
                         if delivered {
-                            handle.refresh(&runtime);
+                            task_handle.refresh(&runtime);
                         }
                         delivered
                     } else {
                         false
                     };
-                    if handle.failure().is_some() {
+                    if task_handle.failure().is_some() {
                         break;
                     }
-                    if delivered && let Err(error) = backend.persist_run_checkpoint(&handle) {
-                        handle.record_failure(error);
+                    if delivered && let Err(error) = backend.persist_run_checkpoint(&task_handle) {
+                        task_handle.record_failure(error);
                         break;
                     }
                     let progress = {
-                        let mut runtime = handle
+                        let mut runtime = task_handle
                             .runtime
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
@@ -147,26 +153,26 @@ impl InProcessBackend {
                             backend.providers.github_write_access(),
                         );
                         let progress = runtime.run_step();
-                        handle.refresh(&runtime);
+                        task_handle.refresh(&runtime);
                         progress
                     };
-                    if handle.failure().is_some() {
+                    if task_handle.failure().is_some() {
                         break;
                     }
                     match progress {
                         Ok(progress) => {
                             if let Some(persistence) = backend.persistence.as_ref()
-                                && let Err(error) = handle.flush_message_fragments(persistence)
+                                && let Err(error) = task_handle.flush_message_fragments(persistence)
                             {
-                                handle.record_failure(error);
+                                task_handle.record_failure(error);
                                 break;
                             }
-                            if let Err(error) = backend.persist_run_checkpoint(&handle) {
-                                handle.record_failure(error);
+                            if let Err(error) = backend.persist_run_checkpoint(&task_handle) {
+                                task_handle.record_failure(error);
                                 break;
                             }
-                            if let Err(error) = backend.after_run_checkpoint(&handle) {
-                                handle.record_failure(error);
+                            if let Err(error) = backend.after_run_checkpoint(&task_handle) {
+                                task_handle.record_failure(error);
                                 break;
                             }
                             if !progress.continues {
@@ -177,19 +183,19 @@ impl InProcessBackend {
                                 let delivered = if let Some(persistence) =
                                     backend.persistence.as_ref()
                                 {
-                                    let mut runtime = handle
+                                    let mut runtime = task_handle
                                         .runtime
                                         .lock()
                                         .unwrap_or_else(PoisonError::into_inner);
                                     match deliver_queued_run_directions(persistence, &mut runtime) {
                                         Ok(delivered) => {
                                             if delivered {
-                                                handle.refresh(&runtime);
+                                                task_handle.refresh(&runtime);
                                             }
                                             delivered
                                         }
                                         Err(error) => {
-                                            handle.record_failure(error);
+                                            task_handle.record_failure(error);
                                             false
                                         }
                                     }
@@ -197,12 +203,13 @@ impl InProcessBackend {
                                     false
                                 };
                                 if delivered {
-                                    if let Err(error) = backend.persist_run_checkpoint(&handle) {
-                                        handle.record_failure(error);
+                                    if let Err(error) = backend.persist_run_checkpoint(&task_handle)
+                                    {
+                                        task_handle.record_failure(error);
                                         break;
                                     }
-                                    if let Err(error) = backend.after_run_checkpoint(&handle) {
-                                        handle.record_failure(error);
+                                    if let Err(error) = backend.after_run_checkpoint(&task_handle) {
+                                        task_handle.record_failure(error);
                                         break;
                                     }
                                     continue;
@@ -213,33 +220,37 @@ impl InProcessBackend {
                         Err(error) => {
                             let flush_error =
                                 backend.persistence.as_ref().and_then(|persistence| {
-                                    handle.flush_message_fragments(persistence).err()
+                                    task_handle.flush_message_fragments(persistence).err()
                                 });
-                            handle.record_failure(flush_error.unwrap_or(error));
+                            task_handle.record_failure(flush_error.unwrap_or(error));
                             break;
                         }
                     }
                 }
                 if let Err(error) = backend.persist_worker_state() {
-                    handle.record_failure(error);
+                    task_handle.record_failure(error);
                 }
-                handle.set_running(false);
-                if fragment_flusher.is_some_and(|flusher| flusher.join().is_err()) {
-                    log::error!("run message fragment flusher thread panicked");
+                task_handle.set_running(false);
+                if let Some(flusher) = fragment_flusher {
+                    flusher.wait();
+                    if let Some(message) = flusher.failure() {
+                        log::error!("run {run_id} message fragment flusher panicked: {message}");
+                    }
                 }
-            })
-            .map_err(|error| {
-                worker_handle.set_running(false);
-                LoomError::new(
-                    ErrorCode::Internal,
-                    format!("could not start worker for run {run_id}: {error}"),
-                    true,
-                )
-            })?;
-        *worker_handle
-            .worker
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(worker);
+            },
+            move |error| {
+                log::warn!("could not admit run {run_id}: {}", error.message);
+                reject_handle.record_failure(error);
+                // No worker owns the runtime yet, so settle the run here rather
+                // than leaving it running with no driver.
+                if let Ok(mut runtime) = reject_handle.try_runtime() {
+                    let _ = runtime.interrupt();
+                    reject_handle.refresh(&runtime);
+                }
+                reject_handle.set_running(false);
+            },
+        );
+        *handle.worker.lock().unwrap_or_else(PoisonError::into_inner) = Some(worker);
         Ok(())
     }
 }

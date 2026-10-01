@@ -75,10 +75,12 @@ mod event_journal;
 mod project_tools;
 mod remote;
 mod resource_monitor;
+mod run_executor;
 mod run_handle;
 mod services;
 mod util;
 
+use run_executor::RunExecutor;
 use util::*;
 
 use services::admission::AdmissionService;
@@ -176,7 +178,7 @@ struct RunHandle {
     running: Mutex<bool>,
     idle: Condvar,
     failure: Mutex<Option<LoomError>>,
-    worker: Mutex<Option<thread::JoinHandle<()>>>,
+    worker: Mutex<Option<run_executor::RunTask>>,
 }
 
 struct MessageCheckpointCursor {
@@ -278,6 +280,7 @@ pub struct InProcessBackend {
     providers: ProviderRegistry,
     credentials: CredentialService,
     persistence: Option<Arc<dyn Persistence>>,
+    run_executor: RunExecutor,
     session_root_base: PathBuf,
     idempotency_store: IdempotencyStore,
     admissions: AdmissionService,

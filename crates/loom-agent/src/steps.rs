@@ -262,26 +262,33 @@ impl AgentRuntime {
         }
         // Publish the starts before executing so blocked reads report as running.
         self.flush_prefix(events);
-        let tools = &self.tools;
+        let tools = self.tools.clone();
         let cancel = self.control.stream_token();
-        let results = std::thread::scope(|scope| {
-            let handles = calls
-                .iter()
-                .map(|call| scope.spawn(|| tools.execute_with_cancel(call, &cancel)))
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .zip(calls.iter())
-                .map(|(handle, call)| {
-                    handle.join().unwrap_or_else(|_| ToolResult {
-                        tool_call_id: call.id,
-                        name: call.name.clone(),
-                        success: false,
-                        output: "tool execution failed".to_owned(),
-                    })
+        // Read-only calls overlap on a bounded, shared pool instead of a fresh
+        // thread per call, so a large batch cannot exhaust OS threads.
+        let jobs = calls
+            .iter()
+            .cloned()
+            .map(|call| {
+                let tools = tools.clone();
+                let cancel = cancel.clone();
+                move || tools.execute_with_cancel(&call, &cancel)
+            })
+            .collect::<Vec<_>>();
+        let results = self
+            .read_pool
+            .execute_batch(jobs)
+            .into_iter()
+            .enumerate()
+            .map(|(index, outcome)| {
+                outcome.unwrap_or_else(|_| ToolResult {
+                    tool_call_id: calls[index].id,
+                    name: calls[index].name.clone(),
+                    success: false,
+                    output: "tool execution failed".to_owned(),
                 })
-                .collect::<Vec<_>>()
-        });
+            })
+            .collect::<Vec<_>>();
         for result in &results {
             self.record_tool_result(result, events);
             self.flush_prefix(events);

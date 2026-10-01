@@ -293,6 +293,7 @@ impl InProcessBackend {
             providers,
             credentials: CredentialService::new(),
             persistence,
+            run_executor: RunExecutor::with_defaults(),
             session_root_base,
             idempotency_store: IdempotencyStore::new(),
             admissions: AdmissionService::new(),

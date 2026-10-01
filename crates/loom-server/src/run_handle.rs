@@ -436,12 +436,15 @@ impl RunHandle {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        if worker.is_some_and(|worker| worker.join().is_err()) {
-            return Err(LoomError::new(
-                ErrorCode::Internal,
-                format!("agent run {} worker panicked", self.run_id),
-                false,
-            ));
+        if let Some(worker) = worker {
+            worker.wait();
+            if let Some(message) = worker.failure() {
+                return Err(LoomError::new(
+                    ErrorCode::Internal,
+                    format!("agent run {} worker panicked: {message}", self.run_id),
+                    false,
+                ));
+            }
         }
         Ok(())
     }
