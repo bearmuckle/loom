@@ -231,7 +231,10 @@ The projection and rendering code lives under `crates/loom-ui/src/view` and
   one usage line that lists each tool type with its invocation count (for
   example `Read ×2 · Search ×1`). Expanding the usage line reveals the detailed
   presentation, where consecutive same-kind tool calls still collapse into one
-  expandable summary row. Active and approval-gated runs stay open. A run that
+  expandable summary row. The usage line stays collapsed by default, including
+  while a run is streaming, so it does not flicker open and shut as each call
+  settles; a run that is waiting on an approval or an input decision opens
+  automatically so the control stays reachable. A run that
   recovered from a failed call reads as done with the failure count called out
   (`done · 1 failed`); only a run where nothing succeeded reads as failed. The
   transcript scrolls through

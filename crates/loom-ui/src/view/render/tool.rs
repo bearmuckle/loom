@@ -168,8 +168,9 @@ impl LoomView {
 
     /// One collapsed line for a run of tool calls, summarizing the tools by type
     /// and invocation count. Expanding it shows the existing per-tool
-    /// presentation. An active run stays open so progress and approval decisions
-    /// remain visible.
+    /// presentation. The line starts collapsed and only opens on click; a run
+    /// that is blocked on an approval or an input decision opens automatically
+    /// so the control stays reachable.
     pub(crate) fn render_tool_usage(
         &self,
         parts: &[AssistantPart],
@@ -198,7 +199,7 @@ impl LoomView {
         };
         let status_label = status.label();
         let key = tool_element_id(index, first_part_index);
-        let expanded = status == ToolPartStatus::Running || self.expanded_tool_usage.contains(&key);
+        let expanded = self.expanded_tool_usage.contains(&key) || tool_needs_attention(&tools);
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let summary = tool_usage_summary(&tools);
@@ -355,10 +356,10 @@ impl LoomView {
         };
         let status_label = status.label();
         let key = tool_element_id(index, first_part_index);
-        // A running group stays open so progress is visible; a settled group
-        // collapses like any other entry and can be reopened.
-        let expanded =
-            matches!(status, ToolPartStatus::Running) || self.expanded_tool_groups.contains(&key);
+        // A group starts collapsed like the summary above it; only a call that
+        // needs the user opens it, so a running group does not flicker open and
+        // shut as each call settles.
+        let expanded = self.expanded_tool_groups.contains(&key) || tool_needs_attention(&tools);
         let total_ms = tools.iter().filter_map(|tool| tool.elapsed_ms).sum::<u64>();
         let duration = (total_ms > 0).then(|| format_duration(total_ms));
         let label = tool_group_label(&first.name, tools.len());
