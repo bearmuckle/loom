@@ -72,9 +72,18 @@ jobs:
       - name: Run tests
         if: github.event_name == 'push'
         run: cargo test --workspace --locked --lib --bins --tests
+      # The GPU client stack (gpui-kit/wgpu) is reached only through
+      # `loom-ui`. cargo-llvm-cov instruments only workspace crates but builds
+      # into a separate `target/llvm-cov-target` directory, so every
+      # dependency (including the whole GPU stack) is recompiled from scratch.
+      # Excluding `loom-ui` prunes that subtree from the coverage build and
+      # runs its tests uninstrumented instead.
       - name: Run tests and collect coverage
         if: github.event_name == 'pull_request'
-        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+        run: cargo llvm-cov --workspace --exclude loom-ui --locked --lcov --output-path lcov.info
+      - name: Run UI tests without coverage
+        if: github.event_name == 'pull_request'
+        run: cargo test -p loom-ui --locked
       - name: Enforce patch coverage on changed lines
         if: github.event_name == 'pull_request'
         run: |
@@ -83,6 +92,7 @@ jobs:
           diff-cover lcov.info \
             --compare-branch="origin/${{ github.base_ref }}" \
             --fail-under=75 \
+            --exclude 'crates/loom-ui/*' \
             --exclude 'crates/*/src/tests.rs' \
             --exclude 'crates/*/src/tests/*' \
             --exclude 'crates/*/src/*/tests.rs' \
