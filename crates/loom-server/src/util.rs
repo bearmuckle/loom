@@ -66,7 +66,7 @@ pub(crate) fn search_github_repositories_at(
             )
         })?;
         url.query_pairs_mut()
-            .append_pair("q", &format!("{query} in:name,description"))
+            .append_pair("q", &github_search_query(query))
             .append_pair("per_page", "50");
         let response = client
             .get(url)
@@ -112,10 +112,47 @@ pub(crate) fn search_github_repositories_at(
                 default_branch: repository.default_branch,
             })
             .collect::<Vec<_>>();
-        repositories.sort_by(|left, right| left.full_name.cmp(&right.full_name));
-        repositories.dedup_by(|left, right| left.full_name == right.full_name);
+        // Keep GitHub's best-match order so an exact name stays at the top
+        // instead of being buried by an alphabetical re-sort.
+        let mut seen = std::collections::HashSet::new();
+        repositories.retain(|repository| seen.insert(repository.full_name.clone()));
         Ok(repositories)
     })
+}
+
+/// Builds the GitHub search expression for a picker query.
+///
+/// A plain term searches repository names and descriptions. GitHub's name
+/// search does not match the owner and does not understand `owner/name`, so
+/// `owner/name` (or a pasted GitHub URL) is turned into an owner-scoped search
+/// instead of returning nothing.
+pub(crate) fn github_search_query(query: &str) -> String {
+    let query = query.trim();
+    let reference = [
+        "https://github.com/",
+        "http://github.com/",
+        "github.com/",
+        "git@github.com:",
+    ]
+    .iter()
+    .find_map(|prefix| query.strip_prefix(prefix))
+    .unwrap_or(query);
+    if let Some((owner, rest)) = reference.split_once('/') {
+        let name = rest.split('/').next().unwrap_or_default();
+        let name = name.strip_suffix(".git").unwrap_or(name);
+        let valid = |part: &str| {
+            part.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        if !owner.is_empty() && valid(owner) && valid(name) {
+            return if name.is_empty() {
+                format!("user:{owner}")
+            } else {
+                format!("{name} in:name user:{owner}")
+            };
+        }
+    }
+    format!("{query} in:name,description")
 }
 
 fn run_github_async<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {

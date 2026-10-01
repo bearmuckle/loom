@@ -127,7 +127,7 @@ fn filesystem_change_response_detects_pruned_client_cursors() {
 }
 
 #[test]
-fn github_repository_search_maps_and_sorts_api_records() {
+fn github_repository_search_maps_records_in_relevance_order_and_dedups() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -152,13 +152,45 @@ fn github_repository_search_maps_and_sorts_api_records() {
     .unwrap();
     server.join().unwrap();
 
+    // GitHub's ranking is preserved (not re-sorted alphabetically) and
+    // duplicates are dropped.
     assert_eq!(repositories.len(), 2);
-    assert_eq!(repositories.first().unwrap().full_name, "owner/alpha");
+    assert_eq!(repositories.first().unwrap().full_name, "owner/zeta");
+    assert_eq!(repositories.last().unwrap().full_name, "owner/alpha");
     assert_eq!(
-        repositories.last().unwrap().clone_url,
+        repositories.first().unwrap().clone_url,
         "https://github.com/owner/zeta.git"
     );
-    assert_eq!(repositories.last().unwrap().default_branch, "main");
+    assert_eq!(repositories.first().unwrap().default_branch, "main");
+}
+
+#[test]
+fn github_search_query_scopes_owner_and_name_references() {
+    use crate::util::github_search_query;
+
+    assert_eq!(github_search_query("loom"), "loom in:name,description");
+    assert_eq!(
+        github_search_query("flatgeobuf/flatgeobuf"),
+        "flatgeobuf in:name user:flatgeobuf"
+    );
+    assert_eq!(
+        github_search_query("flatgeobuf/flat"),
+        "flat in:name user:flatgeobuf"
+    );
+    assert_eq!(github_search_query("flatgeobuf/"), "user:flatgeobuf");
+    assert_eq!(
+        github_search_query("https://github.com/flatgeobuf/flatgeobuf.git"),
+        "flatgeobuf in:name user:flatgeobuf"
+    );
+    assert_eq!(
+        github_search_query("git@github.com:flatgeobuf/flatgeobuf"),
+        "flatgeobuf in:name user:flatgeobuf"
+    );
+    // Not an owner/name reference: fall back to the plain search.
+    assert_eq!(
+        github_search_query("some words/with spaces"),
+        "some words/with spaces in:name,description"
+    );
 }
 
 #[test]
