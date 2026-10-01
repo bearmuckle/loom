@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
-pub use loom_core::WorkspaceRecord;
-use loom_core::{AgentSessionId, CheckpointId, EventSequence, RepositoryId, Timestamp};
+use crate::{AgentSessionId, CheckpointId, EventSequence, RepositoryId, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

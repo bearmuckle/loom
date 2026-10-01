@@ -1,11 +1,10 @@
 use loom_core::{
-    AgentSessionId, CheckpointId, EvidenceLink, InteractionId, LimitStatus, LoomError,
-    PolicyEvaluation, RunAttemptId, RunId, StepId, Timestamp, ToolCallId, UsageSnapshot,
+    AgentSessionId, CheckpointId, ContextInspection, EvidenceLink, InteractionId, LimitStatus,
+    LoomError, PolicyEvaluation, RunAttemptId, RunId, StepId, Timestamp, ToolCallId, UsageSnapshot,
 };
-use loom_model::{ModelId, TokenUsage, ToolCall};
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentActivityRecord, ContextInspection, ToolResult};
+use crate::{AgentActivityRecord, ModelId, TokenUsage, ToolCall, ToolResult};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

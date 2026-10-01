@@ -1,6 +1,20 @@
+mod activity;
+mod agent;
 mod config;
+mod events;
 mod provider;
+mod tool;
 
+pub use activity::{
+    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+    FileActivityOperation,
+};
+pub use agent::{
+    AgentEvent, AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
+    AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
+    AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
+    ApprovalDecision, ProjectJoinContinuation,
+};
 pub use config::{
     CredentialRef, CredentialReference, DEEPSEEK_API_ENDPOINT, DEEPSEEK_DEFAULT_MODEL,
     DEEPSEEK_MAX_OUTPUT_TOKENS, DEEPSEEK_PROVIDER_ID, GITHUB_COPILOT_API_ENDPOINT,
@@ -9,12 +23,18 @@ pub use config::{
     OPENAI_PROVIDER_ID, ProviderConfig, ProviderUsageKey, UsageLedger, deterministic_descriptor,
     github_copilot_descriptor,
 };
+pub use events::{
+    MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
+    MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ServerEvent,
+    ServerEventEnvelope, WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceFeedEvent,
+};
 pub use provider::{
     CancellationToken, CollectingSink, ModelProvider, ModelStreamSink, ProviderDescriptor,
     ProviderHealth, ProviderHealthState, ProviderKind, ProviderSummary, ProviderUsageRecord,
     ProviderUsageSummary, StreamFlow, UnavailableProvider, cancelled_error,
     estimate_message_tokens, estimate_tokens,
 };
+pub use tool::{ToolResult, ToolResultKind, tool_result_kind};
 
 use loom_core::ToolCallId;
 use serde::{Deserialize, Serialize};

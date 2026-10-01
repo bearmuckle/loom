@@ -10,17 +10,19 @@ use loom_core::{
     CheckpointId, EventSequence, RunAttemptId, RunId, SessionLimits, Timestamp, UsageSnapshot,
     WorkspaceId,
 };
+use loom_core::{
+    CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile, ContextAssemblyOptions,
+    SessionFilesystemChange, WorkspaceChangeKind, WorkspaceControl,
+};
 use loom_model::ModelId;
+use loom_model::{
+    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
+    AgentRunSnapshot, AgentRunState, ServerEvent, ServerEventEnvelope,
+};
 use loom_persistence::{
     DurableFeedState, DurableFilesystemEdit, DurableFilesystemRecord, DurableRunActivities,
     DurableRunMessage, DurableRunRuntimeConfig, DurableRunSummary, DurableStateWrite,
     FilePersistence,
-};
-use loom_protocol::{
-    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
-    AgentRunSnapshot, AgentRunState, CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile,
-    ContextAssemblyOptions, ServerEvent, ServerEventEnvelope, SessionFilesystemChange,
-    WorkspaceChangeKind, WorkspaceControl,
 };
 use loom_session::SessionManager;
 use rusqlite::Connection;

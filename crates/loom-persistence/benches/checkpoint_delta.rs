@@ -7,19 +7,20 @@
 
 use std::{env, fs, hint::black_box, path::PathBuf, time::Instant};
 
+use loom_core::ContextAssemblyOptions;
 use loom_core::{
     ActivityId, AgentSessionSnapshot, EventSequence, RunAttemptId, RunId, Timestamp, UsageSnapshot,
     WorkspaceId,
+};
+use loom_model::{
+    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentPlan,
+    AgentRunSnapshot, AgentRunState,
 };
 use loom_model::{MessageRole, ModelId};
 use loom_persistence::{
     DurableFeedState, DurableRunActivities, DurableRunCheckpointWrite, DurableRunMessage,
     DurableRunMessageDelta, DurableRunRuntimeConfig, DurableRunSummary, DurableStateWrite,
     FilePersistence,
-};
-use loom_protocol::{
-    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentPlan,
-    AgentRunSnapshot, AgentRunState, ContextAssemblyOptions,
 };
 use loom_session::SessionManager;
 

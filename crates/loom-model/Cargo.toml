@@ -1,6 +1,6 @@
 [package]
 name = "loom-model"
-description = "Provider-neutral model request, response, and capability types for Loom."
+description = "Neutral model request/response types plus persisted agent, activity, tool, and event domain records for Loom."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

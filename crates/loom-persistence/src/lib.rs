@@ -10,28 +10,26 @@ use std::{
 use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use loom_core::{
     ActivityId, AgentMessageDraft, AgentMessageId, AgentMessageKind, AgentMessageRecord,
-    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, CheckpointId,
+    AgentSessionId, AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, Checkpoint,
+    CheckpointFile, CheckpointId, ContextAssemblyOptions, ContextInspection, ContextSummary,
     DelegatedTaskRecord, DelegatedTaskSpec, DelegatedTaskStatus, ErrorCode, EventSequence,
     InteractionId, LoomError, PolicyDecision, ProjectAgentPermissions, ProjectAgentRecord,
     ProjectId, ProjectManagerWaitId, ProjectManagerWaitRecord, ProjectManagerWaitStatus,
     ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord,
-    ProjectWorktreeStatus, RepositoryId, RequestId, Result, RunAttemptId, RunId, SessionLimits,
-    SessionManagerState, StepId, TaskContextReference, TaskId, Timestamp, ToolCallId,
-    UsageSnapshot, WorkspaceId, WorkspaceManagerState, WorkspaceRecord,
+    ProjectWorktreeStatus, RepositoryId, RequestId, Result, RunAttemptId, RunId, SessionDirectory,
+    SessionFilesystemChange, SessionLimits, SessionManagerState, SessionRepository, StepId,
+    TaskContextReference, TaskId, Timestamp, ToolCallId, UsageSnapshot, WorkspaceChangeKind,
+    WorkspaceConfig, WorkspaceControl, WorkspaceId, WorkspaceManagerState, WorkspaceRecord,
 };
 use loom_model::{
-    ModelId, ProviderConfig, ProviderHealth, ProviderId, ProviderUsageKey, ProviderUsageSummary,
-    UsageLedger,
-};
-use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
     AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
     AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
-    ApprovalDecision, Checkpoint, CheckpointFile, ContextAssemblyOptions, ContextInspection,
-    ContextSummary, ServerEventEnvelope, SessionDirectory, SessionFilesystemChange,
-    SessionRepository, ToolResult, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
-    WorkspaceEventEnvelope, WorkspaceFeedEvent, tool_result_kind,
+    ApprovalDecision, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
+    ModelId, ProviderConfig, ProviderHealth, ProviderId, ProviderUsageKey, ProviderUsageSummary,
+    ServerEventEnvelope, ToolResult, UsageLedger, WorkspaceEventEnvelope, WorkspaceFeedEvent,
+    tool_result_kind,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params, types::Value as SqlValue};
 use serde::{Serialize, de::DeserializeOwned};
@@ -79,9 +77,8 @@ const INLINE_CONTENT_BYTES: usize = 4096;
 const CONTENT_PART_BYTES: usize = 256 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const MAX_MESSAGE_FRAGMENT_BYTES: usize = 32 * 1024;
-const MAX_CONTENT_RANGE_BYTES: usize =
-    loom_protocol::MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES as usize;
-const MAX_RUN_MESSAGE_PAGE_SIZE: usize = loom_protocol::MAX_AGENT_RUN_MESSAGE_PAGE_SIZE as usize;
+const MAX_CONTENT_RANGE_BYTES: usize = MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES as usize;
+const MAX_RUN_MESSAGE_PAGE_SIZE: usize = MAX_AGENT_RUN_MESSAGE_PAGE_SIZE as usize;
 const MAX_FEED_EVENT_BYTES: usize = 128 * 1024 * 1024;
 const MAX_DURABLE_FEED_SESSION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DURABLE_FEED_TOTAL_BYTES: usize = 16 * 1024 * 1024;

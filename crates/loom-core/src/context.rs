@@ -1,4 +1,4 @@
-use loom_core::{ErrorCode, LoomError, Result, Timestamp};
+use crate::{ErrorCode, LoomError, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -105,7 +105,7 @@ impl ContextInspection {
 #[cfg(test)]
 mod tests {
     use super::{ContextBudget, ContextInspection, ContextSummary};
-    use loom_core::ErrorCode;
+    use crate::ErrorCode;
 
     #[test]
     fn context_budget_reserves_output_and_rejects_empty_input_space() {
@@ -167,7 +167,7 @@ mod tests {
             source_message_count: 3,
             projection_version: 1,
             source_digest: "digest".to_owned(),
-            created_at: loom_core::Timestamp::now(),
+            created_at: crate::Timestamp::now(),
         };
         let mut value = serde_json::to_value(&current).unwrap();
         let object = value.as_object_mut().unwrap();

@@ -2,8 +2,7 @@ use loom_core::{
     AgentMessageDraft, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, Capability,
     CapabilitySet, DelegatedTaskRecord, EventSequence, LoomError, ProjectAgentRecord, ProjectId,
     ProjectSnapshot, ProjectWorktreeCleanupDisposition, ProjectWorktreeRecord, ProtocolVersion,
-    RepositoryId, RequestId, RunId, SessionEvent, SessionEventRecord, SessionLimits, ToolCallId,
-    UsageSnapshot, WorkspaceId,
+    RepositoryId, RequestId, RunId, SessionLimits, ToolCallId, UsageSnapshot, WorkspaceId,
 };
 use loom_model::{
     ModelDescriptor, ModelId, ModelMessage, ProviderHealth, ProviderId, ProviderSummary,
@@ -12,51 +11,34 @@ use loom_model::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-mod activity;
-mod agent;
-mod context;
-mod process;
-mod tool;
 mod vcs;
-mod workspace;
 
-pub use activity::{
-    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus,
-    FileActivityOperation,
+pub use loom_core::{
+    CURRENT_PROTOCOL_VERSION, Checkpoint, CheckpointFile, ContextAssemblyOptions, ContextBudget,
+    ContextFileKind, ContextFileReference, ContextInspection, ContextItem, ContextItemKind,
+    ContextSummary, GitHubRepository, MAX_PROJECT_AGENT_CONCURRENCY, MIN_PROJECT_AGENT_CONCURRENCY,
+    RevertResult, SessionDirectory, SessionFilesystemChange, SessionFilesystemFile,
+    SessionFilesystemSnapshot, SessionRepository, TaskArtifact, TaskEvent, TaskEventRecord,
+    TaskEvidenceLink, TaskKind, TaskSnapshot, TaskSpec, TaskStatus, TerminalEvent,
+    TerminalEventRecord, TerminalSnapshot, TerminalStatus, TerminalStream, UndoResult,
+    WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl, WorkspaceEdit,
+    WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
 };
-pub use agent::{
-    AgentEvent, AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
+pub use loom_model::{
+    AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, AgentEvent,
+    AgentExecutionStateRecord, AgentInteractionKind, AgentInteractionRecord,
     AgentInteractionStatus, AgentPlan, AgentPlanStep, AgentRunAttemptRecord, AgentRunSnapshot,
     AgentRunState, AgentToolAttemptRecord, AgentToolAttemptState, AgentToolCallRecord,
-    ApprovalDecision, ProjectJoinContinuation,
+    ApprovalDecision, FileActivityOperation, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES,
+    MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES,
+    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, ProjectJoinContinuation, ServerEvent, ServerEventEnvelope,
+    ToolResult, ToolResultKind, WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceFeedEvent,
+    tool_result_kind,
 };
-pub use context::{
-    ContextAssemblyOptions, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
-    ContextSummary,
-};
-pub use process::{
-    TaskArtifact, TaskEvent, TaskEventRecord, TaskEvidenceLink, TaskKind, TaskSnapshot, TaskSpec,
-    TaskStatus, TerminalEvent, TerminalEventRecord, TerminalSnapshot, TerminalStatus,
-    TerminalStream,
-};
-pub use tool::{ToolResult, ToolResultKind, tool_result_kind};
 pub use vcs::{
     GitBranch, GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus,
     GitFileStatusKind, GitRepositoryStatus,
 };
-pub use workspace::{
-    Checkpoint, CheckpointFile, ContextFileKind, ContextFileReference, GitHubRepository,
-    MAX_PROJECT_AGENT_CONCURRENCY, MIN_PROJECT_AGENT_CONCURRENCY, RevertResult, SessionDirectory,
-    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
-    UndoResult, WorkerNodeConfig, WorkspaceChangeKind, WorkspaceConfig, WorkspaceControl,
-    WorkspaceEdit, WorkspaceEditResult, WorkspaceEntry, WorkspaceEntryKind, WorkspaceRecord,
-};
-
-pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(11, 1);
-pub const MAX_AGENT_RUN_MESSAGE_PAGE_SIZE: u32 = 100;
-pub const MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES: u32 = 256 * 1024;
-pub const MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE: u32 = 32;
-pub const MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES: u32 = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -512,150 +494,6 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     Response(Box<ResponseEnvelope>),
     Event(ServerEventEnvelope),
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ServerEventEnvelope {
-    pub protocol_version: ProtocolVersion,
-    pub sequence: EventSequence,
-    pub session_id: AgentSessionId,
-    pub event: ServerEvent,
-}
-
-/// A change to workspace catalog or configuration state. Workspace events have
-/// their own scope and never borrow a session ID.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct WorkspaceEventEnvelope {
-    pub protocol_version: ProtocolVersion,
-    pub sequence: EventSequence,
-    pub workspace_id: WorkspaceId,
-    pub event: WorkspaceEvent,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum WorkspaceEvent {
-    Renamed { name: String },
-    ConfigChanged { revision: u64 },
-}
-
-/// Unified entries in a workspace reconnect stream.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(untagged)]
-#[allow(clippy::large_enum_variant)]
-pub enum WorkspaceFeedEvent {
-    Session(ServerEventEnvelope),
-    Workspace(WorkspaceEventEnvelope),
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-#[allow(clippy::large_enum_variant)]
-pub enum ServerEvent {
-    ProjectChildWorktreeUpdated {
-        worktree: ProjectWorktreeRecord,
-    },
-    ProjectTaskUpdated {
-        task: DelegatedTaskRecord,
-    },
-    ProjectAgentMessageAccepted {
-        message: AgentMessageRecord,
-    },
-    ProjectAgentCreated {
-        agent: ProjectAgentRecord,
-    },
-    ProjectAgentUpdated {
-        agent: ProjectAgentRecord,
-    },
-    AgentSessionCreated {
-        snapshot: AgentSessionSnapshot,
-    },
-    AgentSessionStateChanged {
-        previous: loom_core::AgentSessionState,
-        current: loom_core::AgentSessionState,
-    },
-    AgentSessionForked {
-        source_session_id: AgentSessionId,
-        snapshot: AgentSessionSnapshot,
-    },
-    AgentSessionRenamed {
-        session_id: AgentSessionId,
-        name: String,
-    },
-    AgentSessionArchived {
-        session_id: AgentSessionId,
-    },
-    Agent {
-        event: AgentEvent,
-    },
-    SessionFilesystemChanged {
-        change: SessionFilesystemChange,
-    },
-    Terminal {
-        event: TerminalEventRecord,
-    },
-    Task {
-        event: TaskEventRecord,
-    },
-    ProviderHealthChanged {
-        provider_id: ProviderId,
-        health: ProviderHealth,
-    },
-}
-
-impl From<SessionEventRecord> for ServerEventEnvelope {
-    fn from(record: SessionEventRecord) -> Self {
-        Self::from_session_event(record.sequence, record.session_id, record.event)
-    }
-}
-
-impl ServerEventEnvelope {
-    pub fn from_session_event(
-        sequence: EventSequence,
-        session_id: AgentSessionId,
-        event: SessionEvent,
-    ) -> Self {
-        let event = match event {
-            SessionEvent::AgentSessionCreated { snapshot } => {
-                ServerEvent::AgentSessionCreated { snapshot }
-            }
-            SessionEvent::AgentSessionStateChanged {
-                previous, current, ..
-            } => ServerEvent::AgentSessionStateChanged { previous, current },
-            SessionEvent::AgentSessionForked {
-                source_session_id,
-                snapshot,
-            } => ServerEvent::AgentSessionForked {
-                source_session_id,
-                snapshot,
-            },
-            SessionEvent::AgentSessionRenamed { session_id, name } => {
-                ServerEvent::AgentSessionRenamed { session_id, name }
-            }
-            SessionEvent::AgentSessionArchived { session_id } => {
-                ServerEvent::AgentSessionArchived { session_id }
-            }
-        };
-        Self {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence,
-            session_id,
-            event,
-        }
-    }
-
-    pub fn from_agent_event(
-        sequence: EventSequence,
-        session_id: AgentSessionId,
-        event: AgentEvent,
-    ) -> Self {
-        Self {
-            protocol_version: CURRENT_PROTOCOL_VERSION,
-            sequence,
-            session_id,
-            event: ServerEvent::Agent { event },
-        }
-    }
 }
 
 #[derive(Debug, Error)]

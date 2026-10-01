@@ -2,12 +2,23 @@
 
 ## Status
 
-Loom stores durable backend state in one SQLite database with a single
-baseline schema, currently version 2. Loom is pre-1.0: there is no migration
-ladder and no legacy import path. A database written by any other Loom revision
-is rejected unchanged, and the operator must wipe it before starting. When the
-domain model changes, the baseline version and the typed schema definitions
-change together.
+Loom stores durable backend state in one SQLite database with a single typed
+schema, currently version 4. Loom is pre-1.0: a database written by a newer or
+unknown revision is rejected unchanged and must be wiped, while versions in the
+supported migration window (2 through 3) are upgraded in place by
+`migrate_schema` (v3 adds persisted provider reasoning to the transcript; v4
+adds the queued user-direction cursor and store). Keep migration steps small and
+self-contained because they may be dropped again before 1.0. When the domain
+model changes in a way the schema cannot absorb, bump the baseline version and
+update the typed schema definitions together.
+
+The persisted domain types live in the neutral `loom-core` and `loom-model`
+crates: `loom-model` holds the agent, activity, tool, and event records that
+reference model types, and `loom-core` holds the context, filesystem, and
+process records. `loom-persistence` depends only on those neutral crates, and
+the protocol contract re-exports the same types. This is a code-organization
+change only; the serde representation of every persisted payload is unchanged,
+so it needs no schema-version bump.
 
 Per-run project-agent grants are stored as one versioned JSON payload
 (`run_runtime_config.project_grants`), and delegated-task grants as
