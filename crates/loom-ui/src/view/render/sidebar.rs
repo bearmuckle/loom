@@ -4,19 +4,27 @@ impl LoomView {
     pub(crate) fn render_new_session_button(
         &self,
         view: &Entity<Self>,
+        layout: ResponsiveLayout,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let _ = view;
         Button::new("new-session")
             .icon(Icon::new(IconName::Plus))
             .ghost()
-            .small()
+            .when(layout.phone, |button| {
+                button.with_size(layout.control_size())
+            })
+            .when(!layout.phone, |button| button.small())
             .tooltip("New project")
             .on_click(cx.listener(Self::new_session))
             .into_any_element()
     }
 
-    pub(crate) fn render_session_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_session_list(
+        &mut self,
+        layout: ResponsiveLayout,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let filter = self
             .session_filter_input
             .as_ref()
@@ -139,22 +147,27 @@ impl LoomView {
             ListItem::new(("session-tree-root", index))
                 .selected(selected)
                 .px_2()
-                .py_2()
-                .text_size(gpui_kit::rems(0.8125))
+                .py(layout.nav_row_padding())
+                .text_size(layout.nav_row_font_size())
                 .child(
                     div()
-                        .pl(px(depth as f32 * 14.))
+                        .pl(px(depth as f32 * if layout.phone { 18. } else { 14. }))
                         .w_full()
                         .flex()
                         .items_center()
                         .gap_2()
                         .child(
                             div()
-                                .w(px(10.))
+                                .w(px(if layout.phone { 16. } else { 10. }))
                                 .text_color(rgb(0x8f98a6))
                                 .child(tree_indicator),
                         )
-                        .child(Icon::new(icon).size_4().text_color(icon_color))
+                        .child(
+                            Icon::new(icon)
+                                .when(layout.phone, |icon| icon.size_5())
+                                .when(!layout.phone, |icon| icon.size_4())
+                                .text_color(icon_color),
+                        )
                         .child(
                             div()
                                 .flex_1()
@@ -335,7 +348,7 @@ impl LoomView {
                             Button::new("close-session-drawer")
                                 .label("Close")
                                 .ghost()
-                                .small()
+                                .h(layout.control_size())
                                 .tooltip("Close session drawer")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.session_drawer_open = false;
@@ -349,18 +362,29 @@ impl LoomView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_xs().text_color(rgb(0x8f98a6)).child("Projects"))
+                    .child(
+                        div()
+                            .when(layout.phone, |element| {
+                                element.text_size(layout.nav_row_font_size())
+                            })
+                            .when(!layout.phone, |element| element.text_xs())
+                            .text_color(rgb(0x8f98a6))
+                            .child("Projects"),
+                    )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(self.render_new_session_button(view, cx))
+                            .child(self.render_new_session_button(view, layout, cx))
                             .child(
                                 Button::new("settings-button")
                                     .icon(Icon::new(IconName::Settings))
                                     .ghost()
-                                    .small()
+                                    .when(layout.phone, |button| {
+                                        button.with_size(layout.control_size())
+                                    })
+                                    .when(!layout.phone, |button| button.small())
                                     .accessibility_label("Settings")
                                     .tooltip("Settings")
                                     .on_click({
@@ -382,7 +406,7 @@ impl LoomView {
                     .flex_1()
                     .id("session-list")
                     .overflow_y_scroll()
-                    .child(self.render_session_list(cx)),
+                    .child(self.render_session_list(layout, cx)),
             )
     }
 }

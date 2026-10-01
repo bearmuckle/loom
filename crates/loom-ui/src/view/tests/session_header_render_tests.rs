@@ -15,7 +15,17 @@ impl Render for SessionHeader {
             .justify_between()
             .child(
                 session_header_title()
-                    .child("A long session name that must leave room for header actions"),
+                    .child(
+                        div()
+                            .truncate()
+                            .child("A long session name that must leave room for header actions"),
+                    )
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .child("main  ·  modified  ·  a long branch summary"),
+                    ),
             )
             .child(
                 session_header_actions()
@@ -47,6 +57,30 @@ fn header_actions_remain_visible_at_desktop_width(cx: &mut TestAppContext) {
             assert!(action.visible(), "{id} should be visible");
             assert!(action.bounds().size.width > px(0.));
             assert!(action.bounds().right() <= window.viewport_size().width);
+            assert!(action.bounds().left() >= previous_right);
+            previous_right = action.bounds().right();
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn header_actions_remain_visible_at_phone_width(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(100.)), |_, _| SessionHeader);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let viewport = window.viewport_size();
+        let mut previous_right = px(0.);
+        for id in ["session-sources", "toggle-review-sidebar"] {
+            let action = window.find(id);
+            assert!(action.visible(), "{id} should be visible at phone width");
+            assert!(action.bounds().size.width > px(0.));
+            assert!(
+                action.bounds().right() <= viewport.width,
+                "{id} ran off the right edge: {:?}",
+                action.bounds()
+            );
             assert!(action.bounds().left() >= previous_right);
             previous_right = action.bounds().right();
         }

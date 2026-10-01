@@ -2718,12 +2718,21 @@ fn phone_drawer_and_review_sidebar_controls_toggle_panels(cx: &mut TestAppContex
     cx.run_until_parked();
     cx.update_window(handle.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.find("mobile-session-drawer").visible());
+        let drawer = window.find("mobile-session-drawer");
+        assert!(drawer.visible());
+        let drawer_width = drawer.bounds().size.width;
         assert!(
-            window
-                .within("mobile-session-drawer")
-                .find(("session-tree-root", 0usize))
-                .visible()
+            drawer_width <= px(300.),
+            "phone drawer should not fill the whole width: {drawer_width:?}"
+        );
+        let row = window
+            .within("mobile-session-drawer")
+            .find(("session-tree-root", 0usize));
+        assert!(row.visible());
+        assert!(
+            row.bounds().size.height >= px(44.),
+            "project row is below the touch target: {:?}",
+            row.bounds()
         );
     })
     .unwrap();
@@ -2795,6 +2804,70 @@ fn phone_composer_and_settings_render_at_mobile_width(cx: &mut TestAppContext) {
                     .visible()
             );
         }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn phone_header_keeps_actions_visible_with_a_long_session_name(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(844.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.active_session.name =
+            "A very long project and session name that must not push the header actions away"
+                .to_owned();
+        view.sessions = vec![view.active_session.clone()];
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let viewport = window.viewport_size();
+        for id in ["session-sources", "toggle-review-sidebar"] {
+            let action = window.find(id);
+            assert!(
+                action.visible(),
+                "{id} should stay visible on a phone header"
+            );
+            assert!(
+                action.bounds().right() <= viewport.width,
+                "{id} ran off the right edge: {:?}",
+                action.bounds()
+            );
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn phone_composer_reserves_space_for_the_on_screen_keyboard(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(390.), px(844.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view
+    });
+    let window_handle = handle.into();
+    // The layout viewport stays 844px tall while the keyboard shrinks the
+    // visual viewport to 544px, matching the browser's default resize policy.
+    cx.simulate_window_visual_viewport_change(
+        window_handle,
+        gpui_kit::Bounds::new(gpui_kit::point(px(0.), px(0.)), size(px(390.), px(544.))),
+    );
+    cx.update_window(window_handle, |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let visible = window.fully_visible_bounds();
+        let composer = window.find("composer-input-box").bounds();
+        assert!(
+            composer.bottom() <= visible.bottom(),
+            "composer is hidden behind the keyboard: {composer:?} vs {visible:?}"
+        );
+        let send = window.find("send-message").bounds();
+        assert!(
+            send.bottom() <= visible.bottom(),
+            "send action is hidden behind the keyboard: {send:?} vs {visible:?}"
+        );
     })
     .unwrap();
 }

@@ -319,13 +319,15 @@ impl Render for LoomView {
                     .child(
                         div()
                             .flex()
+                            .flex_1()
+                            .min_w(px(0.))
                             .items_center()
                             .gap_2()
                             .when(layout.phone, |element| {
                                 element.child(
                                     Button::new("open-session-drawer")
                                         .label("Projects")
-                                        .small()
+                                        .h(layout.control_size())
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.session_drawer_open = true;
                                             cx.notify();
@@ -333,15 +335,16 @@ impl Render for LoomView {
                                 )
                             })
                             .child(
-                                div()
-                                    .flex()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .flex_col()
-                                    .child(self.active_session.name.clone())
+                                session_header_title()
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .child(self.active_session.name.clone()),
+                                    )
                                     .when(!layout.phone, |element| {
                                         element.child(
                                             div()
+                                                .truncate()
                                                 .text_xs()
                                                 .text_color(rgb(0x8f98a6))
                                                 .child(
@@ -384,7 +387,8 @@ impl Render for LoomView {
                         Button::new("session-sources")
                             .icon(Icon::new(AssetIconName::ListTree))
                             .ghost()
-                            .small()
+                            .when(layout.phone, |button| button.with_size(layout.control_size()))
+                            .when(!layout.phone, |button| button.small())
                             .accessibility_label("Session sources")
                             .dropdown_menu({
                                 let view = view.clone();
@@ -495,7 +499,8 @@ impl Render for LoomView {
                                 IconName::PanelRightOpen
                             }))
                             .ghost()
-                            .small()
+                            .when(layout.phone, |button| button.with_size(layout.control_size()))
+                            .when(!layout.phone, |button| button.small())
                             .accessibility_label("Toggle side panel")
                             .when(self.review.open, |button| button.secondary())
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -712,6 +717,7 @@ impl Render for LoomView {
                                 .top(px(0.))
                                 .bottom(px(0.))
                                 .left(px(0.))
+                                .w(layout.sidebar_width)
                                 .shadow_lg()
                                 .child(self.render_session_sidebar(&view, layout, cx)),
                         )
