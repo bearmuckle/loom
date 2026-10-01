@@ -1247,6 +1247,132 @@ fn tool_usage_summary_lines_collapse_by_default(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn a_running_tool_usage_stays_collapsed_until_expanded(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        // A running call is enough to exercise the collapsed summary; an active
+        // run state is deliberately omitted because rendering it would schedule
+        // a poll that never parks the test harness.
+        view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+            parts: vec![AssistantPart::Tool(Box::new(ToolPart {
+                id: ToolCallId::new(),
+                name: "run_command".to_owned(),
+                title: "Run cargo test".to_owned(),
+                status: ToolPartStatus::Running,
+                detail: Some("cargo test".to_owned()),
+                output: Some("running tests".to_owned()),
+                elapsed_ms: None,
+                approval_pending: false,
+            }))],
+            streaming: false,
+        })];
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        // A running call must not pop the summary open and shut as it settles.
+        assert!(window.try_find(("tool-usage-header", 0u64)).is_some());
+        assert!(window.try_find(("tool-header", 0u64)).is_none());
+        // The live status still reads from the collapsed line.
+        let summary = window.find(("tool-usage-header", 0u64));
+        let label = summary.label().unwrap_or_default().to_owned();
+        assert!(label.contains("running"), "summary was {label:?}");
+
+        // Clicking opens it, and it stays open.
+        window.click(("tool-usage-header", 0u64), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("tool-header", 0u64)).is_some());
+        view.update(cx, |view, _| {
+            assert!(view.expanded_tool_usage.contains(&0));
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_running_tool_group_stays_collapsed_until_expanded(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        let parts = (0..3)
+            .map(|offset| {
+                AssistantPart::Tool(Box::new(ToolPart {
+                    id: ToolCallId::new(),
+                    name: "read_file".to_owned(),
+                    title: format!("Read {offset}.rs"),
+                    status: ToolPartStatus::Running,
+                    detail: Some(format!("{offset}.rs")),
+                    output: None,
+                    elapsed_ms: None,
+                    approval_pending: false,
+                }))
+            })
+            .collect();
+        view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+            parts,
+            streaming: false,
+        })];
+        // Reveal the group row behind the usage summary.
+        view.expanded_tool_usage.insert(0);
+        view
+    });
+    cx.update_window(handle.into(), |view, window, cx| {
+        let view = view.downcast::<LoomView>().unwrap();
+        window.render_frame(cx);
+        assert!(window.try_find(("tool-group-header", 0u64)).is_some());
+        assert!(window.try_find(("tool-header", 0u64)).is_none());
+        window.click(("tool-group-header", 0u64), cx);
+        window.render_frame(cx);
+        assert!(window.try_find(("tool-header", 0u64)).is_some());
+        view.update(cx, |view, _| {
+            assert!(view.expanded_tool_groups.contains(&0));
+        });
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_approval_gated_tool_usage_opens_for_the_decision(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let call = loom_model::ToolCall {
+        id: ToolCallId::new(),
+        name: "run_command".to_owned(),
+        arguments: serde_json::Value::Null,
+    };
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        view.sessions = vec![view.active_session.clone()];
+        view.pending_approval = Some(call.clone());
+        view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+            parts: vec![AssistantPart::Tool(Box::new(ToolPart {
+                id: call.id,
+                name: "run_command".to_owned(),
+                title: "Run cargo test".to_owned(),
+                status: ToolPartStatus::AwaitingApproval,
+                detail: Some("cargo test".to_owned()),
+                output: None,
+                elapsed_ms: None,
+                approval_pending: true,
+            }))],
+            streaming: false,
+        })];
+        view
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // The decision control must be reachable without an extra click.
+        assert!(window.try_find(("tool-header", 0u64)).is_some());
+        assert!(window.try_find(("approve-tool", 0u64)).is_some());
+        assert!(window.try_find(("reject-tool", 0u64)).is_some());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn recovered_failures_do_not_condemn_the_tool_summary(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let tool = |name: &str, status: ToolPartStatus| {

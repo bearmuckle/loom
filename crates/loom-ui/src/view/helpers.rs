@@ -1310,6 +1310,18 @@ pub(crate) fn tool_failure_count(tools: &[&ToolPart]) -> usize {
         .count()
 }
 
+/// Whether a run of tool calls contains one that is blocked on the user. The
+/// approval and input controls live inside the individual tool blocks, so a run
+/// that contains one must open even though the summary is collapsed by default.
+pub(crate) fn tool_needs_attention(tools: &[&ToolPart]) -> bool {
+    tools.iter().any(|tool| {
+        matches!(
+            tool.status,
+            ToolPartStatus::AwaitingApproval | ToolPartStatus::AwaitingInput
+        )
+    })
+}
+
 /// Renders a tool result as a patch when it looks like one, otherwise as code.
 pub(crate) fn render_tool_output(
     id: impl Into<gpui_kit::ElementId>,

@@ -7,8 +7,9 @@ use super::{
     endpoint_label, format_bytes, format_duration, format_percentage, humanize_tool_output,
     is_redundant_completion_summary, relative_time, replace_command_token, replace_last_token, rgb,
     run_state_color, run_state_label, session_is_active, session_status_pill, source_mount_path,
-    tool_detail, tool_failure_count, tool_group_label, tool_group_status, tool_part_from_activity,
-    tool_status, tool_title, tool_title_for_activity, tool_usage_label, tool_usage_summary,
+    tool_detail, tool_failure_count, tool_group_label, tool_group_status, tool_needs_attention,
+    tool_part_from_activity, tool_status, tool_title, tool_title_for_activity, tool_usage_label,
+    tool_usage_summary,
 };
 use loom_core::{ActivityId, AgentSessionState, ProtocolVersion, RunId, Timestamp};
 use loom_model::{ModelId, ToolCall};
@@ -536,6 +537,23 @@ fn tool_failure_count_only_counts_failed_calls() {
     let parts = [&failed, &completed, &failed];
     assert_eq!(tool_failure_count(&parts), 2);
     assert_eq!(tool_failure_count(&[&completed]), 0);
+}
+
+#[test]
+fn tool_needs_attention_only_for_blocking_statuses() {
+    let running = grouped_part(ToolPartStatus::Running);
+    let queued = grouped_part(ToolPartStatus::Queued);
+    let completed = grouped_part(ToolPartStatus::Completed);
+    let failed = grouped_part(ToolPartStatus::Failed);
+    let awaiting_approval = grouped_part(ToolPartStatus::AwaitingApproval);
+    let awaiting_input = grouped_part(ToolPartStatus::AwaitingInput);
+
+    assert!(!tool_needs_attention(&[]));
+    assert!(!tool_needs_attention(&[
+        &running, &queued, &completed, &failed
+    ]));
+    assert!(tool_needs_attention(&[&completed, &awaiting_approval]));
+    assert!(tool_needs_attention(&[&awaiting_input]));
 }
 
 #[test]
