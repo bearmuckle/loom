@@ -92,6 +92,7 @@ impl AgentRuntime {
             control: RunControl::new(),
             observer: None,
             flush_offset: 0,
+            read_pool: pool::shared_read_pool(),
         }
     }
 
@@ -121,5 +122,12 @@ impl AgentRuntime {
         options: AgentRuntimeOptions,
     ) -> Self {
         Self::new_with_options(session_id, task, provider, tools, approval_policy, options)
+    }
+
+    /// Replaces the shared read-only tool pool. Test-only: production runtimes
+    /// use the process-wide bounded pool so concurrency stays global.
+    #[cfg(test)]
+    pub(crate) fn set_read_pool(&mut self, pool: Arc<pool::BoundedPool>) {
+        self.read_pool = pool;
     }
 }

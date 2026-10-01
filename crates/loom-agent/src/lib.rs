@@ -31,6 +31,7 @@ mod control;
 mod events;
 mod finalize;
 mod lifecycle;
+mod pool;
 mod state;
 mod steps;
 mod tools;
@@ -327,6 +328,8 @@ pub struct AgentRuntime {
     control: RunControl,
     observer: Option<AgentEventObserver>,
     flush_offset: usize,
+    /// Bounded, shared pool for concurrent read-only tool calls.
+    read_pool: Arc<pool::BoundedPool>,
 }
 
 #[cfg(test)]
@@ -2579,6 +2582,111 @@ mod tests {
         assert_eq!(
             outputs,
             vec!["read first".to_owned(), "read second".to_owned()]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_only_tool_calls_respect_the_bounded_pool_limit() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        };
+
+        use loom_model::{FinishReason, ModelStreamEvent, ToolDefinition};
+
+        struct SlowRead {
+            current: Arc<AtomicUsize>,
+            max: Arc<AtomicUsize>,
+        }
+
+        impl ToolExtension for SlowRead {
+            fn definitions(&self) -> Vec<ToolDefinition> {
+                Vec::new()
+            }
+
+            fn action_kind(&self, _call: &ToolCall) -> Option<loom_core::ActionKind> {
+                Some(loom_core::ActionKind::Read)
+            }
+
+            fn execute(&self, call: &ToolCall) -> ToolResult {
+                let current = self.current.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                self.max.fetch_max(current, AtomicOrdering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                let label = call
+                    .arguments
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("?");
+                self.current.fetch_sub(1, AtomicOrdering::SeqCst);
+                ToolResult::success(call, format!("read {label}"))
+            }
+        }
+
+        let root = workspace();
+        let current = Arc::new(AtomicUsize::new(0));
+        let max = Arc::new(AtomicUsize::new(0));
+        let tools = ToolExecutor::new(&root)
+            .unwrap()
+            .with_extension(Arc::new(SlowRead {
+                current: current.clone(),
+                max: max.clone(),
+            }));
+        let call = |label: &str| ToolCall {
+            id: loom_core::ToolCallId::new(),
+            name: "slow_read".to_owned(),
+            arguments: serde_json::json!({ "label": label }),
+        };
+        let mut first_step = (0..5)
+            .map(|index| ModelStreamEvent::ToolCallDelta {
+                call: call(&format!("call-{index}")),
+            })
+            .collect::<Vec<_>>();
+        first_step.push(ModelStreamEvent::Completed {
+            reason: FinishReason::ToolCall,
+        });
+        let provider = DeterministicProvider {
+            descriptor: loom_providers::deterministic_descriptor(),
+            steps: vec![
+                first_step,
+                vec![
+                    ModelStreamEvent::TextDelta {
+                        text: "done".to_owned(),
+                    },
+                    ModelStreamEvent::Completed {
+                        reason: FinishReason::Stop,
+                    },
+                ],
+            ],
+            cursor: 0,
+        };
+        let task = AgentTask::new("read many things", ModelId::new("gpt-6-luna")).unwrap();
+        let mut runtime = AgentRuntime::new(AgentSessionId::new(), task, Box::new(provider), tools);
+        runtime.set_read_pool(Arc::new(crate::pool::BoundedPool::new(2)));
+
+        runtime.start().unwrap();
+        assert_eq!(runtime.snapshot().state, AgentRunState::Completed);
+        let observed = max.load(AtomicOrdering::SeqCst);
+        assert!(
+            observed >= 2,
+            "read-only calls should overlap, observed {observed}"
+        );
+        assert!(
+            observed <= 2,
+            "read-only calls must stay within the pool limit, observed {observed}"
+        );
+        let outputs = runtime
+            .export_state()
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            (0..5)
+                .map(|index| format!("read call-{index}"))
+                .collect::<Vec<_>>()
         );
         fs::remove_dir_all(root).unwrap();
     }
