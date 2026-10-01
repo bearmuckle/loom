@@ -21,8 +21,9 @@ impl FilePersistence {
         )
     }
 
-    /// Creates a code-changing child and records its initial worktree intent in
-    /// the same transaction as the session and delegated task.
+    /// Creates a delegated child and records its initial worktree intent in the
+    /// same transaction as the session and delegated task. A check-out may be
+    /// provisioned for read-only tasks as well as code tasks.
     pub fn create_project_child_with_worktree(
         &self,
         request_id: RequestId,
@@ -31,9 +32,9 @@ impl FilePersistence {
         task: &DelegatedTaskRecord,
         worktree: &ProjectWorktreeRecord,
     ) -> Result<DelegatedTaskRecord> {
-        if !task.code_change || worktree.status != ProjectWorktreeStatus::Creating {
+        if worktree.status != ProjectWorktreeStatus::Creating {
             return Err(LoomError::invalid_request(
-                "atomic worktree creation requires a code task in creating state",
+                "atomic worktree creation requires a worktree in creating state",
             ));
         }
         if !worktree.conflict_paths.is_empty()

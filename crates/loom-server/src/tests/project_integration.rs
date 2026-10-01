@@ -967,3 +967,174 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
     fs::remove_dir_all(temp).unwrap();
     fs::remove_dir_all(source).unwrap();
 }
+
+#[test]
+fn read_only_child_receives_an_isolated_checkout() {
+    let temp = workspace();
+    let source = git_repository();
+    let database_path = temp.join("state.sqlite");
+    let backend = InProcessBackend::new_persistent(&database_path).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace_record = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Read-only checkout".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace_record.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let parent_repository = match connection
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
+                session_id: root.id,
+                source: source.display().to_string(),
+                path: "repo".to_owned(),
+                revision: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository)) => {
+            repository
+        }
+        response => panic!("unexpected repository response: {response:?}"),
+    };
+    let base_revision = connection
+        .session_git(root.id, parent_repository.id)
+        .unwrap()
+        .status()
+        .unwrap()
+        .head
+        .unwrap();
+    let project_id = ProjectId::from_uuid(*root.id.as_uuid());
+
+    // A non-code task that only needs to read the repository now receives an
+    // isolated checkout instead of forcing the manager to paste file contents.
+    let (task, child) = match connection
+        .create_project_child(
+            RequestId::new(),
+            root.id,
+            "Reader".to_owned(),
+            loom_core::DelegatedTaskSpec {
+                intent: "Read the README and summarize it.".to_owned(),
+                model_id: "deterministic/demo".to_owned(),
+                context_references: vec![],
+                dependencies: vec![],
+                code_change: false,
+                permissions: loom_core::ProjectAgentPermissions::default(),
+            },
+        )
+        .unwrap()
+    {
+        ServerResponse::Project(ProjectResponse::ProjectChildCreated { task, child }) => {
+            (task, child)
+        }
+        response => panic!("unexpected child response: {response:?}"),
+    };
+    assert!(!task.code_change);
+
+    let persistence = backend.persistence.as_ref().unwrap();
+    let mut worktree = persistence
+        .load_project_worktree_by_task(task.task_id)
+        .unwrap()
+        .expect("a read-only child should receive an isolated checkout");
+    connection
+        .ensure_project_worktree_ready(&mut worktree)
+        .unwrap();
+    assert_eq!(worktree.status, ProjectWorktreeStatus::Ready);
+    assert_eq!(worktree.base_revision, base_revision);
+
+    // The checkout is the child's own copy, not the parent checkout, and it is
+    // registered as the child session's repository.
+    let child_checkout = connection
+        .session_filesystem(child.session_id)
+        .unwrap()
+        .root()
+        .join(&worktree.relative_path);
+    assert!(child_checkout.join("README.md").is_file());
+    assert_eq!(
+        backend
+            .session_repositories()
+            .unwrap()
+            .get(&child.session_id)
+            .and_then(|repositories| repositories.get(&worktree.child_repository_id))
+            .map(|repository| repository.path.clone()),
+        Some(worktree.relative_path.clone())
+    );
+
+    // A read-only child has nothing to review or integrate.
+    let review = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::GetProjectChildReview {
+            project_id,
+            manager_session_id: root.id,
+            task_id: task.task_id,
+        },
+    )));
+    assert!(review.result.is_err());
+    let integrate = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::IntegrateProjectChild {
+            project_id,
+            manager_session_id: root.id,
+            task_id: task.task_id,
+            expected_parent_revision: base_revision.clone(),
+        },
+    )));
+    assert!(integrate.result.is_err());
+
+    // Its checkout can still be cleaned up once the task is terminal.
+    assert!(
+        persistence
+            .update_delegated_task_status(
+                task.task_id,
+                loom_core::DelegatedTaskStatus::Completed,
+                Timestamp::now(),
+            )
+            .unwrap()
+    );
+    let cleanup = connection.request(RequestEnvelope::new(ClientRequest::Project(
+        ProjectRequest::CleanupProjectChildWorktree {
+            project_id,
+            manager_session_id: root.id,
+            task_id: task.task_id,
+            disposition: ProjectWorktreeCleanupDisposition::RemoveClean,
+        },
+    )));
+    assert!(matches!(
+        cleanup.result,
+        Ok(ServerResponse::Project(
+            ProjectResponse::ProjectChildWorktreeUpdated(worktree)
+        )) if worktree.status == ProjectWorktreeStatus::Removed
+    ));
+    assert!(
+        backend
+            .session_repositories()
+            .unwrap()
+            .get(&child.session_id)
+            .is_none_or(|repositories| repositories.is_empty())
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(source).unwrap();
+}

@@ -6,7 +6,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_delegate {
             definitions.push(ToolDefinition {
                 name: "delegate_project_task".to_owned(),
-                description: "Create a bounded non-code child agent task in this project. Omit model_id or set it to `current` to reuse this agent's model; use a provider/model ID to choose another model.".to_owned(),
+                description: "Create a bounded non-code child agent task in this project. The child is read-only: when the project has one clean Git repository it receives its own isolated checkout of your current revision, so delegate by objective and reference files by path instead of pasting their contents. Omit model_id or set it to `current` to reuse this agent's model; use a provider/model ID to choose another model.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -53,7 +53,7 @@ impl ToolExtension for ProjectAgentTools {
         if self.can_delegate_code {
             definitions.push(ToolDefinition {
                 name: "delegate_project_code_task".to_owned(),
-                description: "Create a bounded code-changing child task in an isolated Git worktree based on the project's clean current revision. The child must commit its result and report the commit. Only use this for source changes; the child cannot access the parent checkout.".to_owned(),
+                description: "Create a bounded code-changing child task in an isolated Git worktree based on the project's clean current revision. The child must commit its result and report the commit. Only use this for source changes; the child cannot access the parent checkout. Describe the intended change rather than quoting code, because the child reads its own checkout.".to_owned(),
                 input_schema: serde_json::json!({
                     "type": "object",
                     "properties": {

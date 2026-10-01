@@ -9,12 +9,11 @@ impl InProcessConnection {
         spec: loom_core::DelegatedTaskSpec,
     ) -> Result<ServerResponse> {
         let permissions = spec.permissions;
-        if spec.code_change
-            && !self
-                .backend
-                .supported_capabilities
-                .contains(Capability::CreateProjectWorktree)
-        {
+        let worktrees_supported = self
+            .backend
+            .supported_capabilities
+            .contains(Capability::CreateProjectWorktree);
+        if spec.code_change && !worktrees_supported {
             return Err(LoomError::new(
                 ErrorCode::UnsupportedCapability,
                 "project worktree support is unavailable",
@@ -230,17 +229,19 @@ impl InProcessConnection {
                     .insert(existing_task.target_session_id, filesystem);
             }
             let mut existing_task = existing_task;
-            if existing_task.code_change {
-                let mut worktree = persistence
-                    .load_project_worktree_by_task(existing_task.task_id)?
-                    .ok_or_else(|| {
-                        LoomError::new(
-                            ErrorCode::RecoveryRequired,
-                            "code task is missing its durable worktree intent",
-                            true,
-                        )
-                    })?;
+            // A check-out is provisioned for every task when the parent has one
+            // clean repository, so recover it whenever it exists rather than
+            // only for code tasks.
+            if let Some(mut worktree) =
+                persistence.load_project_worktree_by_task(existing_task.task_id)?
+            {
                 self.ensure_project_worktree_ready(&mut worktree)?;
+            } else if existing_task.code_change {
+                return Err(LoomError::new(
+                    ErrorCode::RecoveryRequired,
+                    "code task is missing its durable worktree intent",
+                    true,
+                ));
             }
             self.schedule_project_task_if_ready(&mut existing_task)?;
             return Ok(ServerResponse::Project(
@@ -339,58 +340,74 @@ impl InProcessConnection {
         };
         let mut initial_worktree = None;
         let mut precreated_child_filesystem = None;
-        if task.code_change {
+        // A check-out is provisioned for every delegated task, not only code
+        // tasks, whenever the parent exposes exactly one clean repository.
+        // `code_change` selects write authority; the presence of a check-out no
+        // longer implies the child may commit or be reviewed and integrated.
+        // Code tasks still require a check-out, while read-only tasks degrade to
+        // a prompt-only child when no suitable repository is available.
+        if worktrees_supported {
             let repositories = self
                 .backend
                 .session_repositories()?
                 .get(&parent_session_id)
                 .cloned()
                 .unwrap_or_default();
-            if repositories.len() != 1 {
-                return Err(LoomError::invalid_request(
-                    "code tasks currently require exactly one Git repository attached to the parent session",
-                ));
+            let exactly_one_repository = repositories.len() == 1;
+            let mut checkout = None;
+            if let Some((parent_repository_id, _)) = repositories.into_iter().next() {
+                let parent_git = self.session_git(parent_session_id, parent_repository_id)?;
+                let parent_status = parent_git.status()?;
+                if parent_status.clean
+                    && parent_status.branch.is_some()
+                    && let Some(base_revision) = parent_status.head.clone()
+                {
+                    checkout = Some((parent_repository_id, base_revision));
+                }
             }
-            let (parent_repository_id, _) = repositories
-                .into_iter()
-                .next()
-                .expect("repository count checked above");
-            let parent_git = self.session_git(parent_session_id, parent_repository_id)?;
-            let parent_status = parent_git.status()?;
-            if !parent_status.clean || parent_status.branch.is_none() {
-                return Err(LoomError::conflict(
-                    "code tasks require a clean parent checkout on a local branch",
-                ));
+            match checkout {
+                Some((parent_repository_id, base_revision)) => {
+                    let child_repository_id = RepositoryId::new();
+                    let child_filesystem = self.backend.create_session_filesystem(
+                        parent_snapshot.workspace_id,
+                        child_session_id,
+                    )?;
+                    let worktree_relative_path = format!("project-worktrees/{task_id}");
+                    initial_worktree = Some(ProjectWorktreeRecord {
+                        project_id,
+                        task_id,
+                        parent_session_id,
+                        child_session_id,
+                        parent_repository_id,
+                        child_repository_id,
+                        relative_path: worktree_relative_path,
+                        worktree_name: format!("loom-child-{task_id}"),
+                        branch_name: format!("loom/project-child-{task_id}"),
+                        base_revision,
+                        result_revision: None,
+                        integrated_revision: None,
+                        status: ProjectWorktreeStatus::Creating,
+                        conflict_paths: Vec::new(),
+                        error: None,
+                        cleanup_disposition: None,
+                        created_at: timestamp,
+                        updated_at: timestamp,
+                    });
+                    precreated_child_filesystem = Some(child_filesystem);
+                }
+                None if task.code_change => {
+                    return Err(if exactly_one_repository {
+                        LoomError::conflict(
+                            "code tasks require a clean parent checkout on a local branch",
+                        )
+                    } else {
+                        LoomError::invalid_request(
+                            "code tasks currently require exactly one Git repository attached to the parent session",
+                        )
+                    });
+                }
+                None => {}
             }
-            let base_revision = parent_status.head.ok_or_else(|| {
-                LoomError::invalid_state("parent repository HEAD does not point to a commit")
-            })?;
-            let child_repository_id = RepositoryId::new();
-            let child_filesystem = self
-                .backend
-                .create_session_filesystem(parent_snapshot.workspace_id, child_session_id)?;
-            let worktree_relative_path = format!("project-worktrees/{task_id}");
-            initial_worktree = Some(ProjectWorktreeRecord {
-                project_id,
-                task_id,
-                parent_session_id,
-                child_session_id,
-                parent_repository_id,
-                child_repository_id,
-                relative_path: worktree_relative_path,
-                worktree_name: format!("loom-child-{task_id}"),
-                branch_name: format!("loom/project-child-{task_id}"),
-                base_revision,
-                result_revision: None,
-                integrated_revision: None,
-                status: ProjectWorktreeStatus::Creating,
-                conflict_paths: Vec::new(),
-                error: None,
-                cleanup_disposition: None,
-                created_at: timestamp,
-                updated_at: timestamp,
-            });
-            precreated_child_filesystem = Some(child_filesystem);
         }
         timestamp = loom_core::Timestamp::now();
         child_snapshot.created_at = timestamp;

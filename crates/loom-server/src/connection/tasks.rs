@@ -171,19 +171,19 @@ impl InProcessConnection {
         }) {
             return Ok(());
         }
-        let mut code_worktree = None;
-        if task.code_change {
-            let Some(mut worktree) = persistence.load_project_worktree_by_task(task.task_id)?
-            else {
-                return Err(LoomError::new(
-                    ErrorCode::RecoveryRequired,
-                    "code task is missing its durable worktree intent",
-                    true,
-                ));
-            };
+        let mut checkout = None;
+        let worktree = persistence.load_project_worktree_by_task(task.task_id)?;
+        if task.code_change && worktree.is_none() {
+            return Err(LoomError::new(
+                ErrorCode::RecoveryRequired,
+                "code task is missing its durable worktree intent",
+                true,
+            ));
+        }
+        if let Some(mut worktree) = worktree {
             if let Err(error) = self.ensure_project_worktree_ready(&mut worktree) {
                 log::warn!(
-                    "project code task {} is waiting for worktree recovery: {}",
+                    "project task {} is waiting for checkout recovery: {}",
                     task.task_id,
                     error.message
                 );
@@ -192,7 +192,7 @@ impl InProcessConnection {
             if worktree.status != ProjectWorktreeStatus::Ready {
                 return Ok(());
             }
-            code_worktree = Some(worktree);
+            checkout = Some(worktree);
         }
         let concurrency_limit = self
             .backend
@@ -232,27 +232,27 @@ impl InProcessConnection {
                 context.join("\n")
             )
         };
-        let system_instructions = if task.code_change {
-            let worktree = code_worktree.as_ref().ok_or_else(|| {
-                LoomError::new(
-                    ErrorCode::RecoveryRequired,
-                    "project code task has no ready worktree identity",
-                    true,
-                )
-            })?;
-            format!(
+        let system_instructions = match (&checkout, task.code_change) {
+            (Some(worktree), true) => format!(
                 "You are a project code sub-agent working on one bounded task in your isolated Git worktree. Your repository root is `{}` and your assigned branch is `{}`. Modify only that checkout, commit the completed result on the assigned branch, and report the commit hash and summary to your parent. Do not directly access or alter your parent's checkout. If you have explicit nested project tools, use them to review and integrate your own children's work into this assigned checkout. Project: {}. Parent session: {}. Task ID: {}.",
                 worktree.relative_path,
                 worktree.branch_name,
                 task.project_id,
                 task.requester_session_id,
                 task.task_id
-            )
-        } else {
-            format!(
+            ),
+            (Some(worktree), false) => format!(
+                "You are a project read-only sub-agent working on one bounded task in an isolated checkout of your parent's revision. Your repository root is `{}` and your assigned branch is `{}`. Read and inspect that checkout freely to ground your work, but do not modify source code or repository files and do not commit: this checkout is never reviewed or integrated. Report progress and findings to the parent agent. Project: {}. Parent session: {}. Task ID: {}.",
+                worktree.relative_path,
+                worktree.branch_name,
+                task.project_id,
+                task.requester_session_id,
+                task.task_id
+            ),
+            (None, _) => format!(
                 "You are a non-code project sub-agent working on one bounded task. Do not modify source code or repository files. Report progress and findings to the parent agent. Project: {}. Parent session: {}. Task ID: {}.",
                 task.project_id, task.requester_session_id, task.task_id
-            )
+            ),
         };
         if !persistence.update_delegated_task_status_if_queued(
             task.task_id,

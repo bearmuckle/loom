@@ -143,14 +143,18 @@ not mandatory plan-document-to-issue-to-build pipelines.
 
 ## Code task isolation and integration
 
-Each code-changing agent receives its own Git worktree; non-code work gets no
-worktree. The initial implementation accepts exactly one Git repository
-attached to the parent session and requires its checkout to be clean. Missing
-or multiple repositories and native in-place directory attachments are
-rejected. A child worktree is based on its parent's current project branch and
-revision. A level-three worktree is based on its level-two parent's branch and
-revision. Siblings never share a mutable checkout, and parentage grants no
-shared-filesystem access.
+Every delegated agent receives its own isolated checkout when its parent has
+exactly one clean repository attached; `code_change` selects write authority
+rather than deciding whether a checkout exists. A code agent commits to its
+checkout and is reviewed and integrated by its parent. A read-only agent may
+inspect its checkout but does not commit, and it is never reviewed or
+integrated. When no clean single repository is available a read-only agent
+degrades to a prompt-only child, while a code task is rejected. Missing or
+multiple repositories and native in-place directory attachments are rejected
+for code tasks. A child checkout is based on its parent's current project
+branch and revision. A level-three checkout is based on its level-two parent's
+branch and revision. Siblings never share a mutable checkout, and parentage
+grants no shared-filesystem access.
 
 The parent reviews a child's result and performs or directs integration into
 its own branch. A child never writes or merges into its parent's worktree.

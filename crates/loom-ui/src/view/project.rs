@@ -398,11 +398,10 @@ impl LoomView {
                     }));
                 }
             }
-            if task.code_change
-                && let Some(worktree) = project
-                    .worktrees
-                    .iter()
-                    .find(|worktree| worktree.task_id == task.task_id)
+            if let Some(worktree) = project
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.task_id == task.task_id)
             {
                 let task_id = task.task_id;
                 let terminal = matches!(
@@ -411,7 +410,8 @@ impl LoomView {
                         | loom_core::DelegatedTaskStatus::Failed
                         | loom_core::DelegatedTaskStatus::Cancelled
                 );
-                if can_review
+                if task.code_change
+                    && can_review
                     && !matches!(
                         worktree.status,
                         loom_core::ProjectWorktreeStatus::CleanupPending
@@ -432,7 +432,8 @@ impl LoomView {
                         },
                     ));
                 }
-                if can_integrate
+                if task.code_change
+                    && can_integrate
                     && terminal
                     && task.status == loom_core::DelegatedTaskStatus::Completed
                     && matches!(
