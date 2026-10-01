@@ -35,19 +35,20 @@ use loom_process::{TaskSupervisor, TerminalManager};
 use loom_protocol::{
     AgentActivityRecord, AgentExecutionStateRecord, AgentPlanProgress, AgentRunMessageHeader,
     AgentRunSnapshotProjection, AgentRunTranscriptMessage, AgentSessionInitialState,
-    AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest, ContextRequest,
-    ContextResponse, ControlRequest, ControlResponse, EventsRequest, EventsResponse,
-    FilesystemRequest, FilesystemResponse, GitHubCopilotLoginStatus, GitHubRepository,
-    MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES, MAX_AGENT_RUN_MESSAGE_PAGE_SIZE,
-    MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES, MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult,
-    ProjectChildControlAction, ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse,
-    RepositoryRequest, RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest,
-    RunResponse, ServerEvent, ServerEventEnvelope, ServerResponse, SessionDirectory,
-    SessionFilesystemChange, SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository,
-    SessionRequest, SessionResponse, TaskRequest, TaskResponse, TerminalRequest, TerminalResponse,
-    UsageRequest, UsageResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig,
-    WorkspaceEvent, WorkspaceEventEnvelope, WorkspaceFeedEvent, WorkspaceRequest,
-    WorkspaceResponse, unsupported_version_error,
+    AgentSessionSnapshotProjection, CURRENT_PROTOCOL_VERSION, ClientRequest, ClonedRepository,
+    ContextRequest, ContextResponse, ControlRequest, ControlResponse, EventsRequest,
+    EventsResponse, FilesystemRequest, FilesystemResponse, GITHUB_REPOSITORY_QUERY_MIN_CHARS,
+    GitHubCopilotLoginStatus, GitHubRepository, MAX_AGENT_RUN_MESSAGE_CONTENT_RANGE_BYTES,
+    MAX_AGENT_RUN_MESSAGE_PAGE_SIZE, MAX_AGENT_RUN_TRANSCRIPT_MESSAGE_BYTES,
+    MAX_AGENT_RUN_TRANSCRIPT_PAGE_SIZE, NegotiationResult, ProjectChildControlAction,
+    ProjectRequest, ProjectResponse, ProviderRequest, ProviderResponse, RepositoryRequest,
+    RepositoryResponse, RequestEnvelope, ResponseEnvelope, RunRequest, RunResponse, ServerEvent,
+    ServerEventEnvelope, ServerResponse, SessionDirectory, SessionFilesystemChange,
+    SessionFilesystemFile, SessionFilesystemSnapshot, SessionRepository, SessionRequest,
+    SessionResponse, TaskRequest, TaskResponse, TerminalRequest, TerminalResponse, UsageRequest,
+    UsageResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceConfig, WorkspaceEvent,
+    WorkspaceEventEnvelope, WorkspaceFeedEvent, WorkspaceRequest, WorkspaceResponse,
+    unsupported_version_error,
 };
 use loom_providers::{
     CredentialRef, FileCredentialStore, GITHUB_COPILOT_CREDENTIAL_REF, GitHubCopilotAuthenticator,
@@ -102,6 +103,11 @@ struct GitHubApiRepository {
     clone_url: String,
     private: bool,
     default_branch: String,
+}
+
+#[derive(Deserialize)]
+struct GitHubSearchResponse {
+    items: Vec<GitHubApiRepository>,
 }
 
 pub use auth::{AuthSession, AuthTokenStore, AuthorizationScope, IssuedToken};

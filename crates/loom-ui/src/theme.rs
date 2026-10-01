@@ -80,15 +80,18 @@ const fn legacy_color_role(value: u32) -> Option<ColorRole> {
         0x191c22 | 0x1b1d24 | 0x20242c => Some(ColorRole::Control),
         0x202b3b | 0x25334a | 0x263b58 | 0x293244 => Some(ColorRole::Active),
         0x293b56 => Some(ColorRole::ControlHover),
-        0x242833 | 0x30343f => Some(ColorRole::Border),
+        0x242833 | 0x30343f | 0x232c39 => Some(ColorRole::Border),
         0x3b4555 | 0x3b5d85 => Some(ColorRole::BorderStrong),
         0xe5e7eb | 0xf3f4f6 | 0xcbd5e1 | 0xdbeafe => Some(ColorRole::Foreground),
         0xffffff => Some(ColorRole::AccentForeground),
-        0x64748b | 0x8f98a6 | 0x94a3b8 | 0xb7c0d0 => Some(ColorRole::MutedForeground),
+        0x5c6572 | 0x64748b | 0x7f8b9c | 0x8f98a6 | 0x94a3b8 | 0xb7c0d0 => {
+            Some(ColorRole::MutedForeground)
+        }
         0x93c5fd | 0xbfdbfe | 0x60a5fa | 0x2563eb => Some(ColorRole::Accent),
         0x1d4ed8 => Some(ColorRole::AccentHover),
-        0x86efac | 0x9ad7bd | 0xd1fae5 | 0xbbf7d0 | 0x4ade80 => Some(ColorRole::Success),
-        0x064e3b | 0x24543d => Some(ColorRole::SuccessSurface),
+        0x34d399 | 0x86efac | 0x9ad7bd | 0xd1fae5 | 0xbbf7d0 | 0x4ade80 => Some(ColorRole::Success),
+        0x1f6b4d => Some(ColorRole::Success),
+        0x064e3b | 0x24543d | 0x10291f => Some(ColorRole::SuccessSurface),
         0xef4444 | 0xfca5a5 | 0xfda4af | 0xfecaca | 0xfecdd3 => Some(ColorRole::Danger),
         0x3a1f24 | 0x542936 | 0x7f1d1d => Some(ColorRole::DangerSurface),
         0xfbbf24 | 0xfcd34d | 0xfef3c7 => Some(ColorRole::Warning),

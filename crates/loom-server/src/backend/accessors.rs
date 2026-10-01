@@ -68,6 +68,27 @@ impl InProcessBackend {
         self.repository_service.vcs()
     }
 
+    /// Repositories this worker node has already cloned and cached.
+    pub(crate) fn cached_repositories(&self) -> Result<Vec<ClonedRepository>> {
+        self.repository_service.cached_repositories()
+    }
+
+    /// Existing mirror for a clone URL, when this node has cloned it before.
+    pub(crate) fn cached_repository_mirror(&self, clone_url: &str) -> Result<Option<PathBuf>> {
+        self.repository_service.cached_mirror(clone_url)
+    }
+
+    /// Destination mirror path for a clone URL, whether or not it exists yet.
+    pub(crate) fn repository_mirror_path(&self, clone_url: &str) -> Result<PathBuf> {
+        self.repository_service.mirror_path(clone_url)
+    }
+
+    /// Record a cached clone so later sessions can reuse it.
+    pub(crate) fn register_cloned_repository(&self, repository: &ClonedRepository) -> Result<()> {
+        self.repository_service
+            .register_cloned_repository(repository)
+    }
+
     pub(crate) fn session_task_supervisors(
         &self,
     ) -> Result<MutexGuard<'_, BTreeMap<AgentSessionId, TaskSupervisor>>> {

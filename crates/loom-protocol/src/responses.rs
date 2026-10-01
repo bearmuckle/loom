@@ -42,6 +42,10 @@ pub enum RepositoryResponse {
         repositories: Vec<GitHubRepository>,
     },
 
+    ClonedRepositories {
+        repositories: Vec<ClonedRepository>,
+    },
+
     VcsStatus(GitRepositoryStatus),
 
     VcsDiff(GitDiff),

@@ -12,13 +12,21 @@ impl InProcessConnection {
                 source,
                 path,
                 revision,
+                reuse_local,
             }) => Ok(ServerResponse::Repository(
-                RepositoryResponse::SessionRepositoryAttached(
-                    self.attach_session_repository(session_id, source, path, revision)?,
-                ),
+                RepositoryResponse::SessionRepositoryAttached(self.attach_session_repository(
+                    session_id,
+                    source,
+                    path,
+                    revision,
+                    reuse_local,
+                )?),
             )),
-            ClientRequest::Repository(RepositoryRequest::ListGitHubRepositories) => {
-                self.list_github_repositories()
+            ClientRequest::Repository(RepositoryRequest::SearchGitHubRepositories { query }) => {
+                self.search_github_repositories(&query)
+            }
+            ClientRequest::Repository(RepositoryRequest::ListClonedRepositories) => {
+                self.list_cloned_repositories()
             }
             ClientRequest::Repository(RepositoryRequest::ListSessionRepositories {
                 session_id,

@@ -594,8 +594,12 @@ impl LoomView {
         cx: &mut Context<Self>,
     ) {
         let creation_status = match source.as_ref() {
-            Some(SessionCreationSource::GitHub(repository)) => {
-                format!("Creating project and cloning {}…", repository.full_name)
+            Some(SessionCreationSource::GitHub(source)) => {
+                if source.reuse_local {
+                    format!("Creating project from cached {}…", source.full_name)
+                } else {
+                    format!("Creating project and cloning {}…", source.full_name)
+                }
             }
             Some(SessionCreationSource::LocalDirectory(_)) => {
                 "Creating project and attaching directory…".to_owned()
@@ -712,15 +716,21 @@ impl LoomView {
                             response => Err(unexpected_response("directory attachment", response)),
                         }
                     }
-                    Some(SessionCreationSource::GitHub(repository)) => {
-                        log::info!("cloning GitHub repository {} into session {}", repository.full_name, snapshot.id);
-                        let path = source_mount_path("repositories", &repository.full_name, &[]);
+                    Some(SessionCreationSource::GitHub(source)) => {
+                        log::info!(
+                            "preparing GitHub repository {} for session {} (reuse_local={})",
+                            source.full_name,
+                            snapshot.id,
+                            source.reuse_local
+                        );
+                        let path = source_mount_path("repositories", &source.full_name, &[]);
                         let response = backend
                             .submit(RequestEnvelope::new(ClientRequest::Repository(RepositoryRequest::AttachSessionRepository{
                                 session_id: snapshot.id,
-                                source: repository.clone_url,
+                                source: source.clone_url,
                                 path,
                                 revision: None,
+                                reuse_local: source.reuse_local,
                             })))
                             .wait()
                             .await;

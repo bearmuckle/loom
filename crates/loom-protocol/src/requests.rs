@@ -62,6 +62,10 @@ pub enum RepositoryRequest {
         source: String,
         path: String,
         revision: Option<String>,
+        /// Reuse the worker node's cached clone of `source` when one exists
+        /// instead of cloning from the network again.
+        #[serde(default)]
+        reuse_local: bool,
     },
 
     ListSessionRepositories {
@@ -73,7 +77,15 @@ pub enum RepositoryRequest {
         repository_id: RepositoryId,
     },
 
-    ListGitHubRepositories,
+    /// Search repositories the authenticated GitHub account can access. The
+    /// query must contain at least two characters; the GitHub API performs the
+    /// filtering.
+    SearchGitHubRepositories {
+        query: String,
+    },
+
+    /// List repositories already cloned and cached on this worker node.
+    ListClonedRepositories,
 
     GetSessionVcsStatus {
         session_id: AgentSessionId,

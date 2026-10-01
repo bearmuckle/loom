@@ -156,6 +156,7 @@ fn exposes_workspace_terminal_task_and_checkpoint_controls() {
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
+            reuse_local: false,
         },
     )));
     assert!(matches!(
@@ -1297,6 +1298,7 @@ fn m5_workspace_context_vcs_and_task_evidence_are_authoritative() {
             source: root.display().to_string(),
             path: "repo".to_owned(),
             revision: None,
+            reuse_local: false,
         },
     )));
     assert!(matches!(

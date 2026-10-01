@@ -24,13 +24,13 @@ use loom_model::{
 use loom_protocol::ToolResult;
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, ClientRequest,
-    ContextBudget, ContextInspection, ContextItem, ContextItemKind, ContextSummary, EventsResponse,
-    FileActivityOperation, FilesystemRequest, FilesystemResponse, GitDiff, GitDiffHunk,
-    GitDiffLine, GitDiffLineKind, GitFileStatus, GitFileStatusKind, GitHubRepository,
-    GitRepositoryStatus, ProviderRequest, RequestEnvelope, RunRequest, RunResponse, ServerResponse,
-    SessionFilesystemChange, SessionFilesystemFile, SessionRepository, SessionRequest,
-    SessionResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind, WorkspaceEntry,
-    WorkspaceEntryKind, WorkspaceRequest,
+    ClonedRepository, ContextBudget, ContextInspection, ContextItem, ContextItemKind,
+    ContextSummary, EventsResponse, FileActivityOperation, FilesystemRequest, FilesystemResponse,
+    GitDiff, GitDiffHunk, GitDiffLine, GitDiffLineKind, GitFileStatus, GitFileStatusKind,
+    GitHubRepository, GitRepositoryStatus, ProviderRequest, RequestEnvelope, RunRequest,
+    RunResponse, ServerResponse, SessionFilesystemChange, SessionFilesystemFile, SessionRepository,
+    SessionRequest, SessionResponse, WorkerNodeResources, WorkerNodeStatus, WorkspaceChangeKind,
+    WorkspaceEntry, WorkspaceEntryKind, WorkspaceRequest,
 };
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -3247,6 +3247,76 @@ async fn repository_review_loads_git_status_diff_and_detaches_the_repository(
 }
 
 #[gpui_kit::test]
+async fn confirming_an_existing_clone_creates_a_session_from_it(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let source = std::env::temp_dir().join(format!("loom-ui-cache-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("README.md"), "cached\n").unwrap();
+    for arguments in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "loom@example.test"],
+        vec!["config", "user.name", "Loom Test"],
+        vec!["add", "README.md"],
+        vec!["commit", "-qm", "initial"],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let source_path = source.to_string_lossy().to_string();
+    let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+        let mut view = LoomView::new_for_test(cx.focus_handle());
+        crate::connection::negotiate(&view.connection).unwrap();
+        let workspace =
+            crate::connection::create_workspace(&view.connection, "Cached clone").unwrap();
+        view.workspace_id = workspace.id;
+        view.workspaces.push(workspace);
+        view.session_node_ids
+            .insert(view.active_session.id, view.default_backend_node_id.clone());
+        view
+    });
+
+    cx.update_window(handle.into(), |_, window, cx| {
+        window
+            .root::<LoomView>()
+            .unwrap()
+            .unwrap()
+            .update(cx, |view, cx| {
+                view.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
+                view.choose_source(SessionSourceChoice::GitHub, cx);
+                // Offer a repository that is already cloned on the node and
+                // confirm it, exercising the reuse path (no GitHub search).
+                view.cloned_repositories = vec![ClonedRepository {
+                    full_name: "owner/cached".to_owned(),
+                    clone_url: source_path.clone(),
+                    branch: Some("main".to_owned()),
+                    last_used_at: Timestamp::from_unix_millis(1),
+                }];
+                if let Some(dialog) = &mut view.source_dialog {
+                    dialog.selected_repository = Some("owner/cached".to_owned());
+                }
+                // A short filter is handled locally and never reaches the worker.
+                view.on_repository_search_changed(cx);
+                view.confirm_source_dialog(cx);
+            });
+    })
+    .unwrap();
+    cx.wait_for(handle.into(), Duration::from_secs(10), |window, cx| {
+        window
+            .root::<LoomView>()
+            .flatten()
+            .is_some_and(|view| view.read(cx).sessions.len() == 1)
+    })
+    .await;
+    std::fs::remove_dir_all(&source).unwrap();
+}
+
+#[gpui_kit::test]
 async fn github_source_selection_reports_unconfigured_provider_and_requires_a_repository(
     cx: &mut TestAppContext,
 ) {
@@ -3274,6 +3344,9 @@ async fn github_source_selection_reports_unconfigured_provider_and_requires_a_re
                     .update(cx, |view, cx| {
                         view.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
                         view.choose_source(SessionSourceChoice::GitHub, cx);
+                        // Searching GitHub with no credentials configured must
+                        // surface the provider error in the dialog.
+                        view.search_github_repositories("loom".to_owned(), cx);
                     });
             });
     })
@@ -3404,6 +3477,25 @@ fn rename_and_source_dialogs_render(cx: &mut TestAppContext) {
             filter_subscription: None,
             repositories: Vec::new(),
             selected_repository: None,
+            repositories_loading: false,
+            error: None,
+        });
+    });
+    // A node with existing clones pre-selects one and renders the reuse action.
+    render_scenario(cx, |view| {
+        view.cloned_repositories = vec![ClonedRepository {
+            full_name: "owner/project".to_owned(),
+            clone_url: "https://github.com/owner/project.git".to_owned(),
+            branch: Some("main".to_owned()),
+            last_used_at: Timestamp::from_unix_millis(0),
+        }];
+        view.source_dialog = Some(SessionSourceDialog {
+            purpose: SessionSourceDialogPurpose::StartSession,
+            choice: SessionSourceChoice::GitHub,
+            local_directory_available: true,
+            filter_subscription: None,
+            repositories: Vec::new(),
+            selected_repository: Some("owner/project".to_owned()),
             repositories_loading: false,
             error: None,
         });

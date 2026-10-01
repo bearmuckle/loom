@@ -699,6 +699,7 @@ pub(crate) fn attach_session_repository(
             source: source.to_owned(),
             path: path.to_owned(),
             revision: None,
+            reuse_local: false,
         },
     )));
     match response.result? {
@@ -723,6 +724,7 @@ pub(crate) async fn attach_session_repository_async(
                 source: source.to_owned(),
                 path: path.to_owned(),
                 revision: None,
+                reuse_local: false,
             },
         )))
         .await;

@@ -44,6 +44,7 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
+                reuse_local: false,
             },
         )))
         .result
@@ -636,6 +637,7 @@ fn nested_code_child_worktree_integrates_through_parent_to_root() {
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
+                reuse_local: false,
             },
         )))
         .result
@@ -1008,6 +1010,7 @@ fn read_only_child_receives_an_isolated_checkout() {
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
+                reuse_local: false,
             },
         )))
         .result

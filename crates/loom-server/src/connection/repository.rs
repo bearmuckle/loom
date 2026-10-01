@@ -1,11 +1,18 @@
 use super::*;
 
 impl InProcessConnection {
-    pub(crate) fn list_github_repositories(&self) -> Result<ServerResponse> {
+    pub(crate) fn search_github_repositories(&self, query: &str) -> Result<ServerResponse> {
         let token = self.backend.providers.github_account_token()?;
-        let repositories = fetch_github_repositories(&token, "https://api.github.com/user/repos")?;
+        let repositories = search_github_repositories(&token, query)?;
         Ok(ServerResponse::Repository(
             RepositoryResponse::GitHubRepositories { repositories },
+        ))
+    }
+
+    pub(crate) fn list_cloned_repositories(&self) -> Result<ServerResponse> {
+        let repositories = self.backend.cached_repositories()?;
+        Ok(ServerResponse::Repository(
+            RepositoryResponse::ClonedRepositories { repositories },
         ))
     }
 
@@ -15,6 +22,7 @@ impl InProcessConnection {
         source: String,
         relative_path: String,
         revision: Option<String>,
+        reuse_local: bool,
     ) -> Result<SessionRepository> {
         let session = self.backend.sessions()?.get(session_id)?;
         if matches!(
@@ -84,16 +92,33 @@ impl InProcessConnection {
             .ok()
             .filter(|url| url.scheme() == "https" && url.host_str() == Some("github.com"))
             .and_then(|_| self.backend.providers.github_account_token().ok());
-        log::info!(
-            "[loom-server] cloning repository {source_name} for session {session_id} into {}",
-            destination.display()
-        );
-        let cloned = match GitService::clone_from_authenticated(
-            &source,
-            &temporary,
-            revision.as_deref(),
-            github_token.as_deref(),
-        ) {
+        let cached_mirror = if reuse_local {
+            self.backend.cached_repository_mirror(&source)?
+        } else {
+            None
+        };
+        if let Some(mirror) = &cached_mirror {
+            log::info!(
+                "[loom-server] reusing cached clone of {source_name} for session {session_id} from {}",
+                mirror.display()
+            );
+        } else {
+            log::info!(
+                "[loom-server] cloning repository {source_name} for session {session_id} into {}",
+                destination.display()
+            );
+        }
+        let cloned = if let Some(mirror) = &cached_mirror {
+            GitService::clone_from_local(mirror, &temporary, revision.as_deref(), &source)
+        } else {
+            GitService::clone_from_authenticated(
+                &source,
+                &temporary,
+                revision.as_deref(),
+                github_token.as_deref(),
+            )
+        };
+        let cloned = match cloned {
             Ok(cloned) => cloned,
             Err(error) => {
                 log::warn!(
@@ -136,11 +161,13 @@ impl InProcessConnection {
             ));
         }
         let service = GitService::open(&destination)?;
+        let status = service.status()?;
+        self.cache_clone_for_reuse(&source, &destination, status.branch.as_deref());
         let repository = SessionRepository {
             id: repository_id,
             source: source_name.clone(),
             path: relative_path,
-            revision: service.status()?.head,
+            revision: status.head,
             attached_at: Timestamp::now(),
         };
         self.backend
@@ -156,6 +183,36 @@ impl InProcessConnection {
         filesystem.mark_state_dirty()?;
         log::info!("repository {source_name} attached to session {session_id}");
         Ok(repository)
+    }
+
+    /// Caches a freshly cloned GitHub checkout as a node mirror so later
+    /// sessions can start from an existing clone instead of the network.
+    fn cache_clone_for_reuse(&self, source: &str, checkout: &Path, branch: Option<&str>) {
+        let Some(full_name) = github_repository_full_name(source) else {
+            return;
+        };
+        let Ok(mirror_path) = self.backend.repository_mirror_path(source) else {
+            return;
+        };
+        if let Err(error) = GitService::create_mirror(checkout, &mirror_path, source) {
+            log::warn!(
+                "[loom-server] could not cache a clone mirror for {full_name}: {}",
+                error.message
+            );
+            return;
+        }
+        let repository = ClonedRepository {
+            full_name,
+            clone_url: source.to_owned(),
+            branch: branch.map(str::to_owned),
+            last_used_at: Timestamp::now(),
+        };
+        if let Err(error) = self.backend.register_cloned_repository(&repository) {
+            log::warn!(
+                "[loom-server] could not record the cached clone for {source}: {}",
+                error.message
+            );
+        }
     }
 
     pub(crate) fn detach_session_repository(

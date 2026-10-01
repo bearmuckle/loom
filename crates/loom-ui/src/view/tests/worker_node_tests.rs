@@ -907,6 +907,7 @@ fn session_request_routing_covers_explicit_active_and_non_session_requests() {
             source: "/repo".into(),
             path: "repo".into(),
             revision: None,
+            reuse_local: false,
         }),
         ClientRequest::Filesystem(FilesystemRequest::AttachSessionDirectory {
             session_id: session,

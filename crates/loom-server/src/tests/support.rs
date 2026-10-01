@@ -240,6 +240,7 @@ pub(super) fn project_code_child_fixture() -> ProjectCodeChildFixture {
                 source: source.display().to_string(),
                 path: "repo".to_owned(),
                 revision: None,
+                reuse_local: false,
             },
         )))
         .result

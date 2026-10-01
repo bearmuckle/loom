@@ -72,6 +72,26 @@ pub struct GitHubRepository {
     pub default_branch: String,
 }
 
+/// Minimum number of characters a GitHub repository search query must contain
+/// before the API is asked to filter results. Enforced by both the client and
+/// the worker so a short or empty query never triggers an unfiltered search.
+pub const GITHUB_REPOSITORY_QUERY_MIN_CHARS: usize = 2;
+
+/// A GitHub repository that a worker node has already cloned and cached.
+///
+/// The node keeps a mirror of every repository it has cloned so a later session
+/// can start from the existing checkout instead of downloading it again. This
+/// is the display projection the source picker offers as "start from existing
+/// clone".
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ClonedRepository {
+    pub full_name: String,
+    pub clone_url: String,
+    /// Branch checked out when the repository was cached, when known.
+    pub branch: Option<String>,
+    pub last_used_at: Timestamp,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceEntryKind {
