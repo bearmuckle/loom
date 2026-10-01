@@ -183,7 +183,7 @@ impl LoomView {
                                     .min_w(px(0.))
                                     .when(layout.phone, |element| element.w_full())
                                     .child(self.render_agent_mode_picker(layout.phone))
-                                    .child(self.render_model_picker(layout.phone))
+                                    .child(self.render_model_picker(layout.phone, cx))
                                     .child(
                                         Button::new("open-command-palette")
                                             .icon(Icon::new(command_palette_icon()))

@@ -6,6 +6,9 @@ use crate::{ContextFileKind, ContextFileReference, Workspace, WorkspaceEntryKind
 /// being pulled into an agent prompt.
 pub const MAX_CONTEXT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Upper bound for the root listing scanned for instruction/context files.
+const MAX_CONTEXT_SCAN_ENTRIES: usize = 20_000;
+
 const INSTRUCTION_FILE_NAMES: [&str; 5] = [
     "AGENTS.md",
     "CLAUDE.md",
@@ -16,11 +19,13 @@ const INSTRUCTION_FILE_NAMES: [&str; 5] = [
 
 impl Workspace {
     /// Repository instruction and context files that an agent run may load.
+    ///
+    /// This walks the workspace root only. Attached directories are opaque, so
+    /// a mount cannot make run startup scan an arbitrarily large tree.
     pub fn context_files(&self) -> Result<Vec<ContextFileReference>> {
-        let snapshot = self.snapshot()?;
+        let entries = self.list(".", None, MAX_CONTEXT_SCAN_ENTRIES)?;
         let mut files = Vec::new();
-        for entry in snapshot
-            .entries
+        for entry in entries
             .iter()
             .filter(|entry| entry.kind == WorkspaceEntryKind::File)
         {

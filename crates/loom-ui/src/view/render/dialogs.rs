@@ -1132,6 +1132,23 @@ impl LoomView {
                                 ),
                             false,
                             phone,
+                        ))
+                        .child(settings_row(
+                            "Show model reasoning",
+                            "Reveal the model's thinking above each answer",
+                            Switch::new("show-reasoning-toggle")
+                                .checked(self.show_reasoning)
+                                .accessibility_label("Show model reasoning")
+                                .on_change({
+                                    let view = cx.entity();
+                                    move |_checked, _window, cx| {
+                                        view.update(cx, |view, cx| {
+                                            view.toggle_show_reasoning(cx);
+                                        });
+                                    }
+                                }),
+                            false,
+                            phone,
                         )),
                 )
                 .into_any_element(),

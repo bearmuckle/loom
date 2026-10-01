@@ -190,7 +190,8 @@ duplicate denials across restarts remain open.
 The projection and rendering changes above are implemented in `loom-ui`:
 message-part assistant turns, unified tool blocks, collapsed status chrome,
 streaming cursor, composer send/stop, actionable evidence, single-run plans,
-de-emphasized project messages, and a collapsed reasoning disclosure.
+de-emphasized project messages, and an opt-in collapsed reasoning disclosure
+(hidden by default; enabled under Settings → Appearance).
 
 ## Presentation polish
 
@@ -223,8 +224,16 @@ The projection and rendering code lives under `crates/loom-ui/src/view` and
   command set as the slash menu.
 - **Transcript.** Assistant turns carry a neutral `Agent` gutter marker (user
   turns use `You`); tool blocks carry a type icon, monospace title, patch
-  summary, copy control, and a language label. Consecutive same-kind tool calls
-  collapse into one expandable summary row. The transcript scrolls through
+  summary, copy control, and a language label. A model response that thinks and
+  calls tools several times stays one agent entry: every reasoning part is
+  gathered into a single disclosure at the top, and all of its tool calls share
+  one usage line that lists each tool type with its invocation count (for
+  example `Read ×2 · Search ×1`). Expanding the usage line reveals the detailed
+  presentation, where consecutive same-kind tool calls still collapse into one
+  expandable summary row. Active and approval-gated runs stay open. A run that
+  recovered from a failed call reads as done with the failure count called out
+  (`done · 1 failed`); only a run where nothing succeeded reads as failed. The
+  transcript scrolls through
   gpui-kit's `MessageScroller`, which keeps the live edge pinned and provides
   the scrollbar, bottom fade, and jump-to-latest control.
 - **Navigation.** Session rows show relative update times and an activity dot

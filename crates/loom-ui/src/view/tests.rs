@@ -92,8 +92,9 @@ mod display_helper_tests {
         format_bytes, format_duration, format_percentage, humanize_tool_output,
         is_redundant_completion_summary, relative_time, replace_command_token, replace_last_token,
         rgb, run_state_color, run_state_label, session_is_active, session_status_pill,
-        source_mount_path, tool_detail, tool_group_label, tool_group_status,
+        source_mount_path, tool_detail, tool_failure_count, tool_group_label, tool_group_status,
         tool_part_from_activity, tool_status, tool_title, tool_title_for_activity,
+        tool_usage_label, tool_usage_summary,
     };
     use loom_core::{ActivityId, AgentSessionState, RunId, Timestamp};
     use loom_model::{ModelId, ToolCall};
@@ -486,6 +487,33 @@ mod display_helper_tests {
     }
 
     #[test]
+    fn tool_usage_summary_counts_calls_by_type_in_first_seen_order() {
+        let part = |name: &str| ToolPart {
+            id: loom_core::ToolCallId::new(),
+            name: name.to_owned(),
+            title: String::new(),
+            status: ToolPartStatus::Completed,
+            detail: None,
+            output: None,
+            elapsed_ms: None,
+            approval_pending: false,
+        };
+        let parts = [
+            part("read_file"),
+            part("search_text"),
+            part("read_file"),
+            part("run_command"),
+            part("read_file"),
+        ];
+        let refs = parts.iter().collect::<Vec<_>>();
+        assert_eq!(tool_usage_summary(&refs), "Read ×3 · Search ×1 · Run ×1");
+        assert!(tool_usage_summary(&[]).is_empty());
+
+        assert_eq!(tool_usage_label("read_file"), "Read");
+        assert_eq!(tool_usage_label("mystery_tool"), "mystery_tool");
+    }
+
+    #[test]
     fn glob_tool_gets_a_readable_title_and_no_json_detail() {
         let mut call = call("glob");
         call.arguments = json!({"pattern": "**/*.rs", "path": "crates", "max_entries": 1000});
@@ -577,8 +605,24 @@ mod display_helper_tests {
         assert_eq!(status(&[Completed, Queued, Queued]), Queued);
         assert_eq!(status(&[Queued, Running]), Running);
         assert_eq!(status(&[Completed, AwaitingApproval]), Running);
-        assert_eq!(status(&[Completed, Failed]), Failed);
-        assert_eq!(status(&[Completed, Cancelled]), Cancelled);
+        // A run that recovered from a failed call reads as done, not failed.
+        assert_eq!(status(&[Completed, Failed]), Completed);
+        assert_eq!(status(&[Completed, Cancelled]), Completed);
+        // Nothing succeeded, so the failure (or cancellation) settles the group.
+        assert_eq!(status(&[Failed, Failed]), Failed);
+        assert_eq!(status(&[Failed, Cancelled]), Failed);
+        assert_eq!(status(&[Cancelled, Cancelled]), Cancelled);
+        assert_eq!(status(&[Failed, Running]), Running);
+        assert_eq!(status(&[Failed, Queued]), Queued);
+    }
+
+    #[test]
+    fn tool_failure_count_only_counts_failed_calls() {
+        let failed = grouped_part(ToolPartStatus::Failed);
+        let completed = grouped_part(ToolPartStatus::Completed);
+        let parts = [&failed, &completed, &failed];
+        assert_eq!(tool_failure_count(&parts), 2);
+        assert_eq!(tool_failure_count(&[&completed]), 0);
     }
 
     #[test]
@@ -1820,6 +1864,11 @@ mod loom_view_render_tests {
         });
         cx.update_window(handle.into(), |view, window, cx| {
             window.render_frame(cx);
+            // The run of calls starts behind the collapsed usage summary.
+            assert!(window.try_find(("tool-usage-header", 0u64)).is_some());
+            assert!(window.try_find(("tool-group-header", 0u64)).is_none());
+            window.click(("tool-usage-header", 0u64), cx);
+            window.render_frame(cx);
             assert!(window.try_find(("tool-group-header", 0u64)).is_some());
             assert!(window.try_find(("tool-header", 0u64)).is_none());
             window.click(("tool-group-header", 0u64), cx);
@@ -1827,8 +1876,169 @@ mod loom_view_render_tests {
             assert!(window.try_find(("tool-header", 0u64)).is_some());
             let view = view.downcast::<LoomView>().unwrap();
             view.update(cx, |view, _| {
+                assert!(view.expanded_tool_usage.contains(&0));
                 assert!(view.expanded_tool_groups.contains(&0));
             });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn tool_usage_summary_lines_collapse_by_default(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let tool = |name: &str, title: &str| {
+            AssistantPart::Tool(Box::new(ToolPart {
+                id: ToolCallId::new(),
+                name: name.to_owned(),
+                title: title.to_owned(),
+                status: ToolPartStatus::Completed,
+                detail: Some(title.to_owned()),
+                output: None,
+                elapsed_ms: Some(4),
+                approval_pending: false,
+            }))
+        };
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+                parts: vec![
+                    tool("read_file", "a.rs"),
+                    tool("read_file", "b.rs"),
+                    tool("run_command", "cargo test"),
+                ],
+                streaming: false,
+            })];
+            view
+        });
+        cx.update_window(handle.into(), |view, window, cx| {
+            let view = view.downcast::<LoomView>().unwrap();
+            window.render_frame(cx);
+            // Collapsed by default: only the single summary line is visible.
+            assert!(window.try_find(("tool-usage-header", 0u64)).is_some());
+            assert!(window.try_find(("tool-header", 0u64)).is_none());
+            assert!(window.try_find(("tool-header", 1u64)).is_none());
+            let summary = window.find(("tool-usage-header", 0u64));
+            let label = summary.label().unwrap_or_default().to_owned();
+            assert!(label.contains("Read ×2"), "summary was {label:?}");
+            assert!(label.contains("Run ×1"), "summary was {label:?}");
+
+            // Expanding reveals the existing per-tool presentation.
+            window.click(("tool-usage-header", 0u64), cx);
+            window.render_frame(cx);
+            assert!(window.try_find(("tool-header", 0u64)).is_some());
+            assert!(window.try_find(("tool-header", 1u64)).is_some());
+            assert!(window.try_find(("tool-header", 2u64)).is_some());
+            view.update(cx, |view, _| {
+                assert!(view.expanded_tool_usage.contains(&0));
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn recovered_failures_do_not_condemn_the_tool_summary(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let tool = |name: &str, status: ToolPartStatus| {
+            AssistantPart::Tool(Box::new(ToolPart {
+                id: ToolCallId::new(),
+                name: name.to_owned(),
+                title: name.to_owned(),
+                status,
+                detail: None,
+                output: None,
+                elapsed_ms: Some(1),
+                approval_pending: false,
+            }))
+        };
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+                parts: vec![
+                    tool("read_file", ToolPartStatus::Completed),
+                    tool("read_file", ToolPartStatus::Failed),
+                    tool("read_file", ToolPartStatus::Completed),
+                    tool("run_command", ToolPartStatus::Completed),
+                ],
+                streaming: false,
+            })];
+            // Expand the usage summary so the same-kind group row also renders.
+            view.expanded_tool_usage.insert(0);
+            view
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let summary = window.find(("tool-usage-header", 0u64));
+            let label = summary.label().unwrap_or_default().to_owned();
+            assert!(label.contains("done"), "summary was {label:?}");
+            assert!(label.contains("1 failed"), "summary was {label:?}");
+
+            let group = window.find(("tool-group-header", 0u64));
+            let label = group.label().unwrap_or_default().to_owned();
+            assert!(label.contains("Read 3 files"), "group was {label:?}");
+            assert!(label.contains("done"), "group was {label:?}");
+            assert!(label.contains("1 failed"), "group was {label:?}");
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn reasoning_and_tool_cycles_gather_into_one_agent_entry(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let tool = |name: &str, title: &str| {
+            AssistantPart::Tool(Box::new(ToolPart {
+                id: ToolCallId::new(),
+                name: name.to_owned(),
+                title: title.to_owned(),
+                status: ToolPartStatus::Completed,
+                detail: Some(title.to_owned()),
+                output: None,
+                elapsed_ms: Some(3),
+                approval_pending: false,
+            }))
+        };
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.show_reasoning = true;
+            view.sessions = vec![view.active_session.clone()];
+            view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+                parts: vec![
+                    AssistantPart::Reasoning("first thought".to_owned()),
+                    tool("read_file", "a.rs"),
+                    AssistantPart::Reasoning("second thought".to_owned()),
+                    tool("run_command", "cargo test"),
+                ],
+                streaming: false,
+            })];
+            view
+        });
+        cx.update_window(handle.into(), |view, window, cx| {
+            let view = view.downcast::<LoomView>().unwrap();
+            window.render_frame(cx);
+            // The reasonings gather into one disclosure at the top of the entry.
+            assert!(window.try_find(("reasoning-header", 0u64)).is_some());
+            assert!(window.try_find(("reasoning-header", 2u64)).is_none());
+            // Both cycles share a single tool run rather than one line each.
+            assert!(window.try_find(("tool-usage-header", 1u64)).is_some());
+            assert!(window.try_find(("tool-usage-header", 3u64)).is_none());
+            assert!(window.try_find(("tool-header", 1u64)).is_none());
+            let summary = window.find(("tool-usage-header", 1u64));
+            let label = summary.label().unwrap_or_default().to_owned();
+            assert!(label.contains("Read ×1"), "summary was {label:?}");
+            assert!(label.contains("Run ×1"), "summary was {label:?}");
+
+            // The gathered reasoning is one disclosure that expands in place.
+            window.click(("reasoning-header", 0u64), cx);
+            window.render_frame(cx);
+            view.update(cx, |view, _| {
+                assert!(view.expanded_reasoning.contains(&0));
+            });
+
+            window.click(("tool-usage-header", 1u64), cx);
+            window.render_frame(cx);
+            assert!(window.try_find(("tool-header", 1u64)).is_some());
+            assert!(window.try_find(("tool-header", 3u64)).is_some());
         })
         .unwrap();
     }
@@ -2140,6 +2350,8 @@ mod loom_view_render_tests {
         cx.update_window(handle.into(), |view, window, cx| {
             let view = view.downcast::<LoomView>().unwrap();
             window.render_frame(cx);
+            window.click(("tool-usage-header", 0u64), cx);
+            window.render_frame(cx);
             window.click(("tool-header", 0u64), cx);
             window.render_frame(cx);
             view.update(cx, |view, _| {
@@ -2222,6 +2434,8 @@ mod loom_view_render_tests {
             view.expanded_tools.insert(command_id);
             view.expanded_tools.insert(failed_command_id);
             view.expanded_tools.insert(search_id);
+            // Reveal the tool blocks behind the usage summary.
+            view.expanded_tool_usage.insert(0);
             view
         });
         cx.update_window(handle.into(), |_, window, cx| {
@@ -2299,6 +2513,8 @@ mod loom_view_render_tests {
         });
         cx.update_window(handle.into(), |view, window, cx| {
             let view = view.downcast::<LoomView>().unwrap();
+            window.render_frame(cx);
+            window.click(("tool-usage-header", 0u64), cx);
             window.render_frame(cx);
             window.click(("tool-header", 0u64), cx);
             window.click(("tool-header", 1u64), cx);
@@ -3187,6 +3403,52 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
+    async fn on_demand_model_refresh_is_throttled_by_staleness(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            crate::connection::negotiate(&view.connection).unwrap();
+            view.session_node_ids
+                .insert(view.active_session.id, view.default_backend_node_id.clone());
+            view
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.refresh_models_on_demand(cx);
+                });
+        })
+        .unwrap();
+        cx.wait_for(handle.into(), Duration::from_secs(5), |window, cx| {
+            window.root::<LoomView>().flatten().is_some_and(|view| {
+                let view = view.read(cx);
+                !view.models.is_empty()
+                    && view.model_refreshes_in_flight.is_empty()
+                    && view.model_catalog_refreshed_at.contains_key("test-node")
+            })
+        })
+        .await;
+
+        // Opening the model selection again inside the staleness window must
+        // reuse the cached catalog instead of starting another discovery.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window
+                .root::<LoomView>()
+                .unwrap()
+                .unwrap()
+                .update(cx, |view, cx| {
+                    view.refresh_models_on_demand(cx);
+                    assert!(view.model_refreshes_in_flight.is_empty());
+                });
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     async fn session_creation_attaches_a_local_source_before_selecting_it(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let source = std::env::temp_dir().join(format!("loom-ui-source-{}", uuid::Uuid::new_v4()));
@@ -4007,6 +4269,39 @@ mod loom_view_render_tests {
             view.pending_approval = Some(call);
             view.model = ModelId::new("deterministic/demo");
         });
+    }
+
+    #[gpui_kit::test]
+    fn reasoning_visibility_follows_the_settings_toggle(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let key = super::tool_element_id(0, 0);
+
+        for (show_reasoning, expected) in [(false, false), (true, true)] {
+            let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+                let view = cx.new(|cx| {
+                    let mut view = LoomView::new_for_test(cx.focus_handle());
+                    view.show_reasoning = show_reasoning;
+                    view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+                        parts: vec![
+                            AssistantPart::Reasoning("weighed the options".to_owned()),
+                            AssistantPart::Text("the answer".to_owned()),
+                        ],
+                        streaming: false,
+                    })];
+                    view
+                });
+                gpui_kit::component::Root::new(view, window, cx)
+            });
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.render_frame(cx);
+                assert_eq!(
+                    window.try_find(("reasoning", key)).is_some(),
+                    expected,
+                    "reasoning visibility should be {expected}"
+                );
+            })
+            .unwrap();
+        }
     }
 }
 
@@ -5429,6 +5724,55 @@ mod transcript_paging_tests {
     }
 
     #[test]
+    fn restored_tool_cycles_merge_into_one_agent_entry() {
+        let read = loom_model::ToolCall {
+            id: ToolCallId::new(),
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        };
+        let run = loom_model::ToolCall {
+            id: ToolCallId::new(),
+            name: "run_command".to_owned(),
+            arguments: serde_json::json!({"command": "cargo test"}),
+        };
+        let mut first = ModelMessage::new(MessageRole::Assistant, "");
+        first.reasoning_content = Some("first thought".to_owned());
+        first.tool_calls = vec![read.clone()];
+        let mut read_result = ModelMessage::new(MessageRole::Tool, "fn main() {}");
+        read_result.tool_call_id = Some(read.id);
+        read_result.name = Some("read_file".to_owned());
+        let mut second = ModelMessage::new(MessageRole::Assistant, "");
+        second.reasoning_content = Some("second thought".to_owned());
+        second.tool_calls = vec![run.clone()];
+        let mut run_result = ModelMessage::new(MessageRole::Tool, "test result: ok");
+        run_result.tool_call_id = Some(run.id);
+        run_result.name = Some("run_command".to_owned());
+
+        let messages = vec![
+            (0, 0, first),
+            (1, 1, read_result),
+            (2, 2, second),
+            (3, 3, run_result),
+        ];
+        let timeline = timeline_items_from_messages(messages, Vec::new());
+        assert_eq!(timeline.len(), 1, "tool cycles stay under one agent entry");
+        let TimelineItem::Assistant(turn) = &timeline[0] else {
+            panic!("expected assistant turn");
+        };
+        assert_eq!(turn.parts.len(), 4);
+        assert!(
+            matches!(turn.parts[0], AssistantPart::Reasoning(ref text) if text == "first thought")
+        );
+        assert!(matches!(turn.parts[1], AssistantPart::Tool(ref part) if part.name == "read_file"));
+        assert!(
+            matches!(turn.parts[2], AssistantPart::Reasoning(ref text) if text == "second thought")
+        );
+        assert!(
+            matches!(turn.parts[3], AssistantPart::Tool(ref part) if part.name == "run_command")
+        );
+    }
+
+    #[test]
     fn restored_project_tool_output_is_humanized() {
         let mut tool = ModelMessage::new(
             MessageRole::Tool,
@@ -5776,6 +6120,36 @@ mod provider_control_tests {
             .unwrap();
     }
 
+    #[gpui_kit::test]
+    fn reasoning_visibility_toggle_round_trips(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            assert!(!view.show_reasoning);
+            view.settings_open = true;
+            view.settings_section = SettingsSection::Appearance;
+            view
+        });
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window
+                .within("settings-dialog")
+                .click("show-reasoning-toggle", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            let view = window.root::<LoomView>().unwrap().unwrap();
+            view.update(cx, |view, cx| {
+                assert!(view.show_reasoning);
+                view.toggle_show_reasoning(cx);
+                assert!(!view.show_reasoning);
+            });
+        })
+        .unwrap();
+    }
+
     #[test]
     fn github_login_kind_secure_messages_differ() {
         assert!(
@@ -5873,6 +6247,12 @@ mod state_toggle_tests {
             view.toggle_tool_group(7, cx);
             view.toggle_reasoning(9, cx);
             view.toggle_reasoning(9, cx);
+
+            assert!(!view.show_reasoning);
+            view.toggle_show_reasoning(cx);
+            assert!(view.show_reasoning);
+            view.toggle_show_reasoning(cx);
+            assert!(!view.show_reasoning);
 
             view.toggle_command_palette(cx);
             assert!(view.command_palette_open);

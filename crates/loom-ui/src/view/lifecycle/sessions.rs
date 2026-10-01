@@ -122,6 +122,7 @@ impl LoomView {
         self.transcript_loading = false;
         self.activity_records.clear();
         self.expanded_tools.clear();
+        self.expanded_tool_usage.clear();
         self.expanded_reasoning.clear();
         self.approval_request_in_flight = false;
         self.pending_approval = None;

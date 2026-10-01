@@ -18,8 +18,6 @@ use loom_core::{
     AgentSessionSnapshot, Capability, CapabilitySet, ErrorCode, LoomError, WorkspaceId,
     WorkspaceRecord,
 };
-#[cfg(not(target_family = "wasm"))]
-use loom_model::ProviderId;
 use loom_model::{ModelId, ProviderSummary};
 #[cfg(not(target_family = "wasm"))]
 use loom_protocol::AgentRunSnapshot;
@@ -903,26 +901,6 @@ pub(crate) async fn list_models_from_backend(
     })
 }
 
-/// Provider ids that can currently serve model requests. Providers that still
-/// need a credential are omitted so callers do not run discovery against APIs
-/// that would reject an unauthenticated request.
-#[cfg(not(target_family = "wasm"))]
-pub(crate) fn list_usable_provider_ids(
-    connection: &ClientConnection,
-) -> Result<Vec<ProviderId>, LoomError> {
-    let response = connection.request(RequestEnvelope::new(ClientRequest::Provider(
-        ProviderRequest::ListProviders,
-    )));
-    match response.result? {
-        ServerResponse::Provider(ProviderResponse::Providers { providers }) => Ok(providers
-            .into_iter()
-            .filter(ProviderSummary::is_usable)
-            .map(|provider| provider.id)
-            .collect()),
-        response => Err(unexpected_response("provider list", response)),
-    }
-}
-
 #[cfg(not(target_family = "wasm"))]
 pub(crate) fn start_run(
     connection: &ClientConnection,
@@ -963,10 +941,9 @@ mod tests {
     use super::{
         ClientConnection, LoomError, create_session_in_workspace, create_workspace,
         describe_startup_connection_error, include_discovered_models, list_models,
-        list_usable_provider_ids, list_workspace_sessions, list_workspaces, negotiate,
-        negotiation_capabilities, provider_name_for_id, redact_secret, register_workspace,
-        remote_url_is_secure_for_secrets, set_workspace_config, unexpected_response,
-        worker_node_status, workspace_config,
+        list_workspace_sessions, list_workspaces, negotiate, negotiation_capabilities,
+        provider_name_for_id, redact_secret, register_workspace, remote_url_is_secure_for_secrets,
+        set_workspace_config, unexpected_response, worker_node_status, workspace_config,
     };
     use loom_core::{
         Capability, ErrorCode, LoomError as CoreLoomError, Timestamp, WorkspaceId, WorkspaceRecord,
@@ -1097,7 +1074,6 @@ mod tests {
             vec![session.clone()]
         );
         assert!(!list_models(&connection).unwrap().models.is_empty());
-        assert!(!list_usable_provider_ids(&connection).unwrap().is_empty());
     }
 
     #[test]

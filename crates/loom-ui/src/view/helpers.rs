@@ -395,9 +395,10 @@ pub(crate) fn timeline_items_from_messages(
                         .filter(|reasoning| !reasoning.is_empty());
                     let has_content = !message.content.is_empty();
                     if reasoning.is_some() || has_content {
-                        // Merge into the trailing assistant turn while it is an
-                        // open text/reasoning run; a tool call or another role
-                        // starts a new turn.
+                        // Merge into the trailing assistant turn for the whole
+                        // tool-using response: text, reasoning, and tool cycles
+                        // stay under one agent entry. Another role starts a new
+                        // turn.
                         let merges = matches!(
                             timeline.last(),
                             Some(TimelineItem::Assistant(turn))
@@ -405,6 +406,7 @@ pub(crate) fn timeline_items_from_messages(
                                     turn.parts.last(),
                                     None | Some(AssistantPart::Reasoning(_))
                                         | Some(AssistantPart::Text(_))
+                                        | Some(AssistantPart::Tool(_))
                                 )
                         );
                         if !merges && reasoning.is_none() {
@@ -1070,29 +1072,90 @@ pub(crate) fn tool_group_label(name: &str, count: usize) -> String {
     }
 }
 
-/// The aggregate status for a collapsed group of same-kind tool calls. A single
-/// failed or active call dominates; otherwise pending calls keep the group from
-/// reading as done until every call has settled.
+/// A compact noun for one tool type, used by the transcript's usage summary.
+pub(crate) fn tool_usage_label(name: &str) -> &str {
+    match name {
+        "read_file" => "Read",
+        "write_file" | "apply_patch" => "Edit",
+        "list_files" => "List",
+        "glob" => "Glob",
+        "search_text" => "Search",
+        "github_list_pull_requests" => "List PRs",
+        "github_get_pull_request" => "Read PR",
+        "github_create_pull_request" => "Open PR",
+        "github_push_branch" => "Push",
+        "run_command" => "Run",
+        "web_search" => "Web search",
+        "propose_plan" => "Plan",
+        "ask_user" => "Ask",
+        "delegate_project_task" => "Delegate",
+        "delegate_project_code_task" => "Delegate code",
+        "wait_for_project_children" => "Wait",
+        "control_project_child" => "Control",
+        "send_project_agent_message" => "Message",
+        "list_project_message_recipients" => "List recipients",
+        "list_project_children" => "List agents",
+        "review_project_child" => "Review",
+        "integrate_project_child" => "Integrate",
+        other => other,
+    }
+}
+
+/// Summarizes a run of tool calls by type and invocation count, keeping the
+/// order in which each type first appears. The transcript shows this as the
+/// single collapsed line above the detailed tool presentation.
+pub(crate) fn tool_usage_summary(tools: &[&ToolPart]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for tool in tools {
+        let name = tool.name.as_str();
+        if let Some(entry) = counts.iter_mut().find(|(existing, _)| *existing == name) {
+            entry.1 += 1;
+        } else {
+            counts.push((name, 1));
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(name, count)| format!("{} ×{count}", tool_usage_label(name)))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// The aggregate status for a collapsed group of tool calls. Active work and
+/// pending calls keep the group from reading as done until every call has
+/// settled. At that point a failure only dominates when nothing succeeded: a
+/// response that recovered from a failed call reads as done, with the failures
+/// called out by `tool_failure_count` instead of condemning the whole run.
 pub(crate) fn tool_group_status(tools: &[&ToolPart]) -> ToolPartStatus {
     let has = |status| tools.iter().any(|tool| tool.status == status);
-    if has(ToolPartStatus::Failed) {
-        ToolPartStatus::Failed
-    } else if tools.iter().any(|tool| {
+    let active = tools.iter().any(|tool| {
         matches!(
             tool.status,
             ToolPartStatus::Running
                 | ToolPartStatus::AwaitingApproval
                 | ToolPartStatus::AwaitingInput
         )
-    }) {
+    });
+    if active {
         ToolPartStatus::Running
     } else if has(ToolPartStatus::Queued) {
         ToolPartStatus::Queued
-    } else if has(ToolPartStatus::Cancelled) {
+    } else if has(ToolPartStatus::Failed) && !has(ToolPartStatus::Completed) {
+        ToolPartStatus::Failed
+    } else if has(ToolPartStatus::Cancelled) && !has(ToolPartStatus::Completed) {
         ToolPartStatus::Cancelled
     } else {
         ToolPartStatus::Completed
     }
+}
+
+/// How many calls in a run failed. Paired with an aggregate status of `Completed`
+/// this keeps individual failures visible without reading the run as failed.
+pub(crate) fn tool_failure_count(tools: &[&ToolPart]) -> usize {
+    tools
+        .iter()
+        .filter(|tool| tool.status == ToolPartStatus::Failed)
+        .count()
 }
 
 /// Renders a tool result as a patch when it looks like one, otherwise as code.
