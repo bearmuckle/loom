@@ -415,6 +415,10 @@ pub(crate) struct LoomView {
     pub(crate) workspace_id: WorkspaceId,
     workspaces: Vec<WorkspaceRecord>,
     local_directory_sources_available: bool,
+    /// Native local worker working directory used to pre-fill the New project
+    /// dialog. `None` for remote and browser clients, for the demo workspace,
+    /// and when the launch directory was Loom's own state directory.
+    local_current_directory: Option<PathBuf>,
     pub(crate) sessions: Vec<AgentSessionSnapshot>,
     project_snapshot: Option<loom_core::ProjectSnapshot>,
     /// Retain known project hierarchies while selection changes to another root.
@@ -1201,6 +1205,19 @@ fn session_name_for_path(path: &Path) -> Option<String> {
         .filter(|name| !name.trim().is_empty())
 }
 
+/// Resolves the directory to attach for the local-folder source. An explicit
+/// entry wins; otherwise the native worker's current directory is used. The
+/// result must be an absolute path.
+fn resolve_local_source_path(entered: &str, current: Option<&Path>) -> Option<String> {
+    let entered = entered.trim();
+    let candidate = if entered.is_empty() {
+        current.map(|path| path.display().to_string())
+    } else {
+        Some(entered.to_owned())
+    };
+    candidate.filter(|path| PathBuf::from(path).is_absolute())
+}
+
 struct SessionSourceDialog {
     purpose: SessionSourceDialogPurpose,
     choice: SessionSourceChoice,
@@ -1244,6 +1261,7 @@ impl LoomView {
             workspace_id,
             workspaces: Vec::new(),
             local_directory_sources_available: true,
+            local_current_directory: None,
             sessions: Vec::new(),
             project_snapshot: None,
             project_tree_snapshots: Vec::new(),

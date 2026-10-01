@@ -202,7 +202,33 @@ impl LoomView {
                                     })),
                             )
                         }),
-                );
+                )
+                .when_some(self.local_current_directory.as_ref(), |body, directory| {
+                    body.child(
+                        div()
+                            .mt_1()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .text_color(rgb(0x8f98a6))
+                                    .child(format!("Current folder: {}", directory.display())),
+                            )
+                            .child(
+                                Button::new("use-current-session-directory")
+                                    .label("Use current folder")
+                                    .small()
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.use_current_source_directory(cx);
+                                    })),
+                            ),
+                    )
+                });
         } else if dialog.choice == SessionSourceChoice::GitHub {
             dialog_body = if dialog.repositories_loading {
                 dialog_body.child(

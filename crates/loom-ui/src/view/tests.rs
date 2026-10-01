@@ -1577,6 +1577,65 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
+    fn local_worker_current_directory_prefills_the_source_dialog(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = LoomView::new_for_test(cx.focus_handle());
+                view.local_current_directory =
+                    Some(std::path::PathBuf::from("/tmp/current-project"));
+
+                // Adding to a session opens on the local folder and prefills it.
+                view.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
+                assert_eq!(
+                    view.pending_source_path.as_deref(),
+                    Some("/tmp/current-project")
+                );
+
+                // Choosing the local folder after another choice prefills again.
+                view.pending_source_path = None;
+                view.choose_source(SessionSourceChoice::GitHub, cx);
+                view.choose_source(SessionSourceChoice::LocalDirectory, cx);
+                assert_eq!(
+                    view.pending_source_path.as_deref(),
+                    Some("/tmp/current-project")
+                );
+
+                // The explicit action replaces any pending path, and is a no-op
+                // when there is no native current directory.
+                view.pending_source_path = Some("/somewhere/else".to_owned());
+                view.use_current_source_directory(cx);
+                assert_eq!(
+                    view.pending_source_path.as_deref(),
+                    Some("/tmp/current-project")
+                );
+                view.local_current_directory = None;
+                view.pending_source_path = None;
+                view.use_current_source_directory(cx);
+                assert!(view.pending_source_path.is_none());
+
+                // Restore the dialog for a real render and click.
+                view.local_current_directory =
+                    Some(std::path::PathBuf::from("/tmp/current-project"));
+                view.begin_source_dialog(SessionSourceDialogPurpose::AddToSession, cx);
+                view
+            });
+            gpui_kit::component::Root::new(view, window, cx)
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(window.find("use-current-session-directory").visible());
+            window.click("use-current-session-directory", cx);
+            window.render_frame(cx);
+            // Confirming without a typed path uses the prefilled current folder.
+            window.click("confirm-session-source", cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn phone_source_dialog_stacks_choices_and_keeps_actions_visible(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let handle = cx.open_window(size(px(390.), px(520.)), |window, cx| {
@@ -6293,5 +6352,40 @@ mod transcript_action_tests {
         });
         cx.update_window(handle.into(), |_, window, cx| window.render_frame(cx))
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod local_source_path_tests {
+    use super::resolve_local_source_path;
+    use std::path::Path;
+
+    #[test]
+    fn explicit_absolute_entry_wins_over_the_current_directory() {
+        assert_eq!(
+            resolve_local_source_path("/typed/project", Some(Path::new("/current/project"))),
+            Some("/typed/project".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_entry_falls_back_to_the_current_directory() {
+        assert_eq!(
+            resolve_local_source_path("   ", Some(Path::new("/current/project"))),
+            Some("/current/project".to_owned())
+        );
+    }
+
+    #[test]
+    fn relative_entries_are_rejected() {
+        assert_eq!(
+            resolve_local_source_path("relative/project", Some(Path::new("/current/project"))),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_entry_without_a_current_directory_is_rejected() {
+        assert_eq!(resolve_local_source_path("", None), None);
     }
 }
