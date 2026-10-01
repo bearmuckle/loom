@@ -6,12 +6,20 @@ impl LoomView {
         phone: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let mut picker = div().flex().items_center();
+        let mut picker = div().flex().items_center().min_w(px(0.));
+        if phone {
+            // Let the model picker take the space left by the other composer
+            // actions so the full model name stays readable on a phone, and keep
+            // a finger-sized tap target.
+            picker = picker.flex_1().h(px(44.));
+        }
         if let Some(state) = &self.model_select {
             picker = picker.child(
                 div()
                     .flex()
                     .items_center()
+                    .min_w(px(0.))
+                    .when(phone, |element| element.flex_1())
                     .rounded_md()
                     .hover(|style| style.bg(rgb(0x293244)))
                     // Opening the picker is the on-demand trigger for provider
@@ -26,7 +34,8 @@ impl LoomView {
                     .child(
                         Select::new(state)
                             .id("session-model-select")
-                            .max_w(if phone { px(140.) } else { px(220.) })
+                            .max_w(if phone { px(180.) } else { px(220.) })
+                            .when(phone, |select| select.w_full())
                             .menu_width(px(320.))
                             .small()
                             .appearance(false)
@@ -40,7 +49,10 @@ impl LoomView {
     }
 
     pub(crate) fn render_agent_mode_picker(&self, phone: bool) -> impl IntoElement {
-        let mut picker = div().flex().items_center();
+        let mut picker = div()
+            .flex()
+            .items_center()
+            .when(phone, |element| element.h(px(44.)));
         if let Some(state) = &self.agent_mode_select {
             picker = picker.child(
                 div()

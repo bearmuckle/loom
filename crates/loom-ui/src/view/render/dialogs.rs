@@ -468,72 +468,143 @@ impl LoomView {
                 })),
         );
 
-        Dialog::new(cx)
-            .title(if is_start {
-                "New project"
+        let title = if is_start {
+            "New project"
+        } else {
+            "Add to this session"
+        };
+        let confirm_label = if is_start {
+            if selected_is_cached {
+                "Start from existing clone"
             } else {
-                "Add to this session"
-            })
-            .on_close(cx.listener(|this, _, _, cx| {
-                this.source_dialog = None;
-                cx.notify();
-            }))
-            .keyboard(false)
-            .overlay_closable(false)
-            .w(px(560.))
+                "Create project"
+            }
+        } else if selected_is_cached {
+            "Add existing clone"
+        } else {
+            "Add to session"
+        };
+        let form = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8f98a6))
+                    .child(if is_start {
+                        "Choose what the new project starts with."
+                    } else {
+                        "Choose a repository or folder to add to the active session."
+                    }),
+            )
+            .child(source_choices)
+            .child(dialog_body);
+
+        // The fixed-width modal clipped its contents on phones and wasted space
+        // on desktop. Use a full-height pane in the central area (like
+        // Settings) at every width, with the actions pinned to the bottom.
+        div()
+            .id("source-dialog-pane")
+            .test_support()
+            .occlude()
+            .size_full()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(rgb(0x111318))
             .text_color(rgb(0xe5e7eb))
             .child(
                 div()
-                    .w_full()
                     .flex()
-                    .flex_col()
-                    .gap_3()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(rgb(0x242833))
+                    .child(div().text_sm().text_color(rgb(0xf3f4f6)).child(title))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(0x8f98a6))
-                            .child(if is_start {
-                                "Choose what the new project starts with."
-                            } else {
-                                "Choose a repository or folder to add to the active session."
-                            }),
-                    )
-                    .child(source_choices)
-                    .child(dialog_body),
-            )
-            .footer(
-                div()
-                    .flex()
-                    .justify_end()
-                    .gap_1()
-                    .child(
-                        Button::new("cancel-session-source")
-                            .label("Cancel")
-                            .small()
+                            .id("close-source-dialog")
+                            .test_support()
+                            .w(px(if phone { 44. } else { 30. }))
+                            .h(px(if phone { 44. } else { 30. }))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_lg()
+                            .bg(rgb(0x20242c))
+                            .hover(|style| style.bg(rgb(0x293244)))
+                            .text_color(rgb(0xb7c0d0))
+                            .cursor_pointer()
+                            .tooltip(|_, cx| {
+                                cx.new(|_| LoomTooltip {
+                                    text: "Close new project".into(),
+                                })
+                                .into()
+                            })
+                            .child(Icon::new(IconName::Close).size_4())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.source_dialog = None;
                                 cx.notify();
                             })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("source-dialog-content")
+                    .test_support()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .when(phone, |element| element.p_4())
+                    .when(!phone, |element| element.px_6().py_5())
+                    .overflow_y_scroll()
+                    // Keep the form readable when the pane is much wider than
+                    // a phone instead of stretching controls edge to edge.
+                    .child(div().w_full().max_w(px(640.)).child(form)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .p_3()
+                    .border_t_1()
+                    .border_color(rgb(0x242833))
+                    .when(phone, |element| element.w_full())
+                    .when(!phone, |element| element.justify_end())
+                    .child(
+                        div().when(phone, |element| element.flex_1()).child(
+                            Button::new("cancel-session-source")
+                                .label("Cancel")
+                                .when(phone, |button| button.w_full().h(px(44.)))
+                                .when(!phone, |button| button.small())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.source_dialog = None;
+                                    cx.notify();
+                                })),
+                        ),
                     )
                     .child(
-                        Button::new("confirm-session-source")
-                            .label(if is_start {
-                                if selected_is_cached {
-                                    "Start from existing clone"
-                                } else {
-                                    "Create project"
-                                }
-                            } else if selected_is_cached {
-                                "Add existing clone"
-                            } else {
-                                "Add to session"
-                            })
-                            .small()
-                            .primary()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.confirm_source_dialog(cx);
-                                cx.notify();
-                            })),
+                        div().when(phone, |element| element.flex_1()).child(
+                            Button::new("confirm-session-source")
+                                .label(confirm_label)
+                                .primary()
+                                .when(phone, |button| button.w_full().h(px(44.)))
+                                .when(!phone, |button| button.small())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_source_dialog(cx);
+                                    cx.notify();
+                                })),
+                        ),
                     ),
             )
             .into_any_element()

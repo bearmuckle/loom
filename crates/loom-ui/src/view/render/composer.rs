@@ -173,7 +173,6 @@ impl LoomView {
                             .px_3()
                             .py_2()
                             .flex()
-                            .flex_wrap()
                             .gap_2()
                             .items_center()
                             .justify_between()
@@ -182,11 +181,14 @@ impl LoomView {
                             .child(
                                 div()
                                     .flex()
-                                    .flex_wrap()
                                     .items_center()
                                     .gap_1()
                                     .min_w(px(0.))
-                                    .when(layout.phone, |element| element.w_full())
+                                    // On phone the pickers share the remaining
+                                    // width so the send action stays on the same
+                                    // row instead of dropping onto a mostly empty
+                                    // second row.
+                                    .when(layout.phone, |element| element.flex_1())
                                     .child(self.render_agent_mode_picker(layout.phone))
                                     .child(self.render_model_picker(layout.phone, cx))
                                     .child(
@@ -209,9 +211,9 @@ impl LoomView {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_none()
                                     .items_center()
                                     .gap_2()
-                                    .when(layout.phone, |element| element.w_full().justify_end())
                                     .when(self.run_can_interrupt(), |element| {
                                         element.child(
                                             Button::new("interrupt-run")

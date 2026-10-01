@@ -925,7 +925,7 @@ fn session_source_dialog_choices_and_close_button_work(cx: &mut TestAppContext) 
         assert!(window.find("source-local-directory").visible());
         window.click("source-local-directory", cx);
         window.click("source-github", cx);
-        window.click("close", cx);
+        window.click("close-source-dialog", cx);
         window.render_frame(cx);
         assert!(window.try_find("source-local-directory").is_none());
     })
@@ -1042,10 +1042,47 @@ fn phone_source_dialog_stacks_choices_and_keeps_actions_visible(cx: &mut TestApp
                 "{id} ran off the right edge: {bounds:?}"
             );
         }
+        // On a phone the dialog renders as a full-height pane rather than a
+        // fixed-width modal that clips its contents.
+        assert!(window.find("source-dialog-pane").visible());
+        assert!(window.find("close-source-dialog").visible());
+        assert!(window.find("source-dialog-content").visible());
+        let pane = window.find("source-dialog-pane").bounds();
+        assert_eq!(pane.size.width, viewport.width);
+        // The pane fills the central area below the window title bar.
+        assert_eq!(pane.size.height, viewport.height - px(30.));
         // The actions stay pinned and reachable even though the repository
         // list inside the scrollable body is longer than the window.
         assert!(window.find("cancel-session-source").visible());
         assert!(window.find("confirm-session-source").visible());
+        // The pane sits above the window chrome, so its controls receive
+        // clicks rather than the content behind them.
+        window.click("cancel-session-source", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("source-dialog-pane").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn desktop_source_dialog_renders_as_a_pane(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let handle = cx.open_window(size(px(1280.), px(800.)), |window, cx| {
+        let view = cx.new(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.begin_source_dialog(SessionSourceDialogPurpose::StartSession, cx);
+            view
+        });
+        gpui_kit::component::Root::new(view, window, cx)
+    });
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.render_frame(cx);
+        // Desktop uses the same full-height pane as phone instead of a modal.
+        assert!(window.find("source-dialog-pane").visible());
+        assert!(window.find("close-source-dialog").visible());
+        assert!(window.find("confirm-session-source").visible());
+        assert!(window.find("source-dialog-pane").bounds().right() <= window.viewport_size().width);
     })
     .unwrap();
 }
@@ -2777,6 +2814,18 @@ fn phone_composer_and_settings_render_at_mobile_width(cx: &mut TestAppContext) {
         window.render_frame(cx);
         assert!(window.find("send-message").visible());
         assert!(window.find("open-command-palette").visible());
+        // The send action shares the pickers' row instead of wrapping onto a
+        // second, mostly empty row.
+        let send = window.find("send-message").bounds();
+        let palette = window.find("open-command-palette").bounds();
+        assert!(
+            send.top() < palette.bottom() && palette.top() < send.bottom(),
+            "send button should sit on the composer action row: {send:?} vs {palette:?}"
+        );
+        assert!(send.right() <= window.viewport_size().width);
+        // Phone composer controls use finger-sized targets.
+        assert_eq!(send.size.height, px(44.));
+        assert_eq!(palette.size.height, px(44.));
         window
             .root::<LoomView>()
             .unwrap()
