@@ -63,6 +63,11 @@ project directory, pass `--project PATH`:
 cargo run -p loom-ui -- --project /path/to/project
 ```
 
+When no `--project` is given and Loom is launched from inside its own state
+directory (for example by a desktop environment that picks an internal
+session root as the working directory), Loom skips that directory and opens the
+empty project picker instead of adopting it as a project.
+
 To try the demo without connecting a model provider:
 
 ```sh

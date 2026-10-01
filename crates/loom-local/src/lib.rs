@@ -310,6 +310,46 @@ fn confirm_state_wipe(
     ))
 }
 
+/// Resolves the default project root from a process working directory. Returns
+/// an empty path when the working directory is inside Loom's own state
+/// directory, because adopting an internal session root as a user project is
+/// not useful. A non-empty result is canonicalized.
+fn default_project_root(
+    current_dir: io::Result<PathBuf>,
+    state_directory: &Path,
+) -> Result<PathBuf, LoomError> {
+    let current = current_dir.map_err(|error| {
+        LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            format!("could not determine current workspace: {error}"),
+            false,
+        )
+    })?;
+    let root = fs::canonicalize(current).map_err(|error| {
+        LoomError::new(
+            ErrorCode::WorkspaceAccessDenied,
+            format!("could not open current workspace: {error}"),
+            false,
+        )
+    })?;
+    if root.starts_with(state_directory) {
+        return Ok(PathBuf::new());
+    }
+    Ok(root)
+}
+
+/// Loom's own state directory, canonicalized when it already exists so it can
+/// be compared against canonical working directories.
+fn canonical_state_directory() -> PathBuf {
+    let directory = state_root().join("loom");
+    if let Ok(canonical) = fs::canonicalize(&directory) {
+        return canonical;
+    }
+    let root = state_root();
+    let root = fs::canonicalize(&root).unwrap_or(root);
+    root.join("loom")
+}
+
 pub fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomError> {
     if let Some(project) = &options.project {
         let root = fs::canonicalize(project).map_err(|error| {
@@ -330,20 +370,7 @@ pub fn prepare_workspace(options: &UiOptions) -> Result<(PathBuf, bool), LoomErr
     }
 
     if !options.demo {
-        let root = fs::canonicalize(env::current_dir().map_err(|error| {
-            LoomError::new(
-                ErrorCode::WorkspaceAccessDenied,
-                format!("could not determine current workspace: {error}"),
-                false,
-            )
-        })?)
-        .map_err(|error| {
-            LoomError::new(
-                ErrorCode::WorkspaceAccessDenied,
-                format!("could not open current workspace: {error}"),
-                false,
-            )
-        })?;
+        let root = default_project_root(env::current_dir(), &canonical_state_directory())?;
         return Ok((root, false));
     }
 
@@ -503,6 +530,70 @@ mod tests {
             ErrorCode::WorkspaceAccessDenied
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_project_root_skips_loom_state_directories() {
+        let base = env::temp_dir().join(format!("loom-ui-default-root-{}", WorkspaceId::new()));
+        let state = base.join("state").join("loom");
+        let internal = state
+            .join("state.session-roots")
+            .join("workspace")
+            .join("session")
+            .join("fs");
+        let external = base.join("project");
+        fs::create_dir_all(&internal).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        let state = fs::canonicalize(&state).unwrap();
+        let external = fs::canonicalize(&external).unwrap();
+
+        assert_eq!(
+            default_project_root(Ok(internal), &state).unwrap(),
+            PathBuf::new()
+        );
+        assert_eq!(
+            default_project_root(Ok(external.clone()), &state).unwrap(),
+            external
+        );
+        assert_eq!(
+            default_project_root(Ok(base.join("missing")), &state)
+                .unwrap_err()
+                .code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        assert_eq!(
+            default_project_root(
+                Err(io::Error::new(io::ErrorKind::NotFound, "missing")),
+                &state
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::WorkspaceAccessDenied
+        );
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn canonical_state_directory_is_the_loom_state_directory() {
+        assert_eq!(
+            canonical_state_directory()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("loom")
+        );
+    }
+
+    #[test]
+    fn workspace_preparation_defaults_to_the_process_directory_unless_it_is_internal() {
+        let options = UiOptions::parse(["loom-ui".to_owned()]).unwrap();
+        let (root, demo) = prepare_workspace(&options).unwrap();
+        assert!(!demo);
+        let current = fs::canonicalize(env::current_dir().unwrap()).unwrap();
+        if current.starts_with(canonical_state_directory()) {
+            assert!(root.as_os_str().is_empty());
+        } else {
+            assert_eq!(root, current);
+        }
     }
 
     #[test]

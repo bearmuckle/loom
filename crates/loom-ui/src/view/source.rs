@@ -27,6 +27,12 @@ impl LoomView {
         self.source_path_input = None;
         self.repository_filter_input = None;
         self.pending_source_path = None;
+        if choice == SessionSourceChoice::LocalDirectory {
+            self.pending_source_path = self
+                .local_current_directory
+                .as_ref()
+                .map(|directory| directory.display().to_string());
+        }
         if choice == SessionSourceChoice::GitHub {
             self.load_github_repositories(cx);
         }
@@ -47,9 +53,45 @@ impl LoomView {
                 dialog.repositories_loading = true;
             }
         }
+        if choice == SessionSourceChoice::LocalDirectory {
+            self.prefill_source_directory_if_empty(cx);
+        }
         if choice == SessionSourceChoice::GitHub {
             self.load_github_repositories(cx);
         }
+        cx.notify();
+    }
+
+    /// Pre-fills the local-directory path with the native worker's working
+    /// directory, unless the user has already entered a path.
+    fn prefill_source_directory_if_empty(&mut self, cx: &Context<Self>) {
+        let Some(directory) = self
+            .local_current_directory
+            .as_ref()
+            .map(|directory| directory.display().to_string())
+        else {
+            return;
+        };
+        let already_set = self
+            .source_path_input
+            .as_ref()
+            .is_some_and(|input| !input.read(cx).value().trim().is_empty());
+        if !already_set {
+            self.pending_source_path = Some(directory);
+        }
+    }
+
+    /// Replaces the local-directory path with the native worker's working
+    /// directory, for the "Use current folder" action.
+    pub(crate) fn use_current_source_directory(&mut self, cx: &mut Context<Self>) {
+        let Some(directory) = self
+            .local_current_directory
+            .as_ref()
+            .map(|directory| directory.display().to_string())
+        else {
+            return;
+        };
+        self.pending_source_path = Some(directory);
         cx.notify();
     }
 
@@ -140,13 +182,17 @@ impl LoomView {
         let source = match dialog.choice {
             SessionSourceChoice::Empty => None,
             SessionSourceChoice::LocalDirectory => {
-                let path = local_path.trim();
-                if path.is_empty() || !PathBuf::from(path).is_absolute() {
-                    self.source_dialog = Some(dialog);
-                    self.record_status("Enter an absolute local directory path");
-                    return;
+                match resolve_local_source_path(
+                    local_path.as_str(),
+                    self.local_current_directory.as_deref(),
+                ) {
+                    Some(path) => Some(SessionCreationSource::LocalDirectory(path)),
+                    None => {
+                        self.source_dialog = Some(dialog);
+                        self.record_status("Enter an absolute local directory path");
+                        return;
+                    }
                 }
-                Some(SessionCreationSource::LocalDirectory(path.to_owned()))
             }
             SessionSourceChoice::GitHub => {
                 let selected_repository = dialog.selected_repository.as_deref();

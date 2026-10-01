@@ -223,6 +223,10 @@ impl LoomView {
             workspace_id,
             workspaces,
             local_directory_sources_available: options.remote.is_none(),
+            local_current_directory: (options.remote.is_none()
+                && !demo_workspace
+                && !workspace_root.as_os_str().is_empty())
+            .then(|| workspace_root.clone()),
             sessions: if has_session {
                 vec![session.clone()]
             } else {
@@ -406,6 +410,7 @@ impl LoomView {
             workspace_id,
             workspaces: Vec::new(),
             local_directory_sources_available: false,
+            local_current_directory: None,
             sessions: if demo_mode {
                 vec![active_session.clone()]
             } else {
@@ -676,6 +681,7 @@ impl LoomView {
             workspace_id,
             workspaces,
             local_directory_sources_available: false,
+            local_current_directory: None,
             sessions: if has_session {
                 vec![session.clone()]
             } else {
