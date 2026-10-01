@@ -1366,6 +1366,10 @@ mod loom_view_render_tests {
                     id: "step-1".to_owned(),
                     description: "Read the project files".to_owned(),
                 }],
+                plan_progress: loom_protocol::AgentPlanProgress {
+                    completed: vec![0],
+                    active: None,
+                },
                 messages: vec![
                     loom_model::ModelMessage::new(loom_model::MessageRole::System, "system"),
                     loom_model::ModelMessage::new(loom_model::MessageRole::User, "inspect"),
@@ -1380,6 +1384,9 @@ mod loom_view_render_tests {
                 activities: Vec::new(),
                 message_timeline_ordinals: vec![0, 1, 2, 3, 4, 5],
             });
+            let plan = view.plan.as_ref().expect("plan restored from projection");
+            assert_eq!(plan.total(), 1);
+            assert_eq!(plan.done_count(), 1);
         });
     }
 
@@ -1408,7 +1415,20 @@ mod loom_view_render_tests {
                     summary: Some("Completed task: task".to_owned()),
                     evidence: Vec::new(),
                 },
-                plan: Vec::new(),
+                plan: vec![
+                    loom_protocol::AgentPlanStep {
+                        id: "step-1".to_owned(),
+                        description: "Keep the timeline".to_owned(),
+                    },
+                    loom_protocol::AgentPlanStep {
+                        id: "step-2".to_owned(),
+                        description: "Restore progress".to_owned(),
+                    },
+                ],
+                plan_progress: loom_protocol::AgentPlanProgress {
+                    completed: vec![0],
+                    active: Some(1),
+                },
                 messages: vec![loom_model::ModelMessage::new(
                     loom_model::MessageRole::User,
                     "do not duplicate",
@@ -1419,6 +1439,13 @@ mod loom_view_render_tests {
                 activities: Vec::new(),
                 message_timeline_ordinals: vec![0],
             });
+            // The plan is seeded from the projection even though the timeline
+            // already held a transcript, so reopening a run keeps its plan.
+            assert_eq!(view.timeline.len(), 1);
+            let plan = view.plan.as_ref().expect("plan restored with progress");
+            assert_eq!(plan.total(), 2);
+            assert_eq!(plan.done_count(), 1);
+            assert_eq!(plan.active_step(), Some("Restore progress"));
         });
     }
 
@@ -2912,7 +2939,20 @@ mod loom_view_render_tests {
             };
             let projection = loom_protocol::AgentRunSnapshotProjection {
                 run: run.clone(),
-                plan: Vec::new(),
+                plan: vec![
+                    loom_protocol::AgentPlanStep {
+                        id: "step-1".to_owned(),
+                        description: "Recover the transcript".to_owned(),
+                    },
+                    loom_protocol::AgentPlanStep {
+                        id: "step-2".to_owned(),
+                        description: "Resume the run".to_owned(),
+                    },
+                ],
+                plan_progress: loom_protocol::AgentPlanProgress {
+                    completed: vec![0],
+                    active: Some(1),
+                },
                 messages: vec![loom_model::ModelMessage::new(
                     loom_model::MessageRole::User,
                     "recover the transcript",
@@ -2951,6 +2991,11 @@ mod loom_view_render_tests {
                 item,
                 TimelineItem::Assistant(turn) if turn.parts.iter().any(|part| matches!(part, AssistantPart::Text(text) if text == "Recovered run"))
             )));
+            // Reopening the session restores the plan's progress, not just its steps.
+            let plan = view.plan.as_ref().expect("plan restored on reopen");
+            assert_eq!(plan.total(), 2);
+            assert_eq!(plan.done_count(), 1);
+            assert_eq!(plan.active_step(), Some("Resume the run"));
 
             let old_timeline_len = view.timeline.len();
             view.finish_async_session_load(
@@ -4052,26 +4097,24 @@ mod loom_view_render_tests {
                 cost_micros: 12_500,
                 ..ProviderUsageSummary::default()
             });
-            view.timeline = vec![
-                TimelineItem::Plan {
-                    steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
-                    completed: BTreeSet::from([0]),
-                    active: Some(1),
-                },
-                TimelineItem::Assistant(AssistantTurn {
-                    parts: vec![AssistantPart::Tool(Box::new(ToolPart {
-                        id: ToolCallId::new(),
-                        name: "read_file".to_owned(),
-                        title: "Read src/lib.rs".to_owned(),
-                        status: ToolPartStatus::Completed,
-                        detail: Some("src/lib.rs".to_owned()),
-                        output: Some("contents".to_owned()),
-                        elapsed_ms: Some(12),
-                        approval_pending: false,
-                    }))],
-                    streaming: false,
-                }),
-            ];
+            view.plan = Some(crate::state::PlanState {
+                steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
+                completed: BTreeSet::from([0]),
+                active: Some(1),
+            });
+            view.timeline = vec![TimelineItem::Assistant(AssistantTurn {
+                parts: vec![AssistantPart::Tool(Box::new(ToolPart {
+                    id: ToolCallId::new(),
+                    name: "read_file".to_owned(),
+                    title: "Read src/lib.rs".to_owned(),
+                    status: ToolPartStatus::Completed,
+                    detail: Some("src/lib.rs".to_owned()),
+                    output: Some("contents".to_owned()),
+                    elapsed_ms: Some(12),
+                    approval_pending: false,
+                }))],
+                streaming: false,
+            })];
         });
         render_scenario(cx, |view| {
             view.review.open = true;
@@ -4192,6 +4235,104 @@ mod loom_view_render_tests {
     }
 
     #[gpui_kit::test]
+    fn plan_progress_tracks_steps_and_resets_with_a_new_run(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        cx.update(|cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            let run_id = RunId::new();
+            view.consume_agent_event(&loom_protocol::AgentEvent::PlanProposed {
+                run_id,
+                plan: loom_protocol::AgentPlan {
+                    steps: vec![
+                        loom_protocol::AgentPlanStep {
+                            id: "one".to_owned(),
+                            description: "First".to_owned(),
+                        },
+                        loom_protocol::AgentPlanStep {
+                            id: "two".to_owned(),
+                            description: "Second".to_owned(),
+                        },
+                    ],
+                },
+            });
+            let plan = view.plan.as_ref().unwrap();
+            assert_eq!(plan.total(), 2);
+            assert_eq!(plan.done_count(), 0);
+
+            view.consume_agent_event(&loom_protocol::AgentEvent::StepStarted {
+                run_id,
+                step_id: loom_core::StepId::new(),
+                index: 1,
+            });
+            assert_eq!(view.plan.as_ref().unwrap().active_step(), Some("Second"));
+
+            view.consume_agent_event(&loom_protocol::AgentEvent::StepCompleted {
+                run_id,
+                step_id: loom_core::StepId::new(),
+                index: 1,
+            });
+            let plan = view.plan.as_ref().unwrap();
+            assert_eq!(plan.done_count(), 1);
+            assert_eq!(plan.active_step(), None);
+
+            // A plan belongs to one run, so a new run starts without one.
+            view.consume_agent_event(&loom_protocol::AgentEvent::RunStarted {
+                snapshot: loom_protocol::AgentRunSnapshot {
+                    id: RunId::new(),
+                    attempt_id: loom_core::RunAttemptId::new(),
+                    control_revision: 0,
+                    session_id: view.active_session.id,
+                    task: "next".to_owned(),
+                    model: ModelId::new("deterministic/demo"),
+                    state: loom_protocol::AgentRunState::Planning,
+                    started_at: Timestamp::from_unix_millis(1),
+                    updated_at: Timestamp::from_unix_millis(1),
+                    completed_at: None,
+                    summary: None,
+                    evidence: Vec::new(),
+                },
+            });
+            assert!(view.plan.is_none());
+        });
+    }
+
+    #[gpui_kit::test]
+    fn plan_renders_as_pinned_banner_and_inspector_summary(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let handle = cx.open_window(size(px(1280.), px(800.)), |_, cx| {
+            let mut view = LoomView::new_for_test(cx.focus_handle());
+            view.sessions = vec![view.active_session.clone()];
+            view.review.open = true;
+            view.review.tab = InspectorTab::Agent;
+            view.active_run_id = Some(RunId::new());
+            view.plan = Some(crate::state::PlanState {
+                steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
+                completed: BTreeSet::from([0]),
+                active: Some(1),
+            });
+            view.timeline = vec![
+                TimelineItem::User("do the work".to_owned()),
+                TimelineItem::Assistant(AssistantTurn::text("working")),
+            ];
+            view
+        });
+        cx.update_window(handle.into(), |view, window, cx| {
+            let view = view.downcast::<LoomView>().unwrap();
+            window.render_frame(cx);
+            assert!(window.find("plan-banner").visible());
+            assert!(window.find(("plan-step", 0usize)).visible());
+            assert!(window.find("run-plan-summary").visible());
+
+            window.click("toggle-plan-banner", cx);
+            window.render_frame(cx);
+            view.update(cx, |view, _| assert!(view.plan_collapsed));
+            assert!(window.find("plan-banner").visible());
+            assert!(window.try_find(("plan-step", 0usize)).is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
     fn transcript_renders_all_message_and_activity_variants(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let call = ToolCall {
@@ -4220,6 +4361,11 @@ mod loom_view_render_tests {
         render_scenario(cx, |view| {
             view.expanded_tools.insert(call.id);
             view.activity_records.insert(activity.id, activity);
+            view.plan = Some(crate::state::PlanState {
+                steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
+                completed: BTreeSet::from([0]),
+                active: Some(1),
+            });
             view.timeline = vec![
                 TimelineItem::User("Please update the file".to_owned()),
                 TimelineItem::Assistant(AssistantTurn {
@@ -4243,11 +4389,6 @@ mod loom_view_render_tests {
                     ],
                     streaming: true,
                 }),
-                TimelineItem::Plan {
-                    steps: vec!["Inspect".to_owned(), "Edit".to_owned()],
-                    completed: BTreeSet::from([0]),
-                    active: Some(1),
-                },
                 TimelineItem::System(SystemNote::status("Working".to_owned())),
                 TimelineItem::System(SystemNote {
                     tone: SystemTone::Error,

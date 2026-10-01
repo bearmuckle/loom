@@ -526,6 +526,12 @@ impl LoomView {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
                 }
+                if let Some(run) = fallback_projection
+                    .as_ref()
+                    .and_then(|projection| projection.active_run.as_ref())
+                {
+                    self.seed_plan_from_projection(run);
+                }
                 if self.timeline.is_empty()
                     && let Some(projection) = fallback_projection
                         .as_ref()
@@ -549,6 +555,12 @@ impl LoomView {
                     self.after_sequence = Some(event.sequence);
                     self.consume_event(&event.event);
                 }
+                if let Some(run) = fallback_projection
+                    .as_ref()
+                    .and_then(|projection| projection.active_run.as_ref())
+                {
+                    self.seed_plan_from_projection(run);
+                }
                 if self.timeline.is_empty()
                     && let Some(projection) = fallback_projection
                         .as_ref()
@@ -562,6 +574,7 @@ impl LoomView {
                     .as_ref()
                     .and_then(|projection| projection.active_run.clone())
                 {
+                    self.seed_plan_from_projection(&projection);
                     self.apply_run_projection(projection);
                 }
                 self.record_backend_error("load session events", error);

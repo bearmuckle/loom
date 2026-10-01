@@ -514,18 +514,9 @@ impl InProcessConnection {
                     }
 
                     #[cfg(test)]
-                    if self
-                        .backend
-                        .project_cancellation_failpoint
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                            if remaining > 0 {
-                                Some(remaining - 1)
-                            } else {
-                                None
-                            }
-                        })
-                        .is_ok_and(|remaining| remaining == 1)
-                    {
+                    if consume_project_cancellation_failpoint(
+                        &self.backend.project_cancellation_failpoint,
+                    ) {
                         return Err(LoomError::new(
                             ErrorCode::RecoveryRequired,
                             "test interruption after a durable project cancellation member update",
@@ -560,5 +551,44 @@ impl InProcessConnection {
             .load_delegated_task(task_id)?
             .ok_or_else(|| LoomError::not_found("delegated task", task_id))?;
         Ok((task, run))
+    }
+}
+
+/// Atomically decrements a positive test failpoint counter, returning whether
+/// the decrement consumed the last count.
+///
+/// A compare-exchange loop rather than `Atomic::fetch_update`, which is
+/// deprecated on newer toolchains while its replacement is not yet available on
+/// the workspace's minimum supported Rust version.
+#[cfg(test)]
+fn consume_project_cancellation_failpoint(failpoint: &AtomicUsize) -> bool {
+    let mut remaining = failpoint.load(Ordering::SeqCst);
+    while remaining > 0 {
+        match failpoint.compare_exchange_weak(
+            remaining,
+            remaining - 1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => return remaining == 1,
+            Err(actual) => remaining = actual,
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::consume_project_cancellation_failpoint;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn failpoint_consumption_reports_the_last_count() {
+        let failpoint = AtomicUsize::new(2);
+        assert!(!consume_project_cancellation_failpoint(&failpoint));
+        assert!(consume_project_cancellation_failpoint(&failpoint));
+        // Exhausted counters do not underflow and do not trigger.
+        assert!(!consume_project_cancellation_failpoint(&failpoint));
+        assert_eq!(failpoint.load(Ordering::SeqCst), 0);
     }
 }

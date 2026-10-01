@@ -68,11 +68,11 @@ use crate::{
     connection::{BackendWorker, ClientConnection, ConnectionCleanupGuard},
     state::{
         AgentMode, AssistantPart, AssistantTurn, EvidenceText, FilesState, GitHubLoginKind,
-        GitHubLoginState, InspectorTab, RenameDialogState, ReviewRow, ReviewState, SystemNote,
-        SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus, UsageState, bounded,
-        bounded_to, finish_assistant_turn, has_tool_part, push_assistant_evidence,
-        push_assistant_reasoning, push_assistant_text, session_state_for_run,
-        session_title_from_task, upsert_tool_part,
+        GitHubLoginState, InspectorTab, PlanState, PlanStepStatus, RenameDialogState, ReviewRow,
+        ReviewState, SystemNote, SystemTone, ThemeChoice, TimelineItem, ToolPart, ToolPartStatus,
+        UsageState, bounded, bounded_to, finish_assistant_turn, has_tool_part,
+        push_assistant_evidence, push_assistant_reasoning, push_assistant_text,
+        session_state_for_run, session_title_from_task, upsert_tool_part,
     },
     syntax::{self, Language},
     theme::{
@@ -500,6 +500,11 @@ pub(crate) struct LoomView {
     transcript_loading: bool,
     transcript_generation: u64,
     timeline_view: Option<Entity<TimelineView>>,
+    /// The active run's plan progress. Rendered once as a banner pinned above
+    /// the transcript and summarised in the inspector, never as a timeline row.
+    pub(crate) plan: Option<PlanState>,
+    /// Whether the pinned plan banner is collapsed to its header.
+    pub(crate) plan_collapsed: bool,
     pub(crate) activity_records: BTreeMap<ActivityId, AgentActivityRecord>,
     pub(crate) expanded_tools: BTreeSet<ToolCallId>,
     pub(crate) expanded_tool_groups: BTreeSet<u64>,
@@ -1337,6 +1342,8 @@ impl LoomView {
             transcript_loading: false,
             transcript_generation: 0,
             timeline_view: None,
+            plan: None,
+            plan_collapsed: false,
             activity_records: BTreeMap::new(),
             expanded_tools: BTreeSet::new(),
             expanded_tool_groups: BTreeSet::new(),

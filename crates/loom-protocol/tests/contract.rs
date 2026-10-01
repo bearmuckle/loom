@@ -612,6 +612,10 @@ fn m5_session_run_review_and_evidence_contracts_round_trip() {
                     id: "validate".to_owned(),
                     description: "Validate the change".to_owned(),
                 }],
+                plan_progress: loom_protocol::AgentPlanProgress {
+                    completed: vec![0],
+                    active: Some(1),
+                },
                 messages: Vec::new(),
                 pending_approval: None,
                 pending_input: None,

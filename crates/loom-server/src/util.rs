@@ -1189,6 +1189,18 @@ pub(crate) fn bounded_transcript_content(bytes: &[u8], content_bytes: u64) -> (S
     (content, content_truncated)
 }
 
+/// Derives plan progress from a run's model-step counters.
+///
+/// Plan steps advance with model steps, so the step counter plus whether a step
+/// is currently in flight is enough to restore the checklist after a reconnect
+/// instead of resetting it to "not started".
+pub(crate) fn plan_progress_for(completed_steps: u32, step_in_flight: bool) -> AgentPlanProgress {
+    AgentPlanProgress {
+        completed: (0..completed_steps).collect(),
+        active: step_in_flight.then_some(completed_steps),
+    }
+}
+
 pub(crate) fn run_snapshot_projection_with_messages(
     state: &AgentRuntimeState,
     include_messages: bool,
@@ -1208,6 +1220,7 @@ pub(crate) fn run_snapshot_projection_with_messages(
     AgentRunSnapshotProjection {
         run,
         plan: state.plan.steps.clone(),
+        plan_progress: plan_progress_for(state.step_index, state.step_id.is_some()),
         messages,
         pending_approval: state.pending_approval.clone(),
         pending_input: state.pending_input.clone(),
@@ -1352,6 +1365,21 @@ mod tests {
             delegated_child_model_id(Some("custom".to_owned()), &current),
             "custom".to_owned()
         );
+    }
+
+    #[test]
+    fn plan_progress_derives_completed_and_active_steps() {
+        let idle = plan_progress_for(0, false);
+        assert!(idle.completed.is_empty());
+        assert_eq!(idle.active, None);
+
+        let running = plan_progress_for(3, true);
+        assert_eq!(running.completed, vec![0, 1, 2]);
+        assert_eq!(running.active, Some(3));
+
+        let finished = plan_progress_for(2, false);
+        assert_eq!(finished.completed, vec![0, 1]);
+        assert_eq!(finished.active, None);
     }
 
     #[test]

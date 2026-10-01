@@ -107,10 +107,28 @@ mod worker_node_resource_tests {
     }
 }
 
+/// Plan progress derived from a run's step events.
+///
+/// Plan steps advance with the agent's model steps, so a reconnecting client
+/// can restore exactly the completed and active markers it showed live rather
+/// than resetting the plan to "not started".
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentPlanProgress {
+    /// Step indices reported complete, in ascending order.
+    #[serde(default)]
+    pub completed: Vec<u32>,
+    /// The step currently executing, if a step is in flight.
+    #[serde(default)]
+    pub active: Option<u32>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentRunSnapshotProjection {
     pub run: AgentRunSnapshot,
     pub plan: Vec<AgentPlanStep>,
+    /// Progress for `plan`, or an empty default for peers that predate it.
+    #[serde(default)]
+    pub plan_progress: AgentPlanProgress,
     pub messages: Vec<ModelMessage>,
     pub pending_approval: Option<ToolCall>,
     pub pending_input: Option<String>,
