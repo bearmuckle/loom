@@ -1,6 +1,7 @@
 # About pane improvement plan
 
-Status: proposed
+Status: partially implemented. Problems 1, 2, 4, 7, 8, and 9 landed in
+`88e667d`; problems 3, 5, and 6 remain proposed.
 Scope: `crates/loom-ui` client presentation. Almost everything below is already
 available in the client; the only cross-crate change is retaining the result of
 protocol negotiation so version skew can be shown.
@@ -272,6 +273,69 @@ Each slice is independently reviewable and testable.
 - **Per-crate versions.** All crates currently share the workspace version; if
   that diverges, decide whether About shows the workspace version or the client
   crate version.
+
+## Implementation status
+
+Problems 1, 2, 4, 7, 8, and 9 are implemented in commit `88e667d`, a
+`loom-ui`-only change (12 files; no new dependencies):
+
+- **Mode-aware subtitle (problem 1).** `about_backend_label` derives
+  `Local · in-process backend`, `Demo · deterministic provider`,
+  `Remote · <scheme://host:port>`, or `Browser · <…>` from `demo_workspace`,
+  a new `browser_client` flag, and a new `backend_endpoint` field. Endpoint
+  display strips userinfo, path, query, and fragment; the access token is never
+  stored on the view.
+- **Build metadata (problem 2).** `crates/loom-ui/build.rs` stamps
+  `LOOM_GIT_REVISION` (existing env var → `git rev-parse --short HEAD` →
+  `unknown`, never failing the build). The hero keeps only the name and
+  subtitle; a new "This build" card shows Version, Platform, and Protocol via
+  `settings_row`.
+- **Protocol retention (problem 4).** `negotiate`/`negotiate_async` return
+  `NegotiationResult`; the active-backend startup paths store the server version
+  in `server_protocol_version`, while the additional-worker-node callers
+  discard it via `.map(|_| ())` so their behaviour is unchanged. The Protocol row
+  shows client and server versions and uses the warning tone on a mismatch.
+- **External links (problem 7).** Four rows (Documentation, Source, Releases,
+  Report a security issue) derived from a single `LOOM_REPOSITORY_URL` constant,
+  with a `record_status` fallback when the OS or browser opener refuses.
+- **Discoverability (problem 8).** `about` is a `COMMANDS` entry ("About Loom"),
+  dispatched by `run_command` to `open_about_from_menu`, and `/about` is listed
+  by `/help`.
+- **Test hooks (problem 9).** New `.test_support()` ids (`about-subtitle`,
+  `about-version`, `about-platform`, `about-protocol`, `about-link-*`) and
+  accessibility labels on the link controls; no new colour literals, so the
+  theme mapping test is unaffected.
+
+Deviations from this plan, all deliberate:
+
+- The plan described one helper returning "scheme+host+port" while the required
+  test asserted `host:port`; this landed as two helpers, `endpoint_host` (bare
+  `host:port`) and `endpoint_label` (scheme re-added), with the subtitle using
+  `endpoint_label`.
+- `initialize_from_connection` gained two parameters and therefore carries
+  `#[allow(clippy::too_many_arguments)]`, matching existing usage in the crate.
+- `browser_client` is a plain field rather than `cfg!(target_family = "wasm")`
+  so the browser configuration can be rendered and tested on native builds.
+- The Version/Platform/Protocol rows pass an empty `settings_row` description;
+  tightening that copy is a follow-up.
+
+Verification and environment limits:
+
+- Child worktree gates on `88e667d`: `cargo fmt --all -- --check` pass;
+  `cargo clippy -p loom-ui --all-targets --all-features --locked -- -D warnings`
+  pass; `cargo test -p loom-ui --locked` pass (215 passed, 0 failed);
+  `cargo check -p loom-ui --target wasm32-unknown-unknown --locked` pass with
+  `RUSTC_BOOTSTRAP=1` (the flag `.github/workflows/pages.yml:46` already uses);
+  patch coverage 200/214 changed non-test lines = 93.5% (>= 75%).
+- The isolation environment lacks the native UI packages CI installs
+  (`libdbus-1-dev`, `libxcb1-dev`, `libfontconfig1-dev`, `libxkbcommon-dev`,
+  `libxkbcommon-x11-dev`, `pkg-config`; `ci.yml:51-60`), so the child linked
+  against throwaway stubs outside the repository. The parent checkout cannot
+  re-run the gates at all (no executable `cargo`). Re-running the suite on a
+  machine with the real packages, and in CI, is still required before release.
+- The `--remote` successful-startup negotiate call and the link "Open" handler
+  remain the only changed lines without direct coverage; tests must not click
+  the link controls because that would shell out to the OS opener.
 
 ## Out of scope
 
