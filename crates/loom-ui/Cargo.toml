@@ -27,6 +27,7 @@ uuid.workspace = true
 gpui-kit = { workspace = true, features = ["test-support"] }
 loom-server.workspace = true
 tokio.workspace = true
+ttf-parser.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 env_logger.workspace = true

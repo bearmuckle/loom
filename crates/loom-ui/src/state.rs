@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use gpui_kit::assets::IconName as AssetIconName;
 use gpui_kit::{ListAlignment, ListState, px};
 use loom_core::{
     AgentSessionSnapshot, AgentSessionState, ApprovalPolicy, ToolCallId, UsageSnapshot,
@@ -390,11 +391,16 @@ pub(crate) enum PlanStepStatus {
 }
 
 impl PlanStepStatus {
-    pub(crate) fn marker(self) -> &'static str {
+    /// The icon shown beside a plan step for its status.
+    ///
+    /// Status is drawn with icons rather than Unicode glyphs because the
+    /// browser build's text system cannot fall back to a font that covers
+    /// geometric marks, so `○`/`▶`/`✓` would render blank in wasm.
+    pub(crate) fn icon(self) -> AssetIconName {
         match self {
-            Self::Done => "✓",
-            Self::Active => "▶",
-            Self::Pending => "○",
+            Self::Done => AssetIconName::Check,
+            Self::Active => AssetIconName::Play,
+            Self::Pending => AssetIconName::Circle,
         }
     }
 }
@@ -715,7 +721,7 @@ mod tests {
         plan.active = Some(1);
         assert_eq!(plan.active_step(), Some("Edit"));
         assert_eq!(plan.status(1), PlanStepStatus::Active);
-        assert_eq!(plan.status(1).marker(), "▶");
+        assert_eq!(plan.status(1).icon(), AssetIconName::Play);
 
         plan.completed.insert(0);
         plan.completed.insert(1);
@@ -723,9 +729,9 @@ mod tests {
         assert_eq!(plan.done_count(), 2);
         assert!((plan.fraction() - 2.0 / 3.0).abs() < 1e-6);
         assert_eq!(plan.status(0), PlanStepStatus::Done);
-        assert_eq!(plan.status(0).marker(), "✓");
+        assert_eq!(plan.status(0).icon(), AssetIconName::Check);
         assert_eq!(plan.status(2), PlanStepStatus::Pending);
-        assert_eq!(plan.status(2).marker(), "○");
+        assert_eq!(plan.status(2).icon(), AssetIconName::Circle);
 
         let empty = PlanState::default();
         assert!(empty.is_empty());

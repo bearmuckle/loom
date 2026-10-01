@@ -92,6 +92,7 @@ scraper = "0.24.0"
 url = "2.5.8"
 libc = "0.2"
 sysinfo = "0.31.4"
+ttf-parser = "0.25"
 keyring = { version = "3.6.3", default-features = false, features = [
     "apple-native",
     "windows-native",
