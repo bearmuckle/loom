@@ -35,9 +35,9 @@ use gpui_kit::{
     Subscription, Window, WindowAppearance, WindowControlArea, div, list, prelude::*, px,
 };
 use loom_core::{
-    ActivityId, AgentMessageRecord, AgentSessionId, AgentSessionSnapshot, AgentSessionState,
-    CapabilitySet, ErrorCode, EventSequence, LoomError, RepositoryId, RunId, Timestamp, ToolCallId,
-    UsageSnapshot, WorkspaceId, WorkspaceRecord,
+    ActivityId, AgentSessionId, AgentSessionSnapshot, AgentSessionState, CapabilitySet, ErrorCode,
+    EventSequence, LoomError, RepositoryId, RunId, Timestamp, ToolCallId, UsageSnapshot,
+    WorkspaceId, WorkspaceRecord,
 };
 #[cfg(not(target_family = "wasm"))]
 use loom_local::GitHubDeviceCode;
@@ -428,11 +428,6 @@ pub(crate) struct LoomView {
         loom_protocol::GitDiff,
     )>,
     project_snapshot_stale: bool,
-    project_messages: Vec<AgentMessageRecord>,
-    project_message_cursors: BTreeMap<AgentSessionId, u64>,
-    project_messages_stale: bool,
-    project_messages_loading: bool,
-    project_message_generation: u64,
     project_feed_after_sequence: Option<EventSequence>,
     project_feed_epoch: Option<String>,
     project_poll_scheduled: bool,
@@ -1278,11 +1273,6 @@ impl LoomView {
             project_tree_snapshots: Vec::new(),
             project_child_review: None,
             project_snapshot_stale: false,
-            project_messages: Vec::new(),
-            project_message_cursors: BTreeMap::new(),
-            project_messages_stale: false,
-            project_messages_loading: false,
-            project_message_generation: 0,
             project_feed_after_sequence: None,
             project_feed_epoch: None,
             project_poll_scheduled: false,

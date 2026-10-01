@@ -238,9 +238,6 @@ impl Render for LoomView {
         self.sync_model_select_states(window, cx);
         self.sync_agent_mode_select_state(window, cx);
         self.schedule_run_poll(cx);
-        if self.project_messages_stale {
-            self.refresh_project_messages(cx);
-        }
         self.schedule_project_poll(cx);
         let view = cx.entity();
         let layout = responsive_layout(window.bounds().size.width);

@@ -1,12 +1,8 @@
 use super::{
-    TimelineItem, project_message_transcript_content, remove_project_message_context_duplicates,
-    timeline_items_from_messages, tool_display_title, unseen_transcript_messages,
+    TimelineItem, timeline_items_from_messages, tool_display_title, unseen_transcript_messages,
 };
 use crate::state::AssistantPart;
-use loom_core::{
-    ActivityId, AgentMessageId, AgentMessageKind, AgentMessageRecord, ProjectId, RunId, Timestamp,
-    ToolCallId,
-};
+use loom_core::{ActivityId, RunId, Timestamp, ToolCallId};
 use loom_model::{MessageRole, ModelId, ModelMessage};
 use loom_protocol::{
     AgentActivityData, AgentActivityKind, AgentActivityRecord, AgentActivityStatus, ToolResult,
@@ -104,31 +100,73 @@ fn restored_project_tool_output_is_humanized() {
     assert!(!output.contains("child_session_id"));
 }
 
-#[test]
-fn restored_project_message_is_not_misattributed_to_the_user_or_duplicated() {
-    let sender_session_id = loom_core::AgentSessionId::new();
-    let record = AgentMessageRecord {
-        message_id: AgentMessageId::new(),
-        project_id: ProjectId::new(),
-        task_id: None,
-        sender_session_id,
-        target_session_id: loom_core::AgentSessionId::new(),
-        kind: AgentMessageKind::Result,
-        project_sequence: 1,
-        accepted_at: Timestamp::from_unix_millis(1),
-        body: "The child finished.".to_owned(),
-    };
-    let exact_context = project_message_transcript_content(&record);
-    let mut project_message = ModelMessage::new(MessageRole::User, exact_context.clone());
-    project_message.name = Some("loom_project_message".to_owned());
-    let mut timeline = timeline_items_from_messages(vec![(0, 0, project_message)], Vec::new());
-    assert!(matches!(
-        timeline.as_slice(),
-        [TimelineItem::ProjectMessageContext(content)] if content == &exact_context
-    ));
+fn project_message(body: &str) -> ModelMessage {
+    let mut message = ModelMessage::new(MessageRole::User, body.to_owned());
+    message.name = Some("loom_project_message".to_owned());
+    message
+}
 
-    remove_project_message_context_duplicates(&mut timeline, &[record]);
-    assert!(timeline.is_empty());
+#[test]
+fn restored_project_message_stays_out_of_the_transcript() {
+    let timeline = timeline_items_from_messages(
+        vec![(
+            0,
+            0,
+            project_message("[Project message 1 from agent child-1 (result)]\nDone."),
+        )],
+        Vec::new(),
+    );
+    assert!(
+        timeline.is_empty(),
+        "project messages are orchestration traffic, not transcript content"
+    );
+}
+
+#[test]
+fn restored_project_message_splits_adjacent_agent_turns() {
+    let timeline = timeline_items_from_messages(
+        vec![
+            (0, 0, ModelMessage::new(MessageRole::Assistant, "before")),
+            (1, 1, project_message("child result")),
+            (2, 2, ModelMessage::new(MessageRole::Assistant, "after")),
+        ],
+        Vec::new(),
+    );
+    assert_eq!(timeline.len(), 2, "the project message is not rendered");
+    let TimelineItem::Assistant(before) = &timeline[0] else {
+        panic!("expected a leading agent entry; got {timeline:?}");
+    };
+    assert_eq!(before.parts, vec![AssistantPart::Text("before".to_owned())]);
+    let TimelineItem::Assistant(after) = &timeline[1] else {
+        panic!("expected a reply entry; got {timeline:?}");
+    };
+    assert_eq!(after.parts, vec![AssistantPart::Text("after".to_owned())]);
+}
+
+#[test]
+fn restored_project_message_splits_tool_only_agent_turns() {
+    let mut tool_call = ModelMessage::new(MessageRole::Assistant, "");
+    tool_call.tool_calls = vec![loom_model::ToolCall {
+        id: ToolCallId::new(),
+        name: "read_file".to_owned(),
+        arguments: serde_json::json!({"path": "a.rs"}),
+    }];
+    let timeline = timeline_items_from_messages(
+        vec![
+            (0, 0, ModelMessage::new(MessageRole::Assistant, "before")),
+            (1, 1, project_message("child result")),
+            (2, 2, tool_call),
+        ],
+        Vec::new(),
+    );
+    assert_eq!(timeline.len(), 2, "the project message is not rendered");
+    let TimelineItem::Assistant(second) = &timeline[1] else {
+        panic!("expected a tool entry; got {timeline:?}");
+    };
+    assert!(matches!(
+        second.parts.as_slice(),
+        [AssistantPart::Tool(part)] if part.name == "read_file"
+    ));
 }
 
 #[test]

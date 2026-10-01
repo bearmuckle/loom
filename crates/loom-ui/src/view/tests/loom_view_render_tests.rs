@@ -2351,6 +2351,23 @@ fn server_event_projection_updates_session_and_ignores_service_streams(cx: &mut 
             provider_id: loom_model::ProviderId::new("test-provider"),
             health: ProviderHealth::default(),
         });
+        // Accepted project messages are orchestration traffic and carry no
+        // user-facing projection, so consuming one must not disturb state.
+        let timeline_before = view.timeline.len();
+        view.consume_event(&loom_protocol::ServerEvent::ProjectAgentMessageAccepted {
+            message: loom_core::AgentMessageRecord {
+                message_id: loom_core::AgentMessageId::new(),
+                project_id: loom_core::ProjectId::new(),
+                task_id: None,
+                sender_session_id: session_id,
+                target_session_id: view.active_session.id,
+                kind: loom_core::AgentMessageKind::Result,
+                project_sequence: 1,
+                accepted_at: loom_core::Timestamp::from_unix_millis(1),
+                body: "child result".to_owned(),
+            },
+        });
+        assert_eq!(view.timeline.len(), timeline_before);
         assert_eq!(view.session_state, loom_core::AgentSessionState::Archived);
         assert!(view.status_banner.is_some());
         view

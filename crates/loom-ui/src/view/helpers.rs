@@ -381,11 +381,18 @@ pub(crate) fn timeline_items_from_messages(
     entries.sort_by_key(|(timeline_ordinal, _)| *timeline_ordinal);
 
     let mut timeline = Vec::new();
+    // A hidden project message still ends the previous agent turn, so the reply
+    // that follows reads as its own entry instead of merging into the turn that
+    // preceded the message.
+    let mut project_boundary = false;
     for (_, entry) in entries {
         match entry {
             Entry::Message(message) => match message.role {
+                // Inter-agent project messages are orchestration traffic. The
+                // receiving agent decides whether the user needs to act on
+                // anything, so the raw message stays out of the transcript.
                 MessageRole::User if message.name.as_deref() == Some("loom_project_message") => {
-                    timeline.push(TimelineItem::ProjectMessageContext(message.content));
+                    project_boundary = true;
                 }
                 MessageRole::User => timeline.push(TimelineItem::User(message.content)),
                 MessageRole::Assistant => {
@@ -394,6 +401,12 @@ pub(crate) fn timeline_items_from_messages(
                         .as_deref()
                         .filter(|reasoning| !reasoning.is_empty());
                     let has_content = !message.content.is_empty();
+                    if project_boundary
+                        && (reasoning.is_some() || has_content || !message.tool_calls.is_empty())
+                    {
+                        timeline.push(TimelineItem::Assistant(AssistantTurn::default()));
+                    }
+                    project_boundary = false;
                     if reasoning.is_some() || has_content {
                         // Merge into the trailing assistant turn for the whole
                         // tool-using response: text, reasoning, and tool cycles
@@ -482,39 +495,6 @@ pub(crate) fn timeline_items_from_messages(
         }
     }
     timeline
-}
-
-pub(crate) fn project_message_transcript_content(message: &AgentMessageRecord) -> String {
-    let kind = match message.kind {
-        loom_core::AgentMessageKind::Progress => "progress",
-        loom_core::AgentMessageKind::Result => "result",
-        loom_core::AgentMessageKind::Question => "question",
-        loom_core::AgentMessageKind::Blocker => "blocker",
-        loom_core::AgentMessageKind::Direction => "direction",
-        loom_core::AgentMessageKind::Answer => "answer",
-    };
-    let task = message
-        .task_id
-        .map(|task_id| format!("; task {task_id}"))
-        .unwrap_or_default();
-    format!(
-        "[Project message {} from agent {} ({kind}{task})]\n{}",
-        message.project_sequence, message.sender_session_id, message.body
-    )
-}
-
-pub(crate) fn remove_project_message_context_duplicates(
-    timeline: &mut Vec<TimelineItem>,
-    project_messages: &[AgentMessageRecord],
-) {
-    let project_message_contexts = project_messages
-        .iter()
-        .map(project_message_transcript_content)
-        .collect::<BTreeSet<_>>();
-    timeline.retain(|item| {
-        !matches!(item, TimelineItem::ProjectMessageContext(content)
-            if project_message_contexts.contains(content))
-    });
 }
 
 pub(crate) fn unseen_transcript_messages(

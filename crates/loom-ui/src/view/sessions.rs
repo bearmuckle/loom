@@ -6,11 +6,6 @@ impl LoomView {
         self.active_session = session;
         self.project_snapshot = None;
         self.project_snapshot_stale = false;
-        self.project_messages.clear();
-        self.project_message_cursors.clear();
-        self.project_messages_stale = false;
-        self.project_messages_loading = false;
-        self.project_message_generation = self.project_message_generation.wrapping_add(1);
         if workspace_changed {
             self.project_feed_after_sequence = None;
             self.project_feed_epoch = None;
@@ -180,7 +175,6 @@ impl LoomView {
                 .retain(|known| known.project_id != snapshot.project_id);
             self.project_tree_snapshots.push(snapshot.clone());
             self.project_snapshot = Some(snapshot);
-            self.project_messages_stale = true;
         }
     }
 
@@ -305,7 +299,6 @@ impl LoomView {
             self.session_task_cache.remove(session_id);
             self.session_models.remove(session_id);
             self.session_auto_approve_actions.remove(session_id);
-            self.project_message_cursors.remove(session_id);
         }
         // Drop the archived sessions from every cached project snapshot so the
         // tree view stops rendering them without waiting for a refresh.
@@ -334,12 +327,8 @@ impl LoomView {
         if project_root_removed {
             self.project_snapshot = None;
             self.project_snapshot_stale = false;
-            self.project_messages_stale = false;
             self.project_feed_after_sequence = None;
             self.project_poll_scheduled = false;
-            self.project_messages.clear();
-            self.project_message_cursors.clear();
-            self.rebuild_project_message_timeline();
         } else if let Some(project) = self.project_snapshot.as_mut() {
             prune(project);
         }

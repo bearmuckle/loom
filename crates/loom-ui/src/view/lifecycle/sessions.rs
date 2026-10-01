@@ -134,7 +134,6 @@ impl LoomView {
         self.context_inspection = None;
         self.run_state = None;
         self.after_sequence = None;
-        self.rebuild_project_message_timeline();
     }
 
     pub(crate) fn update_session_list(&mut self) {
