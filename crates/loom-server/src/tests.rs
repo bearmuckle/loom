@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     thread,
     time::Duration,
@@ -5409,6 +5409,539 @@ fn project_child_worktree_can_be_reviewed_fast_forwarded_and_cleaned_up() {
     fs::remove_dir_all(source).unwrap();
 }
 
+struct ProjectCodeChildFixture {
+    temp: PathBuf,
+    source: PathBuf,
+    backend: Arc<InProcessBackend>,
+    connection: InProcessConnection,
+    root_id: AgentSessionId,
+    project_id: ProjectId,
+    task_id: loom_core::TaskId,
+    worktree: ProjectWorktreeRecord,
+    child_checkout: PathBuf,
+    parent_git: GitService,
+}
+
+impl ProjectCodeChildFixture {
+    fn shutdown(self) {
+        self.backend.shutdown().unwrap();
+        fs::remove_dir_all(&self.temp).unwrap();
+        fs::remove_dir_all(&self.source).unwrap();
+    }
+}
+
+fn git_in(dir: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .args(["-C", dir.to_str().unwrap()])
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        arguments,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn commit_file(dir: &Path, file: &str, content: &str, message: &str) {
+    fs::write(dir.join(file), content).unwrap();
+    git_in(dir, &["config", "user.name", "Loom Test"]);
+    git_in(dir, &["config", "user.email", "loom@example.test"]);
+    git_in(dir, &["add", "--", file]);
+    git_in(dir, &["commit", "-qm", message]);
+}
+
+fn project_code_child_fixture() -> ProjectCodeChildFixture {
+    let temp = workspace();
+    let source = git_repository();
+    let database_path = temp.join("state.sqlite");
+    let backend = InProcessBackend::new_persistent(&database_path).unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace_record = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Merge integration".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace_record.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    let parent_repository = match connection
+        .request(RequestEnvelope::new(ClientRequest::Repository(
+            RepositoryRequest::AttachSessionRepository {
+                session_id: root.id,
+                source: source.display().to_string(),
+                path: "repo".to_owned(),
+                revision: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Repository(RepositoryResponse::SessionRepositoryAttached(repository)) => {
+            repository
+        }
+        response => panic!("unexpected repository response: {response:?}"),
+    };
+    let parent_git = connection
+        .session_git(root.id, parent_repository.id)
+        .unwrap();
+    let base_revision = parent_git.status().unwrap().head.unwrap();
+
+    let task_id = loom_core::TaskId::new();
+    let child_session_id = AgentSessionId::new();
+    let created_at = Timestamp::now();
+    let child_snapshot = AgentSessionSnapshot {
+        id: child_session_id,
+        workspace_id: workspace_record.id,
+        name: "Code child".to_owned(),
+        state: AgentSessionState::Idle,
+        created_at,
+        updated_at: created_at,
+    };
+    let task = loom_core::DelegatedTaskRecord {
+        task_id,
+        project_id: ProjectId::from_uuid(*root.id.as_uuid()),
+        requester_session_id: root.id,
+        target_session_id: child_session_id,
+        child_name: child_snapshot.name.clone(),
+        intent: "Make a committed code change".to_owned(),
+        model_id: "deterministic/demo".to_owned(),
+        context_references: Vec::new(),
+        dependencies: Vec::new(),
+        code_change: true,
+        permissions: loom_core::ProjectAgentPermissions::default(),
+        status: loom_core::DelegatedTaskStatus::Queued,
+        created_at,
+        updated_at: created_at,
+    };
+    let mut worktree = ProjectWorktreeRecord {
+        project_id: task.project_id,
+        task_id,
+        parent_session_id: root.id,
+        child_session_id,
+        parent_repository_id: parent_repository.id,
+        child_repository_id: RepositoryId::new(),
+        relative_path: format!("project-worktrees/{task_id}"),
+        worktree_name: format!("loom-child-{task_id}"),
+        branch_name: format!("loom/project-child-{task_id}"),
+        base_revision,
+        result_revision: None,
+        integrated_revision: None,
+        status: ProjectWorktreeStatus::Creating,
+        conflict_paths: Vec::new(),
+        error: None,
+        cleanup_disposition: None,
+        created_at,
+        updated_at: created_at,
+    };
+    backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .create_project_child_with_worktree(
+            RequestId::new(),
+            &child_snapshot,
+            backend.sessions().unwrap().next_sequence().next(),
+            &task,
+            &worktree,
+        )
+        .unwrap();
+    let (_, event) = backend
+        .sessions()
+        .unwrap()
+        .create_in_workspace_with_id(
+            workspace_record.id,
+            child_session_id,
+            child_snapshot.name.clone(),
+        )
+        .unwrap();
+    backend.journal().unwrap().append_session(event);
+    connection
+        .ensure_project_worktree_ready(&mut worktree)
+        .unwrap();
+    let child_checkout = connection
+        .session_filesystem(child_session_id)
+        .unwrap()
+        .root()
+        .join(&worktree.relative_path);
+
+    ProjectCodeChildFixture {
+        temp,
+        source,
+        backend,
+        connection,
+        root_id: root.id,
+        project_id: task.project_id,
+        task_id,
+        worktree,
+        child_checkout,
+        parent_git,
+    }
+}
+
+fn complete_project_code_child(fixture: &ProjectCodeChildFixture) {
+    fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .update_delegated_task_status(
+            fixture.task_id,
+            loom_core::DelegatedTaskStatus::Completed,
+            Timestamp::now(),
+        )
+        .unwrap();
+}
+
+fn review_project_code_child(fixture: &ProjectCodeChildFixture) -> String {
+    let response = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::GetProjectChildReview {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+            },
+        )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildReview { status, .. }) =
+        response.result.unwrap()
+    else {
+        panic!("unexpected child review response");
+    };
+    status.head.expect("reviewed child should have a HEAD")
+}
+
+fn integrated_worktree(fixture: &ProjectCodeChildFixture) -> ProjectWorktreeRecord {
+    fixture
+        .backend
+        .persistence
+        .as_ref()
+        .unwrap()
+        .load_project_worktree_by_task(fixture.task_id)
+        .unwrap()
+        .expect("child worktree should be durable")
+}
+
+#[test]
+fn project_child_integrates_a_merge_over_an_advanced_parent() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
+
+    let integration = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::IntegrateProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                expected_parent_revision: fixture.worktree.base_revision.clone(),
+            },
+        )));
+    let ServerResponse::Project(ProjectResponse::ProjectChildWorktreeUpdated(integrated)) =
+        integration.result.unwrap()
+    else {
+        panic!("unexpected child integration response");
+    };
+    assert_eq!(integrated.status, ProjectWorktreeStatus::Integrated);
+    let integrated_revision = integrated.integrated_revision.clone().unwrap();
+    assert_ne!(integrated_revision, parent_advanced);
+    assert_ne!(integrated_revision, child_revision);
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(integrated_revision.as_str())
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.parent_git.root().join("README.md")).unwrap(),
+        "parent advanced\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.parent_git.root().join("child.txt")).unwrap(),
+        "child\n"
+    );
+    let parents = Command::new("git")
+        .args([
+            "-C",
+            fixture.parent_git.root().to_str().unwrap(),
+            "rev-list",
+            "--parents",
+            "-n1",
+            &integrated_revision,
+        ])
+        .output()
+        .unwrap();
+    assert!(parents.status.success());
+    let parents = String::from_utf8(parents.stdout).unwrap();
+    let parents: Vec<&str> = parents.split_whitespace().collect();
+    assert_eq!(parents.len(), 3, "expected a two-parent merge commit");
+    assert!(parents.contains(&parent_advanced.as_str()));
+    assert!(parents.contains(&child_revision.as_str()));
+    fixture.shutdown();
+}
+
+#[test]
+fn project_child_integration_conflict_is_refused_and_preserved() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "README.md",
+        "child result\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent version\n",
+        "parent change",
+    );
+    let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
+
+    let integration = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::IntegrateProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                expected_parent_revision: fixture.worktree.base_revision.clone(),
+            },
+        )));
+    let Err(error) = integration.result else {
+        panic!("conflicting integration should be refused");
+    };
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(error.message.contains("README.md"));
+
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.status, ProjectWorktreeStatus::Conflict);
+    assert_eq!(worktree.conflict_paths, vec!["README.md".to_owned()]);
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(parent_advanced.as_str())
+    );
+    assert!(fixture.parent_git.status().unwrap().clean);
+    assert_eq!(
+        fs::read_to_string(fixture.parent_git.root().join("README.md")).unwrap(),
+        "parent version\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.child_checkout.join("README.md")).unwrap(),
+        "child result\n"
+    );
+    let child_head = Command::new("git")
+        .args([
+            "-C",
+            fixture.child_checkout.to_str().unwrap(),
+            "rev-parse",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    assert!(child_head.status.success());
+    assert_eq!(
+        String::from_utf8(child_head.stdout).unwrap().trim(),
+        child_revision
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn project_child_integration_rejects_an_unknown_expected_parent_revision() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+
+    let integration = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::IntegrateProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                expected_parent_revision: child_revision,
+            },
+        )));
+    let Err(error) = integration.result else {
+        panic!("integration onto an unrelated expected revision should be refused");
+    };
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(error.message.contains("does not descend"));
+    assert_eq!(
+        integrated_worktree(&fixture).status,
+        ProjectWorktreeStatus::Ready
+    );
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(fixture.worktree.base_revision.as_str())
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn project_child_integration_surfaces_an_in_progress_git_operation() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+    fs::write(
+        fixture.parent_git.root().join(".git").join("MERGE_HEAD"),
+        format!("{child_revision}\n"),
+    )
+    .unwrap();
+
+    let integration = fixture
+        .connection
+        .request(RequestEnvelope::new(ClientRequest::Project(
+            ProjectRequest::IntegrateProjectChild {
+                project_id: fixture.project_id,
+                manager_session_id: fixture.root_id,
+                task_id: fixture.task_id,
+                expected_parent_revision: fixture.worktree.base_revision.clone(),
+            },
+        )));
+    let Err(error) = integration.result else {
+        panic!("integration during an in-progress Git operation should be refused");
+    };
+    assert_eq!(error.code, ErrorCode::RecoveryRequired);
+    let worktree = integrated_worktree(&fixture);
+    assert_eq!(worktree.status, ProjectWorktreeStatus::RecoveryRequired);
+    assert!(
+        worktree
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("in-progress Git operation"))
+    );
+
+    // Restart recovery surfaces the same state instead of replaying the merge.
+    fixture
+        .connection
+        .reconcile_project_child_integrations(fixture.project_id)
+        .unwrap();
+    assert_eq!(
+        integrated_worktree(&fixture).status,
+        ProjectWorktreeStatus::RecoveryRequired
+    );
+    fixture.shutdown();
+}
+
+#[test]
+fn interrupted_project_child_integration_recovers_without_replay() {
+    let fixture = project_code_child_fixture();
+    commit_file(
+        &fixture.child_checkout,
+        "child.txt",
+        "child\n",
+        "child change",
+    );
+    complete_project_code_child(&fixture);
+    let child_revision = review_project_code_child(&fixture);
+
+    commit_file(
+        fixture.parent_git.root(),
+        "README.md",
+        "parent advanced\n",
+        "parent change",
+    );
+    let parent_advanced = fixture.parent_git.status().unwrap().head.unwrap();
+    fixture
+        .parent_git
+        .integrate_merge_revisions(
+            &parent_advanced,
+            &child_revision,
+            "loom: integrate project child",
+        )
+        .unwrap();
+    let merged_revision = fixture.parent_git.status().unwrap().head.unwrap();
+    assert_ne!(merged_revision, parent_advanced);
+
+    // Simulate a crash after the merge landed but before the durable record
+    // was updated to `integrated`.
+    let mut interrupted = integrated_worktree(&fixture);
+    interrupted.status = ProjectWorktreeStatus::Integrating;
+    interrupted.result_revision = Some(child_revision.clone());
+    fixture
+        .connection
+        .save_project_worktree_state(&interrupted)
+        .unwrap();
+
+    fixture
+        .connection
+        .reconcile_project_child_integrations(fixture.project_id)
+        .unwrap();
+    let recovered = integrated_worktree(&fixture);
+    assert_eq!(recovered.status, ProjectWorktreeStatus::Integrated);
+    assert_eq!(
+        recovered.integrated_revision.as_deref(),
+        Some(merged_revision.as_str())
+    );
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(merged_revision.as_str())
+    );
+
+    // Re-running recovery is idempotent and does not replay the merge.
+    fixture
+        .connection
+        .reconcile_project_child_integrations(fixture.project_id)
+        .unwrap();
+    assert_eq!(
+        fixture.parent_git.status().unwrap().head.as_deref(),
+        Some(merged_revision.as_str())
+    );
+    fixture.shutdown();
+}
+
 #[test]
 fn nested_code_child_worktree_integrates_through_parent_to_root() {
     let temp = workspace();
@@ -7348,6 +7881,171 @@ fn child_completion_wakes_a_finished_manager() {
     drop(backend);
     drop(model);
     fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn code_child_completion_wakes_a_finished_manager() {
+    let temp = workspace();
+    let source = git_repository();
+    let persistence_path = temp.join("state.sqlite");
+    let mut model = ScriptedOpenAiEndpoint::start();
+    let model_endpoint = model.endpoint.clone();
+    let model_id = ModelId::new("fixture/code-child-wake");
+    let backend = InProcessBackend::with_provider_registry_persistent(
+        scripted_project_provider_registry(&model_endpoint, model_id.clone()),
+        &persistence_path,
+    )
+    .unwrap();
+    let connection = backend.connect();
+    negotiate(&connection);
+    let workspace = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateWorkspace {
+                name: "Code child wake e2e".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Workspace(WorkspaceResponse::WorkspaceCreated(workspace)) => workspace,
+        response => panic!("unexpected workspace response: {response:?}"),
+    };
+    let root = match connection
+        .request(RequestEnvelope::new(ClientRequest::Workspace(
+            WorkspaceRequest::CreateAgentSessionInWorkspace {
+                workspace_id: workspace.id,
+                name: "Manager".to_owned(),
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Session(SessionResponse::AgentSessionCreated(session)) => session.id,
+        response => panic!("unexpected session response: {response:?}"),
+    };
+    assert!(matches!(
+        connection
+            .request(RequestEnvelope::new(ClientRequest::Repository(
+                RepositoryRequest::AttachSessionRepository {
+                    session_id: root,
+                    source: source.display().to_string(),
+                    path: "repo".to_owned(),
+                    revision: None,
+                },
+            )))
+            .result,
+        Ok(ServerResponse::Repository(
+            RepositoryResponse::SessionRepositoryAttached(_)
+        ))
+    ));
+    let root_run_id = match connection
+        .request(RequestEnvelope::new(ClientRequest::Run(
+            RunRequest::StartSessionAgentRun {
+                session_id: root,
+                task: "Delegate a code task and continue with me meanwhile.".to_owned(),
+                model: model_id.clone(),
+                system_instructions: None,
+                repository_instructions: None,
+            },
+        )))
+        .result
+        .unwrap()
+    {
+        ServerResponse::Run(RunResponse::AgentRunStarted(snapshot)) => snapshot.id,
+        response => panic!("unexpected run response: {response:?}"),
+    };
+    let project_id = ProjectId::from_uuid(*root.as_uuid());
+    let persistence = backend.persistence.as_ref().unwrap();
+
+    // Turn one delegates a code-changing child.
+    let root_delegate = model.next_for_manager();
+    assert!(request_has_tool(
+        &root_delegate.request,
+        "delegate_project_code_task"
+    ));
+    model.respond_with_tool(
+        root_delegate,
+        "delegate_project_code_task",
+        serde_json::json!({
+            "child_name": "code-worker",
+            "intent": "Make a small committed change.",
+            "model_id": model_id,
+        }),
+    );
+
+    // Turn two replies to the user and ends the turn. An active code child no
+    // longer blocks completion, which is what makes "continue here" work.
+    let root_reply = model.next_for_manager();
+    model.respond_with_text(root_reply, "Delegated. Continuing with you now.");
+    assert_eq!(
+        await_settled_run(&connection, root_run_id).state,
+        AgentRunState::Completed
+    );
+
+    let child_task = persistence
+        .list_project_tasks(project_id)
+        .unwrap()
+        .into_iter()
+        .find(|task| task.child_name == "code-worker")
+        .expect("delegation should create the code worker task");
+    assert!(child_task.code_change);
+    assert_eq!(child_task.status, loom_core::DelegatedTaskStatus::Running);
+    let child_run_id = persistence
+        .load_latest_run_summary_for_session(child_task.target_session_id)
+        .unwrap()
+        .expect("code child should have a durable run")
+        .snapshot
+        .id;
+
+    // The child finishes without sending its own result; the server synthesizes
+    // a durable result and wakes the finished manager.
+    let child_turn = model.next_for_child();
+    model.respond_with_text(child_turn, "Code child work complete.");
+    assert_eq!(
+        await_settled_run(&connection, child_run_id).state,
+        AgentRunState::Completed
+    );
+
+    let woken = model.next_for_manager();
+    let messages = woken.request["messages"].as_array().unwrap();
+    assert!(
+        messages.iter().any(|message| {
+            message["name"] == "loom_project_message"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains("code-worker") && content.contains("Completed")
+                })
+        }),
+        "the woken manager should see the code child result"
+    );
+    // The reviewed-result guard still applies to completed code children, so
+    // the woken manager reviews before it can finish its turn.
+    model.respond_with_tool(
+        woken,
+        "review_project_child",
+        serde_json::json!({ "task_id": child_task.task_id }),
+    );
+    let woken_after_review = model.next_for_manager();
+    model.respond_with_text(
+        woken_after_review,
+        "Reviewed the code child result; nothing further to integrate.",
+    );
+    let woken_run_id = persistence
+        .load_latest_run_summary_for_session(root)
+        .unwrap()
+        .expect("woken manager should have a durable run")
+        .snapshot
+        .id;
+    assert_eq!(
+        await_settled_run(&connection, woken_run_id).state,
+        AgentRunState::Completed
+    );
+
+    drop(connection);
+    backend.shutdown().unwrap();
+    drop(backend);
+    drop(model);
+    fs::remove_dir_all(temp).unwrap();
+    fs::remove_dir_all(source).unwrap();
 }
 
 #[cfg(unix)]

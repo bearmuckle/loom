@@ -1256,10 +1256,7 @@ mod loom_view_render_tests {
             window.render_frame(cx);
             let mut menu = window.within("popup-menu");
             assert_eq!(menu.find(2usize).label(), Some("Review child changes"));
-            assert_eq!(
-                menu.find(3usize).label(),
-                Some("Fast-forward child changes")
-            );
+            assert_eq!(menu.find(3usize).label(), Some("Integrate child changes"));
             assert_eq!(menu.find(4usize).label(), Some("Keep child checkout"));
             assert_eq!(
                 menu.find(5usize).label(),

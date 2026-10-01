@@ -97,6 +97,7 @@ impl InProcessBackend {
                     });
                 }
             }
+            connection.reconcile_project_child_integrations(project_id)?;
         }
         for workspace_id in workspace_ids {
             connection
