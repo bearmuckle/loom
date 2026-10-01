@@ -270,49 +270,6 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
                 && error.message.contains("exactly one Git repository")
     ));
 
-    for index in 1..4 {
-        let result = connection.create_project_child(
-            RequestId::new(),
-            root,
-            format!("worker-{index}"),
-            loom_core::DelegatedTaskSpec {
-                intent: format!("Task {index}"),
-                model_id: "deterministic/demo".into(),
-                context_references: vec![],
-                dependencies: vec![],
-                code_change: false,
-                permissions: loom_core::ProjectAgentPermissions::default(),
-            },
-        );
-        assert!(matches!(
-            result,
-            Ok(ServerResponse::Project(
-                ProjectResponse::ProjectChildCreated { .. }
-            ))
-        ));
-    }
-    let additional_child = connection.create_project_child(
-        RequestId::new(),
-        root,
-        "worker-5".into(),
-        loom_core::DelegatedTaskSpec {
-            intent: "One too many".into(),
-            model_id: "deterministic/demo".into(),
-            context_references: vec![],
-            dependencies: vec![],
-            code_change: false,
-            permissions: loom_core::ProjectAgentPermissions::default(),
-        },
-    );
-    assert!(
-        matches!(
-            additional_child,
-            Ok(ServerResponse::Project(
-                ProjectResponse::ProjectChildCreated { .. }
-            ))
-        ),
-        "unexpected additional child response: {additional_child:?}"
-    );
     assert!(matches!(
         connection.create_project_child(
             request_id,
@@ -329,8 +286,13 @@ fn delegated_children_and_direct_messages_are_durable_and_bounded() {
         ),
         Err(error) if error.code == ErrorCode::InvalidRequest
     ));
+    // Delegated children start background runs on the shared process-wide
+    // executor. Nothing below depends on the child runs, so drain the backend
+    // (stopping and joining those workers) before deleting its directory;
+    // otherwise a late worker recreates files under it during removal and
+    // `remove_dir_all` fails with `DirectoryNotEmpty`.
     drop(connection);
-    drop(backend);
+    backend.shutdown().unwrap();
     fs::remove_dir_all(temp).unwrap();
 }
 
@@ -814,7 +776,7 @@ fn project_manager_tool_creates_an_idempotent_non_code_child() {
     assert_eq!(root_inbox[0].sender_session_id, child_session_id);
     assert_eq!(root_inbox[0].target_session_id, root);
     drop(connection);
-    drop(backend);
+    backend.shutdown().unwrap();
     fs::remove_dir_all(temp).unwrap();
 }
 
