@@ -55,7 +55,11 @@ impl LoomView {
         };
         div()
             .w_full()
-            .p_3()
+            .px_3()
+            .pt_3()
+            // Reserve the space hidden by an on-screen keyboard so the field
+            // and send action stay visible while typing on mobile.
+            .pb(px(12.) + bottom_occlusion(window))
             .bg(rgb(0x17191f))
             .border_t_1()
             .border_color(rgb(0x30343f))
@@ -148,6 +152,7 @@ impl LoomView {
             .child(
                 div()
                     .id("composer-input-box")
+                    .test_support()
                     .w_full()
                     .rounded_lg()
                     .bg(rgb(0x10141b))
@@ -188,7 +193,10 @@ impl LoomView {
                                         Button::new("open-command-palette")
                                             .icon(Icon::new(command_palette_icon()))
                                             .ghost()
-                                            .xsmall()
+                                            .when(layout.phone, |button| {
+                                                button.with_size(layout.control_size())
+                                            })
+                                            .when(!layout.phone, |button| button.xsmall())
                                             .tooltip(format!(
                                                 "Command palette ({})",
                                                 command_palette_shortcut_label()
@@ -209,7 +217,10 @@ impl LoomView {
                                             Button::new("interrupt-run")
                                                 .label("Stop")
                                                 .danger()
-                                                .small()
+                                                .when(layout.phone, |button| {
+                                                    button.h(layout.control_size())
+                                                })
+                                                .when(!layout.phone, |button| button.small())
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.interrupt_active_run(cx);
                                                 })),
@@ -219,7 +230,10 @@ impl LoomView {
                                         Button::new("send-message")
                                             .icon(Icon::new(AssetIconName::ArrowUp))
                                             .primary()
-                                            .small()
+                                            .when(layout.phone, |button| {
+                                                button.with_size(layout.control_size())
+                                            })
+                                            .when(!layout.phone, |button| button.small())
                                             .tooltip("Send (↵)")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.submit_composer(cx);

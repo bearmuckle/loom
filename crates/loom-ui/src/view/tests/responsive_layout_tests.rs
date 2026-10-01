@@ -1,6 +1,6 @@
 use super::{
     COMPACT_REVIEW_WIDTH, COMPACT_SIDEBAR_WIDTH, FULL_REVIEW_WIDTH, FULL_SIDEBAR_WIDTH,
-    PHONE_SIDEBAR_WIDTH, responsive_layout, review_panel_is_visible,
+    PHONE_SIDEBAR_WIDTH, PHONE_TOUCH_TARGET, responsive_layout, review_panel_is_visible,
 };
 use gpui_kit::px;
 
@@ -35,6 +35,16 @@ fn very_narrow_phones_keep_the_session_drawer_in_view() {
     assert!(layout.phone);
     assert_eq!(layout.sidebar_width, px(280.));
     assert_eq!(layout.review_width, px(280.));
+}
+
+#[test]
+fn phone_layouts_expand_interactive_targets_for_touch() {
+    let phone = responsive_layout(px(390.));
+    let desktop = responsive_layout(px(1280.));
+    assert_eq!(phone.control_size(), PHONE_TOUCH_TARGET);
+    assert!(phone.control_size() > desktop.control_size());
+    assert!(phone.nav_row_padding() > desktop.nav_row_padding());
+    assert!(phone.nav_row_font_size().0 > desktop.nav_row_font_size().0);
 }
 
 #[test]

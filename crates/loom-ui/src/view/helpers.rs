@@ -30,6 +30,45 @@ pub(crate) fn responsive_layout(width: Pixels) -> ResponsiveLayout {
     }
 }
 
+/// The recommended minimum touch target for phone controls. Phone layouts use
+/// this for navigation rows, header actions, and the composer so the interface
+/// stays usable with a finger instead of a pointer.
+pub(crate) const PHONE_TOUCH_TARGET: Pixels = px(44.);
+
+impl ResponsiveLayout {
+    /// The interactive control height for this layout.
+    pub(crate) fn control_size(self) -> Pixels {
+        if self.phone {
+            PHONE_TOUCH_TARGET
+        } else {
+            px(30.)
+        }
+    }
+
+    /// The vertical padding for a navigation list row.
+    pub(crate) fn nav_row_padding(self) -> Pixels {
+        if self.phone { px(14.) } else { px(8.) }
+    }
+
+    /// The font size for navigation list labels.
+    pub(crate) fn nav_row_font_size(self) -> gpui_kit::Rems {
+        if self.phone {
+            gpui_kit::rems(16. / BASE_FONT_SIZE)
+        } else {
+            gpui_kit::rems(0.8125)
+        }
+    }
+}
+
+/// The part of the layout viewport hidden behind an on-screen keyboard or other
+/// platform overlay. The browser keeps the layout viewport full height while
+/// only the visual viewport shrinks, so the composer must reserve this space to
+/// stay above the keyboard.
+pub(crate) fn bottom_occlusion(window: &Window) -> Pixels {
+    let visible = window.fully_visible_bounds();
+    (window.viewport_size().height - visible.bottom()).max(px(0.))
+}
+
 pub(crate) fn commands_matching(query: &str) -> Vec<&'static CommandSpec> {
     let query = query.trim_start_matches('/').to_ascii_lowercase();
     COMMANDS
@@ -151,9 +190,8 @@ pub(crate) fn review_panel_is_visible(
     !layout.phone && review_open && session_count > 0 && !settings_open && !github_login_open
 }
 
-#[cfg(test)]
 pub(crate) fn session_header_title() -> gpui_kit::Div {
-    div().flex().flex_1().min_w(px(0.)).items_center().gap_2()
+    div().flex().flex_1().min_w(px(0.)).flex_col()
 }
 
 pub(crate) fn session_header_actions() -> gpui_kit::Div {

@@ -85,8 +85,16 @@ impl LoomView {
             InspectorTab::Files => self.render_inspector_files(window, cx).into_any_element(),
         };
         div()
+            .id("inspector-layer")
             .when(layout.phone, |element| {
-                element.size_full().absolute().top(px(0.)).left(px(0.))
+                element
+                    .size_full()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    // The phone inspector covers the panes, so it must capture
+                    // taps instead of letting them reach the header behind it.
+                    .occlude()
             })
             .when(!layout.phone, |element| element.size_full())
             .flex()
